@@ -1641,6 +1641,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let gt_card = intel_card.clone();
     let gt_bar = dev.gtt_mmadr;
     *CONTROLLER.lock() = Some(dev);
+    // narf.intel.hdmi14_ext=1: bind the display-14+ audio component at
+    // probe, ahead of the HD-audio function (i915 binds it at display
+    // init, and snd_hdac_i915_init defers the HDA probe until it has).
+    if crate::intel_gpu_xelpg_external::color::opted_in() {
+        let _ = with_display_info(|gpu| {
+            if crate::intel_gpu_xelpg_hpd::hpd_generation_supported(gpu.chip.generation) {
+                crate::intel_gpu_xelpg_external::audio::bind_production_component(
+                    &gpu.mode_window(),
+                );
+            }
+        });
+    }
     let owns_scanout = scanout_mode.is_some();
     let card_index = match scanout_mode {
         Some(mode) => {

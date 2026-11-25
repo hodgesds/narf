@@ -607,9 +607,9 @@ pub fn hdmi_audio_rate_supported(
     hblank_audio_min <= u64::from(available_tmds) && packets_line <= HDMI_TMDS_AUDIO_PACKETS_LINE_MAX
 }
 
-/// The HDMI VSDB's audio facts (`drm_parse_hdmi_vsdb_audio`): AI support
-/// and the progressive (audio, video) latency, if present.
-fn hdmi_vsdb_audio(edid: &[u8]) -> (bool, Option<(u8, u8)>) {
+/// The HDMI VSDB's progressive (audio, video) latency, if present
+/// (`drm_parse_hdmi_vsdb_audio`).
+fn hdmi_vsdb_latency(edid: &[u8]) -> Option<(u8, u8)> {
     const OUI: [u8; 3] = [0x03, 0x0C, 0x00];
     for block in edid.chunks_exact(128).skip(1) {
         if block[0] != 0x02 {
@@ -628,14 +628,12 @@ fn hdmi_vsdb_audio(edid: &[u8]) -> (bool, Option<(u8, u8)>) {
             }
             let db = &block[pos..pos + 1 + len];
             if tag == 3 && len >= 3 && db[1..4] == OUI {
-                let ai = len >= 6 && db[6] & (1 << 7) != 0;
-                let latency = (len >= 10 && db[8] & (1 << 7) != 0).then(|| (db[10], db[9]));
-                return (ai, latency);
+                return (len >= 10 && db[8] & (1 << 7) != 0).then(|| (db[10], db[9]));
             }
             pos += 1 + len;
         }
     }
-    (false, None)
+    None
 }
 
 /// `drm_av_sync_delay` (progressive mode) in ms from the VSDB's
@@ -657,32 +655,120 @@ pub fn av_sync_delay_ms(latency: Option<(u8, u8)>) -> u32 {
     (ms(v) - ms(a)).max(0) as u32
 }
 
-/// `intel_audio_compute_config` for `publication` (the shared builder's
-/// ELD of `edid`): the ELD with `drm_edid_to_eld`'s baseline length
-/// (`drm_eld_calc_baseline_block_size`, which excludes the 4-byte header),
-/// for HDMI the VSDB's AI bit and `intel_audio_hdmi_eld_compute_config`
+/// `EDID_BASIC_AUDIO` in a CTA extension's byte 3.
+const EDID_BASIC_AUDIO: u8 = 1 << 6;
+/// `CTA_DB_AUDIO`, `CTA_DB_VENDOR` and `CTA_DB_SPEAKER`.
+const CTA_DB_AUDIO: u8 = 1;
+const CTA_DB_VENDOR: u8 = 3;
+const CTA_DB_SPEAKER: u8 = 4;
+
+/// Run `f(tag, payload)` on every data block of `edid`'s CTA extensions
+/// (the collection runs from byte 4 to the DTD offset, 127 when it is 0).
+fn for_each_cta_block(edid: &[u8], mut f: impl FnMut(u8, &[u8])) {
+    for block in edid.chunks_exact(128).skip(1) {
+        if block[0] != 0x02 {
+            continue;
+        }
+        let limit = match block[2] {
+            0 => 127usize,
+            n => (n as usize).min(127),
+        };
+        let mut pos = 4usize;
+        while pos < limit {
+            let header = block[pos];
+            let (tag, len) = (header >> 5, (header & 0x1F) as usize);
+            if pos + 1 + len > 128 {
+                break;
+            }
+            f(tag, &block[pos + 1..pos + 1 + len]);
+            pos += 1 + len;
+        }
+    }
+}
+
+/// `display_info.has_audio` (`drm_parse_cea_ext`): a CTA extension that
+/// declares basic audio (byte 3 bit 6) or carries an audio data block.
+pub fn edid_has_audio(edid: &[u8]) -> bool {
+    let basic = edid
+        .chunks_exact(128)
+        .skip(1)
+        .any(|ext| ext[0] == 0x02 && ext[3] & EDID_BASIC_AUDIO != 0);
+    let mut block = false;
+    for_each_cta_block(edid, |tag, _| block |= tag == CTA_DB_AUDIO);
+    basic || block
+}
+
+/// `drm_edid_to_eld`: the connector ELD Linux builds from `edid` (the ELD
+/// i915 hands `intel_audio_compute_config`), including for a sink that
+/// declares only basic audio, whose ELD carries no SAD. Version CEA-861-D,
+/// the first CTA extension's revision with the monitor name length (up to
+/// 13 bytes of the 0xFC descriptor), manufacturer and product, every audio
+/// data block's SADs (at most 15), the speaker allocation, the HDMI VSDB's
+/// AI bit (`drm_parse_hdmi_vsdb_audio`), the connection type and the
+/// baseline length (`drm_eld_calc_baseline_block_size`, which excludes the
+/// 4-byte header). Port ID and A/V sync delay stay 0.
+pub fn eld_from_edid(edid: &[u8], dp: bool) -> [u8; MAX_ELD_BYTES] {
+    let mut eld = [0u8; MAX_ELD_BYTES];
+    if edid.len() < 128 {
+        return eld;
+    }
+    // get_monitor_name over the base block's display descriptors.
+    let mut mnl = 0usize;
+    for desc in [54usize, 72, 90, 108] {
+        if edid[desc] == 0 && edid[desc + 1] == 0 && edid[desc + 3] == 0xFC {
+            while mnl < 13 && edid[desc + 5 + mnl] != 0x0A {
+                eld[20 + mnl] = edid[desc + 5 + mnl];
+                mnl += 1;
+            }
+            break;
+        }
+    }
+    let cea_rev = edid
+        .chunks_exact(128)
+        .skip(1)
+        .find(|ext| ext[0] == 0x02)
+        .map_or(0, |ext| ext[1]);
+    eld[4] = (cea_rev << 5) | mnl as u8;
+    eld[0] = 2 << 3;
+    eld[16..20].copy_from_slice(&edid[8..12]);
+    let mut sads = 0usize;
+    let mut ai = false;
+    for_each_cta_block(edid, |tag, data| match tag {
+        CTA_DB_AUDIO => {
+            let count = (data.len() / 3).min(15 - sads);
+            let at = 20 + mnl + 3 * sads;
+            eld[at..at + 3 * count].copy_from_slice(&data[..3 * count]);
+            sads += count;
+        }
+        CTA_DB_SPEAKER if !data.is_empty() => eld[7] = data[0],
+        CTA_DB_VENDOR if data.len() >= 5 && data[..3] == [0x03, 0x0C, 0x00] => {
+            ai |= data.len() >= 6 && data[5] & (1 << 7) != 0;
+        }
+        _ => {}
+    });
+    let conn_type: u8 = if dp { 1 << 2 } else { 0 };
+    let supports_ai: u8 = if ai { DRM_ELD_SUPPORTS_AI } else { 0 };
+    eld[5] = ((sads as u8) << 4) | conn_type | supports_ai;
+    eld[2] = (16 + mnl + 3 * sads).div_ceil(4) as u8;
+    eld
+}
+
+/// `intel_audio_compute_config` for `eld` (Linux's connector ELD,
+/// [`eld_from_edid`]): for HDMI `intel_audio_hdmi_eld_compute_config`
 /// (each SAD keeps the rates `hdmi_audio_rate_supported` admits within
 /// `DIV_ROUND_UP(hblank * bpc, 8 * K_420)` TMDS clocks; SADs left with none
-/// are dropped and the count and length recomputed), then
-/// `drm_av_sync_delay / 2` in byte 6. Port ID stays 0 as `drm_edid_to_eld`
-/// leaves it.
+/// are dropped and the count and baseline length recomputed), then
+/// `drm_av_sync_delay / 2` in byte 6.
 pub fn compute_eld(
-    publication: &DisplayAudioPublication,
+    eld: &[u8; MAX_ELD_BYTES],
     edid: &[u8],
     s: &AudioStream,
 ) -> [u8; MAX_ELD_BYTES] {
-    let mut eld = [0u8; MAX_ELD_BYTES];
-    let src = publication.eld_bytes();
-    let n = src.len().min(MAX_ELD_BYTES);
-    eld[..n].copy_from_slice(&src[..n]);
-    eld[8..16].fill(0);
+    let mut eld = *eld;
     let mnl = usize::from(eld[4] & 0x1F);
     let mut sad_count = usize::from(eld[5] >> 4);
-    let (ai, latency) = hdmi_vsdb_audio(edid);
+    let latency = hdmi_vsdb_latency(edid);
     if !s.dp {
-        if ai {
-            eld[5] |= DRM_ELD_SUPPORTS_AI;
-        }
         let hblank = u32::from(s.h_total.saturating_sub(s.h_active));
         let bpc = s.pipe_bpp / 3;
         let divider = if s.ycbcr420 { 2 } else { 1 };
@@ -717,8 +803,8 @@ pub fn compute_eld(
         eld[tail..20 + mnl + 3 * sad_count].fill(0);
         sad_count = dst;
         eld[5] = (eld[5] & 0x0F) | ((sad_count as u8) << 4);
+        eld[2] = (16 + mnl + 3 * sad_count).div_ceil(4) as u8;
     }
-    eld[2] = (16 + mnl + 3 * sad_count).div_ceil(4) as u8;
     eld[6] = (av_sync_delay_ms(latency) / 2) as u8;
     eld
 }
@@ -786,12 +872,13 @@ fn find_audio_state(audio: &Audio, port: i32, cpu_transcoder: i32) -> Option<Aud
 /// `intel_audio_codec_enable` for the route's `stream` with `eld`
 /// ([`compute_eld`]): [`codec_enable`] at the port's current sample rate,
 /// the state store, the shared display-audio sink publication (sink id
-/// `port + 1`) and the codec's `pin_eld_notify`.
+/// `port + 1`; a sink without SADs has none) and the codec's
+/// `pin_eld_notify`.
 pub fn audio_codec_enable<M: MmioWindow + ?Sized>(
     io: &M,
     s: &AudioStream,
     eld: &[u8; MAX_ELD_BYTES],
-    publication: DisplayAudioPublication,
+    publication: Option<DisplayAudioPublication>,
 ) -> Result<(), AudioError> {
     let cdclk = crate::intel_gpu_modeset_xelpg::cdclk_current_khz(io);
     codec_enable(io, s, cdclk, sample_rate(s.port))?;
@@ -801,7 +888,9 @@ pub fn audio_codec_enable<M: MmioWindow + ?Sized>(
             eld: *eld,
         });
     }
-    acomp::publish_display_audio(sink_id(s.port), publication);
+    if let Some(publication) = publication {
+        acomp::publish_display_audio(sink_id(s.port), publication);
+    }
     acomp::notify_pin_eld(s.port, s.notify_pipe());
     Ok(())
 }

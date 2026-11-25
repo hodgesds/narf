@@ -290,18 +290,25 @@ pub(crate) fn audio_edid() -> Vec<u8> {
     )
 }
 
-/// `intel_audio_compute_config` for HDMI: `drm_edid_to_eld`'s baseline
-/// length (16 + 3 x SADs, header excluded) and AI bit, then
-/// `intel_audio_hdmi_eld_compute_config` with 160 TMDS clocks of blanking:
-/// 2-channel LPCM keeps every rate (one packet per line, 106 clocks), the
-/// 8-channel SAD loses 176.4 and 192 kHz (three packets, 170 clocks), the
-/// 6-channel 192 kHz-only AC-3 SAD is dropped; `drm_av_sync_delay` is
-/// 40 - 20 = 20 ms, so byte 6 is 10. On DP no SAD is pruned.
+/// `drm_edid_to_eld` and `intel_audio_compute_config` for HDMI: the
+/// baseline length (16 + 3 x SADs, header excluded) and the VSDB's AI bit,
+/// then `intel_audio_hdmi_eld_compute_config` with 160 TMDS clocks of
+/// blanking: 2-channel LPCM keeps every rate (one packet per line, 106
+/// clocks), the 8-channel SAD loses 176.4 and 192 kHz (three packets, 170
+/// clocks), the 6-channel 192 kHz-only AC-3 SAD is dropped;
+/// `drm_av_sync_delay` is 40 - 20 = 20 ms, so byte 6 is 10. On DP no SAD is
+/// pruned, and `drm_parse_hdmi_vsdb_audio`'s AI bit applies there too.
 fn smoke_xelpg_audio_eld_compute_config() -> TestResult {
     let edid = audio_edid();
-    let Some(publication) = build_eld(&edid, DisplayConnector::Hdmi, 0) else {
-        return TestResult::Fail("the audio sink must build an ELD");
-    };
+    if !edid_has_audio(&edid) {
+        return TestResult::Fail("an audio data block is display_info.has_audio");
+    }
+    let connector_eld = eld_from_edid(&edid, false);
+    // The shared builder's ELD agrees with Linux's on the SADs.
+    match build_eld(&edid, DisplayConnector::Hdmi, 0) {
+        Some(p) if p.eld_bytes()[20..29] == connector_eld[20..29] => {}
+        _ => return TestResult::Fail("drm_edid_to_eld and the shared builder must agree"),
+    }
     if !hdmi_audio_rate_supported(138_500, 2080, 160, 192_000, 2)
         || hdmi_audio_rate_supported(138_500, 2080, 160, 176_400, 8)
         || !hdmi_audio_rate_supported(138_500, 2080, 160, 96_000, 8)
@@ -309,7 +316,7 @@ fn smoke_xelpg_audio_eld_compute_config() -> TestResult {
     {
         return TestResult::Fail("hdmi_audio_rate_supported differs from Linux");
     }
-    let eld = compute_eld(&publication, &edid, &hdmi_stream());
+    let eld = compute_eld(&connector_eld, &edid, &hdmi_stream());
     let mnl = usize::from(eld[4] & 0x1F);
     if eld[5] != (2 << 4) | DRM_ELD_SUPPORTS_AI
         || eld[2] as usize != (16 + mnl + 6).div_ceil(4)
@@ -320,17 +327,13 @@ fn smoke_xelpg_audio_eld_compute_config() -> TestResult {
     {
         return TestResult::Fail("the HDMI ELD differs from intel_audio_compute_config");
     }
-    // DP: no pruning, no AI bit; the baseline length is still Linux's.
+    // DP: no pruning; the connection type is DP and the AI bit stays.
     let dp = AudioStream {
         dp: true,
         ..hdmi_stream()
     };
-    let Some(publication) = build_eld(&edid, DisplayConnector::DisplayPort, 0) else {
-        return TestResult::Fail("the audio sink must build a DP ELD");
-    };
-    let eld = compute_eld(&publication, &edid, &dp);
-    if eld[5] >> 4 != 3
-        || eld[5] & DRM_ELD_SUPPORTS_AI != 0
+    let eld = compute_eld(&eld_from_edid(&edid, true), &edid, &dp);
+    if eld[5] != (3 << 4) | (1 << 2) | DRM_ELD_SUPPORTS_AI
         || eld[2] as usize != (16 + mnl + 9).div_ceil(4)
         || av_sync_delay_ms(Some((11, 21))) != 20
         || av_sync_delay_ms(Some((255, 21))) != 0
@@ -343,6 +346,59 @@ fn smoke_xelpg_audio_eld_compute_config() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_audio",
     smoke_xelpg_audio_eld_compute_config
+);
+
+/// A basic-audio sink (CTA byte 3 bit 6, no audio data block) has
+/// `display_info.has_audio`, and Linux enables audio with its connector ELD:
+/// no SAD, baseline length 16 bytes (`drm_eld_size` 20). A sink with
+/// neither has no audio; the shared builder publishes nothing for either.
+fn smoke_xelpg_audio_basic_audio_sink_gets_linux_eld() -> TestResult {
+    fn with_basic_audio(mut edid: Vec<u8>) -> Vec<u8> {
+        edid[128 + 3] |= 1 << 6;
+        let sum: u32 = edid[128..255].iter().map(|&b| u32::from(b)).sum();
+        edid[255] = ((256 - sum % 256) % 256) as u8;
+        edid
+    }
+    // An HDMI VSDB only (PA 1.0.0.0).
+    let vsdb = [(3 << 5) | 5, 0x03, 0x0C, 0x00, 0x10, 0x00];
+    let base = || crate::intel_gpu_xelpg_external::tests::edid_for(
+        138_500, 1920, 160, 48, 32, 1080, 31, 3, 5,
+    );
+    let plain = crate::intel_gpu_xelpg_external::color::tests::with_cta(base(), &vsdb);
+    let basic = with_basic_audio(plain.clone());
+    if edid_has_audio(&plain) || !edid_has_audio(&basic) {
+        return TestResult::Fail("has_audio must follow the basic-audio bit");
+    }
+    let eld = compute_eld(&eld_from_edid(&basic, false), &basic, &hdmi_stream());
+    if eld[0] != 2 << 3
+        || eld[4] != 3 << 5
+        || eld[5] != 0
+        || eld[2] != 4
+        || eld_size(&eld) != 20
+        || eld[16..20] != basic[8..12]
+        || build_eld(&basic, DisplayConnector::Hdmi, 0).is_some()
+    {
+        return TestResult::Fail("a basic-audio sink must get drm_edid_to_eld's SAD-less ELD");
+    }
+    // The component hands that ELD to the codec once the stream runs.
+    reset_for_test();
+    let io = AudioFake::new();
+    let s = hdmi_stream();
+    let mut buf = [0u8; 128];
+    let result = if audio_codec_enable(&io, &s, &eld, None).is_err() {
+        TestResult::Fail("a basic-audio stream must enable")
+    } else {
+        match component_get_eld(1, 0, &mut buf) {
+            Ok((true, 20)) if buf[..20] == eld[..20] => TestResult::Pass,
+            _ => TestResult::Fail("get_eld must return the 20-byte ELD"),
+        }
+    };
+    reset_for_test();
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_audio",
+    smoke_xelpg_audio_basic_audio_sink_gets_linux_eld
 );
 
 /// The scripted HDA codec: Tiger Lake+ / ADL-P+ `intel_pin2port` (port
@@ -416,10 +472,8 @@ fn scripted_hda_sequence() -> TestResult {
     }
     let edid = audio_edid();
     let s = hdmi_stream();
-    let Some(publication) = build_eld(&edid, DisplayConnector::Hdmi, 0) else {
-        return TestResult::Fail("the audio sink must build an ELD");
-    };
-    let eld = compute_eld(&publication, &edid, &s);
+    let publication = build_eld(&edid, DisplayConnector::Hdmi, 0);
+    let eld = compute_eld(&eld_from_edid(&edid, false), &edid, &s);
     let before = NOTIFY_COUNT.load(Ordering::SeqCst);
     if audio_codec_enable(&io, &s, &eld, publication).is_err() {
         return TestResult::Fail("the HDMI audio enable must run");

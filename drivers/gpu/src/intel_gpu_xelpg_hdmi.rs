@@ -961,10 +961,10 @@ pub struct MtlHdmiProbe {
     /// General Control Packet to an HDMI sink
     /// (`intel_hdmi_compute_gcp_infoframe`).
     pub ext: bool,
-    /// The sink's ELD when the route enables audio
+    /// The sink's ELD (`drm_edid_to_eld`) when the route enables audio
     /// (`narf.intel.hdmi14_ext=1`, `intel_hdmi_has_audio`: an HDMI sink
-    /// with audio descriptors).
-    pub audio: Option<alloc::boxed::Box<narf_drivers_sound::display_audio::DisplayAudioPublication>>,
+    /// that declares basic audio or audio descriptors).
+    pub audio: Option<alloc::boxed::Box<[u8; crate::intel_gpu_xelpg_external::audio::MAX_ELD_BYTES]>>,
     /// EDID bytes (`edid_len` valid).
     pub edid: alloc::boxed::Box<[u8; crate::intel_gpu_hdmi::EDID_CAPACITY]>,
     /// Valid EDID length.
@@ -1100,17 +1100,18 @@ pub(crate) fn probe_hdmi_profile_ext<M: MmioWindow + ?Sized>(
 }
 
 /// `intel_hdmi_has_audio` under `narf.intel.hdmi14_ext=1`: an HDMI sink
-/// whose CTA extension carries audio descriptors gets audio; its ELD is the
-/// shared builder's (Port ID 0, as `drm_edid_to_eld` leaves it).
+/// whose `display_info.has_audio` holds (basic audio or an audio data
+/// block) gets audio with Linux's connector ELD (`drm_edid_to_eld`), SADs
+/// or none.
 fn hdmi_audio(
     edid: &[u8],
     ext: bool,
-) -> Option<narf_drivers_sound::display_audio::DisplayAudioPublication> {
-    use narf_drivers_sound::display_audio::{build_eld, DisplayConnector};
-    if !ext || !crate::intel_gpu_hdmi::is_hdmi_sink(edid) {
+) -> Option<[u8; crate::intel_gpu_xelpg_external::audio::MAX_ELD_BYTES]> {
+    use crate::intel_gpu_xelpg_external::audio;
+    if !ext || !crate::intel_gpu_hdmi::is_hdmi_sink(edid) || !audio::edid_has_audio(edid) {
         return None;
     }
-    build_eld(edid, DisplayConnector::Hdmi, 0)
+    Some(audio::eld_from_edid(edid, false))
 }
 
 /// The output an HDMI probe resolves: format, pipe bpc, PLL request and
@@ -1509,7 +1510,7 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     rp.pipes.arm_primary(io, pipe)?;
     observe_hdmi(io, route, func, start)?;
     // intel_post_plane_update: intel_encoders_audio_enable.
-    let Some(publication) = route.probe.audio.clone() else {
+    let Some(connector_eld) = route.probe.audio.clone() else {
         return Ok(());
     };
     use crate::intel_gpu_xelpg_external::audio;
@@ -1530,15 +1531,18 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         ycbcr420: format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420,
         wa_14020863754: audio::needs_wa_14020863754(ip),
     };
-    let eld = audio::compute_eld(
-        &publication,
-        &route.probe.edid[..route.probe.edid_len],
-        &stream,
+    let edid = &route.probe.edid[..route.probe.edid_len];
+    let eld = audio::compute_eld(&connector_eld, edid, &stream);
+    // The shared sink takes the builder's publication (none without SADs).
+    let publication = narf_drivers_sound::display_audio::build_eld(
+        edid,
+        narf_drivers_sound::display_audio::DisplayConnector::Hdmi,
+        0,
     );
     // The stream is the route's to disable from here on, even if a step
     // of the enable failed.
     route.audio = Some(stream);
-    audio::audio_codec_enable(io, &stream, &eld, *publication)
+    audio::audio_codec_enable(io, &stream, &eld, publication)
         .map_err(|_| ExternalError::AccessLost.into())
 }
 

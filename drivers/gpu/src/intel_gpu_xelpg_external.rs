@@ -1011,10 +1011,10 @@ pub struct MtlSinkProbe {
     /// (`narf.intel.hdmi14_ext=1`, [`color::dp_output`]); RGB with no PCON
     /// writes otherwise.
     pub output: color::DpOutput,
-    /// The sink's ELD when the SST route enables audio
+    /// The sink's ELD (`drm_edid_to_eld`) when the SST route enables audio
     /// (`narf.intel.hdmi14_ext=1`, `intel_dp_has_audio`: every display-12+
-    /// port, a sink with audio descriptors).
-    pub audio: Option<alloc::boxed::Box<narf_drivers_sound::display_audio::DisplayAudioPublication>>,
+    /// port, a sink that declares basic audio or audio descriptors).
+    pub audio: Option<alloc::boxed::Box<[u8; audio::MAX_ELD_BYTES]>>,
 }
 
 /// A 128b/132b SST route (`intel_dp_is_uhbr`).
@@ -1479,16 +1479,8 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     }
     // intel_dp_audio_compute_config (intel_dp_has_audio: every display-12+
     // port; a sink with audio descriptors).
-    let audio = if ext {
-        narf_drivers_sound::display_audio::build_eld(
-            &edid[..edid_len],
-            narf_drivers_sound::display_audio::DisplayConnector::DisplayPort,
-            0,
-        )
-        .map(alloc::boxed::Box::new)
-    } else {
-        None
-    };
+    let audio = (ext && audio::edid_has_audio(&edid[..edid_len]))
+        .then(|| alloc::boxed::Box::new(audio::eld_from_edid(&edid[..edid_len], true)));
     // intel_dp_min_bpp: a YCbCr output has no 6 bpc pipe.
     if output.ycbcr444 && pipe_bpp < dsc::PIPE_BPP {
         return Err(rollback(ExternalError::Color(
@@ -2533,7 +2525,7 @@ fn finish<M: MmioWindow + ?Sized>(
     rp.pipes.arm_primary(io, pipe)?;
     observe_live(io, route, func, start)?;
     // intel_post_plane_update: intel_encoders_audio_enable (SST only).
-    let Some(publication) = route.probe.audio.clone().filter(|_| route.probe.mst.is_none())
+    let Some(connector_eld) = route.probe.audio.clone().filter(|_| route.probe.mst.is_none())
     else {
         return Ok(());
     };
@@ -2557,9 +2549,15 @@ fn finish<M: MmioWindow + ?Sized>(
         ycbcr420: false,
         wa_14020863754: audio::needs_wa_14020863754(route.probe.display_ip),
     };
-    let eld = audio::compute_eld(&publication, &route.probe.edid[..route.probe.edid_len], &stream);
+    let edid = &route.probe.edid[..route.probe.edid_len];
+    let eld = audio::compute_eld(&connector_eld, edid, &stream);
+    let publication = narf_drivers_sound::display_audio::build_eld(
+        edid,
+        narf_drivers_sound::display_audio::DisplayConnector::DisplayPort,
+        0,
+    );
     route.audio = Some(stream);
-    audio::audio_codec_enable(io, &stream, &eld, *publication).map_err(|_| ExternalError::AccessLost)
+    audio::audio_codec_enable(io, &stream, &eld, publication).map_err(|_| ExternalError::AccessLost)
 }
 
 /// Bounded fresh-frame witness: the primary LIVE surface equals the
