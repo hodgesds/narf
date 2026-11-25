@@ -905,7 +905,8 @@ impl Hardware {
         }
         crate::mt7921::pci::invoke(&self.authority, || {
             // SAFETY: exclusive retained aperture/L1 latch inside current invocation.
-            let value = unsafe { registers::read32(&self.mmio, addr) }
+            // The bound PCI id selects the CONNAC2/CONNAC3 fixed table.
+            let value = unsafe { registers::read32(self.device.id.device, &self.mmio, addr) }
                 .map_err(|error| register_access_error("read", addr, error))?;
             if value == u32::MAX {
                 Err(Error::DeviceGone)
@@ -921,7 +922,8 @@ impl Hardware {
         }
         crate::mt7921::pci::invoke(&self.authority, || {
             // SAFETY: bounded register plan and current retained PCI invocation.
-            unsafe { registers::write32(&self.mmio, addr, value) }
+            // The bound PCI id selects the CONNAC2/CONNAC3 fixed table.
+            unsafe { registers::write32(self.device.id.device, &self.mmio, addr, value) }
                 .map_err(|error| register_access_error("write", addr, error))
         })
         .map_err(|_| Error::Authority)?

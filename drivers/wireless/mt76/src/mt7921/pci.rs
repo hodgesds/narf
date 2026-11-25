@@ -405,7 +405,7 @@ fn bring_up_current(
     // SAFETY: caller-asserted BAR exclusivity.
     let mmio_bar0 = unsafe { map_bar_control(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
 
-    validate_probe_window(mmio_bar0.len)?;
+    validate_probe_window(device.id.device, mmio_bar0.len)?;
     use narf_bus::pci::{self, cmd};
     pci::set_command(cap, device, PROBE_COMMAND).map_err(|_| ProbeError::Authority)?;
     let command = pci::read_command(cap, device).map_err(|_| ProbeError::Authority)?;
@@ -429,11 +429,13 @@ fn bring_up_current(
         mmio_bar0.len
     );
     // SAFETY: caller owns BAR0/latch; checked access validates every word.
-    let chip_id = unsafe { chip_id_read(&mmio_bar0)? };
+    // The PCI id selects the fixed table: the chip-id gate below has not
+    // run yet, so there is no effective id to pass here.
+    let chip_id = unsafe { chip_id_read(device.id.device, &mmio_bar0)? };
     // SAFETY: same ownership and checked transaction.
-    let hw_rev = unsafe { hw_rev_read(&mmio_bar0)? };
+    let hw_rev = unsafe { hw_rev_read(device.id.device, &mmio_bar0)? };
     // SAFETY: same ownership and checked transaction.
-    let bound = unsafe { hw_bound_read(&mmio_bar0)? };
+    let bound = unsafe { hw_bound_read(device.id.device, &mmio_bar0)? };
     if [chip_id, hw_rev, bound].contains(&u32::MAX) {
         return Err(ProbeError::DeviceGone);
     }
@@ -462,7 +464,7 @@ fn bring_up_current(
     }
     // SAFETY: exclusive current invocation, verified BME-off, mapped control
     // window, and no published controller/transport or host DMA allocations.
-    match unsafe { mac::initialize_probe(&mmio_bar0) } {
+    match unsafe { mac::initialize_probe(&mmio_bar0, effective_did) } {
         Ok(()) => {}
         Err(mac::PowerError::Timeout) => return Err(ProbeError::DriverOwnTimeout),
         Err(mac::PowerError::DeviceGone) => return Err(ProbeError::DeviceGone),
@@ -488,7 +490,9 @@ fn bring_up_current(
 }
 
 /// Validate all identity/power accesses, including the indirect selector.
-pub(super) fn validate_probe_window(len: u64) -> Result<(), ProbeError> {
+/// `did` is the PCI device id: the probe calls this before the chip-id
+/// gate computes the effective id.
+pub(super) fn validate_probe_window(did: u16, len: u64) -> Result<(), ProbeError> {
     for addr in [
         MT_PCIE_MAC_INT_ENABLE,
         MT_HW_CHIPID,
@@ -496,28 +500,29 @@ pub(super) fn validate_probe_window(len: u64) -> Result<(), ProbeError> {
         MT_HW_BOUND,
         MT_CONN_ON_LPCTL,
     ] {
-        super::registers::plan(addr, len).map_err(|_| ProbeError::UnsupportedRegisterWindow)?;
+        super::registers::plan(did, addr, len)
+            .map_err(|_| ProbeError::UnsupportedRegisterWindow)?;
     }
     Ok(())
 }
 
 /// # Safety
 /// Caller exclusively owns BAR0 and the L1 selector.
-unsafe fn chip_id_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+unsafe fn chip_id_read(did: u16, mmio: &MmioRegion) -> Result<u32, ProbeError> {
     // SAFETY: forwarded ownership; access validates the complete word.
-    unsafe { super::registers::read32(mmio, MT_HW_CHIPID) }.map_err(register_error)
+    unsafe { super::registers::read32(did, mmio, MT_HW_CHIPID) }.map_err(register_error)
 }
 /// # Safety
 /// Caller exclusively owns BAR0 and the L1 selector.
-unsafe fn hw_rev_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+unsafe fn hw_rev_read(did: u16, mmio: &MmioRegion) -> Result<u32, ProbeError> {
     // SAFETY: forwarded ownership; access validates the complete word.
-    unsafe { super::registers::read32(mmio, MT_HW_REV) }.map_err(register_error)
+    unsafe { super::registers::read32(did, mmio, MT_HW_REV) }.map_err(register_error)
 }
 /// # Safety
 /// Caller exclusively owns BAR0 and the L1 selector.
-unsafe fn hw_bound_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+unsafe fn hw_bound_read(did: u16, mmio: &MmioRegion) -> Result<u32, ProbeError> {
     // SAFETY: forwarded ownership; access validates the complete word.
-    unsafe { super::registers::read32(mmio, MT_HW_BOUND) }.map_err(register_error)
+    unsafe { super::registers::read32(did, mmio, MT_HW_BOUND) }.map_err(register_error)
 }
 
 fn register_error(error: super::registers::Error) -> ProbeError {
@@ -531,8 +536,8 @@ fn register_error(error: super::registers::Error) -> ProbeError {
 /// Return the checked PCI register offset, or `u32::MAX` if unsupported.
 /// An indirect offset alone is not sufficient for I/O: use the checked
 /// register transaction, which programs and flushes the L1 selector first.
-pub fn l1_remap(abs: u32) -> u32 {
-    super::registers::plan(abs, 0x100000).map_or(u32::MAX, |plan| plan.offset)
+pub fn l1_remap(did: u16, abs: u32) -> u32 {
+    super::registers::plan(did, abs, 0x100000).map_or(u32::MAX, |plan| plan.offset)
 }
 
 /// SendFn registered with `narf_net::iface` at probe. Stage-2 lights

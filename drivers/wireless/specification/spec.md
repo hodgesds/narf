@@ -967,6 +967,24 @@ outside `{0x7961, 0x7922, 0x7920}`: no verified `MT_HW_CHIPID` value
 exists for the `14c3:0717` card yet (upstream has no explicit MT7925
 chip-id constant, only a `case 0x7925` firmware-name expectation), so
 real-hardware probe stays closed until that value is read off the card.
+Register translation is per-chip: `registers::plan` selects the fixed
+table by device id. MT7925 ids (`0x7925`, `0x0717`) use the CONNAC3
+table `FIXED_MT7925`, transcribed entry-for-entry from upstream
+`default_fixed_map` (`mt7925/pci.c:178-232` at torvalds/linux
+`8d7fe9885c62`); every other registered id keeps the CONNAC2 table.
+Against CONNAC2 the MT7925 table adds windows `0x830c0000`,
+`0x56000000`, `0x57000000`, `0x820ca000`, `0x820c4000`, `0x820b0000`,
+`0x70020000`, `0x7c500000` (remap, length `0x200000`), lengthens PP
+(`0x820cc000`, `0x1000` -> `0x2000`), shrinks the PCIe MAC window
+(`0x74030000`, `0x10000` -> `0x1000`), and drops `0x820cd000`, which
+has no MT7925 counterpart (addresses there now route through the
+lengthened PP window). The sibling `mt7928_fixed_map` is not used.
+Probe-time callers pass the PCI id (no effective id exists before
+the chip-id gate); later callers pass the effective id. The
+`mt76_mt7925_fixed_map_matches_upstream_default_fixed_map` golden
+test asserts the table entry-for-entry against upstream, and
+`mt76_mt7925_plan_uses_connac3_windows` asserts the dispatch, the
+new windows, and both length changes through `plan()`.
 Register translation and selector encoding follow the local Linux reference at `ecd997b0189a`.
 
 ### MT76 MCU/DMA firmware transport
