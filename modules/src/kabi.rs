@@ -1660,6 +1660,33 @@ kernel_abi! {
         let side = crate::module_block::Endpoint::Module(dst as usize);
         crate::module_block::copy(owner, dev, request, side, req_off..end, false)
     }
+
+    // ── PCI command register read/clear (mt76.ko) ──────────────────────────
+
+    /// Clear, then set, PCI command bits on the module's device and write the
+    /// register read back through `out_cmd` (`clear = set = 0` only reads
+    /// it). Only memory decode, bus mastering and INTx disable may change
+    /// (`-EINVAL` otherwise). For stop/reset sequences that must prove bus
+    /// mastering off (Linux `pci_clear_master`). Returns 0, `-ENODEV` or
+    /// `-EIO`.
+    ///
+    /// # Safety
+    /// `out_cmd` must point to writable `u16` storage.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_pci_command(dev: u64, clear: u16, set: u16, out_cmd: *mut u16) -> i32 {
+        if out_cmd.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_pci_command(owner, dev, clear, set) {
+            Ok(command) => {
+                // SAFETY: non-null; the module promises writable storage.
+                unsafe { out_cmd.write(command) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -2266,3 +2293,31 @@ fn smoke_kabi_runtime_services_behave() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_runtime_services_behave);
+
+// ── narf_pci_command (mt76.ko) ─────────────────────────────────────────
+
+/// `narf_pci_command` refuses a null output, bits outside decode/mastering/
+/// INTx, and a token with no device context, and needs `BusDevice` to link.
+fn smoke_kabi_pci_command_validates_arguments() -> TestResult {
+    use narf_capabilities::CapKind;
+    const UNKNOWN: u64 = (0x56u64 << 56) | 0xFF00;
+    let mut command = 0x5a5a_u16;
+    // SAFETY: the pointer is null (to prove rejection) or names a live local.
+    let ok = unsafe {
+        narf_pci_command(UNKNOWN, 0, 0, core::ptr::null_mut()) == -22
+            && narf_pci_command(UNKNOWN, 0x1, 0, &mut command) == -22
+            && narf_pci_command(UNKNOWN, 0, 0x100, &mut command) == -22
+            && narf_pci_command(UNKNOWN, 0x4, 0x2, &mut command) == -19
+            && narf_pci_command(UNKNOWN, 0, 0, &mut command) == -19
+    };
+    if !ok || command != 0x5a5a {
+        return TestResult::Fail("narf_pci_command accepted a malformed argument or token");
+    }
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    match crate::symbols::resolve("narf_pci_command", None, &denied) {
+        Err(crate::symbols::ResolveError::CapMissing(CapKind::BusDevice)) => TestResult::Pass,
+        _ => TestResult::Fail("narf_pci_command resolved without BusDevice"),
+    }
+}
+kernel_test_in!("modules/kabi", smoke_kabi_pci_command_validates_arguments);

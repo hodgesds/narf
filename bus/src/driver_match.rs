@@ -1087,6 +1087,49 @@ pub fn module_pci_enable(owner: u64, token: u64, bits: u16) -> i32 {
     }
 }
 
+// ── PCI command register read/clear (mt76.ko) ───────────────────────────
+
+/// Command bits [`module_pci_command`] may change: memory decode, bus
+/// mastering and the INTx disable. I/O decode, SERR, parity and the rest stay
+/// the kernel's.
+const MODULE_COMMAND_BITS: u16 =
+    crate::pci::cmd::MEM_SPACE | crate::pci::cmd::BUS_MASTER | crate::pci::cmd::INTX_DISABLE;
+
+/// Clear, then set, command bits of a module-owned function and return the
+/// register read back (`clear = set = 0` only reads it). A driver whose
+/// stop/reset sequence must prove bus mastering is off (Linux
+/// `pci_clear_master`, then reading `PCI_COMMAND`) needs both the clear and
+/// the read, which [`module_pci_enable`] lacks. Bits outside
+/// [`MODULE_COMMAND_BITS`] are refused with `-EINVAL`. Reached from
+/// `narf_pci_command`.
+pub fn module_pci_command(owner: u64, token: u64, clear: u16, set: u16) -> Result<u16, i32> {
+    if (clear | set) & !MODULE_COMMAND_BITS != 0 {
+        return Err(-22);
+    }
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        return Err(-19);
+    };
+    let result = ctx.cap.invoke(DeviceOp(|| {
+        if clear != 0 {
+            crate::pci::clear_command(&ctx.cap, &ctx.device, clear)?;
+        }
+        if set != 0 {
+            crate::pci::set_command(&ctx.cap, &ctx.device, set)?;
+        }
+        crate::pci::read_command(&ctx.cap, &ctx.device)
+    }));
+    match result {
+        Ok(Ok(command)) => {
+            // Teardown clears what is still enabled through this context.
+            ctx.enabled_bits = (ctx.enabled_bits & !clear) | set;
+            Ok(command)
+        }
+        Ok(Err(_)) => Err(-5),
+        Err(_) => Err(-19),
+    }
+}
+
 /// Map a BAR of a module-owned device and return a 1-based handle (0 = fail).
 /// Reached from `narf_bar_map`.
 pub fn module_bar_map(owner: u64, token: u64, idx: u8) -> u64 {
