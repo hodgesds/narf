@@ -249,6 +249,21 @@ impl Profile {
     pub(crate) fn bss_color(self) -> Option<u8> {
         self.color_enabled.then_some(self.bss_color)
     }
+    /// UNI BSS HE parameters for `mt7925_mcu_bss_he_tlv`
+    /// (`mt7925/mcu.c:2971-2996`): PE duration, RTS threshold, the
+    /// local TX NSS/MCS maps `[BW80, BW160, BW8080]`, BSS color.
+    /// `enable = false` clears the color (the teardown record); the
+    /// maps and timings stay. `local_tx` is exactly this TLV's
+    /// `max_nss_mcs` (see the field doc).
+    pub(crate) fn uni_bss_he(self, enable: bool) -> crate::mt7925::mcu::UniBssHe {
+        crate::mt7925::mcu::UniBssHe {
+            pe_duration: self.pe_duration,
+            rts_thres: self.rts_threshold,
+            max_nss_mcs: self.local_tx,
+            color_enabled: enable && self.color_enabled,
+            color: self.bss_color,
+        }
+    }
     pub(crate) fn has_mu_edca(self) -> bool {
         self.mu_edca.is_some()
     }

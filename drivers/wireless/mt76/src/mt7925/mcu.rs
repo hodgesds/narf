@@ -48,8 +48,10 @@
 //!   EHT IEs; this module only lays out their bytes.
 //! - `cap_tlvs` in the station builder is the caller-supplied
 //!   capability TLV stream (HT/VHT/HE/EHT/RA/PHY/UAPSD/AMSDU/
-//!   HDR_TRANS) in upstream order. Slice 7 fills it; until then the
-//!   builder emits BASIC + STATE (+ MLD/EHT_MLD) only.
+//!   HDR_TRANS) in upstream order. `mt7921::association`
+//!   (`JoinPlan::uni_cap_tlvs`, MLO slice) fills it from the
+//!   negotiated profiles, mirroring the CONNAC2 `peer_record_on`
+//!   arms; the builder itself only lays out the bytes.
 //! - 320 MHz stays refused (`association.rs:1296`): the RLM encoder
 //!   accepts the upstream `CMD_CBW_320MHZ` value but no caller in
 //!   this slice passes it.
@@ -269,6 +271,33 @@ pub const STA_REC_EHT: u16 = 0x22;
 pub const STA_REC_MLD_OFF: u16 = 0x23;
 /// `STA_REC_REMOVE` = 0x25.
 pub const STA_REC_REMOVE: u16 = 0x25;
+/// `STA_REC_KEY_V3` = 0x27 (`mt76_connac_mcu.h:866`) — the CONNAC3
+/// key record (`struct sta_rec_sec_uni`, `mt7925/mcu.h`), used by
+/// `mt7925_mcu_sta_key_tlv` (`mt7925/mcu.c:1320-1401`) for pairwise,
+/// group and IGTK installs alike. The CONNAC2 `STA_REC_KEY_V2` (17)
+/// has no UNI counterpart: a 7925 key goes in its own
+/// `STA_REC_UPDATE` carrying only this TLV (`mt7925_mcu_add_key`,
+/// `mt7925/mcu.c:1403-1423`).
+pub const STA_REC_KEY_V3: u16 = 0x27;
+
+/// CONNAC3 cipher ids (`mt7925/mcu.h:165-175`, enum):
+/// NONE = 0, WEP40 = 1, TKIP = 2, AES_CCMP = 4, WEP104 = 5,
+/// BIP_CMAC_128 = 6, WEP128 = 7, WAPI = 8, CCMP_256 = 10,
+/// GCMP = 11, GCMP_256 = 12. The mapping from an 802.11 suite to
+/// these bytes is `mt7925_mcu_get_cipher` (`mt7925/mcu.c:679-698`);
+/// the NARF-side mapping lives in `mt7921::association`
+/// (`connac3_cipher_for_suite`), next to the CONNAC2 one.
+pub const CONNAC3_CIPHER_NONE: u8 = 0;
+pub const CONNAC3_CIPHER_WEP40: u8 = 1;
+pub const CONNAC3_CIPHER_TKIP: u8 = 2;
+pub const CONNAC3_CIPHER_AES_CCMP: u8 = 4;
+pub const CONNAC3_CIPHER_WEP104: u8 = 5;
+pub const CONNAC3_CIPHER_BIP_CMAC_128: u8 = 6;
+pub const CONNAC3_CIPHER_WEP128: u8 = 7;
+pub const CONNAC3_CIPHER_WAPI: u8 = 8;
+pub const CONNAC3_CIPHER_CCMP_256: u8 = 10;
+pub const CONNAC3_CIPHER_GCMP: u8 = 11;
+pub const CONNAC3_CIPHER_GCMP_256: u8 = 12;
 
 // ── UNI BSS_INFO tags ────────────────────────────────────────────
 //
@@ -349,6 +378,13 @@ pub const STA_REC_EHT_MLD_TLV_SIZE: usize = 16;
 pub const STA_REC_EHT_TLV_SIZE: usize = 40;
 /// `sta_rec_remove` total size (`mt76_connac_mcu.h:578-582`).
 pub const STA_REC_REMOVE_TLV_SIZE: usize = 8;
+/// `sta_rec_sec_uni` total size (`mt7925/mcu.h`, `struct
+/// sta_rec_sec_uni`): tag+len (4) + add/tx_key/key_type/
+/// is_authenticator (4) + peer_addr (6) + bss_idx/cipher_id/key_id/
+/// key_len/wlan_idx/mgmt_prot (6) + key (32) + key_rsc (16).
+pub const STA_REC_KEY_V3_TLV_SIZE: usize = 68;
+/// Maximum key bytes a `sta_rec_sec_uni` carries (`key[32]`).
+pub const STA_REC_KEY_V3_MAX_KEY_LEN: usize = 32;
 
 /// BA types (`mt76_connac_mcu.h:1034-1037`, enum):
 /// `MT_BA_TYPE_INVALID` = 0, `MT_BA_TYPE_ORIGINATOR` = 1,
@@ -462,8 +498,13 @@ pub struct MldLinks {
     /// Masked EML capabilities for the EHT MLD TLV: the vif's
     /// `eml_cap` masked to EMLSR-supp + transition timeout, plus the
     /// wiphy ext-capa EML padding/transition delay bits
-    /// (`mt7925/mcu.c:2052-2058`). Computed by the caller (slice 7
-    /// owns the EML capability source); 0 when unknown.
+    /// (`mt7925/mcu.c:2052-2058`). Computed by the caller from
+    /// `mt7921::mlo::EmlCaps::advertised()` — NARF models neither
+    /// input (no vif cfg, no wiphy iftype ext capa), so the
+    /// fail-closed value is 0 with `emlsr = false` (the EHT MLD
+    /// TLV then carries `str_cap[0] = BIT(1)`). See `mlo.rs` for
+    /// the full provenance; never fill this from the negotiated
+    /// EHT caps — upstream does not source EML there.
     pub eml_cap: u16,
     /// `true` when EMLSR is supported (selects the `eml_cap` bytes;
     /// otherwise `str_cap[0] = BIT(1)`).
@@ -600,7 +641,9 @@ pub struct UniStaParams<'a> {
     pub state: u8,
     /// Caller-supplied capability TLV stream (HT/VHT/HE/EHT/RA/PHY/
     /// UAPSD/AMSDU/HDR_TRANS) in upstream order, appended verbatim
-    /// between BASIC and STATE. Slice 7 fills it; empty until then.
+    /// between BASIC and STATE. Filled by
+    /// `mt7921::association::JoinPlan::uni_cap_tlvs` (MLO slice)
+    /// from the negotiated profiles.
     pub cap_tlvs: &'a [u8],
     /// MLD links, when the vif is an MLD vif. Appends the MLD +
     /// EHT MLD TLVs after STATE (upstream emits them only when
@@ -754,6 +797,94 @@ pub fn build_uni_sta_remove_req(bss_idx: u8, wcid_idx: u16, omac_idx: u8) -> Vec
     let _ = append_tlv(&mut out, STA_REC_MLD_OFF, &[]);
     set_sta_req_tlv_count(&mut out, 2);
     out
+}
+
+/// Parameters for one link's UNI key install/remove
+/// (`mt7925_mcu_sta_key_tlv`, `mt7925/mcu.c:1320-1401`).
+#[derive(Clone, Debug)]
+pub struct UniStaKeyParams<'a> {
+    /// BSS index of this link (`mconf->mt76.idx`).
+    pub bss_idx: u8,
+    /// WCID index of the station record the key belongs to.
+    pub wcid_idx: u16,
+    /// OMAC index of the vif (`muar_idx`).
+    pub omac_idx: u8,
+    /// `true` = SET_KEY (`add = 1`), `false` = DISABLE_KEY (`add = 0`).
+    pub add: bool,
+    /// `true` for a pairwise key (upstream's `sta` branch, which
+    /// also sets `key_type = 1`); `false` for a group/IGTK key (the
+    /// vif-sta branch, `tx_key = key_type = 0`).
+    pub pairwise: bool,
+    /// Peer address: the AP address for a pairwise key, the BSSID
+    /// for a group/IGTK key (the vif-sta branch copies
+    /// `link_conf->bssid`).
+    pub peer_addr: [u8; MAC_ADDR_LEN],
+    /// CONNAC3 cipher id (`CONNAC3_CIPHER_*`). Ignored (zeroed)
+    /// when `add` is false: upstream only consults the cipher on
+    /// the SET_KEY path.
+    pub cipher_id: u8,
+    /// Key index. Ignored (zeroed) when `add` is false, except the
+    /// BIP batch, which carries the GTK index here (see
+    /// `key` below).
+    pub key_id: u8,
+    /// Key bytes: at most 32. Empty when `add` is false. For the
+    /// BIP batch (`cipher_id == CONNAC3_CIPHER_BIP_CMAC_128`) this
+    /// is the 32-byte `key[0] || key[1]` pair — the installed GTK
+    /// (16 bytes) followed by the IGTK (16 bytes) — and `key_id`
+    /// is the GTK index (`mt7925/mcu.c:1372-1377`).
+    pub key: &'a [u8],
+}
+
+/// Encode `sta_rec_sec_uni` (`mt7925/mcu.c:1320-1401`,
+/// `mt7925/mcu.h`): `{ add, tx_key, key_type, is_authenticator = 0,
+/// peer_addr[6], bss_idx, cipher_id, key_id, key_len, wlan_idx,
+/// mgmt_prot = 1, key[32], key_rsc[16] = 0 }`. `mgmt_prot` is 1
+/// unconditionally upstream ("only used in MLO mode").
+/// `is_authenticator` and `key_rsc` are never set by upstream here
+/// and stay 0. `None` when `out` is short, the key is over 32
+/// bytes, or a remove carries key bytes.
+/// TKIP MIC order: upstream swaps the Rx/Tx MIC halves
+/// (`mt7925/mcu.c:1384-1388`); this encoder copies `key` verbatim,
+/// so callers must not pass a TKIP key — the association layer
+/// refuses TKIP key installs (see `connac3_cipher_for_suite`).
+pub fn encode_sta_rec_key_v3_tlv(params: &UniStaKeyParams<'_>, out: &mut [u8]) -> Option<()> {
+    if params.key.len() > STA_REC_KEY_V3_MAX_KEY_LEN || !params.add && !params.key.is_empty() {
+        return None;
+    }
+    let body = out.get_mut(..STA_REC_KEY_V3_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_KEY_V3.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_KEY_V3_TLV_SIZE as u16).to_le_bytes());
+    body[4] = u8::from(params.add);
+    body[5] = u8::from(params.pairwise);
+    body[6] = u8::from(params.pairwise);
+    body[8..14].copy_from_slice(&params.peer_addr);
+    body[14] = params.bss_idx;
+    if params.add {
+        body[15] = params.cipher_id;
+        body[16] = params.key_id;
+        body[17] = params.key.len() as u8;
+        body[20..20 + params.key.len()].copy_from_slice(params.key);
+    }
+    body[18] = (params.wcid_idx & 0xff) as u8;
+    body[19] = 1; // mgmt_prot
+    Some(())
+}
+
+/// Build one link's UNI key body (`mt7925_mcu_add_key`,
+/// `mt7925/mcu.c:1403-1423`): `sta_req_hdr` + a single
+/// `STA_REC_KEY_V3` TLV. A key install/remove is its own
+/// `STA_REC_UPDATE`, unlike the CONNAC2 secure peer record, which
+/// appends `STA_REC_KEY_V2` to the full station record.
+pub fn build_uni_sta_key_req(params: &UniStaKeyParams<'_>) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(STA_REQ_HDR_SIZE + STA_REC_KEY_V3_TLV_SIZE);
+    out.resize(STA_REQ_HDR_SIZE, 0);
+    encode_sta_req_hdr(params.bss_idx, params.wcid_idx, params.omac_idx, &mut out)?;
+    let mut key = [0u8; STA_REC_KEY_V3_TLV_SIZE];
+    encode_sta_rec_key_v3_tlv(params, &mut key)?;
+    out.extend_from_slice(&key);
+    set_sta_req_tlv_count(&mut out, 1);
+    Some(out)
 }
 
 // ── BSS TLV encoders ─────────────────────────────────────────────

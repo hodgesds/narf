@@ -61,6 +61,7 @@ mod mac_power;
 mod mac_power_tests;
 #[cfg(feature = "builtin")]
 pub mod mcu;
+pub(crate) mod mlo;
 mod p2p_cnm;
 mod p2p_wire;
 mod packet_tx;

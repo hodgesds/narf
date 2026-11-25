@@ -273,6 +273,112 @@ pub(crate) fn mcu_data_cipher(suite: u8) -> Option<(u8, usize)> {
     Some((mcu, rsn::data_cipher_key_len(suite)?))
 }
 
+/// The CONNAC3 cipher byte (`mt7925_mcu_get_cipher`,
+/// `mt7925/mcu.c:679-698`) of an 802.11 suite: CCMP-128 →
+/// AES_CCMP (4), CCMP-256 → 10, GCMP-128 → 11, GCMP-256 → 12,
+/// AES-CMAC → BIP_CMAC_128 (6), TKIP → 2, WEP40 → 1, WEP104 → 5.
+/// TKIP maps but is never installed: upstream swaps the MIC halves
+/// (`mt7925/mcu.c:1384-1388`) and the KEY_V3 encoder copies the key
+/// verbatim, so the UNI key fns below refuse it.
+pub(crate) fn connac3_cipher_for_suite(suite: u8) -> Option<u8> {
+    use crate::mt7925::mcu::*;
+    use narf_wireless::rsn;
+    Some(match suite {
+        rsn::CIPHER_WEP40 => CONNAC3_CIPHER_WEP40,
+        rsn::CIPHER_WEP104 => CONNAC3_CIPHER_WEP104,
+        rsn::CIPHER_TKIP => CONNAC3_CIPHER_TKIP,
+        rsn::CIPHER_BIP_CMAC_128 => CONNAC3_CIPHER_BIP_CMAC_128,
+        rsn::CIPHER_CCMP_128 => CONNAC3_CIPHER_AES_CCMP,
+        rsn::CIPHER_CCMP_256 => CONNAC3_CIPHER_CCMP_256,
+        rsn::CIPHER_GCMP_128 => CONNAC3_CIPHER_GCMP,
+        rsn::CIPHER_GCMP_256 => CONNAC3_CIPHER_GCMP_256,
+        _ => return None,
+    })
+}
+
+/// UNI pairwise key install for `link`'s peer without a plan
+/// (MT7925/CONNAC3): one `STA_REC_UPDATE` with a single
+/// `STA_REC_KEY_V3` (the `sta` branch of
+/// `mt7925_mcu_sta_key_tlv`: `tx_key = key_type = 1`, `peer_addr`
+/// = the AP address). Only the installable data ciphers
+/// (CCMP/GCMP) are accepted, and TKIP is refused outright
+/// (upstream swaps the MIC halves, `mt7925/mcu.c:1384-1388`,
+/// which the KEY_V3 encoder does not). The rekey path calls
+/// this directly (it has no `JoinPlan`, so the phase guard of
+/// `JoinPlan::secure_peer_record_uni_on` cannot apply — the
+/// caller is the Associated-state rekey service, which is the
+/// same guarantee).
+pub(crate) fn pairwise_key_record_uni_on(
+    link: Link,
+    key: &[u8],
+    cipher: u8,
+    peer_addr: [u8; 6],
+) -> Result<Vec<u8>, Error> {
+    use narf_wireless::rsn;
+    if !matches!(
+        cipher,
+        rsn::CIPHER_CCMP_128 | rsn::CIPHER_CCMP_256 | rsn::CIPHER_GCMP_128 | rsn::CIPHER_GCMP_256
+    ) || key.len() != rsn::data_cipher_key_len(cipher).ok_or(Error::UnsupportedSecurity)?
+    {
+        return Err(Error::UnsupportedSecurity);
+    }
+    let cipher_id = connac3_cipher_for_suite(cipher).ok_or(Error::UnsupportedSecurity)?;
+    // Infallible after the guards above (the key length is already
+    // validated to 16 or 32 bytes); the build can only fail on a
+    // key the guards refused.
+    crate::mt7925::mcu::build_uni_sta_key_req(&crate::mt7925::mcu::UniStaKeyParams {
+        bss_idx: link.bss(),
+        wcid_idx: u16::from(link.peer()),
+        omac_idx: link.omac(),
+        add: true,
+        pairwise: true,
+        peer_addr,
+        cipher_id,
+        key_id: 0,
+        key,
+    })
+    .ok_or(Error::UnsupportedSecurity)
+}
+
+/// UNI station remove for `link`'s peer without a plan
+/// (MT7925/CONNAC3): the teardown paths have no `JoinPlan`, so
+/// they call this directly. Same bytes as
+/// `JoinPlan::sta_remove_uni_on` — `sta_req_hdr` +
+/// `STA_REC_REMOVE` + bare `STA_REC_MLD_OFF`.
+pub(crate) fn sta_remove_uni_record(link: Link) -> Vec<u8> {
+    crate::mt7925::mcu::build_uni_sta_remove_req(link.bss(), u16::from(link.peer()), link.omac())
+}
+
+/// UNI BSS SEC identity for a join's `Security` (MT7925/CONNAC3):
+/// the vif's `CONNAC3_CIPHER_*` value plus the mode/status pair
+/// `mt7925_mcu_bss_sec_tlv` (`mt7925/mcu.c:2819-2857`) derives from
+/// it — OPEN (0, 1), WPA2-PSK CCMP (7, 6), WPA3-SAE GCMP (11, 8).
+/// The cipher is the plan's selected suite: CCMP for WPA2-PSK,
+/// GCMP for SAE (the same suites the RSNA negotiates; TKIP/WEP
+/// are not offered by the plan).
+pub(crate) fn uni_bss_sec_for(security: Security) -> crate::mt7925::mcu::UniBssSec {
+    use crate::mt7925::mcu::*;
+    match security {
+        Security::Open => UniBssSec {
+            mode: BSS_SEC_MODE_OPEN,
+            status: 1,
+            cipher: CONNAC3_CIPHER_NONE,
+        },
+        Security::Wpa2Psk { .. }
+        | Security::Wpa2PskPmf { .. }
+        | Security::Wpa2PskSelected { .. } => UniBssSec {
+            mode: BSS_SEC_MODE_WPA2_PSK,
+            status: 6,
+            cipher: CONNAC3_CIPHER_AES_CCMP,
+        },
+        Security::Wpa3Sae { .. } => UniBssSec {
+            mode: BSS_SEC_MODE_WPA3_SAE,
+            status: 8,
+            cipher: CONNAC3_CIPHER_GCMP,
+        },
+    }
+}
+
 /// The RXD1 `MT_RXD1_NORMAL_SEC_MODE` value (`enum mt76_cipher_type`) of
 /// a frame hardware decrypted under `suite`.
 pub(crate) fn mac_data_cipher(suite: u8) -> Option<u8> {
@@ -292,6 +398,14 @@ fn tlv(bytes: &mut Vec<u8>, id: u16, len: usize) -> usize {
     bytes[offset..offset + 2].copy_from_slice(&id.to_le_bytes());
     bytes[offset + 2..offset + 4].copy_from_slice(&(len as u16).to_le_bytes());
     offset
+}
+
+/// Eight-byte `STA_REC_HW_AMSDU` (15) TLV: eight subframes, the
+/// large-MPDU flag, enabled — the same bytes `peer_record_on`
+/// appends for every HT station
+/// (`mt76_connac_mcu_sta_amsdu_tlv`).
+fn hw_amsdu_tlv(large_mpdu: bool) -> [u8; 8] {
+    [15, 0, 8, 0, 8, u8::from(large_mpdu), 1, 0]
 }
 #[cfg(any(test, feature = "builtin"))]
 fn ies(
@@ -1060,16 +1174,63 @@ impl JoinPlan {
         Ok(out)
     }
 
+    /// UNI capability TLV stream for [`Self::peer_record_uni_on`]:
+    /// the negotiated HT/VHT/HE/EHT records in upstream order
+    /// (`mt7925_mcu_sta_cmd`, `mt7925/mcu.c:2182-2197`: BASIC, PHY,
+    /// HT, VHT, UAPSD, AMSDU, HE, HE_6G, EHT, rate-ctrl,
+    /// STATE_V2). This fills the HT/VHT/AMSDU/HE/HE_6G/EHT
+    /// members — the same byte builders `peer_record_on` appends,
+    /// minus its WTBL nesting (the UNI update has no WTBL TLVs).
+    /// PHY, UAPSD, rate-ctrl and STATE_V2 have no UNI encoders in
+    /// the tree yet and are not emitted; the builder's plain STATE
+    /// TLV stands in for STATE_V2. Only when `associated`: a
+    /// pre-association add has no negotiation, exactly as
+    /// `peer_record_on` gates its HT arm on `associated`.
+    pub(crate) fn uni_cap_tlvs(&self, associated: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(profile) = self.ht20.filter(|_| associated) {
+            // Top-level STA_REC_HT (9): the peer HT capability.
+            out.extend_from_slice(&[9, 0, 8, 0]);
+            out.extend_from_slice(&profile.peer_capability().to_le_bytes());
+            out.extend_from_slice(&[0, 0]);
+            if let Some(vht) = self.vht {
+                out.extend_from_slice(&vht.sta());
+            }
+            let max_amsdu = self
+                .vht
+                .map_or(profile.max_amsdu_len(), |vht| vht.max_amsdu_len());
+            out.extend_from_slice(&hw_amsdu_tlv(max_amsdu >= 7991));
+            if let Some(he) = self.he {
+                out.extend_from_slice(&he.sta());
+                out.extend_from_slice(&he.sta_v2());
+            }
+            if let Some(eht) = self.eht {
+                out.extend_from_slice(&eht.sta());
+            }
+        } else if let (Some(six), Some(he), true) = (self.common.six_ghz(), self.he, associated) {
+            let peer = six.peer_capability();
+            out.extend_from_slice(&hw_amsdu_tlv(super::six_ghz::large_mpdu(peer)));
+            out.extend_from_slice(&he.sta());
+            out.extend_from_slice(&he.sta_v2());
+            out.extend_from_slice(&super::six_ghz::sta_he_6g(peer));
+            if let Some(eht) = self.eht {
+                out.extend_from_slice(&eht.sta());
+            }
+        }
+        out
+    }
+
     /// UNI station update for `link`'s peer (MT7925/CONNAC3):
     /// `mt7925_mcu_sta_update` → `mt7925_mcu_sta_cmd`
     /// (`MCU_UNI_CMD(STA_REC_UPDATE)`).
     ///
     /// Same guards as [`Self::peer_record_on`]: aid range, phase,
     /// and the associated/aid agreement. The body is
-    /// `sta_req_hdr` + BASIC + `cap_tlvs` (empty until slice 7
-    /// wires the HT/VHT/HE/EHT capability TLVs) + STATE (+ MLD +
-    /// EHT MLD when `mld` is set and the state is not NONE), built
-    /// by `crate::mt7925::mcu::build_uni_sta_update_req`. The
+    /// `sta_req_hdr` + BASIC + `cap_tlvs` (from
+    /// [`Self::uni_cap_tlvs`]: the negotiated HT/VHT/HE/EHT
+    /// capability TLVs) + STATE (+ MLD + EHT MLD when `mld` is
+    /// set and the state is not NONE), built by
+    /// `crate::mt7925::mcu::build_uni_sta_update_req`. The
     /// caller sends one such message per active link, primary
     /// first; the CONNAC2 WTBL nested TLVs of `peer_record_on`
     /// have no UNI-station-update counterpart (WTBL programming on
@@ -1092,6 +1253,7 @@ impl JoinPlan {
         if !associated && aid != 0 {
             return Err(Error::Protocol);
         }
+        let caps = self.uni_cap_tlvs(associated);
         let params = crate::mt7925::mcu::UniStaParams {
             bss_idx: link.bss(),
             wcid_idx: u16::from(link.peer()),
@@ -1107,7 +1269,7 @@ impl JoinPlan {
             } else {
                 crate::mt7925::mcu::STA_STATE_NONE
             },
-            cap_tlvs: &[],
+            cap_tlvs: &caps,
             mld,
         };
         Ok(crate::mt7925::mcu::build_uni_sta_update_req(&params))
@@ -1119,11 +1281,143 @@ impl JoinPlan {
     /// from any phase, including after a failed association.
     pub(crate) fn sta_remove_uni_on(&self, link: Link) -> Vec<u8> {
         let _ = self;
-        crate::mt7925::mcu::build_uni_sta_remove_req(
-            link.bss(),
-            u16::from(link.peer()),
-            link.omac(),
-        )
+        sta_remove_uni_record(link)
+    }
+
+    /// UNI pairwise key install for `link`'s peer (MT7925/CONNAC3):
+    /// its own `STA_REC_UPDATE` carrying a single `STA_REC_KEY_V3`
+    /// (`mt7925_mcu_add_key`, `mt7925/mcu.c:1403-1423`) — NOT the
+    /// CONNAC2 shape, which appends `STA_REC_KEY_V2` to the full
+    /// station record. Same guards as `peer_record_uni_on` with
+    /// `associated = true` (aid range + `Phase::Associated`); the
+    /// key itself is built by `pairwise_key_record_uni_on`.
+    pub(crate) fn secure_peer_record_uni_on(
+        &self,
+        link: Link,
+        aid: u16,
+        key: &[u8],
+        cipher: u8,
+    ) -> Result<Vec<u8>, Error> {
+        if aid > 2007 || aid == 0 {
+            return Err(Error::Protocol);
+        }
+        if self.phase() == Phase::Failed || self.phase() != (Phase::Associated { aid }) {
+            return Err(Error::Busy);
+        }
+        pairwise_key_record_uni_on(link, key, cipher, self.peer)
+    }
+
+    /// UNI group-key install for `link`'s BMC WCID (MT7925/CONNAC3):
+    /// its own `STA_REC_UPDATE` with one `STA_REC_KEY_V3` (the
+    /// vif-sta branch of `mt7925_mcu_sta_key_tlv`:
+    /// `tx_key = key_type = 0`, `peer_addr` = the BSSID).
+    /// `key_id` is the GTK index; same suite gate as the pairwise
+    /// record. Pairwise keys go through
+    /// `secure_peer_record_uni_on`, never here.
+    pub(crate) fn key_record_uni_on(
+        link: Link,
+        wcid: u8,
+        key_id: u8,
+        key: &[u8],
+        cipher: u8,
+        peer_addr: [u8; 6],
+    ) -> Result<Vec<u8>, Error> {
+        use narf_wireless::rsn;
+        if wcid != link.bmc() || key_id > 3 {
+            return Err(Error::UnsupportedSecurity);
+        }
+        if !matches!(
+            cipher,
+            rsn::CIPHER_CCMP_128
+                | rsn::CIPHER_CCMP_256
+                | rsn::CIPHER_GCMP_128
+                | rsn::CIPHER_GCMP_256
+        ) || key.len() != rsn::data_cipher_key_len(cipher).ok_or(Error::UnsupportedSecurity)?
+        {
+            return Err(Error::UnsupportedSecurity);
+        }
+        let cipher_id = connac3_cipher_for_suite(cipher).ok_or(Error::UnsupportedSecurity)?;
+        // Infallible after the guards above (the key length is
+        // already validated to 16 or 32 bytes).
+        crate::mt7925::mcu::build_uni_sta_key_req(&crate::mt7925::mcu::UniStaKeyParams {
+            bss_idx: link.bss(),
+            wcid_idx: u16::from(wcid),
+            omac_idx: link.omac(),
+            add: true,
+            pairwise: false,
+            peer_addr,
+            cipher_id,
+            key_id,
+            key,
+        })
+        .ok_or(Error::UnsupportedSecurity)
+    }
+
+    /// UNI key removal for `link`'s `wcid` (MT7925/CONNAC3):
+    /// `STA_REC_UPDATE` with one `STA_REC_KEY_V3`, `add = 0`
+    /// (`mt7925_mcu_sta_key_tlv` with `cmd != SET_KEY`). No phase
+    /// guard: removal is valid from any phase. `peer_addr` is the
+    /// AP address for the pairwise WCID, the BSSID for the BMC
+    /// WCID — the same value on a station link.
+    pub(crate) fn key_remove_uni_on(link: Link, wcid: u8, peer_addr: [u8; 6]) -> Vec<u8> {
+        // Infallible by construction: empty key, `add = false`.
+        crate::mt7925::mcu::build_uni_sta_key_req(&crate::mt7925::mcu::UniStaKeyParams {
+            bss_idx: link.bss(),
+            wcid_idx: u16::from(wcid),
+            omac_idx: link.omac(),
+            add: false,
+            pairwise: wcid == link.peer(),
+            peer_addr,
+            cipher_id: 0,
+            key_id: 0,
+            key: &[],
+        })
+        .unwrap_or_default()
+    }
+
+    /// UNI IGTK install for `link`'s BMC WCID (MT7925/CONNAC3):
+    /// the BIP batch (`mt7925/mcu.c:1372-1377`) — one
+    /// `STA_REC_KEY_V3` with `cipher_id = BIP_CMAC_128`,
+    /// `key = GTK(16) || IGTK(16)`, `key_id` = the GTK index.
+    /// Only the AES-CMAC IGTK is a hardware key (as for the
+    /// CONNAC2 record). Upstream copies exactly 16 bytes of the
+    /// stored GTK, so the group cipher must be a 16-byte-key
+    /// suite (CCMP-128/GCMP-128); a 256-bit group cipher fails
+    /// closed here rather than installing a truncated GTK.
+    pub(crate) fn igtk_record_uni_on(
+        link: Link,
+        gtk_id: u8,
+        gtk: &[u8],
+        group_cipher: u8,
+        igtk: &[u8],
+        peer_addr: [u8; 6],
+    ) -> Result<Vec<u8>, Error> {
+        use crate::mt7925::mcu::CONNAC3_CIPHER_BIP_CMAC_128;
+        use narf_wireless::rsn;
+        if gtk_id > 3
+            || gtk.len() != 16
+            || igtk.len() != 16
+            || !matches!(group_cipher, rsn::CIPHER_CCMP_128 | rsn::CIPHER_GCMP_128)
+        {
+            return Err(Error::UnsupportedSecurity);
+        }
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(gtk);
+        key[16..].copy_from_slice(igtk);
+        // Infallible after the guards above (the 32-byte batch is
+        // assembled here, never over the encoder's cap).
+        crate::mt7925::mcu::build_uni_sta_key_req(&crate::mt7925::mcu::UniStaKeyParams {
+            bss_idx: link.bss(),
+            wcid_idx: u16::from(link.bmc()),
+            omac_idx: link.omac(),
+            add: true,
+            pairwise: false,
+            peer_addr,
+            cipher_id: CONNAC3_CIPHER_BIP_CMAC_128,
+            key_id: gtk_id,
+            key: &key,
+        })
+        .ok_or(Error::UnsupportedSecurity)
     }
 }
 /// The VIF's BMC WCID (19), used for received group keys. Linux uses the
