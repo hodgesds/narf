@@ -54,6 +54,20 @@ pub struct Sink {
     fec_status_nacks: u8,
     /// Native writes to the DSC/FEC registers, in order.
     pub dsc_log: Vec<(u32, u8)>,
+    /// DP 2.0: `DP_128B132B_SUPPORTED_LINK_RATES` (0 for an 8b/10b sink).
+    pub uhbr_rates: u8,
+    /// `DP_MAIN_LINK_CHANNEL_CODING_SET`.
+    pub coding: u8,
+    /// The TX FFE preset the 128b/132b sink asks for on each lane.
+    pub ffe_request: [u8; 4],
+    /// `DP_PAYLOAD_TABLE_UPDATE_STATUS`.
+    pub payload_status: u8,
+    /// Native writes to the 128b/132b and payload registers, in order.
+    pub uhbr_log: Vec<(u32, u8)>,
+    /// Native reads of the 128b/132b capability registers.
+    pub uhbr_reads: Vec<u32>,
+    /// Further DPCD bytes the sink reports.
+    pub extra: Vec<(u32, u8)>,
 }
 
 impl Sink {
@@ -84,7 +98,43 @@ impl Sink {
             fec_status: 0,
             fec_status_nacks: 0,
             dsc_log: Vec::new(),
+            uhbr_rates: 0,
+            coding: 0,
+            ffe_request: [0; 4],
+            payload_status: 0,
+            uhbr_log: Vec::new(),
+            uhbr_reads: Vec::new(),
+            extra: Vec::new(),
         }
+    }
+    /// A DP 2.0 sink: `DP_CAP_ANSI_128B132B` with `uhbr_rates`.
+    pub fn dp20(max_bw: u8, edid: Vec<u8>, uhbr_rates: u8) -> Self {
+        let mut sink = Self::new(max_bw, edid);
+        sink.caps[6] |= 1 << 1;
+        sink.uhbr_rates = uhbr_rates;
+        sink
+    }
+    fn uhbr(&self) -> bool {
+        self.coding == uhbr::DP_SET_ANSI_128B132B
+    }
+    /// The 128b/132b lane status of lanes `2 * pair` and `2 * pair + 1`:
+    /// CHANNEL_EQ_DONE from TPS2 on, SYMBOL_LOCKED from the CDS phase on.
+    fn uhbr_status(&self, pair: usize) -> u8 {
+        let mut nibble = 0;
+        if self.eq_locked {
+            nibble |= uhbr::DP_LANE_CHANNEL_EQ_DONE;
+        }
+        if self.cr_locked {
+            nibble |= uhbr::DP_LANE_SYMBOL_LOCKED;
+        }
+        let lanes = usize::from(self.lanes_set);
+        let mut byte = 0;
+        for half in 0..2 {
+            if pair * 2 + half < lanes {
+                byte |= nibble << (half * 4);
+            }
+        }
+        byte
     }
     pub fn drop_lock(&mut self) {
         self.cr_locked = false;
@@ -110,8 +160,44 @@ impl Sink {
         nibble | (nibble << 4)
     }
     fn read_byte(&mut self, addr: u32) -> u8 {
+        if self.uhbr() {
+            // 128b/132b: TPS2 equalizes (CHANNEL_EQ_DONE with the interlane
+            // and EQ-interlane alignment), TPS2_CDS locks symbols and aligns
+            // the CDS; disabling the pattern keeps the trained state.
+            match addr {
+                0x202 => return self.uhbr_status(0),
+                0x203 => return self.uhbr_status(1),
+                0x204 => {
+                    return match (self.eq_locked, self.cr_locked) {
+                        (true, true) => {
+                            uhbr::DP_INTERLANE_ALIGN_DONE
+                                | uhbr::DP_128B132B_DPRX_EQ_INTERLANE_ALIGN_DONE
+                                | uhbr::DP_128B132B_DPRX_CDS_INTERLANE_ALIGN_DONE
+                        }
+                        (true, false) => {
+                            uhbr::DP_INTERLANE_ALIGN_DONE
+                                | uhbr::DP_128B132B_DPRX_EQ_INTERLANE_ALIGN_DONE
+                        }
+                        _ => 0,
+                    }
+                }
+                0x205 => return 0,
+                0x206 => return self.ffe_request[0] | (self.ffe_request[1] << 4),
+                0x207 => return self.ffe_request[2] | (self.ffe_request[3] << 4),
+                _ => {}
+            }
+        }
         match addr {
             0x000..=0x00F => self.caps[addr as usize],
+            uhbr::DP_128B132B_SUPPORTED_LINK_RATES => {
+                self.uhbr_reads.push(addr);
+                self.uhbr_rates
+            }
+            0xf_0000..=0xf_0007 => {
+                self.uhbr_reads.push(addr);
+                0
+            }
+            uhbr::DP_PAYLOAD_TABLE_UPDATE_STATUS => self.payload_status,
             0x202 => {
                 self.polls += 1;
                 if self.powered && self.pattern == 1 && self.lanes_ok() {
@@ -129,24 +215,52 @@ impl Sink {
             0x120 => self.fec_config,
             0x160 => self.dsc_enable,
             0x280 => self.fec_status,
-            _ => 0,
+            _ => self
+                .extra
+                .iter()
+                .find(|(a, _)| *a == addr)
+                .map_or(0, |(_, v)| *v),
         }
     }
     fn write_byte(&mut self, addr: u32, value: u8) {
         match addr {
-            0x100 => {
-                self.drop_lock();
-                self.polls = 0;
-            }
             0x101 => {
                 self.training_writes.push((addr, value));
                 self.lanes_set = value & 0x1F;
                 self.drop_lock();
             }
+            0x102 if self.uhbr() => {
+                self.training_writes.push((addr, value));
+                self.uhbr_log.push((addr, value));
+                match value {
+                    1 => self.drop_lock(),
+                    2 => self.eq_locked = self.powered,
+                    3 => self.cr_locked = self.eq_locked,
+                    _ => {}
+                }
+                self.pattern = value & 0x7;
+            }
             0x102 => {
                 self.training_writes.push((addr, value));
                 self.pattern = value & 0x7;
                 self.polls = 0;
+            }
+            0x100 | 0x107 | 0x108 | 0x121 | 0x1c0..=0x1c2 => {
+                self.uhbr_log.push((addr, value));
+                match addr {
+                    0x100 => {
+                        self.drop_lock();
+                        self.polls = 0;
+                    }
+                    0x108 => self.coding = value,
+                    // DP_PAYLOAD_ALLOCATE_SET's last byte updates the table.
+                    0x1c2 => self.payload_status |= uhbr::DP_PAYLOAD_TABLE_UPDATED,
+                    _ => {}
+                }
+            }
+            uhbr::DP_PAYLOAD_TABLE_UPDATE_STATUS => {
+                self.uhbr_log.push((addr, value));
+                self.payload_status &= !value;
             }
             0x120 | 0x160 | 0x280 => {
                 self.dsc_log.push((addr, value));
@@ -508,12 +622,16 @@ impl ExtFake {
         if wire[0] >> 4 == 8 && address == 0x102 {
             // BSpec DP_TP_CTL patterns must reach the source before the
             // corresponding DPCD write. A sink-only trainer cannot lock.
-            let expected = match wire[4] & 7 {
-                0 => 3,
-                1 => 0,
-                2 => 1,
-                3 => 4,
-                7 => 5,
+            // On 128b/132b the source keeps TPS2 through the CDS phase and
+            // the pattern disable (intel_dp_128b132b_link_train).
+            let expected = match (self.sink.borrow().uhbr(), wire[4] & 7) {
+                (true, 1) => 0,
+                (true, 0 | 2 | 3) => 1,
+                (_, 0) => 3,
+                (_, 1) => 0,
+                (_, 2) => 1,
+                (_, 3) => 4,
+                (_, 7) => 5,
                 _ => 7,
             };
             let correct = (0..4).any(|pipe| {
@@ -710,6 +828,10 @@ impl MmioWindow for ExtFake {
             let status = 0x60544 + u64::from(master) * 0x1000;
             self.phy
                 .write32(status, self.phy.read32(status) | (1 << 24));
+            let mut sink = self.sink.borrow_mut();
+            if sink.uhbr() {
+                sink.payload_status |= uhbr::DP_PAYLOAD_ACT_HANDLED;
+            }
         }
         if is_gmbus(off) {
             self.ddc.write32(off, value);
@@ -3484,7 +3606,7 @@ fn smoke_xe3_external_dsc_confirms_fec_before_pps() -> TestResult {
         };
         let probe =
             match probe_link_profile(&io, ExternalDisplayProfile::for_ip(ip), io.port, false)
-                .and_then(|link| probe_sink_link(&io, link))
+                .and_then(|link| probe_sink_link(&io, link, false))
             {
                 Ok(probe) if probe.dsc.is_some_and(|plan| plan.fec) => probe,
                 _ => return TestResult::Fail("the USB-C sink must need DSC and FEC"),
@@ -4098,6 +4220,372 @@ kernel_test_in!(
     smoke_mtl_panel_profile_proves_its_share_beside_external
 );
 
+// ── narf.intel.uhbr: DP 2.0 UHBR (128b/132b) routes ────────────────
+
+/// 3840x2160 with the CTA 4K timing (htotal 4400, vtotal 2250) at `pclk`.
+fn edid_uhd(pclk_khz: u32) -> Vec<u8> {
+    edid_for(pclk_khz, 3840, 560, 176, 88, 2160, 90, 8, 10)
+}
+
+/// A DP 2.0 4K60 monitor behind TC2 in pin assignment D (two lanes) whose
+/// 8b/10b ceiling is HBR2: two HBR2 lanes carry 1080000 kBps, the mode needs
+/// 1782000 at 24 bpp and 1336500 at 18 (`intel_dp_link_required`), so only
+/// UHBR10 x2 (2417750) carries it. The sink asks for TX FFE presets 4 / 9.
+fn uhbr_tc() -> ExtFake {
+    let mut sink = Sink::dp20(0x14, edid_uhd(594_000), uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+    sink.ffe_request = [4, 9, 0, 0];
+    let io = ExtFake::new(XeLpgPort::Tc2, sink);
+    io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+    io
+}
+
+/// Without `narf.intel.uhbr=1` the route stays 8b/10b exactly as before: a
+/// DP 2.0 sink whose stream only UHBR carries is refused over budget, and
+/// no 128b/132b register (`DP_128B132B_SUPPORTED_LINK_RATES`, the LTTPR
+/// caps, `DP_MAIN_LINK_CHANNEL_CODING_SET`, the payload table) is touched;
+/// the Type-C ownership is rolled back.
+fn smoke_mtl_external_uhbr_option_off_refuses_over_budget() -> TestResult {
+    let io = uhbr_tc();
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    match probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, false) {
+        Err(ExternalError::OverBudget { .. }) => {}
+        _ => return TestResult::Fail("without narf.intel.uhbr the 8b/10b route must refuse"),
+    }
+    let sink = io.sink.borrow();
+    if !sink.uhbr_reads.is_empty() || !sink.uhbr_log.is_empty() || sink.coding != 0 {
+        return TestResult::Fail("the option off must not touch a 128b/132b register");
+    }
+    drop(sink);
+    if io.read32(XeLpgPort::Tc2.buf_ctl1()) & TC_PHY_OWNERSHIP != 0 {
+        return TestResult::Fail("the refused probe must release the Type-C PHY");
+    }
+    // The production entry reads the strict boot option, which this boot
+    // does not carry.
+    if uhbr::opted_in() {
+        return TestResult::Fail("narf.intel.uhbr must default off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_option_off_refuses_over_budget
+);
+
+/// `narf.intel.uhbr=1` on Meteor Lake TC2: `intel_dp_compute_link_config_wide`
+/// picks UHBR10 x2 at 24 bpp; `mtl_ddi_pre_enable_dp` and `intel_ddi_enable`
+/// then run the 128b/132b route: the C20 MPLLA UHBR10 image with
+/// `DDI_CLK_VALFREQ` = 312500 (the 32-bit symbol clock), `TRANS_DP2_CTL`
+/// 128b/132b, `TRANS_DDI_FUNC_CTL` in 128b/132b mode with the route's own
+/// MST transport, `DP_TP_CTL` in MST mode (no enhanced framing) through
+/// TPS1, TPS2 and NORMAL, the 40-bit `PORT_BUF_CTL1` and `DDI_CTL_DE`, the
+/// sink's channel coding before its rate, the TX FFE presets it asked for
+/// (`mtl_c20_trans_uhbr` 4 and 9, the last lane's for lanes past the count),
+/// the VC payload (VCPID 1, slot 0, 48 slots) and its ACT, the MTP M/N
+/// (`TU_SIZE(48)`) and the `TRANS_DP2_VFREQ` pair. The stop clears the
+/// payload, then the function (port and mode after the sink's D3), hands the
+/// sink back to 8b/10b and clears `TRANS_DP2_CTL`.
+fn smoke_mtl_external_uhbr_tc_route_lights_and_stops() -> TestResult {
+    use crate::intel_gpu_pipes::{
+        PIPE_DATA_M1_OFFSET, PIPE_DATA_N1_OFFSET, PIPE_LINK_M1_OFFSET, PIPE_LINK_N1_OFFSET,
+    };
+    let io = uhbr_tc();
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let probe = match probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) {
+        Ok(probe) => probe,
+        Err(_) => return TestResult::Fail("the DP 2.0 sink must probe with UHBR on"),
+    };
+    let Some(plan) = probe.uhbr else {
+        return TestResult::Fail("only UHBR carries 4K60 on two HBR2 lanes");
+    };
+    let mn = [(47 << 25) | 0x5e_579e, 0x80_0000, 0xf_34d6, 0x8_0000];
+    if plan.link
+        != (uhbr::UhbrLink {
+            rate: uhbr::UhbrRate::Uhbr10,
+            lanes: 2,
+            pipe_bpp: 24,
+        })
+        || plan.stream.tu != 48
+        || plan.stream.m_n != mn
+        || plan.post_lt_adj_req
+        || probe.pipe_bpp != 24
+        || probe.negotiated.lanes != 2
+        || probe.dsc.is_some()
+    {
+        return TestResult::Fail("the probe must carry Linux's UHBR10 x2 link and MTP");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live && route.pipe() == Pipe::B => route,
+        _ => return TestResult::Fail("the 128b/132b route must light Pipe B"),
+    };
+    // Source PHY: C20 MPLLA, width 2, no SSC (no sink downspread).
+    if io.phy.writes_to(0x6_4430) != [312_500]
+        || io.phy.sram_get(0xCCE5) != 0x3104
+        || io.phy.sram_get(0xCCE5 - 9) != 0x0001
+        || io.phy.vdr_get(0, crate::intel_gpu_xelpg::C20_VDR_CUSTOM_WIDTH) & 3 != 2
+        || io.read32(XeLpgPort::Tc2.port_clock_ctl())
+            & (crate::intel_gpu_xelpg::SSC_ENABLE_PLLA | crate::intel_gpu_xelpg::SSC_ENABLE_PLLB)
+            != 0
+    {
+        return TestResult::Fail("UHBR10 must run the C20 MPLLA image at the symbol clock");
+    }
+    // TX FFE presets 4 (33, 0, 15) and 9 (33, 2, 13) on PHY lane 0.
+    let vdr = |a: u16| io.phy.vdr_get(0, a);
+    if [vdr(0xD80), vdr(0xD81), vdr(0xD82)] != [0, 33, 15]
+        || [vdr(0xD90), vdr(0xD91), vdr(0xD92)] != [2, 33, 13]
+        || route.uhbr.map(|u| u.presets) != Some([4, 9, 9, 9])
+    {
+        return TestResult::Fail("the trained TX FFE presets must reach the C20");
+    }
+    let want = (crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
+        4,
+        crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
+        2,
+    ) & !(7 << 24))
+        | (4 << 24)
+        | (1 << 10);
+    let func = io.writes_to(TRANS_DDI_FUNC_CTL_B);
+    if func != [want & !TRANS_DDI_FUNC_ENABLE, want, want | (1 << 8)] {
+        return TestResult::Fail("TRANS_DDI_FUNC_CTL: 128b/132b, enabled, then VC payload");
+    }
+    if io.writes_to(0x6_10a0) != [1 << 31]
+        || io.writes_to(0x6_10a4) != [0x2300]
+        || io.writes_to(0x6_10a8) != [0x67b8_8000]
+    {
+        return TestResult::Fail("TRANS_DP2_CTL and the VFREQ pair (594 MHz) differ");
+    }
+    let tp = io.writes_to(DP_TP_CTL_B);
+    if tp.first() != Some(&(DP_TP_CTL_ENABLE | (1 << 27)))
+        || !tp.contains(&(DP_TP_CTL_ENABLE | (1 << 27) | (1 << 8)))
+        || tp.last() != Some(&(DP_TP_CTL_ENABLE | (1 << 27) | DP_TP_CTL_LINK_TRAIN_NORMAL))
+    {
+        return TestResult::Fail("DP_TP_CTL: MST mode through TPS1, TPS2, NORMAL");
+    }
+    if io.read32(XeLpgPort::Tc2.buf_ctl1()) & (3 << 18) != 2 << 18
+        || io.read32(0x6_4400) != DDI_BUF_CTL_ENABLE | (1 << 1) | (2 << 18)
+    {
+        return TestResult::Fail("PORT_BUF_CTL1 and DDI_CTL_DE must carry the 40-bit width");
+    }
+    let base = Transcoder::B.base();
+    let got = [
+        io.read32(base + PIPE_DATA_M1_OFFSET),
+        io.read32(base + PIPE_DATA_N1_OFFSET),
+        io.read32(base + PIPE_LINK_M1_OFFSET),
+        io.read32(base + PIPE_LINK_N1_OFFSET),
+    ];
+    if got != mn {
+        return TestResult::Fail("the MTP M/N must be programmed with TU_SIZE(48)");
+    }
+    {
+        let sink = io.sink.borrow();
+        let log = &sink.uhbr_log;
+        let at = |w: (u32, u8)| log.iter().position(|&e| e == w);
+        let (Some(crc), Some(coding), Some(bw)) = (
+            at((uhbr::DP_SDP_ERROR_DETECTION_CONFIGURATION, 1)),
+            at((uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET, uhbr::DP_SET_ANSI_128B132B)),
+            at((0x100, 0x01)),
+        ) else {
+            return TestResult::Fail("SDP CRC16, 128b/132b coding and DP_LINK_BW_10 must be set");
+        };
+        let patterns: Vec<u8> = sink.training_writes_to(0x102);
+        if !(crc < coding && coding < bw)
+            || sink.training_writes_to(0x101) != [2]
+            || patterns != [1, 2, 3, 0]
+            || !log.ends_with(&[(0x1c0, 1), (0x1c1, 0), (0x1c2, 48)])
+            || sink.payload_status & uhbr::DP_PAYLOAD_ACT_HANDLED == 0
+        {
+            return TestResult::Fail("the sink's 128b/132b DPCD sequence differs from Linux");
+        }
+    }
+    if route.link_ok(&io) != Ok(true) {
+        return TestResult::Fail("the trained 128b/132b link must revalidate");
+    }
+    if route.stop(&io).is_err() || route.state() != RouteState::Stopped {
+        return TestResult::Fail("the 128b/132b route must stop");
+    }
+    let func = io.writes_to(TRANS_DDI_FUNC_CTL_B);
+    if func[3..]
+        != [
+            want,
+            want & !TRANS_DDI_FUNC_ENABLE,
+            want & !(TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE),
+        ]
+    {
+        return TestResult::Fail("stop: VC payload, then ENABLE, then port and mode");
+    }
+    {
+        let sink = io.sink.borrow();
+        let log = &sink.uhbr_log;
+        let clear = log
+            .windows(3)
+            .position(|w| w == [(0x1c0, 1), (0x1c1, 0), (0x1c2, 0)]);
+        let back = log
+            .iter()
+            .rposition(|&e| e == (uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET, uhbr::DP_SET_ANSI_8B10B));
+        if clear.is_none() || back.is_none() || clear > back || sink.power_log.last() != Some(&2) {
+            return TestResult::Fail("stop: payload clear, 8b/10b coding back, then D3");
+        }
+    }
+    if io.writes_to(0x6_10a0).last() != Some(&0)
+        || io.read32(XeLpgPort::Tc2.port_clock_ctl()) & crate::intel_gpu_xelpg::lane_pclk_pll_request(0)
+            != 0
+    {
+        return TestResult::Fail("stop: TRANS_DP2_CTL off and the PLL released");
+    }
+    if route.release(&io).is_err() {
+        return TestResult::Fail("the stopped route must release");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_tc_route_lights_and_stops
+);
+
+/// A sparse DPCD image for [`plan_uhbr`].
+struct Dpcd(Vec<(u32, u8)>);
+
+impl crate::dp_aux::AuxChannel for Dpcd {
+    fn transact<'a>(
+        &mut self,
+        req: &crate::dp_aux::AuxRequest<'_>,
+        reply: &'a mut [u8],
+    ) -> Result<crate::dp_aux::AuxResponse<'a>, crate::dp_aux::AuxError> {
+        use crate::dp_aux::{AuxCommand, AuxResponse, AuxStatus};
+        reply[0] = 0;
+        let n = match req.cmd {
+            AuxCommand::NativeRead => req.data.len(),
+            _ => 0,
+        };
+        for i in 0..n {
+            let a = req.address + i as u32;
+            reply[1 + i] = self.0.iter().find(|(x, _)| *x == a).map_or(0, |(_, v)| *v);
+        }
+        Ok(AuxResponse {
+            status: AuxStatus::Ack,
+            data: &reply[1..1 + n],
+        })
+    }
+}
+
+/// The typed refusals of `plan_uhbr` (nothing programmed): a stream only
+/// DSC could carry with UHBR in the common rates (Linux's DSC search would
+/// consider them), UHBR over Thunderbolt alt mode, UHBR through an LTTPR;
+/// and what keeps the 8b/10b negotiation: no common UHBR rate, a C10 PHY or
+/// Wildcat Lake as the source, a DSC-less sink nothing fits.
+fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
+    let mut raw = [0u8; 16];
+    raw[0] = 0x14;
+    raw[1] = 0x14;
+    raw[2] = 2 | 0x40 | 0x80;
+    raw[6] = 1 << 1;
+    let link = |display_ip, mode| LinkProbe {
+        display_ip,
+        port: XeLpgPort::Tc2,
+        tc: Some(TcConnection {
+            port: XeLpgPort::Tc2,
+            tc: 1,
+            mode,
+            legacy_port: false,
+            pin_assignment: crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D,
+            max_lanes: 2,
+            profile: TcDisplayProfile::XeLpdp,
+        }),
+        raw,
+    };
+    let rates = |r: u8| Dpcd(alloc::vec![(uhbr::DP_128B132B_SUPPORTED_LINK_RATES, r)]);
+    let limits = dsc::LinkLimits::standard(540_000, 2);
+    let uhd60 = crate::intel_gpu_dp::mode_from_edid(&edid_uhd(594_000)).unwrap();
+    let uhd120 = Mode {
+        pixel_clock_khz: 1_188_000,
+        ..uhd60
+    };
+    let dp_alt = link(DisplayIp::Xelpdp, TcMode::DpAlt);
+    let refusal = |r| Err::<Option<UhbrPlan>, _>(ExternalError::Uhbr(r));
+    // 4K120 fits neither HBR2 x2 nor UHBR10 x2 at 18 bpp: DSC territory.
+    if plan_uhbr(&mut rates(uhbr::DP_UHBR10), &dp_alt, false, &limits, &uhd120, 24, true)
+        != refusal(uhbr::UhbrRefusal::Dsc)
+        || plan_uhbr(&mut rates(uhbr::DP_UHBR10), &dp_alt, false, &limits, &uhd120, 24, false)
+            != Ok(None)
+    {
+        return TestResult::Fail("DSC over a UHBR common rate must refuse typed");
+    }
+    let tbt = link(DisplayIp::Xelpdp, TcMode::TbtAlt);
+    if plan_uhbr(&mut rates(uhbr::DP_UHBR10), &tbt, false, &limits, &uhd60, 24, false)
+        != refusal(uhbr::UhbrRefusal::Tbt)
+    {
+        return TestResult::Fail("UHBR over Thunderbolt alt mode must refuse typed");
+    }
+    let mut lttpr = rates(uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+    for (i, b) in [0x20u8, 0x1e, 0x80, 0x55, 4, 0, 1, uhbr::DP_UHBR10]
+        .into_iter()
+        .enumerate()
+    {
+        lttpr.0.push((uhbr::DP_LTTPR_COMMON_CAPS + i as u32, b));
+    }
+    if plan_uhbr(&mut lttpr, &dp_alt, false, &limits, &uhd60, 24, false)
+        != refusal(uhbr::UhbrRefusal::Lttpr)
+    {
+        return TestResult::Fail("UHBR through an LTTPR must refuse typed");
+    }
+    // What leaves the 8b/10b route alone.
+    let wcl = link(DisplayIp::WildcatLake, TcMode::DpAlt);
+    if plan_uhbr(&mut rates(uhbr::DP_UHBR13_5), &dp_alt, false, &limits, &uhd60, 24, false)
+        != Ok(None)
+        || plan_uhbr(&mut rates(uhbr::DP_UHBR10), &dp_alt, true, &limits, &uhd60, 24, false)
+            != Ok(None)
+        || plan_uhbr(&mut rates(uhbr::DP_UHBR10), &wcl, false, &limits, &uhd60, 24, false)
+            != Ok(None)
+    {
+        return TestResult::Fail("no common UHBR rate, a C10 or WCL source keeps 8b/10b");
+    }
+    match plan_uhbr(&mut rates(uhbr::DP_UHBR20), &dp_alt, false, &limits, &uhd60, 24, false) {
+        Ok(Some(plan)) if plan.link.rate == uhbr::UhbrRate::Uhbr20 && plan.link.lanes == 1 => {}
+        _ => return TestResult::Fail("a UHBR20-only sink takes UHBR20 x1"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_typed_refusals
+);
+
+/// A UHBR-capable MST hub under `narf.intel.uhbr=1` is refused typed at
+/// connect, before any sideband traffic (Linux would run 128b/132b MST at
+/// its highest common bandwidth), and leaves nothing owned.
+fn smoke_mtl_external_uhbr_mst_hub_refused() -> TestResult {
+    let mut sink = Sink::dp20(0x1e, edid_1024(), uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+    // DP_MSTM_CAP.
+    sink.extra.push((0x21, 1));
+    let io = ExtFake::new(XeLpgPort::Tc2, sink);
+    let event = MtlHpdEvent {
+        pin: MtlHpdPin::Tc2,
+        kind: MtlHpdKind::Connected(LiveMode::DpAlt),
+    };
+    let mut service = MtlExternalService::new();
+    service.set_generation(Generation::MeteorLake);
+    service.set_uhbr(true);
+    match service.handle(&io, event, &mut fb_for) {
+        ServiceOutcome::Refused {
+            error: RouteError::Dp(ExternalError::Uhbr(uhbr::UhbrRefusal::Mst)),
+            ..
+        } => {}
+        _ => return TestResult::Fail("a UHBR MST hub must refuse typed with UHBR on"),
+    }
+    if service.route().is_some()
+        || io.read32(XeLpgPort::Tc2.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
+        || !io.sink.borrow().uhbr_log.is_empty()
+        || io.sink.borrow().uhbr_reads.first() != Some(&uhbr::DP_128B132B_SUPPORTED_LINK_RATES)
+    {
+        return TestResult::Fail("the refused hub must leave nothing owned or written");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_mst_hub_refused
+);
+
 // ── Nova Lake-S display 35: the routes through the LT PHY ───────────
 
 #[cfg(feature = "kernel-test")]
@@ -4314,6 +4802,80 @@ mod nova {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xelpg_external",
         smoke_nvl_external_dp_on_lt_port_b
+    );
+
+    /// `narf.intel.uhbr=1` on Nova Lake-S LT port B: a DP 2.0 4K30 monitor
+    /// whose 8b/10b ceiling is RBR (four RBR lanes carry 648000 kBps, the
+    /// mode needs 891000 at 24 bpp and 668250 at 18) takes UHBR10 x1 at 24
+    /// bpp (1208875 kBps, `tu` 48). The route enables the LT PHY at the
+    /// `xe3plpd_lt_dp_uhbr10` image with `DDI_CLK_VALFREQ` = 312500, the
+    /// requested `xe3plpd_lt_trans_uhbr` preset 15, `TRANS_DP2_CTL`, the
+    /// 128b/132b function and the 40-bit `DDI_CTL_DE` beside its display-20+
+    /// D2D enable, never a Cx0 or display-14 PHY register; the stop releases
+    /// MacCLK and clears `TRANS_DP2_CTL`.
+    fn smoke_nvl_external_uhbr_on_lt_port_b() -> TestResult {
+        use crate::intel_gpu_lt_phy::{dp_pll_state, LtDpRate, UHBR_LEVELS};
+        let port = XeLpgPort::B;
+        let mut sink = Sink::dp20(0x06, edid_uhd(297_000), uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+        sink.ffe_request = [15, 0, 0, 0];
+        let io = NovaExt::new(ExtFake::new(port, sink));
+        let Some(panel) = io.ext.light_panel_ip(DisplayIp::NovaLakeS) else {
+            return TestResult::Fail("the fixture must light the display-35 panel");
+        };
+        let view = crate::intel_gpu_xe3plpd::View(&io);
+        let profile = ExternalDisplayProfile::for_ip(DisplayIp::NovaLakeS);
+        let probe = match probe_sink_profile_uhbr(&view, profile, port, false, true) {
+            Ok(probe) => probe,
+            Err(_) => return TestResult::Fail("the Nova DP 2.0 sink must probe with UHBR on"),
+        };
+        if probe.uhbr.map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp, p.stream.tu))
+            != Some((uhbr::UhbrRate::Uhbr10, 1, 24, 48))
+        {
+            return TestResult::Fail("4K30 over an RBR ceiling must take UHBR10 x1");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        let mut route = match activate(&view, probe, fb, &display) {
+            Ok(route) if route.state() == RouteState::Live && route.pipe == Pipe::B => route,
+            _ => return TestResult::Fail("the Nova 128b/132b route must light Pipe B"),
+        };
+        if io.read32(port.clk_valfreq().unwrap()) != 312_500 {
+            return TestResult::Fail("DDI_CLK_VALFREQ must be the UHBR10 symbol clock");
+        }
+        if let Err(e) = nova_lt_lit(&io, dp_pll_state(LtDpRate::Uhbr10), &[UHBR_LEVELS[15]]) {
+            return TestResult::Fail(e);
+        }
+        if io.lt.read32(0x16_fc60)
+            & (crate::intel_gpu_xelpg::SSC_ENABLE_PLLA | crate::intel_gpu_xelpg::SSC_ENABLE_PLLB)
+            != 0
+        {
+            return TestResult::Fail("no sink downspread: no LT SSC");
+        }
+        if io.ext.writes_to(0x6_10a0).first() != Some(&(1 << 31))
+            || io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 24) != 4 << 24
+            || io.read32(port.ddi_buf_ctl())
+                & (DDI_BUF_CTL_ENABLE | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE | (3 << 18))
+                != DDI_BUF_CTL_ENABLE | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE | (2 << 18)
+        {
+            return TestResult::Fail("TRANS_DP2_CTL, the 128b/132b mode and the 40-bit DDI");
+        }
+        if route.stop(&view).is_err() || route.state() != RouteState::Stopped {
+            return TestResult::Fail("the Nova 128b/132b route must stop");
+        }
+        if io.lt.read32(0x16_fc60) & (3 << 30) != 0
+            || io.ext.writes_to(0x6_10a0).last() != Some(&0)
+            || !io.strays.borrow().is_empty()
+        {
+            return TestResult::Fail("the stop must release MacCLK and TRANS_DP2_CTL");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_external",
+        smoke_nvl_external_uhbr_on_lt_port_b
     );
 
     /// Nova Lake-S USB-C DP-alt on LT TC1: the Type-C connect under the exact

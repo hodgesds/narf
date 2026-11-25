@@ -34,9 +34,6 @@
 //! in non-transparent mode), and the reduced-parameter retry after a failed
 //! 128b/132b training.
 
-// The route integration lands next; until then only the fixtures use it.
-#![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
-
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_modeset::Mode;
 use crate::intel_gpu_xe2lpd::DisplayIp;
