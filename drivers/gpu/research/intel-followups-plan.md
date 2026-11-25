@@ -63,11 +63,13 @@ work had.
 - Older display: the Rocket Lake internal panel, a DG1 KMS owner, Gen9
   DPLL arbitration between two external outputs, and the Gen9 interrupt
   handler (`intel_gpu_gen9_irq` has no caller).
-- PXP: protected-plane decryption is refused, and the RUN_ALONE LRC bit and
-  the runtime wiring have no native model.
-- HDCP: DP MST stream encryption, `CP_IRQ` delivery (RxStatus is polled),
-  the KMS-owner cards' property path, the Gen9/Gen11 port-indexed HDCP
-  registers and the debugfs files.
+- PXP: protected planes decrypt or go black on linear XR24 only (tiled and
+  XR30 protected framebuffers are refused), the RUN_ALONE LRC bit and the
+  runtime wiring have no native model, and there is no silicon run.
+- HDCP: the Gen9/Gen11 port-indexed HDCP registers, the debugfs files,
+  HDCP on 128b/132b links, and a silicon run (the NUC12's GOP-lit route is
+  the first target). The firmware-lit Gen12 route has no hotplug owner, so
+  its HDCP 2.2 waits still poll RxStatus every 10 ms.
 - VRAM PRIME beyond static attachments: dynamic importers with move
   notification (`xe_dma_buf_move_notify`), system suspend with a pinned VRAM
   export, CPU mmap and scanout of a foreign import, AMD exporters and
