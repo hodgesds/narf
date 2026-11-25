@@ -661,6 +661,37 @@ fn smoke_display20_tc_pica_pin_and_display30_mailbox() -> TestResult {
     {
         return TestResult::Fail("Nova profile must refuse a non-LT MMIO view before writes");
     }
+
+    // TBT-alt on display >= 20 (`xelpdp_tc_phy_connect`): no TCSS request
+    // and no PHY ownership, but PICA_TC, which carries AUX_TBT1-4 and the
+    // TC DDI lanes (`xe2lpd_pwdoms_pica_tc`), for the tunnel's lifetime.
+    for profile in [TcDisplayProfile::Xe2Lpd, TcDisplayProfile::NovaLakeS] {
+        let io = Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_C);
+        let nova = NovaTc(Display20Tc::new(XeLpgPort::Tc1, PIN_ASSIGNMENT_C));
+        let tbt: (&dyn MmioWindow, &Display20Tc) = if profile == TcDisplayProfile::NovaLakeS {
+            (&nova, &nova.0)
+        } else {
+            (&io, &io)
+        };
+        tbt.1.inner.pica_isr.set(pica_tbt_hotplug(0));
+        let conn = match connect_for(tbt.0, XeLpgPort::Tc1, false, 4, profile) {
+            Ok(conn) if conn.mode == TcMode::TbtAlt => conn,
+            _ => return TestResult::Fail("display 20+ TBT-alt must connect through the fabric"),
+        };
+        if conn.max_lanes != 4
+            || conn.pin_assignment != PIN_ASSIGNMENT_NONE
+            || tbt.1.pica_req.get() & PICA_POWER_REQUEST == 0
+            || !tbt.1.inner.buf_writes().is_empty()
+        {
+            return TestResult::Fail("display 20+ TBT-alt must power PICA without the PHY");
+        }
+        if disconnect(tbt.0, &conn).is_err()
+            || tbt.1.pica_req.get() & PICA_POWER_REQUEST != 0
+            || !tbt.1.inner.buf_writes().is_empty()
+        {
+            return TestResult::Fail("the TBT-alt disconnect must drop PICA_PW_CTL alone");
+        }
+    }
     TestResult::Pass
 }
 kernel_test_in!(

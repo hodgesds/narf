@@ -782,12 +782,14 @@ impl ResidentBatch {
                 } else {
                     space.objects.push((object.clone(), mapping.writable));
                 }
+                let mut mapped = 0u64;
                 for (i, phys) in object
                     .pages()
                     .skip((mapping.offset / PAGE) as usize)
                     .take((mapping.length / PAGE) as usize)
                     .enumerate()
                 {
+                    mapped += 1;
                     let tables = space.tables.as_mut().expect("owned tables");
                     let va = mapping.va + i as u64 * PAGE;
                     if object.is_vram() && object.vram_page_size() == 65536 {
@@ -819,6 +821,12 @@ impl ResidentBatch {
                         )
                     }
                     .map_err(map_error)?;
+                }
+                // A foreign import whose exporter moved since its pages were
+                // installed has none: never submit tables with holes. The
+                // exec maps it again and retries (`intel_gpu_prime`).
+                if object.is_imported() && mapped != mapping.length / PAGE {
+                    return Err(FsError::WouldBlock);
                 }
             } else if !scratch {
                 for page in 0..mapping.length / PAGE {

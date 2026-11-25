@@ -1155,6 +1155,11 @@ pub struct Card {
     /// Discrete Arc display (`DG2` / `BMG`) admitting local VRAM scanout BOs.
     #[cfg(feature = "intel")]
     pub(crate) intel_vram_scanout: bool,
+    /// PXP is up on this MTL/Arrow card (`narf.intel.pxp=1`) and its planes
+    /// decrypt protected framebuffers (or show them black once their key is
+    /// stale): protected objects may become framebuffers.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_pxp_planes: bool,
     #[cfg(feature = "intel")]
     intel_blob_pins: Vec<(u32, usize)>,
     /// A released master still owns hardware until serialized restoration.
@@ -1501,6 +1506,8 @@ impl Card {
             intel_xr30: false,
             #[cfg(feature = "intel")]
             intel_vram_scanout: false,
+            #[cfg(feature = "intel")]
+            intel_pxp_planes: false,
             #[cfg(feature = "intel")]
             intel_display: false,
             #[cfg(feature = "intel")]
@@ -2861,13 +2868,18 @@ impl Card {
         }
         // On integrated GPUs VRAM pages have no display-DMA backing here;
         // discrete Arc display (`intel_vram_scanout`) scans directly from VRAM.
-        // A foreign dma-buf import (another card's memory or BAR) is not
-        // scanned out here.
-        if (object.is_vram() && !self.intel_vram_scanout) || object.is_imported() {
+        // A foreign dma-buf import (another card's memory or BAR) is scanned
+        // out only by an integrated display: a discrete one pins to VRAM0
+        // (`__xe_pin_fb_vma` -> `xe_bo_migrate`), which an sg BO cannot.
+        if (object.is_vram() && !self.intel_vram_scanout)
+            || (object.is_imported() && self.intel_vram_scanout)
+        {
             return Err(CardError::InvalidDimensions);
         }
         if xe && !xr30 && !object.scanout() {
-            if object.vm_bound() {
+            // xe_display_bo_framebuffer_init sets FORCE_WC only on a BO it
+            // owns: an sg import keeps its caching, so binding is no bar.
+            if object.vm_bound() && !object.is_imported() {
                 return Err(CardError::InvalidDimensions);
             }
             object.mark_scanout();
@@ -2910,10 +2922,11 @@ impl Card {
             return Err(CardError::InvalidDimensions);
         }
         // A PXP-protected object (xe_bo_is_protected; only with
-        // narf.intel.pxp=1): NARF programs no plane decryption, so it never
-        // becomes a framebuffer. Linux decrypts it, or shows black once its
-        // key is stale.
-        if object.pxp_key() != 0 {
+        // narf.intel.pxp=1) becomes a framebuffer only where PXP published
+        // plane decryption for this card: its planes decrypt it, or scan it
+        // out black once its key is stale (check_protection). Tiled
+        // protected surfaces take the DSB arm, which carries neither.
+        if object.pxp_key() != 0 && (!self.intel_pxp_planes || tiled || xr30) {
             return Err(CardError::InvalidDimensions);
         }
         if self.framebuffers.len() >= 4096 {

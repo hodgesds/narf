@@ -3,8 +3,9 @@
 ## Primary sources
 
 - **VirtIO-GPU spec (§5.7 of VIRTIO 1.2)** — cleanest starting target.
-- **Intel Graphics Programmer's Reference Manuals (PRMs)** — if we
-  target iGFX. <https://01.org/linuxgraphics/documentation/hardware-specification-prms>
+- **Intel Graphics Programmer's Reference Manuals (PRMs)** — used by the
+  Intel driver; `specification/intel_gpu.md` §2 lists the per-generation set.
+  <https://01.org/linuxgraphics/documentation/hardware-specification-prms>
 
 ## Secondary sources
 
@@ -32,9 +33,8 @@
   RDNA2 APU's graphics needs beyond the discrete Navi22 cold boot: GC 10.3.6
   against 10.3.2 in `gfx_v10_0.c`, PSP/SMU 13.0.5, MMHUB 2.3, NBIO 7.x, who
   owns the PSP, and the order of work.
-- [Intel GPU follow-ups plan](intel-followups-plan.md) — the remaining Gen9
-  and Gen11 remainders, display gaps, Open capability rows and §6 programmes,
-  in lane order, with the scope and Comet Lake revision decisions.
+- [Intel GPU follow-ups plan](intel-followups-plan.md) — what #2489 and #2511
+  landed, the Intel boot options they added, and the work still open.
 
 ## Open research questions
 

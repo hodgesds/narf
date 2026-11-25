@@ -11,12 +11,12 @@
 //! [`crate::intel_gpu_rcs::RcsEngine`]: one hardware context per user
 //! context, the context workarounds loaded ahead of its first request.
 //!
-//! What this owner does not do yet, and Linux does: RC6 and frequency
-//! management (it keeps render and GT forcewake held), preemption and
-//! timeslicing (one engine load at a time), per-engine reset (a hang or
-//! lost completion resets the whole GT and bans the contexts involved), the
-//! Gen9 golden render state (`intel_renderstate`), and engines other than
-//! RCS0.
+//! It schedules RCS0, BCS0, VCS0 and VECS0 with timeslicing and priority
+//! preemption, records each engine's default image with the golden render
+//! state (`__engines_record_defaults`), runs RC6 and RPS through
+//! [`crate::intel_gpu_legacy_power`], and resets a hung engine alone where
+//! it has its own reset domain (`intel_engine_reset`), falling back to a
+//! full GT reset otherwise.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;

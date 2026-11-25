@@ -322,6 +322,11 @@ struct Plan {
     /// `SETCRTC` without a framebuffer): after the console restore, the
     /// panel's crtc goes off where the backend can turn it off.
     off: bool,
+    /// "Content Protection" / "HDCP Content Type" connector changes
+    /// (drm_atomic_connector_set_property), committed into the connector
+    /// state with the transaction and then handed to HDCP
+    /// (intel_hdcp_atomic_check + intel_hdcp_update_pipe).
+    protection: Vec<(u32, ContentProtectionChange)>,
 }
 
 fn same_timing(
@@ -468,6 +473,7 @@ impl Plan {
             legacy_store,
             damage: crate::drm::fb_cmd::Damage::Full,
             off: false,
+            protection: Vec::new(),
         };
         let mut fb = p.next.primary_fb;
         let mut route = fb.map(|_| p.next.id);
@@ -791,7 +797,18 @@ impl Plan {
                                 _ => return Err(FsError::InvalidData),
                             }
                         } else if card.connector(object).is_ok() {
-                            if prop != CONNECTOR_CRTC_ID_PROP_ID || value != u64::from(p.next.id) {
+                            let at = p.protection.iter().position(|(c, _)| *c == object);
+                            let mut change =
+                                at.map_or_else(Default::default, |i| p.protection[i].1);
+                            if content_protection_property(card, object, prop, value, &mut change)?
+                            {
+                                match at {
+                                    Some(i) => p.protection[i].1 = change,
+                                    None => p.protection.push((object, change)),
+                                }
+                            } else if prop != CONNECTOR_CRTC_ID_PROP_ID
+                                || value != u64::from(p.next.id)
+                            {
                                 return Err(FsError::Unsupported);
                             }
                         } else {
@@ -912,7 +929,8 @@ impl Plan {
                     || !object.object.scanout()
                     || object.object.is_userptr()
                     || !((card.intel_vram_scanout && object.object.is_vram())
-                        || object.object.is_wc())
+                        || object.object.is_wc()
+                        || (!card.intel_vram_scanout && object.object.is_imported()))
                 {
                     return Err(FsError::Unsupported);
                 }
@@ -1400,6 +1418,11 @@ where
         // The transaction owner resolves writer dependencies before obtaining
         // the display session, so reset recovery never waits behind a fence.
 
+        // A foreign import's pages are DMA addresses of another card's
+        // memory or BAR, not CPU frames: only the plane may fetch them.
+        if intel.object.is_imported() {
+            return Err(FsError::Unsupported);
+        }
         if !intel.object.sync_for_cpu_read() {
             return Err(crate::intel_gpu_user::io_error());
         }
@@ -1627,11 +1650,17 @@ async fn execute_plan<B: Backend>(
             // The crtc enable of a commit that lights it again.
             backend.panel_on().await?;
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;
+            // A PXP-protected frame only ever reaches the plane, which
+            // decrypts it or shows it black; a CPU copy would put its
+            // ciphertext on the console.
+            let protected = protected(fb);
             let direct = fb.intel.as_ref().filter(|i| {
                 fb.format == PixelFormat::Xrgb8888
                     && !i.object.is_userptr()
                     && i.object.scanout()
-                    && ((backend.allows_vram_scanout() && i.object.is_vram()) || i.object.is_wc())
+                    && ((backend.allows_vram_scanout() && i.object.is_vram())
+                        || i.object.is_wc()
+                        || (!backend.allows_vram_scanout() && i.object.is_imported()))
             });
             let direct = if direct.is_some() {
                 match backend.check(plan.geometry) {
@@ -1653,7 +1682,7 @@ async fn execute_plan<B: Backend>(
                         // The display owner uses Unsupported only for admission
                         // before arm. A hard/lost/pending hardware error must keep
                         // its owners and cannot silently turn into CPU presentation.
-                        Err(FsError::Unsupported) => {
+                        Err(FsError::Unsupported) if !protected => {
                             backend.surface().await?;
                             backend.copy(fb, mode).await?;
                             backend.vblank().await?
@@ -1661,6 +1690,8 @@ async fn execute_plan<B: Backend>(
                         Err(error) => return Err(error),
                     },
                 );
+            } else if protected {
+                return Err(FsError::Unsupported);
             } else {
                 backend.surface().await?;
                 backend.copy(fb, mode).await?;
@@ -1689,6 +1720,9 @@ async fn execute_plan<B: Backend>(
                         .await?,
                 );
             } else {
+                if plan.framebuffer.as_ref().is_some_and(protected) {
+                    return Err(FsError::Unsupported);
+                }
                 backend.surface().await?;
                 if let Some(fb) = &plan.framebuffer {
                     backend.copy(fb, mode).await?;
@@ -1719,6 +1753,12 @@ async fn execute_plan<B: Backend>(
     // This is the completion linearization witness. A reset/loss after the
     // final await must not turn an abandoned surface into a success event.
     backend.valid()?;
+    let card_index = if plan.protection.is_empty() {
+        u32::MAX
+    } else {
+        card_index_of(mode).unwrap_or(u32::MAX)
+    };
+    let mut hdcp = Vec::new();
     let published = {
         let mut card = mode.lock();
         if !plan.still_valid(&card, open) {
@@ -1755,6 +1795,11 @@ async fn execute_plan<B: Backend>(
                 }
             }
             card.collect_blobs();
+            for (connector, change) in &plan.protection {
+                hdcp.extend(apply_content_protection(
+                    card_index, &mut card, *connector, *change,
+                ));
+            }
             if matches!(plan.action, Action::Color { .. }) {
                 backend.color_published();
             }
@@ -1776,10 +1821,26 @@ async fn execute_plan<B: Backend>(
         mode.lock().intel_master_restored();
         return Err(FsError::Busy);
     }
+    // The committed connector state reaches HDCP once the card lock is
+    // released (intel_hdcp_update_pipe from the commit).
+    for (connector, value, content_type) in hdcp {
+        crate::intel_hdcp_live::request(card_index, connector, value, content_type);
+    }
     Ok(stamp.unwrap_or(FlipStamp {
         ns: narf_time::monotonic_ns(),
         sequence: 0,
     }))
+}
+
+/// A PXP-protected framebuffer (`xe_bo_is_protected`).
+fn protected(fb: &Framebuffer) -> bool {
+    fb.intel.as_ref().is_some_and(|i| i.object.pxp_key() != 0)
+}
+
+/// The registry index of the card whose state is `mode`.
+fn card_index_of(mode: &ModeState) -> Option<u32> {
+    (0..crate::drm_registry::count() as u32)
+        .find(|&i| crate::drm_registry::mode_state(i).is_some_and(|m| Arc::ptr_eq(&m, mode)))
 }
 
 fn plan_dependencies(

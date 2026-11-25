@@ -81,7 +81,8 @@
 //! 18 bpp; the 8 bpc route is unchanged. DP 1.4 rates RBR–HBR3 with the
 //! C10/C20 tables in [`crate::intel_gpu_xelpg`]; a stream that neither
 //! bpp carries refuses unless the sink decompresses DSC (below).
-//! UHBR (128b/132b, C20 MPLLA) and audio remain unadvertised. Live TBT
+//! DP 2.0 UHBR (128b/132b) runs only under `narf.intel.uhbr=1` (below);
+//! audio remains unadvertised. Live TBT
 //! routes select fabric-owned AUX/clocking. MST uses the shared sideband
 //! manager and a single primary transport across independent Pipe B-D
 //! streams. Native/legacy VBT lane reversal reaches the PHY; DP-alt cable
@@ -107,7 +108,35 @@
 //! `intel_lt_phy_pll_disable`, `intel_lt_phy_set_signal_levels` over
 //! `xe3plpd_lt_trans_dp14`), and a profile whose PHY family the view does not
 //! report is refused before MMIO ([`ExternalDisplayProfile::admits_view`]).
-//! Thunderbolt alt mode on an LT port is refused ([`ExternalError::LtTbtAlt`]).
+//! Thunderbolt alt mode on TC1/TC2 runs as on display 14: the Type-C connect
+//! takes no PHY (display 35 powers PICA_TC for the tunnel's AUX and lanes),
+//! AUX selects TBT IO, and the port clock is the fabric's
+//! (`intel_mtl_tbt_pll_enable_clock` with the display-30 five-bit select and
+//! `DDI_CLK_VALFREQ`, `PORT_BUF_CTL1` TBT IO select); the LT PHY takes no PLL
+//! or signal-level transaction (`xe3plpd_tbt_pll_funcs` enable is a no-op,
+//! `intel_lt_phy_set_signal_levels` returns in TBT alt mode).
+//!
+//! ## DP 2.0 UHBR (`narf.intel.uhbr=1`)
+//!
+//! With the strict boot option ([`uhbr::BOOT_OPTION`], default off) the
+//! probe adds the sink's 128b/132b rates to Linux's
+//! `intel_dp_compute_link_config_wide` search ([`uhbr::wide_link`]). Only
+//! when no 8b/10b link carries the stream at a bpp does a UHBR one take it:
+//! UHBR10 or UHBR20 on the C20 Type-C ports (and Panther Lake's C20 DDI B)
+//! and on Nova Lake's LT ports, never on a C10 PHY or Wildcat Lake
+//! (`mtl_max_source_rate`). Such a route follows `mtl_ddi_pre_enable_dp` /
+//! `intel_ddi_enable` for 128b/132b SST: the UHBR port PLL (C20 MPLLA/MPLLB
+//! image or LT UHBR image, `DDI_CLK_VALFREQ` at the 32-bit symbol clock),
+//! `TRANS_DP2_CTL`, `TRANS_DDI_FUNC_CTL` in 128b/132b mode with its own MST
+//! transport, `DP_TP_CTL` in MST mode, the 40-bit `PORT_BUF_CTL1` and
+//! `DDI_CTL_DE`, the 128b/132b training with TX FFE presets
+//! ([`uhbr::train`]), the sink's VC payload and its ACT, the MTP M/N, the
+//! `TRANS_DP2_VFREQ` pair and, on display 30+, `DP_MIN_HBLANK_CTL`. The stop
+//! reverses it and hands the sink back to 8b/10b channel coding. 128b/132b
+//! MST, DSC on a UHBR link, Thunderbolt alt mode, LTTPRs, a failed
+//! training's reduced retry and HDCP are refused typed
+//! ([`ExternalError::Uhbr`]) or not offered. Without the option no
+//! 128b/132b register is touched.
 //!
 //! ## DSC with FEC
 //!
@@ -150,6 +179,9 @@ use core::sync::atomic::{compiler_fence, AtomicU8, Ordering};
 mod mst;
 pub use mst::{MstFailure, MtlMstRoute};
 
+#[path = "intel_gpu_dp_uhbr.rs"]
+pub(crate) mod uhbr;
+
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
 use crate::dp_link_training::{
@@ -165,10 +197,10 @@ use crate::intel_gpu_pipes::{Pipe, Transcoder};
 use crate::intel_gpu_vbt::{dp_ssc_enabled, Vbt, VbtEncoder, VbtPlatform, DP_MAX_DOWNSPREAD};
 use crate::intel_gpu_xe2lpd::{disable_d2d, enable_d2d, DisplayIp, DDI_BUF_D2D_LINK_ENABLE};
 use crate::intel_gpu_xelpg::{
-    disable_port_pll_lanes, disable_tbt_clock, dp_pll_request, enable_port_pll_state,
-    enable_tbt_clock, program_port_buf_ctl, set_signal_levels, wait_port_buf_active,
-    wait_port_buf_idle, Cx0Error, Cx0Phy, PhyLaneConfig, XeLpgPort, PORT_BUF_IO_SELECT_TBT,
-    PORT_BUF_PHY_IDLE,
+    disable_port_pll_lanes, disable_tbt_clock, dp_pll_request, dp_uhbr_pll_request,
+    enable_port_pll_state, enable_tbt_clock, program_port_buf_ctl, program_port_buf_ctl_width,
+    set_signal_levels, set_signal_levels_uhbr, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
+    Cx0Phy, PhyKind, PhyLaneConfig, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
@@ -305,8 +337,37 @@ const DP_TP_CTL_ENABLE: u32 = 1 << 31;
 const DP_TP_CTL_ENHANCED_FRAME: u32 = 1 << 18;
 const DP_TP_CTL_LINK_TRAIN_MASK: u32 = 0x7 << 8;
 const DP_TP_CTL_LINK_TRAIN_PAT1: u32 = 0;
+const DP_TP_CTL_LINK_TRAIN_PAT2: u32 = 1 << 8;
 const DP_TP_CTL_LINK_TRAIN_NORMAL: u32 = 3 << 8;
+/// `DP_TP_CTL_MODE_MST`: MST, and 128b/132b SST (`mtl_ddi_prepare_link_retrain`).
+const DP_TP_CTL_MODE_MST: u32 = 1 << 27;
 const TRANS_DDI_FUNC_ENABLE: u32 = 1 << 31;
+/// `TRANS_DDI_MODE_SELECT_FDI_OR_128B132B` (display 14+: 128b/132b).
+const TRANS_DDI_MODE_128B132B: u32 = 4 << 24;
+/// `TRANS_DDI_MODE_SELECT_MASK`.
+const TRANS_DDI_MODE_MASK: u32 = 7 << 24;
+/// `TRANS_DDI_MST_TRANSPORT_SELECT(trans)` (bits 11:10).
+const fn trans_ddi_mst_transport(trans: Transcoder) -> u32 {
+    (trans as u32) << 10
+}
+/// `TRANS_DDI_DP_VC_PAYLOAD_ALLOC`.
+const TRANS_DDI_DP_VC_PAYLOAD_ALLOC: u32 = 1 << 8;
+/// `TRANS_DP2_CTL(trans)` (`_TRANS_DP2_CTL_A` 0x600a0) and its
+/// `TRANS_DP2_128B132B_CHANNEL_CODING`.
+const fn trans_dp2_ctl(trans: Transcoder) -> u64 {
+    trans.base() + 0xa0
+}
+const TRANS_DP2_128B132B_CHANNEL_CODING: u32 = 1 << 31;
+/// `TRANS_DP2_VFREQHIGH(trans)` / `TRANS_DP2_VFREQLOW(trans)` (0x600a4/a8),
+/// `TRANS_DP2_VFREQ_PIXEL_CLOCK` in bits 31:8.
+const fn trans_dp2_vfreqhigh(trans: Transcoder) -> u64 {
+    trans.base() + 0xa4
+}
+const fn trans_dp2_vfreqlow(trans: Transcoder) -> u64 {
+    trans.base() + 0xa8
+}
+/// `DDI_BUF_PORT_DATA_40BIT` (display 14+, `intel_ddi_init_dp_buf_reg`).
+const DDI_BUF_PORT_DATA_40BIT: u32 = 2 << 18;
 /// `TGL_TRANS_DDI_PORT_MASK | TRANS_DDI_MODE_SELECT_MASK`.
 const TRANS_DDI_PORT_AND_MODE: u32 = (0xF << 27) | (0x7 << 24);
 const DDI_BUF_CTL_ENABLE: u32 = 1 << 31;
@@ -409,9 +470,9 @@ pub enum ExternalError {
     /// The stream needs a DSC configuration Linux would not choose or this
     /// driver does not qualify (nothing was programmed).
     Dsc(DscRefusal),
-    /// A Thunderbolt-alt connection on an LT-PHY port: its TBT clock
-    /// (`intel_mtl_tbt_pll_enable_clock`) is not owned on display 35.
-    LtTbtAlt,
+    /// A 128b/132b (UHBR) route `narf.intel.uhbr=1` would run is refused or
+    /// failed ([`uhbr::UhbrRefusal`]).
+    Uhbr(uhbr::UhbrRefusal),
 }
 
 impl From<TcError> for ExternalError {
@@ -681,6 +742,7 @@ pub(crate) fn external_pipe(
         dsc,
         pipe_bpp,
         scaler: None,
+        min_hblank: 0,
     })
 }
 
@@ -741,10 +803,17 @@ pub(crate) fn lt_phy<'a, M: MmioWindow + ?Sized>(
         .map_err(phy_err)
 }
 
+/// The LT PHY behind `probe`. A Thunderbolt-alt connection's PHY belongs to
+/// the TBT fabric, so no LT transaction may reach it: `intel_xe3plpd_pll_disable`
+/// takes the TBT clock instead of `intel_lt_phy_pll_disable`, and the TBT PLL's
+/// enable is a no-op (`xe3plpd_tbt_pll_funcs`).
 fn probe_lt_phy<'a, M: MmioWindow + ?Sized>(
     io: &'a M,
     probe: &MtlSinkProbe,
 ) -> Result<Option<crate::intel_gpu_lt_phy::LtPhy<'a, M>>, ExternalError> {
+    if probe.tbt() && io.has_lt_phy() {
+        return Err(phy_err(Cx0Error::ProtocolMismatch));
+    }
     lt_phy(
         io,
         probe.port,
@@ -754,10 +823,12 @@ fn probe_lt_phy<'a, M: MmioWindow + ?Sized>(
     )
 }
 
-/// `encoder->set_signal_levels` on `lanes` at `levels`:
+/// `encoder->set_signal_levels` on an 8b/10b link's `lanes` at `levels`:
 /// `intel_lt_phy_set_signal_levels` over the DP 1.4 table
-/// (`xe3plpd_lt_trans_dp14`; UHBR is not advertised) at each lane's
-/// `intel_ddi_dp_level`, or `intel_cx0_phy_set_signal_levels`.
+/// (`xe3plpd_lt_trans_dp14`; UHBR takes [`uhbr_levels`]) at each lane's
+/// `intel_ddi_dp_level`, or `intel_cx0_phy_set_signal_levels`. Both return
+/// without a transaction in Thunderbolt alt mode: the fabric drives the
+/// lanes.
 fn port_levels<M: MmioWindow + ?Sized>(
     io: &M,
     probe: &MtlSinkProbe,
@@ -765,6 +836,9 @@ fn port_levels<M: MmioWindow + ?Sized>(
     lanes: u8,
     levels: &[(u8, u8); 4],
 ) -> Result<(), ExternalError> {
+    if probe.tbt() {
+        return Ok(());
+    }
     match probe_lt_phy(io, probe)? {
         Some(lt) => {
             let lanes = usize::from(lanes);
@@ -792,7 +866,9 @@ fn port_levels<M: MmioWindow + ?Sized>(
 }
 
 /// `intel_ddi_disable_clock` for a non-TBT route: `intel_lt_phy_pll_disable`
-/// or `intel_cx0pll_disable` of the probe's lanes.
+/// or `intel_cx0pll_disable` of the probe's lanes. A TBT route takes
+/// [`disable_tbt_clock`] instead (`intel_xe3plpd_pll_disable`,
+/// `intel_mtl_pll_disable_clock`).
 fn port_pll_disable<M: MmioWindow + ?Sized>(
     io: &M,
     probe: &MtlSinkProbe,
@@ -841,6 +917,23 @@ pub struct MtlSinkProbe {
     /// EDID limits the pipe to it or only 18 bpp fits the link; the
     /// negotiated link is then Linux's (`intel_dp_compute_link_config_wide`).
     pub pipe_bpp: u32,
+    /// The 128b/132b link when `narf.intel.uhbr=1` and only a UHBR rate
+    /// carries the stream at its bpp. `negotiated` then carries the UHBR
+    /// link's lane count and bandwidth beside the 8b/10b ceiling rate that
+    /// could not.
+    pub uhbr: Option<UhbrPlan>,
+}
+
+/// A 128b/132b SST route (`intel_dp_is_uhbr`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UhbrPlan {
+    /// Rate, lanes and pipe bpp ([`uhbr::wide_link`]).
+    pub link: uhbr::UhbrLink,
+    /// MTP time slots and M/N ([`uhbr::mtp_tu`]).
+    pub stream: uhbr::UhbrStream,
+    /// `intel_dp_use_post_lt_adj_req` (the sink's
+    /// `DP_POST_LT_ADJ_REQ_SUPPORTED`).
+    pub post_lt_adj_req: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -853,6 +946,15 @@ impl MtlSinkProbe {
     /// Display version whose register layout this probe owns.
     pub fn display_version(&self) -> u16 {
         self.display_ip.ver()
+    }
+
+    /// `crtc_state->port_clock` of the planned link: the UHBR rate, or the
+    /// negotiated 8b/10b rate.
+    fn port_clock_khz(&self) -> u32 {
+        match self.uhbr {
+            Some(plan) => plan.link.rate.link_rate(),
+            None => link_clock_khz(self.negotiated.rate),
+        }
     }
 
     fn tbt(&self) -> bool {
@@ -962,14 +1064,6 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
         }
         e
     };
-    // No Thunderbolt clock owner is modelled for the LT PHY: a TBT-alt
-    // connection on display 35 is released before any AUX traffic.
-    if io.has_lt_phy() && tc.is_some_and(|conn| conn.mode == TcMode::TbtAlt) {
-        if let Some(conn) = tc {
-            let _ = tc_disconnect(io, &conn);
-        }
-        return Err(ExternalError::LtTbtAlt);
-    }
     if let Err(e) = aux_power_enable(io, port) {
         if let Some(conn) = tc {
             let _ = tc_disconnect(io, &conn);
@@ -1014,6 +1108,7 @@ impl LinkProbe {
     }
 }
 
+/// Probe the sink on `port` (UHBR as `narf.intel.uhbr` says).
 pub fn probe_sink<M: MmioWindow + ?Sized>(
     io: &M,
     generation: Generation,
@@ -1021,11 +1116,11 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
     legacy_port: bool,
 ) -> Result<MtlSinkProbe, ExternalError> {
     let link = probe_link(io, generation, port, legacy_port)?;
-    probe_sink_link(io, link)
+    probe_sink_link(io, link, uhbr::opted_in())
 }
 
 /// [`probe_sink`] for an exact source profile (Nova Lake-S has no
-/// generation of its own).
+/// generation of its own), with UHBR off.
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn probe_sink_profile<M: MmioWindow + ?Sized>(
     io: &M,
@@ -1033,13 +1128,77 @@ pub(crate) fn probe_sink_profile<M: MmioWindow + ?Sized>(
     port: XeLpgPort,
     legacy_port: bool,
 ) -> Result<MtlSinkProbe, ExternalError> {
+    probe_sink_profile_uhbr(io, profile, port, legacy_port, false)
+}
+
+/// [`probe_sink_profile`] with an explicit `narf.intel.uhbr` decision.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn probe_sink_profile_uhbr<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    port: XeLpgPort,
+    legacy_port: bool,
+    uhbr: bool,
+) -> Result<MtlSinkProbe, ExternalError> {
     let link = probe_link_profile(io, profile, port, legacy_port)?;
-    probe_sink_link(io, link)
+    probe_sink_link(io, link, uhbr)
+}
+
+/// Whether `port`'s PHY is a C10 (`intel_encoder_is_c10phy`): DDI A/B on
+/// Meteor and Lunar Lake, DDI A on Panther Lake. Nova Lake's LT PHY is not.
+fn c10_phy<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> bool {
+    !io.has_lt_phy() && crate::intel_gpu_xelpg::phy_kind(io, port) == PhyKind::C10
+}
+
+/// `intel_dp_compute_link_config_wide` with the 128b/132b common rates
+/// (`narf.intel.uhbr=1`): `Ok(Some)` when only a UHBR rate carries the
+/// stream at its bpp, `Ok(None)` when the 8b/10b negotiation stands (an
+/// 8b/10b link carries it, no UHBR rate is common, or nothing fits a sink
+/// without DSC), a typed refusal for what is not implemented.
+fn plan_uhbr<A: crate::dp_aux::AuxChannel + ?Sized>(
+    aux: &mut A,
+    link: &LinkProbe,
+    c10: bool,
+    limits: &dsc::LinkLimits,
+    mode: &Mode,
+    max_bpp: u32,
+    sink_dsc: bool,
+) -> Result<Option<UhbrPlan>, ExternalError> {
+    let source = uhbr::source_rates(link.display_ip, c10);
+    if source == 0 {
+        return Ok(None);
+    }
+    let sink = uhbr::read_sink(aux, &link.raw)
+        .map_err(|e| ExternalError::Link(LinkError::AuxFailure(e)))?;
+    let common = sink.rates & source;
+    if common == 0 {
+        return Ok(None);
+    }
+    match uhbr::wide_link(limits, common, mode, max_bpp) {
+        uhbr::WideLink::Uhbr(chosen) => {
+            if link.tbt() {
+                return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt));
+            }
+            if sink.lttpr {
+                return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Lttpr));
+            }
+            let stream =
+                uhbr::mtp_tu(&chosen, mode).ok_or(ExternalError::Uhbr(uhbr::UhbrRefusal::Slots))?;
+            Ok(Some(UhbrPlan {
+                link: chosen,
+                stream,
+                post_lt_adj_req: sink.post_lt_adj_req,
+            }))
+        }
+        uhbr::WideLink::None if sink_dsc => Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Dsc)),
+        uhbr::WideLink::EightTenB | uhbr::WideLink::None => Ok(None),
+    }
 }
 
 fn probe_sink_link<M: MmioWindow + ?Sized>(
     io: &M,
     link: LinkProbe,
+    uhbr_on: bool,
 ) -> Result<MtlSinkProbe, ExternalError> {
     let LinkProbe {
         display_ip,
@@ -1087,6 +1246,37 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     );
     let mut plan = None;
     let mut pipe_bpp = dsc::PIPE_BPP;
+    // narf.intel.uhbr=1: the same search over the UHBR common rates too.
+    let uhbr_plan = if uhbr_on {
+        plan_uhbr(
+            &mut aux,
+            &link,
+            c10_phy(io, port),
+            &limits,
+            &mode,
+            max_bpp,
+            sink.dsc.dpcd.supports_dsc(),
+        )
+        .map_err(rollback)?
+    } else {
+        None
+    };
+    if let Some(p) = uhbr_plan {
+        let lanes = u32::from(p.link.lanes);
+        negotiated = NegotiatedLink {
+            rate: ceiling,
+            lanes: p.link.lanes,
+            demand_kbps: uhbr::link_required(
+                lanes,
+                mode.pixel_clock_khz,
+                u32::from(mode.h_active),
+                p.link.pipe_bpp * 16,
+            ) * 8,
+            payload_kbps: uhbr::max_link_data_rate(p.link.rate, lanes) * 8,
+            over_budget: false,
+        };
+        pipe_bpp = p.link.pipe_bpp;
+    }
     // A 6 bpc link: Linux's own (intel_dp_compute_link_config_wide).
     let six_bpc = |link: dsc::UncompressedLink| {
         let rate = train_rate_for(link.link_rate)?;
@@ -1098,7 +1288,9 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
             over_budget: false,
         })
     };
-    if !sink.dsc.dpcd.supports_dsc() && (negotiated.over_budget || max_bpp < dsc::PIPE_BPP) {
+    if uhbr_plan.is_some() {
+        // The 128b/132b link above is Linux's choice.
+    } else if !sink.dsc.dpcd.supports_dsc() && (negotiated.over_budget || max_bpp < dsc::PIPE_BPP) {
         // No DSC: 24 bpp that the negotiation carries keeps it; otherwise
         // the bpp descent, or the existing over-budget refusal.
         if let Some(link) = dsc::uncompressed_link(&limits, &mode, max_bpp)
@@ -1161,6 +1353,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         edid_len,
         dsc: plan,
         pipe_bpp,
+        uhbr: uhbr_plan,
     })
 }
 
@@ -1193,7 +1386,8 @@ pub struct MtlExternalRoute {
     pub probe: MtlSinkProbe,
     /// The scanned-out framebuffer (owned by the caller's allocation).
     pub fb: Framebuffer,
-    /// The trained link.
+    /// The trained link. On a 128b/132b route only its lane count is the
+    /// link's; the rate and presets are in `probe.uhbr` and `uhbr`.
     pub trained: TrainedLink,
     state: RouteState,
     /// The Pipe B–D (and transcoder) the route was activated on.
@@ -1203,6 +1397,19 @@ pub struct MtlExternalRoute {
     /// Plane, transcoder and port are disabled. Only the source FEC-off
     /// acknowledgement is pending before clock teardown can resume.
     awaiting_fec_stop: bool,
+    /// A 128b/132b route's trained TX FFE presets and payload state.
+    pub uhbr: Option<UhbrTrained>,
+}
+
+/// What a 128b/132b route has trained and allocated.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct UhbrTrained {
+    /// `intel_dp->train_set`: the per-lane TX FFE presets.
+    pub presets: [u8; 4],
+    /// The sink's payload table holds VCPID 1 (`drm_dp_dpcd_write_payload`).
+    pub sink_payload: bool,
+    /// `TRANS_DDI_DP_VC_PAYLOAD_ALLOC` is set.
+    pub vc_payload: bool,
 }
 
 /// Why [`activate`] did not produce a live route.
@@ -1334,21 +1541,27 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
     // lowest rate that carries the stream and the fallback ladder never
     // raises it, so a fallback that still carries the stream trains at
     // this same rate (fewer lanes) and the reservation is exact.
-    let ext = match external_pipe(
+    let mut ext = match external_pipe(
         &choice,
         probe.port,
         &probe.mode,
         &fb,
-        link_clock_khz(negotiated.rate),
+        probe.port_clock_khz(),
         probe.dsc.map(|plan| plan.term(&probe.mode)),
         probe.pipe_bpp,
     ) {
         Ok(ext) => ext,
         Err(e) => return Err(ActivateError::Refused(probe, e)),
     };
+    // intel_dp_compute_min_hblank: display 30+ programs DP_MIN_HBLANK_CTL
+    // for 128b/132b SST (zero for 8b/10b SST).
+    if probe.uhbr.is_some() && probe.display_ip.is_display30() {
+        ext.min_hblank = uhbr::min_hblank(&probe.mode, probe.pipe_bpp);
+    }
     if let Err(e) = choice.pipes.admit(io, &ext) {
         return Err(ActivateError::Refused(probe, e.into()));
     }
+    let route_uhbr = probe.uhbr.map(|_| UhbrTrained::default());
     let mut route = MtlExternalRoute {
         probe,
         fb,
@@ -1361,6 +1574,7 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
         pipe: choice.pipe,
         reservation: None,
         awaiting_fec_stop: false,
+        uhbr: route_uhbr,
     };
     match program(io, &mut route, choice, &ext, display.pipe_dmc, payload) {
         Ok(()) => {
@@ -1393,6 +1607,20 @@ fn program<M: MmioWindow + ?Sized>(
     request_pipe_wells(io, ext.pipe)?;
     route.reservation = Some(reserve_pipe(io, choice, ext, dmc)?);
     let (rate, lanes) = (route.probe.negotiated.rate, route.probe.negotiated.lanes);
+    if let Some(plan) = route.probe.uhbr {
+        // A 128b/132b link trains once at the planned rate and lanes; a
+        // failure stops the route (Linux's reduced-parameter retry is not
+        // run).
+        enable_port_uhbr(io, route, &plan)?;
+        let trained = TrainedLink {
+            rate,
+            lanes,
+            vswing_pe: Default::default(),
+        };
+        finish(io, route, &trained, payload)?;
+        route.trained = trained;
+        return Ok(());
+    }
     let mut trained = enable_port(io, route, rate, lanes)?;
     if (route.probe.dsc.is_some() || route.probe.mst.is_some())
         && (trained.rate != rate || trained.lanes != lanes)
@@ -1536,6 +1764,222 @@ fn enable_port<M: MmioWindow + ?Sized>(
         Some(error) => Err(error),
         None => result,
     }
+}
+
+/// `TRANS_DDI_FUNC_CTL` for 128b/132b SST (`intel_ddi_transcoder_func_reg_val_get`
+/// with `intel_dp_is_uhbr`): `TRANS_DDI_MODE_SELECT_FDI_OR_128B132B`, the
+/// port width and the MST transport select of the route's own transcoder
+/// (`mst_master_transcoder = cpu_transcoder`).
+fn uhbr_func(probe: &MtlSinkProbe, trans: Transcoder, lanes: u8) -> u32 {
+    (dp_func(probe.port, lanes, probe.pipe_bpp) & !TRANS_DDI_MODE_MASK)
+        | TRANS_DDI_MODE_128B132B
+        | trans_ddi_mst_transport(trans)
+}
+
+/// `encoder->set_signal_levels` on a 128b/132b link: each lane's TX FFE
+/// preset from `xe3plpd_lt_trans_uhbr` (`intel_lt_phy_set_signal_levels`)
+/// or `mtl_c20_trans_uhbr` (`intel_cx0_phy_set_signal_levels`).
+fn uhbr_levels<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: &MtlSinkProbe,
+    lanes: u8,
+    presets: &[u8; 4],
+) -> Result<(), ExternalError> {
+    match probe_lt_phy(io, probe)? {
+        Some(lt) => {
+            let lanes = usize::from(lanes);
+            if !(1..=presets.len()).contains(&lanes) {
+                return Err(phy_err(Cx0Error::ProtocolMismatch));
+            }
+            let mut index = [0u8; 4];
+            for (slot, preset) in index.iter_mut().zip(presets) {
+                *slot = preset & 0xf;
+            }
+            lt.program_signal_levels(
+                crate::intel_gpu_lt_phy::LtSignalProtocol::Uhbr,
+                &index[..lanes],
+            )
+            .map_err(phy_err)
+        }
+        None => set_signal_levels_uhbr(
+            &Cx0Phy::with_lanes(io, probe.port, probe.phy_lanes()?),
+            lanes,
+            presets,
+        )
+        .map_err(phy_err),
+    }
+}
+
+/// `intel_ddi_enable_clock` at a UHBR rate: `intel_lt_phy_pll_enable` over
+/// `xe3plpd_lt_dp_uhbr*` or `intel_cx0pll_enable` over the C20 DP 2.0 image
+/// ([`dp_uhbr_pll_request`]), after `mtl_port_buf_ctl_io_selection` (never
+/// Thunderbolt: that refuses at probe).
+fn enable_clock_uhbr<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: &MtlSinkProbe,
+    rate: uhbr::UhbrRate,
+    lanes: u8,
+) -> Result<(), ExternalError> {
+    let port = probe.port;
+    if probe.tbt() {
+        return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt));
+    }
+    let buf = read(io, port.buf_ctl1())?;
+    write(io, port.buf_ctl1(), buf & !PORT_BUF_IO_SELECT_TBT)?;
+    match probe_lt_phy(io, probe)? {
+        Some(lt) => {
+            let rate = crate::intel_gpu_lt_phy::LtDpRate::from_clock_khz(rate.link_rate())
+                .filter(|rate| rate.is_uhbr())
+                .ok_or(phy_err(Cx0Error::UnsupportedRate))?;
+            lt.enable_dp(crate::intel_gpu_lt_phy::LtDpEnable {
+                rate,
+                lane_count: lanes,
+                pin_assignment_d: probe.pin_assignment_d(),
+                ssc_enabled: probe.ssc,
+            })
+            .map_err(phy_err)
+        }
+        None => {
+            let mut request = dp_uhbr_pll_request(
+                crate::intel_gpu_xelpg::phy_kind(io, port),
+                rate.link_rate(),
+                lanes,
+                probe.dp_alt(),
+                probe.legacy(),
+                probe.ssc,
+                probe.display_ip.is_display30(),
+            )
+            .map_err(phy_err)?;
+            request.lanes = probe.phy_lanes()?;
+            enable_port_pll_state(io, port, &request).map_err(phy_err)
+        }
+    }
+}
+
+/// The source side of a 128b/132b training: `DP_TP_CTL`'s link-training
+/// field (`intel_ddi_set_link_train`) and the TX FFE presets.
+struct UhbrPort<'a, M: MmioWindow + ?Sized> {
+    io: &'a M,
+    probe: &'a MtlSinkProbe,
+    trans: Transcoder,
+    lanes: u8,
+    presets: [u8; 4],
+}
+
+impl<M: MmioWindow + ?Sized> uhbr::UhbrSource for UhbrPort<'_, M> {
+    type Error = ExternalError;
+    fn pattern(&mut self, pattern: uhbr::SourcePattern) -> Result<(), ExternalError> {
+        let bits = match pattern {
+            uhbr::SourcePattern::Tps1 => DP_TP_CTL_LINK_TRAIN_PAT1,
+            uhbr::SourcePattern::Tps2 => DP_TP_CTL_LINK_TRAIN_PAT2,
+            uhbr::SourcePattern::Normal => DP_TP_CTL_LINK_TRAIN_NORMAL,
+        };
+        let old = read(self.io, dp_tp_ctl(self.trans))?;
+        write(
+            self.io,
+            dp_tp_ctl(self.trans),
+            (old & !DP_TP_CTL_LINK_TRAIN_MASK) | bits,
+        )
+    }
+    fn presets(&mut self, presets: &[u8; 4]) -> Result<(), ExternalError> {
+        uhbr_levels(self.io, self.probe, self.lanes, presets)?;
+        self.presets = *presets;
+        Ok(())
+    }
+}
+
+/// `mtl_ddi_pre_enable_dp` steps 3-7.a on a 128b/132b link, preceded by
+/// `intel_dp_128b132b_sdp_crc16`: the UHBR port PLL, `TRANS_CLK_SEL`,
+/// `TRANS_DP2_CTL` 128b/132b and `TRANS_DDI_FUNC_CTL` configured without
+/// ENABLE, `DP_SET_POWER` D0, `mtl_ddi_prepare_link_retrain` (`DP_TP_CTL`
+/// TPS1 in MST mode, D2D, zeroed presets, the 40-bit `PORT_BUF_CTL1`, the
+/// 40-bit `DDI_CTL_DE`), `intel_dp_prepare_link_train`, the 128b/132b
+/// training and `intel_dp_stop_link_train`, then the sink's VC payload
+/// (VCPID 1, slot 0, `tu` slots).
+fn enable_port_uhbr<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &mut MtlExternalRoute,
+    plan: &UhbrPlan,
+) -> Result<(), ExternalError> {
+    let probe = &route.probe;
+    let port = probe.port;
+    let trans = route_pipe(route)?.transcoder();
+    let (rate, lanes) = (plan.link.rate, plan.link.lanes);
+    let mut aux = IntelAux::xelpdp(io, port.aux_base(), probe.tbt());
+    let mut clock = uhbr::SystemClock;
+    let link = |e| ExternalError::Link(LinkError::AuxFailure(e));
+    // DP v2.0 SCR on SDP CRC16 for the 128b/132b link layer (best effort,
+    // as Linux's unchecked write).
+    let _ = aux.dpcd_write(
+        uhbr::DP_SDP_ERROR_DETECTION_CONFIGURATION,
+        &[uhbr::DP_SDP_CRC16_128B132B_EN],
+    );
+    // 3./5. TBT deselect and the port PLL.
+    enable_clock_uhbr(io, probe, rate, lanes)?;
+    // 6.a TRANS_CLK_SEL; 6.b TRANS_DP2_CTL; 6.c TRANS_DDI_FUNC_CTL.
+    write(io, trans_clk_sel(trans), trans_clk_sel_port(port))?;
+    write(io, trans_dp2_ctl(trans), TRANS_DP2_128B132B_CHANNEL_CODING)?;
+    write(
+        io,
+        trans_ddi_func_ctl(trans),
+        uhbr_func(probe, trans, lanes) & !TRANS_DDI_FUNC_ENABLE,
+    )?;
+    // intel_dp_set_power(D0): three tries 1 ms apart, failures only logged.
+    for _ in 0..3 {
+        if aux
+            .dpcd_write(DPCD_SET_POWER, &[dsc::DP_SET_POWER_D0])
+            .is_ok()
+        {
+            break;
+        }
+        uhbr::Clock::sleep_us(&mut clock, 1_000);
+    }
+    // mtl_ddi_prepare_link_retrain.
+    write(
+        io,
+        dp_tp_ctl(trans),
+        DP_TP_CTL_ENABLE | DP_TP_CTL_LINK_TRAIN_PAT1 | DP_TP_CTL_MODE_MST,
+    )?;
+    enable_d2d(io, probe.display_ip, port).map_err(d2d_err)?;
+    uhbr_levels(io, probe, lanes, &[0; 4])?;
+    program_port_buf_ctl_width(io, port, lanes, true);
+    write(
+        io,
+        port.ddi_buf_ctl(),
+        ddi_enable_value(probe.display_ip, lanes) | DDI_BUF_PORT_DATA_40BIT,
+    )?;
+    wait_port_buf_active(io, port).map_err(phy_err)?;
+    // 6.k intel_dp_prepare_link_train (sink half) and the 128b/132b
+    // training; no LTTPR is in the path (refused at probe).
+    uhbr::prepare(&mut aux, rate, lanes, plan.post_lt_adj_req).map_err(link)?;
+    let mut source = UhbrPort {
+        io,
+        probe,
+        trans,
+        lanes,
+        presets: [0; 4],
+    };
+    let presets = match uhbr::train(&mut aux, &mut source, &mut clock, lanes, 0) {
+        Ok(presets) => presets,
+        Err(uhbr::TrainError::Link(failure)) => {
+            return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Training(failure)))
+        }
+        Err(uhbr::TrainError::Source(error)) => return Err(error),
+    };
+    // 6.n intel_dp_stop_link_train: the normal pattern, then the intra-hop
+    // indication (Linux only logs one that does not clear).
+    let _ = uhbr::stop_train(&mut aux, &mut source, &mut clock)?;
+    // 7.a 128b/132b SST: VCPID 1, start slot 0, tu slots.
+    let sink_payload = uhbr::write_payload(&mut aux, &mut clock, 1, 0, plan.stream.tu);
+    route.uhbr = Some(UhbrTrained {
+        presets,
+        sink_payload,
+        vc_payload: false,
+    });
+    if !sink_payload {
+        return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Payload));
+    }
+    Ok(())
 }
 
 fn enable_clock<M: MmioWindow + ?Sized>(
@@ -1747,11 +2191,15 @@ fn finish<M: MmioWindow + ?Sized>(
     let mode = route.probe.mode;
     let pll_rate = crate::intel_gpu_modeset::to_pll_rate(trained.rate);
     let lanes = trained.lanes;
+    let uhbr_plan = route.probe.uhbr;
     let mut levels = [(0u8, 0u8); 4];
     for (i, lane) in trained.vswing_pe.lanes.iter().enumerate() {
         levels[i] = (lane.swing, lane.pre_emph);
     }
-    if !route.probe.tbt()
+    // A 128b/132b link keeps the presets its training left and already runs
+    // the normal pattern (intel_dp_stop_link_train in enable_port_uhbr).
+    if uhbr_plan.is_none()
+        && !route.probe.tbt()
         && route
             .probe
             .mst
@@ -1765,22 +2213,24 @@ fn finish<M: MmioWindow + ?Sized>(
         .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
     let (pipe, trans) = (rp.pipe, rp.transcoder());
     let master = route.probe.mst.map_or(trans, |mst| mst.master);
-    let tp = read(io, dp_tp_ctl(master))?;
-    if route.probe.mst.is_some() && master == trans {
+    if uhbr_plan.is_none() {
+        let tp = read(io, dp_tp_ctl(master))?;
+        if route.probe.mst.is_some() && master == trans {
+            write(
+                io,
+                dp_tp_ctl(master),
+                (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | (2 << 8),
+            )?;
+            if !wait_bit(io, dp_tp_ctl(master) + 4, 1 << 25, true, 800_000) {
+                return Err(ExternalError::Mst(MstFailure::Act));
+            }
+        }
         write(
             io,
             dp_tp_ctl(master),
-            (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | (2 << 8),
+            (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | DP_TP_CTL_LINK_TRAIN_NORMAL,
         )?;
-        if !wait_bit(io, dp_tp_ctl(master) + 4, 1 << 25, true, 800_000) {
-            return Err(ExternalError::Mst(MstFailure::Act));
-        }
     }
-    write(
-        io,
-        dp_tp_ctl(master),
-        (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | DP_TP_CTL_LINK_TRAIN_NORMAL,
-    )?;
     let lost = |_| ExternalError::AccessLost;
     let pipe_bpp = route.probe.pipe_bpp;
     // intel_ddi_set_dp_msa, the last step of intel_ddi_pre_enable_dp. The
@@ -1805,13 +2255,28 @@ fn finish<M: MmioWindow + ?Sized>(
     }
     // hsw_configure_cpu_transcoder: M/N with the timings; the transcoder
     // is off, so nothing here latches before its enable.
-    match &plan {
-        Some(plan) => dsc::write_m_n(io, trans, &plan.m_n(&mode)).map_err(lost)?,
-        None => program_mn(io, trans, &mode, pll_rate, lanes, pipe_bpp)?,
+    match (&plan, &uhbr_plan) {
+        (Some(plan), _) => dsc::write_m_n(io, trans, &plan.m_n(&mode)).map_err(lost)?,
+        // intel_dp_mtp_tu_compute_config: TU_SIZE(tu) in PIPE_DATA_M1.
+        (None, Some(u)) => dsc::write_m_n(io, trans, &u.stream.m_n).map_err(lost)?,
+        (None, None) => program_mn(io, trans, &mode, pll_rate, lanes, pipe_bpp)?,
     }
     rp.pipes.program_timings(io, pipe)?;
-    // intel_ddi_enable: function, then the transcoder.
-    let mut func = stream_func(&route.probe, lanes);
+    // intel_ddi_enable: 128b/132b SST's TRANS_DP2_VFREQ pair (the pixel
+    // clock in Hz, bits 31:8 of each), function, then the transcoder.
+    if uhbr_plan.is_some() {
+        let hz = u64::from(mode.pixel_clock_khz) * 1_000;
+        write(io, trans_dp2_vfreqhigh(trans), ((hz >> 24) as u32) << 8)?;
+        write(
+            io,
+            trans_dp2_vfreqlow(trans),
+            ((hz & 0xff_ffff) as u32) << 8,
+        )?;
+    }
+    let mut func = match &uhbr_plan {
+        Some(u) => uhbr_func(&route.probe, trans, u.link.lanes),
+        None => stream_func(&route.probe, lanes),
+    };
     if let Some(mst) = route.probe.mst {
         let off = trans.base() + crate::intel_gpu_pipes::PIPE_DATA_M1_OFFSET;
         let mn = read(io, off)?;
@@ -1829,6 +2294,26 @@ fn finish<M: MmioWindow + ?Sized>(
     // Display 30 always scans out through the VRR timing generator. Linux
     // programs and enables it after TRANS_DDI_FUNC_CTL and before TRANSCONF.
     rp.pipes.enable_fixed_tg(io, pipe)?;
+    // 128b/132b SST: intel_ddi_clear_act_sent, TRANS_DDI_DP_VC_PAYLOAD_ALLOC,
+    // intel_ddi_wait_for_act_sent, then the sink's ACT handled.
+    if uhbr_plan.is_some() {
+        if let Some(state) = route.uhbr.as_mut() {
+            state.vc_payload = true;
+        }
+        mst::source_payload(io, trans, trans, true).map_err(|e| match e {
+            ExternalError::Mst(MstFailure::Act) => ExternalError::Uhbr(uhbr::UhbrRefusal::Payload),
+            e => e,
+        })?;
+        func |= TRANS_DDI_DP_VC_PAYLOAD_ALLOC;
+        let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
+        if !uhbr::poll_act_handled(&mut aux, &mut uhbr::SystemClock) {
+            return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Payload));
+        }
+    }
+    let rp = route
+        .reservation
+        .as_mut()
+        .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
     let start = read(io, pipe.base() + FRMCOUNT)?;
     rp.pipes.enable(io, pipe)?;
     // intel_ddi_wait_for_fec_status(true). Display 30 requires its source
@@ -1904,6 +2389,33 @@ fn observe_live<M: MmioWindow + ?Sized>(
     Ok(())
 }
 
+/// `intel_ddi_post_disable_hdmi_or_sst`'s 128b/132b SST step after the
+/// transcoder disable: the sink's VCPID 1 payload cleared
+/// (`drm_dp_dpcd_write_payload(aux, 1, 0, 0)`), `intel_ddi_clear_act_sent`,
+/// `TRANS_DDI_DP_VC_PAYLOAD_ALLOC` off, `intel_ddi_wait_for_act_sent` and
+/// `drm_dp_dpcd_poll_act_handled`. Linux only logs a missing ACT; so does
+/// this. A failed activation undoes only what it allocated.
+fn uhbr_payload_off<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &MtlExternalRoute,
+    trans: Transcoder,
+) -> Result<(), ExternalError> {
+    let state = route.uhbr.unwrap_or_default();
+    let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
+    let mut clock = uhbr::SystemClock;
+    if state.sink_payload {
+        let _ = uhbr::write_payload(&mut aux, &mut clock, 1, 0, 0);
+    }
+    if state.vc_payload {
+        match mst::source_payload(io, trans, trans, false) {
+            Ok(()) | Err(ExternalError::Mst(MstFailure::Act)) => {}
+            Err(e) => return Err(e),
+        }
+        let _ = uhbr::poll_act_handled(&mut aux, &mut clock);
+    }
+    Ok(())
+}
+
 /// The port side of `intel_ddi_post_disable_dp`, with the transcoder off:
 /// function deselect, sink D3, `intel_ddi_buf_disable` and FEC disable.
 fn disable_port<M: MmioWindow + ?Sized>(
@@ -1913,12 +2425,18 @@ fn disable_port<M: MmioWindow + ?Sized>(
     let port = route.probe.port;
     let trans = route_pipe(route)?.transcoder();
     let stop_failed = ExternalError::Modeset(ModesetError::PipelineStopUnavailable);
-    // intel_ddi_disable_transcoder_func (TGL+ SST): enable, port, mode.
+    let uhbr = route.probe.uhbr.is_some();
+    if uhbr {
+        uhbr_payload_off(io, route, trans)?;
+    }
+    // intel_ddi_disable_transcoder_func (TGL+ SST): enable, port, mode. A
+    // 128b/132b SST transcoder is its own MST master: its port and mode
+    // stay until intel_ddi_post_disable_dp, after the sink's D3.
     let func = read(io, trans_ddi_func_ctl(trans))?;
     write(
         io,
         trans_ddi_func_ctl(trans),
-        func & !(TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE),
+        func & !(TRANS_DDI_FUNC_ENABLE | if uhbr { 0 } else { TRANS_DDI_PORT_AND_MODE }),
     )?;
     // A 6 bpc route leaves the MSA at 8 bpc: the 8 bpc route does not
     // write it (its write stream predates the MSA), and Linux's
@@ -1935,11 +2453,29 @@ fn disable_port<M: MmioWindow + ?Sized>(
     dsc::disable_engines(io, pipe).map_err(|_| ExternalError::AccessLost)?;
     dsc::disable_pps_sdp(io, trans).map_err(|_| ExternalError::AccessLost)?;
     let fec = route.probe.dsc.is_some_and(|p| p.fec);
+    let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
+    // The 8b/10b route never runs intel_dp_link_training_set_mode, so a
+    // 128b/132b route hands the sink back with DP_SET_ANSI_8B10B (best
+    // effort, while the sink is still in D0).
+    if uhbr {
+        let _ = aux.dpcd_write(
+            uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET,
+            &[uhbr::DP_SET_ANSI_8B10B],
+        );
+    }
     // Sink to D3 before the port goes down (a NACK never replaces the
     // local idle proof).
     if route.probe.caps.dpcd_rev >= 0x11 {
-        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
         let _ = aux.dpcd_write(DPCD_SET_POWER, &[DP_SET_POWER_D3]);
+    }
+    // intel_ddi_post_disable_dp (display 12+, 128b/132b): port and mode.
+    if uhbr {
+        let func = read(io, trans_ddi_func_ctl(trans))?;
+        write(
+            io,
+            trans_ddi_func_ctl(trans),
+            func & !TRANS_DDI_PORT_AND_MODE,
+        )?;
     }
     // intel_ddi_buf_disable (display 14): DDI_CTL_DE off, PHY idle, D2D
     // off, DP_TP_CTL off.
@@ -1976,6 +2512,10 @@ fn finish_port_stop<M: MmioWindow + ?Sized>(
         }
         let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
         let _ = dsc::set_sink_fec_ready(&mut aux, false);
+    }
+    // intel_ddi_config_transcoder_dp2(false) on a 128b/132b route.
+    if route.probe.uhbr.is_some() {
+        write(io, trans_dp2_ctl(trans), 0)?;
     }
     // TRANS_CLK_SEL: no clock to the transcoder.
     write(io, trans_clk_sel(trans), 0)?;
@@ -2097,13 +2637,21 @@ impl MtlExternalRoute {
 
     /// Short-pulse revalidation (DPCD 0x202..0x204): every trained lane
     /// reports CR_DONE | CHANNEL_EQ_DONE | SYMBOL_LOCKED and inter-lane
-    /// alignment is done.
+    /// alignment is done; on 128b/132b, every lane's CHANNEL_EQ_DONE and
+    /// the interlane alignment (`intel_dp_link_ok`).
     pub fn link_ok<M: MmioWindow + ?Sized>(&self, io: &M) -> Result<bool, ExternalError> {
         let mut aux = IntelAux::xelpdp(io, self.probe.port.aux_base(), self.probe.tbt());
         let mut status = [0u8; 3];
         aux.dpcd_read(0x202, &mut status)
             .map_err(|e| ExternalError::Link(LinkError::AuxFailure(e)))?;
         let lanes = self.trained.lanes.min(4) as usize;
+        if self.probe.uhbr.is_some() {
+            // intel_dp_link_ok on 128b/132b:
+            // drm_dp_128b132b_lane_channel_eq_done.
+            let mut full = [0u8; uhbr::LINK_STATUS_SIZE];
+            full[..3].copy_from_slice(&status);
+            return Ok(uhbr::lane_channel_eq_done(&full, lanes as u8));
+        }
         for lane in 0..lanes {
             let nibble = (status[lane / 2] >> (4 * (lane % 2))) & 0x7;
             if nibble != 0x7 {
@@ -2559,6 +3107,9 @@ pub struct MtlExternalService {
     display: MtlDisplay,
     /// Where this service publishes its route presence, if anywhere.
     presence: Option<&'static RoutePresence>,
+    /// The `narf.intel.uhbr` decision for later probes; `None` reads the
+    /// boot option at each connect.
+    uhbr: Option<bool>,
 }
 
 impl Default for MtlExternalService {
@@ -2582,6 +3133,7 @@ impl MtlExternalService {
             policy,
             display: MtlDisplay::NONE,
             presence: None,
+            uhbr: None,
         }
     }
 
@@ -2610,6 +3162,17 @@ impl MtlExternalService {
     /// What activations share the display with.
     pub fn display(&self) -> MtlDisplay {
         self.display
+    }
+
+    /// Decide `narf.intel.uhbr` for later probes instead of reading the
+    /// boot option (fixtures).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn set_uhbr(&mut self, on: bool) {
+        self.uhbr = Some(on);
+    }
+
+    fn uhbr_on(&self) -> bool {
+        self.uhbr.unwrap_or_else(uhbr::opted_in)
     }
 
     /// Replace the display context (the owned panel, the pipe-DMC sink)
@@ -2721,6 +3284,30 @@ impl MtlExternalService {
                 };
             }
         }
+        let uhbr_on = self.uhbr_on();
+        if cap[0] & 1 != 0 && uhbr_on {
+            // Linux runs an MST link at its highest common bandwidth
+            // (INTEL_DP_LINK_CAPS_ORDER_KEY_BW): a hub with a common UHBR
+            // rate would carry 128b/132b MST, which is not implemented.
+            let source = uhbr::source_rates(link.display_ip, c10_phy(io, port));
+            let sink = if source == 0 {
+                Ok(uhbr::UhbrSink::default())
+            } else {
+                uhbr::read_sink(&mut link.aux(io), &link.raw)
+            };
+            let error = match sink {
+                Ok(sink) if sink.rates & source == 0 => None,
+                Ok(_) => Some(ExternalError::Uhbr(uhbr::UhbrRefusal::Mst)),
+                Err(e) => Some(ExternalError::Link(LinkError::AuxFailure(e))),
+            };
+            if let Some(error) = error {
+                let _ = link.release(io);
+                return ServiceOutcome::Refused {
+                    port,
+                    error: RouteError::Dp(error),
+                };
+            }
+        }
         if cap[0] & 1 != 0 {
             match MtlMstRoute::connect(io, link, self.policy.decl(port), &self.display, alloc) {
                 Ok(route) => {
@@ -2740,7 +3327,7 @@ impl MtlExternalService {
                 }
             }
         } else {
-            match probe_sink_link(io, link) {
+            match probe_sink_link(io, link, uhbr_on) {
                 Ok(mut probe) => {
                     probe.lane_reversal = self.policy.decl(port).lane_reversal;
                     probe.ssc = dp_ssc_enabled(self.policy.use_ssc, probe.max_downspread);
@@ -2925,6 +3512,16 @@ impl MtlExternalService {
             MtlHpdKind::Connected(_) => ServiceOutcome::Unchanged,
             MtlHpdKind::Disconnected if owns => self.withdraw(io),
             MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::DpMst)) => {
+                // The sink's CP_IRQ to HDCP first (`intel_dp_mst_hpd_irq`).
+                if let Some(MtlRoute::Mst(route)) = self.route.as_ref() {
+                    let key = crate::intel_hdcp_live::xelpg_key(
+                        port as u8,
+                        self.route
+                            .as_ref()
+                            .map_or(0, |r| r.pipe().transcoder() as u8),
+                    );
+                    crate::intel_hdcp_live::short_pulse(&mut route.link_aux(io), key, true);
+                }
                 let unchanged = match self.route.as_mut() {
                     Some(MtlRoute::Mst(route)) => route.unchanged(io) == Ok(true),
                     _ => false,
@@ -2941,6 +3538,20 @@ impl MtlExternalService {
             }
             // HDMI has no IRQ_HPD (`intel_hdmi` installs no hpd_pulse).
             MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::Dp)) => {
+                // The sink's CP_IRQ to HDCP first (`intel_dp_short_pulse`'s
+                // device service IRQ).
+                if let Some(MtlRoute::Dp(route)) = self.route.as_ref() {
+                    let mut aux =
+                        IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
+                    crate::intel_hdcp_live::short_pulse(
+                        &mut aux,
+                        crate::intel_hdcp_live::xelpg_key(
+                            route.port() as u8,
+                            route.pipe().transcoder() as u8,
+                        ),
+                        false,
+                    );
+                }
                 let healthy = match self.route.as_ref() {
                     Some(MtlRoute::Dp(route)) => Some(route.link_ok(io)),
                     _ => None,
@@ -3203,31 +3814,48 @@ pub fn route_live() -> bool {
     PRESENCE.live()
 }
 
-/// HDCP (`crate::intel_hdcp_live`): the live SST DP or HDMI route, unless
-/// a pass holds the service. MST is not reported.
+/// HDCP (`crate::intel_hdcp_live`): the live DP, HDMI or DP MST route,
+/// unless a pass holds the service. An MST route reports its streams, the
+/// master's first, and `transcoder` is the master's.
 pub(crate) fn hdcp_route() -> Option<crate::intel_hdcp_live::XelpgRoute> {
-    use crate::intel_hdcp_live::{RouteLink, XelpgRoute};
+    use crate::intel_hdcp_live::{MstStreams, RouteLink, XelpgRoute};
     let service = SERVICE.try_lock()?;
     let route = service.route.as_ref().filter(|r| r.live())?;
-    let (protocol, link) = match route {
+    let (protocol, link, mst) = match route {
+        // HDCP is not offered on a 128b/132b route.
+        MtlRoute::Dp(r) if r.probe.uhbr.is_some() => return None,
         MtlRoute::Dp(r) => (
             crate::intel_hdcp::Protocol::Dp,
             RouteLink::Dp(crate::intel_hdcp_shim::AuxPort::XeLpdp {
                 base: r.probe.port.aux_base(),
                 tbt_io: r.probe.tbt(),
             }),
+            MstStreams::default(),
         ),
         MtlRoute::Hdmi(r) => (
             crate::intel_hdcp::Protocol::Hdmi,
             RouteLink::Hdmi(r.probe.ddc),
+            MstStreams::default(),
         ),
-        MtlRoute::Mst(_) => return None,
+        MtlRoute::Mst(r) => {
+            let (base, tbt_io, streams) = r.hdcp_streams();
+            (
+                crate::intel_hdcp::Protocol::Dp,
+                RouteLink::Dp(crate::intel_hdcp_shim::AuxPort::XeLpdp { base, tbt_io }),
+                MstStreams::new(&streams)?,
+            )
+        }
+    };
+    let transcoder = match mst.as_slice().first() {
+        Some(&(master, _)) => master,
+        None => route.pipe().transcoder() as u8,
     };
     Some(XelpgRoute {
         port: route.port() as u8,
-        transcoder: route.pipe().transcoder() as u8,
+        transcoder,
         protocol,
         link,
+        mst,
     })
 }
 

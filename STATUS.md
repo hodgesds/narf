@@ -1019,6 +1019,11 @@ interfaces and limits.
 
 ## Current work
 
+The Intel GPU entries below record each checkpoint as it landed; their
+remaining-work lists are not current. The current Intel state is
+[`intel_gpu.md`](drivers/gpu/specification/intel_gpu.md), and the open work
+is the [Intel follow-ups plan](drivers/gpu/research/intel-followups-plan.md).
+
 Intel GPU hangs are now recovered per context. GuC autonomous engine reset is
 enabled; a user job that overruns its 5 s deadline (from GuC's enable ACK) is
 disabled alone, and GuC preempts it or resets the engine under it
@@ -2407,12 +2412,11 @@ run on physical Intel hardware.
 `narf.intel.gsc=1` is a new default-off option. With it, the media GuC's stop
 honours Wa_14015076503 around its GRDOM_FULL, and media scheduling is admitted
 beside loaded GSC firmware. A GSC worker (firmware load, HuC authentication via
-the GSC, proxy start) runs on native models only. It carries a temporary
-dead-code allowance outside kernel-test builds until a platform owner supplies
-its GSCCS queue, stolen object and CSME component.
+the GSC, proxy start) runs on native models only; the next entry wires it into
+the runtime.
 
-**Real UAPI changes on every native Xe device**, following Linux with PXP
-absent:
+**Real UAPI changes on every native Xe device** without `narf.intel.pxp=1`,
+following Linux with PXP absent:
 - Query 9 (PXP status): size 0 now reports 8, other sizes are EINVAL, and the
   exact size is ENODEV. It used to be EINVAL.
 - Exec-queue PXP_TYPE: NONE is accepted, HWDRM is ENODEV, and anything else is
@@ -2439,8 +2443,9 @@ With `narf.intel.media_gt=1` and `narf.intel.gsc=1`:
 - The 4 MiB GSC private object lives in stolen memory behind a fixed GGTT
   DM window, which the FBC carve and the claim registry avoid.
 - The GSC worker runs in production: firmware load, compatibility query, HuC
-  authentication, then proxy start. Proxy start ends at LOAD_FAIL (ENODEV)
-  until the MEI GSC proxy joins, as Linux does without the proxy.
+  authentication, then proxy start. Without a bound MEI GSC proxy component,
+  proxy start ends at LOAD_FAIL (ENODEV), as Linux does without the proxy;
+  the MEI client in `drivers/platform` binds it.
 
 Known stall: the one-time 4 MiB image copy is about 1M uncached BAR2 writes in
 a single GT-worker poll. It is off any present path.

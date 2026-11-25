@@ -52,6 +52,7 @@ fn external(pipe: Pipe) -> ExternalPipe {
         dsc: None,
         pipe_bpp: 24,
         scaler: None,
+        min_hblank: 0,
     }
 }
 

@@ -22,24 +22,44 @@
 //!   (`xe_dma_buf_create_obj`, `GemState::import_attachment`) sharing the
 //!   exporter's reservation, mapped at first VM bind ([`ensure_mapped`]).
 //!
-//! NARF importers are static: they have no `invalidate_mappings`
-//! (`xe_dma_buf_move_notify`), so mapping pins the export for the
-//! attachment's life (`dma-buf.c::dma_buf_pin_on_map`) and the exporter
-//! cannot evict or migrate it underneath the importer. A pinned VRAM export
-//! therefore also refuses system suspend (Linux evicts and restores pinned
-//! external objects in place). The exporter's runtime-PM reference
-//! (`xe_pm_runtime_get` in attach) is taken at the first pin, since NARF's
-//! runtime resume is asynchronous; it holds the BAR decoding while a peer
-//! may DMA into it.
+//! Live importers are dynamic (`dma_buf_dynamic_attach` with
+//! `xe_dma_buf_attach_ops`): mapping does not pin, so the exporter may evict
+//! or migrate the object. Each move first calls
+//! `DmaBufObject::invalidate_mappings` (`xe_bo_move_notify` ->
+//! `dma_buf_invalidate_mappings`), and the importer's
+//! `invalidate_mappings` (`xe_dma_buf_move_notify`) makes its mapping and
+//! installed pages stale ([`MoveNotify`]). The importer's VM bindings keep
+//! their records; the next VM_BIND or exec maps the attachment again and
+//! rebuilds its page tables from the new pages (`xe_bo_trigger_rebind`,
+//! `xe_bo_move_dmabuf`). A static attachment ([`attach`]; Linux
+//! `dma_buf_attach`) still pins on map for its whole life
+//! (`dma_buf_pin_on_map`). The exporter's runtime-PM reference
+//! (`xe_pm_runtime_get` in attach) is taken at the first map or pin, since
+//! NARF's runtime resume is asynchronous; it holds the BAR decoding while a
+//! peer may DMA into it.
+//!
+//! A pinned VRAM export survives system suspend in place
+//! (`GemObject::backup_pinned` / `restore_pinned`, Linux
+//! `xe_bo_evict_pinned` / `xe_bo_restore_pinned`); an importer's map
+//! restores it first ([`Attachment::restore_export`]). An import's mmap is
+//! the exporter's (`GemState::mapping_object`, `dma_buf_mmap`), and an
+//! integrated display scans an import out after [`pin_for_scanout`]
+//! (`__xe_pin_fb_vma`, with `dma_buf_pin`).
+//!
+//! LINUX-GAP: `xe_dma_buf_begin_cpu_access` migrates a VRAM export to
+//! system memory for CPU reads when it can. NARF's DMA_BUF_IOCTL_SYNC is
+//! synchronous and has no exporter hook, so CPU access always takes place in
+//! the current placement, which is what Linux falls back to.
 //!
 //! Peer-to-peer into another function's BAR is unvalidated on hardware:
 //! the live importer asks for it only with `narf.intel.prime_p2p=1`, and
 //! otherwise takes the migration path.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use narf_filesystem::dma_buf::DmaBufAttachOps;
 use narf_filesystem::FsError;
 use narf_io::p2pdma::{P2pMapType, P2pTopology};
 use narf_io::sg::Segment;
@@ -88,6 +108,8 @@ pub(crate) enum SgPlacement {
 pub(crate) struct SgTable {
     pub(crate) placement: SgPlacement,
     pub(crate) segments: Vec<Segment>,
+    /// The attachment's move count this table was built at.
+    pub(crate) generation: u64,
 }
 
 impl SgTable {
@@ -105,17 +127,55 @@ impl SgTable {
     }
 }
 
+/// The importer side of an attachment: its move count and cached table.
+/// A dynamic attachment registers it with the exporter's dma-buf as its
+/// `dma_buf_attach_ops` (`xe_dma_buf_attach_ops`); a static one never moves.
+#[derive(Debug)]
+pub(crate) struct MoveNotify {
+    /// Bumped by every move notification. A table or installed page list
+    /// built at an older count is stale.
+    moves: AtomicU64,
+    /// The cached table (`ttm_bo->sg`).
+    sg: IrqSafeSpinLock<Option<Arc<SgTable>>>,
+}
+
+impl MoveNotify {
+    fn new() -> Self {
+        Self {
+            moves: AtomicU64::new(0),
+            sg: IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+impl DmaBufAttachOps for MoveNotify {
+    /// `xe_dma_buf_move_notify` -> `xe_bo_evict` of the import: the sg BO
+    /// moves to SYSTEM, `xe_bo_trigger_rebind` invalidates its VMAs, and
+    /// `xe_bo_move_dmabuf` unmaps the stale table at the next map. NARF's VM
+    /// bindings build page tables from the import's pages at every exec, so
+    /// the bumped count is the invalidation: the stale pages read as none
+    /// until the next VM_BIND or exec maps the attachment again.
+    fn invalidate_mappings(&self) {
+        self.moves.fetch_add(1, Ordering::AcqRel);
+        let stale = self.sg.lock().take();
+        drop(stale);
+    }
+}
+
 /// One importer of an Intel export (Linux `struct dma_buf_attachment`).
 pub(crate) struct Attachment {
     object: Arc<GemObject>,
     exporter: Exporter,
     /// `attach->peer2peer` after `xe_dma_buf_attach`.
     peer2peer: Option<P2pMapType>,
+    /// `dma_buf_attachment_is_dynamic`: registered with the exporter's
+    /// dma-buf, mapped without a pin.
+    dynamic: bool,
     /// Serializes this attachment's pin and map.
     serial: Mutex<()>,
     pinned: AtomicBool,
     wakeref: IrqSafeSpinLock<Option<Box<dyn core::any::Any + Send>>>,
-    sg: IrqSafeSpinLock<Option<Arc<SgTable>>>,
+    mapping: Arc<MoveNotify>,
 }
 
 impl core::fmt::Debug for Attachment {
@@ -123,15 +183,21 @@ impl core::fmt::Debug for Attachment {
         f.debug_struct("Attachment")
             .field("exporter", &self.exporter)
             .field("peer2peer", &self.peer2peer)
+            .field("dynamic", &self.dynamic)
             .field("pinned", &self.pinned.load(Ordering::Relaxed))
+            .field("moves", &self.mapping.moves.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
-/// `dma_buf_dynamic_attach` + `xe_dma_buf_attach` for `object`, exported by
+/// `dma_buf_attach` + `xe_dma_buf_attach` for `object`, exported by
 /// `exporter` whose PCI function is `provider`, to an importer whose PCI
 /// function is `client` (`None`: not a PCI device). `allow_peer2peer` is
-/// the importer's `dma_buf_attach_ops.allow_peer2peer`.
+/// the importer's `dma_buf_attach_ops.allow_peer2peer`. The attachment is
+/// static: its first map pins the export until it drops. Live Intel
+/// importers are dynamic ([`attach_dynamic`]); fixtures model a static
+/// (non-Intel) importer with this.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn attach<T: P2pTopology>(
     object: Arc<GemObject>,
     exporter: Exporter,
@@ -139,6 +205,48 @@ pub(crate) fn attach<T: P2pTopology>(
     provider: Option<T::Node>,
     client: Option<T::Node>,
     allow_peer2peer: bool,
+) -> Result<Attachment, FsError> {
+    attach_with(
+        object,
+        exporter,
+        topology,
+        provider,
+        client,
+        allow_peer2peer,
+        false,
+    )
+}
+
+/// [`attach`] as `dma_buf_dynamic_attach` with `xe_dma_buf_attach_ops`: the
+/// attachment maps without a pin and follows the exporter's moves through
+/// [`MoveNotify`], registered once the exporter's `attach` admitted it.
+pub(crate) fn attach_dynamic<T: P2pTopology>(
+    object: Arc<GemObject>,
+    exporter: Exporter,
+    topology: &T,
+    provider: Option<T::Node>,
+    client: Option<T::Node>,
+    allow_peer2peer: bool,
+) -> Result<Attachment, FsError> {
+    attach_with(
+        object,
+        exporter,
+        topology,
+        provider,
+        client,
+        allow_peer2peer,
+        true,
+    )
+}
+
+fn attach_with<T: P2pTopology>(
+    object: Arc<GemObject>,
+    exporter: Exporter,
+    topology: &T,
+    provider: Option<T::Node>,
+    client: Option<T::Node>,
+    allow_peer2peer: bool,
+    dynamic: bool,
 ) -> Result<Attachment, FsError> {
     // xe_gem_prime_export: a VM-private object is never exported, and an
     // import or USERPTR is not an Intel dma-buf here.
@@ -162,14 +270,20 @@ pub(crate) fn attach<T: P2pTopology>(
         return Err(FsError::Unsupported);
     }
     object.prime_attach(peer2peer.is_some());
+    let mapping = Arc::new(MoveNotify::new());
+    if dynamic {
+        let weak: Weak<MoveNotify> = Arc::downgrade(&mapping);
+        object.dma_buf.attach_dynamic(weak);
+    }
     Ok(Attachment {
         object,
         exporter,
         peer2peer,
+        dynamic,
         serial: Mutex::new(()),
         pinned: AtomicBool::new(false),
         wakeref: IrqSafeSpinLock::new(None),
-        sg: IrqSafeSpinLock::new(None),
+        mapping,
     })
 }
 
@@ -185,22 +299,47 @@ impl Attachment {
     pub(crate) fn pinned(&self) -> bool {
         self.pinned.load(Ordering::Acquire)
     }
+    /// `dma_buf_attachment_is_dynamic`.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn is_dynamic(&self) -> bool {
+        self.dynamic
+    }
+    /// The move count now: a table or page list built at an older count is
+    /// stale.
+    pub(crate) fn moves(&self) -> u64 {
+        self.mapping.moves.load(Ordering::Acquire)
+    }
+    /// No move was notified since `generation`.
+    pub(crate) fn current(&self, generation: u64) -> bool {
+        self.moves() == generation
+    }
 
-    /// `xe_dma_buf_pin` for this attachment. NARF importers are static, so
-    /// the only caller is [`Self::map`] (`dma_buf_pin_on_map`); the pin lasts
-    /// until the attachment drops (`dma_buf_detach` unpins).
-    async fn pin_locked(&self) -> Result<(), FsError> {
+    /// The exporter's runtime-PM reference, held from the first map or pin
+    /// until the attachment drops (`xe_dma_buf_attach`/`detach`).
+    async fn wake(&self) -> Result<(), FsError> {
         if self.wakeref.lock().is_none() {
             let wakeref = self.exporter.backend.cpu_vram_wakeref().await?;
             let previous = self.wakeref.lock().replace(wakeref);
             drop(previous);
         }
-        let epoch = self
-            .exporter
+        Ok(())
+    }
+
+    /// The exporter's current user epoch, which a migration copy runs in.
+    fn exporter_epoch(&self) -> Option<u64> {
+        self.exporter
             .backend
             .status()
             .filter(|s| s.platform == self.exporter.platform && s.epoch != 0)
-            .map(|s| s.epoch);
+            .map(|s| s.epoch)
+    }
+
+    /// `xe_dma_buf_pin` for this attachment: [`Self::map`] of a static
+    /// attachment (`dma_buf_pin_on_map`). The pin lasts until the attachment
+    /// drops (`dma_buf_detach` unpins).
+    async fn pin_locked(&self) -> Result<(), FsError> {
+        self.wake().await?;
+        let epoch = self.exporter_epoch();
         self.object
             .pin_external(self.exporter.backend.as_ref(), epoch)
             .await?;
@@ -208,25 +347,76 @@ impl Attachment {
         Ok(())
     }
 
-    /// `dma_buf_map_attachment` -> `xe_dma_buf_map`, pinning first
-    /// (`dma_buf_pin_on_map`). One mapping per attachment; later calls
-    /// return it.
+    /// `dma_buf_pin` of a dynamic attachment, which the dma-buf core keeps
+    /// for scanout: the export stays in its pinned placement, with no more
+    /// move notifications, until the attachment drops. Pinning may migrate
+    /// the object first (`xe_dma_buf_pin`), which notifies this importer
+    /// too; the caller maps again afterwards.
+    pub(crate) async fn pin(&self) -> Result<(), FsError> {
+        let _serial = self.serial.lock().await;
+        if self.pinned() {
+            return Ok(());
+        }
+        if self.peer2peer.is_none() && !self.object.can_migrate_to_system() {
+            return Err(FsError::Unsupported);
+        }
+        self.pin_locked().await
+    }
+
+    /// `xe_bo_restore_late` for this attachment's export when a system resume
+    /// has not restored it yet: an importer must not reach VRAM S3 cleared.
+    /// The copy runs in the exporter's epoch; without a running exporter GT
+    /// the use waits (`WouldBlock`).
+    pub(crate) async fn restore_export(&self) -> Result<(), FsError> {
+        if !self.object.restore_pending() {
+            return Ok(());
+        }
+        let epoch = self.exporter_epoch().ok_or(FsError::WouldBlock)?;
+        self.object
+            .restore_pinned(self.exporter.backend.as_ref(), epoch)
+            .await
+            .map(drop)
+    }
+
+    /// `dma_buf_map_attachment` -> `xe_dma_buf_map`. A static attachment
+    /// pins first (`dma_buf_pin_on_map`) and keeps one table for its life. A
+    /// dynamic one validates the placement without a pin and caches its
+    /// table until the next move notification; a later call after a move
+    /// maps the new placement.
     pub(crate) async fn map(&self) -> Result<Arc<SgTable>, FsError> {
         let _serial = self.serial.lock().await;
-        if let Some(sg) = self.sg.lock().clone() {
+        let cached = self.mapping.sg.lock().clone();
+        if let Some(sg) = cached.filter(|sg| self.current(sg.generation)) {
             return Ok(sg);
         }
         if self.peer2peer.is_none() && !self.object.can_migrate_to_system() {
             return Err(FsError::Unsupported);
         }
+        if self.dynamic && !self.pinned() {
+            self.wake().await?;
+            let epoch = self.exporter_epoch();
+            // Every move takes this placement lock and notifies under it, so
+            // the count read here stays current while the table is built.
+            let _placement = self
+                .object
+                .validate_for_dma_buf(
+                    self.exporter.backend.as_ref(),
+                    epoch,
+                    self.peer2peer.is_some(),
+                )
+                .await?;
+            let sg = Arc::new(self.build_sg(self.moves())?);
+            *self.mapping.sg.lock() = Some(sg.clone());
+            return Ok(sg);
+        }
         let newly_pinned = !self.pinned();
         if newly_pinned {
             self.pin_locked().await?;
         }
-        match self.build_sg() {
+        match self.build_sg(self.moves()) {
             Ok(sg) => {
                 let sg = Arc::new(sg);
-                *self.sg.lock() = Some(sg.clone());
+                *self.mapping.sg.lock() = Some(sg.clone());
                 Ok(sg)
             }
             Err(error) => {
@@ -240,8 +430,8 @@ impl Attachment {
     }
 
     /// The `switch (bo->ttm.resource->mem_type)` of `xe_dma_buf_map` on the
-    /// pinned placement.
-    fn build_sg(&self) -> Result<SgTable, FsError> {
+    /// pinned or validated placement, at move count `generation`.
+    fn build_sg(&self, generation: u64) -> Result<SgTable, FsError> {
         if self.object.is_vram() {
             // Fail closed where Linux would hand a non-P2P importer a VRAM
             // table: a non-P2P pin either migrated the object or refused.
@@ -263,6 +453,7 @@ impl Attachment {
             return Ok(SgTable {
                 placement: SgPlacement::PeerVram(map),
                 segments,
+                generation,
             });
         }
         // drm_prime_pages_to_sg merges physically contiguous pages;
@@ -289,14 +480,20 @@ impl Attachment {
         Ok(SgTable {
             placement: SgPlacement::System,
             segments,
+            generation,
         })
     }
 }
 
 impl Drop for Attachment {
-    /// `dma_buf_detach`: unmap (identity here), unpin a pin-on-map, then
-    /// `xe_dma_buf_detach`'s runtime-PM put.
+    /// `dma_buf_detach`: leave the dynamic attachment list, unmap (identity
+    /// here), unpin a pin-on-map, then `xe_dma_buf_detach`'s runtime-PM put.
     fn drop(&mut self) {
+        if self.dynamic {
+            let weak: Weak<MoveNotify> = Arc::downgrade(&self.mapping);
+            let ops: Weak<dyn DmaBufAttachOps> = weak;
+            self.object.dma_buf.detach_dynamic(&ops);
+        }
         if self.pinned.swap(false, Ordering::AcqRel) {
             self.object.unpin_external();
         }
@@ -329,21 +526,63 @@ impl Import {
     }
 }
 
-/// Map an imported object's attachment before its first GPU use (Linux
+/// Moves that may overtake one [`ensure_mapped`] before it reports
+/// `WouldBlock` (the exec ioctl's -EAGAIN) instead of mapping again.
+const MAP_RETRIES: usize = 8;
+
+/// Map an imported object's attachment before a GPU use (Linux
 /// `xe_bo_validate` -> `xe_bo_move` -> `dma_buf_map_attachment` of the sg
-/// BO), installing its pages once. Not an import: nothing to do.
+/// BO), installing its pages. After a move notification the stale pages are
+/// replaced by a fresh mapping: the rebind of `xe_bo_trigger_rebind`. Not an
+/// import: nothing to do.
 pub(crate) async fn ensure_mapped(object: &Arc<GemObject>) -> Result<(), FsError> {
     let Some(import) = object.import() else {
         return Ok(());
     };
-    if object.import_mapped() {
+    // A pinned export's tables stay valid across suspend; its contents come
+    // back only with the restore.
+    import.attachment().restore_export().await?;
+    for _ in 0..MAP_RETRIES {
+        if object.import_mapped() {
+            return Ok(());
+        }
+        let sg = import.attachment().map().await?;
+        if sg.len() != object.size() {
+            return Err(FsError::InvalidData);
+        }
+        match object.install_import_pages(sg.pages(), sg.generation) {
+            // Moved again since this table was built: map the new placement.
+            Err(FsError::WouldBlock) => continue,
+            result => return result,
+        }
+    }
+    Err(FsError::WouldBlock)
+}
+
+/// `__xe_pin_fb_vma` of a foreign import for an integrated display's plane:
+/// Linux validates the sg BO (`xe_bo_validate`, which maps its attachment)
+/// and counts a pin on it. NARF also pins the export itself (`dma_buf_pin`):
+/// a plane cannot follow a move notification, and the exporter would
+/// otherwise move the pages the GGTT names (Linux's importer only warns
+/// when `xe_bo_evict` of its pinned sg BO fails). The pin lasts for the
+/// import's life. Then the import's pages are mapped for the GGTT. Not an
+/// import: nothing to do.
+pub(crate) async fn pin_for_scanout(object: &Arc<GemObject>) -> Result<(), FsError> {
+    let Some(import) = object.import() else {
         return Ok(());
-    }
-    let sg = import.attachment().map().await?;
-    if sg.len() != object.size() {
-        return Err(FsError::InvalidData);
-    }
-    object.install_import_pages(sg.pages())
+    };
+    import.attachment().restore_export().await?;
+    import.attachment().pin().await?;
+    ensure_mapped(object).await
+}
+
+/// Whether any import in `objects` was notified of a move since its pages
+/// were installed: page tables built from them are stale
+/// (`xe_exec_ioctl`'s retry after `xe_vm_validate_rebind`).
+pub(crate) fn imports_stale<'a>(objects: impl IntoIterator<Item = &'a Arc<GemObject>>) -> bool {
+    objects
+        .into_iter()
+        .any(|object| object.is_imported() && !object.import_mapped())
 }
 
 /// The live PCI function of an Intel DRM card.
@@ -379,7 +618,8 @@ pub(crate) fn import_foreign(
         crate::intel_gpu_render::DeviceInfo::for_card(exporter_card).ok_or(FsError::InvalidData)?;
     let backend = exporter.backend.clone().ok_or(FsError::InvalidData)?;
     let allow_peer2peer = crate::intel_gpu_gt::boot_opt_in(narf_boot::args(), P2P_OPTION);
-    let attachment = attach(
+    // xe_dma_buf_attach_ops: an Intel importer follows the exporter's moves.
+    let attachment = attach_dynamic(
         object.clone(),
         Exporter {
             platform: exporter.platform,
@@ -400,7 +640,54 @@ pub(crate) fn import_foreign(
 /// whitelist, on a CPU that is not AMD Zen (no peer path).
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod fixture {
+    use alloc::sync::Arc;
+    use narf_filesystem::FsError;
     use narf_io::p2pdma::{HostBridgeDev, P2pTopology};
+
+    use crate::intel_gpu_gem::{GemObject, GemState};
+
+    /// An exporting card with no running GT: enough for a system-memory
+    /// export, which an attachment never migrates.
+    #[derive(Debug)]
+    pub(crate) struct NoGt;
+    impl crate::intel_gpu_user::UserBackend for NoGt {
+        fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+            None
+        }
+        fn submit<'a>(
+            &'a self,
+            _: Arc<crate::intel_gpu_user::UserContext>,
+            _: crate::intel_gpu_user::UserBatch,
+        ) -> narf_filesystem::FsFuture<'a, Arc<crate::intel_gpu_fence::CompletionFence>> {
+            alloc::boxed::Box::pin(async { Err(FsError::NoDevice) })
+        }
+    }
+
+    /// `xe_gem_prime_import` of a system `exporter` from card `card`: a
+    /// dynamic host attachment and the importing open's sg object.
+    pub(crate) fn foreign_import(
+        exporter: &Arc<GemObject>,
+        card: u32,
+    ) -> (GemState, u32, Arc<GemObject>) {
+        let attachment = super::attach_dynamic(
+            exporter.clone(),
+            super::Exporter {
+                platform: crate::intel_gpu_gt::GtPlatform::Battlemage,
+                backend: Arc::new(NoGt),
+            },
+            &Fabric,
+            Some(EXPORTER),
+            Some(DISTANT),
+            false,
+        )
+        .expect("host attachment of a system export");
+        let importer = GemState::new();
+        let handle = importer
+            .import_attachment(super::Import::new(card, attachment))
+            .expect("foreign import");
+        let imported = importer.object(handle).expect("imported object");
+        (importer, handle, imported)
+    }
 
     /// Root port 0 -> switch upstream port 1 -> downstream ports 2 and 3;
     /// root port 6 -> 7.

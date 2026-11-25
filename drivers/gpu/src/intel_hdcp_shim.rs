@@ -6,10 +6,13 @@
 //!
 //! HDCP 1.4 registers at `DP_AUX_HDCP_*`; HDCP 2.2 messages at the
 //! `DP_HDCP_2_2_*_OFFSET`s without their message-id byte, in 16-byte AUX
-//! transfers; availability from `DP_HDCP_2_2_REG_RXSTATUS_OFFSET`. Linux
-//! waits for the sink's `CP_IRQ` before checking a detectable message;
-//! NARF does not route the short-pulse `CP_IRQ` to HDCP and polls RxStatus
-//! every [`DP_POLL_MS`] up to the same timeout instead. The Aksv write is a
+//! transfers; availability from `DP_HDCP_2_2_REG_RXSTATUS_OFFSET`. As in
+//! Linux, a detectable message waits for the sink's `CP_IRQ` (the
+//! short-pulse `DP_DEVICE_SERVICE_IRQ_VECTOR`, or ESI0 on MST, routed by
+//! `crate::intel_hdcp_live::short_pulse`) up to its timeout and RxStatus is
+//! read once after; a route with no hotplug owner to deliver CP_IRQ (the
+//! firmware-lit Gen12 route) polls RxStatus every [`DP_POLL_MS`] up to the
+//! same timeout instead. The Aksv write is a
 //! five-zero-byte native write to `DP_AUX_HDCP_AKSV`, which the AUX
 //! transport marks `DP_AUX_CH_CTL_AUX_AKSV_SELECT`.
 //!
@@ -30,6 +33,11 @@ use crate::intel_hdcp_msg as msg;
 pub trait Dpcd: Send {
     fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), HdcpError>;
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), HdcpError>;
+    /// The sink's CP_IRQs so far (`hdcp->cp_irq_count`), where the route's
+    /// short pulses reach HDCP; `None` where nothing delivers them.
+    fn cp_irq_count(&mut self) -> Option<u32> {
+        None
+    }
 }
 
 /// The HDCP DDC slave (0x3A) for the HDMI shim.
@@ -86,10 +94,39 @@ const RXSTATUS_PAIRING: u8 = 1 << 2;
 const RXSTATUS_REAUTH_REQ: u8 = 1 << 3;
 const RXSTATUS_LINK_FAILED: u8 = 1 << 4;
 
-/// The RxStatus poll that stands in for `intel_dp_hdcp_wait_for_cp_irq`.
+/// The RxStatus poll that stands in for `intel_dp_hdcp_wait_for_cp_irq`
+/// on a route without CP_IRQ delivery.
 pub const DP_POLL_MS: u64 = 10;
 /// `DP_AUX_MAX_PAYLOAD_BYTES`.
 const AUX_MAX: usize = 16;
+
+/// `DP_DEVICE_SERVICE_IRQ_VECTOR` (SST) and
+/// `DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0` (MST, `DP_SINK_COUNT_ESI + 1`).
+pub const DP_DEVICE_SERVICE_IRQ_VECTOR: u32 = 0x201;
+pub const DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0: u32 = 0x2003;
+/// `DP_CP_IRQ`.
+pub const DP_CP_IRQ: u8 = 1 << 2;
+
+/// A short pulse's CP_IRQ: `intel_dp_short_pulse` reads
+/// `DP_DEVICE_SERVICE_IRQ_VECTOR` (SST), `intel_dp_mst_hpd_irq` ESI0 (MST),
+/// and a set `DP_CP_IRQ` is acknowledged (written back, the vector is
+/// write-one-to-clear) and handed to HDCP. Only HDCP's bit is written:
+/// the vector's other events stay for their own handlers. Returns whether
+/// the sink raised CP_IRQ.
+pub fn take_cp_irq(aux: &mut dyn AuxChannel, mst: bool) -> Result<bool, AuxError> {
+    let addr = if mst {
+        DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0
+    } else {
+        DP_DEVICE_SERVICE_IRQ_VECTOR
+    };
+    let mut vector = [0u8; 1];
+    aux.dpcd_read(addr, &mut vector)?;
+    if vector[0] & DP_CP_IRQ == 0 {
+        return Ok(false);
+    }
+    aux.dpcd_write(addr, &[DP_CP_IRQ])?;
+    Ok(true)
+}
 
 /// `hdcp2_dp_msg_data`: (msg_id, offset, detectable, timeout,
 /// timeout2 for a non-paired H', whole-message read timeout).
@@ -195,15 +232,23 @@ fn dp_msg(id: u8) -> Result<(u8, u32, bool, u64, u64, u64), HdcpError> {
         .ok_or(HdcpError::MsgSize)
 }
 
-/// `intel_dp_hdcp_shim` (single stream).
+/// `intel_dp_hdcp_shim` (single stream) and the DPCD side of
+/// `intel_dp_mst_hdcp_shim` (the MST stream registers are the engine's).
 #[derive(Debug)]
 pub struct DpShim<D> {
     pub dpcd: D,
+    /// `cp_irq_count_cached`, from the count when the shim was made: a
+    /// CP_IRQ from before this operation never satisfies its first wait.
+    cp_irq_cached: u32,
 }
 
 impl<D: Dpcd> DpShim<D> {
-    pub fn new(dpcd: D) -> Self {
-        Self { dpcd }
+    pub fn new(mut dpcd: D) -> Self {
+        let cp_irq_cached = dpcd.cp_irq_count().unwrap_or(0);
+        Self {
+            dpcd,
+            cp_irq_cached,
+        }
     }
 
     fn byte(&mut self, addr: u32) -> Result<u8, HdcpError> {
@@ -391,6 +436,17 @@ impl<D: Dpcd> HdcpShim for DpShim<D> {
         } else {
             LinkCheck::Protected
         })
+    }
+
+    fn cp_irq_pending(&mut self) -> Option<bool> {
+        let count = self.dpcd.cp_irq_count()?;
+        Some(count != self.cp_irq_cached)
+    }
+
+    fn cp_irq_consume(&mut self) {
+        if let Some(count) = self.dpcd.cp_irq_count() {
+            self.cp_irq_cached = count;
+        }
     }
 }
 

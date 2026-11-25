@@ -3546,6 +3546,12 @@ impl Owner {
                 pxp: shared.clone(),
                 engine: pxp::Engine::new(client, session),
             });
+            // The display checks protected planes' keys against it
+            // (xe_pxp_obj_key_check).
+            crate::intel_gpu_gt::media::pxp::set_display_pxp(Some(&shared));
+            if let Some(mode) = crate::drm_registry::mode_state(self.pending.index) {
+                mode.lock().intel_pxp_planes = true;
+            }
             *self.user_pxp.lock() = Some(shared);
             log(self.pending.index, "PXP initialized; KCR enabled");
         }
@@ -3740,6 +3746,23 @@ impl Owner {
     /// panel holds one, as Linux's display wakeref does.
     fn autosuspend_eligible(&self) -> bool {
         self.profile.is_ok()
+    }
+
+    /// VRAM a system suspend would lose: every allocation not covered by a
+    /// pinned export's suspend backup (`xe_bo_evict_pinned`).
+    fn vram_unsaved(&self) -> bool {
+        crate::drm_registry::DrmCard::intel_vram(&*self.pending.card)
+            .is_some_and(|pool| pool.unsaved_bytes() != 0)
+    }
+
+    /// A refused suspend left power on: drop the pinned exports' backups,
+    /// whose VRAM still holds the data.
+    async fn discard_vram_backups(&self) {
+        if let Some(pool) = crate::drm_registry::DrmCard::intel_vram(&*self.pending.card) {
+            for object in pool.restore_pending() {
+                object.discard_backup().await;
+            }
+        }
     }
 
     fn display_profile(&self) -> bool {
@@ -4064,35 +4087,45 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
                         {
                             return Err(E::Busy);
                         }
+                        // xe_bo_evict_all: dma-buf-pinned exports stay in
+                        // place, their contents saved to system memory for
+                        // the resume's restore (xe_bo_evict_pinned).
+                        if crate::intel_gpu_xe::backup_pinned_vram(
+                            backend.as_ref(),
+                            &pool,
+                            status.epoch,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            self.discard_vram_backups().await;
+                            return Err(E::Busy);
+                        }
                     }
                 }
             }
-            // S3 may lose both data and flat CCS. If un-evictable objects remain,
-            // refuse suspend cleanly.
-            if self
-                .pending
-                .card
-                .intel_vram_used()
-                .is_some_and(|used| used != 0)
-            {
+            // S3 may lose both data and flat CCS. If VRAM neither evicted nor
+            // saved remains, refuse suspend cleanly.
+            if self.vram_unsaved() {
+                self.discard_vram_backups().await;
                 return Err(E::Busy);
             }
             // Retire display GEM fetch before closing the backend or taking
             // its reset mutex. KMS holds this same display mutex while a
             // transaction is armed, so suspend cannot overtake its latch.
-            crate::intel_gpu_kms::quiesce_for_legacy(&self.pending.bar)
+            if crate::intel_gpu_kms::quiesce_for_legacy(&self.pending.bar)
                 .await
-                .map_err(|_| E::Busy)?;
+                .is_err()
+            {
+                self.discard_vram_backups().await;
+                return Err(E::Busy);
+            }
             // Serialize closing admission with the worker's ready-epoch
             // activation. Display quiescence remains outside this lock.
             let mut state = self.state.lock().await;
-            if self
-                .pending
-                .card
-                .intel_vram_used()
-                .is_some_and(|used| used != 0)
-            {
+            if self.vram_unsaved() {
                 drop(state);
+                self.discard_vram_backups().await;
                 // Failed prepare hooks are not resumed by the coordinator.
                 let _ = crate::intel_dpcd_bl::resume_for_bar(&self.pending.bar);
                 return Err(E::Busy);
@@ -4161,6 +4194,8 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             // AUX is panel-global; restore it after releasing the GT mutex.
             drop(state);
             if result.is_err() {
+                // The function never lost power: VRAM still holds the data.
+                self.discard_vram_backups().await;
                 let _ = crate::intel_dpcd_bl::resume_for_bar(&self.pending.bar);
                 // Nova's quiesce turned the panel off; the function is still
                 // in D0, so the resume relight lights it again in place.
@@ -4206,12 +4241,65 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             state.saved = None;
             self.suspended.store(false, Ordering::Release);
             drop(state);
+            // xe_bo_restore_late: pinned exports' backups go back in place
+            // once the resumed GT runs (their uses restore them first too).
+            if let (Some(pool), Some(backend)) = (
+                crate::drm_registry::DrmCard::intel_vram(&*self.pending.card),
+                crate::drm_registry::DrmCard::intel_user_backend(&*self.pending.card),
+            ) {
+                if !pool.restore_pending().is_empty() {
+                    narf_scheduler::spawn(restore_pinned_after_resume(
+                        self.pending.index,
+                        backend,
+                        pool,
+                    ));
+                }
+            }
             // The system sleep's runtime-PM reference; the display wakerefs
             // (the relit panel) keep holding the function as before.
             let awake = self.system_awake.lock().take();
             drop(awake);
             Ok(())
         })
+    }
+}
+
+/// How long a resume's restore of pinned exports waits for the GT.
+const RESTORE_WAIT_NS: u64 = 60_000_000_000;
+
+/// `xe_bo_restore_late`'s pinned-external pass after a system resume: copy
+/// every pinned export's suspend backup back to its VRAM placement once the
+/// resumed GT publishes a user epoch. NARF's GT restarts after the resume
+/// hook returns, so this waits for it; a use that comes first (an exec, an
+/// importer's map) restores the object itself, and anything else stays
+/// refused while its restore is pending.
+async fn restore_pinned_after_resume(
+    card: u32,
+    backend: Arc<dyn crate::intel_gpu_user::UserBackend>,
+    pool: Arc<crate::intel_gpu_vram::Vram>,
+) {
+    let deadline = narf_time::monotonic_ns().saturating_add(RESTORE_WAIT_NS);
+    loop {
+        if let Some(epoch) = backend.status().map(|s| s.epoch).filter(|e| *e != 0) {
+            // A failed copy (a reset ended the epoch) retries in the next one.
+            if crate::intel_gpu_xe::restore_pinned_vram(backend.as_ref(), &pool, epoch)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        if pool.restore_pending().is_empty() {
+            return;
+        }
+        if narf_time::monotonic_ns() >= deadline {
+            log(
+                card,
+                "pinned VRAM exports not restored after resume; they stay refused",
+            );
+            return;
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(10).as_instant()).await;
     }
 }
 

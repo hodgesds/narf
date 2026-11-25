@@ -118,6 +118,9 @@ pub(crate) struct ExternalPipe {
     /// The pipe scaler the stream runs through (an HDMI 4:2:0 route's 1:1
     /// downsampler), for the resource transaction's prefill term.
     pub(crate) scaler: Option<crate::intel_gpu_xelpg_scaler::PipeScaler>,
+    /// `crtc_state->min_hblank` (`intel_dp_compute_min_hblank`): zero for
+    /// 8b/10b SST and HDMI, the 128b/132b value for a UHBR route.
+    pub(crate) min_hblank: u32,
 }
 
 /// Typed pipe-owner failures.
@@ -643,9 +646,10 @@ impl Pipes {
             checked(io, base + off, v)?;
         }
         if self.ip.is_display30() {
-            // intel_dp_compute_min_hblank is zero for this qualified 8b/10b
-            // SST route. Display 30 requires the register on every pipe.
-            checked(io, base + DP_MIN_HBLANK_CTL_OFFSET, 0)?;
+            // intel_dp_compute_min_hblank: zero for 8b/10b SST and HDMI,
+            // computed for 128b/132b. Display 30 requires the register on
+            // every pipe.
+            checked(io, base + DP_MIN_HBLANK_CTL_OFFSET, ext.min_hblank)?;
         }
         checked(io, base + TRANS_VRR_CTL_OFFSET, 0)?;
         checked(io, base + TRANS_MULT_OFFSET, 0)?;

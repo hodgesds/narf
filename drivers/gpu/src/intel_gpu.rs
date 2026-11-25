@@ -1494,8 +1494,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // panel (a desktop, or a panel takeover that failed) still scanning the
     // GOP framebuffer: retain it for fixed-mode KMS, as an external-only
     // Gen12 board does, and keep hotplug modesets and system suspend off the
-    // inherited pipe. Broxton and Gemini Lake, whose DPIO PHY display is
-    // never programmed, have only this route, panel or not. Displays 9 to 11
+    // inherited pipe. Broxton and Gemini Lake take this route too when no
+    // panel is owned. Displays 9 to 11
     // have three pipes, with Skylake's universal-plane registers. On
     // Gen9/Gen11 the execlists owner already starts beside it (its planes
     // fetch below the GT arena); Meteor Lake's GuC owner takes the firmware
@@ -1764,6 +1764,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // (DC5/DC6 may be entered once idle) only with the DMC loaded and the
     // internal panel owned on Pipe A; inert without the Gen9 service.
     crate::intel_gpu_gen9_dc_states::probe_complete(&gt_bar, owns_scanout && panel_mode.is_some());
+    // Gen9 display system suspend (`narf.intel.gen9_suspend=1`, default
+    // off): the owned panel turns off before system sleep and is relit after
+    // it. Without the option nothing is installed.
+    if let Some(chip) = with_controller(|gpu| gpu.chip).filter(|_| owns_scanout) {
+        crate::intel_gpu_gen9_suspend::install(
+            crate::intel_gpu_gen9_suspend::requested(narf_boot::args()),
+            chip,
+            gt_bar,
+            device,
+            cap,
+            panel_mode,
+        );
+    }
 
     // Power management (Q9, #1015): retain the PCI authority,
     // note the takeover mode for resume re-light, and register
@@ -2440,6 +2453,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             }
         }
         HpdEvent::RetrainRequired(ddi) => {
+            hdcp_short_pulse(ddi);
             if mst_session_ddi() == Some(ddi) {
                 // MST links don't revalidate per-lane status the
                 // SST way; branch notifications are the change
@@ -2452,6 +2466,26 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             // Fresh retrain/activation remains a separate resource transaction.
         }
     }
+}
+
+/// HDCP's share of a DP short pulse on `ddi`: the live SST session's
+/// (`intel_dp_short_pulse`) or the MST session's (`intel_dp_mst_hpd_irq`)
+/// CP_IRQ goes to `intel_hdcp_handle_cp_irq`. Inert without
+/// `narf.intel.hdcp=1`.
+fn hdcp_short_pulse(ddi: crate::intel_gpu_ddi::Ddi) {
+    let sst = DP_SESSION
+        .lock()
+        .as_ref()
+        .is_some_and(|state| state.conn.ddi == ddi && state.live());
+    let mst = !sst && mst_session_ddi() == Some(ddi);
+    if !sst && !mst {
+        return;
+    }
+    with_display_info(|gpu| {
+        let window = gpu.mode_window();
+        let mut aux = crate::intel_gpu_aux::IntelAux::new(&window, ddi);
+        crate::intel_hdcp_live::short_pulse(&mut aux, crate::intel_hdcp_live::gen12_key(ddi), mst);
+    });
 }
 
 /// Tear down whichever session owns `ddi` after its sink went away.
@@ -2842,6 +2876,9 @@ pub(crate) fn service_external_sst(bar: &MmioRegion) {
         poll_external_hpd(&io, gpu.chip.generation)
     })
     .flatten();
+    if let Some(crate::intel_gpu_dp::HpdEvent::RetrainRequired(ddi)) = event {
+        hdcp_short_pulse(ddi);
+    }
     let stop = DP_SESSION.lock().as_ref().is_some_and(|state| {
         event == Some(crate::intel_gpu_dp::HpdEvent::Disconnected(state.conn.ddi))
     });
@@ -2884,6 +2921,22 @@ pub(crate) fn hdcp_gen12_sessions(
         }
     }
     out
+}
+
+/// HDCP (`crate::intel_hdcp_live`): the live Gen12 MST session on `bar` as
+/// its DDI and streams (CPU transcoder index, VCPI), the master's first.
+pub(crate) fn hdcp_gen12_mst(
+    bar: &MmioRegion,
+) -> Option<(crate::intel_gpu_ddi::Ddi, alloc::vec::Vec<(u8, u8)>)> {
+    let session = MST_SESSION.lock();
+    let state = session.as_ref().filter(|s| s.bar == bar.phys.raw())?;
+    let streams: alloc::vec::Vec<(u8, u8)> = state
+        .link
+        .streams()
+        .iter()
+        .map(|s| (s.pipe.transcoder() as u8, s.vcpi))
+        .collect();
+    (!streams.is_empty()).then(|| (state.link.ddi(), streams))
 }
 
 /// No stop is inferred for unsupported HDMI/MST. Stopped SST leases remain

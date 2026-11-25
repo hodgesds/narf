@@ -1328,7 +1328,10 @@ pub(crate) struct LtHdmiEnable {
 
 struct LtEnablePlan<'a> {
     state: &'a LtPllState,
-    clock_khz: u32,
+    /// `DDI_CLK_VALFREQ`: `intel_ddi_link_symbol_clock` of the port clock
+    /// (the port clock itself for HDMI TMDS and DP 8b/10b, the 32-bit
+    /// symbol clock on 128b/132b).
+    valfreq_khz: u32,
     lane_count: u8,
     pin_assignment_d: bool,
     plla_ssc: bool,
@@ -1669,9 +1672,12 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         )
     }
 
-    fn program_port_clock(&self, rate: LtDpRate, ssc_enabled: bool) -> Result<(), Cx0Error> {
-        let plla_ssc = matches!(rate, LtDpRate::Uhbr10 | LtDpRate::Uhbr20);
-        self.program_port_clock_for(plla_ssc, !plla_ssc && ssc_enabled, false)
+    /// `intel_lt_phy_program_port_clock_ctl` for a DP rate: the LT PHY's
+    /// spread spectrum is on PLLA whenever `ltpll->ssc_enabled`, at every
+    /// rate (Linux 7.4 `intel_lt_phy.c`; its readout checks PLLA only).
+    #[cfg(any(test, feature = "kernel-test"))]
+    fn program_port_clock(&self, _rate: LtDpRate, ssc_enabled: bool) -> Result<(), Cx0Error> {
+        self.program_port_clock_for(ssc_enabled, false, false)
     }
 
     fn program_pll_state(&self, state: &LtPllState) -> Result<(), Cx0Error> {
@@ -1717,7 +1723,7 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         }
         self.mmio.write32(
             port.clk_valfreq().ok_or(Cx0Error::ProtocolMismatch)?,
-            plan.clock_khz,
+            plan.valfreq_khz,
         );
         compiler_fence(Ordering::SeqCst);
         self.rmw(clock_ctl, pll_request, pll_request)?;
@@ -1750,14 +1756,15 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         if !matches!(request.lane_count, 1 | 2 | 4) || request.lane_count > self.max_lanes {
             return Err(Cx0Error::ProtocolMismatch);
         }
-        let plla_ssc = matches!(request.rate, LtDpRate::Uhbr10 | LtDpRate::Uhbr20);
+        // intel_lt_phy_program_port_clock_ctl: SSC is PLLA's at every DP
+        // rate, UHBR included. Step 10 writes the link symbol clock.
         self.enable_pll_state(LtEnablePlan {
             state: dp_pll_state(request.rate),
-            clock_khz: request.rate.clock_khz(),
+            valfreq_khz: crate::intel_gpu_xelpg::dp_link_symbol_clock_khz(request.rate.clock_khz()),
             lane_count: request.lane_count,
             pin_assignment_d: request.pin_assignment_d,
-            plla_ssc,
-            pllb_ssc: !plla_ssc && request.ssc_enabled,
+            plla_ssc: request.ssc_enabled,
+            pllb_ssc: false,
             hdmi_frl: false,
         })
     }
@@ -1775,7 +1782,7 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         state.config[2] = 1;
         self.enable_pll_state(LtEnablePlan {
             state: &state,
-            clock_khz: rate.clock_khz(),
+            valfreq_khz: rate.clock_khz(),
             lane_count,
             pin_assignment_d: false,
             plla_ssc: false,
@@ -1799,7 +1806,7 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         let state = hdmi_pll_state(request.clock_khz).ok_or(Cx0Error::UnsupportedRate)?;
         self.enable_pll_state(LtEnablePlan {
             state: &state,
-            clock_khz: request.clock_khz,
+            valfreq_khz: request.clock_khz,
             lane_count: request.lane_count,
             pin_assignment_d: false,
             plla_ssc: false,
@@ -1928,7 +1935,8 @@ pub(crate) mod tests {
     }
 
     /// The LT PHY's message bus, P2P status, lane reset/pulse status and
-    /// MacCLK request/ACK at the PICA offsets of ports A, B, TC1 and TC2.
+    /// MacCLK and Thunderbolt clock request/ACK at the PICA offsets of ports
+    /// A, B, TC1 and TC2.
     #[derive(Debug)]
     pub(crate) struct FakeLtMmio {
         pub(crate) regs: RefCell<BTreeMap<u64, u32>>,
@@ -2277,11 +2285,17 @@ pub(crate) mod tests {
 
         fn write32(&self, off: u64, value: u32) {
             if matches!(off, 0x16_fa60 | 0x16_fc60 | 0x16_f260 | 0x16_f460) {
+                use crate::intel_gpu_xelpg::{TBT_CLOCK_ACK, TBT_CLOCK_REQUEST};
                 let mut next = value;
                 if value & lane_pclk_pll_request(0) != 0 {
                     next |= lane_pclk_pll_ack(0);
                 } else {
                     next &= !lane_pclk_pll_ack(0);
+                }
+                if value & TBT_CLOCK_REQUEST != 0 {
+                    next |= TBT_CLOCK_ACK;
+                } else {
+                    next &= !TBT_CLOCK_ACK;
                 }
                 self.regs.borrow_mut().insert(off, next);
                 return;
@@ -2985,12 +2999,19 @@ pub(crate) mod tests {
     fn smoke_nvl_lt_phy_clock_selection_and_width_refusal() -> TestResult {
         let fake = FakeLtMmio::default();
         let phy = LtPhy::new(&fake, LtPort::Tc2, true, 2, false).unwrap();
+        // intel_lt_phy_program_port_clock_ctl: `ssc_enabled ? PLLA : 0`
+        // at every rate; PLLB's bit is only ever cleared.
         phy.program_port_clock(LtDpRate::Uhbr10, true).unwrap();
         assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLA, SSC_ENABLE_PLLA);
         assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLB, 0);
         phy.program_port_clock(LtDpRate::Hbr3, true).unwrap();
-        assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLA, 0);
-        assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLB, SSC_ENABLE_PLLB);
+        assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLA, SSC_ENABLE_PLLA);
+        assert_eq!(fake.read32(0x16_f460) & SSC_ENABLE_PLLB, 0);
+        phy.program_port_clock(LtDpRate::Uhbr20, false).unwrap();
+        assert_eq!(
+            fake.read32(0x16_f460) & (SSC_ENABLE_PLLA | SSC_ENABLE_PLLB),
+            0
+        );
         assert_eq!(
             phy.enable_dp(LtDpEnable {
                 rate: LtDpRate::Hbr3,
@@ -3005,5 +3026,59 @@ pub(crate) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_lt_phy",
         smoke_nvl_lt_phy_clock_selection_and_width_refusal
+    );
+
+    /// `intel_lt_phy_pll_enable` at the DP 2.0 rates: the
+    /// `xe3plpd_lt_dp_uhbr10/20` images (config 0x43 / 0x53, 0x2d), SSC on
+    /// PLLA only when the sink's downspread asks for it, and
+    /// `DDI_CLK_VALFREQ` = `intel_ddi_link_symbol_clock` (UHBR10 312500,
+    /// UHBR20 625000), then the `xe3plpd_lt_trans_uhbr` TX FFE presets.
+    fn smoke_nvl_lt_phy_uhbr_enable_sequence() -> TestResult {
+        let fake = FakeLtMmio::default();
+        let phy = LtPhy::new(&fake, LtPort::Tc1, true, 4, false).unwrap();
+        phy.enable_dp(LtDpEnable {
+            rate: LtDpRate::Uhbr10,
+            lane_count: 4,
+            pin_assignment_d: false,
+            ssc_enabled: true,
+        })
+        .unwrap();
+        let clock = fake.read32(0x16_f260);
+        assert_eq!(clock & lane_pclk_pll_ack(0), lane_pclk_pll_ack(0));
+        assert_eq!(clock & XE3_DDI_CLOCK_SELECT_MASK, DDI_CLOCK_SELECT_MAXPCLK);
+        assert_eq!(clock & (SSC_ENABLE_PLLA | SSC_ENABLE_PLLB), SSC_ENABLE_PLLA);
+        assert_eq!(fake.read32(0x6_4330), 312_500);
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0c02)).copied(), Some(0x43));
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0c03)).copied(), Some(0x2d));
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x040a)).copied(), Some(1));
+        assert_eq!(fake.vdr.borrow().get(&(1, 0x060a)).copied(), Some(1));
+        // Lane 3 asks preset 15 ({1, 0, 2, 26, 2}), lane 0 preset 0.
+        phy.program_signal_levels(LtSignalProtocol::Uhbr, &[0, 5, 14, 15])
+            .unwrap();
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0403)).copied(), Some(48));
+        assert_eq!(fake.vdr.borrow().get(&(1, 0x0603)).copied(), Some(26));
+        assert_eq!(fake.vdr.borrow().get(&(1, 0x0604)).copied(), Some(2));
+        phy.disable().unwrap();
+
+        let fake = FakeLtMmio::default();
+        let phy = LtPhy::new(&fake, LtPort::Tc2, false, 4, false).unwrap();
+        phy.enable_dp(LtDpEnable {
+            rate: LtDpRate::Uhbr20,
+            lane_count: 2,
+            pin_assignment_d: false,
+            ssc_enabled: false,
+        })
+        .unwrap();
+        assert_eq!(
+            fake.read32(0x16_f460) & (SSC_ENABLE_PLLA | SSC_ENABLE_PLLB),
+            0
+        );
+        assert_eq!(fake.read32(0x6_4430), 625_000);
+        assert_eq!(fake.vdr.borrow().get(&(0, 0x0c02)).copied(), Some(0x53));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_lt_phy",
+        smoke_nvl_lt_phy_uhbr_enable_sequence
     );
 }

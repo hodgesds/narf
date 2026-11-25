@@ -31,8 +31,11 @@ const UTIL_PWM: u32 = (1 << 31) | (1 << 24);
 /// A register file with a write log. The display-core wells model their
 /// hardware: a `HSW_PWR_WELL_CTL2` request reports its state, the DBUF
 /// slice's state follows its request, the PG0/PG1 fuses read distributed
-/// (unless `fuse_stuck`), the DE PLL locks while enabled, and the pcode
-/// mailbox completes at once. `drop_ram` drops DMC program-RAM writes.
+/// (unless `fuse_stuck`), the DE PLL and DPLL0 (`LCPLL1_CTL`) lock while
+/// enabled, and the pcode mailbox completes at once (its DATA0 reply is the
+/// request, so Skylake's `SKL_CDCLK_PREPARE_FOR_CHANGE` 0x3 reads back with
+/// `SKL_CDCLK_READY_FOR_CHANGE` 0x1 set). `drop_ram` drops DMC program-RAM
+/// writes.
 #[derive(Default)]
 pub(crate) struct Fake {
     regs: RefCell<BTreeMap<u64, u32>>,
@@ -73,6 +76,14 @@ impl Fake {
 const DE_PLL_ENABLE: u64 = 0x46070;
 const DE_PLL_ON: u32 = 1 << 31;
 const DE_PLL_LOCK: u32 = 1 << 30;
+/// `LCPLL1_CTL` (DPLL0): `LCPLL_PLL_ENABLE` bit 31 and `LCPLL_PLL_LOCK` bit
+/// 30, the same bits as the DE PLL's.
+const LCPLL1: u64 = 0x46010;
+/// `BXT_DE_PLL_CTL` and `CDCLK_CTL`.
+const DE_PLL_CTL: u64 = 0x6d000;
+const CDCLK: u64 = 0x46000;
+/// `DPLL_CTRL1`.
+const CTRL1: u64 = 0x6c058;
 
 impl MmioWindow for Fake {
     fn read32(&self, off: u64) -> u32 {
@@ -95,6 +106,8 @@ impl MmioWindow for Fake {
             DBUF_CTL_S1 => val & !(1 << 30),
             DE_PLL_ENABLE if val & DE_PLL_ON != 0 => val | DE_PLL_LOCK,
             DE_PLL_ENABLE => val & !DE_PLL_LOCK,
+            LCPLL1 if val & DE_PLL_ON != 0 => val | DE_PLL_LOCK,
+            LCPLL1 => val & !DE_PLL_LOCK,
             crate::intel_gpu_pcode::PCODE_MAILBOX => 0,
             _ if self.drop_ram.get() && (0x80000..0x8F000).contains(&off) => return,
             _ => val,
@@ -161,6 +174,42 @@ impl Gen9DcOff for LocalDc {
     }
     fn put(&self, user: Gen9DcUser) {
         if let Some(at) = self.core.lock().put(user, self.now.load(Ordering::Relaxed)) {
+            self.deadline.store(at, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The fixture core's system-suspend steps, on the holder's window; a
+/// scheduled re-entry lands in `deadline`.
+impl Gen9DcSuspend for LocalDc {
+    fn present(&self) -> bool {
+        true
+    }
+    fn suspend_begin(&self, regs: &dyn MmioWindow) -> Result<(), DcError> {
+        self.core.lock().suspend_begin(regs)
+    }
+    fn suspend_abort(&self, now: u64) {
+        if let Some(at) = self.core.lock().suspend_abort(now) {
+            self.deadline.store(at, Ordering::Relaxed);
+        }
+    }
+    fn uninit_admit(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        self.core.lock().uninit_admit(regs)
+    }
+    fn dc9_admit(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        self.core.lock().dc9_admit(regs)
+    }
+    fn enter_dc9(&self, regs: &dyn MmioWindow) -> Result<(), Dc9Block> {
+        self.core.lock().enter_dc9(regs)
+    }
+    fn dc9_abort(&self) {
+        self.core.lock().dc9_abort();
+    }
+    fn resume_begin(&self, regs: &dyn MmioWindow) -> Result<bool, DcError> {
+        self.core.lock().resume_begin(regs)
+    }
+    fn resume_finish(&self, loaded: bool, now: u64) {
+        if let Some(at) = self.core.lock().resume_finish(loaded, now) {
             self.deadline.store(at, Ordering::Relaxed);
         }
     }
@@ -438,10 +487,11 @@ kernel_test_in!(
 );
 
 /// System suspend disarms DC6 and holds DC states off. Resume runs the
-/// display-core init (`skl_display_core_init(resume)`: DC_STATE_DISABLE, PW_1
-/// with its PG0/PG1 fuses, MISC IO, the DBUF slice) and reloads the resident
-/// program (`intel_dmc_load_program`) before releasing the Suspend reference:
-/// DC6 returns 17 ms later whether the program survived (s2idle) or was lost
+/// display-core init (`skl_display_core_init(resume)`: DC_STATE_DISABLE, the
+/// PCH reset handshake, PW_1 with its PG0/PG1 fuses, MISC IO,
+/// `intel_cdclk_init_hw`, the DBUF slice) and reloads the resident program
+/// (`intel_dmc_load_program`) before releasing the Suspend reference: DC6
+/// returns 17 ms later whether the program survived (s2idle) or was lost
 /// with system power (S3).
 fn smoke_gen9_dc_suspend_disarms() -> TestResult {
     let fake = Fake::default();
@@ -492,9 +542,18 @@ fn smoke_gen9_dc_suspend_disarms() -> TestResult {
         .iter()
         .position(|(o, v)| *o == DBUF_CTL_S1 && v & (1 << 31) != 0);
     let ram = log.iter().position(|(o, _)| (0x80000..0x8F000).contains(o));
-    match (pw1, misc_io, dbuf, ram) {
-        (Some(p), Some(m), Some(d), Some(r)) if p < m && m < d && d < r => {}
-        _ => return TestResult::Fail("PW_1, MISC IO and DBUF must precede the program reload"),
+    let pch = log
+        .iter()
+        .position(|(o, v)| *o == HSW_NDE_RSTWRN_OPT && v & (1 << 4) != 0);
+    let cdclk = log.iter().position(|(o, _)| *o == CDCLK);
+    match (pch, pw1, misc_io, cdclk, dbuf, ram) {
+        (Some(h), Some(p), Some(m), Some(c), Some(d), Some(r))
+            if h < p && p < m && m < c && c < d && d < r => {}
+        _ => {
+            return TestResult::Fail(
+                "PCH handshake, PW_1, MISC IO, CDCLK and DBUF must precede the program reload",
+            )
+        }
     }
     if core.program_lost()
         || due != 117 * MS
@@ -779,7 +838,7 @@ fn smoke_gen9_dc_gt_irq_hold_while_unparked() -> TestResult {
                 prefetchable: false,
             },
         };
-        if !gt_unparked(&bar).is_some_and(|r| r.service.is_none()) || take_pps_reset_for_bar(&bar) {
+        if gt_unparked(&bar).is_none_or(|r| r.service.is_some()) || take_pps_reset_for_bar(&bar) {
             return TestResult::Fail("without a service the GT_IRQ hold must be inert");
         }
     }
@@ -1113,4 +1172,354 @@ fn smoke_gen9_dc_brackets_an_aux_transfer() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_gen9_dc_states",
     smoke_gen9_dc_brackets_an_aux_transfer
+);
+
+/// `PCODE_MAILBOX` with `GEN6_PCODE_READY` and `SKL_PCODE_CDCLK_CONTROL`
+/// (0x7): one Skylake CDCLK notify (pre or post).
+const SKL_CDCLK_NOTIFY: u32 = 0x8000_0007;
+
+/// The resume's display-core init on display 9 proper after power loss,
+/// in `skl_display_core_init`'s order: the PCH reset handshake enabled (the
+/// rest of `HSW_NDE_RSTWRN_OPT` kept), PW_1 and MISC IO, `skl_cdclk_init_hw`,
+/// then DBUF. With DPLL0 off the CDCLK is programmed from scratch at the
+/// preferred VCO's lowest rung: 337.5 MHz at VCO 8100 (`CDCLK_FREQ_337_308`
+/// 2 << 26, decimal `DIV_ROUND_CLOSEST(336500, 500)` = 673 = 0x2A1; DPLL_CTRL1
+/// `OVERRIDE(0) | LINK_RATE(810 = 2, 0)` = 0x5), through `skl_set_cdclk`'s Wa
+/// #1183 dance and both pcode notifies; 308.571 MHz at VCO 8640 on Kaby Lake
+/// (decimal 615 = 0x267, `LINK_RATE_1080` 4: 0x9). Skylake never takes VCO
+/// 8640 (Wa Display #1183).
+fn smoke_gen9_resume_cdclk_init_and_pch_handshake() -> TestResult {
+    let fake = Fake::default();
+    // An unrelated bit of HSW_NDE_RSTWRN_OPT survives the handshake.
+    fake.set(HSW_NDE_RSTWRN_OPT, 1);
+    if display_core_init(&fake, Gen9Platform::Skylake, 0).is_err() {
+        return TestResult::Fail("the Skylake display-core init must complete");
+    }
+    if fake.writes_to(HSW_NDE_RSTWRN_OPT) != [0x11] {
+        return TestResult::Fail("RESET_PCH_HANDSHAKE_ENABLE (bit 4) must be set, bit 0 kept");
+    }
+    if fake.writes_to(CDCLK)
+        != [
+            0x0800_02A1,
+            0x0808_02A1,
+            0x0008_0000,
+            0x0808_02A1,
+            0x0800_02A1,
+        ]
+    {
+        return TestResult::Fail("CDCLK_CTL must take skl_set_cdclk's 337.5 MHz Wa #1183 dance");
+    }
+    if fake.writes_to(CTRL1) != [0x5] || fake.get(LCPLL1) & (1 << 31) == 0 {
+        return TestResult::Fail("DPLL0 must run at VCO 8100 (DPLL_CTRL1 0x5, LCPLL enabled)");
+    }
+    if fake
+        .writes_to(crate::intel_gpu_pcode::PCODE_MAILBOX)
+        .iter()
+        .filter(|w| **w == SKL_CDCLK_NOTIFY)
+        .count()
+        != 2
+    {
+        return TestResult::Fail("the CDCLK change must be pre- and post-notified");
+    }
+    let log = fake.log();
+    let at = |pred: &dyn Fn(&(u64, u32)) -> bool| log.iter().position(pred);
+    let order = [
+        at(&|(o, _)| *o == HSW_NDE_RSTWRN_OPT),
+        at(&|(o, v)| *o == HSW_PWR_WELL_CTL2 && v & (1 << 29) != 0),
+        at(&|(o, v)| *o == HSW_PWR_WELL_CTL2 && v & (1 << 1) != 0),
+        at(&|(o, _)| *o == CDCLK),
+        at(&|(o, v)| *o == DBUF_CTL_S1 && v & (1 << 31) != 0),
+    ];
+    if order.iter().any(Option::is_none) || order.windows(2).any(|w| w[0] >= w[1]) {
+        return TestResult::Fail("PCH handshake, PW_1, MISC IO, CDCLK, DBUF: in that order");
+    }
+    // Kaby Lake keeps the eDP 1.4 VCO it ran before the suspend.
+    let fake = Fake::default();
+    if display_core_init(&fake, Gen9Platform::KabyLake, 8_640_000).is_err()
+        || fake.get(CDCLK) != 0x0800_0267
+        || fake.writes_to(CTRL1) != [0x9]
+    {
+        return TestResult::Fail("Kaby Lake must restore VCO 8640 at 308.571 MHz");
+    }
+    // Skylake refuses VCO 8640 (Wa Display #1183): VCO 8100 instead.
+    let fake = Fake::default();
+    if display_core_init(&fake, Gen9Platform::Skylake, 8_640_000).is_err()
+        || fake.get(CDCLK) != 0x0800_02A1
+        || fake.writes_to(CTRL1) != [0x5]
+    {
+        return TestResult::Fail("Skylake must fall back to VCO 8100");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_resume_cdclk_init_and_pch_handshake
+);
+
+/// `skl_sanitize_cdclk`: a locked DPLL0 at VCO 8100 with `CDCLK_CTL` at 450
+/// MHz (`CDCLK_FREQ_450_432` 0, decimal 898 = 0x382) is kept untouched; a
+/// wrong decimal alone is rewritten in place; any other stray bit (the Wa
+/// #1183 override left set) forces DPLL0 off and on again and the full
+/// program at the preferred VCO.
+fn smoke_gen9_resume_cdclk_sanitize_skl() -> TestResult {
+    use crate::intel_gpu_gen9_cdclk::{init_hw, InitOutcome};
+    let running = |cdclk: u32| {
+        let fake = Fake::default();
+        fake.write32(CTRL1, 0x5);
+        fake.write32(LCPLL1, 1 << 31);
+        fake.set(CDCLK, cdclk);
+        fake.clear_log();
+        fake
+    };
+    let fake = running(0x0000_0382);
+    if init_hw(&fake, Gen9Platform::Skylake, 8_100_000) != Ok(InitOutcome::Kept)
+        || !fake.log().is_empty()
+    {
+        return TestResult::Fail("a sane 450 MHz CDCLK must be kept without a write");
+    }
+    let fake = running(0x0000_0381);
+    if init_hw(&fake, Gen9Platform::Skylake, 8_100_000) != Ok(InitOutcome::DecimalFixed)
+        || fake.log() != [(CDCLK, 0x0000_0382)]
+    {
+        return TestResult::Fail("a wrong decimal alone must be rewritten in place");
+    }
+    let fake = running(0x0008_0382);
+    let programmed = InitOutcome::Programmed {
+        vco: 8_100_000,
+        cdclk_khz: 337_500,
+    };
+    if init_hw(&fake, Gen9Platform::Skylake, 8_100_000) != Ok(programmed) {
+        return TestResult::Fail("a stray CDCLK_CTL bit must force the full program");
+    }
+    // "force full PLL disable + enable": ENABLE cleared, then set again.
+    let lcpll = fake.writes_to(LCPLL1);
+    if lcpll.len() != 2 || lcpll[0] & (1 << 31) != 0 || lcpll[1] & (1 << 31) == 0 {
+        return TestResult::Fail("DPLL0 must be disabled then re-enabled");
+    }
+    if fake.get(CDCLK) != 0x0800_02A1 {
+        return TestResult::Fail("the forced program must land on 337.5 MHz");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_resume_cdclk_sanitize_skl
+);
+
+/// Gen9 LP: `bxt_display_core_init` clears the PCH reset handshake (no PCH
+/// answers it) and `bxt_cdclk_init_hw` programs the lowest table CDCLK on
+/// a DE PLL that lost power: Broxton 144 MHz on ratio 60 (VCO 1152 MHz, CD2X
+/// divider 4: `BXT_CDCLK_CD2X_DIV_SEL_4` 3 << 22, `PIPE_NONE` 3 << 20,
+/// decimal 286 = 0x11E), Gemini Lake 79.2 MHz on ratio 33 (VCO 633.6 MHz,
+/// divider 4, decimal 156 = 0x9C). A sane 288 MHz Broxton clock is kept even
+/// with its CD2X pipe field naming pipe A (`bxt_sanitize_cdclk` ignores it).
+fn smoke_gen9_resume_cdclk_init_lp() -> TestResult {
+    for (platform, ratio, ctl) in [
+        (Gen9Platform::Broxton, 60, 0x00F0_011E),
+        (Gen9Platform::GeminiLake, 33, 0x00F0_009C),
+    ] {
+        let fake = Fake::default();
+        fake.set(HSW_NDE_RSTWRN_OPT, (1 << 4) | 1);
+        if display_core_init(&fake, platform, 0).is_err() {
+            return TestResult::Fail("the Gen9 LP display-core init must complete");
+        }
+        if fake.writes_to(HSW_NDE_RSTWRN_OPT) != [0x1] {
+            return TestResult::Fail("Gen9 LP must clear RESET_PCH_HANDSHAKE_ENABLE only");
+        }
+        if fake.writes_to(DE_PLL_CTL) != [ratio] || fake.writes_to(CDCLK) != [ctl] {
+            return TestResult::Fail("the DE PLL ratio and CDCLK_CTL of the lowest table rung");
+        }
+        if fake.get(HSW_PWR_WELL_CTL2) & (1 << 1) != 0 {
+            return TestResult::Fail("Gen9 LP requests no MISC IO well");
+        }
+    }
+    // An already-clear handshake bit is not rewritten (intel_de_rmw).
+    let fake = Fake::default();
+    if display_core_init(&fake, Gen9Platform::Broxton, 0).is_err()
+        || !fake.writes_to(HSW_NDE_RSTWRN_OPT).is_empty()
+    {
+        return TestResult::Fail("an unchanged handshake bit must not be written");
+    }
+    // 288 MHz: ratio 60, divider 2 (2 << 22), decimal 574 = 0x23E, CD2X pipe
+    // A (0 << 20) where bxt_cdclk_ctl would name PIPE_NONE.
+    let fake = Fake::default();
+    fake.write32(DE_PLL_CTL, 60);
+    fake.write32(DE_PLL_ENABLE, DE_PLL_ON);
+    fake.set(CDCLK, 0x0080_023E);
+    fake.clear_log();
+    if crate::intel_gpu_bxt_cdclk::init_hw(&fake, false)
+        != Ok(crate::intel_gpu_gen9_cdclk::InitOutcome::Kept)
+        || !fake.log().is_empty()
+    {
+        return TestResult::Fail("a sane Broxton CDCLK must be kept whatever its pipe field");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_resume_cdclk_init_lp
+);
+
+/// `skl_display_core_uninit` after the DC exit: DBUF off, then
+/// `skl_cdclk_uninit_hw` (DPLL0 disabled first, so the frequency is not
+/// written before the Wa #1183 override and DPLL0 is not re-enabled; CDCLK_CTL
+/// ends at `CDCLK_FREQ_337_308` with the 24 MHz decimal 46 = 0x2E), then the
+/// driver's PW_1 request dropped with MISC IO kept. The VCO DPLL0 ran at is
+/// returned for the resume.
+fn smoke_gen9_skl_display_core_uninit() -> TestResult {
+    let fake = Fake::default();
+    fake.write32(HSW_PWR_WELL_CTL2, (1 << 29) | (1 << 1));
+    fake.write32(DBUF_CTL_S1, 1 << 31);
+    fake.write32(CTRL1, 0x5);
+    fake.write32(LCPLL1, 1 << 31);
+    fake.set(CDCLK, 0x0800_02A1);
+    fake.clear_log();
+    if display_core_uninit_skl(&fake, Gen9Platform::Skylake) != Ok(8_100_000) {
+        return TestResult::Fail("the uninit must complete and report VCO 8100");
+    }
+    if fake.writes_to(CDCLK) != [0x0808_02A1, 0x0008_0000, 0x0808_002E, 0x0800_002E] {
+        return TestResult::Fail("CDCLK_CTL must take skl_set_cdclk's VCO-0 sequence");
+    }
+    if !fake.writes_to(CTRL1).is_empty() || fake.get(LCPLL1) & (1 << 31) != 0 {
+        return TestResult::Fail("DPLL0 must be left off");
+    }
+    let wells = fake.get(HSW_PWR_WELL_CTL2);
+    if wells & (1 << 29) != 0 || wells & (1 << 1) == 0 {
+        return TestResult::Fail("PW_1's request must drop and MISC IO's stay");
+    }
+    let log = fake.log();
+    let dbuf = log
+        .iter()
+        .position(|(o, v)| *o == DBUF_CTL_S1 && v & (1 << 31) == 0);
+    let pll = log
+        .iter()
+        .position(|(o, v)| *o == LCPLL1 && v & (1 << 31) == 0);
+    let pw1 = log
+        .iter()
+        .position(|(o, v)| *o == HSW_PWR_WELL_CTL2 && v & (1 << 29) == 0);
+    match (dbuf, pll, pw1) {
+        (Some(d), Some(p), Some(w)) if d < p && p < w => {}
+        _ => return TestResult::Fail("DBUF, then DPLL0, then PW_1"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_skl_display_core_uninit
+);
+
+/// DC9 admission on Gen9 LP refuses a lit DSI transcoder and live device
+/// interrupts before any write, then lifts its fence:
+/// - `bxt_get_dsi_transcoder_state`: behind `BXT_DSI_PLL_ENABLE` with
+///   `BXT_DSI_PLL_DO_ENABLE | BXT_DSI_PLL_LOCKED` (bits 31, 30) and the
+///   dividers `bxt_dsi_pll_is_enabled` accepts (`BXT_DSIA_16X_MASK` 3 << 8,
+///   and on Broxton `BXT_DSIC_16X_MASK` 3 << 10), `DPI_ENABLE` (bit 31) in
+///   `BXT_MIPI_PORT_CTRL(PORT_A)` 0x6b0c0 or `(PORT_C)` 0x6b8c0 refuses;
+///   with the PLL off the ports are not consulted; an enabled PLL with a
+///   rejected divider refuses (its ports cannot be read safely);
+/// - `assert_can_enable_dc9`'s "Interrupts not disabled yet":
+///   `GEN8_MASTER_IRQ` 0x44200 with `GEN8_MASTER_IRQ_CONTROL` (bit 31) set
+///   refuses, at admission and again at the DC9 write.
+fn smoke_gen9_lp_dc9_refuses_dsi_and_live_interrupts() -> TestResult {
+    const DSI_PLL: u32 = (1 << 31) | (1 << 30);
+    const DSIA_DSIC: u32 = (1 << 8) | (1 << 10);
+    let attempt = |platform, setup: &dyn Fn(&Fake)| {
+        let fake = Fake::default();
+        let mut core = armed(&fake, platform);
+        if core.suspend_begin(&fake).is_err() {
+            return (Err(Dc9Block::Unavailable), false);
+        }
+        setup(&fake);
+        fake.clear_log();
+        let got = core.dc9_admit(&fake);
+        core.dc9_abort();
+        let clean = fake.log().is_empty()
+            && core.get(&fake, Gen9DcUser::Kms) == Ok(true)
+            && core.refs(Gen9DcUser::Suspend) == 1;
+        (got, clean)
+    };
+    let lit = |fake: &Fake| {
+        fake.set(0x46080, DSI_PLL);
+        fake.set(0x161000, DSIA_DSIC);
+        fake.set(0x6b0c0, 1 << 31);
+    };
+    for platform in [Gen9Platform::Broxton, Gen9Platform::GeminiLake] {
+        let (got, clean) = attempt(platform, &lit);
+        if got
+            != Err(Dc9Block::DsiActive {
+                reg: 0x6b0c0,
+                value: 1 << 31,
+            })
+            || !clean
+        {
+            return TestResult::Fail("a DSI A port in video mode must refuse DC9 with no write");
+        }
+    }
+    let (got, clean) = attempt(Gen9Platform::Broxton, &|fake| {
+        fake.set(0x46080, DSI_PLL);
+        fake.set(0x161000, DSIA_DSIC);
+        fake.set(0x6b8c0, (1 << 31) | 0x10);
+    });
+    if got
+        != Err(Dc9Block::DsiActive {
+            reg: 0x6b8c0,
+            value: (1 << 31) | 0x10,
+        })
+        || !clean
+    {
+        return TestResult::Fail("a DSI C port in video mode must refuse DC9");
+    }
+    // Broxton validates both dividers, Gemini Lake DSI A's alone.
+    let half = |fake: &Fake| {
+        fake.set(0x46080, DSI_PLL);
+        fake.set(0x161000, 1 << 8);
+    };
+    if attempt(Gen9Platform::Broxton, &half).0 != Err(Dc9Block::DsiPllUnverified(1 << 8))
+        || attempt(Gen9Platform::GeminiLake, &half).0 != Ok(())
+    {
+        return TestResult::Fail("the DSI PLL dividers are checked as bxt_dsi_pll_is_enabled does");
+    }
+    // An unlocked DSI PLL: the ports are not read, so DPI_ENABLE left there
+    // by firmware does not count.
+    let (got, _) = attempt(Gen9Platform::Broxton, &|fake| {
+        fake.set(0x46080, 1 << 31);
+        fake.set(0x6b0c0, 1 << 31);
+    });
+    if got != Ok(()) {
+        return TestResult::Fail("DSI ports behind an unlocked PLL must not be consulted");
+    }
+    // A live master interrupt refuses admission ...
+    let (got, clean) = attempt(Gen9Platform::Broxton, &|fake| {
+        fake.set(0x44200, (1 << 31) | (1 << 16));
+    });
+    if got != Err(Dc9Block::InterruptsLive((1 << 31) | (1 << 16))) || !clean {
+        return TestResult::Fail("an enabled GEN8_MASTER_IRQ must refuse DC9 with no write");
+    }
+    // ... and one re-enabled after admission refuses the DC9 write itself.
+    let fake = Fake::default();
+    let mut core = armed(&fake, Gen9Platform::GeminiLake);
+    let _ = core.suspend_begin(&fake);
+    if core.dc9_admit(&fake).is_err() {
+        return TestResult::Fail("a dark, quiet display must admit DC9");
+    }
+    fake.set(0x44200, 1 << 31);
+    fake.clear_log();
+    if core.enter_dc9(&fake) != Err(Dc9Block::InterruptsLive(1 << 31))
+        || !fake.writes_to(DC_STATE_EN).is_empty()
+        || core.dc9()
+    {
+        return TestResult::Fail("the DC9 write must re-check the interrupts");
+    }
+    // The shared dark check alone: display 9 proper reads no DSI register.
+    let fake = Fake::default();
+    fake.set(0x46080, DSI_PLL);
+    fake.set(0x6b0c0, 1 << 31);
+    if display_dark(&fake, false, false) != Ok(()) {
+        return TestResult::Fail("display 9 proper has no DSI transcoders");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_lp_dc9_refuses_dsi_and_live_interrupts
 );

@@ -1619,6 +1619,12 @@ impl RenderFile {
                 if object.is_wc() || object.is_vram() {
                     return Err(FsError::InvalidData);
                 }
+                // A foreign Xe import has no i915 compatibility mapping (i915
+                // refuses an object without struct pages); only native Xe
+                // MMAP_OFFSET redirects it to the exporter.
+                if object.is_imported() {
+                    return Err(FsError::Unsupported);
+                }
                 let offset = self.gem.mmap_offset(u32_at(&request, 0))?;
                 put64(&mut request, 8, offset);
                 user.write(arg, &request)

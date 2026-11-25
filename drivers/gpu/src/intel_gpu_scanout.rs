@@ -31,6 +31,18 @@ use crate::intel_gpu_pipes::{
 };
 
 const SURFLIVE_OFFSET: u64 = 0x2c;
+/// `PLANE_SURF_DECRYPT` (`skl_plane_surf_offset` with
+/// `plane_state->decrypt`).
+pub(crate) const PLANE_SURF_DECRYPT: u32 = 1 << 2;
+/// `PLANE_COLOR_PLANE_CSC_ENABLE`.
+pub(crate) const PLANE_COLOR_CSC_ENABLE: u32 = 1 << 21;
+/// The primary plane's `PLANE_CSC_COEFF(0..5)`, `PLANE_CSC_PREOFF(0..2)`
+/// and `PLANE_CSC_POSTOFF(0..2)` past its base (`_PLANE_CSC_RY_GY_1_A`
+/// 0x70210, `_PLANE_CSC_PREOFF_HI_1_A` 0x70228, `_PLANE_CSC_POSTOFF_HI_1_A`
+/// 0x70234): what `icl_plane_csc_load_black` zeroes.
+pub(crate) const PLANE_CSC_BLACK: [u64; 12] = [
+    0x90, 0x94, 0x98, 0x9c, 0xa0, 0xa4, 0xa8, 0xac, 0xb0, 0xb4, 0xb8, 0xbc,
+];
 const FRAMECOUNT_OFFSET: u64 = 0x40;
 const PIPE_IIR_BASE: u64 = 0x44408;
 const PRIMARY_FLIP_DONE: u32 = 1 << 3;
@@ -472,6 +484,9 @@ struct Surface {
 struct Pending {
     id: SurfaceId,
     offset: u32,
+    /// The PLANE_SURF value: `offset`, with `PLANE_SURF_DECRYPT` for a
+    /// decrypted protected surface.
+    surf: u32,
     geometry: Geometry,
     view: View,
     plane_offset: u32,
@@ -486,6 +501,8 @@ struct Target {
     geometry: Geometry,
     view: View,
     plane_offset: u32,
+    /// `check_protection` for the surface's object.
+    protection: crate::intel_gpu_gt::media::pxp::PlaneProtection,
 }
 
 /// Hardware evidence for this particular armed surface. `stamp.ns` is the
@@ -517,6 +534,11 @@ pub struct Presenter<M: ScanoutIo> {
     console_surface: u32,
     console_geometry: Option<Geometry>,
     expected_surface: u32,
+    /// The latched PLANE_SURF value (`expected_surface`, with
+    /// `PLANE_SURF_DECRYPT` for a decrypted protected surface).
+    expected_surf: u32,
+    /// The plane CSC was last programmed black (`force_black`).
+    black: bool,
     expected_offset: u32,
     console_ctl: u32,
     expected_view: View,
@@ -597,6 +619,8 @@ impl<M: ScanoutIo> Presenter<M> {
             console_surface: initial_surface,
             console_geometry: None,
             expected_surface: initial_surface,
+            expected_surf: initial_surface,
+            black: false,
             expected_offset: 0,
             console_ctl,
             expected_view: View::default(),
@@ -708,6 +732,8 @@ impl<M: ScanoutIo> Presenter<M> {
             console_surface: console,
             console_geometry: Some(geometry),
             expected_surface: console,
+            expected_surf: console,
+            black: false,
             expected_offset: 0,
             console_ctl,
             expected_view: View::default(),
@@ -748,6 +774,7 @@ impl<M: ScanoutIo> Presenter<M> {
                 geometry,
                 view: View::default(),
                 plane_offset: 0,
+                protection: Default::default(),
             },
             0,
             now,
@@ -779,10 +806,16 @@ impl<M: ScanoutIo> Presenter<M> {
         self
     }
 
+    /// A foreign import is fetched from its mapped attachment's pages
+    /// (another card's memory or BAR), only on an integrated display and
+    /// only once `intel_gpu_prime::pin_for_scanout` pinned and mapped it.
     fn scanout_backing_ok(&self, object: &GemObject) -> bool {
         object.scanout()
             && !object.is_userptr()
-            && ((self.vram_scanout && object.is_vram()) || object.is_wc())
+            && !object.restore_pending()
+            && ((self.vram_scanout && object.is_vram())
+                || object.is_wc()
+                || (!self.vram_scanout && object.is_imported() && object.import_mapped()))
     }
 
     fn encode_surface_pte(
@@ -1010,8 +1043,7 @@ impl<M: ScanoutIo> Presenter<M> {
             return Err(ScanoutError::Busy);
         }
         if !self.geometry_matches(geometry, self.expected_view)
-            || self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
-            || self.io().read32(self.plane() + SURFLIVE_OFFSET) != self.expected_surface
+            || !self.latched_expected()
             || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != self.expected_offset
         {
             return Err(ScanoutError::Unavailable);
@@ -1185,6 +1217,9 @@ impl<M: ScanoutIo> Presenter<M> {
             .view
             .footprint_aligned(surface.geometry, self.alignment)?;
         let (offset, geometry) = (surface.offset + base, surface.geometry);
+        // check_protection, at each commit: the object's key now.
+        let protection =
+            crate::intel_gpu_gt::media::pxp::plane_protection(surface.object.pxp_key());
         self.arm_target(
             id,
             Target {
@@ -1192,6 +1227,7 @@ impl<M: ScanoutIo> Presenter<M> {
                 geometry,
                 view: surface.view,
                 plane_offset,
+                protection,
             },
             ticket,
             now,
@@ -1210,6 +1246,10 @@ impl<M: ScanoutIo> Presenter<M> {
     ) -> Result<Vec<(u64, u32)>, ScanoutError> {
         self.ready()?;
         let surface = self.surfaces.get(&id).ok_or(ScanoutError::UnknownSurface)?;
+        // The DSB arm carries neither the decrypt bit nor the black CSC.
+        if surface.object.pxp_key() != 0 {
+            return Err(ScanoutError::Unsupported);
+        }
         if !surface.object.idle(false) {
             return Err(ScanoutError::Busy);
         }
@@ -1233,6 +1273,7 @@ impl<M: ScanoutIo> Presenter<M> {
                 geometry,
                 view,
                 plane_offset,
+                protection: Default::default(),
             },
             ticket,
             now,
@@ -1242,6 +1283,19 @@ impl<M: ScanoutIo> Presenter<M> {
             (self.plane() + PLANE_OFFSET_OFFSET, plane_offset),
             (self.plane() + PLANE_SURF_OFFSET, offset),
         ];
+        // A plane left black by a stale protected surface gets its CSC
+        // back with this arm.
+        if self.black {
+            let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
+            registers.insert(
+                0,
+                (
+                    self.plane() + COLOR_CTL_OFFSET,
+                    color & !PLANE_COLOR_CSC_ENABLE,
+                ),
+            );
+            self.black = false;
+        }
         if self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) != view.stride(geometry)
             || self.io().read32(self.plane() + PLANE_CTL_OFFSET) != self.control(view)
         {
@@ -1264,8 +1318,7 @@ impl<M: ScanoutIo> Presenter<M> {
         if !self.pending.is_some_and(|pending| pending.deferred) {
             return Err(ScanoutError::Busy);
         }
-        if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
-            || self.io().read32(self.plane() + SURFLIVE_OFFSET) != self.expected_surface
+        if !self.latched_expected()
             || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != self.expected_offset
             || !self.geometry_matches(
                 self.console_geometry.ok_or(ScanoutError::Unsupported)?,
@@ -1291,6 +1344,7 @@ impl<M: ScanoutIo> Presenter<M> {
                 geometry,
                 view: View::default(),
                 plane_offset: 0,
+                protection: Default::default(),
             },
             ticket,
             now,
@@ -1329,9 +1383,7 @@ impl<M: ScanoutIo> Presenter<M> {
         {
             return Err(ScanoutError::Unsupported);
         }
-        if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
-            || self.io().read32(self.plane() + SURFLIVE_OFFSET) != self.expected_surface
-        {
+        if !self.latched_expected() {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }
@@ -1351,7 +1403,13 @@ impl<M: ScanoutIo> Presenter<M> {
             geometry,
             view,
             plane_offset,
+            protection,
         } = target;
+        let surf = if protection.decrypt {
+            offset | PLANE_SURF_DECRYPT
+        } else {
+            offset
+        };
         self.retain_controls(Some(view))?;
         let iir = self.io().read32(self.iir());
         let frame = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
@@ -1369,6 +1427,7 @@ impl<M: ScanoutIo> Presenter<M> {
         self.pending = Some(Pending {
             id,
             offset,
+            surf,
             geometry,
             view,
             plane_offset,
@@ -1407,12 +1466,54 @@ impl<M: ScanoutIo> Presenter<M> {
                 return Err(ScanoutError::Unavailable);
             }
         }
-        self.io().write32(self.plane() + PLANE_SURF_OFFSET, offset);
-        if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != offset {
+        // force_black (icl_plane_csc_load_black, glk_plane_color_ctl): a
+        // protected surface whose key is stale scans out through an all-zero
+        // plane CSC. Both are armed by the SURF write below.
+        if protection.force_black || self.black {
+            if protection.force_black {
+                for reg in PLANE_CSC_BLACK {
+                    self.io().write32(self.plane() + reg, 0);
+                }
+            }
+            let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
+            let want = if protection.force_black {
+                color | PLANE_COLOR_CSC_ENABLE
+            } else {
+                color & !PLANE_COLOR_CSC_ENABLE
+            };
+            self.io().write32(self.plane() + COLOR_CTL_OFFSET, want);
+            self.black = protection.force_black;
+            if color == u32::MAX || self.io().read32(self.plane() + COLOR_CTL_OFFSET) != want {
+                self.failed = true;
+                return Err(ScanoutError::Unavailable);
+            }
+        }
+        self.io().write32(self.plane() + PLANE_SURF_OFFSET, surf);
+        if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != surf {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }
         Ok(())
+    }
+
+    /// SURFLIVE reports a surface whose PLANE_SURF value is `surf` at
+    /// address `offset` (with or without the decrypt bit).
+    fn live_is(&self, live: u32, offset: u32, surf: u32) -> bool {
+        live == offset || live == surf
+    }
+
+    /// PLANE_SURF and SURFLIVE hold the latched surface.
+    fn latched_expected(&self) -> bool {
+        let live = self.io().read32(self.plane() + SURFLIVE_OFFSET);
+        self.io().read32(self.plane() + PLANE_SURF_OFFSET) == self.expected_surf
+            && self.live_is(live, self.expected_surface, self.expected_surf)
+    }
+
+    /// Whether the plane CSC was last programmed black (a stale protected
+    /// surface, `force_black`).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn forced_black(&self) -> bool {
+        self.black
     }
 
     /// Bounded task-context observation, usable from an IRQ-driven worker or
@@ -1432,10 +1533,10 @@ impl<M: ScanoutIo> Presenter<M> {
         }
         if before == after
             && after != pending.frame
-            && live == pending.offset
+            && self.live_is(live, pending.offset, pending.surf)
             && status & PRIMARY_FLIP_DONE != 0
         {
-            if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != pending.offset
+            if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != pending.surf
                 || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != pending.plane_offset
                 || !self.geometry_matches(pending.geometry, pending.view)
             {
@@ -1446,6 +1547,7 @@ impl<M: ScanoutIo> Presenter<M> {
             let xr30_transition = self.expected_view.input == InputFormat::Xrgb2101010
                 || pending.view.input == InputFormat::Xrgb2101010;
             self.expected_surface = pending.offset;
+            self.expected_surf = pending.surf;
             self.expected_offset = pending.plane_offset;
             self.expected_view = pending.view;
             let retired = if pending.id == SurfaceId(0) {
@@ -1502,8 +1604,8 @@ impl<M: ScanoutIo> Presenter<M> {
         let status = self.io().read32(self.iir());
         if before == u32::MAX
             || status & self.faults() != 0
-            || live != self.expected_surface
-            || self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
+            || !self.live_is(live, self.expected_surface, self.expected_surf)
+            || self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surf
             || self.io().read32(self.plane() + PLANE_OFFSET_OFFSET) != self.expected_offset
             || !self.geometry_matches(geometry, self.expected_view)
         {

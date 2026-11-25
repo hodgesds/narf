@@ -8,12 +8,22 @@
 //    the exporter's reservation and refuses CPU access.
 // 3. Refusals: a VRAM-only placement without P2P (-EOPNOTSUPP), a system pin
 //    of an object pinned in VRAM (-EINVAL), a VRAM scanout object.
+// 4. Dynamic importers (xe_dma_buf_attach_ops): mapping does not pin, so the
+//    exporter evicts and migrates the object; each move notifies the
+//    importer first (xe_bo_move_notify -> dma_buf_invalidate_mappings ->
+//    xe_dma_buf_move_notify), whose binding has no pages until its next exec
+//    or VM_BIND maps the new placement (xe_bo_trigger_rebind).
+// 5. System suspend with a pinned VRAM export (xe_bo_evict_all ->
+//    xe_bo_evict_pinned, xe_bo_restore_late -> xe_bo_restore_pinned): the
+//    drain evicts unpinned VRAM; a pinned export keeps its allocation, its
+//    data saved to system memory, and the resume copies it back to the same
+//    device address.
 use super::vram_evict::{create_vram_bo, evict_fixture, EvictBackend};
 use super::*;
 use crate::intel_gpu_exec::vram_clear;
 use crate::intel_gpu_gem::GemObject;
 use crate::intel_gpu_prime::fixture::{Fabric, DISTANT, EXPORTER, PEER};
-use crate::intel_gpu_prime::{attach, Exporter, Import, SgPlacement};
+use crate::intel_gpu_prime::{attach, attach_dynamic, Exporter, Import, SgPlacement};
 use narf_io::p2pdma::P2pMapType;
 use narf_io::sg::Segment;
 use narf_scheduler::block_on_spin;
@@ -184,10 +194,12 @@ fn smoke_xe_prime_import_without_p2p_migrates_to_system_and_binds() -> TestResul
     assert!(imported.is_imported() && !imported.is_vram());
     assert_eq!(imported.size(), BO);
     assert_eq!(imported.pages().next(), None);
-    assert_eq!(
-        importer.gem.mmap_offset(imported_handle),
-        Err(FsError::Unsupported)
-    );
+    // Its MMAP_OFFSET maps the exporter's object (dma_buf_mmap), not its own
+    // pages; the import has no kernel CPU access of its own.
+    let offset = importer.gem.mmap_offset(imported_handle).unwrap();
+    let (owner, within) = importer.gem.mapping_object(offset, 4096).unwrap();
+    assert!(Arc::ptr_eq(&owner, &object) && within == 0);
+    drop(owner);
     assert_eq!(imported.read(0, &mut [0]), Err(FsError::Unsupported));
     assert_eq!(imported.write(0, &[0]), Err(FsError::Unsupported));
     assert_eq!(imported.backing(0, 4096).err(), Some(FsError::Unsupported));
@@ -365,4 +377,439 @@ fn smoke_xe_prime_pinned_and_vram_only_refusals() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_prime",
     smoke_xe_prime_pinned_and_vram_only_refusals
+);
+
+/// The importer's exec at the import's binding: `xe_exec_ioctl`, whose
+/// `xe_vm_validate_rebind` maps a moved import again.
+fn exec_import(importer: &RenderFile, info: &DeviceInfo, user: &Cpu, queue: u32) {
+    exec_wire(user, queue, true, &[]);
+    assert_eq!(
+        block_on_spin(importer.dispatch_user(info, xe::EXEC, 64, user)).expect("native EXEC"),
+        Ok(0)
+    );
+}
+
+fn smoke_xe_prime_move_notify_invalidates_and_rebinds_dynamic_import() -> TestResult {
+    let (frame, pool, backend, info) = evict_fixture(GtPlatform::Battlemage, 0xdfc);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let epoch = backend.status().unwrap().epoch;
+    let handle = create_vram_bo(&file, &info, &user, BO, 3).unwrap();
+    let object = file.gem.object(handle).unwrap();
+    object.write(0, &pattern(9)).unwrap();
+    let bar = |object: &Arc<GemObject>| -> Vec<u64> {
+        // xe_ttm_vram_mgr_alloc_sgt: the DPA plus the fixture BAR's io_start.
+        let bus = frame.start_address().raw() + object.pages().next().unwrap();
+        (0..BO / 4096).map(|page| bus + page * 4096).collect()
+    };
+
+    // A dynamic peer attachment joins the exporter's attachment list.
+    let peer = attach_dynamic(
+        file.gem.export_object(handle).unwrap(),
+        exporter(&backend),
+        &Fabric,
+        Some(EXPORTER),
+        Some(PEER),
+        true,
+    )
+    .unwrap();
+    assert!(peer.is_dynamic() && peer.moves() == 0);
+    assert_eq!(object.dma_buf.dynamic_importers(), 1);
+    let importer = RenderFile::new();
+    let imported_handle = importer
+        .gem
+        .import_attachment(Import::new(EXPORTER_CARD, peer))
+        .unwrap();
+    let imported = importer.gem.object(imported_handle).unwrap();
+    let vm = create_vm(&importer, &info, &user);
+    let queue = create_queue(&importer, &info, &user, vm, 0);
+    bind_wire(
+        &user,
+        vm,
+        &[mapping(imported_handle, 0x1234_0000_0000, 0, BO, PAT_2WAY, 0)],
+        &[],
+    );
+    assert_eq!(bind_now(&importer, &info, &user), Ok(0));
+    let in_vram = bar(&object);
+    assert_eq!(imported.pages().collect::<Vec<_>>(), in_vram);
+    // dma_buf_pin_on_map is false for a dynamic attachment: no pin, so the
+    // object stays evictable.
+    assert!(object.is_vram() && !object.externally_pinned());
+    assert!(object.is_evictable(false));
+
+    // VRAM pressure evicts the export. The importer is notified before the
+    // move: its binding has no pages, not the freed VRAM.
+    assert_eq!(
+        block_on_spin(object.evict_to_system(backend.as_ref(), epoch, false)),
+        Ok(BO)
+    );
+    assert!(!object.is_vram());
+    assert_eq!(pool.used(), 0);
+    let moves = imported.import().unwrap().attachment().moves();
+    assert_eq!(moves, 1);
+    assert!(!imported.import_mapped());
+    assert_eq!(imported.pages().next(), None);
+
+    // The importer's next exec maps the attachment again: a peer takes the
+    // object where it is (system memory now) and the exec's tables use it.
+    exec_import(&importer, &info, &user, queue);
+    assert!(imported.import_mapped());
+    let in_system: Vec<u64> = object.pages().collect();
+    assert_eq!(in_system.len() as u64, BO / 4096);
+    assert_eq!(imported.pages().collect::<Vec<_>>(), in_system);
+    assert!(!object.is_vram());
+
+    // The exporter migrates it back (its exec's re-migration): notified
+    // again, and a VM_BIND of the same range rebinds the new BAR pages.
+    assert_eq!(
+        block_on_spin(object.migrate_to_vram(backend.as_ref(), &pool, true, epoch)),
+        Ok(())
+    );
+    assert!(object.is_vram() && !imported.import_mapped());
+    assert_eq!(imported.import().unwrap().attachment().moves(), moves + 1);
+    bind_wire(
+        &user,
+        vm,
+        &[mapping(imported_handle, 0x1234_0000_0000, 0, BO, PAT_2WAY, 0)],
+        &[],
+    );
+    assert_eq!(bind_now(&importer, &info, &user), Ok(0));
+    assert_eq!(imported.pages().collect::<Vec<_>>(), bar(&object));
+    let mut back = alloc::vec![0; BO as usize];
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(9));
+
+    // A move the importer has not mapped since makes exec map again first.
+    assert_eq!(
+        block_on_spin(object.evict_to_system(backend.as_ref(), epoch, false)),
+        Ok(BO)
+    );
+    exec_import(&importer, &info, &user, queue);
+    assert_eq!(
+        imported.pages().collect::<Vec<_>>(),
+        object.pages().collect::<Vec<_>>()
+    );
+
+    // dma_buf_detach: the import's last owner leaves the attachment list.
+    importer.gem.close(imported_handle).unwrap();
+    drop(imported);
+    drop(importer);
+    assert_eq!(object.dma_buf.dynamic_importers(), 0);
+    assert!(!object.externally_pinned());
+
+    drop(object);
+    drop(file);
+    drop(info);
+    drop(backend);
+    drop(pool);
+    vram_clear::fixture_finish();
+    narf_memory::frame::free_pages(frame, 6);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    smoke_xe_prime_move_notify_invalidates_and_rebinds_dynamic_import
+);
+
+fn smoke_xe_prime_dynamic_host_import_follows_exporter_migration() -> TestResult {
+    let (frame, pool, backend, info) = evict_fixture(GtPlatform::Battlemage, 0xdfc);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let epoch = backend.status().unwrap().epoch;
+    let handle = create_vram_bo(&file, &info, &user, BO, 3).unwrap();
+    let object = file.gem.object(handle).unwrap();
+    object.write(0, &pattern(11)).unwrap();
+    // No P2P path: xe_dma_buf_map of an unpinned object migrates it to TT.
+    let host = attach_dynamic(
+        file.gem.export_object(handle).unwrap(),
+        exporter(&backend),
+        &Fabric,
+        Some(EXPORTER),
+        Some(DISTANT),
+        true,
+    )
+    .unwrap();
+    assert_eq!(host.peer2peer(), None);
+    let importer = RenderFile::new();
+    let imported_handle = importer
+        .gem
+        .import_attachment(Import::new(EXPORTER_CARD, host))
+        .unwrap();
+    let imported = importer.gem.object(imported_handle).unwrap();
+    let vm = create_vm(&importer, &info, &user);
+    let queue = create_queue(&importer, &info, &user, vm, 0);
+    bind_wire(
+        &user,
+        vm,
+        &[mapping(imported_handle, 0x1234_0000_0000, 0, BO, PAT_2WAY, 0)],
+        &[],
+    );
+    assert_eq!(bind_now(&importer, &info, &user), Ok(0));
+    assert!(!object.is_vram() && !object.externally_pinned());
+    assert_eq!(
+        imported.pages().collect::<Vec<_>>(),
+        object.pages().collect::<Vec<_>>()
+    );
+    // The migration on map notified this importer too, before the table it
+    // installed was built.
+    assert!(imported.import_mapped());
+
+    // Unpinned, the export may go back to VRAM (a static attachment's pin
+    // refuses this with -EBUSY); the importer is notified.
+    assert_eq!(
+        block_on_spin(object.migrate_to_vram(backend.as_ref(), &pool, true, epoch)),
+        Ok(())
+    );
+    assert!(object.is_vram() && !imported.import_mapped());
+    // Its next exec maps again, which migrates the export to system memory
+    // once more (Linux's dynamic ping-pong between a VRAM-preferring
+    // exporter and a host importer).
+    exec_import(&importer, &info, &user, queue);
+    assert!(!object.is_vram() && imported.import_mapped());
+    assert_eq!(
+        imported.pages().collect::<Vec<_>>(),
+        object.pages().collect::<Vec<_>>()
+    );
+    let mut back = alloc::vec![0; BO as usize];
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(11));
+
+    importer.gem.close(imported_handle).unwrap();
+    drop(imported);
+    drop(importer);
+    assert_eq!(object.dma_buf.dynamic_importers(), 0);
+    drop(object);
+    drop(file);
+    drop(info);
+    drop(backend);
+    drop(pool);
+    vram_clear::fixture_finish();
+    narf_memory::frame::free_pages(frame, 6);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    smoke_xe_prime_dynamic_host_import_follows_exporter_migration
+);
+
+// CPU mmap of a VRAM export through a peer's import: the importer's offset
+// maps the exporter's LMEM BAR frames write-combining (xe_gem_object_mmap
+// of the exporter, reached by dma_buf_mmap), and the live alias keeps the
+// export in place: an eviction would move pages a process maps.
+fn smoke_xe_prime_foreign_import_mmap_maps_exporter_bar_and_holds_placement() -> TestResult {
+    let (frame, pool, backend, info) = evict_fixture(GtPlatform::Battlemage, 0xdfc);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let epoch = backend.status().unwrap().epoch;
+    let handle = create_vram_bo(&file, &info, &user, BO, 3).unwrap();
+    let object = file.gem.object(handle).unwrap();
+    object.write(0, &pattern(13)).unwrap();
+    let bus = frame.start_address().raw() + object.pages().next().unwrap();
+    let peer = attach_dynamic(
+        file.gem.export_object(handle).unwrap(),
+        exporter(&backend),
+        &Fabric,
+        Some(EXPORTER),
+        Some(PEER),
+        true,
+    )
+    .unwrap();
+    let importer = RenderFile::new();
+    let imported_handle = importer
+        .gem
+        .import_attachment(Import::new(EXPORTER_CARD, peer))
+        .unwrap();
+    let offset = importer.gem.mmap_offset(imported_handle).unwrap();
+    assert_ne!(Ok(offset), file.gem.mmap_offset(handle));
+    let view = importer.gem.mmap_backing(offset + 4096, 8192).unwrap();
+    assert_eq!(view.frames, [bus + 4096, bus + 8192]);
+    assert_eq!(view.memory_type, narf_memory::MemoryType::WriteCombining);
+    // The alias is the exporter's: no eviction while it is mapped.
+    assert!(!object.is_evictable(false));
+    assert_eq!(
+        block_on_spin(object.evict_to_system(backend.as_ref(), epoch, false)),
+        Err(FsError::Busy)
+    );
+    assert!(object.is_vram());
+    drop(view);
+    assert_eq!(
+        block_on_spin(object.evict_to_system(backend.as_ref(), epoch, false)),
+        Ok(BO)
+    );
+    // After the move the same offset maps the exporter's system pages.
+    let view = importer.gem.mmap_backing(offset, 4096).unwrap();
+    assert_eq!(view.frames[0], object.pages().next().unwrap());
+    assert_eq!(view.memory_type, narf_memory::MemoryType::WriteBack);
+    drop(view);
+    let mut back = alloc::vec![0; BO as usize];
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(13));
+
+    importer.gem.close(imported_handle).unwrap();
+    drop(importer);
+    drop(object);
+    drop(file);
+    drop(info);
+    drop(backend);
+    drop(pool);
+    vram_clear::fixture_finish();
+    narf_memory::frame::free_pages(frame, 6);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    smoke_xe_prime_foreign_import_mmap_maps_exporter_bar_and_holds_placement
+);
+
+fn smoke_xe_prime_pinned_vram_export_survives_suspend_in_place() -> TestResult {
+    let (frame, pool, backend, info) = evict_fixture(GtPlatform::Battlemage, 0xdfc);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let epoch = backend.status().unwrap().epoch;
+    let handle = create_vram_bo(&file, &info, &user, BO, 3).unwrap();
+    let object = file.gem.object(handle).unwrap();
+    object.write(0, &pattern(17)).unwrap();
+    let other = file
+        .gem
+        .object(create_vram_bo(&file, &info, &user, BO, 3).unwrap())
+        .unwrap();
+    other.write(0, &pattern(19)).unwrap();
+    let dpa = object.pages().next().unwrap();
+    // A peer's static attachment pins the export in VRAM.
+    let peer = attach(
+        file.gem.export_object(handle).unwrap(),
+        exporter(&backend),
+        &Fabric,
+        Some(EXPORTER),
+        Some(PEER),
+        true,
+    )
+    .unwrap();
+    let sg = block_on_spin(peer.map()).unwrap();
+    assert!(object.externally_pinned() && object.is_vram());
+
+    // xe_bo_evict_all_user: the drain moves only the unpinned object, and
+    // the pinned one is all prepare_suspend's gate would lose.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::evict_vram_for(
+            backend.as_ref(),
+            &pool,
+            false,
+            0,
+            epoch,
+            true
+        )),
+        Ok(BO)
+    );
+    assert!(!other.is_vram() && object.is_vram());
+    assert_eq!(pool.unsaved_bytes(), BO);
+    // xe_bo_evict_pinned: saved to system memory, the allocation kept.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::backup_pinned_vram(
+            backend.as_ref(),
+            &pool,
+            epoch
+        )),
+        Ok(BO)
+    );
+    assert!(object.restore_pending() && object.is_vram());
+    assert_eq!(pool.used(), BO);
+    assert_eq!(pool.unsaved_bytes(), 0);
+    // A second pass keeps the backup that still holds the data.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::backup_pinned_vram(
+            backend.as_ref(),
+            &pool,
+            epoch
+        )),
+        Ok(BO)
+    );
+    // Until the restore nothing reaches the VRAM: no CPU copy or mapping,
+    // no eviction.
+    assert_eq!(object.read(0, &mut [0]), Err(FsError::WouldBlock));
+    assert_eq!(object.write(0, &[0]), Err(FsError::WouldBlock));
+    assert_eq!(object.backing(0, 4096).err(), Some(FsError::WouldBlock));
+    assert!(!object.is_evictable(true));
+
+    // S3 loses LMEM: poison the fixture aperture behind the object.
+    // SAFETY: the fixture exclusively owns its fake LMEM frames; nothing
+    // maps or accesses this object while its restore is pending.
+    unsafe {
+        core::ptr::write_bytes(
+            frame.start_address().kernel_mut_ptr::<u8>().add(dpa as usize),
+            0x5a,
+            BO as usize,
+        )
+    };
+    // xe_bo_restore_pinned: the same device address, the saved bytes.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::restore_pinned_vram(
+            backend.as_ref(),
+            &pool,
+            epoch
+        )),
+        Ok(1)
+    );
+    assert!(!object.restore_pending() && object.is_vram());
+    assert_eq!(object.pages().next(), Some(dpa));
+    let mut back = alloc::vec![0; BO as usize];
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(17));
+    // The peer's table names the same BAR addresses as before the suspend.
+    assert_eq!(block_on_spin(peer.map()).unwrap().segments, sg.segments);
+
+    // Another suspend: the importer's first use after resume restores the
+    // export before mapping it.
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_xe::backup_pinned_vram(
+            backend.as_ref(),
+            &pool,
+            epoch
+        )),
+        Ok(BO)
+    );
+    // SAFETY: as above.
+    unsafe {
+        core::ptr::write_bytes(
+            frame.start_address().kernel_mut_ptr::<u8>().add(dpa as usize),
+            0xa5,
+            BO as usize,
+        )
+    };
+    let importer = RenderFile::new();
+    let imported_handle = importer
+        .gem
+        .import_attachment(Import::new(EXPORTER_CARD, peer))
+        .unwrap();
+    let imported = importer.gem.object(imported_handle).unwrap();
+    assert_eq!(
+        block_on_spin(crate::intel_gpu_prime::ensure_mapped(&imported)),
+        Ok(())
+    );
+    assert!(!object.restore_pending());
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(17));
+    let bus = frame.start_address().raw() + dpa;
+    assert_eq!(imported.pages().next(), Some(bus));
+
+    importer.gem.close(imported_handle).unwrap();
+    drop(imported);
+    drop(importer);
+    assert!(!object.externally_pinned());
+    // Unpinned, a later suspend drains it like any other object.
+    other.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(19));
+    drop(other);
+    drop(object);
+    drop(file);
+    drop(info);
+    drop(backend);
+    drop(pool);
+    vram_clear::fixture_finish();
+    narf_memory::frame::free_pages(frame, 6);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    smoke_xe_prime_pinned_vram_export_survives_suspend_in_place
 );

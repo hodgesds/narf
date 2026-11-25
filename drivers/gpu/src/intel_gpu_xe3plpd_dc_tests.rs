@@ -518,3 +518,172 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3plpd_dc",
     smoke_xe3plpd_dc_guard_releases_what_it_took
 );
+
+/// `intel_display_power_dc3co_compute` (Linux 7.4-rc4) on display 35: one
+/// active pipe, eDP only, the CMTG's 1:1 pipe/port (A/A or B/B, unjoined,
+/// `intel_dc3co_port_pipe_compatible`), PSR2 not in deep sleep, and a
+/// trigger (`DC3CO_TRIGGER_LOBF`, `_PANEL_REPLAY` with AS SDP, `_PSR2` for
+/// selective update) that AS SDP skip frames clears. The owned Nova panel
+/// has none of the triggers, and a triggered state is still refused for
+/// the unowned CMTG, so the service keeps DC6.
+fn smoke_xe3plpd_dc3co_trigger_and_owned_refusal() -> TestResult {
+    let panel = Dc3coState::OWNED_NOVA_PANEL;
+    let psr2 = Dc3coState {
+        sel_update: true,
+        ..panel
+    };
+    let cases = [
+        (panel, Err(Dc3coRefusal::NoTrigger)),
+        (psr2, Ok(1)),
+        (
+            Dc3coState {
+                lobf: true,
+                ..panel
+            },
+            Ok(2),
+        ),
+        (
+            Dc3coState {
+                panel_replay_as_sdp: true,
+                lobf: true,
+                ..panel
+            },
+            Ok(6),
+        ),
+        (
+            Dc3coState {
+                pr_skip_frames: true,
+                ..psr2
+            },
+            Err(Dc3coRefusal::NoTrigger),
+        ),
+        (
+            Dc3coState {
+                active_pipes: 0b11,
+                ..psr2
+            },
+            Err(Dc3coRefusal::NotSinglePipe),
+        ),
+        (
+            Dc3coState {
+                active_pipes: 0,
+                ..psr2
+            },
+            Err(Dc3coRefusal::NotSinglePipe),
+        ),
+        (Dc3coState { edp: false, ..psr2 }, Err(Dc3coRefusal::NotEdp)),
+        (
+            Dc3coState {
+                active_pipes: 0b10,
+                port: 1,
+                ..psr2
+            },
+            Ok(1),
+        ),
+        (
+            Dc3coState {
+                active_pipes: 0b10,
+                ..psr2
+            },
+            Err(Dc3coRefusal::PortPipe),
+        ),
+        (
+            Dc3coState {
+                active_pipes: 0b100,
+                port: 2,
+                ..psr2
+            },
+            Err(Dc3coRefusal::PortPipe),
+        ),
+        (
+            Dc3coState {
+                joined_pipes: 2,
+                ..psr2
+            },
+            Err(Dc3coRefusal::PortPipe),
+        ),
+        (
+            Dc3coState {
+                psr2_deep_sleep: true,
+                ..psr2
+            },
+            Err(Dc3coRefusal::Psr2DeepSleep),
+        ),
+    ];
+    for (state, expected) in cases {
+        if dc3co_trigger(&state) != expected {
+            return TestResult::Fail("DC3CO trigger must follow intel_display_power_dc3co_compute");
+        }
+    }
+    if xe3plpd_dc3co_refusal(&panel) != Dc3coRefusal::NoTrigger
+        || xe3plpd_dc3co_refusal(&psr2) != Dc3coRefusal::CmtgUnowned
+        || XE3PLPD_ALLOWED_DC_MASK & DC_STATE_EN_DC3CO != 0
+        || XE3PLPD_ALLOWED_DC_MASK != DC6
+    {
+        return TestResult::Fail("the owned Nova panel keeps DC6 and never targets DC3CO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3plpd_dc",
+    smoke_xe3plpd_dc3co_trigger_and_owned_refusal
+);
+
+/// The DMC wakelock (`intel_dmc_wl.c`): its mode is enabled only by the
+/// driver, in `DMC_WAKELOCK_CFG`, as it enables DC5/DC6
+/// (`intel_dmc_wl_enable`), and only then must accesses hold
+/// `DMC_WAKELOCK1_CTL` to exit DC states. The display-35 service never
+/// enables it and exits DC through `DC_off`, so a mode an earlier owner left
+/// on (or an unreadable `DMC_WAKELOCK_CFG`) refuses re-entry before any
+/// `DC_STATE_EN` write; with the mode off, the next release enters DC6.
+fn smoke_xe3plpd_dc_refuses_inherited_dmc_wakelock_mode() -> TestResult {
+    let regs = Regs::default();
+    let core = IrqSafeSpinLock::new(DcCore::new_for(
+        DmcPlatform::Xe3pLpd,
+        XE3PLPD_ALLOWED_DC_MASK,
+    ));
+    {
+        let mut c = core.lock();
+        if c.sanitize(&regs).is_err() || c.get(&regs, DcUser::Init).is_err() {
+            return TestResult::Fail("Init must be granted");
+        }
+    }
+    let Some(mut due) =
+        publication_step(&core, &regs, 0, || Ok(Arc::new(container(&[MAIN, PIPE_A]))))
+    else {
+        return TestResult::Fail("the display-35 container must load and release Init");
+    };
+    for (cfg, refusal) in [
+        (DMC_WAKELOCK_CFG_ENABLE, ArmBlock::DmcWakelock),
+        (u32::MAX, ArmBlock::Unavailable),
+    ] {
+        regs.set(DMC_WAKELOCK_CFG, cfg);
+        regs.writes.borrow_mut().clear();
+        if core.lock().arm_if_due(&regs, due, ArmGates::default()) != Err(refusal)
+            || !regs.written(DC_STATE_EN).is_empty()
+            || regs.get(DC_STATE_EN) & DC6 != 0
+            || !regs.written(DMC_WAKELOCK_CFG).is_empty()
+        {
+            return TestResult::Fail("an inherited wakelock mode must keep DC0 untouched");
+        }
+        let mut c = core.lock();
+        if c.get(&regs, DcUser::Kms).is_err() {
+            return TestResult::Fail("a reference must still be granted in DC0");
+        }
+        match c.put(DcUser::Kms, due) {
+            Some(next) => due = next,
+            None => return TestResult::Fail("the release must reschedule re-entry"),
+        }
+    }
+    regs.set(DMC_WAKELOCK_CFG, 0);
+    if core.lock().arm_if_due(&regs, due, ArmGates::default()) != Ok(DC6)
+        || regs.get(DC_STATE_EN) & DC6 == 0
+    {
+        return TestResult::Fail("with the wakelock mode off the service must enter DC6");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3plpd_dc",
+    smoke_xe3plpd_dc_refuses_inherited_dmc_wakelock_mode
+);

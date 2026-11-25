@@ -387,6 +387,12 @@ fn post_notify(io: &(impl MmioWindow + ?Sized), cdclk_khz: u32) {
 /// the hardware already runs is a no-op (no notify, no
 /// writes); the modeset only calls this when the floor is
 /// unmet. VCO 8640 on Skylake is refused (Wa #1183).
+///
+/// A VCO-0 target at the 24 MHz bypass is `skl_cdclk_uninit_hw`:
+/// `skl_dpll0_disable` leaves Linux's tracked VCO at 0, so the
+/// frequency is not written before the override and DPLL0 is not
+/// enabled again. An `old` whose VCO is `u32::MAX` is
+/// `skl_sanitize_cdclk`'s "force full PLL disable + enable".
 pub fn program(
     io: &(impl MmioWindow + ?Sized),
     old: &Current,
@@ -404,12 +410,15 @@ pub fn program(
     let want_dec = decimal(target_cdclk_khz);
     pre_notify(io)?;
     // `skl_set_cdclk`: disable DPLL0 first on a VCO change
-    // from a running PLL.
-    if old.vco != 0 && old.vco != target_vco {
+    // from a running PLL; the disable leaves the VCO at 0.
+    let mut hw_vco = old.vco;
+    if hw_vco != 0 && hw_vco != target_vco {
         dpll0_disable(io)?;
+        hw_vco = 0;
     }
+    let old_vco = hw_vco;
     let mut ctl = read(io, CDCLK_CTL)?;
-    if old.vco != target_vco {
+    if old_vco != target_vco {
         // Wa #1183: program freq + decimal before the
         // override when the VCO changes.
         ctl &= !(CDCLK_FREQ_SEL_MASK | CDCLK_FREQ_DECIMAL_MASK);
@@ -420,7 +429,7 @@ pub fn program(
     ctl |= CDCLK_DIVMUX_CD_OVERRIDE;
     io.write32(CDCLK_CTL, ctl);
     let _ = read(io, CDCLK_CTL)?;
-    if old.vco != target_vco {
+    if old_vco != target_vco {
         dpll0_enable(io, target_vco)?;
     }
     // Wa #1183: re-program freq + decimal, override off.
@@ -439,6 +448,87 @@ pub fn program(
         return Err(CdclkError::Readback);
     }
     Ok(())
+}
+
+/// What a display-core CDCLK init (`intel_cdclk_init_hw`) did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitOutcome {
+    /// The running clock passed the sanitize checks; nothing written.
+    Kept,
+    /// Only the `CDCLK_CTL` decimal field was wrong: rewritten in place.
+    DecimalFixed,
+    /// The clock was programmed from scratch: this VCO and CDCLK (kHz).
+    Programmed { vco: u32, cdclk_khz: u32 },
+}
+
+/// `skl_sanitize_cdclk`: `None` when the clock must be programmed from
+/// scratch ("force full PLL disable + enable"), otherwise what was kept.
+fn sanitize(
+    io: &(impl MmioWindow + ?Sized),
+    hw: &Current,
+) -> Result<Option<InitOutcome>, CdclkError> {
+    // "Is PLL enabled and locked?"
+    if hw.vco == 0 || hw.cdclk_khz == REFCLK_KHZ {
+        return Ok(None);
+    }
+    // "DPLL okay; verify the cdclock": the frequency select as found with
+    // the decimal field of the decoded CDCLK, and no other bit.
+    let cdctl = read(io, CDCLK_CTL)?;
+    let expected = (cdctl & CDCLK_FREQ_SEL_MASK) | decimal(hw.cdclk_khz);
+    if cdctl == expected {
+        return Ok(Some(InitOutcome::Kept));
+    }
+    let fixed = (cdctl & !CDCLK_FREQ_DECIMAL_MASK) | (expected & CDCLK_FREQ_DECIMAL_MASK);
+    if fixed != expected {
+        return Ok(None);
+    }
+    io.write32(CDCLK_CTL, expected);
+    Ok(Some(InitOutcome::DecimalFixed))
+}
+
+/// `intel_cdclk_init_hw` on display 9 (`skl_cdclk_init_hw`), run by the
+/// display-core init (`skl_display_core_init`): a clock that passes
+/// `skl_sanitize_cdclk` is kept (its decimal field corrected if that alone
+/// is wrong); otherwise DPLL0 is disabled and re-enabled at the preferred
+/// VCO (`skl_preferred_vco_freq`, VCO 8100 when none was recorded) and
+/// CDCLK is programmed at that VCO's lowest rung (`skl_calc_cdclk(0, vco)`).
+/// Skylake never takes VCO 8640 here (Wa Display #1183; Linux would warn
+/// and program it).
+pub fn init_hw(
+    io: &(impl MmioWindow + ?Sized),
+    platform: Gen9Platform,
+    preferred_vco: u32,
+) -> Result<InitOutcome, CdclkError> {
+    let hw = Current::read(io)?;
+    if let Some(kept) = sanitize(io, &hw)? {
+        return Ok(kept);
+    }
+    let vco = if preferred_vco == VCO_8640_KHZ && !matches!(platform, Gen9Platform::Skylake) {
+        VCO_8640_KHZ
+    } else {
+        VCO_8100_KHZ
+    };
+    let cdclk_khz = calc_cdclk(0, vco);
+    let forced = Current {
+        vco: u32::MAX,
+        cdclk_khz: 0,
+        ..hw
+    };
+    program(io, &forced, cdclk_khz, vco, platform)?;
+    Ok(InitOutcome::Programmed { vco, cdclk_khz })
+}
+
+/// `intel_cdclk_uninit_hw` on display 9 (`skl_cdclk_uninit_hw`), run by
+/// the display-core uninit (`skl_display_core_uninit`): CDCLK to the 24 MHz
+/// bypass with DPLL0 off. Returns the VCO DPLL0 ran at, the preferred VCO
+/// the next [`init_hw`] restores (0 when it was already off).
+pub fn uninit_hw(
+    io: &(impl MmioWindow + ?Sized),
+    platform: Gen9Platform,
+) -> Result<u32, CdclkError> {
+    let hw = Current::read(io)?;
+    program(io, &hw, REFCLK_KHZ, 0, platform)?;
+    Ok(hw.vco)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

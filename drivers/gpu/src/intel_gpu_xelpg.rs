@@ -46,10 +46,12 @@
 //!
 //! ## Scope
 //!
-//! - DP 1.4 rates only (RBR/HBR/HBR2/HBR3 + the eDP intermediate
-//!   rates on C10). DP 2.0 UHBR rates use the C20 MPLLA tables and
-//!   128b/132b encoding, which the DP stack in this tree does not
-//!   model yet.
+//! - DP 1.4 rates (RBR/HBR/HBR2/HBR3 + the eDP intermediate rates on
+//!   C10) and, on C20, the DP 2.0 UHBR rates (`mtl_c20_dp_uhbr10/13_5/20`,
+//!   [`dp_uhbr_pll_request`]): UHBR10/20 run on MPLLA, UHBR13.5 on MPLLB,
+//!   at the 40-bit custom width with the TX FFE presets of
+//!   `mtl_c20_trans_uhbr` ([`set_signal_levels_uhbr`]). The 128b/132b link
+//!   layer above them lives in `intel_gpu_dp_uhbr.rs`.
 //! - HDMI PLL states (C10/C20 carry separate HDMI tables) land
 //!   with the HDMI lane; this module's lookups return `None` for
 //!   non-DP rates.
@@ -263,8 +265,10 @@ pub const PORT_BUF_D2D_LINK_STATE: u32 = 1 << 28;
 /// `XELPDP_PORT_BUF_SOC_PHY_READY` (BUF_CTL1 bit 24).
 pub const PORT_BUF_SOC_PHY_READY: u32 = 1 << 24;
 /// `XELPDP_PORT_BUF_PORT_DATA_WIDTH` field (BUF_CTL1 bits 19:18);
-/// 0 = 10-bit (DP 1.4 8b/10b), the only width this lane programs.
+/// 0 = 10-bit (DP 1.4 8b/10b).
 pub const PORT_BUF_PORT_DATA_WIDTH_MASK: u32 = 0x3 << 18;
+/// `XELPDP_PORT_BUF_PORT_DATA_40BIT`: the 128b/132b (UHBR) data width.
+pub const PORT_BUF_PORT_DATA_40BIT: u32 = 2 << 18;
 /// `XELPDP_PORT_REVERSAL` (BUF_CTL1 bit 16).
 pub const PORT_BUF_REVERSAL: u32 = 1 << 16;
 /// `XELPDP_PORT_BUF_IO_SELECT_TBT` (BUF_CTL1 bit 11) — set only for
@@ -354,9 +358,11 @@ pub const DDI_CLOCK_SELECT_MASK: u32 = 0xF << 12;
 /// 312.5/625 MHz selects need the fifth bit).
 pub const XE3_DDI_CLOCK_SELECT_MASK: u32 = 0x1F << 12;
 
-/// `XELPDP_DDI_CLOCK_SELECT_MASK(display)` for the window's display.
+/// `XELPDP_DDI_CLOCK_SELECT_MASK(display)` for the window's display: the
+/// five-bit field on display >= 30, which is Panther/Wildcat Lake's Cx0 view
+/// and Nova Lake's LT view.
 fn ddi_clock_select_mask<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
-    if mmio.cx0_xe3() {
+    if mmio.cx0_xe3() || mmio.has_lt_phy() {
         XE3_DDI_CLOCK_SELECT_MASK
     } else {
         DDI_CLOCK_SELECT_MASK
@@ -369,7 +375,12 @@ pub const TBT_CLOCK_REQUEST: u32 = 1 << 19;
 pub const TBT_CLOCK_ACK: u32 = 1 << 18;
 
 /// `intel_mtl_tbt_pll_enable_clock`: use the fabric's clock, with no
-/// C20 reset, SRAM or message-bus transaction against the USB-owned PHY.
+/// C20 or LT reset, SRAM or message-bus transaction against the USB-owned
+/// PHY. The clock mux takes `intel_mtl_tbt_clock_select` for the DP 1.4
+/// rates in the display's select field (five bits on display >= 30, where
+/// Linux also has the UHBR10/20 selects; UHBR is not routed here), then
+/// `DDI_CLK_VALFREQ` takes `intel_ddi_link_symbol_clock`, which is the port
+/// clock for an 8b/10b rate.
 pub fn enable_tbt_clock<M: MmioWindow + ?Sized>(
     mmio: &M,
     port: XeLpgPort,
@@ -401,10 +412,16 @@ pub fn enable_tbt_clock<M: MmioWindow + ?Sized>(
     if !wait_for(mmio, off, TBT_CLOCK_ACK, true, 100_000) || !mmio.display_access_ok() {
         return Err(Cx0Error::Timeout);
     }
+    // 7. DDI_CLK_VALFREQ to the intended DDI clock.
+    if let Some(valfreq) = port.clk_valfreq() {
+        mmio.write32(valfreq, rate.megabits_per_sec() * 100);
+        compiler_fence(Ordering::SeqCst);
+    }
     Ok(())
 }
 
 /// `intel_mtl_tbt_pll_disable_clock`; the fabric keeps its PHY and tunnel.
+/// The request drops, then the mux is gated and `DDI_CLK_VALFREQ` cleared.
 pub fn disable_tbt_clock<M: MmioWindow + ?Sized>(
     mmio: &M,
     port: XeLpgPort,
@@ -423,6 +440,11 @@ pub fn disable_tbt_clock<M: MmioWindow + ?Sized>(
         ddi_clock_select_mask(mmio) | FORWARD_CLOCK_UNGATE,
         0,
     );
+    // 6. DDI_CLK_VALFREQ to 0.
+    if let Some(valfreq) = port.clk_valfreq() {
+        mmio.write32(valfreq, 0);
+        compiler_fence(Ordering::SeqCst);
+    }
     Ok(())
 }
 /// `XELPDP_FORWARD_CLOCK_UNGATE` (PORT_CLOCK_CTL bit 10).
@@ -1004,8 +1026,9 @@ pub struct C10PllState {
 }
 
 /// C20 PLL state: 16-bit SRAM context words — TX(3), CMN(4),
-/// MPLLB(11). DP 1.4 always uses MPLLB on C20 (UHBR 10G/20G use
-/// MPLLA and are out of scope).
+/// MPLLB(11). DP 1.4, HDMI TMDS and UHBR13.5 use MPLLB on C20; UHBR10
+/// and UHBR20 use MPLLA ([`C20MpllaState`]). Linux keeps both in one
+/// union and selects by `tx[0]` bit 7 (`intel_c20phy_use_mpllb`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct C20PllState {
     /// TX context words.
@@ -1015,6 +1038,22 @@ pub struct C20PllState {
     /// MPLLB context words.
     pub mpllb: [u16; 11],
 }
+
+/// A C20 PLL state on MPLLA (`intel_c20pll_state.mplla`): the DP 2.0
+/// 10 and 20 Gbps rates (`is_mplla_clock_rate`). `tx[0]` bit 7
+/// (`C20_PHY_USE_MPLLB`) is clear.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct C20MpllaState {
+    /// TX context words.
+    pub tx: [u16; 3],
+    /// Common context words.
+    pub cmn: [u16; 4],
+    /// MPLLA context words.
+    pub mplla: [u16; 10],
+}
+
+/// `C20_PHY_USE_MPLLB` (TX context word 0, bit 7).
+pub const C20_PHY_USE_MPLLB: u16 = 1 << 7;
 
 /// Port clock (kHz) for a DP link rate — the PLL tables are keyed
 /// by it. `None` for the HDMI rates the shared enum carries.
@@ -1029,15 +1068,39 @@ pub const fn dp_port_clock_khz(rate: LinkRate) -> Option<u32> {
 }
 
 /// C20 serdes-rate index for a DP port clock
-/// (`intel_c20_get_dp_rate`, DP 1.4 range).
+/// (`intel_c20_get_dp_rate`: the DP 1.4 rates and the DP 2.0 UHBR rates).
 fn c20_dp_rate_index(port_clock_khz: u32) -> Option<u8> {
     match port_clock_khz {
         162_000 => Some(0),
         270_000 => Some(1),
         540_000 => Some(2),
         810_000 => Some(3),
+        1_000_000 => Some(8),
+        1_350_000 => Some(9),
+        2_000_000 => Some(10),
         _ => None,
     }
+}
+
+/// `is_dp2`: the DP 2.0 (UHBR, 128b/132b) port clocks.
+pub const fn is_dp2_clock(port_clock_khz: u32) -> bool {
+    matches!(port_clock_khz, 1_000_000 | 1_350_000 | 2_000_000)
+}
+
+/// `is_mplla_clock_rate`: UHBR10 and UHBR20 run on MPLLA, whose SSC bit
+/// `intel_program_port_clock_ctl` sets instead of MPLLB's.
+pub const fn is_mplla_clock_rate(port_clock_khz: u32) -> bool {
+    matches!(port_clock_khz, 1_000_000 | 2_000_000)
+}
+
+/// `intel_ddi_link_symbol_clock` for a DP port clock
+/// (`intel_dp_link_symbol_clock`): `DIV_ROUND_CLOSEST(rate * 10,
+/// symbol_size)`, 10-bit symbols on 8b/10b (the port clock itself) and
+/// 32-bit symbols on 128b/132b (UHBR10 312500, UHBR13.5 421875, UHBR20
+/// 625000). It is what `DDI_CLK_VALFREQ` carries.
+pub const fn dp_link_symbol_clock_khz(port_clock_khz: u32) -> u32 {
+    let size: u64 = if port_clock_khz >= 1_000_000 { 32 } else { 10 };
+    ((port_clock_khz as u64 * 10 + size / 2) / size) as u32
 }
 
 const C10_DP_RBR: C10PllState = C10PllState {
@@ -1161,6 +1224,61 @@ const C20_DP_HBR3: C20PllState = C20PllState {
     ],
 };
 
+// C20 basic DP 2.0 tables (`intel_cx0_phy.c`): `mtl_c20_dp_uhbr10`,
+// `mtl_c20_dp_uhbr13_5`, `mtl_c20_dp_uhbr20`, and display 30's UHBR13.5
+// (`xe3lpd_c20_dp_edp_tables` carries `xe2hpd_c20_dp_uhbr13_5`).
+const C20_DP_UHBR10: C20MpllaState = C20MpllaState {
+    tx: [0xBE21, 0xE800, 0x0000],
+    cmn: [0x0700, 0x0005, 0x0000, 0x0000],
+    mplla: [
+        0x3104, 0xD105, 0xC025, 0xC025, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001,
+    ],
+};
+const C20_DP_UHBR13_5: C20PllState = C20PllState {
+    tx: [0xBEA0, 0x4800, 0x0000],
+    cmn: C20_CMN_DP14,
+    mpllb: [
+        0x015F, 0x2205, 0x1B17, 0xFFC1, 0xE100, 0xBD00, 0x2000, 0x0001, 0x4800, 0x0000, 0x0000,
+    ],
+};
+const C20_XE2HPD_DP_UHBR13_5: C20PllState = C20PllState {
+    tx: [0xBEA0, 0x4800, 0x0000],
+    cmn: C20_CMN_DP14,
+    mpllb: [
+        0x015F, 0x2205, 0x1B17, 0xFFC1, 0xBD00, 0x9EC3, 0x2000, 0x0001, 0x4800, 0x0000, 0x0000,
+    ],
+};
+const C20_DP_UHBR20: C20MpllaState = C20MpllaState {
+    tx: [0xBE20, 0x4800, 0x0000],
+    cmn: C20_CMN_DP14,
+    mplla: [
+        0x3104, 0xD105, 0x9217, 0x9217, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001,
+    ],
+};
+
+/// A C20 DP 2.0 PLL image on the MPLL its `tx[0]` selects.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum C20UhbrPll {
+    /// UHBR10 / UHBR20.
+    Mplla(&'static C20MpllaState),
+    /// UHBR13.5.
+    Mpllb(&'static C20PllState),
+}
+
+/// The C20 DP 2.0 PLL image for a UHBR port clock from the display's
+/// table (`intel_c20_pll_tables_get`): `mtl_c20_dp_tables` below display
+/// 30, `xe3lpd_c20_dp_edp_tables` (with `xe2hpd_c20_dp_uhbr13_5`) on
+/// display 30. UHBR10 and UHBR20 are the same image in both.
+pub fn c20_uhbr_pll_state(port_clock_khz: u32, display30: bool) -> Option<C20UhbrPll> {
+    match port_clock_khz {
+        1_000_000 => Some(C20UhbrPll::Mplla(&C20_DP_UHBR10)),
+        1_350_000 if display30 => Some(C20UhbrPll::Mpllb(&C20_XE2HPD_DP_UHBR13_5)),
+        1_350_000 => Some(C20UhbrPll::Mpllb(&C20_DP_UHBR13_5)),
+        2_000_000 => Some(C20UhbrPll::Mplla(&C20_DP_UHBR20)),
+        _ => None,
+    }
+}
+
 /// Resolve the C20 PLL state for a DP 1.4 port clock.
 pub fn c20_pll_state(port_clock_khz: u32) -> Option<&'static C20PllState> {
     match port_clock_khz {
@@ -1184,6 +1302,10 @@ const C20_A_CMN_CNTX_CFG: u16 = 0xCDAA;
 const C20_B_CMN_CNTX_CFG: u16 = 0xCDA5;
 const C20_A_MPLLB_CNTX_CFG: u16 = 0xCB5A;
 const C20_B_MPLLB_CNTX_CFG: u16 = 0xCB4E;
+/// `_MTL_C20_{A,B}_MPLLA_CFG` (display 14.00, 20 and 30; only 14.01's
+/// Xe2_HPD C20 moves them).
+const C20_A_MPLLA_CNTX_CFG: u16 = 0xCCF0;
+const C20_B_MPLLA_CNTX_CFG: u16 = 0xCCE5;
 
 // ── PLL programming ──────────────────────────────────────────────
 
@@ -1235,11 +1357,13 @@ pub struct C20Vdr {
 }
 
 impl C20Vdr {
-    /// DP 1.4: width 0, `IS_DP | DP_RATE(intel_c20_get_dp_rate)`.
+    /// DP (`intel_c20_calc_vdr_params`): `IS_DP | DP_RATE(
+    /// intel_c20_get_dp_rate)`, custom width 0 on DP 1.4 and 2 on the
+    /// DP 2.0 rates (`intel_get_c20_custom_width`, `is_dp2`).
     pub fn dp(port_clock_khz: u32) -> Option<Self> {
         let rate = c20_dp_rate_index(port_clock_khz)?;
         Some(Self {
-            custom_width: 0,
+            custom_width: if is_dp2_clock(port_clock_khz) { 2 } else { 0 },
             serdes_rate: C20_SERDES_IS_DP | (rate << 1),
             hdmi_rate: None,
         })
@@ -1274,6 +1398,42 @@ fn c20_pll_program_vdr<M: MmioWindow + ?Sized>(
     vdr: &C20Vdr,
     protocol_switch: bool,
 ) -> Result<(), Cx0Error> {
+    c20_pll_program_context(
+        phy,
+        C20Context {
+            tx: &state.tx,
+            cmn: &state.cmn,
+            mpll: C20Mpll::B(&state.mpllb),
+        },
+        vdr,
+        protocol_switch,
+    )
+}
+
+/// The MPLL words of one C20 context (`intel_c20phy_use_mpllb`).
+#[derive(Copy, Clone)]
+enum C20Mpll<'a> {
+    A(&'a [u16; 10]),
+    B(&'a [u16; 11]),
+}
+
+/// One C20 SRAM context image.
+#[derive(Copy, Clone)]
+struct C20Context<'a> {
+    tx: &'a [u16; 3],
+    cmn: &'a [u16; 4],
+    mpll: C20Mpll<'a>,
+}
+
+/// `intel_c20_pll_program` step 3.3 writes the MPLLB words when
+/// `intel_c20phy_use_mpllb`, the MPLLA words otherwise, into the context
+/// the toggle bit does not select.
+fn c20_pll_program_context<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    state: C20Context<'_>,
+    vdr: &C20Vdr,
+    protocol_switch: bool,
+) -> Result<(), Cx0Error> {
     // Step 1: current context selection (toggle bit of the
     // serdes-rate byte, read on lane 0).
     let serdes = phy.read(LANE0, C20_VDR_CUSTOM_SERDES_RATE)?;
@@ -1291,10 +1451,10 @@ fn c20_pll_program_vdr<M: MmioWindow + ?Sized>(
     // currently select (i915 writes context A when the bit reads
     // set, context B when it reads clear), then flip the bit in
     // step 7 to make the freshly written context live.
-    let (tx_base, cmn_base, mpllb_base) = if cntx {
-        (C20_A_TX_CNTX_CFG, C20_A_CMN_CNTX_CFG, C20_A_MPLLB_CNTX_CFG)
+    let (tx_base, cmn_base) = if cntx {
+        (C20_A_TX_CNTX_CFG, C20_A_CMN_CNTX_CFG)
     } else {
-        (C20_B_TX_CNTX_CFG, C20_B_CMN_CNTX_CFG, C20_B_MPLLB_CNTX_CFG)
+        (C20_B_TX_CNTX_CFG, C20_B_CMN_CNTX_CFG)
     };
     for (i, word) in state.tx.iter().enumerate() {
         phy.sram_write(LANE0, tx_base - i as u16, *word)?;
@@ -1302,8 +1462,14 @@ fn c20_pll_program_vdr<M: MmioWindow + ?Sized>(
     for (i, word) in state.cmn.iter().enumerate() {
         phy.sram_write(LANE0, cmn_base - i as u16, *word)?;
     }
-    for (i, word) in state.mpllb.iter().enumerate() {
-        phy.sram_write(LANE0, mpllb_base - i as u16, *word)?;
+    let (mpll_base, words): (u16, &[u16]) = match state.mpll {
+        C20Mpll::B(words) if cntx => (C20_A_MPLLB_CNTX_CFG, words),
+        C20Mpll::B(words) => (C20_B_MPLLB_CNTX_CFG, words),
+        C20Mpll::A(words) if cntx => (C20_A_MPLLA_CNTX_CFG, words),
+        C20Mpll::A(words) => (C20_B_MPLLA_CNTX_CFG, words),
+    };
+    for (i, word) in words.iter().enumerate() {
+        phy.sram_write(LANE0, mpll_base - i as u16, *word)?;
     }
     // Steps 4-6: VDR parameters (`intel_c20_program_vdr_params`) —
     // custom width, the serdes rate byte and, for HDMI, the HDMI rate.
@@ -1688,8 +1854,10 @@ fn program_pll_state<M: MmioWindow + ?Sized>(
 pub enum Cx0PllState {
     /// C10 bytes (DDI A/B).
     C10(C10PllState),
-    /// C20 SRAM context words plus VDR protocol parameters (TC ports).
+    /// C20 SRAM context words on MPLLB plus VDR protocol parameters.
     C20(C20PllState, C20Vdr),
+    /// C20 SRAM context words on MPLLA (UHBR10/20) plus VDR parameters.
+    C20Mplla(C20MpllaState, C20Vdr),
 }
 
 /// Everything `intel_cx0pll_enable` needs beyond the port.
@@ -1728,8 +1896,15 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
     }
     let c10 = match (&req.state, phy_kind(mmio, port)) {
         (Cx0PllState::C10(_), PhyKind::C10) => true,
-        (Cx0PllState::C20(..), PhyKind::C20) => false,
+        (Cx0PllState::C20(..) | Cx0PllState::C20Mplla(..), PhyKind::C20) => false,
         _ => return Err(Cx0Error::UnsupportedRate),
+    };
+    // intel_program_port_clock_ctl: DP 2.0 10G and 20G rates enable MPLLA,
+    // so their SSC bit is PLLA's; every other rate's is PLLB's.
+    let ssc = match (req.ssc, is_mplla_clock_rate(req.port_clock_khz)) {
+        (false, _) => 0,
+        (true, true) => SSC_ENABLE_PLLA,
+        (true, false) => SSC_ENABLE_PLLB,
     };
     let phy = Cx0Phy::with_lanes(mmio, port, req.lanes);
     rmw(
@@ -1752,7 +1927,7 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
             | SSC_ENABLE_PLLB,
         FORWARD_CLOCK_UNGATE
             | DDI_CLOCK_SELECT_MAXPCLK
-            | if req.ssc { SSC_ENABLE_PLLB } else { 0 }
+            | ssc
             | if req.lanes.reversed {
                 LANE1_PHY_CLOCK_SELECT
             } else {
@@ -1765,10 +1940,29 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
     match &req.state {
         Cx0PllState::C10(state) => c10_pll_program(&phy, state)?,
         Cx0PllState::C20(state, vdr) => c20_pll_program_vdr(&phy, state, vdr, req.protocol_switch)?,
+        Cx0PllState::C20Mplla(state, vdr) => c20_pll_program_context(
+            &phy,
+            C20Context {
+                tx: &state.tx,
+                cmn: &state.cmn,
+                mpll: C20Mpll::A(&state.mplla),
+            },
+            vdr,
+            req.protocol_switch,
+        )?,
     }
     program_phy_lane(&phy, req.lane_count, req.dp_alt)?;
+    // 8. DDI_CLK_VALFREQ = intel_ddi_link_symbol_clock: the port clock for
+    // HDMI TMDS and DP 8b/10b, the 32-bit symbol clock on 128b/132b.
     if let Some(off) = port.clk_valfreq() {
-        mmio.write32(off, req.port_clock_khz);
+        mmio.write32(
+            off,
+            if req.hdmi {
+                req.port_clock_khz
+            } else {
+                dp_link_symbol_clock_khz(req.port_clock_khz)
+            },
+        );
         compiler_fence(Ordering::SeqCst);
     }
     set_pclk_pll_request(mmio, port, true, req.lanes)?;
@@ -1812,6 +2006,43 @@ pub fn dp_pll_request(
             C20Vdr::dp(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?,
         ),
     };
+    Ok(PllRequest {
+        lanes: PhyLaneConfig::NATIVE,
+        state,
+        port_clock_khz,
+        lane_count,
+        dp_alt,
+        ssc,
+        hdmi: false,
+        protocol_switch,
+    })
+}
+
+/// The DP 2.0 PLL request for a UHBR `port_clock_khz` on a C20 port
+/// (`intel_c20pll_calc_state` over the display's DP table): the MPLLA image
+/// for UHBR10/20, the MPLLB image for UHBR13.5 (display 30 takes
+/// `xe2hpd_c20_dp_uhbr13_5`), VDR custom width 2 and `DP_RATE` 8/9/10.
+/// `ssc` lands on PLLA for the MPLLA rates (`intel_program_port_clock_ctl`).
+/// C10 has no UHBR table (`mtl_max_source_rate` caps it at HBR3).
+#[allow(clippy::too_many_arguments)]
+pub fn dp_uhbr_pll_request(
+    kind: PhyKind,
+    port_clock_khz: u32,
+    lane_count: u8,
+    dp_alt: bool,
+    protocol_switch: bool,
+    ssc: bool,
+    display30: bool,
+) -> Result<PllRequest, Cx0Error> {
+    if kind != PhyKind::C20 {
+        return Err(Cx0Error::UnsupportedRate);
+    }
+    let vdr = C20Vdr::dp(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?;
+    let state =
+        match c20_uhbr_pll_state(port_clock_khz, display30).ok_or(Cx0Error::UnsupportedRate)? {
+            C20UhbrPll::Mplla(state) => Cx0PllState::C20Mplla(*state, vdr),
+            C20UhbrPll::Mpllb(state) => Cx0PllState::C20(*state, vdr),
+        };
     Ok(PllRequest {
         lanes: PhyLaneConfig::NATIVE,
         state,
@@ -2065,6 +2296,28 @@ pub const C20_TRANS_DP14: [SnpsTrans; 10] = [
     snps(48, 0, 0),
 ];
 
+/// `mtl_c20_trans_uhbr` (`intel_ddi_buf_trans.c`): the sixteen DP 2.0
+/// TX FFE presets, indexed by the preset itself (`intel_ddi_dp_level` on
+/// 128b/132b is `train_set & DP_TX_FFE_PRESET_VALUE_MASK`).
+pub const C20_TRANS_UHBR: [SnpsTrans; 16] = [
+    snps(48, 0, 0),
+    snps(43, 0, 5),
+    snps(40, 0, 8),
+    snps(37, 0, 11),
+    snps(33, 0, 15),
+    snps(46, 2, 0),
+    snps(42, 2, 4),
+    snps(38, 2, 8),
+    snps(35, 2, 11),
+    snps(33, 2, 13),
+    snps(44, 4, 0),
+    snps(40, 4, 4),
+    snps(37, 4, 7),
+    snps(33, 4, 11),
+    snps(40, 8, 0),
+    snps(30, 2, 2),
+];
+
 /// The translation table for a PHY kind.
 pub const fn trans_table(phy: PhyKind) -> &'static [SnpsTrans; 10] {
     match phy {
@@ -2153,9 +2406,46 @@ pub fn set_signal_levels_khz<M: MmioWindow + ?Sized>(
             true,
         )?;
     }
+    let mut entries = [table[0]; 4];
+    for (entry, &(swing, pre_emph)) in entries.iter_mut().zip(levels) {
+        *entry = table[preset_index(swing, pre_emph)];
+    }
+    program_lane_levels(phy, lane_count, &entries)
+}
+
+/// [`set_signal_levels_khz`] on a 128b/132b link: each main-link lane
+/// takes its TX FFE preset (`presets[ln] & DP_TX_FFE_PRESET_VALUE_MASK`)
+/// from `mtl_c20_trans_uhbr`. Only the C20 has UHBR presets.
+pub fn set_signal_levels_uhbr<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    lane_count: u8,
+    presets: &[u8; 4],
+) -> Result<(), Cx0Error> {
+    if phy.kind() != PhyKind::C20 {
+        return Err(Cx0Error::UnsupportedRate);
+    }
+    if !phy.lanes.admits(lane_count) {
+        return Err(Cx0Error::ProtocolMismatch);
+    }
+    let mut entries = [C20_TRANS_UHBR[0]; 4];
+    for (entry, &preset) in entries.iter_mut().zip(presets) {
+        *entry = C20_TRANS_UHBR[usize::from(preset & 0xF)];
+    }
+    phy.program_msgbus_timer();
+    phy.msgbus_access_begin(phy.lanes.owned)?;
+    program_lane_levels(phy, lane_count, &entries)
+}
+
+/// The per-lane half of `intel_cx0_phy_set_signal_levels` inside an open
+/// message-bus access: each lane's pre-cursor, swing and post-cursor
+/// overrides, the override enables, then the commit.
+fn program_lane_levels<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    lane_count: u8,
+    entries: &[SnpsTrans; 4],
+) -> Result<(), Cx0Error> {
     for ln in 0..lane_count {
-        let (swing, pre_emph) = levels[ln as usize];
-        let entry = table[preset_index(swing, pre_emph)];
+        let entry = entries[ln as usize];
         let lane = (ln / 2) as u16;
         let tx = (ln % 2) as u16;
         let lane_mask = 1u8 << lane;
@@ -2272,11 +2562,23 @@ pub fn wait_port_buf_idle<M: MmioWindow + ?Sized>(
 /// (`mtl_port_buf_ctl_program`): `lane_count` main-link lanes,
 /// 10-bit port data width (DP 1.4), no reversal.
 pub fn program_port_buf_ctl<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort, lane_count: u8) {
+    program_port_buf_ctl_width(mmio, port, lane_count, false);
+}
+
+/// [`program_port_buf_ctl`] with the data width `mtl_port_buf_ctl_program`
+/// picks: `XELPDP_PORT_BUF_PORT_DATA_40BIT` on a UHBR (128b/132b) link,
+/// 10-bit otherwise.
+pub fn program_port_buf_ctl_width<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    lane_count: u8,
+    uhbr: bool,
+) {
     rmw(
         mmio,
         port.buf_ctl1(),
         PORT_WIDTH_MASK | PORT_BUF_PORT_DATA_WIDTH_MASK,
-        port_width(lane_count),
+        port_width(lane_count) | if uhbr { PORT_BUF_PORT_DATA_40BIT } else { 0 },
     );
 }
 
@@ -2872,6 +3174,203 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_xelpg", smoke_enable_port_pll_c20);
+
+    /// `mtl_c20_dp_uhbr10/13_5/20`, `xe2hpd_c20_dp_uhbr13_5` and
+    /// `intel_c20_calc_vdr_params` / `intel_dp_link_symbol_clock`, as
+    /// transcribed from Linux 7.4 `intel_cx0_phy.c` / `intel_dp.c`.
+    fn smoke_c20_uhbr_pll_images_match_linux_tables() -> TestResult {
+        let Some(C20UhbrPll::Mplla(u10)) = c20_uhbr_pll_state(1_000_000, false) else {
+            return TestResult::Fail("UHBR10 must be an MPLLA image");
+        };
+        if u10.tx != [0xBE21, 0xE800, 0x0000]
+            || u10.cmn != [0x0700, 0x0005, 0x0000, 0x0000]
+            || u10.mplla
+                != [
+                    0x3104, 0xD105, 0xC025, 0xC025, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001,
+                ]
+        {
+            return TestResult::Fail("mtl_c20_dp_uhbr10 words differ");
+        }
+        let Some(C20UhbrPll::Mplla(u20)) = c20_uhbr_pll_state(2_000_000, true) else {
+            return TestResult::Fail("UHBR20 must be an MPLLA image");
+        };
+        if u20.tx != [0xBE20, 0x4800, 0x0000]
+            || u20.cmn != [0x0500, 0x0005, 0x0000, 0x0000]
+            || u20.mplla
+                != [
+                    0x3104, 0xD105, 0x9217, 0x9217, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001,
+                ]
+        {
+            return TestResult::Fail("mtl_c20_dp_uhbr20 words differ");
+        }
+        let (Some(C20UhbrPll::Mpllb(mtl)), Some(C20UhbrPll::Mpllb(xe3))) = (
+            c20_uhbr_pll_state(1_350_000, false),
+            c20_uhbr_pll_state(1_350_000, true),
+        ) else {
+            return TestResult::Fail("UHBR13.5 must be an MPLLB image");
+        };
+        if mtl.tx != [0xBEA0, 0x4800, 0x0000]
+            || mtl.mpllb
+                != [
+                    0x015F, 0x2205, 0x1B17, 0xFFC1, 0xE100, 0xBD00, 0x2000, 0x0001, 0x4800, 0x0000,
+                    0x0000,
+                ]
+            || xe3.mpllb
+                != [
+                    0x015F, 0x2205, 0x1B17, 0xFFC1, 0xBD00, 0x9EC3, 0x2000, 0x0001, 0x4800, 0x0000,
+                    0x0000,
+                ]
+        {
+            return TestResult::Fail("UHBR13.5 MPLLB words differ (mtl vs xe2hpd)");
+        }
+        // intel_c20phy_use_mpllb agrees with the table each image sits in.
+        if u10.tx[0] & C20_PHY_USE_MPLLB != 0
+            || u20.tx[0] & C20_PHY_USE_MPLLB != 0
+            || mtl.tx[0] & C20_PHY_USE_MPLLB == 0
+        {
+            return TestResult::Fail("tx[0] bit 7 must select the MPLL");
+        }
+        if c20_uhbr_pll_state(810_000, false).is_some() {
+            return TestResult::Fail("HBR3 is not a UHBR image");
+        }
+        for (clock, rate, symbol) in [
+            (1_000_000, 8u8, 312_500u32),
+            (1_350_000, 9, 421_875),
+            (2_000_000, 10, 625_000),
+        ] {
+            let vdr = C20Vdr::dp(clock).unwrap();
+            if vdr.custom_width != 2
+                || vdr.serdes_rate != C20_SERDES_IS_DP | (rate << 1)
+                || vdr.hdmi_rate.is_some()
+                || dp_link_symbol_clock_khz(clock) != symbol
+            {
+                return TestResult::Fail("UHBR VDR width/rate or symbol clock wrong");
+            }
+        }
+        if C20Vdr::dp(810_000).unwrap().custom_width != 0
+            || dp_link_symbol_clock_khz(810_000) != 810_000
+            || !is_mplla_clock_rate(1_000_000)
+            || is_mplla_clock_rate(1_350_000)
+        {
+            return TestResult::Fail("DP 1.4 width/symbol clock or MPLLA rate set wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_c20_uhbr_pll_images_match_linux_tables
+    );
+
+    /// `intel_cx0pll_enable` at UHBR10 on a TC port: the MPLLA words land
+    /// in context B's MPLLA SRAM (`_MTL_C20_B_MPLLA_CFG` 0xCCE5 counting
+    /// down), custom width 2, `DP_RATE` 8, SSC on PLLA and
+    /// `DDI_CLK_VALFREQ` = the 312.5 MHz symbol clock.
+    fn smoke_c20_uhbr10_enable_programs_mplla_context() -> TestResult {
+        let fake = FakePhy::new(XeLpgPort::Tc1);
+        let req = match dp_uhbr_pll_request(PhyKind::C20, 1_000_000, 4, false, false, true, false) {
+            Ok(req) => req,
+            Err(_) => return TestResult::Fail("UHBR10 request must build on C20"),
+        };
+        if enable_port_pll_state(&fake, XeLpgPort::Tc1, &req).is_err() {
+            return TestResult::Fail("UHBR10 PLL enable failed against healthy PHY");
+        }
+        let tx = [0xBE21u16, 0xE800, 0x0000];
+        let cmn = [0x0700u16, 0x0005, 0x0000, 0x0000];
+        let mplla = [
+            0x3104u16, 0xD105, 0xC025, 0xC025, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001,
+        ];
+        for (i, w) in tx.iter().enumerate() {
+            if fake.sram_get(0xCF2A - i as u16) != *w {
+                return TestResult::Fail("UHBR10 TX words not in context B");
+            }
+        }
+        for (i, w) in cmn.iter().enumerate() {
+            if fake.sram_get(0xCDA5 - i as u16) != *w {
+                return TestResult::Fail("UHBR10 CMN words not in context B");
+            }
+        }
+        for (i, w) in mplla.iter().enumerate() {
+            if fake.sram_get(0xCCE5 - i as u16) != *w {
+                return TestResult::Fail("UHBR10 MPLLA words not at _MTL_C20_B_MPLLA_CFG");
+            }
+        }
+        if fake.sram_get(0xCB4E) != 0 || fake.sram_get(0xCCF0) != 0 {
+            return TestResult::Fail("MPLLB and context A must stay untouched");
+        }
+        let serdes = fake.vdr_get(0, C20_VDR_CUSTOM_SERDES_RATE);
+        if fake.vdr_get(0, C20_VDR_CUSTOM_WIDTH) & C20_CUSTOM_WIDTH_MASK != 2
+            || fake.vdr_get(1, C20_VDR_CUSTOM_WIDTH) & C20_CUSTOM_WIDTH_MASK != 2
+            || serdes & C20_SERDES_RATE_MASK != C20_SERDES_IS_DP | (8 << 1)
+            || serdes & C20_CONTEXT_TOGGLE == 0
+        {
+            return TestResult::Fail("UHBR10 VDR: width 2, IS_DP | rate 8, toggled context");
+        }
+        let clock = fake.stored(XeLpgPort::Tc1.port_clock_ctl());
+        if clock & SSC_ENABLE_PLLA == 0 || clock & SSC_ENABLE_PLLB != 0 {
+            return TestResult::Fail("MPLLA rate must take PLLA's SSC bit");
+        }
+        if fake.writes_to(XeLpgPort::Tc1.clk_valfreq().unwrap()) != alloc::vec![312_500] {
+            return TestResult::Fail("DDI_CLK_VALFREQ must be the 128b/132b symbol clock");
+        }
+        // UHBR13.5 on display 30 stays on MPLLB with PLLB's SSC bit.
+        let fake = FakePhy::new(XeLpgPort::Tc2);
+        let req = dp_uhbr_pll_request(PhyKind::C20, 1_350_000, 2, true, false, true, true).unwrap();
+        if enable_port_pll_state(&fake, XeLpgPort::Tc2, &req).is_err()
+            || fake.sram_get(0xCB4E - 4) != 0xBD00
+            || fake.sram_get(0xCB4E - 5) != 0x9EC3
+            || fake.stored(XeLpgPort::Tc2.port_clock_ctl()) & (SSC_ENABLE_PLLA | SSC_ENABLE_PLLB)
+                != SSC_ENABLE_PLLB
+            || fake.writes_to(XeLpgPort::Tc2.clk_valfreq().unwrap()) != alloc::vec![421_875]
+        {
+            return TestResult::Fail("display-30 UHBR13.5 must program xe2hpd MPLLB words");
+        }
+        // No C10 UHBR image exists.
+        if dp_uhbr_pll_request(PhyKind::C10, 1_000_000, 4, false, false, false, false)
+            != Err(Cx0Error::UnsupportedRate)
+        {
+            return TestResult::Fail("C10 must refuse a UHBR rate");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_c20_uhbr10_enable_programs_mplla_context
+    );
+
+    /// `intel_cx0_phy_set_signal_levels` on 128b/132b: lane `ln` takes
+    /// `mtl_c20_trans_uhbr[train_set[ln] & 0xf]` (`intel_ddi_dp_level`).
+    fn smoke_c20_uhbr_signal_levels_take_tx_ffe_presets() -> TestResult {
+        let fake = FakePhy::new(XeLpgPort::Tc3);
+        let phy = Cx0Phy::new(&fake, XeLpgPort::Tc3);
+        if set_signal_levels_uhbr(&phy, 4, &[0, 5, 14, 0xF0 | 15]).is_err() {
+            return TestResult::Fail("UHBR levels failed against healthy PHY");
+        }
+        // (bus lane, VDR control base, [pre, swing, post]).
+        for (lane, base, want) in [
+            (0u8, 0xD80u16, [0u8, 48, 0]),
+            (0, 0xD90, [2, 46, 0]),
+            (1, 0xD90, [8, 40, 0]),
+            (1, 0xD80, [2, 30, 2]),
+        ] {
+            for (c, v) in want.iter().enumerate() {
+                if fake.vdr_get(lane, base + c as u16) != *v {
+                    return TestResult::Fail("TX FFE preset override wrong");
+                }
+            }
+        }
+        if fake.vdr_get(0, C10_VDR_OVRD) & (C10_VDR_OVRD_TX1 | C10_VDR_OVRD_TX2) != 0x5 {
+            return TestResult::Fail("override enables not set");
+        }
+        let c10 = FakePhy::new(XeLpgPort::B);
+        if set_signal_levels_uhbr(&Cx0Phy::new(&c10, XeLpgPort::B), 4, &[0; 4]).is_ok() {
+            return TestResult::Fail("C10 has no UHBR presets");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg",
+        smoke_c20_uhbr_signal_levels_take_tx_ffe_presets
+    );
 
     fn smoke_pll_enable_times_out_without_ack() -> TestResult {
         let fake = FakePhy::new(XeLpgPort::A);

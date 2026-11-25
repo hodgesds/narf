@@ -876,3 +876,243 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_scanout",
     scanout_failed_console_write_and_invalidation_retain_front
 );
+
+/// PXP protected planes (`skl_universal_plane.c`: `check_protection`,
+/// `skl_plane_surf_offset`, `icl_plane_csc_load_black`,
+/// `glk_plane_color_ctl`): a protected surface whose key is current scans
+/// out with `PLANE_SURF_DECRYPT`; after the PXP termination the next
+/// commit scans it out without decryption through an all-zero plane CSC
+/// (`PLANE_COLOR_PLANE_CSC_ENABLE`); an unprotected surface takes the CSC
+/// off again. Without a published PXP a protected object is black, and
+/// the DSB arm, which carries neither, refuses it. ADDFB takes a protected
+/// object only on a card with PXP planes, and linear XR24 only.
+fn scanout_pxp_protected_plane_decrypts_then_goes_black() -> TestResult {
+    use crate::intel_gpu_gt::media::pxp::{self, PlaneProtection, Pxp};
+    const SURF: u64 = 0x7019c;
+    const COLOR_CTL: u64 = 0x701cc;
+    let csc_written = |model: &Model| {
+        model
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .filter(|(off, _)| PLANE_CSC_BLACK.iter().any(|r| 0x70180 + r == *off))
+            .map(|&(_, v)| v)
+            .collect::<Vec<_>>()
+    };
+    let last = |model: &Model, reg: u64| {
+        model
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .rev()
+            .find(|(off, _)| *off == reg)
+            .map(|&(_, v)| v)
+    };
+    let pxp = Pxp::new();
+    pxp.activate_for_test();
+    pxp::set_display_pxp(Some(&pxp));
+    let key = pxp.key_assign();
+    if pxp::plane_protection(key)
+        != (PlaneProtection {
+            decrypt: true,
+            force_black: false,
+        })
+        || pxp::plane_protection(0) != PlaneProtection::default()
+    {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("check_protection for a current key");
+    }
+    let model = Model::new();
+    let mut owner = presenter(&model);
+    let protected = object(8192);
+    protected.set_pxp_key(key);
+    let id = owner
+        .prepare_object(protected.clone(), geometry())
+        .expect("protected map");
+    owner.arm(id, 1, 0).expect("protected arm");
+    let surf = last(&model, SURF).unwrap_or(0);
+    let address = surf & !0xfff;
+    if surf != address | PLANE_SURF_DECRYPT
+        || last(&model, COLOR_CTL).is_some()
+        || !csc_written(&model).is_empty()
+    {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("decrypted surface not armed with PLANE_SURF_DECRYPT alone");
+    }
+    model.land(address, 41);
+    if owner.poll(1).map(|c| c.map(|c| c.ticket)) != Ok(Some(1)) {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("decrypted surface did not latch");
+    }
+    // The PXP session is terminated: the key iteration moves on, and the
+    // next commit of the same framebuffer is black.
+    pxp.terminate_for_test();
+    if pxp.key_check(key).is_ok() {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("termination left the key current");
+    }
+    owner.arm(id, 2, 10).expect("stale protected arm");
+    let csc = csc_written(&model);
+    if last(&model, SURF) != Some(address)
+        || csc.len() != 12
+        || csc.iter().any(|&v| v != 0)
+        || last(&model, COLOR_CTL).map(|v| v & PLANE_COLOR_CSC_ENABLE)
+            != Some(PLANE_COLOR_CSC_ENABLE)
+        || !owner.forced_black()
+    {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("stale key not scanned out black through the plane CSC");
+    }
+    model.land(address, 42);
+    if owner.poll(11).map(|c| c.map(|c| c.ticket)) != Ok(Some(2)) {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("black surface did not latch");
+    }
+    // An unprotected surface: the plane CSC goes off, no decryption.
+    let plain = owner
+        .prepare_object(object(8192), geometry())
+        .expect("plain map");
+    owner.arm(plain, 3, 20).expect("plain arm");
+    let plain_surf = last(&model, SURF).unwrap_or(0);
+    if plain_surf & PLANE_SURF_DECRYPT != 0
+        || last(&model, COLOR_CTL).map(|v| v & PLANE_COLOR_CSC_ENABLE) != Some(0)
+        || owner.forced_black()
+    {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("unprotected surface left the CSC black");
+    }
+    model.land(plain_surf, 43);
+    owner.poll(21).expect("plain poll").expect("plain latch");
+    // The DSB arm refuses a protected surface before any change.
+    if owner.stage_dsb(id, 4, 30) != Err(ScanoutError::Unsupported) || owner.pending() {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("DSB arm took a protected surface");
+    }
+    // No PXP for the display: xe_pxp_obj_key_check fails, black.
+    pxp::set_display_pxp(None);
+    if pxp::plane_protection(pxp.key_assign())
+        != (PlaneProtection {
+            decrypt: false,
+            force_black: true,
+        })
+    {
+        return TestResult::Fail("protected object decrypted without a PXP");
+    }
+    shutdown(&mut owner);
+    // ADDFB: refused without PXP planes, and for a tiled surface.
+    let mut card = crate::drm::card::Card::new("intel-gpu", "PXP planes", (1, 0, 0));
+    card.intel_x_tiled = true;
+    let cmd = |modifier: u64| crate::drm::fb_cmd::FbCmd {
+        width: 64,
+        height: 32,
+        pixel_format: 0x3432_5258,
+        handles: [1, 0, 0, 0],
+        pitches: [if modifier == 0 { 256 } else { 512 }, 0, 0, 0],
+        flags: 2,
+        modifier: [modifier, 0, 0, 0],
+        ..Default::default()
+    };
+    let fb_object = object(16384);
+    fb_object.set_pxp_key(7);
+    if card
+        .addfb2_intel(&cmd(0), fb_object.clone(), 7, true)
+        .is_ok()
+    {
+        return TestResult::Fail("protected framebuffer without PXP planes");
+    }
+    card.intel_pxp_planes = true;
+    if card
+        .addfb2_intel(&cmd(X_TILED_MODIFIER), fb_object.clone(), 7, true)
+        .is_ok()
+        || card.addfb2_intel(&cmd(0), fb_object, 7, true).is_err()
+    {
+        return TestResult::Fail("protected framebuffer admission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout",
+    scanout_pxp_protected_plane_decrypts_then_goes_black
+);
+
+// ADDFB and scanout of a foreign dma-buf import on an integrated display:
+// xe_display_bo_framebuffer_lookup admits an sg BO, framebuffer_init sets
+// no FORCE_WC on it (so a bound import may become a framebuffer), and
+// __xe_pin_fb_vma validates it, mapping its attachment, before the GGTT
+// names its pages. NARF pins the export for the plane (dma_buf_pin) until
+// the import drops. A discrete display pins to VRAM0, which an sg BO
+// cannot: refused.
+fn scanout_foreign_import_framebuffer_maps_pinned_exporter_pages() -> TestResult {
+    use crate::drm::card::Card;
+    use crate::drm::fb_cmd::FbCmd;
+    let gem = GemState::new();
+    let exporter = gem
+        .object(gem.create(16384, |_, _| Ok(())).expect("exporter"))
+        .expect("exporter object");
+    let (importer, handle, imported) =
+        crate::intel_gpu_prime::fixture::foreign_import(&exporter, 778);
+    let cmd = FbCmd {
+        width: 64,
+        height: 32,
+        pixel_format: 0x3432_5258,
+        handles: [handle, 0, 0, 0],
+        pitches: [256, 0, 0, 0],
+        ..Default::default()
+    };
+    let mut discrete = Card::new("intel-gpu", "Intel test", (1, 0, 0));
+    discrete.intel_vram_scanout = true;
+    if discrete
+        .addfb2_intel(&cmd, imported.clone(), 7, true)
+        .is_ok()
+    {
+        return TestResult::Fail("a discrete display took a foreign import");
+    }
+    let mut card = Card::new("intel-gpu", "Intel test", (1, 0, 0));
+    imported.vm_bind();
+    let fb = card.addfb2_intel(&cmd, imported.clone(), 7, true);
+    imported.vm_unbind();
+    if fb.is_err() || !imported.scanout() {
+        return TestResult::Fail("ADDFB refused a bound foreign import");
+    }
+    let model = Model::new();
+    let mut owner = presenter(&model);
+    if owner.prepare(imported.clone(), geometry()) != Err(ScanoutError::Unsupported)
+        || !model.0.borrow().writes.is_empty()
+    {
+        return TestResult::Fail("an unmapped import reached the GGTT");
+    }
+    if narf_scheduler::block_on_spin(crate::intel_gpu_prime::pin_for_scanout(&imported)).is_err()
+        || !exporter.externally_pinned()
+        || !imported.import_mapped()
+    {
+        return TestResult::Fail("scanout pin did not map and pin the export");
+    }
+    let pages: Vec<u64> = exporter.pages().collect();
+    if owner.prepare(imported.clone(), geometry()).is_err()
+        || model.read32(0x850000) != pages[0] as u32 | 1
+        || model.read32(0x850004) != (pages[0] >> 32) as u32
+        || model.read32(0x850008) != pages[1] as u32 | 1
+        || model.read32(0x850010) != 0
+    {
+        return TestResult::Fail("GGTT does not name the exporter's pages");
+    }
+    // The plane's surface and the framebuffer keep the import, and with it
+    // the pin, after the handle closes.
+    importer.close(handle).expect("close import handle");
+    drop(imported);
+    drop(card);
+    if !exporter.externally_pinned() {
+        return TestResult::Fail("export unpinned under a live surface");
+    }
+    shutdown(&mut owner);
+    if exporter.externally_pinned() {
+        return TestResult::Fail("released surface left the export pinned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    scanout_foreign_import_framebuffer_maps_pinned_exporter_pages
+);

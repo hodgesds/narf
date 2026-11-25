@@ -98,25 +98,71 @@ kernel_test_in!(
     smoke_usbc_board_reversal_selects_lane1_clock_and_high_txs
 );
 
+/// `intel_mtl_tbt_pll_enable_clock` / `_disable_clock`: the select of
+/// `intel_mtl_tbt_clock_select`, the request/ACK pair and
+/// `DDI_CLK_VALFREQ` at `intel_ddi_link_symbol_clock` (the port clock in
+/// kHz for 8b/10b), then 0 on disable; no PHY register besides
+/// `PORT_CLOCK_CTL` is touched.
 fn smoke_usbc_tbt_clock_rates_preserve_phy_and_timeout() -> TestResult {
     let port = XeLpgPort::Tc3;
-    for (rate, select) in [
-        (LinkRate::DpRbr, 0xC),
-        (LinkRate::DpHbr, 0xD),
-        (LinkRate::DpHbr2, 0xE),
-        (LinkRate::DpHbr3, 0xF),
+    let valfreq = port.clk_valfreq().unwrap();
+    for (rate, select, khz) in [
+        (LinkRate::DpRbr, 0xC, 162_000),
+        (LinkRate::DpHbr, 0xD, 270_000),
+        (LinkRate::DpHbr2, 0xE, 540_000),
+        (LinkRate::DpHbr3, 0xF, 810_000),
     ] {
         let io = FakePhy::new(port);
         if enable_tbt_clock(&io, port, rate).is_err()
             || io.read32(port.port_clock_ctl()) & DDI_CLOCK_SELECT_MASK != select << 12
+            || io.read32(valfreq) != khz
             || disable_tbt_clock(&io, port).is_err()
+            || io.read32(valfreq) != 0
             || io
                 .writes
                 .borrow()
                 .iter()
-                .any(|(off, _)| *off != port.port_clock_ctl())
+                .any(|(off, _)| *off != port.port_clock_ctl() && *off != valfreq)
         {
             return TestResult::Fail("TBT clock must use fabric rate without touching C20");
+        }
+    }
+    // Display >= 30 (Panther/Wildcat Cx0 and Nova LT views) owns the
+    // five-bit select field: a stale bit 16 is cleared on enable and on
+    // disable, which the four-bit display-14 mask leaves.
+    struct Display30<'a>(&'a FakePhy, bool);
+    impl MmioWindow for Display30<'_> {
+        fn cx0_xe3(&self) -> bool {
+            !self.1
+        }
+        fn has_lt_phy(&self) -> bool {
+            self.1
+        }
+        fn read32(&self, off: u64) -> u32 {
+            self.0.read32(off)
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.0.write32(off, value)
+        }
+    }
+    for lt in [false, true] {
+        let io = FakePhy::new(port);
+        io.write32(port.port_clock_ctl(), 1 << 16);
+        let view = Display30(&io, lt);
+        if enable_tbt_clock(&view, port, LinkRate::DpHbr2).is_err()
+            || io.read32(port.port_clock_ctl()) & XE3_DDI_CLOCK_SELECT_MASK != 0xE << 12
+        {
+            return TestResult::Fail("display 30+ TBT select must own bits 16:12");
+        }
+        io.write32(
+            port.port_clock_ctl(),
+            io.read32(port.port_clock_ctl()) | 1 << 16,
+        );
+        if disable_tbt_clock(&view, port).is_err()
+            || io.read32(port.port_clock_ctl()) & (XE3_DDI_CLOCK_SELECT_MASK | FORWARD_CLOCK_UNGATE)
+                != 0
+        {
+            return TestResult::Fail("display 30+ TBT disable must gate the five-bit select");
         }
     }
     let stuck = FakePhy::new(port);

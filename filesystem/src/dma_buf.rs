@@ -12,13 +12,20 @@
 //! core reaches them only through [`IoctlContext::sync_file_fences`] and
 //! [`IoctlContext::install_sync_file`].
 //!
+//! An importer that can follow a moving buffer registers as a dynamic
+//! attachment ([`DmaBufAttachOps`], Linux `dma_buf_dynamic_attach` with
+//! `importer_ops`); the exporter calls [`DmaBufObject::invalidate_mappings`]
+//! before it moves the backing store. Static importers register nothing and
+//! keep the exporter's pin-on-map.
+//!
 //! Linux refs: `drivers/dma-buf/dma-buf.c` (`dma_buf_ioctl`,
 //! `dma_buf_export_sync_file`, `dma_buf_import_sync_file`,
-//! `dma_buf_set_name`, `__dma_buf_begin_cpu_access`),
+//! `dma_buf_set_name`, `__dma_buf_begin_cpu_access`,
+//! `dma_buf_dynamic_attach`, `dma_buf_invalidate_mappings`),
 //! `drivers/dma-buf/dma-resv.c`, `include/uapi/linux/dma-buf.h`.
 
 use crate::{DrmFence, FsError, InstallFdError, IoctlContext};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -275,11 +282,27 @@ impl DmaResv {
     }
 }
 
+/// Linux `struct dma_buf_attach_ops` of a dynamic importer: the callback
+/// the exporter's move reaches through [`DmaBufObject::invalidate_mappings`].
+pub trait DmaBufAttachOps: Send + Sync {
+    /// `invalidate_mappings`: drop every cached mapping of the buffer and map
+    /// it again before any further DMA. It runs with no dma-buf lock held,
+    /// from the exporter's move path, so it must neither block nor await.
+    /// Until the exporter's reservation fences retire, work the importer
+    /// already submitted may still access the old placement; the exporter
+    /// waits for them before it moves.
+    fn invalidate_mappings(&self);
+}
+
 /// One exported buffer's dma-buf state, shared by every fd and GEM handle
-/// that names the buffer (Linux `struct dma_buf`'s `resv` and `name`).
+/// that names the buffer (Linux `struct dma_buf`'s `resv` and `name`), and
+/// its dynamic attachments (the dynamic part of `dmabuf->attachments`).
 pub struct DmaBufObject {
     pub resv: DmaResv,
     name: IrqSafeSpinLock<Option<Vec<u8>>>,
+    /// Dynamic importers, held weakly: the importer's attachment owns its
+    /// ops and detaches them when it drops.
+    importers: IrqSafeSpinLock<Vec<Weak<dyn DmaBufAttachOps>>>,
 }
 
 impl Default for DmaBufObject {
@@ -287,6 +310,7 @@ impl Default for DmaBufObject {
         Self {
             resv: DmaResv::new(),
             name: IrqSafeSpinLock::new(None),
+            importers: IrqSafeSpinLock::new(Vec::new()),
         }
     }
 }
@@ -296,6 +320,7 @@ impl core::fmt::Debug for DmaBufObject {
         f.debug_struct("DmaBufObject")
             .field("resv", &self.resv)
             .field("name", &self.name.lock().as_deref())
+            .field("dynamic_importers", &self.dynamic_importers())
             .finish()
     }
 }
@@ -308,6 +333,49 @@ impl DmaBufObject {
     /// The `DMA_BUF_SET_NAME` name (without its NUL), if one was set.
     pub fn name(&self) -> Option<Vec<u8>> {
         self.name.lock().clone()
+    }
+
+    /// `dma_buf_dynamic_attach`'s `list_add` of an attachment whose
+    /// importer has `invalidate_mappings` (after the exporter's `attach`
+    /// op admitted it).
+    pub fn attach_dynamic(&self, importer: Weak<dyn DmaBufAttachOps>) {
+        let mut importers = self.importers.lock();
+        importers.retain(|live| live.strong_count() != 0);
+        importers.push(importer);
+    }
+
+    /// `dma_buf_detach` of a dynamic attachment: no later move notifies it.
+    pub fn detach_dynamic(&self, importer: &Weak<dyn DmaBufAttachOps>) {
+        self.importers
+            .lock()
+            .retain(|live| live.strong_count() != 0 && !Weak::ptr_eq(live, importer));
+    }
+
+    /// Live dynamic attachments.
+    pub fn dynamic_importers(&self) -> usize {
+        self.importers
+            .lock()
+            .iter()
+            .filter(|live| live.strong_count() != 0)
+            .count()
+    }
+
+    /// Linux `dma_buf_invalidate_mappings`, which an exporter calls before
+    /// it moves the buffer: every dynamic importer drops its mappings and
+    /// maps again before further DMA. Static attachments are pinned and are
+    /// not told. The callbacks run after the attachment list lock is
+    /// released. Returns how many importers were notified.
+    pub fn invalidate_mappings(&self) -> usize {
+        let importers: Vec<Arc<dyn DmaBufAttachOps>> = self
+            .importers
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for importer in &importers {
+            importer.invalidate_mappings();
+        }
+        importers.len()
     }
 }
 
