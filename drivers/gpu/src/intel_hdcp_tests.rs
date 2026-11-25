@@ -346,6 +346,13 @@ impl Dpcd for DpSink {
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), HdcpError> {
         self.writes.push((addr, data.to_vec()));
         self.put(addr, data);
+        // A new authentication (the Aksv write) restarts the repeater's
+        // part 2: its KSV list is read from the first KSV again.
+        // `intel_hdcp1_enable` retries `intel_hdcp_auth` three times and
+        // each `intel_hdcp_auth_downstream` reads the whole list.
+        if addr == shim::DP_AUX_HDCP_AKSV {
+            self.fifo_at = 0;
+        }
         Ok(())
     }
 }
@@ -1011,6 +1018,19 @@ fn hdcp14_dp_repeater() -> TestResult {
     };
     if drive(link.enable(&mut cx, 0)) != Some(Err(HdcpError::Revoked)) {
         return TestResult::Fail("revoked downstream KSV accepted");
+    }
+    drop(cx);
+    // intel_hdcp1_enable's three tries each read the whole list and stop
+    // at drm_hdcp_check_ksvs_revoked, before any V' comparison.
+    if s.dpcd
+        .reads
+        .iter()
+        .filter(|&&a| a == shim::DP_AUX_HDCP_KSV_FIFO)
+        .count()
+        != 3
+        || !regs.wrote(HDCP_SHA_TEXT).is_empty()
+    {
+        return TestResult::Fail("revoked KSV list not refused on every try before V'");
     }
     TestResult::Pass
 }
