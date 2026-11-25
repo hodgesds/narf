@@ -1257,11 +1257,14 @@ also consult upstream Linux GPL sources.
   - **Descriptors and strings:** the device descriptor, every
     configuration descriptor, and the manufacturer, product and serial
     strings.
-  - **The active configuration and per-interface claims**, each held by
-    a kernel driver or a usbfs file.
+  - **The active configuration, per-interface claims and current
+    alternate settings.** A claim is held by a usbfs file or by a kernel
+    driver under its Linux name (`attach::driver_name`: `usbhid`,
+    `usb-storage`, `cdc_acm`, `hub`, ...; `narf_*` for binders Linux
+    leaves to libusb).
   - **Lifecycle:** `dispatch_after_address` registers the device after
     its device descriptor read; `release_slot` and controller recovery
-    remove it.
+    remove it, and removal runs usbfs's `usbdev_remove`.
 - `usb_sysfs` publishes the Linux topology under the xHCI's PCI
   kobject:
   - **Root hubs (`usbN`):** published at Stage::Late, so empty buses
@@ -1308,6 +1311,58 @@ also consult upstream Linux GPL sources.
     (`register_binder_interface`) and tees every report, so a
     keyboard's hidraw node exists beside its evdev node (a YubiKey's
     OTP interface for ykman).
+  - `unbind_interface` releases one interface's binding (usbfs
+    DISCONNECT).
+- `usbfs` is Linux `drivers/usb/core/devio.c`:
+  - **Nodes:** `/dev/bus/usb/BBB/DDD` for every root hub (devnum 1) and
+    registered device, from a devfs provider (`usbfs-devfs`,
+    Stage::Subsys). Character major 189, minor `(bus - 1) * 128 +
+    dev - 1`. Nodes start at devtmpfs's `0600 root:root`; udev's mode,
+    owner and `system.posix_acl_access` persist per device until it is
+    removed.
+  - **`read`:** the device descriptor, then every configuration
+    descriptor, at the file offset.
+  - **ioctls,** each with devio.c's checks in its order: CONTROL, BULK,
+    SUBMITURB, DISCARDURB, REAPURB, REAPURBNDELAY, CLAIMINTERFACE,
+    RELEASEINTERFACE, SETINTERFACE, SETCONFIGURATION, GETDRIVER,
+    CONNECTINFO, CONNINFO_EX, GET_SPEED, CLEAR_HALT, RESETEP, RESET,
+    IOCTL (DISCONNECT, CONNECT, the hub's HUB_PORTINFO), DISCONNECT_CLAIM,
+    CLAIM_PORT, RELEASE_PORT, DISCSIGNAL, DROP_PRIVILEGES,
+    GET_CAPABILITIES, ALLOC_STREAMS, FREE_STREAMS, FORBID_SUSPEND,
+    ALLOW_SUSPEND, WAIT_FOR_RESUME. A fd without write access gets EPERM;
+    reaping works after disconnect; unknown commands are ENOTTY.
+  - **GET_CAPABILITIES** is ZERO_PACKET, NO_PACKET_SIZE_LIM,
+    REAP_AFTER_DISCONNECT, DROP_PRIVILEGES and CONNINFO_EX: no MMAP, no
+    streams, no scatter-gather, no BULK_CONTINUATION (as on every xHCI
+    host), and no SUSPEND (suspend ioctls behave as on a `!CONFIG_PM`
+    kernel).
+  - **URB engine (`usbfs::engine`):** per-file queue, ordered per
+    endpoint; the oldest URB of an endpoint is posted in page-sized TDs
+    with bulk receipts (`Xhci::begin_bulk_*` / `begin_interrupt_*`), so
+    every URB can be stopped (DISCARDURB, a sync timeout, release). A
+    short IN packet ends a URB (`-EREMOTEIO` with SHORT_NOT_OK);
+    ZERO_PACKET adds a zero-length packet. A failed bulk transfer unlinks
+    its queued continuation URBs (`-ECONNRESET`) and refuses more with
+    EREMOTEIO until a new transfer. A STALL, babble or transaction error
+    recovers the endpoint's host side (Reset Endpoint + Set TR Dequeue)
+    before the next TD, as the Linux xHCI driver does. Disconnect gives
+    every pending URB back with `-ESHUTDOWN`. Buffers count against a
+    16 MiB budget (`usbfs_memory_mb`), ENOMEM beyond it. Control URBs and
+    CONTROL run to completion in the submitting ioctl.
+  - **Endpoints:** an interface's current-setting endpoints are
+    programmed when a file first claims it; SETINTERFACE and
+    SETCONFIGURATION drop the old endpoints (`Xhci::drop_endpoints_*`)
+    and program the new.
+  - **Root hubs:** standard requests are emulated (`rh_call_control`'s
+    device part); interface 0 belongs to `hub`, which answers
+    HUB_PORTINFO.
+  - **Gaps (`// LINUX-GAP`):** no isochronous URBs (EINVAL after Linux's
+    checks); RESET of a device is EIO (no in-place port reset yet);
+    control stages keep the controller's fixed 250 ms bound; DISCSIGNAL
+    and URB `signr` signals are not sent; kernel drivers are not probed
+    against a new configuration; DISCONNECT releases only raw-HID
+    bindings (EBUSY for a device-wide binding); NARF hub enumeration
+    does not skip a claimed port.
 - WBDI fingerprint readers (issue #919): `wbdi` recognises a
   sensor by its MS OS 2.0 Compatible-ID (WINUSB with a WBDI
   sub-compatible-ID) and runs last in the attach cascade, after

@@ -48,6 +48,7 @@ mod usb_sysfs_tests;
 pub mod usbdev;
 #[cfg(feature = "kernel-test")]
 mod usbdev_tests;
+pub mod usbfs;
 pub mod uvc;
 pub mod wbdi;
 pub mod xhci;
@@ -85,6 +86,12 @@ pub fn register_initcalls() {
     // Linux ref: `drivers/usb/serial/usb-serial.c:usb_serial_register_drivers`.
     // /sys/devices/.../usbN for every root hub, once the controllers have
     // probed (Stage::Device), so empty buses are listed too.
+    // /dev/bus/usb (usbfs): resolves per lookup, so one registration
+    // serves devices that attach later.
+    narf_init::register(Stage::Subsys, "usbfs-devfs", || {
+        usbfs::register_devfs();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Late, "usb-sysfs-root-hubs", || {
         if usb_sysfs::publish_all_root_hubs() == 0 {
             InitResult::NotPresent

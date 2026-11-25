@@ -60,6 +60,9 @@ struct DevState {
     /// unconfigured.
     config: u8,
     claims: Vec<(u8, Owner)>,
+    /// `(bInterfaceNumber, bAlternateSetting)` for interfaces whose
+    /// current setting is not 0 (`intf->cur_altsetting`).
+    alts: Vec<(u8, u8)>,
 }
 
 /// One addressed USB device.
@@ -142,7 +145,35 @@ impl UsbDev {
         if st.config != value {
             st.claims.clear();
         }
+        // SET_CONFIGURATION puts every interface at setting 0, even when
+        // the value is unchanged (`usb_reset_configuration`).
+        st.alts.clear();
         st.config = value;
+    }
+
+    /// Current alternate setting of `iface` (0 until SET_INTERFACE).
+    pub fn alt_setting(&self, iface: u8) -> u8 {
+        self.state
+            .lock()
+            .alts
+            .iter()
+            .find(|(i, _)| *i == iface)
+            .map_or(0, |(_, alt)| *alt)
+    }
+
+    /// Record that `SET_INTERFACE(iface, alt)` succeeded.
+    pub fn set_alt_setting(&self, iface: u8, alt: u8) {
+        let mut st = self.state.lock();
+        st.alts.retain(|(i, _)| *i != iface);
+        if alt != 0 {
+            st.alts.push((iface, alt));
+        }
+    }
+
+    /// Whether this record is still the registered device (Linux
+    /// `dev->state != USB_STATE_NOTATTACHED`).
+    pub fn attached(self: &Arc<Self>) -> bool {
+        find(self.controller, self.slot).is_some_and(|d| Arc::ptr_eq(&d, self))
     }
 
     /// The active configuration's descriptor blob.
@@ -459,6 +490,7 @@ pub async fn register(
         state: IrqSafeSpinLock::new(DevState {
             config: 0,
             claims: Vec::new(),
+            alts: Vec::new(),
         }),
     });
     DEVICES.lock().push(dev.clone());
@@ -480,6 +512,7 @@ pub fn remove(controller: u8, slot: u8) -> Option<Arc<UsbDev>> {
         g.remove(i)
     };
     free_devnum(removed.busnum, removed.devnum);
+    crate::usbfs::device_removed(&removed);
     Some(removed)
 }
 
@@ -497,6 +530,7 @@ pub fn remove_controller(controller: u8) -> Vec<Arc<UsbDev>> {
     };
     for d in &removed {
         free_devnum(d.busnum, d.devnum);
+        crate::usbfs::device_removed(d);
     }
     removed
 }
@@ -552,6 +586,7 @@ pub fn __spec_for_test(spec: UsbDevSpec) -> UsbDev {
         state: IrqSafeSpinLock::new(DevState {
             config: spec.config,
             claims: Vec::new(),
+            alts: Vec::new(),
         }),
     }
 }
