@@ -2628,6 +2628,10 @@ pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
     /// render state ([`Self::begin_default_image`]). Later contexts start
     /// from it instead of restore-inhibited.
     default_image: Option<A::Backing>,
+    /// `HAS_POOLED_EU` (a Gen9 LP part with all three subslices): the
+    /// media pool state joins the indirect-context batch and the golden
+    /// render state ([`Self::set_pooled_eu`]).
+    pooled_eu: bool,
 }
 
 impl<M: MmioWindow, A: GpuAllocator> core::fmt::Debug for RcsEngine<M, A> {
@@ -2701,14 +2705,15 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             completion_lost: false,
             wa_bb: None,
             default_image: None,
+            pooled_eu: false,
         })
     }
 
     /// `lrc_init_wa_ctx` for Gen9 RCS: build [`gen9_init_indirectctx_bb`]
     /// once per engine in a GGTT page, against a GT scratch page (the
     /// coherent-L3 save dword at scratch + 256), and point every context
-    /// created afterwards at it ([`setup_gen9_indirect_ctx`]). Big-core
-    /// Gen9 has no pooled EUs (`WaMediaPoolStateCmdInWABB` is BXT/GLK).
+    /// created afterwards at it ([`setup_gen9_indirect_ctx`]). A pooled-EU
+    /// part adds `WaMediaPoolStateCmdInWABB` ([`Self::set_pooled_eu`]).
     /// Other generations and engines take no batch.
     pub fn install_gen9_wa_bb(&mut self) -> Result<(), SubmitError> {
         if !matches!(self.generation, crate::intel_gpu::Generation::Skylake)
@@ -2726,7 +2731,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             }
         };
         let mut words = [MI_NOOP; GEN9_INDIRECT_CTX_BB_DWORDS];
-        let n = gen9_init_indirectctx_bb(&mut words, false, scratch.ggtt_offset() + 256);
+        let n = gen9_init_indirectctx_bb(&mut words, self.pooled_eu, scratch.ggtt_offset() + 256);
         for (i, word) in words[..n].iter().enumerate() {
             bb.write32(i as u64 * 4, *word);
         }
@@ -2740,6 +2745,12 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// (all-ones), and `RING_CONTEXT_STATUS_PTR` is forced to match ("Ice
     /// Lake forgets to reset its pointers on a GPU reset"). Only valid with
     /// nothing loaded on the engine.
+    /// `HAS_POOLED_EU`, from the GT's subslice fuses: set before
+    /// [`Self::install_gen9_wa_bb`] and [`Self::begin_default_image`].
+    pub fn set_pooled_eu(&mut self, pooled: bool) {
+        self.pooled_eu = pooled;
+    }
+
     pub fn reset_csb_pointers(&mut self) -> Result<(), SubmitError> {
         if !self.is_idle() {
             return Err(SubmitError::ContextBusy);
@@ -2845,7 +2856,10 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         let batch = self.emit_context_setup(id, setup).and_then(|()| {
             let backing = self.alloc.alloc(1)?;
             let words = if matches!(self.generation, crate::intel_gpu::Generation::Skylake) {
-                crate::intel_gpu_renderstate::gen9_null_state(u64::from(backing.ggtt_offset()))
+                crate::intel_gpu_renderstate::gen9_null_state(
+                    u64::from(backing.ggtt_offset()),
+                    self.pooled_eu,
+                )
             } else {
                 crate::intel_gpu_renderstate::empty_state()
             };

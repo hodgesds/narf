@@ -2131,6 +2131,11 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
                 0 => Err(FsError::NoDevice),
                 v => i32::try_from(v).map_err(|_| FsError::NoDevice),
             };
+        } // HAS_POOLED_EU and MIN_EU_IN_POOL report plain values, zero included.
+        match param {
+            38 => return Ok(i32::from(topology.pooled_eu())),
+            39 => return i32::try_from(topology.min_eu_in_pool()).map_err(|_| FsError::NoDevice),
+            _ => {}
         }
     }
     Ok(match param {

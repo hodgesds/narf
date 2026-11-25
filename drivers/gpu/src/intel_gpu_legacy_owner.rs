@@ -64,9 +64,9 @@ const GRDOM_RENDER: u32 = 1 << 1;
 pub(crate) const fn engine_reset_domain(gt: LegacyGt, which: HwEngine) -> Option<u32> {
     match (gt, which) {
         (_, HwEngine::Rcs0) => Some(GRDOM_RENDER),
-        (LegacyGt::Gen9, HwEngine::Bcs0) => Some(1 << 3),
-        (LegacyGt::Gen9, HwEngine::Vcs0) => Some(1 << 2),
-        (LegacyGt::Gen9, HwEngine::Vecs0) => Some(1 << 4),
+        (LegacyGt::Gen9 | LegacyGt::Gen9Lp, HwEngine::Bcs0) => Some(1 << 3),
+        (LegacyGt::Gen9 | LegacyGt::Gen9Lp, HwEngine::Vcs0) => Some(1 << 2),
+        (LegacyGt::Gen9 | LegacyGt::Gen9Lp, HwEngine::Vecs0) => Some(1 << 4),
         (LegacyGt::Gen11, HwEngine::Bcs0) => Some(1 << 2),
         _ => None,
     }
@@ -276,7 +276,7 @@ pub(crate) fn resume_rcs(
         RCS + 0x29c,
         match gt {
             LegacyGt::Gen11 => masked_enable(1 << 3),
-            LegacyGt::Gen9 => masked_enable(1 << 15),
+            LegacyGt::Gen9 | LegacyGt::Gen9Lp => masked_enable(1 << 15),
         },
     );
     mmio.write32(MI_MODE, masked_disable(STOP_RING));
@@ -300,6 +300,8 @@ pub(crate) fn timestamp_frequency(gt: LegacyGt, mut read: impl FnMut(u64) -> u32
     }
     match gt {
         LegacyGt::Gen9 => 24_000_000 >> (3 - ((ctc >> 1) & 3)),
+        // Gen9 LP's crystal is 19.2 MHz (`gen9_read_clock_frequency`).
+        LegacyGt::Gen9Lp => 19_200_000 >> (3 - ((ctc >> 1) & 3)),
         LegacyGt::Gen11 => {
             let config = read(0xd00);
             let crystal = match (config >> 3) & 7 {
@@ -340,7 +342,8 @@ const GEN11_VDBOX_VEBOX_DISABLE: u64 = 0x9140;
 fn xcs_engines(gt: LegacyGt, mut read: impl FnMut(u64) -> u32) -> Vec<(HwEngine, EngineSpec)> {
     use crate::intel_gpu_media as media;
     match gt {
-        LegacyGt::Gen9 => alloc::vec![
+        // GEN9_LP_FEATURES' engine mask is the same RCS0, BCS0, VCS0, VECS0.
+        LegacyGt::Gen9 | LegacyGt::Gen9Lp => alloc::vec![
             (HwEngine::Bcs0, BCS0),
             (HwEngine::Vcs0, media::GEN9_VCS0_SPEC),
             (HwEngine::Vecs0, media::GEN9_VECS0_SPEC),
@@ -372,7 +375,7 @@ fn resume_xcs(mmio: &impl MmioWindow, gt: LegacyGt, which: HwEngine, base: u64) 
         base + 0x29c,
         match gt {
             LegacyGt::Gen11 => masked_enable(1 << 3),
-            LegacyGt::Gen9 => masked_enable(1 << 15),
+            LegacyGt::Gen9 | LegacyGt::Gen9Lp => masked_enable(1 << 15),
         },
     );
     mmio.write32(base + 0x9c, masked_disable(STOP_RING));
@@ -387,7 +390,7 @@ fn resume_xcs(mmio: &impl MmioWindow, gt: LegacyGt, which: HwEngine, base: u64) 
 fn media_domain(gt: LegacyGt, which: HwEngine) -> Option<MediaFwDomain> {
     match (gt, which) {
         (_, HwEngine::Bcs0 | HwEngine::Rcs0) => None,
-        (LegacyGt::Gen9, _) => Some(MediaFwDomain::Aggregate),
+        (LegacyGt::Gen9 | LegacyGt::Gen9Lp, _) => Some(MediaFwDomain::Aggregate),
         (LegacyGt::Gen11, HwEngine::Vcs0) => Some(MediaFwDomain::VdBox(0)),
         (LegacyGt::Gen11, HwEngine::Vecs0) => Some(MediaFwDomain::VeBox(0)),
         _ => None,
@@ -476,8 +479,9 @@ struct Runtime {
     governor: Governor,
     /// MCR steering for re-applying RCS0's workarounds after an engine reset.
     steering: Steering,
-    /// `RC_CONTROL` while unparked (`rc6->ctl_enable`).
-    rc6_ctl: u32,
+    /// `RC_CONTROL` while unparked (`rc6->ctl_enable`); `None` when RC6 is
+    /// not supported, which leaves every RC6 control untouched.
+    rc6: Option<u32>,
 }
 
 impl Runtime {
@@ -501,7 +505,9 @@ impl Runtime {
             return Err(crate::intel_gpu_user::io_error());
         }
         let window = &self.window;
-        rc6_unpark(self.rc6_ctl, |r, v| window.write32(r, v));
+        if let Some(ctl) = self.rc6 {
+            rc6_unpark(ctl, |r, v| window.write32(r, v));
+        }
         if let Some(Some(freq)) = self.governor.unpark() {
             rps_request(freq, |r, v| window.write32(r, v));
         }
@@ -516,7 +522,9 @@ impl Runtime {
         if idle != 0 {
             rps_request(idle, |r, v| window.write32(r, v));
         }
-        rc6_park(|r, v| window.write32(r, v));
+        if self.rc6.is_some() {
+            rc6_park(|r, v| window.write32(r, v));
+        }
         self.release_media();
         let _ = self.fw.release(&self.window, FwDomain::Blitter);
         let _ = self.fw.release(&self.window, FwDomain::Render);
@@ -734,8 +742,10 @@ impl Owner {
             u64::from(timestamp_frequency(self.wa.gt(), |reg| window.read32(reg))),
             Ordering::Release,
         );
+        // The engine's execlists layout: Gen9 LP shares big-core Gen9's
+        // context image, CSB and indirect-context batch.
         let generation = match self.wa.gt() {
-            LegacyGt::Gen9 => crate::intel_gpu::Generation::Skylake,
+            LegacyGt::Gen9 | LegacyGt::Gen9Lp => crate::intel_gpu::Generation::Skylake,
             LegacyGt::Gen11 => crate::intel_gpu::Generation::IceLake,
         };
         let mut engine = RcsEngine::new_for_generation(
@@ -744,6 +754,7 @@ impl Owner {
             crate::intel_gpu_rcs::production_arena(self.bar),
         )
         .map_err(InitError::Engine)?;
+        engine.set_pooled_eu(self.topology.lock().is_some_and(|t| t.pooled_eu()));
         let ready = engine
             .install_gen9_wa_bb()
             .and_then(|()| engine.reset_csb_pointers());
@@ -784,8 +795,10 @@ impl Owner {
         } else {
             log(self.index, "no RP_STATE_CAP; GPU frequency left to the PCU");
         }
-        let rc6_ctl = rc6_enable(gt, self.device, |r, v| window.write32(r, v));
-        rc6_unpark(rc6_ctl, |r, v| window.write32(r, v));
+        let rc6 = rc6_enable(gt, self.device, |r, v| window.write32(r, v));
+        if let Some(ctl) = rc6 {
+            rc6_unpark(ctl, |r, v| window.write32(r, v));
+        }
         // BCS0, VCS0 and VECS0: each its own execlists engine on the shared
         // arena. An engine that does not come up is left out of the
         // published set; RCS0 still runs.
@@ -848,7 +861,7 @@ impl Owner {
             jobs: Vec::new(),
             governor: Governor::new(caps),
             steering,
-            rc6_ctl,
+            rc6,
         });
         self.epoch.store(epoch, Ordering::Release);
         Ok(())
@@ -872,7 +885,9 @@ impl Owner {
                 Poll::Ready(result) => break result,
             }
         };
-        rc6_disable(|r, v| runtime.window.write32(r, v));
+        if runtime.rc6.is_some() {
+            rc6_disable(|r, v| runtime.window.write32(r, v));
+        }
         runtime.release_media();
         let _ = runtime.fw.release(&runtime.window, FwDomain::Blitter);
         let _ = runtime.fw.release(&runtime.window, FwDomain::Render);
@@ -1087,7 +1102,7 @@ impl UserBackend for Backend {
         (clock != 0).then(|| crate::intel_gpu_user::DeviceFacts {
             revision: self.0.revision,
             graphics_version: match self.0.wa.gt() {
-                LegacyGt::Gen9 => 900,
+                LegacyGt::Gen9 | LegacyGt::Gen9Lp => 900,
                 LegacyGt::Gen11 => 1100,
             },
             graphics_step: 0,
@@ -1337,6 +1352,9 @@ pub mod tests {
         // CTC shift 2: 24 MHz >> 1 = Skylake's 12 MHz.
         if timestamp_frequency(LegacyGt::Gen9, regs(2 << 1, 0, 0)) != 12_000_000
             || timestamp_frequency(LegacyGt::Gen9, regs(3 << 1, 0, 0)) != 24_000_000
+            // Gen9 LP: the 19.2 MHz crystal.
+            || timestamp_frequency(LegacyGt::Gen9Lp, regs(3 << 1, 0, 0)) != 19_200_000
+            || timestamp_frequency(LegacyGt::Gen9Lp, regs(2 << 1, 0, 0)) != 9_600_000
             // Ice Lake: 19.2 MHz crystal, shift 3 → full rate.
             || timestamp_frequency(LegacyGt::Gen11, regs(0, 1 << 3 | 3 << 1, 0)) != 19_200_000
             || timestamp_frequency(LegacyGt::Gen11, regs(0, 2 << 3 | 2 << 1, 0)) != 19_200_000

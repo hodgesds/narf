@@ -144,7 +144,7 @@ impl Batch {
 /// aligned, below 4 GiB in practice; the upper dwords carry the rest). The
 /// caller runs it once on a restore-inhibited render context and keeps the
 /// saved image.
-pub(crate) fn gen9_null_state(base: u64) -> Vec<u32> {
+pub(crate) fn gen9_null_state(base: u64, pooled_eu: bool) -> Vec<u32> {
     // The general, surface, dynamic and instruction bases all address this
     // batch (bit 0: modify enable); the indirect object base stays at zero.
     let reloc = base + 1;
@@ -278,6 +278,20 @@ pub(crate) fn gen9_null_state(base: u64) -> Vec<u32> {
     }
     // One triangle-list vertex, one instance: nothing is rasterized.
     b.command(PRIMITIVE, 7, &[(1, TRILIST), (2, 1), (4, 1)]);
+    // render_state_setup's aux batch on a pooled-EU part: the 3x6 pool
+    // configuration, which the hardware narrows to the fused subslices.
+    // Linux starts it as a second batch at `aux_offset` in the same request;
+    // here it follows the primitive in this batch, the same command order.
+    if pooled_eu {
+        b.0.extend_from_slice(&[
+            crate::intel_gpu_rcs::GEN9_MEDIA_POOL_STATE,
+            crate::intel_gpu_rcs::GEN9_MEDIA_POOL_ENABLE,
+            0x0077_7000,
+            0,
+            0,
+            0,
+        ]);
+    }
     b.0.push(MI_BATCH_BUFFER_END);
     debug_assert!(b.0.len() * 4 <= CC_STATE as usize);
     let mut words = b.0;
@@ -310,8 +324,26 @@ pub mod tests {
 
     fn smoke_gen9_null_state_layout() -> TestResult {
         let base = 0x0012_3000;
-        let words = gen9_null_state(base);
+        let words = gen9_null_state(base, false);
         kt_assert_eq!(words.len() * 4, NULL_STATE_BYTES);
+        // A pooled-EU part appends the media pool state before the end,
+        // still below the indirect state; nothing else moves.
+        let pooled = gen9_null_state(base, true);
+        kt_assert_eq!(pooled.len(), words.len());
+        kt_assert_eq!(&pooled[..885], &words[..885]);
+        kt_assert_eq!(
+            &pooled[885..892],
+            &[
+                0x7005_0004,
+                1 << 31,
+                0x0077_7000,
+                0,
+                0,
+                0,
+                MI_BATCH_BUFFER_END
+            ]
+        );
+        kt_assert_eq!(&pooled[896..], &words[896..]);
         // Walk the command stream: it must parse to MI_BATCH_BUFFER_END
         // before the indirect state, ending in the one-vertex 3DPRIMITIVE.
         let mut at = 0;

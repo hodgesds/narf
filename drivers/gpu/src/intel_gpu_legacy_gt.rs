@@ -1,8 +1,8 @@
 //! Gen9 / Gen11 GT setup for the execlists owner: the cache policy Linux's
 //! `intel_gt_init_hw` programs before any engine runs.
 //!
-//! Gen9 (Skylake through Comet Lake) and Gen11 (Ice, Elkhart and Jasper
-//! Lake) submit through execlists: i915 has no GuC submission below
+//! Gen9 (Skylake through Comet Lake, and the LP Broxton and Gemini Lake)
+//! and Gen11 (Ice, Elkhart and Jasper Lake) submit through execlists: i915 has no GuC submission below
 //! graphics 11 and does not enable it by default below graphics 12
 //! (`uc_expand_default_options`). Their cache model also predates Gen12's
 //! global MOCS and PAT index: a private PPAT selects the leaf cacheability a
@@ -23,6 +23,10 @@ use crate::intel_gpu_gt::GtPlatform;
 pub(crate) enum LegacyGt {
     /// Graphics 9, big-core (`IS_GEN9_BC`: SKL/KBL/CFL/WHL/CML).
     Gen9,
+    /// Graphics 9, low power (`IS_GEN9_LP`: Broxton, Gemini Lake). There is
+    /// no LLC: GT accesses snoop the CPU caches through the CHV-style PPAT,
+    /// and the MOCS table never allocates in a last-level cache.
+    Gen9Lp,
     /// Graphics 11 (ICL/EHL/JSL).
     Gen11,
 }
@@ -30,12 +34,16 @@ pub(crate) enum LegacyGt {
 impl LegacyGt {
     pub(crate) const fn for_platform(platform: GtPlatform) -> Option<Self> {
         match platform {
-            // Gen9 LP needs its own cache, workaround and power profile.
-            GtPlatform::Gen9(p) if p.is_lp() => None,
+            GtPlatform::Gen9(p) if p.is_lp() => Some(Self::Gen9Lp),
             GtPlatform::Gen9(_) => Some(Self::Gen9),
             GtPlatform::Gen11(_) => Some(Self::Gen11),
             _ => None,
         }
+    }
+
+    /// `GRAPHICS_VER == 9`, big core or LP.
+    pub(crate) const fn graphics9(self) -> bool {
+        matches!(self, Self::Gen9 | Self::Gen9Lp)
     }
 }
 
@@ -71,12 +79,34 @@ pub(crate) const PPAT_ENTRIES: [u8; 8] = [
     PPAT_WB | PPAT_LLCELLC | ppat_age(3),
 ];
 
+/// `CHV_PPAT_SNOOP`, the only PPAT bit Gen9 LP honours.
+const CHV_PPAT_SNOOP: u8 = 1 << 6;
+
+/// `chv_setup_private_ppat`, which Gen9 LP takes: Broadwell's write-back
+/// entries become snooped ones, the rest uncached. GGTT accesses always use
+/// entry 0 ("there is NO pat_sel[2:0] from the entry"), so it must snoop for
+/// the status page; the page walker never snoops, which is why page tables
+/// are cleaned before every submission ([`crate::intel_gpu_gtt::publish_system_pages`]).
+pub(crate) const CHV_PPAT_ENTRIES: [u8; 8] = [
+    CHV_PPAT_SNOOP,
+    0,
+    0,
+    0,
+    CHV_PPAT_SNOOP,
+    CHV_PPAT_SNOOP,
+    CHV_PPAT_SNOOP,
+    CHV_PPAT_SNOOP,
+];
+
 /// The PPAT register writes in Linux's order: Gen9 the 64-bit
 /// `GEN8_PPAT(i, x)` pair (LO then HI), Gen11 `GEN10_PAT_INDEX(0..8)`.
 pub(crate) fn ppat_writes(gt: LegacyGt) -> alloc::vec::Vec<(u64, u32)> {
-    let entries = PPAT_ENTRIES;
+    let entries = match gt {
+        LegacyGt::Gen9Lp => CHV_PPAT_ENTRIES,
+        LegacyGt::Gen9 | LegacyGt::Gen11 => PPAT_ENTRIES,
+    };
     match gt {
-        LegacyGt::Gen9 => {
+        LegacyGt::Gen9 | LegacyGt::Gen9Lp => {
             let pat = entries
                 .iter()
                 .enumerate()
@@ -157,6 +187,14 @@ const SKL_MOCS: [MocsEntry; 4] = [
     entry(63, LE_3_WB | LE_TC_1_LLC | le_lrum(3), L3_1_UC),
 ];
 
+/// `broxton_mocs_table`: `GEN9_MOCS_ENTRIES` and a cached entry that only
+/// L3 caches (there is no LLC), with no entry 63.
+const BXT_MOCS: [MocsEntry; 3] = [
+    entry(0, LE_1_UC | LE_TC_2_LLC_ELLC, L3_1_UC),
+    entry(1, LE_0_PAGETABLE | LE_TC_0_PAGETABLE | le_lrum(3), L3_3_WB),
+    entry(2, LE_1_UC | LE_TC_2_LLC_ELLC | le_lrum(3), L3_3_WB),
+];
+
 /// `icl_mocs_table`: per-platform 0/1, then `GEN11_MOCS_ENTRIES`.
 const ICL_MOCS: [MocsEntry; 26] = [
     entry(0, LE_1_UC | LE_TC_1_LLC, L3_1_UC),
@@ -198,12 +236,13 @@ const ICL_MOCS: [MocsEntry; 26] = [
 const fn table(gt: LegacyGt) -> &'static [MocsEntry] {
     match gt {
         LegacyGt::Gen9 => &SKL_MOCS,
+        LegacyGt::Gen9Lp => &BXT_MOCS,
         LegacyGt::Gen11 => &ICL_MOCS,
     }
 }
 
 /// `get_mocs_settings`' `unused_entries_index`: `I915_MOCS_PTE` (1) on
-/// both, the default neither table overrides.
+/// all three, the default no table overrides.
 const UNUSED_ENTRIES_INDEX: u8 = 1;
 
 const fn lookup(gt: LegacyGt, index: u8) -> MocsEntry {
@@ -280,7 +319,7 @@ pub(crate) const fn skip_caching_clear(gt: LegacyGt) -> bool {
     let t = table(gt);
     let mut i = 0;
     while i < t.len() {
-        if matches!(gt, LegacyGt::Gen9) && t[i].l3cc & 0xf != 0 {
+        if gt.graphics9() && t[i].l3cc & 0xf != 0 {
             return false;
         }
         i += 1;
@@ -290,6 +329,7 @@ pub(crate) const fn skip_caching_clear(gt: LegacyGt) -> bool {
 
 // get_mocs_settings refuses a Gen9 table that sets these bits; ours never does.
 const _: () = assert!(skip_caching_clear(LegacyGt::Gen9));
+const _: () = assert!(skip_caching_clear(LegacyGt::Gen9Lp));
 
 // ── Workarounds (`intel_workarounds.c`) ─────────────────────────────
 
@@ -302,6 +342,8 @@ pub(crate) enum Gen9Kind {
     KabyLake,
     CoffeeLake,
     CometLake,
+    Broxton,
+    GeminiLake,
 }
 
 /// The workaround identity of one GT: generation, sub-platform and the
@@ -329,6 +371,8 @@ impl WaPlatform {
             "kabylake" => Gen9Kind::KabyLake,
             "coffeelake" | "whiskeylake" => Gen9Kind::CoffeeLake,
             "cometlake" => Gen9Kind::CometLake,
+            "broxton" => Gen9Kind::Broxton,
+            "geminilake" => Gen9Kind::GeminiLake,
             "icelake" => {
                 return Some(Self::Gen11 {
                     jsl_ehl: false,
@@ -348,9 +392,21 @@ impl WaPlatform {
 
     pub(crate) const fn gt(self) -> LegacyGt {
         match self {
+            _ if self.lp() => LegacyGt::Gen9Lp,
             Self::Gen9 { .. } => LegacyGt::Gen9,
             Self::Gen11 { .. } => LegacyGt::Gen11,
         }
+    }
+
+    /// `IS_GEN9_LP`.
+    pub(crate) const fn lp(self) -> bool {
+        matches!(
+            self,
+            Self::Gen9 {
+                kind: Gen9Kind::Broxton | Gen9Kind::GeminiLake,
+                ..
+            }
+        )
     }
 
     /// `IS_SKYLAKE && IS_GRAPHICS_STEP(A0, H0)`: `skl_revids` puts H0 at 7.
@@ -516,15 +572,18 @@ const GEN11_GT_SLICE_ENABLE: u64 = 0x9138;
 const GEN11_GT_SUBSLICE_DISABLE: u64 = 0x913c;
 
 impl Steering {
-    /// `gen9_sseu_info_init` (big-core: three slices of four subslices) or
+    /// `gen9_sseu_info_init` (big-core: three slices of four subslices; LP:
+    /// one slice of three) or
     /// `gen11_sseu_info_init` (one slice, eight subslices on Ice Lake, four
     /// on Elkhart/Jasper Lake). `None` when no slice or subslice is on.
     pub(crate) fn read(platform: WaPlatform, mut read: impl FnMut(u64) -> u32) -> Option<Self> {
         match platform {
             WaPlatform::Gen9 { .. } => {
+                // Gen9 LP: one slice of at most three subslices.
+                let (max_slices, max_subslices) = if platform.lp() { (1, 3) } else { (3, 4) };
                 let fuse2 = read(GEN8_FUSE2);
-                let slices = (fuse2 >> 25) & 0x7;
-                let subslices = 0xf & !((fuse2 >> 20) & 0xf);
+                let slices = (fuse2 >> 25) & 0x7 & ((1 << max_slices) - 1);
+                let subslices = ((1 << max_subslices) - 1) & !((fuse2 >> 20) & 0xf);
                 if slices == 0 || subslices == 0 {
                     return None;
                 }
@@ -534,7 +593,7 @@ impl Steering {
                         continue;
                     }
                     let disable = read(GEN9_EU_DISABLE + 4 * s as u64);
-                    let seven = (0..4)
+                    let seven = (0..max_subslices)
                         .filter(|ss| subslices & 1 << ss != 0)
                         .filter(|ss| 8 - ((disable >> (ss * 8)) & 0xff).count_ones() == 7)
                         .fold(0u32, |mask, ss| mask | 1 << ss);
@@ -607,25 +666,30 @@ pub(crate) fn gt_workarounds(platform: WaPlatform, steering: Steering) -> WaList
             }
             // WaCompressedResourceSamplerPbeMediaNewHashMode (HAS_LLC):
             // MMCD_MISC_CTRL MMCD_PCLA | MMCD_HOTSPOT_EN.
-            w.or(0x4ddc, 1 << 31 | 1 << 27);
+            if !platform.lp() {
+                w.or(0x4ddc, 1 << 31 | 1 << 27);
+            }
             // WaDisableHDCInvalidation (BDW_DISABLE_HDC_INVALIDATION).
             w.or(0x4090, 1 << 25);
             // WaDisableDynamicCreditSharing:kbl (GAMT_CHKN_BIT_REG).
             if platform.kbl_before_c0() {
                 w.or(0x4ab8, 1 << 28);
             }
-            // WaDisableGafsUnitClkGating (GEN7_UCGCTL4).
-            w.or(0x940c, 1 << 14);
+            // WaDisableGafsUnitClkGating (GEN7_UCGCTL4): skl/kbl/cfl only;
+            // Broxton and Gemini Lake take gen9_gt_workarounds_init alone.
+            if !platform.lp() {
+                w.or(0x940c, 1 << 14);
+            }
             // WaInPlaceDecompressionHang (GEN9_GAMT_ECO_REG_RW_IA): every
-            // KBL/CFL/CML, Skylake only before H0.
-            if !matches!(
-                platform,
+            // KBL/CFL/CML, Skylake only before H0, never Gen9 LP.
+            let in_place = match platform {
                 WaPlatform::Gen9 {
                     kind: Gen9Kind::Skylake,
                     ..
-                }
-            ) || platform.skl_before_h0()
-            {
+                } => platform.skl_before_h0(),
+                _ => !platform.lp(),
+            };
+            if in_place {
                 w.or(0x4ab0, 1 << 18);
             }
         }
@@ -668,8 +732,10 @@ pub(crate) fn ctx_workarounds(platform: WaPlatform, steering: Steering) -> WaLis
     match platform {
         WaPlatform::Gen9 { kind, .. } => {
             // HAS_LLC: PBE / sampler compressed hash selection.
-            w.masked_en(0x7014, 1 << 13);
-            w.masked_en(0xe194, 1 << 8);
+            if !platform.lp() {
+                w.masked_en(0x7014, 1 << 13);
+                w.masked_en(0xe194, 1 << 8);
+            }
             // WaClearFlowControlGpgpuContextSave, WaDisablePartialInstShootdown.
             w.masked_en(0xe4f0, 1 << 15 | 1 << 8);
             // WaEnableYV12BugFixInHalfSliceChicken7,
@@ -683,13 +749,19 @@ pub(crate) fn ctx_workarounds(platform: WaPlatform, steering: Steering) -> WaLis
             w.masked_en(0x7300, 1 << 5 | 1 << 15);
             w.masked_en(0x7300, 1 << 4);
             // WaDisableSamplerPowerBypassForSOPingPong (every Gen9 big core).
-            w.masked_en(0xe184, 1 << 1);
+            if !platform.lp() {
+                w.masked_en(0xe184, 1 << 1);
+            }
             // WaDisableSTUnitPowerOptimization.
             w.masked_en(0xe180, 1 << 13);
             // WaDisable3DMidCmdPreemption, WaDisableGPGPUMidCmdPreemption:
             // GEN8_CS_CHICKEN1 3D object level off, GPGPU command level.
             w.masked_dis(0x2580, 1);
             w.masked_field(0x2580, 0x6, 0x4);
+            // WaClearHIZ_WM_CHICKEN3:bxt,glk (GEN9_FACTOR_IN_CLR_VAL_HIZ).
+            if platform.lp() {
+                w.masked_en(0x5588, 1 << 9);
+            }
             match kind {
                 Gen9Kind::Skylake => {
                     // skl_tune_iz_hashing: GEN7_GT_MODE.
@@ -709,6 +781,17 @@ pub(crate) fn ctx_workarounds(platform: WaPlatform, steering: Steering) -> WaLis
                     }
                     // WaDisableSbeCacheDispatchPortSharing.
                     w.masked_en(0xe100, 1 << 4);
+                }
+                Gen9Kind::Broxton => {
+                    // WaDisableThreadStallDopClockGating:bxt (GEN8_ROW_CHICKEN
+                    // STALL_DOP_GATING_DISABLE).
+                    w.masked_en(0xe4f0, 1 << 5);
+                    // WaToEnableHwFixForPushConstHWBug:bxt.
+                    w.masked_en(0x7014, 1 << 8);
+                }
+                Gen9Kind::GeminiLake => {
+                    // WaToEnableHwFixForPushConstHWBug:glk.
+                    w.masked_en(0x7014, 1 << 8);
                 }
             }
         }
@@ -761,13 +844,24 @@ pub(crate) fn rcs_workarounds(platform: WaPlatform) -> WaList {
             // Wa_22010271021: GEN9_CS_DEBUG_MODE1 FF DOP clock gating.
             w.masked_en(0x20ec, 1 << 1);
         }
-        WaPlatform::Gen9 { .. } => {
-            // WaEnableGapsTsvCreditFix (GEN8_GARBCNTL).
-            w.or(0xb004, 1 << 7);
+        WaPlatform::Gen9 { kind, .. } => {
+            // WaEnableGapsTsvCreditFix (GEN8_GARBCNTL): skl/kbl/cfl/cml.
+            if !platform.lp() {
+                w.or(0xb004, 1 << 7);
+            }
+            // WaDisablePooledEuLoadBalancingFix:bxt (FF_SLICE_CS_CHICKEN2).
+            if kind == Gen9Kind::Broxton {
+                w.masked_en(0x20e4, 1 << 10);
+            }
             // WaContextSwitchWithConcurrentTLBInvalidate.
             w.masked_en(0x20d4, 1 << 2);
             // WaEnableLbsSlaRetryTimerDecrement (BDW_SCRATCH1).
             w.or(0xb11c, 1 << 2);
+            // WaProgramL3SqcReg1DefaultForPerf:bxt,glk (GEN8_L3SQCREG1):
+            // L3_GENERAL_PRIO_CREDITS(62) | L3_HIGH_PRIO_CREDITS(2).
+            if platform.lp() {
+                w.clear_set(0xb100, 0x1f << 19 | 0x1f << 14, 31 << 19 | 1 << 14);
+            }
             // WaOCLCoherentLineFlush (GEN8_L3SQCREG4).
             w.or(0xb118, 1 << 21);
             // L3 atomics off: GEN9_SCRATCH_LNCF1, L3SQCREG4, GEN9_SCRATCH1
@@ -802,6 +896,11 @@ pub(crate) fn rcs_whitelist(platform: WaPlatform) -> alloc::vec::Vec<u32> {
                 Gen9Kind::CoffeeLake | Gen9Kind::CometLake => {
                     regs.push(0x2348 | NONPRIV_RD | NONPRIV_RANGE_4)
                 }
+                // bxt_whitelist_build adds nothing.
+                Gen9Kind::Broxton => {}
+                // WA #0862 (glk_whitelist_build): userspace sets "Barrier
+                // Mode" in GEN9_SLICE_COMMON_ECO_CHICKEN1.
+                Gen9Kind::GeminiLake => regs.push(0x731c),
             }
             regs
         }
@@ -830,14 +929,22 @@ pub(crate) fn whitelist_writes(base: u64, regs: &[u32]) -> [(u64, u32); NONPRIV_
 /// `gtt_write_workarounds` and the GTT cache policy, in Linux's order.
 pub(crate) fn gtt_workarounds(gt: LegacyGt) -> WaList {
     let mut w = WaList::default();
-    // WaIncreaseDefaultTLBEntries: GEN8_L3_LRA_1_GPGPU, graphics 9..=11.
-    w.write(0x4dd4, 0x67f1_427f);
-    if gt == LegacyGt::Gen9 {
+    // WaIncreaseDefaultTLBEntries: GEN8_L3_LRA_1_GPGPU, graphics 9..=11
+    // (`GEN9_L3_LRA_1_GPGPU_DEFAULT_VALUE_BXT` on Gen9 LP).
+    w.write(
+        0x4dd4,
+        if gt == LegacyGt::Gen9Lp {
+            0x5ff1_01ff
+        } else {
+            0x67f1_427f
+        },
+    );
+    if gt.graphics9() {
         // 64K pages (graphics <= 10): GAMW_ECO_ENABLE_64K_IPS_FIELD.
         w.or(0x4080, 0xf);
     }
     // WaGttCachingOffByDefault: HSW_GTT_CACHE_EN, off where 2M pages exist.
-    w.write(0x4024, if gt == LegacyGt::Gen9 { 0xf000_7fff } else { 0 });
+    w.write(0x4024, if gt.graphics9() { 0xf000_7fff } else { 0 });
     w
 }
 
@@ -846,7 +953,8 @@ pub(crate) fn gtt_workarounds(gt: LegacyGt) -> WaList {
 /// The slice / subslice / EU layout i915 records for these generations and
 /// reports through `DRM_I915_QUERY_TOPOLOGY_INFO` and the SSEU GETPARAMs.
 /// Gen9 big core is three slices of four subslices of eight EUs, each slice
-/// with its own EU fuses; Gen11 one slice of eight (Ice Lake) or four
+/// with its own EU fuses (Gen9 LP one slice of three, pooling its EUs when
+/// all three are on); Gen11 one slice of eight (Ice Lake) or four
 /// (Elkhart/Jasper Lake) subslices sharing one EU fuse byte.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LegacyTopology {
@@ -857,6 +965,8 @@ pub struct LegacyTopology {
     subslices: [u8; 3],
     /// Enabled EUs of each (slice, subslice).
     eus: [[u8; 8]; 3],
+    /// `sseu->min_eu_in_pool`: nonzero only on a pooled-EU Gen9 LP part.
+    min_eu_in_pool: u8,
 }
 
 impl LegacyTopology {
@@ -867,25 +977,35 @@ impl LegacyTopology {
             slices: 0,
             subslices: [0; 3],
             eus: [[0; 8]; 3],
+            min_eu_in_pool: 0,
         };
         match platform {
             WaPlatform::Gen9 { .. } => {
-                topology.max_slices = 3;
-                topology.max_subslices = 4;
+                // "BXT has a single slice and at most 3 subslices."
+                let lp = platform.lp();
+                topology.max_slices = if lp { 1 } else { 3 };
+                topology.max_subslices = if lp { 3 } else { 4 };
                 let fuse2 = read(GEN8_FUSE2);
                 topology.slices = ((fuse2 >> 25) & 0x7) as u8;
-                let subslices = (0xf & !((fuse2 >> 20) & 0xf)) as u8;
-                for s in 0..3 {
+                let subslices =
+                    (((1u32 << topology.max_subslices) - 1) & !((fuse2 >> 20) & 0xf)) as u8;
+                for s in 0..usize::from(topology.max_slices) {
                     if topology.slices & 1 << s == 0 {
                         continue;
                     }
                     topology.subslices[s] = subslices;
                     let disable = read(GEN9_EU_DISABLE + 4 * s as u64);
-                    for ss in 0..4 {
+                    for ss in 0..usize::from(topology.max_subslices) {
                         if subslices & 1 << ss != 0 {
                             topology.eus[s][ss] = !(disable >> (8 * ss)) as u8;
                         }
                     }
+                }
+                // has_pooled_eu: all three subslices of slice 0. Its
+                // min_eu_in_pool branches for a disabled subslice are then
+                // unreachable, leaving 9.
+                if lp && topology.subslices[0].count_ones() == 3 {
+                    topology.min_eu_in_pool = 9;
                 }
             }
             WaPlatform::Gen11 { jsl_ehl, .. } => {
@@ -907,6 +1027,15 @@ impl LegacyTopology {
         (topology.slices != 0 && topology.subslices.iter().any(|&m| m != 0)).then_some(topology)
     }
 
+    /// `I915_PARAM_HAS_POOLED_EU` (`RUNTIME_INFO->has_pooled_eu`): a Gen9 LP
+    /// part with all three subslices, whose EUs the hardware pools.
+    pub fn pooled_eu(&self) -> bool {
+        self.min_eu_in_pool != 0
+    }
+    /// `I915_PARAM_MIN_EU_IN_POOL`.
+    pub fn min_eu_in_pool(&self) -> u32 {
+        u32::from(self.min_eu_in_pool)
+    }
     /// `I915_PARAM_SLICE_MASK`.
     pub fn slice_mask(&self) -> u32 {
         u32::from(self.slices)
@@ -1528,5 +1657,113 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_legacy_gt",
         smoke_legacy_topology_follows_sseu_info_init
+    );
+
+    /// Gen9 LP (Broxton, Gemini Lake): the CHV PPAT, the Broxton MOCS
+    /// table, the LP workaround split and the one-slice, three-subslice
+    /// topology with pooled EUs, each hand-expanded from Linux's macros.
+    fn smoke_legacy_gt_gen9_lp_profile() -> TestResult {
+        let bxt = gen9(Gen9Kind::Broxton, 0);
+        let glk = gen9(Gen9Kind::GeminiLake, 0);
+        let dispatch = WaPlatform::for_device(0x5a85, 0) == Some(bxt)
+            && WaPlatform::for_device(0x3185, 0) == Some(glk)
+            && bxt.gt() == LegacyGt::Gen9Lp
+            && glk.gt() == LegacyGt::Gen9Lp
+            && gen9(Gen9Kind::Skylake, 6).gt() == LegacyGt::Gen9
+            && LegacyGt::for_platform(GtPlatform::Gen9(
+                crate::intel_gpu_gt::Gen9Platform::GeminiLake,
+            )) == Some(LegacyGt::Gen9Lp);
+        if !dispatch {
+            return TestResult::Fail("Gen9 LP dispatch");
+        }
+        // GEN8_PPAT(0, SNOOP) | GEN8_PPAT(4..8, SNOOP); entries 1-3 uncached.
+        if ppat_writes(LegacyGt::Gen9Lp)
+            != alloc::vec![(0x40e0, 0x0000_0040), (0x40e4, 0x4040_4040)]
+        {
+            return TestResult::Fail("Gen9 LP PPAT");
+        }
+        // Uncached LLC/eLLC 0x09, PTE with LRUM(3) 0x30, cached 0x39; the
+        // unused entries take the PTE entry, 63 included.
+        let lp = LegacyGt::Gen9Lp;
+        let controls = [0, 1, 2, 3, 62, 63].map(|i| mocs_control(lp, i));
+        let l3 = l3cc_writes(lp);
+        if controls != [0x09, 0x30, 0x39, 0x30, 0x30, 0x30]
+            || l3[0] != (0xb020, 0x0030_0010)
+            || l3.iter().skip(1).any(|&(_, v)| v != 0x0030_0030)
+        {
+            return TestResult::Fail("Broxton MOCS table");
+        }
+        let has = |list: &WaList, reg: u64| list.entries().iter().find(|w| w.reg == reg).copied();
+        // gen9_gt_workarounds_init alone: no HAS_LLC MMCD, GAFS or in-place
+        // decompression workaround.
+        let gt = gt_workarounds(bxt, STEER);
+        if gt.entries() != gt_workarounds(glk, STEER).entries()
+            || [0x4ddc, 0x940c, 0x4ab0, 0x4ab8]
+                .iter()
+                .any(|&r| has(&gt, r).is_some())
+            || has(&gt, 0x4090).map(|w| w.set) != Some(1 << 25 | 1 << 8)
+        {
+            return TestResult::Fail("Gen9 LP GT workarounds");
+        }
+        let ctx = ctx_workarounds(bxt, STEER);
+        let glk_ctx = ctx_workarounds(glk, STEER);
+        if has(&ctx, 0x5588).map(|w| w.set) != Some(masked_enable(1 << 9))
+            || has(&ctx, 0xe4f0).map(|w| w.set) != Some(masked_enable(1 << 15 | 1 << 8 | 1 << 5))
+            || has(&glk_ctx, 0xe4f0).map(|w| w.set) != Some(masked_enable(1 << 15 | 1 << 8))
+            || has(&ctx, 0x7014).map(|w| w.set) != Some(masked_enable(1 << 8))
+            || has(&glk_ctx, 0x7014).map(|w| w.set) != Some(masked_enable(1 << 8))
+            || has(&ctx, 0xe184).is_some()
+            || has(&ctx, 0xe194).map(|w| w.set) != Some(masked_enable(1 << 4 | 1 << 2))
+        {
+            return TestResult::Fail("Gen9 LP context workarounds");
+        }
+        let rcs = rcs_workarounds(bxt);
+        let glk_rcs = rcs_workarounds(glk);
+        if has(&rcs, 0x20e4).map(|w| w.set) != Some(masked_enable(1 << 10))
+            || has(&glk_rcs, 0x20e4).is_some()
+            || has(&rcs, 0xb004).is_some()
+            || has(&glk_rcs, 0xb100).map(|w| (w.clear, w.set))
+                != Some((0x1f << 19 | 0x1f << 14, 31 << 19 | 1 << 14))
+        {
+            return TestResult::Fail("Gen9 LP render workarounds");
+        }
+        if rcs_whitelist(bxt) != alloc::vec![0x2248, 0x2580, 0x7014, 0x7304]
+            || rcs_whitelist(glk) != alloc::vec![0x2248, 0x2580, 0x7014, 0x7304, 0x731c]
+        {
+            return TestResult::Fail("Gen9 LP whitelist");
+        }
+        let gtt = gtt_workarounds(LegacyGt::Gen9Lp);
+        if has(&gtt, 0x4dd4).map(|w| w.set) != Some(0x5ff1_01ff)
+            || has(&gtt, 0x4024).map(|w| w.set) != Some(0xf000_7fff)
+            || has(&gtt, 0x4080).is_none()
+        {
+            return TestResult::Fail("Gen9 LP GTT workarounds");
+        }
+        // One slice, three subslices; all three pooled with nine minimum EUs.
+        let regs = |map: &'static [(u64, u32)]| {
+            move |reg: u64| map.iter().find(|(r, _)| *r == reg).map_or(0, |(_, v)| *v)
+        };
+        let full = LegacyTopology::read(glk, regs(&[(0x9120, 1 << 25), (0x9134, 0)])).unwrap();
+        let fused =
+            LegacyTopology::read(bxt, regs(&[(0x9120, 1 << 25 | 1 << 21), (0x9134, 0)])).unwrap();
+        let steering = Steering::read(bxt, regs(&[(0x9120, 1 << 25 | 1 << 20)])).unwrap();
+        if full.subslice_mask() != 0x7
+            || full.eu_total() != 24
+            || !full.pooled_eu()
+            || full.min_eu_in_pool() != 9
+            || fused.subslice_mask() != 0x5
+            || fused.pooled_eu()
+            || fused.min_eu_in_pool() != 0
+            || full.i915_bytes().len() != 16 + 2 + 3
+            || (steering.slice, steering.subslice) != (0, 1)
+            || Steering::read(bxt, regs(&[(0x9120, 1 << 25 | 0x7 << 20)])).is_some()
+        {
+            return TestResult::Fail("Gen9 LP topology");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_gt",
+        smoke_legacy_gt_gen9_lp_profile
     );
 }

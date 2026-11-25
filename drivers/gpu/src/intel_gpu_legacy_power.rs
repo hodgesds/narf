@@ -19,6 +19,8 @@ use crate::intel_gpu_legacy_gt::LegacyGt;
 /// `GEN6_RP_STATE_CAP` (`MCHBAR_MIRROR_BASE_SNB + 0x5998`): RP0 [7:0], RP1
 /// [15:8], RPn [23:16], in 50 MHz units.
 const RP_STATE_CAP: u64 = 0x145998;
+/// `BXT_RP_STATE_CAP`, Gen9 LP's caps register.
+const BXT_RP_STATE_CAP: u64 = 0x138170;
 /// `GEN10_FREQ_INFO_REC`: RPe [15:8] (`RPE_MASK`), 50 MHz units; Gen11's RP1.
 const FREQ_INFO_REC: u64 = 0x145ef0;
 /// `GEN9_FREQ_SCALER`: requests are in 16.67 MHz units.
@@ -85,6 +87,20 @@ impl Caps {
     /// the caps are unreadable or inconsistent; the owner then requests
     /// nothing and the PCU keeps its own choice.
     pub(crate) fn read(gt: LegacyGt, mut read: impl FnMut(u64) -> u32) -> Option<Self> {
+        if gt == LegacyGt::Gen9Lp {
+            // BXT_RP_STATE_CAP: RP0 [23:16], RP1 [15:8], RPn [7:0], already
+            // in 16.67 MHz units. RPe stays RP1 (no pcode DDCC read on LP).
+            let cap = read(BXT_RP_STATE_CAP);
+            let (rp0, rp1, rpn) = ((cap >> 16) & 0xff, (cap >> 8) & 0xff, cap & 0xff);
+            if cap == u32::MAX || rpn == 0 || rp0 < rpn {
+                return None;
+            }
+            return Some(Self {
+                rp0,
+                rp1: rp1.clamp(rpn, rp0),
+                rpn,
+            });
+        }
         let cap = read(RP_STATE_CAP);
         if cap == u32::MAX {
             return None;
@@ -92,7 +108,7 @@ impl Caps {
         let rp0 = (cap & 0xff) * FREQ_SCALER;
         let rpn = ((cap >> 16) & 0xff) * FREQ_SCALER;
         let rp1 = match gt {
-            LegacyGt::Gen9 => ((cap >> 8) & 0xff) * FREQ_SCALER,
+            LegacyGt::Gen9 | LegacyGt::Gen9Lp => ((cap >> 8) & 0xff) * FREQ_SCALER,
             LegacyGt::Gen11 => {
                 let info = read(FREQ_INFO_REC);
                 if info == u32::MAX {
@@ -128,7 +144,7 @@ fn pm_interval(clock_hz: u64, ns: u64) -> u32 {
 /// at RPn with the LOW_POWER thresholds and `RP_CONTROL`. `clock_hz` is the
 /// CS timestamp clock (`gt->clock_frequency`).
 pub(crate) fn rps_enable(gt: LegacyGt, caps: Caps, clock_hz: u64, mut write: impl FnMut(u64, u32)) {
-    if gt == LegacyGt::Gen9 {
+    if gt.graphics9() {
         write(RC_VIDEO_FREQ, Caps::request(caps.rp1));
     }
     write(RP_IDLE_HYSTERSIS, 0xa);
@@ -147,7 +163,7 @@ pub(crate) fn rps_enable(gt: LegacyGt, caps: Caps, clock_hz: u64, mut write: imp
     );
     // MEDIA_TURBO (Gen9 only) | MEDIA_HW_NORMAL_MODE | MEDIA_IS_GFX |
     // ENABLE | UP_BUSY_AVG | DOWN_IDLE_AVG.
-    let turbo = if gt == LegacyGt::Gen9 { 1 << 11 } else { 0 };
+    let turbo = if gt.graphics9() { 1 << 11 } else { 0 };
     write(RP_CONTROL, turbo | 2 << 9 | 1 << 8 | 1 << 7 | 2 << 3 | 2);
 }
 
@@ -155,9 +171,16 @@ pub(crate) fn rps_enable(gt: LegacyGt, caps: Caps, clock_hz: u64, mut write: imp
 /// Returns `ctl_enable`, the `RC_CONTROL` value [`rc6_unpark`] restores:
 /// zero on Gen9, whose RC6 context-corruption workaround leaves only the
 /// software entry at park (`NEEDS_RC6_CTX_CORRUPTION_WA`), and hardware RC6
-/// on Gen11.
-pub(crate) fn rc6_enable(gt: LegacyGt, device: u16, mut write: impl FnMut(u64, u32)) -> u32 {
+/// on Gen11. `None` when RC6 is not supported (`rc6_supported` false): the
+/// owner then never parks into RC6 nor writes the RC6 controls. Gen9 LP is
+/// `None` until its BIOS setup check (`bxt_check_bios_rc6_setup`) exists.
+pub(crate) fn rc6_enable(
+    gt: LegacyGt,
+    device: u16,
+    mut write: impl FnMut(u64, u32),
+) -> Option<u32> {
     match gt {
+        LegacyGt::Gen9Lp => None,
         LegacyGt::Gen9 => {
             // WaRsDoubleRc6WrlWithCoarsePowerGating: Skylake doubles it.
             let skylake = crate::intel_gpu::DEVICE_TABLE
@@ -180,7 +203,7 @@ pub(crate) fn rc6_enable(gt: LegacyGt, device: u16, mut write: impl FnMut(u64, u
             if !SKL_GT3_GT4.contains(&device) {
                 write(PG_ENABLE, 0x3); // RENDER_PG | MEDIA_PG
             }
-            0
+            Some(0)
         }
         LegacyGt::Gen11 => {
             write(RC6_WAKE_RATE_LIMIT, 54 << 16 | 85);
@@ -196,7 +219,7 @@ pub(crate) fn rc6_enable(gt: LegacyGt, device: u16, mut write: impl FnMut(u64, u
             write(MEDIA_PG_IDLE_HYSTERESIS, 60);
             write(RENDER_PG_IDLE_HYSTERESIS, 60);
             write(PG_ENABLE, 0x7); // RENDER_PG | MEDIA_PG | MEDIA_SAMPLER_PG
-            RC_CTL_HW_RC6
+            Some(RC_CTL_HW_RC6)
         }
     }
 }
@@ -335,6 +358,23 @@ pub mod tests {
                 rpn: 27
             })
         );
+        // BXT_RP_STATE_CAP: RP0 [23:16], RP1 [15:8], RPn [7:0], unscaled.
+        let lp = Caps::read(LegacyGt::Gen9Lp, |r| {
+            if r == BXT_RP_STATE_CAP {
+                0x0021_0f06
+            } else {
+                0
+            }
+        });
+        kt_assert_eq!(
+            lp,
+            Some(Caps {
+                rp0: 0x21,
+                rp1: 0x0f,
+                rpn: 6
+            })
+        );
+        kt_assert_eq!(Caps::read(LegacyGt::Gen9Lp, |_| 0x0006_0f21), None);
         let gen11 = Caps::read(LegacyGt::Gen11, |r| match r {
             RP_STATE_CAP => 0x0009_1122,
             FREQ_INFO_REC => 0x1400,
@@ -396,7 +436,7 @@ pub mod tests {
         let mut writes = Vec::new();
         kt_assert_eq!(
             rc6_enable(LegacyGt::Gen9, 0x1912, |r, v| writes.push((r, v))),
-            0
+            Some(0)
         );
         kt_assert_eq!(writes.first(), Some(&(RC6_WAKE_RATE_LIMIT, 108 << 16)));
         kt_assert_eq!(writes.last(), Some(&(PG_ENABLE, 3)));
@@ -410,10 +450,17 @@ pub mod tests {
         let mut writes = Vec::new();
         kt_assert_eq!(
             rc6_enable(LegacyGt::Gen11, 0x8a52, |r, v| writes.push((r, v))),
-            0x8804_0000
+            Some(0x8804_0000)
         );
         kt_assert_eq!(writes.last(), Some(&(PG_ENABLE, 7)));
         kt_assert!(writes.contains(&(RC6_WAKE_RATE_LIMIT, 0x0036_0055)));
+        // Gen9 LP leaves RC6 to the BIOS until its setup check exists.
+        let mut writes = Vec::new();
+        kt_assert_eq!(
+            rc6_enable(LegacyGt::Gen9Lp, 0x3185, |r, v| writes.push((r, v))),
+            None
+        );
+        kt_assert!(writes.is_empty());
         let mut writes = Vec::new();
         rc6_park(|r, v| writes.push((r, v)));
         kt_assert_eq!(
