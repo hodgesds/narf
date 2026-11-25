@@ -156,7 +156,11 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "rtw88", || {
+        #[cfg(not(feature = "rtw88-module-only"))]
         rtw88::register();
+        // rtw88.ko owns the RTL8821CU/RTL8822BU USB ids; PCIe stays built in.
+        #[cfg(feature = "rtw88-module-only")]
+        rtw88::register_without_usb();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "rtw89", || {

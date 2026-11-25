@@ -2579,6 +2579,93 @@ feature off).
   leaves no match. QEMU emulates no WCN6855, so bring-up and RF behavior
   are first proven on hardware (`docs/BOOTING_ON_CACHYOS.md`).
 
+### 4.8 `rtw88.ko`: the RTL8821CU / RTL8822BU driver as a loadable module
+
+`narf-drivers-wireless-rtw --no-default-features --features module` builds
+the rtw88 driver tree (`src/rtw88/`) into a `.ko` (x86_64 and aarch64) from
+the same source as the built-in, for its USB parts. rtw89 does not build
+into the module; the rtw88 and rtw89 PCIe ids stay registration-only
+(`module_probe.rs`, probe `-ENOSYS`).
+
+- **Platform** (`src/rtw88/platform/`). rtw88 names some twenty kernel
+  crates directly (`narf_scheduler`, `narf_time`, `narf_wireless::reg`,
+  `narf_net::iface`, ...). In the module build `platform` provides **the
+  same names** — `platform::narf_time`, `platform::narf_net`, ... — and each
+  driver file imports them under `#[cfg(feature = "module")]`, so the
+  driver bodies are unchanged and the built-in build is untouched:
+  - runtime: the module executor, `narf-module-rt` clock, sleeps and locks;
+  - firmware: `narf_firmware_open`/`_read`/`_signed`, each file read once
+    and kept for the module's lifetime (a signed file's view reports a
+    signer; the KABI does not name the key, and rtw88 only requires that a
+    record is signed); the firmware capability types are plain tokens, the
+    module's `Firmware:Read` grant being the authority;
+  - the regulatory domain: the kernel's, read once per probe through
+    `narf_wireless_regdomain` (the signed per-board records are checked
+    against it, as built in);
+  - USB: the `ControlIo` / `Io` transport traits `usb_firmware::Backend`
+    is written against;
+  - stack hooks: `narf_net::iface::{lookup, set_link_metadata,
+    on_rx_frame_from}`, `nl80211::notify_disconnect` and the shell's
+    withdrawal land on the module netdev (`iface_module.rs`);
+  - PCI types (`BusDevice`, `MmioRegion`, `BusAddr`): uninhabited, so every
+    PCI-only branch of the shared code builds and is statically unreachable.
+  PCI, PCI power/recovery, system PM, runtime idle, rejoin and the B22 PCI
+  owner are `builtin`-only.
+- **Probe** (`usb_kabi.rs`, Linux `rtw_usb_probe` order). Every
+  RTL8821CU / RTL8822BU VID:PID (50 entries, vendor-specific interface
+  0xff/0xff/0xff) is registered with `narf_register_usb_driver`. Probe reads
+  the configuration descriptor and parses the endpoints
+  (`usb::Endpoints::parse`) — a token without a USB context is refused
+  here, before device access — then starts the 1 ms heartbeat
+  (`narf_usb_spawn_poller`) and the attach task:
+  1. GET_DESCRIPTOR(DEVICE) for the VID:PID (the probe thunk carries none),
+     then the chip (`usb_driver::chip`);
+  2. SET_CONFIGURATION and the bulk endpoint contexts (`narf_usb_configure`);
+  3. the port speed from the bulk-IN `wMaxPacketSize` (the KABI carries no
+     speed);
+  4. from here on the driver's own code: `Backend::new_for`,
+     `usb_driver::power_and_factory_for` (`rtw_mac_power_on`, the factory
+     map), the B22 `phy_cfg` / `switch_mode`;
+  5. the station shell (`interface::Device`) is published (below) and
+     `usb_driver::provision` runs the lifecycle — firmware, MAC, PHY, the
+     C21 calibration / operating / station stages or the B22 `N2BQ` / `N2BP`
+     / `N2BS` stages — to `station.activate()`, retried 120 × 500 ms while
+     the firmware or signed records are not registered, as built in.
+- **Transport.** EP0 register access is `narf_usb_control`; register delays
+  ≤ 1 ms busy-wait (`narf_udelay`). Bulk pipes: the KABI moves at most 4 KiB
+  per request and one request per endpoint, while rtw88 posts 32 KiB
+  receive buffers, 4.1 KiB firmware pages and queued sends. A transfer is a
+  chain of ≤ 4 KiB requests on a per-endpoint FIFO: OUT splits on 4 KiB
+  boundaries (a multiple of every bulk max packet, so the wire packets are
+  one transfer's), IN completes on the first short chunk or when full.
+  Every completion and the poller run the executor.
+- **Netdev** (`iface_module.rs`). `narf_usb_netif_register_with_context`
+  registers `wlan%d`; the stack's TX goes to the shell's built-in send hook
+  (`endpoints::send` → `Device::enqueue`), the shell's RX delivery leaves
+  through `narf_usb_netif_rx`. The netdev is open from registration; its
+  provider lifetime is the shell's native emission identity.
+- **Control plane.** No wiphy: the `WIFI` host (§4.1) binds sessions to bus
+  device contexts only, so nl80211 cannot reach a USB function's module.
+  The station is driven by the same in-driver SME nl80211 calls built in
+  (`WirelessNetIface::scan` / `associate`: Open and WPA2-PSK with the
+  driver's own 4-way handshake and CCMP) from `rtw.ssid=` / `rtw.psk=` /
+  `rtw.passphrase=` (PBKDF2-SHA1 to the PMK) / `rtw.scan=`, declared in
+  `.narf_kparams`; it rejoins after link loss.
+- **Configuration.** `narf-drivers-wireless/rtw88-module-only` leaves the
+  built-in USB class driver unregistered so a loaded `rtw88.ko` is offered
+  the functions (module matches see only devices no built-in driver
+  claimed); rtw88 PCIe and rtw89 stay built in.
+- **Not carried (built-in only).** nl80211 / wiphy and the userspace SME;
+  USB reset, rejoin, runtime idle and system PM (`usb_recovery.rs`); USB
+  CLEAR_FEATURE(HALT) recovery (no host endpoint reset in the KABI); WoW.
+- **Proof.** `modules/e2e/rtw88` loads the real `.ko`: relocations, init,
+  the declared parameters and an applied load argument, the USB claim (both
+  chips' ids on the vendor interface, not rtl8xxxu's id, not another
+  interface class), the registration-only PCIe ids, refusal of a USB probe
+  with no context, and an unload that leaves no match. QEMU emulates no
+  Realtek USB Wi-Fi device, so bring-up, RF and association through the
+  module are unproven until run on hardware.
+
 ## 5. Buffer Management
 
 - **Data Path**: Uses standard `DmaBuffer` caps provided by `io/spec`.

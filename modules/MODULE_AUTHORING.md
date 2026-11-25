@@ -349,6 +349,18 @@ services sit behind one `platform` module that re-exports the kernel crates
 names. Pure protocol crates are linked with their `kernel` feature off.
 `modules/e2e/ath11k` loads it.
 
+`drivers/wireless/rtw` (rtw88 USB) is the USB full-driver example. A driver
+that names many kernel crates directly can keep its bodies unchanged: its
+`platform` module defines modules with the kernel crates' own names
+(`platform::narf_time`, ...), and each driver file imports them under
+`#[cfg(feature = "module")]`. Import them explicitly, not with a glob: a
+glob import that shadows a crate also in the extern prelude (a kernel-free
+`narf_wireless`) is ambiguous (E0659). PCI types the USB build cannot have
+are uninhabited enums, so shared PCI-only branches compile and are provably
+unreachable. A USB function's heartbeat and netdev come from
+`narf_usb_spawn_poller` and `narf_usb_netif_*` (the bus-context exports
+refuse USB tokens). `modules/e2e/rtw88` loads it.
+
 ## Lifecycle symbols
 
 Every NARF module exports two C-ABI symbols the kernel calls:

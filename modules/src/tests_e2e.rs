@@ -1763,6 +1763,105 @@ fn e2e_ath11k_module_registration() -> TestResult {
 }
 kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
 
+/// The real rtw `.ko` (`narf-drivers-wireless-rtw --features module`: the
+/// rtw88 driver source — USB transport, firmware, MAC/PHY/RF, calibration,
+/// the station shell and its in-driver SME — over `narf-module-rt`, the
+/// kernel-free protocol crates and the KABI). Relocations resolve and init
+/// runs; the station parameters are declared and a load argument applies;
+/// the module claims the RTL8821CU / RTL8822BU USB ids on their
+/// vendor-specific interface (and not a Realtek id rtw88 does not drive, nor
+/// the same id on another interface class), keeps the rtw88 / rtw89 PCIe
+/// ids registration-only; a USB probe with no device context is refused
+/// before any device access; unload leaves no USB or PCI match behind. QEMU
+/// has no Realtek Wi-Fi device, so bring-up itself is proven on hardware.
+fn e2e_rtw88_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    use narf_drivers_usb::class_registry::{__module_probe_for_test, module_match_count};
+    const REALTEK: u16 = 0x10ec;
+    /// RTL8821CU (0bda:c811), RTL8822BU (0bda:b812), and RTL8188EU
+    /// (0bda:8179, rtl8xxxu's) — the last is not rtw88's.
+    const RTL8821CU: (u16, u16) = (0x0bda, 0xc811);
+    const RTL8822BU: (u16, u16) = (0x0bda, 0xb812);
+    const RTL8188EU: (u16, u16) = (0x0bda, 0x8179);
+    /// The id tables' entry counts (`rtw88::usb::RTL8821CU_IDS`,
+    /// `RTL8822BU_IDS`).
+    const USB_IDS: usize = 15 + 35;
+    /// A configuration descriptor with one interface of class
+    /// `class`/`class`/`class`.
+    fn config(class: u8) -> [u8; 18] {
+        [
+            9, 2, 18, 0, 1, 1, 0, 0x80, 50, // configuration
+            9, 4, 0, 0, 0, class, class, class, 0, // interface 0
+        ]
+    }
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/rtw88.ko")
+    else {
+        return TestResult::Fail("rtw88 module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("rtw88 module has no ABI placeholder");
+    };
+    let (pci_before, usb_before) = (count(), module_match_count());
+    let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("rtw88.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let declared = ["ssid", "psk", "passphrase", "scan"]
+        .iter()
+        .all(|name| crate::params::find(&module.params, name).is_some());
+    let applied = crate::params::find(&module.params, "ssid")
+        .is_some_and(|s| s.read() == "narf-e2e")
+        && crate::params::find(&module.params, "psk").is_some_and(|s| s.read().is_empty());
+    let vendor = config(0xff);
+    let probe_8821cu = __module_probe_for_test(RTL8821CU.0, RTL8821CU.1, &vendor);
+    let usb_claims = module.name() == "rtw"
+        && module_match_count() == usb_before + USB_IDS
+        && probe_8821cu.is_some_and(|(name, _)| name == "rtw8821cu")
+        && __module_probe_for_test(RTL8822BU.0, RTL8822BU.1, &vendor)
+            .is_some_and(|(name, _)| name == "rtw8822bu")
+        && __module_probe_for_test(RTL8188EU.0, RTL8188EU.1, &vendor).is_none()
+        && __module_probe_for_test(RTL8821CU.0, RTL8821CU.1, &config(0x08)).is_none();
+    let pci_claims = count() > pci_before
+        && __module_thunk_for_test(REALTEK, 0xc821).is_some()
+        && __module_thunk_for_test(REALTEK, 0x8852).is_some();
+    // A bogus token (no USB context): the configuration read fails first.
+    let refused = probe_8821cu.is_some_and(|(_, probe)| probe(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("rtw").is_err() {
+        return TestResult::Fail("could not unload rtw88.ko");
+    }
+    if !live || !declared || !applied {
+        return TestResult::Fail("rtw88.ko not Live, or its parameters missing or not applied");
+    }
+    if !usb_claims {
+        return TestResult::Fail("rtw88.ko did not claim exactly the RTL8821CU/RTL8822BU USB ids");
+    }
+    if !pci_claims {
+        return TestResult::Fail("rtw88.ko did not register the rtw88/rtw89 PCIe ids");
+    }
+    if !refused {
+        return TestResult::Fail("rtw88.ko probe accepted a token with no USB context");
+    }
+    if module_match_count() != usb_before
+        || count() != pci_before
+        || __module_probe_for_test(RTL8821CU.0, RTL8821CU.1, &vendor).is_some()
+    {
+        return TestResult::Fail("rtw88.ko unload left a USB or PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/rtw88", e2e_rtw88_module_registration);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]
