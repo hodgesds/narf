@@ -2223,6 +2223,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::NotATty) => ctx.set_return(errno_ret(ENOTTY)),
         Err(narf_filesystem::FsError::Protocol) => ctx.set_return(errno_ret(71)),
         Err(narf_filesystem::FsError::Overflow) => ctx.set_return(errno_ret(75)),
+        Err(narf_filesystem::FsError::NoData) => ctx.set_return(errno_ret(61)),
+        Err(narf_filesystem::FsError::HostUnreachable) => ctx.set_return(errno_ret(113)),
+        Err(narf_filesystem::FsError::IsADirectory) => ctx.set_return(errno_ret(21)),
+        Err(narf_filesystem::FsError::RemoteIo) => ctx.set_return(errno_ret(121)),
+        Err(narf_filesystem::FsError::Interrupted) => ctx.set_return(errno_ret(4)),
         Err(narf_filesystem::FsError::OutOfMemory) => {
             ctx.set_return(errno_ret(ENOMEM));
         }

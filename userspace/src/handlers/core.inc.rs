@@ -2572,6 +2572,10 @@ fn open_impl_reserved(
                         narf_filesystem::FsError::NotATty => 25,          // ENOTTY
                         narf_filesystem::FsError::Protocol => 71,         // EPROTO
                         narf_filesystem::FsError::Overflow => 75,         // EOVERFLOW
+                        narf_filesystem::FsError::NoData => 61,           // ENODATA
+                        narf_filesystem::FsError::HostUnreachable => 113, // EHOSTUNREACH
+                        narf_filesystem::FsError::IsADirectory => 21,     // EISDIR
+                        narf_filesystem::FsError::RemoteIo => 121,        // EREMOTEIO
                         narf_filesystem::FsError::Canceled => 125,        // ECANCELED
                         narf_filesystem::FsError::Interrupted => 4,       // EINTR
                         narf_filesystem::FsError::NoSpace => 28,
@@ -5720,6 +5724,10 @@ pub(crate) fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::NotATty => 25,     // ENOTTY
         narf_filesystem::FsError::Protocol => 71,    // EPROTO
         narf_filesystem::FsError::Overflow => 75,    // EOVERFLOW
+        narf_filesystem::FsError::NoData => 61,      // ENODATA
+        narf_filesystem::FsError::HostUnreachable => 113, // EHOSTUNREACH
+        narf_filesystem::FsError::IsADirectory => 21, // EISDIR
+        narf_filesystem::FsError::RemoteIo => 121,   // EREMOTEIO
         narf_filesystem::FsError::Canceled => 125, // ECANCELED
         narf_filesystem::FsError::Interrupted => EINTR,
     }

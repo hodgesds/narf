@@ -897,6 +897,22 @@ pub enum FsError {
     /// The device sent more data than the transfer asked for (USB
     /// babble). Linux returns `-EOVERFLOW`. Maps to `EOVERFLOW`.
     Overflow,
+    /// The object has no data of the kind asked for: an interface with no
+    /// driver bound (usbfs `GETDRIVER` / `DISCONNECT`). Linux returns
+    /// `-ENODATA`. Maps to `ENODATA`.
+    NoData,
+    /// The device is not in a state that can reach its interfaces: a USB
+    /// device that is not configured (usbfs `checkintf`). Linux returns
+    /// `-EHOSTUNREACH`. Maps to `EHOSTUNREACH`.
+    HostUnreachable,
+    /// The operation does not apply to this kind of object: a USB reset
+    /// of a root hub (`usb_reset_device`). Linux returns `-EISDIR`. Maps to
+    /// `EISDIR`.
+    IsADirectory,
+    /// A transfer that must be one piece was refused: usbfs rejects a bulk
+    /// continuation URB after its transfer failed (`proc_do_submiturb`).
+    /// Linux returns `-EREMOTEIO`. Maps to `EREMOTEIO`.
+    RemoteIo,
     /// The work was abandoned without running to completion — a GPU job
     /// queued behind one that hung, or any job of a context that caused a
     /// hang (`-ECANCELED`). Maps to `ECANCELED`.
