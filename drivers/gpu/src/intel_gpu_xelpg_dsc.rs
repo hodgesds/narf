@@ -2,7 +2,10 @@
 //! DSC capabilities, Linux's compression decision, the per-pipe VDSC
 //! engine image, the PPS secondary data packet and DP FEC.
 //!
-//! Sources (Linux b90c984d):
+//! Sources (Linux 7.4-rc4; the compression search is 7.4's
+//! `intel_dp_dsc_compute_config` / `dsc_compute_compressed_bpp` /
+//! `dsc_compute_link_config`, including its 128b/132b half, which the UHBR
+//! link layer supplies, [`UhbrDscFit`]):
 //! - `drm_dp_helper.c` / `drm_dp_helper.h`: the DSC DPCD accessors
 //!   (`drm_dp_dsc_sink_*`, `drm_edp_dsc_sink_output_bpp`,
 //!   `drm_dp_bw_overhead`, `drm_dp_max_dprx_data_rate`);
@@ -57,9 +60,10 @@
 //! [`msa_misc`].
 //!
 //! Qualified DSC profile: one pipe, no joiner (big, ultra or
-//! uncompressed), RGB, a DSC input of at most 8 bpc, 8b/10b SST (UHBR
-//! refused upstream), at most four slices per line (two VDSC engines), no
-//! branch device. Everything else is a typed [`DscRefusal`].
+//! uncompressed), RGB, a DSC input of at most 8 bpc, SST over 8b/10b with
+//! FEC or over 128b/132b (FEC implicit; only through [`compute_with`] under
+//! `narf.intel.uhbr=1`), at most four slices per line (two VDSC engines),
+//! no branch device. Everything else is a typed [`DscRefusal`].
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::drm_dsc::{self, Pps};
@@ -184,6 +188,20 @@ impl DscDpcd {
     /// not declared.
     pub fn output_bpp_x16(&self) -> u16 {
         u16::from(self.reg(0x067)) | (u16::from(self.reg(0x068) & 3) << 8)
+    }
+
+    /// `intel_dp_dsc_max_delta_bppx16` for RGB (eDP 1.5 / DP 2.0): with
+    /// `DP_DSC_MAX_BPP_DELTA_AVAILABILITY` in `DP_DSC_MAX_BITS_PER_PIXEL_HI`,
+    /// `DP_DSC_MAX_BPP_DELTA_VERSION_1`'s RGB/YCbCr444 field 1..=21 is
+    /// `field + DP_DSC_BPP_DELTA_444 - 1` bpp (x16); 0 otherwise.
+    pub fn max_bpp_delta_x16(&self) -> u16 {
+        if self.reg(0x068) & (1 << 7) == 0 {
+            return 0;
+        }
+        match self.reg(0x06e) & 0x1f {
+            d @ 1..=21 => (u16::from(d) + 16 - 1) << 4,
+            _ => 0,
+        }
     }
 
     /// `drm_dp_dsc_sink_supports_format(DP_DSC_RGB)`.
@@ -424,8 +442,11 @@ impl LinkLimits {
     }
 }
 
-/// What `intel_dp_get_link_train_fallback_values` (Linux b90c984d
-/// `intel_dp_link_training.c`) decides after a training failure.
+/// What `intel_dp_get_link_train_fallback_values`
+/// (`intel_dp_link_training.c`) decides after a training failure. For SST
+/// this is Linux 7.4's descending lane-count/rate walk of
+/// `intel_dp_link_caps.c` (`reduce_link_params`), which visits the same
+/// configurations as the older rate-then-lanes reduction this keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {
     /// eDP, the first failure: retry with `use_max_params`.
@@ -1129,13 +1150,17 @@ fn min_compressed_bpp_x16(dpcd: &DscDpcd) -> u32 {
     )
 }
 
-/// `compute_max_compressed_bpp_x16` for one pipe, RGB, no throughput quirk.
+/// `compute_max_compressed_bpp_x16` for one pipe, RGB, no throughput quirk
+/// (a non-branch sink: `dsc_throughput_quirk_max_bpp_x16` is `INT_MAX`).
 fn max_compressed_bpp_x16(dpcd: &DscDpcd, hdisplay: u32, pipe_max_bpp: u32, link_max: u32) -> u32 {
+    // get_max_compressed_bpp_with_joiner: small_joiner_ram_max_bpp, one pipe.
     let joiner = SMALL_JOINER_RAM_BITS / hdisplay;
-    // intel_dp_dsc_max_sink_compressed_bppx16 >> 4.
-    let sink = match dpcd.output_bpp_x16() {
-        0 => 3 * (pipe_max_bpp / 3),
-        x16 => u32::from(x16) >> 4,
+    // intel_dp_dsc_sink_max_compressed_bpp: the bpp delta, else
+    // drm_edp_dsc_sink_output_bpp, else 3 * bpc (Table 2-157, DP v2.0).
+    let sink = match (dpcd.max_bpp_delta_x16(), dpcd.output_bpp_x16()) {
+        (0, 0) => 3 * (pipe_max_bpp / 3),
+        (0, x16) => u32::from(x16) >> 4,
+        (delta, _) => u32::from(delta) >> 4,
     };
     let dsc_max = sink.min(SRC_MAX_COMPRESSED_BPP).min(joiner);
     align_max_compressed_bpp_x16(bpp_step_x16(dpcd), pipe_max_bpp, link_max.min(dsc_max * 16))
@@ -1182,20 +1207,61 @@ pub fn slice_height(vactive: u32) -> u32 {
 
 /// `intel_dp_dsc_compute_config` (SST, one pipe) after
 /// `intel_dp_compute_config_limits(dsc = true)` with the pipe maximum
-/// `max_bpp` ([`max_pipe_bpp`]).
+/// `max_bpp` ([`max_pipe_bpp`]), over the 8b/10b configurations of
+/// `limits` only.
 pub fn compute(
     sink: &DscSink,
     limits: &LinkLimits,
     mode: &Mode,
     max_bpp: u32,
 ) -> Result<DscPlan, DscRefusal> {
+    compute_with(sink, limits, mode, max_bpp, None, None)
+}
+
+/// The 128b/132b half of `dsc_compute_link_config`: given a compressed
+/// `bpp_x16` and the stream's slice count (`intel_dp_mst_dsc_get_slice_count`),
+/// the first allowed UHBR configuration, ascending by rate then lane count,
+/// whose 64-slot MTP carries the stream (`intel_dp_mtp_tu_compute_config`
+/// with `dsc`), as (link rate, lanes).
+pub type UhbrDscFit<'a> = &'a dyn Fn(u32, u8) -> Option<(u32, u8)>;
+
+/// Linux 7.4's `intel_dp_dsc_compute_config` (SST, one pipe):
+///
+/// 1. `intel_dp_supports_dsc` (DSC, and on DP `intel_dp_supports_fec`, also
+///    for a 128b/132b link, whose FEC is implicit) and the bpp limits of
+///    `intel_dp_compute_config_limits(dsc = true)`: the pipe bpp
+///    (`intel_dp_dsc_compute_pipe_bpp_limits`), the compressed range
+///    (`intel_dp_compute_min_compressed_bpp_x16`,
+///    `compute_max_compressed_bpp_x16`);
+/// 2. `intel_dp_dsc_supports_format` (RGB);
+/// 3. `dsc_compute_compressed_bpp`: eDP takes the maximum link at the
+///    maximum bpp; DP walks the compressed bpp from the maximum down in
+///    `intel_dp_dsc_bpp_step_x16` steps (every step is valid on display
+///    13+, `intel_dp_dsc_valid_compressed_bpp`) and takes the first
+///    `dsc_compute_link_config` hit in `INTEL_DP_LINK_CAPS_ORDER_KEY_RATE_LANE`
+///    order: the 8b/10b configurations (`is_bw_sufficient_for_dsc_config`,
+///    with FEC; `cap` is `intel_dp_max_link_data_rate`'s DP tunnel cap),
+///    then, when `uhbr` supplies them, the 128b/132b ones;
+/// 4. `intel_dp_dsc_get_slice_config` and `intel_dp_dsc_compute_params`.
+///
+/// `fec_enable` follows `intel_dp_needs_8b10b_fec`: on for 8b/10b DP, off for
+/// eDP and 128b/132b. (Linux leaves the flag a 128b/132b attempt cleared
+/// when a later bpp lands on 8b/10b; this keeps FEC on every 8b/10b DP
+/// link, as the DSC/FEC rule requires.)
+pub fn compute_with(
+    sink: &DscSink,
+    limits: &LinkLimits,
+    mode: &Mode,
+    max_bpp: u32,
+    cap: Option<u64>,
+    uhbr: Option<UhbrDscFit<'_>>,
+) -> Result<DscPlan, DscRefusal> {
     let dpcd = &sink.dpcd;
     // intel_dp_supports_dsc: DSC, and FEC on DP.
     if !dpcd.supports_dsc() {
         return Err(DscRefusal::SinkUnsupported);
     }
-    let fec = !sink.is_edp;
-    if fec && !sink.fec_capable {
+    if !sink.is_edp && !sink.fec_capable {
         return Err(DscRefusal::FecUnsupported);
     }
     let hdisplay = u32::from(mode.h_active);
@@ -1216,30 +1282,42 @@ pub fn compute(
     // intel_dp_dsc_compute_pipe_bpp / dsc_compute_compressed_bpp.
     let step = bpp_step_x16(dpcd);
     let max_x16 = align_max_compressed_bpp_x16(step, pipe_max, max_x16);
+    let capped = |rate: u64| cap.map_or(rate, |cap| rate.min(cap));
     let (link_rate, lanes, bpp_x16) = if sink.is_edp {
         (limits.max_rate(), limits.max_lanes, max_x16)
     } else {
+        let slices = dp_slice_count(dpcd, clock, hdisplay);
         let mut found = None;
         let mut bpp = max_x16;
         'bpp: while bpp >= min_x16 {
+            // dsc_compute_link_config: 8b/10b, then 128b/132b.
             for rate in limits.rates() {
                 for lanes in limits.lanes() {
-                    if link_required(lanes, clock, hdisplay, bpp, fec)
-                        <= max_link_data_rate(rate, lanes)
+                    if link_required(lanes, clock, hdisplay, bpp, true)
+                        <= capped(max_link_data_rate(rate, lanes))
                     {
                         found = Some((rate, lanes as u8, bpp));
                         break 'bpp;
                     }
                 }
             }
+            if let Some((rate, lanes)) = uhbr.filter(|_| slices != 0).and_then(|f| f(bpp, slices))
+            {
+                found = Some((rate, lanes, bpp));
+                break;
+            }
             bpp -= step;
         }
         found.ok_or(DscRefusal::NoLinkConfig)?
     };
-    // Guard: the compressed stream must fit the link it trains (Linux's
-    // eDP path takes the maximum link without this check).
-    if link_required(u32::from(lanes), clock, hdisplay, bpp_x16, fec)
-        > max_link_data_rate(link_rate, u32::from(lanes))
+    let uhbr_link = link_rate >= 1_000_000;
+    // intel_dp_needs_8b10b_fec.
+    let fec = !sink.is_edp && !uhbr_link;
+    // Guard: the compressed stream must fit the 8b/10b link it trains
+    // (Linux's eDP path takes the maximum link without this check).
+    if !uhbr_link
+        && link_required(u32::from(lanes), clock, hdisplay, bpp_x16, fec)
+            > max_link_data_rate(link_rate, u32::from(lanes))
     {
         return Err(DscRefusal::OverBudget);
     }
@@ -1266,6 +1344,16 @@ pub fn compute(
         fec,
         config,
     })
+}
+
+/// `intel_dp_dsc_get_slice_count` for the stream (one pipe, a non-branch
+/// sink), which the 128b/132b MTP needs before the link is chosen.
+pub fn slice_count(sink: &DscSink, mode: &Mode) -> u8 {
+    if sink.is_edp {
+        sink.dpcd.max_slice_count(true)
+    } else {
+        dp_slice_count(&sink.dpcd, mode.pixel_clock_khz, u32::from(mode.h_active))
+    }
 }
 
 // ── Rate control (intel_vdsc.c) ──────────────────────────────────
