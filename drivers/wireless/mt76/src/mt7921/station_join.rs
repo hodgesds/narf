@@ -1171,6 +1171,7 @@ impl<B: Backend> Session<B> {
             self.station.ht20_profile = None;
             self.station.vht_profile = None;
             self.station.he_profile = None;
+            self.station.eht_profile = None;
             self.station.ap_phy = None;
             self.station.rx_ba.fence();
             self.station.tx_ba.fence();
@@ -1318,7 +1319,9 @@ impl<B: Backend> Session<B> {
                 continue;
             }
             // HE P-RXV modes (8..11) are admitted only by a negotiated HE
-            // profile; every other mode keeps the HT/VHT checks below.
+            // profile; EHT modes (13..15) only by a negotiated EHT
+            // profile, and EHT_TRIG (14) is never admitted. Every other
+            // mode keeps the HT/VHT checks below.
             let he_ppdu = native
                 .phy
                 .filter(|v| (8..=11).contains(&((v >> 24) & 15)))
@@ -1331,9 +1334,23 @@ impl<B: Backend> Session<B> {
                 self.clear_aggregate_receive();
                 continue;
             }
+            let eht_ppdu = native
+                .phy
+                .filter(|v| (13..=15).contains(&((v >> 24) & 15)))
+                .map(|v| {
+                    self.station.eht_profile.is_some_and(|eht| {
+                        crate::mt7921::eht::receive_allowed(eht.width(), v, eht.rx_limits())
+                    })
+                });
+            if eht_ppdu == Some(false) {
+                self.clear_aggregate_receive();
+                continue;
+            }
             if let Some(profile) = self.station.vht_profile {
                 if native.frame.len() > 3895
-                    || he_ppdu.is_none() && !profile.receive_allowed(native.phy)
+                    || he_ppdu.is_none()
+                        && eht_ppdu.is_none()
+                        && !profile.receive_allowed(native.phy)
                 {
                     self.clear_aggregate_receive();
                     continue;
@@ -1374,6 +1391,7 @@ impl<B: Backend> Session<B> {
             if let Some(ap) = self.station.ap_phy {
                 if self.station.vht_profile.is_none()
                     && he_ppdu.is_none()
+                    && eht_ppdu.is_none()
                     && !crate::mt7921::vht::receive_allowed(
                         u8::from(
                             self.station
@@ -1791,6 +1809,7 @@ impl<B: Backend> Session<B> {
         self.station.ht20_profile = None;
         self.station.vht_profile = None;
         self.station.he_profile = None;
+        self.station.eht_profile = None;
         self.station.ap_phy = None;
         self.station.rx_ba.fence();
         self.station.tx_ba.fence();
@@ -2402,6 +2421,7 @@ impl<B: Backend> Session<B> {
         self.station.ht20_profile = None;
         self.station.vht_profile = None;
         self.station.he_profile = None;
+        self.station.eht_profile = None;
         self.station.ap_phy = None;
         self.station.control_pending.clear();
         self.station.tx_fragments.clear();
@@ -2998,6 +3018,7 @@ impl<B: Backend> Session<B> {
                 self.station.ht20_profile = plan.ht20();
                 self.station.vht_profile = plan.vht();
                 self.station.he_profile = plan.he();
+                self.station.eht_profile = plan.eht();
                 self.station.ap_phy = plan.ap_phy();
                 if let Some(receiver) = &mut self.station.ht20_rx {
                     receiver.active = true;
@@ -3048,6 +3069,7 @@ impl<B: Backend> Session<B> {
                 self.station.ht20_profile = None;
                 self.station.vht_profile = None;
                 self.station.he_profile = None;
+                self.station.eht_profile = None;
                 self.station.ap_phy = None;
                 plan.cancel();
                 if left {
@@ -3196,6 +3218,10 @@ impl<B: Backend> Session<B> {
         self.station.ht20_profile = None;
         self.station.vht_profile = None;
         let had_he = self.station.he_profile.take();
+        // No BSS EHT record to clear: the BSS EHT TLV is slice (6)'s
+        // per-link BSS info and is not programmed by this slice, so the
+        // peer record (including STA_REC_EHT) is removed with the peer.
+        self.station.eht_profile.take();
         self.station.ap_phy = None;
         self.station.control_pending.clear();
         self.station.tx_fragments.clear();
@@ -3337,6 +3363,7 @@ impl<B: Backend> Session<B> {
             self.station.ht20_profile = None;
             self.station.vht_profile = None;
             self.station.he_profile = None;
+            self.station.eht_profile = None;
             self.station.ap_phy = None;
             self.station.rx_ba.fence();
             self.station.tx_ba.fence();
@@ -3520,6 +3547,7 @@ impl<B: Backend> Session<B> {
             self.station.ht20_profile = None;
             self.station.vht_profile = None;
             self.station.he_profile = None;
+            self.station.eht_profile = None;
             self.station.ap_phy = None;
             self.station.ht20_rx = None;
             self.station.rx_ba.fence();
@@ -3750,6 +3778,9 @@ impl<B: Backend> Session<B> {
         }
         if let Some(profile) = self.station.he_profile {
             self.station.he_profile = Some(profile.retuned(used.width));
+        }
+        if let Some(profile) = self.station.eht_profile {
+            self.station.eht_profile = Some(profile.retuned(used.width));
         }
         self.station.ap_phy = elements;
         if let Some(receiver) = &mut self.station.ht20_rx {

@@ -93,7 +93,18 @@ pub(crate) fn local(
         .ok_or(Error::Authority)?
         .clone();
     let he = super::he::local_he(info, true, true)?;
-    SixGhzLocal::new(he, capability(info)?, rule).map_err(|_| Error::UnsupportedFirmware)
+    let mut local =
+        SixGhzLocal::new(he, capability(info)?, rule).map_err(|_| Error::UnsupportedFirmware)?;
+    // EHT on top of HE when the firmware reports it. Keep in sync with
+    // `association::JoinPlan::prepare_native_6ghz`: the grant and the
+    // join must negotiate the same EHT profile or `grant.matches(plan)`
+    // refuses the join.
+    if super::eht::qualified(info, true) {
+        local = local
+            .with_eht(super::eht::local_eht(info, true, true)?)
+            .map_err(|_| Error::UnsupportedFirmware)?;
+    }
+    Ok(local)
 }
 
 /// `struct sta_rec_he_6g_capa` carrying the peer's (`sta->deflink.

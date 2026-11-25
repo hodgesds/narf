@@ -1983,6 +1983,7 @@ struct StationLink {
     ht20_profile: Option<crate::mt7921::ht20::Profile>,
     vht_profile: Option<crate::mt7921::vht::Profile>,
     he_profile: Option<crate::mt7921::he::Profile>,
+    eht_profile: Option<crate::mt7921::eht::Profile>,
     ap_phy: Option<narf_wireless::association::phy::ApElements>,
     control_pending: VecDeque<Vec<u8>>,
     /// The remaining software fragments of the MSDU in flight (each one
@@ -2044,6 +2045,7 @@ impl StationLink {
             ht20_profile: None,
             vht_profile: None,
             he_profile: None,
+            eht_profile: None,
             ap_phy: None,
             control_pending: VecDeque::new(),
             tx_fragments: VecDeque::new(),
@@ -2523,6 +2525,7 @@ impl<B: Backend> Session<B> {
         self.station.ht20_profile = None;
         self.station.vht_profile = None;
         self.station.he_profile = None;
+        self.station.eht_profile = None;
         self.station.ap_phy = None;
         self.station.received_msdu.clear();
         self.station.rx_fragments.clear();
