@@ -127,12 +127,17 @@ fn eht_elements(wide: bool) -> Vec<u8> {
 }
 
 fn bss() -> ScanBss {
+    // OFDM basic rates (6/12/24 Mbps): a 5 GHz AP never advertises
+    // DSSS 1/2/5.5/11, and `prepare_inner` refuses those off
+    // 2.4 GHz. The WMM Information element is what lets the native
+    // path engage the VHT/HE/EHT branch.
     let mut ies = vec![
-        0, 4, b'n', b'a', b'r', b'f', 1, 4, 0x82, 0x84, 0x8b, 0x96, 3, 1, CHANNEL,
+        0, 4, b'n', b'a', b'r', b'f', 1, 3, 0x8c, 0x98, 0xb0, 3, 1, CHANNEL,
     ];
     let rsn = RsnIe::wpa2_psk_ccmp().encode_body();
     ies.extend_from_slice(&[48, rsn.len() as u8]);
     ies.extend_from_slice(&rsn);
+    ies.extend_from_slice(&narf_wireless::wmm::INFORMATION);
     let (ht, vht) = vht_elements(2, CHANNEL);
     ies.extend_from_slice(&ht);
     ies.extend_from_slice(&vht);
@@ -160,15 +165,52 @@ fn reply(subtype: u8, body: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// 5 GHz regulatory domain (US, 5170-5895 @ 160 MHz), copied from
+/// `vht160_tests::domain` (that module is private to
+/// `firmware_transport_tests.rs`).
+fn domain() -> narf_wireless::reg::RegulatoryDomain {
+    narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 5170,
+            freq_end_mhz: 5895,
+            max_bandwidth_mhz: 160,
+            max_power_dbm: 17,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    }
+}
+
 /// A plan associated on the wide BSS: HT/VHT/HE/EHT negotiated,
 /// aid 42.
+///
+/// Built through the production native path (`prepare_native`):
+/// the test-facing `JoinPlan::prepare` never negotiates PHY
+/// (local PHY is `None`), so a plan built on it carries no
+/// HT/VHT/HE/EHT profile — and the single-link STA record would
+/// have no EHT TLV. It also never got this far: the wide BSS
+/// advertised DSSS basic rates, which `prepare_inner` refuses off
+/// 2.4 GHz, so the old helper panicked at prepare.
 fn associated_plan() -> JoinPlan {
-    let mut plan = JoinPlan::prepare(&bss(), OWN, b"narf", Security::Wpa2Psk { psk: [0x55; 32] })
-        .expect("wide BSS prepares");
+    let bss = bss();
+    let info = info(0x7925);
+    let permission = TxPermission::from_ap(&domain(), info, &bss)
+        .expect("wide BSS grants a 160 MHz permission");
+    let mut plan = JoinPlan::prepare_native(
+        &bss,
+        OWN,
+        b"narf",
+        Security::Wpa2Psk { psk: [0x55; 32] },
+        info,
+        permission,
+        None,
+    )
+    .expect("wide BSS prepares");
     plan.start_authentication().expect("auth starts");
     plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
         .expect("auth response");
-    let mut body = vec![0x11, 0, 0, 0, 42, 0xc0, 1, 4, 0x82, 0x84, 0x8b, 0x96];
+    let mut body = vec![0x11, 0, 0, 0, 42, 0xc0, 1, 3, 0x8c, 0x98, 0xb0];
+    body.extend_from_slice(&narf_wireless::wmm::INFORMATION);
     let (ht, vht) = vht_elements(2, CHANNEL);
     body.extend_from_slice(&ht);
     body.extend_from_slice(&vht);

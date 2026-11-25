@@ -1,5 +1,7 @@
 use super::*;
+use crate::mt7921::firmware_transport::{NicCapabilities, PhyCapabilities, RadioInfo, Report};
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
 const OWN: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 2];
 fn bss(wpa2: bool) -> ScanBss {
@@ -636,22 +638,98 @@ fn find_tlv(body: &[u8], start: usize, tag: u16) -> Option<&[u8]> {
     None
 }
 
+/// 7925 RadioInfo fixture, mirroring `eht_tests::info7925` (that
+/// module is private to `firmware_transport_tests.rs`).
+fn info7925(streams: u8) -> RadioInfo {
+    RadioInfo {
+        chip_id: 0x7925,
+        firmware: Report {
+            version: [0; 10],
+            build_date: [0; 15],
+            patch_already_loaded: false,
+            bytes_transferred: 0,
+        },
+        capabilities: NicCapabilities {
+            mac: [2, 0, 0xde, 0xad, 0xbe, 0xef],
+            phy: PhyCapabilities {
+                ht: true,
+                vht: true,
+                he: true,
+                max_bandwidth: 3,
+                spatial_streams: streams,
+                bands: 3,
+                tx_ldpc: true,
+                rx_ldpc: true,
+                tx_stbc: true,
+                rx_stbc: true,
+            },
+            has_6ghz: true,
+            chip_capabilities: 0,
+        },
+        hardware_type: 0,
+        world_limit_commands: 0,
+        channel_configuration: None,
+    }
+}
+
+/// 2.4 GHz regulatory domain (US, 2402-2472 @ 20 MHz), copied from
+/// `active_scan_tests::policy` (that module is private to
+/// `firmware_transport_tests.rs`).
+fn domain_24ghz() -> RegulatoryDomain {
+    RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 17,
+            flags: RegFlags::empty(),
+        }],
+    }
+}
+
 fn mt76_uni_station_join_caps_mirror() -> TestResult {
     // HT-only open BSS: the UNI station update must carry the same
     // HT + HW_AMSDU TLV bytes as the CONNAC2 peer record, and no
     // EHT TLV (no EHT negotiated) and no WTBL TLV (no WTBL nesting
     // on UNI).
+    //
+    // Built through the production native path (`prepare_native`):
+    // the test-facing `JoinPlan::prepare` never negotiates PHY
+    // (local PHY is `None`), so a plan built on it carries no HT
+    // profile and both records lack the HT TLV. The BSS carries a
+    // WMM Information element: without it the HT branch never
+    // engages (`prepare_native_common` and `offer_ht20` both
+    // require `wmm_present`); the association response carries one
+    // too (the response re-parses WMM and cancels without it).
     let mut ies = bss(false).information_elements;
     ies.extend_from_slice(&ht_elements(6));
+    ies.extend_from_slice(&narf_wireless::wmm::INFORMATION);
     let bss = ScanBss {
         information_elements: ies,
         ..bss(false)
     };
-    let mut plan = JoinPlan::prepare(&bss, OWN, b"narf", Security::Open).unwrap();
+    let info = info7925(2);
+    let Some(permission) = TxPermission::from_ap(&domain_24ghz(), info, &bss) else {
+        return TestResult::Fail("HT BSS grants no transmit permission");
+    };
+    let mut plan = match JoinPlan::prepare_native(
+        &bss,
+        OWN,
+        b"narf",
+        Security::Open,
+        info,
+        permission,
+        None,
+    ) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("native HT join rejected"),
+    };
     plan.start_authentication().unwrap();
     plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
         .unwrap();
     let mut body = vec![1, 0, 0, 0, 42, 0xc0, 1, 4, 0x82, 0x84, 0x8b, 0x96];
+    body.extend_from_slice(&narf_wireless::wmm::INFORMATION);
     body.extend_from_slice(&ht_elements(6));
     if plan.association_response(&reply(0x10, &body)) != Ok(Some(42)) {
         return TestResult::Fail("HT association response rejected");
