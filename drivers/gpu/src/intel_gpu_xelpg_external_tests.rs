@@ -4345,7 +4345,7 @@ fn smoke_mtl_external_uhbr_tc_route_lights_and_stops() -> TestResult {
         Ok(probe) => probe,
         Err(_) => return TestResult::Fail("the DP 2.0 sink must probe with UHBR on"),
     };
-    let Some(plan) = probe.uhbr else {
+    let Some(plan) = probe.uhbr.as_deref().copied() else {
         return TestResult::Fail("only UHBR carries 4K60 on two HBR2 lanes");
     };
     let mn = [(47 << 25) | 0x5e_579e, 0x80_0000, 0xf_34d6, 0x8_0000];
@@ -4526,7 +4526,7 @@ fn smoke_mtl_external_uhbr_training_fallback_retry() -> TestResult {
     let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
         return TestResult::Fail("the one-lane DP 2.0 sink must probe");
     };
-    match probe.uhbr {
+    match probe.uhbr.as_deref() {
         Some(p)
             if p.link
                 == (uhbr::UhbrLink {
@@ -4543,7 +4543,7 @@ fn smoke_mtl_external_uhbr_training_fallback_retry() -> TestResult {
         Ok(_) | Err(_) => return TestResult::Fail("the reduced retry must light the route"),
     };
     let mn = [(59 << 25) | 0x75_ed85, 0x80_0000, 0xc_ac08, 0x8_0000];
-    match route.probe.uhbr {
+    match route.probe.uhbr.as_deref() {
         Some(p)
             if p.link
                 == (uhbr::UhbrLink {
@@ -4613,7 +4613,7 @@ fn smoke_mtl_external_uhbr_fallback_to_8b10b_or_none() -> TestResult {
     let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
         return TestResult::Fail("the DP 2.0 sink must probe");
     };
-    if probe.uhbr.map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp))
+    if probe.uhbr.as_deref().map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp))
         != Some((uhbr::UhbrRate::Uhbr10, 2, 24))
     {
         return TestResult::Fail("440 MHz on two HBR2 lanes plans UHBR10 x2");
@@ -4665,7 +4665,7 @@ fn smoke_mtl_external_uhbr_lttpr_non_transparent_route() -> TestResult {
     let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
         return TestResult::Fail("the DP 2.0 sink must probe through its LTTPR");
     };
-    if probe.uhbr.map(|p| (p.link.rate, p.link.lanes)) != Some((uhbr::UhbrRate::Uhbr10, 2)) {
+    if probe.uhbr.as_deref().map(|p| (p.link.rate, p.link.lanes)) != Some((uhbr::UhbrRate::Uhbr10, 2)) {
         return TestResult::Fail("the LTTPR keeps Linux's UHBR10 x2 link");
     }
     if !io.sink.borrow().uhbr_log.is_empty() {
@@ -5126,7 +5126,7 @@ fn smoke_ptl_external_uhbr_over_tbt_tunnel() -> TestResult {
             return TestResult::Fail("the tunnelled DP 2.0 sink must probe with UHBR on");
         }
     };
-    let Some(plan) = probe.uhbr else {
+    let Some(plan) = probe.uhbr.as_deref().copied() else {
         return TestResult::Fail("only the tunnel's UHBR10 carries 4K60 on two lanes");
     };
     let mn = [(47 << 25) | 0x5e_579e, 0x80_0000, 0xf_34d6, 0x8_0000];
@@ -5187,6 +5187,7 @@ fn smoke_ptl_external_uhbr_over_tbt_tunnel() -> TestResult {
     if route
         .probe
         .uhbr
+        .as_deref()
         .and_then(|p| p.tunnel)
         .and_then(|t| t.allocated_bw)
         != Some(58 * 31_250)
@@ -5562,6 +5563,7 @@ pub(crate) mod nova {
         };
         if probe
             .uhbr
+            .as_deref()
             .map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp, p.stream.tu))
             != Some((uhbr::UhbrRate::Uhbr10, 1, 24, 48))
         {

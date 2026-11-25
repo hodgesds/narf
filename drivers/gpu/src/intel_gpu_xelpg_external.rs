@@ -1019,8 +1019,9 @@ pub struct MtlSinkProbe {
     /// The 128b/132b link when `narf.intel.uhbr=1` and only a UHBR rate
     /// carries the stream at its bpp. `negotiated` then carries the UHBR
     /// link's lane count and bandwidth beside the 8b/10b ceiling rate that
-    /// could not.
-    pub uhbr: Option<UhbrPlan>,
+    /// could not. Boxed: the probe crosses several call frames (the MST
+    /// connect path builds one per stream).
+    pub uhbr: Option<alloc::boxed::Box<UhbrPlan>>,
     /// The output format and protocol-converter setup
     /// (`narf.intel.hdmi14_ext=1`, [`color::dp_output`]); RGB with no PCON
     /// writes otherwise.
@@ -1069,7 +1070,7 @@ impl MtlSinkProbe {
     /// `crtc_state->port_clock` of the planned link: the UHBR rate, or the
     /// negotiated 8b/10b rate.
     fn port_clock_khz(&self) -> u32 {
-        match self.uhbr {
+        match self.uhbr.as_deref() {
             Some(plan) => plan.link.rate.link_rate(),
             None => link_clock_khz(self.negotiated.rate),
         }
@@ -1119,7 +1120,7 @@ pub fn release_probe<M: MmioWindow + ?Sized>(
     io: &M,
     probe: &MtlSinkProbe,
 ) -> Result<(), ExternalError> {
-    let mut probe_tunnel = probe.uhbr.and_then(|plan| plan.tunnel);
+    let mut probe_tunnel = probe.uhbr.as_deref().and_then(|plan| plan.tunnel);
     tunnel_off(io, probe, &mut probe_tunnel);
     let aux = aux_power_disable(io, probe.port);
     let tc = match probe.tc {
@@ -1408,7 +1409,7 @@ fn tunnel_alloc<M: MmioWindow + ?Sized>(
     io: &M,
     route: &mut MtlExternalRoute,
 ) -> Result<(), ExternalError> {
-    let Some(mut plan) = route.probe.uhbr else {
+    let Some(mut plan) = route.probe.uhbr.as_deref().copied() else {
         return Ok(());
     };
     let Some(mut t) = plan.tunnel else {
@@ -1437,7 +1438,7 @@ fn tunnel_alloc<M: MmioWindow + ?Sized>(
         )
     });
     plan.tunnel = Some(t);
-    route.probe.uhbr = Some(plan);
+    route.probe.uhbr = Some(alloc::boxed::Box::new(plan));
     result.map_err(|e| ExternalError::Uhbr(uhbr::UhbrRefusal::Tunnel(e)))
 }
 
@@ -1664,7 +1665,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         edid_len,
         dsc: plan,
         pipe_bpp,
-        uhbr: uhbr_plan,
+        uhbr: uhbr_plan.map(alloc::boxed::Box::new),
         output,
         audio,
         c20_uhbr_vspeo: None,
@@ -1868,7 +1869,7 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
 /// nothing follows or nothing allowed carries the stream (Linux would
 /// prune the mode).
 fn uhbr_fallback(probe: &MtlSinkProbe) -> Option<MtlSinkProbe> {
-    let plan = probe.uhbr?;
+    let plan = *probe.uhbr.as_deref()?;
     let mut caps = plan.caps;
     caps.fallback(plan.link.rate.link_rate(), plan.link.lanes, false)?;
     let cap = plan
@@ -1897,12 +1898,12 @@ fn uhbr_fallback(probe: &MtlSinkProbe) -> Option<MtlSinkProbe> {
                 link.pipe_bpp * 16,
             ) * 8;
             next.negotiated.payload_kbps = uhbr::max_link_data_rate(rate, lanes) * 8;
-            next.uhbr = Some(UhbrPlan {
+            next.uhbr = Some(alloc::boxed::Box::new(UhbrPlan {
                 link: chosen,
                 stream,
                 caps,
                 ..plan
-            });
+            }));
         }
         None => {
             let rate = train_rate_for(link.link_rate)?;
@@ -1988,7 +1989,7 @@ fn activate_once<M: MmioWindow + ?Sized>(
     if let Err(e) = choice.pipes.admit(io, &ext) {
         return Err(ActivateError::Refused(probe, e.into()));
     }
-    let route_uhbr = probe.uhbr.map(|_| UhbrTrained::default());
+    let route_uhbr = probe.uhbr.as_ref().map(|_| UhbrTrained::default());
     let mut route = MtlExternalRoute {
         probe,
         fb,
@@ -2038,7 +2039,7 @@ fn program<M: MmioWindow + ?Sized>(
         io, choice, ext, dmc,
     )?);
     let (rate, lanes) = (route.probe.negotiated.rate, route.probe.negotiated.lanes);
-    if let Some(plan) = route.probe.uhbr {
+    if let Some(plan) = route.probe.uhbr.as_deref().copied() {
         // The DP tunnel's bandwidth first (intel_dp_tunnel_atomic_alloc_bw
         // precedes the modeset enables).
         tunnel_alloc(io, route)?;
@@ -2662,7 +2663,7 @@ fn finish<M: MmioWindow + ?Sized>(
     let mode = route.probe.mode;
     let pll_rate = crate::intel_gpu_modeset::to_pll_rate(trained.rate);
     let lanes = trained.lanes;
-    let uhbr_plan = route.probe.uhbr;
+    let uhbr_plan = route.probe.uhbr.as_deref().copied();
     let mut levels = [(0u8, 0u8); 4];
     for (i, lane) in trained.vswing_pe.lanes.iter().enumerate() {
         levels[i] = (lane.swing, lane.pre_emph);
@@ -3105,9 +3106,9 @@ fn stop_local<M: MmioWindow + ?Sized>(
         disable_port(io, route)?;
     }
     finish_port_stop(io, route)?;
-    if let Some(mut plan) = route.probe.uhbr {
+    if let Some(mut plan) = route.probe.uhbr.as_deref().copied() {
         tunnel_off(io, &route.probe, &mut plan.tunnel);
-        route.probe.uhbr = Some(plan);
+        route.probe.uhbr = Some(alloc::boxed::Box::new(plan));
     }
     let rp = route
         .reservation
