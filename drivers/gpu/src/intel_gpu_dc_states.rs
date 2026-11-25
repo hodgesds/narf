@@ -239,7 +239,11 @@ pub const XE2LPD_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
 /// `sanitize_target_dc_state(DC6)` starts at DC6.
 /// `intel_display_power_select_target_dc_state` moves to DC3CO only for a
 /// DC3CO trigger (LOBF, panel replay or PSR2 selective update on a 1:1 CMTG
-/// pipe/port), none of which this driver configures: the owned Nova panel
+/// pipe/port), none of which this driver configures on display 35: Panel
+/// Replay (`narf.intel.panel_replay=1`) is qualified on display 20/30 only
+/// and never with the AS SDP its trigger needs
+/// (`has_panel_replay && as_sdp_supported`), and the CMTG it would then
+/// need (`intel_cmtg.c`) is not implemented. The owned Nova panel
 /// is refused DC3CO with [`Dc3coRefusal::NoTrigger`]
 /// ([`xe3plpd_dc3co_refusal`] of [`Dc3coState::OWNED_NOVA_PANEL`]), so DC6
 /// stays the runtime target. DC9 belongs to display-core uninit, which this
@@ -280,7 +284,8 @@ pub struct Dc3coState {
 impl Dc3coState {
     /// The owned Nova Lake-S route (`narf.intel.nvl_modeset=1`): the eDP
     /// panel alone on Pipe A and port A, with no PSR, panel replay or LOBF
-    /// on display 35.
+    /// on display 35 (`crate::intel_gpu_psr::panel_replay` refuses display
+    /// 35 and the AS SDP).
     pub const OWNED_NOVA_PANEL: Self = Self {
         active_pipes: 1,
         edp: true,

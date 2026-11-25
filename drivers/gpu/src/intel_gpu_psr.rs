@@ -439,7 +439,11 @@ impl Refusal {
     }
 }
 
-fn read<A: AuxChannel + ?Sized>(aux: &mut A, address: u32, buf: &mut [u8]) -> Result<(), AuxError> {
+pub(crate) fn read<A: AuxChannel + ?Sized>(
+    aux: &mut A,
+    address: u32,
+    buf: &mut [u8],
+) -> Result<(), AuxError> {
     let request = AuxRequest {
         cmd: AuxCommand::NativeRead,
         address,
@@ -458,7 +462,11 @@ fn read<A: AuxChannel + ?Sized>(aux: &mut A, address: u32, buf: &mut [u8]) -> Re
     Ok(())
 }
 
-fn write<A: AuxChannel + ?Sized>(aux: &mut A, address: u32, value: u8) -> Result<(), AuxError> {
+pub(crate) fn write<A: AuxChannel + ?Sized>(
+    aux: &mut A,
+    address: u32,
+    value: u8,
+) -> Result<(), AuxError> {
     let data = [value];
     let request = AuxRequest {
         cmd: AuxCommand::NativeWrite,
@@ -1402,6 +1410,10 @@ pub struct Psr {
     config: Psr1,
     su: Option<Su>,
     active: bool,
+    /// Panel Replay (`narf.intel.panel_replay=1`, display 20/30 eDP): this
+    /// owner then activates, exits, waits and disables through it, and
+    /// `su` holds its selective update.
+    replay: Option<panel_replay::PanelReplay>,
 }
 
 impl Psr {
@@ -1489,6 +1501,7 @@ impl Psr {
                 cursor: None,
             }),
             active: false,
+            replay: None,
         };
         if let Some((su, commit)) = su {
             let first = sel_fetch_update(&su, commit, (None, None));
@@ -1534,6 +1547,45 @@ impl Psr {
             );
         }
         Ok(psr)
+    }
+
+    /// [`Psr::enable`] for Panel Replay on the Pipe-A eDP: the replay
+    /// owner's sink and source enable ([`panel_replay::PanelReplay::enable`]),
+    /// then, with selective update, the selective fetch of the qualifying
+    /// commit. `config` is the panel's PSR1 qualification (idle frames,
+    /// display 20), which Linux computes first (`psr_global_enabled`).
+    pub fn enable_replay<M: MmioWindow + ?Sized, A: AuxChannel + ?Sized>(
+        regs: &M,
+        aux: &mut A,
+        config: Psr1,
+        replay: panel_replay::Config,
+        width: u16,
+        height: u16,
+        commit: &SuCommit<'_>,
+    ) -> Result<Psr, panel_replay::Refusal> {
+        let pr = panel_replay::PanelReplay::enable(regs, aux, replay)?;
+        let mut psr = Psr {
+            config,
+            su: pr.psr2(width, height).map(|config| Su {
+                config,
+                primary: None,
+                cursor: None,
+            }),
+            active: false,
+            replay: Some(pr),
+        };
+        if let Some(su) = psr.su {
+            let first = sel_fetch_update(&su.config, commit, (None, None));
+            psr.program_sel_fetch_noarm(regs, &first);
+            psr.program_sel_fetch_arm(regs, &first);
+            psr.program_sel_fetch_cursor(regs, &first);
+        }
+        Ok(psr)
+    }
+
+    /// Whether this owner runs Panel Replay.
+    pub fn replay(&self) -> Option<panel_replay::PanelReplay> {
+        self.replay
     }
 
     pub fn config(&self) -> Psr1 {
@@ -1587,6 +1639,11 @@ impl Psr {
     /// `EDP_PSR_TP1_TP3_SEL` unset while PSR2 is enabled), then
     /// `EDP_PSR2_CTL`.
     fn activate<M: MmioWindow + ?Sized>(&mut self, regs: &M) -> Result<(), Refusal> {
+        if let Some(pr) = self.replay.as_mut() {
+            pr.activate(regs).map_err(replay_refusal)?;
+            self.active = true;
+            return Ok(());
+        }
         match self.su {
             Some(su) => {
                 readable(regs, PSR2_CTL)?;
@@ -1611,6 +1668,11 @@ impl Psr {
         if !self.active {
             return Ok(());
         }
+        if let Some(pr) = self.replay.as_mut() {
+            pr.exit(regs).map_err(replay_refusal)?;
+            self.active = false;
+            return Ok(());
+        }
         let (register, enable) = if self.su.is_some() {
             (PSR2_CTL, EDP_PSR2_ENABLE)
         } else {
@@ -1625,6 +1687,9 @@ impl Psr {
     /// `intel_psr_wait_exit_locked`'s status: `EDP_PSR2_STATUS` for
     /// selective update, else `EDP_PSR_STATUS`.
     fn status(&self) -> (u64, u32) {
+        if let Some(pr) = self.replay {
+            return pr.status();
+        }
         if self.su.is_some() {
             (PSR2_STATUS, EDP_PSR2_STATUS_STATE_MASK)
         } else {
@@ -1685,6 +1750,10 @@ impl Psr {
     /// `_psr2_ready_for_pipe_update_locked`: PSR2 is out of deep sleep, so
     /// a pipe update may run while it stays enabled.
     pub fn ready_for_update<M: MmioWindow + ?Sized>(&self, regs: &M) -> Result<bool, Refusal> {
+        // intel_psr_wait_for_idle_locked skips Panel Replay.
+        if self.replay.is_some() {
+            return Ok(true);
+        }
         Ok(readable(regs, PSR2_STATUS)? & EDP_PSR2_STATUS_STATE_DEEP_SLEEP == 0)
     }
 
@@ -1762,6 +1831,17 @@ impl Psr {
         timeout_ms: u64,
         wake: bool,
     ) -> Result<(), Refusal> {
+        if let Some(mut pr) = self.replay {
+            // intel_psr_disable_locked's Panel Replay branch: no sink PSR
+            // writes, no Wa_16025596647.
+            let result = pr.disable(regs, timeout_ms).map_err(replay_refusal);
+            self.replay = Some(pr);
+            if wake {
+                let _ = write(aux, DP_SET_POWER, DP_SET_POWER_D0);
+            }
+            self.active = false;
+            return result;
+        }
         let mut first = self.exit(regs).err();
         if let Err(refusal) = self.wait_idle(regs, timeout_ms) {
             first.get_or_insert(refusal);
@@ -1804,6 +1884,15 @@ impl Psr {
     }
 }
 
+/// A replay owner's register failure as the PSR owner reports it.
+fn replay_refusal(refusal: panel_replay::Refusal) -> Refusal {
+    match refusal {
+        panel_replay::Refusal::ExitTimeout => Refusal::ExitTimeout,
+        panel_replay::Refusal::Aux(error) => Refusal::Aux(error),
+        _ => Refusal::Unavailable,
+    }
+}
+
 // ── Watermark-lane input ──────────────────────────────────────────
 
 /// A Wa_14015648006 input provider: Pipe-A `wm_level_disabled`, or `None`
@@ -1830,3 +1919,6 @@ pub fn wm_level_disabled() -> Option<bool> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_psr_tests.rs"]
 mod tests;
+
+#[path = "intel_gpu_panel_replay.rs"]
+pub mod panel_replay;

@@ -1352,6 +1352,9 @@ struct State<M: Platform> {
     /// Why the last PSR qualification fell back to PSR1 (`None` when it
     /// selected PSR2 or did not reach selective update).
     psr2_refused: Option<crate::intel_gpu_psr::Psr2Refusal>,
+    /// Why Panel Replay (`narf.intel.panel_replay=1`) did not qualify on
+    /// this card; PSR then qualifies as before.
+    replay_refused: Option<crate::intel_gpu_psr::panel_replay::Refusal>,
     /// The panel's crtc is off ([`Guard::panel_off`]): Pipe A is dark and
     /// holds no display wakeref until [`Guard::panel_on`].
     panel_off: bool,
@@ -1856,6 +1859,7 @@ impl<M: Platform> Device<M> {
                 psr_sink: None,
                 psr_refused: None,
                 psr2_refused: None,
+                replay_refused: None,
                 panel_off: false,
             }),
         }
@@ -3056,6 +3060,11 @@ impl<M: Platform> Guard<'_, M> {
         if self.state.psr.is_some() || self.state.psr_refused.is_some() {
             return;
         }
+        // intel_psr_compute_config computes Panel Replay before PSR.
+        if let Some(psr) = self.replay_after_latch() {
+            self.state.psr = Some(psr);
+            return;
+        }
         let refusal = match self.psr_qualify() {
             Ok((config, su)) => {
                 if !config.display20 || su.is_some() {
@@ -3104,6 +3113,129 @@ impl<M: Platform> Guard<'_, M> {
         if refusal.latched() {
             self.state.psr_refused = Some(refusal);
         }
+    }
+    /// Panel Replay on the display-20/30 Pipe-A eDP under
+    /// `narf.intel.panel_replay=1`, enabled when it qualifies
+    /// ([`Self::replay_qualify`]) and the link was trained with the sink's
+    /// replay enable. A refusal is kept for the card's lifetime (only the
+    /// boot option, the VBT and the sink decide it) and PSR qualifies.
+    fn replay_after_latch(&mut self) -> Option<crate::intel_gpu_psr::Psr> {
+        if self.state.replay_refused.is_some() {
+            return None;
+        }
+        let result = self.replay_qualify().and_then(|(config, replay)| {
+            let (scaled, cursor) = self
+                .psr_su_facts()
+                .map_err(|_| crate::intel_gpu_psr::panel_replay::Refusal::Unavailable)?;
+            if replay.su {
+                if let Some(fbc) = self.state.fbc.as_mut() {
+                    fbc.disable(&self.device.platform);
+                }
+            }
+            let platform = &self.device.platform;
+            let console = self.console_geometry();
+            let (width, height) = (console.width as u16, console.height as u16);
+            let src = crate::drm::fb_cmd::Rect::new(0, 0, i32::from(width), i32::from(height));
+            crate::intel_gpu_psr::Psr::enable_replay(
+                platform,
+                &mut PsrAux(platform),
+                config,
+                replay,
+                width,
+                height,
+                &crate::intel_gpu_psr::SuCommit {
+                    damage: &crate::drm::fb_cmd::Damage::Full,
+                    old_src: src,
+                    src,
+                    pipe_supported: !scaled,
+                    cursor,
+                },
+            )
+        });
+        match result {
+            Ok(psr) => Some(psr),
+            Err(refusal) => {
+                self.state.replay_refused = Some(refusal);
+                None
+            }
+        }
+    }
+
+    /// `_panel_replay_compute_config` for the KMS-owned eDP: past
+    /// `psr_global_enabled` (the VBT) and the interlace and VRR gates of
+    /// `intel_psr_compute_config`, against the live link (`port_clock`
+    /// from the sink's link rate, lanes from `TRANS_DDI_FUNC_CTL(A)`, DSC
+    /// from `PIPE_DSS_CTL2`) and the sink's Panel Replay and AS SDP
+    /// capability.
+    fn replay_qualify(
+        &mut self,
+    ) -> Result<
+        (
+            crate::intel_gpu_psr::Psr1,
+            crate::intel_gpu_psr::panel_replay::Config,
+        ),
+        crate::intel_gpu_psr::panel_replay::Refusal,
+    > {
+        use crate::intel_gpu_psr::panel_replay::{self as pr, Refusal};
+        use crate::intel_gpu_psr::DRM_MODE_FLAG_INTERLACE;
+        if !pr::opted_in() {
+            return Err(Refusal::Disabled);
+        }
+        let platform = &self.device.platform;
+        // DISPLAY_VER from GMD_ID_DISPLAY (31:22): display 20 and 30 only.
+        let gmd = platform.read32(crate::intel_gpu_psr::GMD_ID_DISPLAY);
+        let display_ver = match gmd >> 22 {
+            _ if gmd == u32::MAX => return Err(Refusal::Unavailable),
+            ver @ (20 | 30) => ver as u16,
+            _ => return Err(Refusal::SourceUnsupported),
+        };
+        platform
+            .psr_vbt()
+            .enabled()
+            .map_err(|_| Refusal::VbtDisabled)?;
+        let timing = platform.psr_timing().ok_or(Refusal::NoTiming)?;
+        if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 || crate::intel_gpu_vrr::vrr_excludes_psr(1) {
+            return Err(Refusal::NoTiming);
+        }
+        let mut aux = PsrAux(platform);
+        let caps = pr::Caps::read(&mut aux, true, false)?;
+        let port_clock = crate::intel_gpu_psr::sink_link_rate(&mut aux).ok_or(Refusal::Unavailable)?;
+        let mut feature = [0u8];
+        let as_sdp = crate::intel_gpu_psr::read(&mut aux, 0x2214, &mut feature).is_ok()
+            && feature[0] & 1 != 0;
+        let mut edp_rev = [0u8];
+        crate::intel_gpu_psr::read(&mut aux, 0x700, &mut edp_rev).map_err(Refusal::Aux)?;
+        let func = platform.read32(crate::intel_gpu_psr::TRANS_DDI_FUNC_CTL_A);
+        let dss = platform.read32(crate::intel_gpu_psr::PIPE_DSS_CTL2_A);
+        if func == u32::MAX || dss == u32::MAX {
+            return Err(Refusal::Unavailable);
+        }
+        let stream = pr::Stream {
+            display_ver,
+            pipe: 0,
+            port: 0,
+            port_clock,
+            lanes: ((func >> 1) & 7) + 1,
+            timing,
+            dsc: dss & (1 << 31) != 0,
+            uhbr: false,
+            hdcp: false,
+            as_sdp_v2: as_sdp,
+            edp_rev: edp_rev[0],
+            fw_sync_quirk: false,
+            sel_fetch: true,
+        };
+        let replay = pr::compute(&caps, &stream, None)?;
+        let config = crate::intel_gpu_psr::Psr1 {
+            idle_frames: 0,
+            tps3: false,
+            wm_level_disabled: false,
+            tp1_wakeup_us: 0,
+            tp2_tp3_wakeup_us: 0,
+            display20: true,
+            entry_setup_frames: 0,
+        };
+        Ok((config, replay))
     }
     /// `intel_psr_compute_config` against the live fixed timing, the VBT,
     /// the (cached) sink capability and the `wm_level_disabled` of the
