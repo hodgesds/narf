@@ -2893,6 +2893,102 @@ driver.
   bring-up, calibration, scan and association through the module are
   unverified until a hardware run.
 
+### 4.7 `brcmfmac.ko`: the Broadcom FullMAC PCIe driver as a loadable module
+
+`narf-drivers-wireless-brcm --no-default-features --features module` builds
+the brcmfmac PCIe driver into a `.ko` (module name `brcm`; x86_64 and
+aarch64) from the same source as the built-in. Kernel services come from
+`src/platform/`: `kernel.rs` re-exports the kernel crates, `kabi.rs`
+implements the same names over `narf-module-rt` and the KABI. `narf-crypto`,
+`narf-wireless` and `narf-drivers-wireless-ath-core` are linked kernel-free.
+The driver's own code runs in the `.ko`: AI core discovery (`chip.rs`), the
+CR4/CA7 passive/download/active sequence (`boot.rs`), the msgbuf common and
+flow rings (`runtime.rs`), the station transport (`station_transport.rs`)
+and the shared FullMAC station (`cyw43439/station*.rs`). CYW43439 (SDIO and
+gSPI) stays built-in only: no SDIO I/O KABI exists.
+
+- **Claim.** Every Broadcom FullMAC PCIe id of the built-in table
+  (`pcie_ids::ALL_DEV_IDS`, 26 ids, `14e4:43a3`..`14e4:4433`), under the
+  match name `brcmfmac-module` so the built-in per-id entries are not
+  replaced. `narf-drivers-wireless/brcmfmac-module-only` leaves the built-in
+  PCI claim (and its PCIe system-PM hooks) aside so an early-loaded `.ko`
+  owns the device; CYW43439 stays built in.
+- **Probe** (`brcmfmac/pcie_kabi.rs`, the built-in `pcie.rs::probe` and
+  `native_runtime.rs` order).
+  1. `narf_pci_identity`; the id must be in the table.
+  2. `narf_pci_prepare_probe`; decode and bus mastering must read back off.
+  3. BAR0 (at least 4 KiB) is mapped, and BAR2 for the ids the built-in
+     boots (BCM43602, or a chip-profile PCI row with an implemented vendor
+     path); memory decode on with INTx disable kept.
+  4. `Chip::discover` through the BAR0 window, then `park_pcie`.
+  5. A chip without a covered profile or BAR2 stays parked and bound, as
+     built in. Otherwise the provisioning task runs on the module's executor
+     and is retried every 500 ms for a minute while no hardware attempt has
+     started: the signed NBSP board selection
+     (`brcm/wifi-board-selection-v1.bin`), its assets with exact length and
+     SHA-256, the signed regulatory policy, then the CR4/CA7 boot, ring
+     attach, data enable, the station transport and the station.
+- **Bus seams** (`KabiBackplane`). BAR0 window select (`0x80`) and the SBMBX
+  doorbell (`0x98`) are written with `narf_pci_config_write32`
+  (`modules/DATAPATH_ABI_DESIGN.md`, "Device-specific PCI configuration
+  window") and read back with `narf_pci_config_read32`; Command-register
+  parking and bus mastering go through `narf_pci_command`; Link Control ASPM through `narf_pcie_aspm`. TCM is
+  accessed in dwords (partial dwords read-merge-write; the dongle CPU is
+  halted). DMA comes from `narf_dma_alloc_mapped` below 4 GiB, per-frame
+  buffers from a 4–64 KiB size-class pool; the device context retains DMA
+  on teardown. One plain MSI vector raises the runtime's signal and runs
+  the executor; without it the 1 ms poller keeps service. The IOMMU block is
+  reported `Untranslated`.
+- **Provisioning differences.** Explicit kernel board registrations
+  (`native_runtime::register_board_profile`) do not exist in the module;
+  only the signed manifest selects a board. The KABI exposes no firmware
+  blob identity, so a module `Proof` re-opens each file and refuses a
+  missing file or a changed size or signedness; the bytes are hashed once at
+  load. The regulatory domain must come from a staged, signed
+  `wireless-regulatory.bin`: the built-in fallback to the Linux database's
+  world domain is kernel-resident and unreachable from a module, so without
+  that policy the device stays parked.
+- **Netdev and wiphy** (`cyw43439/interface_module.rs`).
+  - The netif bridge names the netdev `wlan%d`.
+  - `REGISTER_WIPHY` (§4.1) advertises the station's policy-admitted 2.4
+    and 5 GHz channels, HT/VHT as firmware reports them, the built-in
+    shell's ciphers (CCMP, plus AES-CMAC with firmware MFP) and the
+    firmware SME: `PSK_OFFLOAD` with the firmware supplicant (`sup_wpa`),
+    `SAE_OFFLOAD` where `cap` lists `sae` with MFP, and
+    `REPORTS_DISCONNECT`.
+  - FullMAC maps onto the v2 SME-offload model directly: `SCAN_REQUEST`
+    runs the station's escan, `CONNECT` the firmware join (open, PMK, or
+    SAE password; a zero BSSID resolves to the strongest matching BSS of
+    the last scan) and `DISCONNECT` the firmware disassociation.
+  - The station's event poll drives carrier; a firmware deauth, disassoc or
+    link-down is reported as `DISCONNECTED`.
+  - TX frames are admitted as built in (Ethernet II from this station,
+    never EAPOL), prioritized with `classify8021d` and sent on the flow
+    rings; RX goes through `narf_netif_rx`.
+- **Recovery.** A terminal transport (firmware halt, a fatal protocol or
+  access error) is reset as the built-in `Generation::recover` does it
+  (Linux `brcmf_fw_crashed` -> `brcmf_pcie_reset`): carrier off, the
+  confirmed stop, the device reset and a fresh download of the re-verified
+  signed assets, a re-initialized station on the same netdev, then a rejoin
+  of the retained association. At most 64 resets; an unproven stop releases
+  nothing (the mappings stay pinned).
+- **Parameters.** `.narf_kparams` declares `ssid`, `psk` (64 hex digits)
+  and `passphrase`; `brcm.ssid=` on the kernel command line scans and joins
+  after the station is up.
+- **Not carried (built-in only).** AP, monitor, P2P and virtual interfaces;
+  WoWL and system PM; power-save control; firmware roaming (off by default
+  built in too: the v2 host has no roam report); the host supplicant
+  (`SecurityConfig::External`) and nl80211 PMKSA entries (the firmware list
+  is kept empty, as built in without any); device removal (the device
+  context retains every DMA mapping at unload); CYW43439.
+- **Proof.** `modules/e2e/brcmfmac` loads the real `.ko`: the relocations
+  resolve, init runs, the parameters are declared and a load argument
+  applies, exactly the 26 FullMAC PCIe ids are claimed under the module's
+  match name, a probe with no device context is refused, and unload leaves
+  no match. QEMU emulates no Broadcom Wi-Fi, so bring-up, firmware boot,
+  scan and association through the module are unverified until run on
+  hardware.
+
 ## 5. Buffer Management
 
 - **Data Path**: Uses standard `DmaBuffer` caps provided by `io/spec`.

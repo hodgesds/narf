@@ -85,7 +85,7 @@ impl<B: Bus> Runtime<B> {
         let lsc = self.bus.link_control()?;
         self.bus.set_link_control(lsc & !ASPM_ENAB)?;
         self.backplane_write(common.base + CC_WATCHDOG, 4)?;
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
+        crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
             WATCHDOG_SETTLE_MS * 1_000_000,
         ))
         .await;

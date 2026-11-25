@@ -194,7 +194,7 @@ fn wait_register(
     us: u64,
 ) -> Result<(), Error> {
     let mut failure = None;
-    let complete = narf_scheduler::responsive_spin_until(
+    let complete = crate::platform::responsive_spin_until(
         || match bus.read32(address) {
             Ok(u32::MAX) => {
                 failure = Some(Error::Gone);
@@ -206,7 +206,7 @@ fn wait_register(
                 true
             }
         },
-        narf_time::Deadline::after_us(us),
+        crate::platform::time::Deadline::after_us(us),
     );
     if let Some(error) = failure {
         Err(error)
@@ -331,8 +331,10 @@ impl Chip {
             bus.write32(control, before | 3)?;
             let _ = bus.read32(control)?;
             bus.write32(reset_control, 1)?;
-            let _ =
-                narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(10));
+            let _ = crate::platform::responsive_spin_until(
+                || false,
+                crate::platform::time::Deadline::after_us(10),
+            );
             wait_register(bus, reset_control, 1, 1, 300)?;
         }
         bus.write32(control, reset | 3)?;
@@ -351,7 +353,10 @@ impl Chip {
     ) -> Result<(), Error> {
         Self::disable_core(bus, core, before, reset)?;
         bus.write32(core.wrapper + 0x800, 0)?;
-        let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(40));
+        let _ = crate::platform::responsive_spin_until(
+            || false,
+            crate::platform::time::Deadline::after_us(40),
+        );
         wait_register(bus, core.wrapper + 0x800, 1, 0, 3_000)?;
         bus.write32(core.wrapper + 0x408, after | 1)?;
         let _ = bus.read32(core.wrapper + 0x408)?;

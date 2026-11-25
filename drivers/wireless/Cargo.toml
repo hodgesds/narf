@@ -94,6 +94,11 @@ ath10k-module-only = []
 # owns them (the e1000/nvme/ath11k precedent). Every chip owner runs in the
 # module.
 ath9k-module-only = []
+
+# Leave the built-in brcmfmac's Broadcom PCIe ids (and its PCIe system-PM
+# hooks) unclaimed so an early-loaded brcm `.ko` (brcmfmac.ko) owns the
+# device. CYW43439 over SDIO/gSPI stays built in.
+brcmfmac-module-only = []
 kernel-test = ["narf-bus/kernel-test", "narf-drivers-sdio/kernel-test", "narf-wireless/kernel-test", "narf-drivers-qcom-soc/kernel-test", "narf-power/wake-test", "narf-drivers-wireless-core/kernel-test", "narf-drivers-wireless-iwlwifi/kernel-test", "narf-drivers-wireless-rtl-usb/kernel-test", "narf-drivers-wireless-rtw/kernel-test", "narf-drivers-wireless-ath-core/kernel-test", "narf-drivers-wireless-ath9k/kernel-test", "narf-drivers-wireless-ath10k/kernel-test", "narf-drivers-wireless-ath11k/kernel-test", "narf-drivers-wireless-brcm/kernel-test", "narf-drivers-wireless-rtl/kernel-test"]
 
 [lints]

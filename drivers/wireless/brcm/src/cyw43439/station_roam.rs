@@ -43,7 +43,7 @@ const ROAM_BUDGET_MS: u64 = 15_000;
 pub(super) struct Pending {
     pub(super) peer: [u8; 6],
     pub(super) keys: bool,
-    deadline: narf_time::Deadline,
+    deadline: crate::platform::time::Deadline,
 }
 
 /// Completed roam for host publication (`cfg80211_roam_info`).
@@ -182,7 +182,7 @@ impl<R: Fullmac> Station<R> {
         self.roam = Some(Pending {
             peer,
             keys: !secure,
-            deadline: narf_time::Deadline::after_ms(ROAM_BUDGET_MS),
+            deadline: crate::platform::time::Deadline::after_ms(ROAM_BUDGET_MS),
         });
         true
     }

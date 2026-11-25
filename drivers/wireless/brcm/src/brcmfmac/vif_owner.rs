@@ -310,7 +310,7 @@ impl Owner {
     }
 
     async fn wait<R: Fullmac>(&mut self, runtime: &mut R) -> Result<Observed, Error> {
-        let deadline = narf_time::Deadline::after_ms(VIF_EVENT_TIMEOUT_MS);
+        let deadline = crate::platform::time::Deadline::after_ms(VIF_EVENT_TIMEOUT_MS);
         loop {
             runtime.poll()?;
             self.service(runtime)?;
@@ -320,7 +320,10 @@ impl Owner {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                1_000_000,
+            ))
+            .await;
         }
     }
 
@@ -449,12 +452,15 @@ impl Owner {
         self.armed = None;
         self.observed = None;
         result?;
-        let deadline = narf_time::Deadline::after_ms(2000);
+        let deadline = crate::platform::time::Deadline::after_ms(2000);
         while !runtime.vif_close(entry.ifidx)? {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                1_000_000,
+            ))
+            .await;
         }
         // The removed interface's role owner no longer consumes events;
         // the union drops its bits at the next `event_msgs` write.
@@ -694,7 +700,8 @@ impl Owner {
                 // BRCMF_E_LINK with BRCMF_E_REASON_LINK_BSSCFG_DIS
                 // (`brcmf_notify_connect_status_ap`); the timeout is not an
                 // error. Other events of the stopped role are dropped.
-                let deadline = narf_time::Deadline::after_ms(super::p2p_wire::DISABLE_TIMEOUT_MS);
+                let deadline =
+                    crate::platform::time::Deadline::after_ms(super::p2p_wire::DISABLE_TIMEOUT_MS);
                 'disable: while !deadline.expired() {
                     runtime.poll()?;
                     self.service(runtime)?;
@@ -708,7 +715,10 @@ impl Owner {
                     if self.registry.by_bsscfgidx(entry.bsscfgidx) != Some(entry) {
                         break;
                     }
-                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                        1_000_000,
+                    ))
+                    .await;
                 }
             }
             set_plain(runtime, b"p2p_ifdel", &entry.mac).await?;
@@ -721,12 +731,15 @@ impl Owner {
         self.armed = None;
         self.observed = None;
         result?;
-        let deadline = narf_time::Deadline::after_ms(2000);
+        let deadline = crate::platform::time::Deadline::after_ms(2000);
         while !runtime.vif_close(entry.ifidx)? {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                1_000_000,
+            ))
+            .await;
         }
         runtime.events_compose(Need::Secondary(entry.ifidx), [0; event_mask::LEN]);
         self.withdraw_listener(runtime);

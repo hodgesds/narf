@@ -1027,6 +1027,39 @@ Not in the module build:
 QEMU has no Atheros Wi-Fi, so bring-up, calibration, scan and association
 through the module are unverified until a hardware run.
 
+## Loadable brcmfmac (Broadcom FullMAC PCIe)
+
+The brcmfmac PCIe driver now builds from one source either built in or as
+the `brcm` `.ko`. The module runs the driver's own code over the KABI:
+
+- AI core discovery through the BAR0 config window, CR4/CA7 firmware
+  download into BAR2 TCM, the msgbuf common and flow rings, one MSI vector;
+- signed NBSP board selection and asset checks, and the signed regulatory
+  policy;
+- the shared FullMAC station (firmware SME and supplicant: open, WPA2-PSK
+  from the PMK, WPA3-SAE where firmware offers it), with one `wlan%d`
+  netdev and wiphy through the netif bridge and the `WIFI` v2 host;
+- firmware reset recovery on the same netdev, with a rejoin.
+
+It claims the 26 FullMAC PCIe ids of the built-in table under its own match
+name. `narf-drivers-wireless/brcmfmac-module-only` steps the built-in PCI
+claim aside; CYW43439 (SDIO/gSPI) stays built in. The config window uses the
+shared `narf_pci_config_write32`, `narf_pci_config_read32` and
+`narf_pci_command` exports. The module links on x86_64 and aarch64, and every
+undefined symbol is a KABI export.
+
+`modules/e2e/brcmfmac` loads the real `.ko` and checks relocations and init,
+the declared `brcm.*` parameters, the exact PCI claim, refusal of a probe
+with no device context and clean unload (written; not yet run).
+
+Not in the module build: AP/monitor/P2P and virtual interfaces, WoWL and
+system PM, power-save control, firmware roaming, the host supplicant and
+PMKSA entries (the v2 host carries none of these), explicit kernel board
+registrations, and the Linux-database world-domain fallback (the module
+needs a signed `wireless-regulatory.bin`). QEMU has no Broadcom Wi-Fi, so
+bring-up, firmware boot, scan and association through the module are
+unverified until run on hardware.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

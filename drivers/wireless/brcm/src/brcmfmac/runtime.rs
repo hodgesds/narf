@@ -125,8 +125,8 @@ pub trait Bus: BootBus {
     /// leaves the device-side proof as the only quiescence evidence; an
     /// error means the device may still translate. Must not depend on
     /// live firmware or BAR authority: dead-firmware stops call it.
-    fn block_dma(&mut self) -> Result<narf_io::iommu::DmaBlock, Error> {
-        Ok(narf_io::iommu::DmaBlock::Untranslated)
+    fn block_dma(&mut self) -> Result<crate::platform::DmaBlock, Error> {
+        Ok(crate::platform::DmaBlock::Untranslated)
     }
     /// Undo [`Self::block_dma`] before a fresh generation allocates
     /// (Linux `pci_dev_reset_iommu_done`). Called by `Runtime::attach`
@@ -193,7 +193,7 @@ struct Flow<M: Memory> {
     generation: u32,
     ring: Ring<M>,
     state: FlowState,
-    deadline: Option<narf_time::Deadline>,
+    deadline: Option<crate::platform::time::Deadline>,
     source: [u8; 6],
     destination: [u8; 6],
     priority: u8,
@@ -529,7 +529,7 @@ impl<B: Bus> Runtime<B> {
             runtime: self,
             retired: false,
         };
-        let deadline = narf_time::Deadline::after_ms(2000);
+        let deadline = crate::platform::time::Deadline::after_ms(2000);
         loop {
             transaction.runtime.poll()?;
             if let Some(result) = transaction.runtime.take_response(&ticket)? {
@@ -539,7 +539,10 @@ impl<B: Bus> Runtime<B> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                1_000_000,
+            ))
+            .await;
         }
     }
     pub fn is_failed(&self) -> bool {
@@ -1167,7 +1170,7 @@ impl<B: Bus> Runtime<B> {
         flow.ring.read = 0;
         flow.ring.write = 0;
         flow.state = FlowState::Creating;
-        flow.deadline = Some(narf_time::Deadline::after_ms(2000));
+        flow.deadline = Some(crate::platform::time::Deadline::after_ms(2000));
         flow.source = source;
         flow.destination = destination;
         flow.priority = priority;
@@ -1252,7 +1255,7 @@ impl<B: Bus> Runtime<B> {
             return Err(Error::Busy);
         }
         flow.state = FlowState::Deleting;
-        flow.deadline = Some(narf_time::Deadline::after_ms(2000));
+        flow.deadline = Some(crate::platform::time::Deadline::after_ms(2000));
         let mut entry = [0; 40];
         entry[0] = 5;
         entry[1] = flow.ifidx;

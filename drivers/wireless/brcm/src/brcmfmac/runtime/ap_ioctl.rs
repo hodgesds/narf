@@ -36,7 +36,7 @@ impl<B: Bus> Runtime<B> {
             runtime: self,
             retired: false,
         };
-        let deadline = narf_time::Deadline::after_ms(2000);
+        let deadline = crate::platform::time::Deadline::after_ms(2000);
         loop {
             transaction.runtime.poll()?;
             if let Some(result) = transaction.runtime.take_response(&ticket)? {
@@ -46,7 +46,10 @@ impl<B: Bus> Runtime<B> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                1_000_000,
+            ))
+            .await;
         }
     }
     fn begin_ioctl_ap(

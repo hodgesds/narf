@@ -39,41 +39,78 @@
 
 #![allow(dead_code)]
 
+// The module build (`brcmfmac.ko`) is the PCIe station: the AP, monitor,
+// built-in PCI binding and provisioning owners stay built in. The three
+// role-scope types the shared FullMAC seam names (`ap_source::Source`,
+// `ap_scope::Capture`, `monitor_scope::Capture`) are uninhabited in the
+// module (`*_module.rs`): no AP or monitor role can be entered there.
+#[cfg(feature = "builtin")]
 pub(crate) mod ap;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_beacon;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_key;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_keys;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_native;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_operation;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_packet;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_peer;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_plan;
+#[cfg(feature = "builtin")]
 pub mod ap_scope;
+#[cfg(feature = "module")]
+#[path = "ap_scope_module.rs"]
+pub mod ap_scope;
+#[cfg(feature = "builtin")]
 pub mod ap_source;
+#[cfg(feature = "module")]
+#[path = "ap_source_module.rs"]
+pub mod ap_source;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_station;
+#[cfg(feature = "builtin")]
 pub(crate) mod ap_stop;
 pub mod ap_tx;
 pub(crate) mod ap_wire;
 pub mod boot;
 pub mod bus;
+#[cfg(feature = "builtin")]
 pub mod cfg80211;
 pub mod chip;
 pub mod chip_profile;
+#[cfg(feature = "builtin")]
 pub mod connect;
 pub mod event_mask;
 pub mod firmware;
 pub mod fweh;
 pub mod fwil;
+
 pub mod irq;
+#[cfg(feature = "builtin")]
 pub(crate) mod monitor;
 pub mod monitor_native;
+#[cfg(feature = "builtin")]
+pub mod monitor_scope;
+#[cfg(feature = "module")]
+#[path = "monitor_scope_module.rs"]
 pub mod monitor_scope;
 pub(crate) mod monitor_wire;
 pub mod msgbuf;
+#[cfg(feature = "builtin")]
 pub mod native_runtime;
 pub mod p2p;
 pub mod p2p_wire;
+#[cfg(feature = "builtin")]
 pub mod pcie;
+pub mod pcie_ids;
+#[cfg(feature = "module")]
+pub mod pcie_kabi;
 pub mod provision;
 pub mod ringbuf;
 pub mod runtime;
@@ -84,6 +121,7 @@ pub mod vif_demux;
 pub mod vif_owner;
 pub mod vif_wire;
 
+#[cfg(feature = "builtin")]
 pub use pcie::{name_for, probe, register_pci_driver, BrcmfmacDevice, BROADCOM_VENDOR};
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -91,6 +129,7 @@ pub mod tests;
 
 /// Entry point invoked from the wireless crate's `register_initcalls`
 /// (one level up in `drivers/wireless/src/lib.rs`).
+#[cfg(feature = "builtin")]
 pub fn register() {
     register_pci_driver();
     // Linux `brcmf_pciedrvr_pm` suspend/resume: the D3_INFORM/D0_INFORM
@@ -99,7 +138,9 @@ pub fn register() {
     narf_power::system_pm::register_async_system_pm("brcmfmac", alloc::sync::Arc::new(SystemPm));
 }
 
+#[cfg(feature = "builtin")]
 struct SystemPm;
+#[cfg(feature = "builtin")]
 impl narf_power::system_pm::AsyncSystemPm for SystemPm {
     fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
@@ -120,6 +161,7 @@ impl narf_power::system_pm::AsyncSystemPm for SystemPm {
         })
     }
 }
+#[cfg(feature = "builtin")]
 fn pm_error(error: crate::cyw43439::runtime::Error) -> narf_power::device_pm::DevicePmError {
     match error {
         crate::cyw43439::runtime::Error::Busy => narf_power::device_pm::DevicePmError::Busy,
@@ -147,3 +189,11 @@ mod p2p_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod p2p_transport_cases;
+
+/// `narf_module_init` (module build): install the kernel DRBG as the
+/// protocol code's entropy source, then register the PCI matches.
+#[cfg(feature = "module")]
+pub fn register_module() {
+    crate::platform::install_entropy();
+    pcie_kabi::register_pci_driver();
+}
