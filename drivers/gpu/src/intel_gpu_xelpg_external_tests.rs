@@ -5090,6 +5090,122 @@ pub(crate) mod nova {
         smoke_nvl_external_tbt_alt_on_lt_tc1
     );
 
+    /// Nova Lake-S DSC with FEC over LT TC2 (DP-alt, pin D) beside the lit
+    /// panel. One HBR lane cannot carry 1080p60 even at 18 bpp, so the probe
+    /// compresses with FEC (`intel_dp_compute_link_config`) on a one-lane HBR
+    /// link. The LT PHY runs that link on PHY lane 0 alone
+    /// (`intel_lt_phy_get_owned_lane_mask` for pin D): `xe3plpd_lt_dp_hbr1`,
+    /// the pin-D single-lane transmitter 0 (`intel_lt_phy_enable_disable_tx`)
+    /// and the lane's trained level. Display 30+ confirms the source FEC live
+    /// before the PPS SDP, then Pipe B's engines and TRANSCONF; the stop
+    /// waits for FEC off before the LT PHY releases MacCLK
+    /// (`intel_lt_phy_pll_disable`), and the release returns the Type-C PHY.
+    /// No Cx0 transaction or C20 SRAM state is staged.
+    fn smoke_nvl_external_dsc_fec_over_lt_tc2() -> TestResult {
+        use crate::intel_gpu_lt_phy::{dp_pll_state, signal_level, LtDpRate, LtSignalProtocol};
+        use crate::intel_gpu_xelpg::lane_pclk_pll_request;
+        let io = NovaExt::new(compressed_tc(0));
+        let port = io.ext.port;
+        let Some(panel) = io.ext.light_panel_ip(DisplayIp::NovaLakeS) else {
+            return TestResult::Fail("the fixture must light the display-35 panel");
+        };
+        let view = crate::intel_gpu_xe3plpd::View(&io);
+        let profile = ExternalDisplayProfile::for_ip(DisplayIp::NovaLakeS);
+        let probe = match probe_sink_profile(&view, profile, port, false) {
+            Ok(probe) => probe,
+            Err(_) => return TestResult::Fail("the Nova USB-C DSC sink must probe"),
+        };
+        let Some(plan) = probe.dsc.filter(|plan| plan.fec) else {
+            return TestResult::Fail("one HBR lane must compress 1080p60 with FEC");
+        };
+        if (plan.link_rate, plan.lanes) != (270_000, 1)
+            || probe.negotiated.rate != TrainRate::Hbr
+            || probe.negotiated.lanes != 1
+            || probe.tc.is_none_or(|tc| tc.mode != TcMode::DpAlt || tc.max_lanes != 2)
+        {
+            return TestResult::Fail("the plan must keep the sink's one-lane HBR link");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        io.ext.writes.borrow_mut().clear();
+        let mut route = match activate(&view, probe, fb, &display) {
+            Ok(route) if route.state() == RouteState::Live && route.pipe == Pipe::B => route,
+            _ => return TestResult::Fail("the compressed Nova route must light Pipe B"),
+        };
+        let lane = &route.trained.vswing_pe.lanes[0];
+        let level = signal_level(
+            LtSignalProtocol::Dp14,
+            crate::intel_gpu_xelpg::preset_index(lane.swing, lane.pre_emph),
+        )
+        .unwrap();
+        if let Err(e) = nova_lt_lit(&io, dp_pll_state(LtDpRate::Hbr), &[level]) {
+            return TestResult::Fail(e);
+        }
+        let vdr = |lane: u8, address: u16| io.lt.vdr.borrow().get(&(lane, address)).copied();
+        if vdr(0, 0x040a) != Some(1)
+            || vdr(0, 0x060a) != Some(0)
+            || io.read32(port.clk_valfreq().unwrap()) != 270_000
+            || !io.ext.phy.sram_values().is_empty()
+        {
+            return TestResult::Fail("pin D must drive transmitter 0 of PHY lane 0 at HBR");
+        }
+        let writes = io.ext.writes.borrow().clone();
+        let pos = |f: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(o, v)| f(o, v));
+        let fec = pos(&|o, v| o == DP_TP_CTL_B && v & dsc::DP_TP_CTL_FEC_ENABLE != 0);
+        let pps = pos(&|o, _| o == 0x6_1350);
+        let engines = pos(&|o, _| o == 0x7_8204);
+        let enable = pos(&|o, v| o == PIPECONF_B && v & ENABLE != 0);
+        let sdp = plan.pps_sdp();
+        match (fec, pps, engines, enable) {
+            (Some(f), Some(p), Some(c), Some(e)) if f < p && p < c && c < e => {}
+            _ => return TestResult::Fail("FEC, the PPS SDP and the engines precede TRANSCONF"),
+        }
+        // The plan's Pipe B engine writes, in order (the display-30 Pipes
+        // owner may program other DSS state around them).
+        let mut log = writes.iter();
+        if !plan
+            .engine_writes(Pipe::B)
+            .iter()
+            .all(|write| log.any(|logged| logged == write))
+            || (0..33).any(|i| io.ext.writes_to(0x6_1350 + 4 * i as u64) != [sdp[i]])
+            || io.ext.read32(DP_TP_CTL_B) & dsc::DP_TP_CTL_FEC_ENABLE == 0
+        {
+            return TestResult::Fail("Pipe B must compress with the plan's engines and SDP");
+        }
+        io.ext.writes.borrow_mut().clear();
+        if route.stop(&view).is_err() || route.state() != RouteState::Stopped {
+            return TestResult::Fail("the compressed Nova route must stop");
+        }
+        let writes = io.ext.writes.borrow().clone();
+        let pos = |f: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(o, v)| f(o, v));
+        let fec_off =
+            pos(&|o, v| o == DP_TP_CTL_B && v & (DP_TP_CTL_ENABLE | dsc::DP_TP_CTL_FEC_ENABLE) == 0);
+        let macclk_off =
+            pos(&|o, v| o == port.port_clock_ctl() && v & lane_pclk_pll_request(0) == 0);
+        if !matches!((fec_off, macclk_off), (Some(f), Some(m)) if f < m)
+            || io.read32(port.port_clock_ctl()) & (3 << 30) != 0
+            || io.ext.read32(0x7_8204) != 0
+            || io.ext.read32(DP_TP_CTL_B) & dsc::DP_TP_CTL_FEC_ENABLE != 0
+        {
+            return TestResult::Fail("FEC must stop before the LT PHY releases MacCLK");
+        }
+        if route.release(&view).is_err()
+            || io.read32(port.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
+            || !io.strays.borrow().is_empty()
+            || !io.ext.phy.msgbus_txns(0).is_empty()
+        {
+            return TestResult::Fail("the release must return the Type-C PHY");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_external",
+        smoke_nvl_external_dsc_fec_over_lt_tc2
+    );
+
     /// Nova Lake-S HDMI TMDS on LT port B: 1080p60's 148.5 MHz TMDS clock takes
     /// the LT HDMI image (`xe3plpd_lt_hdmi_148_5`, `intel_lt_phy_pll_enable`),
     /// and `intel_lt_phy_set_signal_levels` the DP 1.4 table's default HDMI
