@@ -11,6 +11,11 @@
 //! table, everything else keeps the CONNAC2 table.
 //! L1 transactions preserve the unrelated selector bits, flush the posted
 //! selector write before accessing the window, and restore the prior selector.
+//! The selector register, page-field mask, and window base are per-chip
+//! (`regs::L1Remap`): CONNAC2 programs `0xfe24c` with the page in the
+//! low half and lands the slab at `0x40000`; MT7925 programs `0x155024`
+//! with the page in the high half and lands it at `0x130000`
+//! (upstream `mt7921/regs.h:63-70` vs `mt7925/regs.h:80-90`).
 use super::regs::*;
 use narf_bus::MmioRegion;
 
@@ -205,8 +210,14 @@ pub(super) fn plan(did: u16, addr: u32, len: u64) -> Result<Plan, Error> {
                 || (0x70000000..0x78000000).contains(&addr)
                 || (0x7c000000..0x7c400000).contains(&addr)
             {
+                // Per-chip L1 window: MT7925 programs selector
+                // 0x155024 (page in the high half) and lands the slab
+                // at 0x130000; CONNAC2 uses 0xfe24c (page in the low
+                // half) and 0x40000. The L1 ranges are the same on
+                // both chips (upstream `__mt792x_reg_addr`).
+                let base = L1Remap::for_chip(did).base;
                 Some(Plan {
-                    offset: MT_HIF_REMAP_BASE_L1 + (addr & 0xffff),
+                    offset: base + (addr & 0xffff),
                     page: Some((addr >> 16) as u16),
                 })
             } else {
@@ -214,8 +225,12 @@ pub(super) fn plan(did: u16, addr: u32, len: u64) -> Result<Plan, Error> {
             }
         })
         .ok_or(Error::Unsupported)?;
+    // The selector is per-chip too: a 7925 selector (0x155024) past
+    // a 1 MiB BAR must fail closed with `Bounds`, never program a
+    // truncated window.
+    let selector = L1Remap::for_chip(did).selector;
     if u64::from(mapped.offset) + 4 > len
-        || (mapped.page.is_some() && u64::from(MT_HIF_REMAP_L1) + 4 > len)
+        || (mapped.page.is_some() && u64::from(selector) + 4 > len)
     {
         return Err(Error::Bounds);
     }
@@ -250,23 +265,26 @@ pub(super) fn transaction<I: Io>(
     write: Option<u32>,
 ) -> Result<u32, Error> {
     let mapped = plan(did, addr, io.len())?;
+    // Per-chip L1 geometry (`regs::L1Remap`): the selector register,
+    // the page-field mask, and the window base all differ between
+    // CONNAC2 and MT7925. Upstream programs the field with
+    // `FIELD_PREP(MT_HIF_REMAP_L1_MASK, addr >> 16)` — low half on
+    // 7921 (`mt7921_reg_map_l1`), high half on 7925
+    // (`mt7925_reg_map_l1`, mt7925/pci.c:141-156).
+    let l1 = L1Remap::for_chip(did);
     let saved = if let Some(page) = mapped.page {
-        let saved = io.read(MT_HIF_REMAP_L1);
+        let saved = io.read(l1.selector);
         if saved == u32::MAX {
             return Err(Error::DeviceGone);
         }
-        // FIELD_PREP(GENMASK(15, 0), addr >> 16), not addr & 0xffff0000.
-        io.write(
-            MT_HIF_REMAP_L1,
-            (saved & !MT_HIF_REMAP_L1_MASK) | u32::from(page),
-        );
-        let selected = io.read(MT_HIF_REMAP_L1); // push the posted selector write
+        io.write(l1.selector, (saved & !l1.mask) | l1.field(page));
+        let selected = io.read(l1.selector); // push the posted selector write
         if selected == u32::MAX {
             return Err(Error::DeviceGone);
         }
-        if selected & MT_HIF_REMAP_L1_MASK != u32::from(page) {
-            io.write(MT_HIF_REMAP_L1, saved);
-            let _ = io.read(MT_HIF_REMAP_L1);
+        if selected & l1.mask != l1.field(page) {
+            io.write(l1.selector, saved);
+            let _ = io.read(l1.selector);
             return Err(Error::RemapRejected);
         }
         Some(saved)
@@ -277,15 +295,15 @@ pub(super) fn transaction<I: Io>(
         io.write(mapped.offset, value);
         // Complete the window write before changing its address selection.
         if saved.is_some() {
-            let _ = io.read(MT_HIF_REMAP_L1);
+            let _ = io.read(l1.selector);
         }
         value
     } else {
         io.read(mapped.offset)
     };
     if let Some(saved) = saved {
-        io.write(MT_HIF_REMAP_L1, saved);
-        let _ = io.read(MT_HIF_REMAP_L1);
+        io.write(l1.selector, saved);
+        let _ = io.read(l1.selector);
     }
     Ok(result)
 }

@@ -35,6 +35,9 @@ mod module_host;
 pub mod mt7921;
 
 #[cfg(feature = "builtin")]
+pub mod mt7925;
+
+#[cfg(feature = "builtin")]
 pub mod iface;
 
 #[cfg(feature = "module")]

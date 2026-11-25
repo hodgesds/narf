@@ -1060,6 +1060,72 @@ impl JoinPlan {
         out[sec + 12..sec + 12 + len].copy_from_slice(key);
         Ok(out)
     }
+
+    /// UNI station update for `link`'s peer (MT7925/CONNAC3):
+    /// `mt7925_mcu_sta_update` → `mt7925_mcu_sta_cmd`
+    /// (`MCU_UNI_CMD(STA_REC_UPDATE)`).
+    ///
+    /// Same guards as [`Self::peer_record_on`]: aid range, phase,
+    /// and the associated/aid agreement. The body is
+    /// `sta_req_hdr` + BASIC + `cap_tlvs` (empty until slice 7
+    /// wires the HT/VHT/HE/EHT capability TLVs) + STATE (+ MLD +
+    /// EHT MLD when `mld` is set and the state is not NONE), built
+    /// by `crate::mt7925::mcu::build_uni_sta_update_req`. The
+    /// caller sends one such message per active link, primary
+    /// first; the CONNAC2 WTBL nested TLVs of `peer_record_on`
+    /// have no UNI-station-update counterpart (WTBL programming on
+    /// 7925 is a separate WTBL-update path).
+    pub(crate) fn peer_record_uni_on(
+        &self,
+        link: Link,
+        aid: u16,
+        associated: bool,
+        mld: Option<crate::mt7925::mcu::MldLinks>,
+    ) -> Result<Vec<u8>, Error> {
+        if aid > 2007 || associated && aid == 0 {
+            return Err(Error::Protocol);
+        }
+        if self.phase() == Phase::Failed
+            || associated && self.phase() != (Phase::Associated { aid })
+        {
+            return Err(Error::Busy);
+        }
+        if !associated && aid != 0 {
+            return Err(Error::Protocol);
+        }
+        let params = crate::mt7925::mcu::UniStaParams {
+            bss_idx: link.bss(),
+            wcid_idx: u16::from(link.peer()),
+            omac_idx: link.omac(),
+            conn_type: crate::mt7925::mcu::CONN_TYPE_INFRA_STA,
+            conn_state: crate::mt7925::mcu::CONN_STATE_PORT_SECURE,
+            aid,
+            peer_addr: self.peer,
+            qos: associated && self.wmm.is_some(),
+            newly: !associated,
+            state: if associated {
+                crate::mt7925::mcu::STA_STATE_ASSOC
+            } else {
+                crate::mt7925::mcu::STA_STATE_NONE
+            },
+            cap_tlvs: &[],
+            mld,
+        };
+        Ok(crate::mt7925::mcu::build_uni_sta_update_req(&params))
+    }
+
+    /// UNI station remove for `link`'s peer (MT7925/CONNAC3):
+    /// `sta_req_hdr` + `STA_REC_REMOVE` + bare `STA_REC_MLD_OFF`
+    /// (`mt7925/mcu.c:2237-2244`). No phase guard: removal is valid
+    /// from any phase, including after a failed association.
+    pub(crate) fn sta_remove_uni_on(&self, link: Link) -> Vec<u8> {
+        let _ = self;
+        crate::mt7925::mcu::build_uni_sta_remove_req(
+            link.bss(),
+            u16::from(link.peer()),
+            link.omac(),
+        )
+    }
 }
 /// The VIF's BMC WCID (19), used for received group keys. Linux uses the
 /// station's AP address for this record, not a fabricated multicast peer.
@@ -1231,6 +1297,85 @@ pub(crate) fn bss_record_on(link: Link, bss: &ScanBss, connected: bool) -> Resul
         out[34] = super::six_ghz::PHY_MODE_AX_6G;
     }
     Ok(out)
+}
+
+/// UNI BSS info for `link`'s vif (MT7925/CONNAC3):
+/// `mt7925_mcu_add_bss_info` → `mt7925_mcu_add_bss_info_sta`
+/// (`MCU_UNI_CMD(BSS_INFO_UPDATE)`).
+///
+/// Same validation as [`bss_record_on`] (unicast BSSID, known band,
+/// non-zero beacon interval) and the same field derivations
+/// (PHY_MODE_A on 5/6 GHz, PHY_MODE_B | PHY_MODE_G on 2.4 GHz,
+/// non-HT basic PHY 8 vs 3, `phymode_ext = PHY_MODE_AX_6G` on
+/// 6 GHz). `sec`/`mld`/`he`/`rlm` are caller-supplied: the SEC
+/// cipher byte is the vif's `CONNAC3_CIPHER_*` value, the RLM
+/// channel comes from the negotiated operating width (slice 7 owns
+/// width negotiation), and MBSSID defaults to (0, 0) — `ScanBss`
+/// carries no MBSSID indicator/index. `slot_time` is the BSS slot
+/// time in µs (9 short / 20 long; upstream `phy->slottime`).
+/// `connected` maps to the builder's `enable` (RLM + MBSSID only
+/// when enabling).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bss_record_uni_on(
+    link: Link,
+    bss: &ScanBss,
+    connected: bool,
+    sec: crate::mt7925::mcu::UniBssSec,
+    mld: crate::mt7925::mcu::UniBssMld,
+    he: Option<crate::mt7925::mcu::UniBssHe>,
+    rlm: Option<crate::mt7925::mcu::UniBssRlm>,
+    slot_time: u16,
+) -> Result<Vec<u8>, Error> {
+    use crate::mt7925::mcu;
+    let six = is_six_ghz(bss);
+    if !unicast(bss.bssid)
+        || if six {
+            super::channel::rx_channel(super::channel::Band::Ghz6, bss.channel).is_none()
+        } else {
+            super::channel::band(bss.channel).is_none()
+        }
+        || bss.beacon_interval == 0
+    {
+        return Err(Error::InvalidBss);
+    }
+    let five = six || super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5);
+    let params = mcu::UniBssParams {
+        bss_idx: link.bss(),
+        enable: connected,
+        conn_type: mcu::CONN_TYPE_INFRA_STA,
+        omac_idx: link.omac(),
+        hw_bss_idx: link.bss(),
+        band_idx: 0,
+        wmm_idx: link.wmm(),
+        bssid: bss.bssid,
+        bmc_tx_wlan_idx: u16::from(link.bmc()),
+        bcn_interval: bss.beacon_interval,
+        dtim_period: 0,
+        phymode: if five { 1 } else { 6 },
+        sta_idx: u16::from(link.bmc()),
+        nonht_basic_phy: if five { 8 } else { 3 },
+        phymode_ext: if six {
+            super::six_ghz::PHY_MODE_AX_6G
+        } else {
+            0
+        },
+        link_idx: link.bss(),
+        sec,
+        basic_rate: if five {
+            mcu::BSS_BASIC_RATE_5G
+        } else {
+            mcu::BSS_BASIC_RATE_2G
+        },
+        short_preamble: !five,
+        fixed_rate_idx: 0,
+        qos: true,
+        mld,
+        slot_time,
+        he,
+        rlm,
+        mbssid: connected.then_some((0, 0)),
+    };
+    Ok(mcu::build_uni_bss_info_sta_req(&params))
 }
 
 /// Linux mt76_connac_mcu_uni_add_bss appends UNI_BSS_INFO_QBSS to

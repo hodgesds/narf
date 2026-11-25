@@ -5,6 +5,7 @@ use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 struct Hif {
+    did: u16,
     selector: u32,
     own: u32,
     reset: u32,
@@ -22,6 +23,7 @@ struct Hif {
 impl Hif {
     fn new() -> Self {
         Self {
+            did: MTK_DEV_MT7922,
             selector: 0xa5a51234,
             own: 4,
             reset: 0xa0000011,
@@ -37,28 +39,54 @@ impl Hif {
             holds: Vec::new(),
         }
     }
+    /// The reset register's BAR0 window on this fixture's chip. On
+    /// CONNAC2 the reset register (`0x18000140`) is reached through
+    /// L1, so the window follows the programmed selector page
+    /// (`0x40000 + 0x140` for page `0x1800`). On MT7925 the reset
+    /// register (`0x7c000140`) sits inside the fixed CONN_INFRA
+    /// window (upstream `default_fixed_map`: `0x7c000000 -> 0x0f0000`,
+    /// torvalds/linux 8d7fe9885c62), so it is reached at BAR0
+    /// `0x0f0140` without programming the L1 selector at all — the
+    /// selector stays at its initial value on the correct path, and
+    /// a write to the L1 window `0x130140` is the signature of the
+    /// CONNAC2 address being used on a 7925.
+    fn reset_window(&self) -> Option<u32> {
+        if is_mt7925_did(self.did) {
+            Some(0x0f0000 + 0x140)
+        } else if self.selector & 0xffff == 0x1800 {
+            Some(MT_HIF_REMAP_BASE_L1 + 0x140)
+        } else {
+            None
+        }
+    }
 }
 impl registers::Io for Hif {
     fn len(&self) -> u64 {
-        0x100000
+        // Real 7925 BAR0 is 2 MiB (the 7925 selector needs it);
+        // CONNAC2 keeps the 1 MiB probe BAR.
+        if is_mt7925_did(self.did) {
+            0x200000
+        } else {
+            0x100000
+        }
     }
     fn read(&mut self, offset: u32) -> u32 {
         self.reads.push(offset);
         if self.gone {
             return u32::MAX;
         }
-        if offset == MT_HIF_REMAP_L1 {
+        if offset == MT_HIF_REMAP_L1 || offset == MT7925_HIF_REMAP_L1 {
             self.selector
         } else if offset == 0xe0010 {
             self.own
-        } else if offset == MT_HIF_REMAP_BASE_L1 + 0x140 && self.selector & 0xffff == 0x1800 {
+        } else if Some(offset) == self.reset_window() {
             self.reset
         } else {
             0
         }
     }
     fn write(&mut self, offset: u32, value: u32) {
-        if offset == MT_HIF_REMAP_L1 {
+        if offset == MT_HIF_REMAP_L1 || offset == MT7925_HIF_REMAP_L1 {
             self.selector = value;
         } else {
             self.writes.push((offset, value));
@@ -68,10 +96,7 @@ impl registers::Io for Hif {
                 } else if value == 2 && !self.stuck_own {
                     self.own = 0;
                 }
-            } else if offset == MT_HIF_REMAP_BASE_L1 + 0x140
-                && self.selector & 0xffff == 0x1800
-                && !self.reset_rejected
-            {
+            } else if Some(offset) == self.reset_window() && !self.reset_rejected {
                 if value & 1 == 0 {
                     self.asserted = Some(self.now);
                     self.reset = value & !16;
@@ -85,12 +110,14 @@ impl registers::Io for Hif {
     }
 }
 impl mac_power::Io for Hif {
+    fn sw_rst_b(&self) -> u32 {
+        wfsys_sw_rst_b(self.did)
+    }
     fn read(&mut self, address: u32) -> Result<u32, PowerError> {
-        registers::transaction(MTK_DEV_MT7922, self, address, None)
-            .map_err(|_| PowerError::InvalidWindow)
+        registers::transaction(self.did, self, address, None).map_err(|_| PowerError::InvalidWindow)
     }
     fn write(&mut self, address: u32, value: u32) -> Result<(), PowerError> {
-        registers::transaction(MTK_DEV_MT7922, self, address, Some(value))
+        registers::transaction(self.did, self, address, Some(value))
             .map(|_| ())
             .map_err(|_| PowerError::InvalidWindow)
     }
@@ -189,4 +216,32 @@ fn mt76_probe_power_rejects_gone_and_unverified_reset() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921",
     mt76_probe_power_rejects_gone_and_unverified_reset
+);
+
+/// The MT7925 probe power sequence resets WFSYS at the CONNAC3
+/// address (`0x7c000140`), reached through the fixed CONN_INFRA
+/// window at BAR0 `0x0f0140` — never through L1, and never the
+/// CONNAC2 address (`0x18000140`, whose L1 window on a 7925 would
+/// be `0x130140`) or the CONNAC2 L1 window (`0x40140`). Upstream
+/// `mt7925/regs.h:92` for the address and `mt7925/pci.c`
+/// `default_fixed_map` (`0x7c000000 -> 0x0f0000`) for the window,
+/// both at torvalds/linux 8d7fe9885c62.
+fn mt76_probe_power_mt7925_reset_uses_connac3_address() -> TestResult {
+    let mut hif = Hif::new();
+    hif.did = MTK_DEV_MT7925;
+    if mac_power::initialize(&mut hif) != Ok(())
+        || hif.resets != 1
+        || hif.holds != vec![50]
+        || hif.selector != 0xa5a51234
+        || !hif.writes.iter().any(|(offset, _)| *offset == 0x0f0140)
+        || hif.writes.iter().any(|(offset, _)| *offset == 0x130140)
+        || hif.writes.iter().any(|(offset, _)| *offset == 0x40140)
+    {
+        return TestResult::Fail("MT7925 probe reset used the CONNAC2 address or window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    mt76_probe_power_mt7925_reset_uses_connac3_address
 );

@@ -604,32 +604,32 @@ pub unsafe fn ring_dma_index(mmio: &MmioRegion, regs: RingRegs) -> u32 {
 
 // ── INFRA L1 remap (re)programming ───────────────────────────────
 //
-// L1 selector encoding follows Linux mt7921/mt7921.h::mt7921_reg_map_l1.
-// The upper half of the chip address is stored in the LOW selector bits.
+// L1 selector encoding follows Linux mt7921/mt7921.h::mt7921_reg_map_l1
+// on CONNAC2 and mt7925/pci.c::mt7925_reg_map_l1 on MT7925. The page
+// field sits in the LOW selector half on CONNAC2 and the HIGH half on
+// MT7925 (`regs::L1Remap::field`); the window base is per-chip too.
+// Callers pass the PCI id so a 7925 window never programs the 7921
+// selector with the wrong field layout.
 
 /// Program the L1 window for `upper << 16`, retaining unrelated register bits.
 /// # Safety
 /// Caller exclusively owns BAR0 and its latch, including the later window
-/// access. BAR0 must cover MT_HIF_REMAP_L1; the caller validates geometry.
-pub unsafe fn program_l1_remap(mmio: &MmioRegion, upper: u16) {
+/// access. BAR0 must cover the per-chip L1 selector; the caller validates geometry.
+pub unsafe fn program_l1_remap(mmio: &MmioRegion, did: u16, upper: u16) {
+    let l1 = L1Remap::for_chip(did);
     // SAFETY: caller guarantees the mapped selector register and ownership.
-    let old = unsafe { mmio.read32(MT_HIF_REMAP_L1 as u64) };
+    let old = unsafe { mmio.read32(l1.selector as u64) };
     // SAFETY: same selector ownership and validated bounds.
-    unsafe {
-        mmio.write32(
-            MT_HIF_REMAP_L1 as u64,
-            (old & !MT_HIF_REMAP_L1_MASK) | u32::from(upper),
-        )
-    };
+    unsafe { mmio.write32(l1.selector as u64, (old & !l1.mask) | l1.field(upper)) };
     // SAFETY: push the posted selector write before the window access.
-    let _ = unsafe { mmio.read32(MT_HIF_REMAP_L1 as u64) };
+    let _ = unsafe { mmio.read32(l1.selector as u64) };
 }
 
 /// Translate an absolute on-chip address into a BAR0 offset that hits
 /// the L1-remapped window. The caller must have programmed the remap
 /// page to cover `addr`'s upper 16 bits first.
-pub const fn l1_remapped_offset(addr: u32) -> u32 {
-    MT_HIF_REMAP_BASE_L1 + (addr & MT_HIF_REMAP_L1_MASK)
+pub const fn l1_remapped_offset(did: u16, addr: u32) -> u32 {
+    L1Remap::for_chip(did).base + (addr & MT_HIF_REMAP_L1_MASK)
 }
 
 // ── Stage-4 collected device rings ────────────────────────────────

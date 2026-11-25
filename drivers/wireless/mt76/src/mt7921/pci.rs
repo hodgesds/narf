@@ -536,8 +536,16 @@ fn register_error(error: super::registers::Error) -> ProbeError {
 /// Return the checked PCI register offset, or `u32::MAX` if unsupported.
 /// An indirect offset alone is not sufficient for I/O: use the checked
 /// register transaction, which programs and flushes the L1 selector first.
+/// The mapped BAR length is per-chip: MT7925 silicon reports a 2 MiB
+/// BAR0 (a 14c3:0717 card reports `[size=2M]`), so the 7925 selector
+/// at 0x155024 fits; CONNAC2 keeps the 1 MiB probe BAR.
 pub fn l1_remap(did: u16, abs: u32) -> u32 {
-    super::registers::plan(did, abs, 0x100000).map_or(u32::MAX, |plan| plan.offset)
+    let len = if super::regs::is_mt7925_did(did) {
+        0x200000
+    } else {
+        0x100000
+    };
+    super::registers::plan(did, abs, len).map_or(u32::MAX, |plan| plan.offset)
 }
 
 /// SendFn registered with `narf_net::iface` at probe. Stage-2 lights
