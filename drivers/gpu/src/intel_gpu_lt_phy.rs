@@ -1937,7 +1937,8 @@ pub(crate) mod tests {
     }
 
     /// The LT PHY's message bus, P2P status, lane reset/pulse status and
-    /// MacCLK request/ACK at the PICA offsets of ports A, B, TC1 and TC2.
+    /// MacCLK and Thunderbolt clock request/ACK at the PICA offsets of ports
+    /// A, B, TC1 and TC2.
     #[derive(Debug)]
     pub(crate) struct FakeLtMmio {
         pub(crate) regs: RefCell<BTreeMap<u64, u32>>,
@@ -2286,11 +2287,17 @@ pub(crate) mod tests {
 
         fn write32(&self, off: u64, value: u32) {
             if matches!(off, 0x16_fa60 | 0x16_fc60 | 0x16_f260 | 0x16_f460) {
+                use crate::intel_gpu_xelpg::{TBT_CLOCK_ACK, TBT_CLOCK_REQUEST};
                 let mut next = value;
                 if value & lane_pclk_pll_request(0) != 0 {
                     next |= lane_pclk_pll_ack(0);
                 } else {
                     next &= !lane_pclk_pll_ack(0);
+                }
+                if value & TBT_CLOCK_REQUEST != 0 {
+                    next |= TBT_CLOCK_ACK;
+                } else {
+                    next &= !TBT_CLOCK_ACK;
                 }
                 self.regs.borrow_mut().insert(off, next);
                 return;

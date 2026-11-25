@@ -108,7 +108,13 @@
 //! `intel_lt_phy_pll_disable`, `intel_lt_phy_set_signal_levels` over
 //! `xe3plpd_lt_trans_dp14`), and a profile whose PHY family the view does not
 //! report is refused before MMIO ([`ExternalDisplayProfile::admits_view`]).
-//! Thunderbolt alt mode on an LT port is refused ([`ExternalError::LtTbtAlt`]).
+//! Thunderbolt alt mode on TC1/TC2 runs as on display 14: the Type-C connect
+//! takes no PHY (display 35 powers PICA_TC for the tunnel's AUX and lanes),
+//! AUX selects TBT IO, and the port clock is the fabric's
+//! (`intel_mtl_tbt_pll_enable_clock` with the display-30 five-bit select and
+//! `DDI_CLK_VALFREQ`, `PORT_BUF_CTL1` TBT IO select); the LT PHY takes no PLL
+//! or signal-level transaction (`xe3plpd_tbt_pll_funcs` enable is a no-op,
+//! `intel_lt_phy_set_signal_levels` returns in TBT alt mode).
 //!
 //! ## DP 2.0 UHBR (`narf.intel.uhbr=1`)
 //!
@@ -465,9 +471,6 @@ pub enum ExternalError {
     /// The stream needs a DSC configuration Linux would not choose or this
     /// driver does not qualify (nothing was programmed).
     Dsc(DscRefusal),
-    /// A Thunderbolt-alt connection on an LT-PHY port: its TBT clock
-    /// (`intel_mtl_tbt_pll_enable_clock`) is not owned on display 35.
-    LtTbtAlt,
     /// A 128b/132b (UHBR) route `narf.intel.uhbr=1` would run is refused or
     /// failed ([`uhbr::UhbrRefusal`]).
     Uhbr(uhbr::UhbrRefusal),
@@ -801,10 +804,17 @@ pub(crate) fn lt_phy<'a, M: MmioWindow + ?Sized>(
         .map_err(phy_err)
 }
 
+/// The LT PHY behind `probe`. A Thunderbolt-alt connection's PHY belongs to
+/// the TBT fabric, so no LT transaction may reach it: `intel_xe3plpd_pll_disable`
+/// takes the TBT clock instead of `intel_lt_phy_pll_disable`, and the TBT PLL's
+/// enable is a no-op (`xe3plpd_tbt_pll_funcs`).
 fn probe_lt_phy<'a, M: MmioWindow + ?Sized>(
     io: &'a M,
     probe: &MtlSinkProbe,
 ) -> Result<Option<crate::intel_gpu_lt_phy::LtPhy<'a, M>>, ExternalError> {
+    if probe.tbt() && io.has_lt_phy() {
+        return Err(phy_err(Cx0Error::ProtocolMismatch));
+    }
     lt_phy(
         io,
         probe.port,
@@ -817,7 +827,9 @@ fn probe_lt_phy<'a, M: MmioWindow + ?Sized>(
 /// `encoder->set_signal_levels` on an 8b/10b link's `lanes` at `levels`:
 /// `intel_lt_phy_set_signal_levels` over the DP 1.4 table
 /// (`xe3plpd_lt_trans_dp14`; UHBR takes [`uhbr_levels`]) at each lane's
-/// `intel_ddi_dp_level`, or `intel_cx0_phy_set_signal_levels`.
+/// `intel_ddi_dp_level`, or `intel_cx0_phy_set_signal_levels`. Both return
+/// without a transaction in Thunderbolt alt mode: the fabric drives the
+/// lanes.
 fn port_levels<M: MmioWindow + ?Sized>(
     io: &M,
     probe: &MtlSinkProbe,
@@ -825,6 +837,9 @@ fn port_levels<M: MmioWindow + ?Sized>(
     lanes: u8,
     levels: &[(u8, u8); 4],
 ) -> Result<(), ExternalError> {
+    if probe.tbt() {
+        return Ok(());
+    }
     match probe_lt_phy(io, probe)? {
         Some(lt) => {
             let lanes = usize::from(lanes);
@@ -852,7 +867,9 @@ fn port_levels<M: MmioWindow + ?Sized>(
 }
 
 /// `intel_ddi_disable_clock` for a non-TBT route: `intel_lt_phy_pll_disable`
-/// or `intel_cx0pll_disable` of the probe's lanes.
+/// or `intel_cx0pll_disable` of the probe's lanes. A TBT route takes
+/// [`disable_tbt_clock`] instead (`intel_xe3plpd_pll_disable`,
+/// `intel_mtl_pll_disable_clock`).
 fn port_pll_disable<M: MmioWindow + ?Sized>(
     io: &M,
     probe: &MtlSinkProbe,
@@ -1048,14 +1065,6 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
         }
         e
     };
-    // No Thunderbolt clock owner is modelled for the LT PHY: a TBT-alt
-    // connection on display 35 is released before any AUX traffic.
-    if io.has_lt_phy() && tc.is_some_and(|conn| conn.mode == TcMode::TbtAlt) {
-        if let Some(conn) = tc {
-            let _ = tc_disconnect(io, &conn);
-        }
-        return Err(ExternalError::LtTbtAlt);
-    }
     if let Err(e) = aux_power_enable(io, port) {
         if let Some(conn) = tc {
             let _ = tc_disconnect(io, &conn);

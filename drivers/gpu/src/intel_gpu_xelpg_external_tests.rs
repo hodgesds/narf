@@ -4958,6 +4958,138 @@ mod nova {
         smoke_nvl_external_tc_dp_alt_on_lt_tc1
     );
 
+    /// Nova Lake-S Thunderbolt alt mode on LT TC1. The live TBT HPD connects
+    /// through the fabric (`xelpdp_tc_phy_connect`: no TCSS request, no PHY
+    /// ownership) with PICA_TC powered for the tunnel's AUX_TBT and DDI-lane
+    /// domains, and AUX selects TBT IO. `mtl_ddi_pre_enable_dp` selects TBT IO
+    /// in `PORT_BUF_CTL1` before the port clock, which is the fabric's
+    /// (`intel_mtl_tbt_pll_enable_clock`): `intel_mtl_tbt_clock_select` in the
+    /// display-30 five-bit field with the forward clock ungated, the TBT
+    /// request and its ACK, then `DDI_CLK_VALFREQ` at the link rate. The LT
+    /// PHY takes no lane reset, PLL, transmitter or signal-level transaction
+    /// (the TBT PLL's enable is a no-op, `intel_lt_phy_set_signal_levels`
+    /// returns in TBT alt mode). The stop gates the TBT clock, clears
+    /// VALFREQ and the IO select (`intel_mtl_tbt_pll_disable_clock`,
+    /// `intel_ddi_post_disable_dp`); the release drops AUX power and PICA.
+    fn smoke_nvl_external_tbt_alt_on_lt_tc1() -> TestResult {
+        use crate::intel_gpu_xe2lpd::{PICA_POWER_REQUEST, PICA_PW_CTL};
+        use crate::intel_gpu_xelpg::{
+            lane_pclk_pll_request, FORWARD_CLOCK_UNGATE, PORT_BUF_IO_SELECT_TBT,
+            TBT_CLOCK_ACK, TBT_CLOCK_REQUEST, XE3_DDI_CLOCK_SELECT_MASK,
+        };
+        let port = XeLpgPort::Tc1;
+        let io = NovaExt::new(ExtFake::new(port, Sink::new(0x14, edid_1024())));
+        io.ext.pica_isr.set(pica_tbt_hotplug(0));
+        let Some(panel) = io.ext.light_panel_ip(DisplayIp::NovaLakeS) else {
+            return TestResult::Fail("the fixture must light the display-35 panel");
+        };
+        let view = crate::intel_gpu_xe3plpd::View(&io);
+        let profile = ExternalDisplayProfile::for_ip(DisplayIp::NovaLakeS);
+        let probe = match probe_sink_profile(&view, profile, port, false) {
+            Ok(probe)
+                if probe.tc.is_some_and(|tc| {
+                    tc.mode == TcMode::TbtAlt
+                        && tc.max_lanes == 4
+                        && tc.profile == TcDisplayProfile::NovaLakeS
+                }) =>
+            {
+                probe
+            }
+            _ => return TestResult::Fail("Nova TBT-alt must probe the sink through the tunnel"),
+        };
+        if io.ext.read32(PICA_PW_CTL) & PICA_POWER_REQUEST == 0
+            || io.ext.read32(port.buf_ctl1()) & (TCSS_POWER_REQUEST | TC_PHY_OWNERSHIP) != 0
+            || !io
+                .ext
+                .aux_ctl_writes
+                .borrow()
+                .iter()
+                .any(|v| v & AUX_CTL_TBT_IO != 0)
+        {
+            return TestResult::Fail("the tunnel must power PICA and select TBT AUX, not the PHY");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        io.ext.writes.borrow_mut().clear();
+        let mut route = match activate(&view, probe, fb, &display) {
+            Ok(route) if route.state() == RouteState::Live && route.pipe == Pipe::B => route,
+            _ => return TestResult::Fail("Nova TBT-alt DP must light Pipe B beside the panel"),
+        };
+        // intel_mtl_tbt_clock_select for the DP 1.4 rates.
+        let khz = link_clock_khz(route.trained.rate);
+        let Some(select) = [(162_000, 0xc), (270_000, 0xd), (540_000, 0xe), (810_000, 0xf)]
+            .into_iter()
+            .find_map(|(rate, select)| (rate == khz).then_some(select))
+        else {
+            return TestResult::Fail("the tunnel trains at a DP 1.4 rate");
+        };
+        let clock = io.read32(port.port_clock_ctl());
+        if clock & XE3_DDI_CLOCK_SELECT_MASK != select << 12
+            || clock & (FORWARD_CLOCK_UNGATE | TBT_CLOCK_REQUEST | TBT_CLOCK_ACK)
+                != FORWARD_CLOCK_UNGATE | TBT_CLOCK_REQUEST | TBT_CLOCK_ACK
+            || clock & lane_pclk_pll_request(0) != 0
+            || io.read32(port.clk_valfreq().unwrap()) != khz
+        {
+            return TestResult::Fail("the port clock must be the fabric's at the trained rate");
+        }
+        let io_select = io
+            .ext
+            .first_write(|r, v| r == port.buf_ctl1() && v & PORT_BUF_IO_SELECT_TBT != 0);
+        let request = io
+            .ext
+            .first_write(|r, v| r == port.port_clock_ctl() && v & TBT_CLOCK_REQUEST != 0);
+        if !matches!((io_select, request), (Some(s), Some(r)) if s < r)
+            || io.read32(port.buf_ctl1()) & PORT_BUF_IO_SELECT_TBT == 0
+        {
+            return TestResult::Fail("TBT IO must be selected before the TBT clock request");
+        }
+        // Nothing but PORT_CLOCK_CTL of the LT-only registers: no BUF_CTL2/5,
+        // message-bus or P2P access, and no LT or Cx0 transaction.
+        let lt_only = |r: u64| r != port.port_clock_ctl() && io.lt_reg(r);
+        if io.ext.writes.borrow().iter().any(|&(r, _)| lt_only(r))
+            || !io.lt.transactions.borrow().is_empty()
+            || !io.lt.vdr.borrow().is_empty()
+            || !io.ext.phy.msgbus_txns(0).is_empty()
+            || !io.strays.borrow().is_empty()
+        {
+            return TestResult::Fail("the fabric's PHY must take no LT transaction");
+        }
+        if io.read32(port.ddi_buf_ctl())
+            & (DDI_BUF_CTL_ENABLE | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE)
+            != DDI_BUF_CTL_ENABLE | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+        {
+            return TestResult::Fail("DDI_CTL_DE must carry the display-20+ D2D enable");
+        }
+        if route.stop(&view).is_err() || route.state() != RouteState::Stopped {
+            return TestResult::Fail("Nova TBT-alt DP must stop");
+        }
+        if io.read32(port.port_clock_ctl())
+            & (XE3_DDI_CLOCK_SELECT_MASK | FORWARD_CLOCK_UNGATE | TBT_CLOCK_REQUEST | TBT_CLOCK_ACK)
+            != 0
+            || io.read32(port.clk_valfreq().unwrap()) != 0
+            || io.read32(port.buf_ctl1()) & PORT_BUF_IO_SELECT_TBT != 0
+            || io.read32(port.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
+        {
+            return TestResult::Fail("the stop must gate the TBT clock and deselect TBT IO");
+        }
+        if route.release(&view).is_err()
+            || io.ext.read32(PICA_PW_CTL) & PICA_POWER_REQUEST != 0
+            || io.ext.aux_power.get()
+            || !io.lt.transactions.borrow().is_empty()
+            || io.ext.writes.borrow().iter().any(|&(r, _)| lt_only(r))
+        {
+            return TestResult::Fail("the release must drop AUX power and PICA");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_external",
+        smoke_nvl_external_tbt_alt_on_lt_tc1
+    );
+
     /// Nova Lake-S HDMI TMDS on LT port B: 1080p60's 148.5 MHz TMDS clock takes
     /// the LT HDMI image (`xe3plpd_lt_hdmi_148_5`, `intel_lt_phy_pll_enable`),
     /// and `intel_lt_phy_set_signal_levels` the DP 1.4 table's default HDMI
