@@ -362,7 +362,7 @@ impl From<DcUser> for Gen9DcUser {
     fn from(user: DcUser) -> Self {
         match user {
             DcUser::Init | DcUser::Load => Self::Init,
-            DcUser::Modeset | DcUser::PipeDmc => Self::Modeset,
+            DcUser::Modeset | DcUser::PipeDmc | DcUser::Phy => Self::Modeset,
             DcUser::Kms | DcUser::Psr => Self::Kms,
             DcUser::Suspend => Self::Suspend,
             DcUser::Aux => Self::Aux,

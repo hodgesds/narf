@@ -1215,6 +1215,19 @@ pub(crate) const fn pipedmc_interrupt_mask(pipe: u32) -> u64 {
 /// `pipedmc_interrupt_mask`: FLIPQ_PROG_DONE | GTT_FAULT | ATS_FAULT
 /// (PIPEDMC_ERROR stays off, as the pinned tree leaves it).
 pub(crate) const PIPEDMC_IRQS: u32 = (1 << 3) | (1 << 1) | 1;
+/// `pipedmc_interrupt_mask` for display >= 35 (Linux 7.4-rc4):
+/// `PIPEDMC_FLIPQ_PROG_DONE | PIPEDMC_ERROR`, without the GTT and ATS fault
+/// bits.
+pub(crate) const PIPEDMC_IRQS_XE3PLPD: u32 = (1 << 3) | (1 << 2);
+
+/// The pipe-DMC interrupts a container's platform arms: display 35 takes
+/// [`PIPEDMC_IRQS_XE3PLPD`], display 20/30 keep the pinned [`PIPEDMC_IRQS`].
+pub(crate) const fn pipedmc_interrupt_bits(platform: crate::intel_gpu_dmc::DmcPlatform) -> u32 {
+    match platform {
+        crate::intel_gpu_dmc::DmcPlatform::Xe3pLpd => PIPEDMC_IRQS_XE3PLPD,
+        _ => PIPEDMC_IRQS,
+    }
+}
 /// `intel_flipq_reset` registers for `pipe`, in source write order:
 /// `PIPEDMC_FQ_CTRL`, `SCANLINECMPLOWER`, `SCANLINECMPUPPER`, then
 /// `FPQ_HP` and `FPQ_CHP` of each of the five flip queues, then
@@ -1248,19 +1261,19 @@ fn flipq_reset(io: &(impl MmioWindow + ?Sized), pipe: u32) {
 
 /// The display >= 20 half of `intel_dmc_enable_pipe` that precedes
 /// `PIPEDMC_ENABLE_MTL`: reset the flip queue, clear and unmask the pipe
-/// DMC interrupts.
-pub(crate) fn pipe_dmc_enable_prologue(io: &(impl MmioWindow + ?Sized), pipe: u32) {
+/// DMC interrupts `irqs` ([`pipedmc_interrupt_bits`]).
+pub(crate) fn pipe_dmc_enable_prologue(io: &(impl MmioWindow + ?Sized), pipe: u32, irqs: u32) {
     flipq_reset(io, pipe);
-    io.write32(pipedmc_interrupt(pipe), PIPEDMC_IRQS);
-    io.write32(pipedmc_interrupt_mask(pipe), !PIPEDMC_IRQS);
+    io.write32(pipedmc_interrupt(pipe), irqs);
+    io.write32(pipedmc_interrupt_mask(pipe), !irqs);
 }
 
 /// The display >= 20 half of `intel_dmc_disable_pipe` that follows the
-/// `PIPEDMC_ENABLE_MTL` clear: mask and clear the pipe DMC interrupts,
-/// then reset the flip queue.
-pub(crate) fn pipe_dmc_disable_epilogue(io: &(impl MmioWindow + ?Sized), pipe: u32) {
+/// `PIPEDMC_ENABLE_MTL` clear: mask and clear the pipe DMC interrupts
+/// `irqs`, then reset the flip queue.
+pub(crate) fn pipe_dmc_disable_epilogue(io: &(impl MmioWindow + ?Sized), pipe: u32, irqs: u32) {
     io.write32(pipedmc_interrupt_mask(pipe), !0);
-    io.write32(pipedmc_interrupt(pipe), PIPEDMC_IRQS);
+    io.write32(pipedmc_interrupt(pipe), irqs);
     flipq_reset(io, pipe);
 }
 

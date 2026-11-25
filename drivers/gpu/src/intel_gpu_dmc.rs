@@ -325,8 +325,9 @@ pub enum DmcPlatform {
     /// execution rules as display 30.00 but an exact, distinct container.
     WildcatLake,
     /// Display 35.00 (Nova Lake-S, `xe3p_lpd_dmc.bin`): the 0x8000 ceiling,
-    /// display-20 pipe hooks and Pipe C/D MMIO restore. No production DC
-    /// service selects this variant yet.
+    /// display-20 pipe hooks with the display-35 pipe-DMC interrupt mask,
+    /// Pipe C/D MMIO restore, and `DC_COUNT_EN` after every load. The
+    /// display-35 DC service (`intel_gpu_dc_states`) selects it.
     Xe3pLpd,
 }
 
@@ -1303,7 +1304,17 @@ pub fn load_program<M: MmioWindow + ?Sized>(regs: &M, fw: &DmcFirmware<'_>) {
     );
     // Posting read: flush the mask write before returning.
     let _ = regs.read32(DC_STATE_DEBUG);
+    // xe3lpd_enable_dc_count (Linux 7.4-rc4), display >= 35: start the DC
+    // residency counters after the debug masks.
+    if fw.platform == DmcPlatform::Xe3pLpd {
+        regs.write32(DC_COUNT_EN, DC_COUNT_EN_COUNTER_ENABLE);
+    }
 }
+
+/// `DC_COUNT_EN` (display >= 35).
+pub const DC_COUNT_EN: u64 = 0x457b4;
+/// `DC_COUNT_EN_COUNTER_ENABLE`.
+pub const DC_COUNT_EN_COUNTER_ENABLE: u32 = 1 << 31;
 
 /// Disable the firmware: quiesce the event handlers of
 /// every loaded program, making the DMC inactive —
@@ -1459,7 +1470,11 @@ pub fn enable_pipe<M: MmioWindow + ?Sized>(
     }
     verify_program(regs, fw, id).map_err(PipeDmcError::Verify)?;
     if fw.platform.has_display20_pipe_hooks() {
-        crate::intel_gpu_xe2lpd::pipe_dmc_enable_prologue(regs, pipe);
+        crate::intel_gpu_xe2lpd::pipe_dmc_enable_prologue(
+            regs,
+            pipe,
+            crate::intel_gpu_xe2lpd::pipedmc_interrupt_bits(fw.platform),
+        );
     }
     regs.write32(MTL_PIPEDMC_CONTROL, control | pipedmc_enable_mtl(pipe));
     Ok(true)
@@ -1486,7 +1501,11 @@ pub fn disable_pipe<M: MmioWindow + ?Sized>(
     }
     regs.write32(MTL_PIPEDMC_CONTROL, control & !pipedmc_enable_mtl(pipe));
     if fw.platform.has_display20_pipe_hooks() {
-        crate::intel_gpu_xe2lpd::pipe_dmc_disable_epilogue(regs, pipe);
+        crate::intel_gpu_xe2lpd::pipe_dmc_disable_epilogue(
+            regs,
+            pipe,
+            crate::intel_gpu_xe2lpd::pipedmc_interrupt_bits(fw.platform),
+        );
     }
     Ok(true)
 }

@@ -693,8 +693,15 @@ The DMC parser separately tags Panther (`xe3lpd_dmc.bin`), Wildcat
 0x8000 ceiling. Panther/Wildcat KMS passes its retained exact identity and
 read-flush fact to the DC service, which restores Pipe C/D DMC MMIO and uses
 the display >= 20 flip-queue/interrupt brackets; a broad generation cannot
-select either container. Nova's parser has the same Pipe C/D rule but remains
-disconnected from the production DC service.
+select either container. Nova's owned route (`narf.intel.nvl_display=1` with
+`narf.intel.nvl_modeset=1`) passes display 35.00 the same way: its service
+loads `xe3p_lpd_dmc.bin` under the same Pipe C/D rule, writes `DC_COUNT_EN`
+after each load, arms the display-35 pipe-DMC interrupts
+(`PIPEDMC_FLIPQ_PROG_DONE | PIPEDMC_ERROR`), takes Linux 7.4-rc4's
+`gen9_dc_mask` and CMTG read-only mask for `DC_STATE_EN`, and targets DC6
+(DC3CO, which needs the CMTG, is never armed). Every display-35 AUX transfer
+and LT PHY message-bus transaction takes its own DC_off reference
+(`xe3plpd_pwdoms_dc_off`, `intel_lt_phy_transaction_begin`).
 
 The Nova Lake-S census includes the exact `INTEL_NVLS_IDS` from Linux 7.4-rc1
 and retains D744 from Linux 7.0-rc7. Linux gives them a

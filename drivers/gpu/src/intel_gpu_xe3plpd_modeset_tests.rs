@@ -451,3 +451,140 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3plpd_modeset",
     smoke_nvl_relight_refusals_write_nothing
 );
+
+/// `xe3plpd_pwdoms_dc_off` puts every AUX channel in the `DC_off` well and
+/// `intel_dp_aux_xfer` holds the channel's AUX domain across a transfer: with
+/// DC6 entered on the Nova fake, a DPCD read through the display-35 view
+/// writes `DC_STATE_DISABLE` before its first AUX register write, keeps DC0
+/// to the end and defers re-entry 17 ms; DC6 then returns. A refused exit
+/// touches no AUX register. A window without the LT PHY never consults the
+/// display-35 hook.
+fn smoke_nvl_dc6_disarmed_around_an_aux_transfer() -> TestResult {
+    use crate::dp_aux::{AuxChannel as _, AuxError};
+    use crate::intel_gpu_aux::IntelAux;
+    use crate::intel_gpu_dc_states::xe3plpd_dc_tests::{armed_local, RefuseDcOff};
+    use crate::intel_gpu_dc_states::{ArmGates, DC_REENABLE_DELAY_NS};
+    use crate::intel_gpu_dmc::DC_STATE_EN;
+    use core::sync::atomic::Ordering;
+    const MS: u64 = 1_000_000;
+    let io = Nova::new();
+    let local = match armed_local(&io) {
+        Ok(local) => local,
+        Err(why) => return TestResult::Fail(why),
+    };
+    assert_eq!(io.get(DC_STATE_EN) & 3, 2, "the fixture starts in DC6");
+    local.now.store(7 * MS, Ordering::Relaxed);
+    io.writes.borrow_mut().clear();
+    let view = View(&io);
+    let base = crate::intel_gpu_xelpg::XeLpgPort::A.aux_base();
+    let mut buf = [0u8; 1];
+    let mut aux = IntelAux::with_base(&view, base).with_dc_off(&local);
+    assert!(aux.dpcd_read(0x000, &mut buf).is_ok());
+    assert_eq!(buf[0], 0x12, "the sink's DPCD revision");
+    let writes = io.writes.borrow().clone();
+    // DDI A's AUX control at its PICA offset (`__xe2lpd_aux_ch_idx`).
+    let exit = writes.iter().position(|w| *w == (DC_STATE_EN, 0));
+    let first_aux = writes.iter().position(|(r, _)| *r == 0x16fa10);
+    match (exit, first_aux) {
+        (Some(0), Some(at)) if at > 0 => {}
+        _ => return TestResult::Fail("DC exit must precede the transfer's first AUX write"),
+    }
+    assert_eq!(io.written(DC_STATE_EN), [0], "DC0 for the whole transfer");
+    assert_eq!(local.core.lock().total(), 0);
+    let due = local.deadline.load(Ordering::Relaxed);
+    assert_eq!(due, 7 * MS + DC_REENABLE_DELAY_NS);
+    assert_eq!(
+        local.core.lock().arm_if_due(&io, due, ArmGates::default()),
+        Ok(2)
+    );
+    assert_eq!(io.get(DC_STATE_EN) & 3, 2, "DC6 again after the deferral");
+
+    io.writes.borrow_mut().clear();
+    let mut aux = IntelAux::with_base(&view, base).with_dc_off(&RefuseDcOff);
+    assert!(matches!(
+        aux.dpcd_read(0x000, &mut buf),
+        Err(AuxError::Deferred)
+    ));
+    assert!(io.writes.borrow().is_empty(), "{:x?}", io.writes.borrow());
+    // The same registers behind a window without the LT PHY: the display-35
+    // hook is not consulted.
+    struct NoLt<'a>(&'a View<'a, Nova>);
+    impl MmioWindow for NoLt<'_> {
+        fn read32(&self, r: u64) -> u32 {
+            self.0.read32(r)
+        }
+        fn write32(&self, r: u64, v: u32) {
+            self.0.write32(r, v)
+        }
+    }
+    let plain = NoLt(&view);
+    let mut aux = IntelAux::with_base(&plain, base).with_dc_off(&RefuseDcOff);
+    assert!(aux.dpcd_read(0x000, &mut buf).is_ok());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3plpd_modeset",
+    smoke_nvl_dc6_disarmed_around_an_aux_transfer
+);
+
+/// `intel_lt_phy_transaction_begin` holds `POWER_DOMAIN_DC_OFF` around
+/// every LT PHY message-bus conversation: with DC6 entered, a signal-level
+/// update on port A exits DC6 before its first message-bus write, keeps DC0
+/// to the end and defers re-entry 17 ms. A refused exit writes nothing.
+fn smoke_nvl_dc6_disarmed_around_an_lt_phy_transaction() -> TestResult {
+    use crate::intel_gpu_dc_states::xe3plpd_dc_tests::{armed_local, RefuseDcOff};
+    use crate::intel_gpu_dc_states::{ArmGates, DC_REENABLE_DELAY_NS};
+    use crate::intel_gpu_dmc::DC_STATE_EN;
+    use crate::intel_gpu_lt_phy::{LtPhy, LtPort, LtSignalProtocol};
+    use core::sync::atomic::Ordering;
+    const MS: u64 = 1_000_000;
+    let io = Nova::new();
+    let local = match armed_local(&io) {
+        Ok(local) => local,
+        Err(why) => return TestResult::Fail(why),
+    };
+    local.now.store(9 * MS, Ordering::Relaxed);
+    io.writes.borrow_mut().clear();
+    let view = View(&io);
+    let phy = LtPhy::new(&view, LtPort::A, false, 4, false)
+        .unwrap()
+        .with_dc_off(&local);
+    assert_eq!(
+        phy.program_signal_levels(LtSignalProtocol::Edp, &[0, 0, 0, 0]),
+        Ok(())
+    );
+    let writes = io.writes.borrow().clone();
+    let exit = writes.iter().position(|w| *w == (DC_STATE_EN, 0));
+    let first_bus = writes.iter().position(|(r, _)| lt_reg(*r));
+    match (exit, first_bus) {
+        (Some(0), Some(at)) if at > 0 => {}
+        _ => return TestResult::Fail("DC exit must precede the first message-bus write"),
+    }
+    assert_eq!(
+        io.written(DC_STATE_EN),
+        [0],
+        "DC0 for the whole transaction"
+    );
+    let due = local.deadline.load(Ordering::Relaxed);
+    assert_eq!(due, 9 * MS + DC_REENABLE_DELAY_NS);
+    assert_eq!(
+        local.core.lock().arm_if_due(&io, due, ArmGates::default()),
+        Ok(2)
+    );
+
+    io.writes.borrow_mut().clear();
+    let phy = LtPhy::new(&view, LtPort::A, false, 4, false)
+        .unwrap()
+        .with_dc_off(&RefuseDcOff);
+    assert_eq!(
+        phy.program_signal_levels(LtSignalProtocol::Edp, &[0, 0, 0, 0]),
+        Err(crate::intel_gpu_xelpg::Cx0Error::PhyError)
+    );
+    assert!(phy.disable().is_err());
+    assert!(io.writes.borrow().is_empty(), "{:x?}", io.writes.borrow());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3plpd_modeset",
+    smoke_nvl_dc6_disarmed_around_an_lt_phy_transaction
+);

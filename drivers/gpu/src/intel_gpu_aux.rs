@@ -186,6 +186,12 @@ pub struct IntelAux<'a, M: MmioWindow + ?Sized> {
     /// service, inert unless `narf.intel.gen9_dc=1` installed it on a Gen9
     /// display, or a fixture's own ([`IntelAux::with_gen9_dc`]).
     gen9_dc: &'a dyn crate::intel_gpu_gen9_dc_states::Gen9DcOff,
+    /// The display-35 `DC_off` well every transfer on an LT-PHY window
+    /// holds: `xe3plpd_pwdoms_dc_off` lists every AUX channel, and
+    /// `intel_dp_aux_xfer` holds the channel's AUX domain across the
+    /// transfer. The production service, inert unless the Nova Lake-S
+    /// route installed it, or a fixture's own ([`IntelAux::with_dc_off`]).
+    dc_off: &'a dyn crate::intel_gpu_dc_states::DcOff,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
@@ -325,7 +331,15 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
             ddi,
             profile: AuxCtlProfile::Gen12,
             gen9_dc: &crate::intel_gpu_gen9_dc_states::ServiceDcOff,
+            dc_off: &crate::intel_gpu_dc_states::Xe3pLpdDcOff,
         }
+    }
+
+    /// Hold `dc` as the display-35 `DC_off` well across each transfer on
+    /// an LT-PHY window instead of the production service.
+    pub fn with_dc_off(mut self, dc: &'a dyn crate::intel_gpu_dc_states::DcOff) -> Self {
+        self.dc_off = dc;
+        self
     }
 
     /// Hold `dc` as the Gen9 `DC_off` well across each transfer instead of
@@ -366,6 +380,7 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
             base,
             profile: AuxCtlProfile::XeLpdp { tbt_io },
             gen9_dc: &crate::intel_gpu_gen9_dc_states::ServiceDcOff,
+            dc_off: &crate::intel_gpu_dc_states::Xe3pLpdDcOff,
         }
     }
 
@@ -526,6 +541,21 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
             crate::intel_gpu_gen9_dc_states::Gen9DcUser::Aux,
         )
         .map_err(|_| AuxError::Deferred)?;
+        // Display 35 (the LT-PHY windows): every AUX channel is a DC_off
+        // domain. Exit DC6 before the first AUX register access and defer
+        // re-entry after the transfer; a refused exit touches nothing.
+        let _dc35 = if self.mmio.has_lt_phy() {
+            Some(
+                crate::intel_gpu_dc_states::hold(
+                    self.dc_off,
+                    self.mmio,
+                    crate::intel_gpu_dc_states::DcUser::Aux,
+                )
+                .map_err(|_| AuxError::Deferred)?,
+            )
+        } else {
+            None
+        };
         let inherited = self.mmio.read32(self.aux_ctl_off());
         if inherited == u32::MAX {
             return Err(AuxError::ShortReply);

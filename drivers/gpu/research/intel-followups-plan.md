@@ -153,10 +153,13 @@ Still open, each needing its own grounding first:
   Gen9 LP system suspend (`bxt_enable_dc9`, with the PPS reset), the
   post-S3 DMC reload (a lost program keeps DC states off), and the GT's
   `GT_IRQ` hold while unparked (`__gt_unpark`).
-- Nova Lake-S beyond the owned eDP route, its suspend relight and the LT
-  external outputs (`narf.intel.nvl_modeset=1`): UHBR and Thunderbolt alt
-  mode on the LT PHY, Nova fixtures for MST and DSC over LT ports (they
-  run the same LT-dispatched route), and the DMC/DC states.
+- Nova Lake-S beyond the owned eDP route, its suspend relight, the LT
+  external outputs and the display-35 DMC/DC6 service
+  (`narf.intel.nvl_modeset=1`): UHBR and Thunderbolt alt mode on the LT PHY,
+  Nova fixtures for MST and DSC over LT ports (they run the same
+  LT-dispatched route), DC3CO (it needs the CMTG and a LOBF, panel-replay or
+  PSR2 trigger), the DMC wakelock (`intel_dmc_wl`), and a silicon run of the
+  DC service.
 - PXP silicon acceptance. Xe PXP on MTL/Arrow runs behind
   `narf.intel.pxp=1` (spec "MTL/Arrow PXP behind narf.intel.pxp=1") with
   native fixtures only; protected-plane decryption is refused, and the

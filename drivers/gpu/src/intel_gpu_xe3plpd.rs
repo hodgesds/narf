@@ -28,6 +28,12 @@
 //! (`drm_atomic_helper_suspend`, `intel_lt_phy_pll_disable`), and resume runs
 //! [`relight`]: the sequencer delays [`record_panel_delays`] kept, then the
 //! cold panel-on through the LT PHY (`xe_display_pm_resume`).
+//!
+//! The KMS install also creates the display-35 DC service
+//! (`intel_gpu_dc_states`, `DmcPlatform::Xe3pLpd`): `xe3p_lpd_dmc.bin`
+//! loaded after the GT publication and reloaded after resume, DC6 between
+//! display conversations, and a `DC_off` reference around every AUX
+//! transfer and LT PHY transaction on [`View`].
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
@@ -588,7 +594,8 @@ pub(crate) fn probe_takeover(
     .map_err(|_| TakeoverRefusal::PciAccess)?;
     // SAFETY: the PCI probe grants exclusive ownership of this function's
     // BAR0; an identical later mapping reuses the same typed VA.
-    let bar = unsafe { narf_bus::bar::map_bar(device, 0) }.map_err(|_| TakeoverRefusal::PciAccess)?;
+    let bar =
+        unsafe { narf_bus::bar::map_bar(device, 0) }.map_err(|_| TakeoverRefusal::PciAccess)?;
     let asls = pci::read_config32(cap, device, crate::intel_gpu_vbt::ASLS).ok();
     let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, *cap);
     let mode = take_over_for_probe(&window, primary, asls)?;
