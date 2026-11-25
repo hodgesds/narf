@@ -305,7 +305,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
         // No existing block had room — extend the directory by one
         // block. Allocate, seed with a single record, write, then
-        // bump the parent's i_size + i_blocks.
+        // bump the parent's i_size. `map_block_alloc` already counted the
+        // new block (and any index block) in i_blocks.
         let new_logical = blocks as u64;
         let phys = self
             .map_block_alloc(parent_inode_no, parent_inode, new_logical)
@@ -327,8 +328,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             .await?;
         // Update parent inode bookkeeping.
         parent_inode.size += bs as u64;
-        // i_blocks is in 512-byte sectors.
-        parent_inode.blocks = parent_inode.blocks.saturating_add(bs as u32 / 512);
         self.write_inode(parent_inode_no, parent_inode).await
     }
 
