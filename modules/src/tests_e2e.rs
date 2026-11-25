@@ -1928,13 +1928,14 @@ kernel_test_in!("modules/e2e/ath10k", e2e_ath10k_module_registration);
 /// the KABI, including the softMAC exports `narf_pci_command`,
 /// `narf_pcie_state`, `narf_pci_config_read32` and
 /// `narf_wireless_regdomain`). The relocations resolve and init runs; the
-/// module claims exactly the built-in driver's fifteen Atheros ids and none
+/// module claims exactly the built-in driver's fifteen Atheros ids, under
+/// its own match name `ath9k-module`, and none
 /// of ath10k's; a probe with no device context is refused before any
 /// device access; and unload (whose exit runs the owners' removal with
 /// nothing bound) leaves no match behind. QEMU has no Atheros Wi-Fi, so
 /// bring-up itself is proven on hardware.
 fn e2e_ath9k_module_registration() -> TestResult {
-    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    use narf_bus::driver_match::{__module_thunk_for_test, count, registered};
     const ATHEROS: u16 = 0x168c;
     /// AR5416/AR5418/AR9160, AR9280 PCI/PCIe, AR9285, AR2427, AR9287
     /// PCI/PCIe, AR9380, AR9485, AR9580, AR9462, AR9565, AR9462/AR1111.
@@ -1966,7 +1967,15 @@ fn e2e_ath9k_module_registration() -> TestResult {
         Err(_) => return TestResult::Fail("ath9k.ko failed to load or run init"),
     };
     let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    // Under its own match name: a built-in per-chip name would replace the
+    // built-in entry instead of adding one (whether the built-in driver has
+    // registered by now depends on the tests that ran before this one).
+    let own_matches = registered()
+        .iter()
+        .filter(|m| m.name == "ath9k-module")
+        .count();
     let claims = module.name() == "ath9k"
+        && own_matches == CLAIMED.len()
         && count() == before + CLAIMED.len()
         && CLAIMED
             .iter()

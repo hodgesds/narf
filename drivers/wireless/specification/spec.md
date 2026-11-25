@@ -2897,9 +2897,12 @@ driver.
     linked kernel-free.
   - A device capability handle is live only while its token is the bound
     device. A firmware handle is live only while its record is open.
-- **Claim.** The built-in tables, unchanged: fifteen `168c:*` ids.
-  `narf-drivers-wireless/ath9k-module-only` leaves the built-in driver
-  unregistered, so an early-loaded `ath9k.ko` owns the devices.
+- **Claim.** The built-in tables' ids, unchanged: fifteen `168c:*` ids,
+  under the module's own match name `ath9k-module`. The match table is keyed
+  on (name, id), so a built-in per-chip name would replace the built-in
+  entry, and unload would remove it. `narf-drivers-wireless/ath9k-module-only`
+  leaves the built-in driver unregistered, so an early-loaded `ath9k.ko`
+  owns the devices.
 - **Probe** (`pci_kabi.rs`). This is the built-in probes' shared bus half,
   in Linux `ath_pci_probe` order.
   1. `narf_pci_identity`, and the owner for the device id.

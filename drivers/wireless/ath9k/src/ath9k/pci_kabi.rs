@@ -68,16 +68,19 @@ enum Owner {
     Ar9300,
 }
 
-/// Every (device, match name, owner) the module claims: the built-in
-/// tables, unchanged.
-fn ids() -> impl Iterator<Item = (u16, &'static str, Owner)> {
+/// The module's match name. Distinct from the built-in per-chip names: the
+/// PCI match table is keyed on (name, id), so reusing a built-in name would
+/// replace the built-in entry, and unload would take it away again.
+pub const MODULE_MATCH_NAME: &str = "ath9k-module";
+
+/// Every (device, owner) the module claims: the built-in tables' ids,
+/// unchanged.
+fn ids() -> impl Iterator<Item = (u16, Owner)> {
     let ar9285 = super::DEVICES
         .into_iter()
-        .map(|(device, name, _)| (device, name, Owner::Ar9285));
+        .map(|(device, _, _)| (device, Owner::Ar9285));
     let tagged = |table: &'static [(u16, &'static str)], owner: Owner| {
-        table
-            .iter()
-            .map(move |&(device, name)| (device, name, owner))
+        table.iter().map(move |&(device, _)| (device, owner))
     };
     ar9285
         .chain(tagged(&super::ar5008_owner::DEVICES, Owner::Ar5008))
@@ -91,8 +94,8 @@ fn owner_for(id: &DeviceId) -> Option<Owner> {
         return None;
     }
     ids()
-        .find(|(device, _, _)| *device == id.device)
-        .map(|(_, _, owner)| owner)
+        .find(|(device, _)| *device == id.device)
+        .map(|(_, owner)| owner)
 }
 
 /// The bound function and its owner, for [`exit`].
@@ -109,13 +112,13 @@ fn log(args: core::fmt::Arguments<'_>) {
 /// Register every owner's PCI ids; the kernel calls [`probe_c`] for a
 /// match.
 pub fn register() {
-    for (device, name, _) in ids() {
-        // SAFETY: `name` is 'static and `probe_c` is a valid extern "C" fn;
+    for (device, _) in ids() {
+        // SAFETY: the name is 'static and `probe_c` is a valid extern "C" fn;
         // the loader unregisters the match before this image is unmapped.
         let rc = unsafe {
             ffi::narf_register_pci_driver(
-                name.as_ptr(),
-                name.len(),
+                MODULE_MATCH_NAME.as_ptr(),
+                MODULE_MATCH_NAME.len(),
                 super::ATHEROS_PCI_VENDOR,
                 device,
                 probe_c as usize,
