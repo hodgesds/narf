@@ -1883,17 +1883,22 @@ correction:
   refused with power well 2 requested or on,
   the utility pin in PWM mode (DC6), a live external route,
   or a resident DMC program that no longer verifies. System
-  suspend holds DC states off. On Gen9 LP with the display
-  dark (every transcoder off, PW_2 not requested, no other
-  holder) it then runs the rest of `bxt_display_core_uninit`
-  (DBUF off, CDCLK bypass with the DE PLL off, the PW_1
-  request dropped) and `bxt_enable_dc9` (PPS reset, DC9),
-  and grants no reference until the resume; otherwise it
-  stays in DC0. Resume exits DC9 (`bxt_disable_dc9`), runs
-  the power half of the display-core init (PW_1 with its
-  fuses, MISC IO on display 9 proper, DBUF) and reloads the
-  resident program, releasing the Suspend reference only
-  once it verifies.
+  suspend holds DC states off. In the device-PM phase
+  (interrupts gated), on Gen9 LP with the display dark (every
+  transcoder off, the DSI ports included, PW_2 not requested,
+  `GEN8_MASTER_IRQ_CONTROL` clear, no other holder) it then
+  runs the rest of `bxt_display_core_uninit` (DBUF off, CDCLK
+  bypass with the DE PLL off, the PW_1 request dropped) and
+  `bxt_enable_dc9` (PPS reset, DC9), and grants no reference
+  until the resume; otherwise it stays in DC0. Resume exits
+  DC9 (`bxt_disable_dc9`), runs the display-core init (the
+  PCH reset handshake, PW_1 with its fuses, MISC IO on
+  display 9 proper, `intel_cdclk_init_hw`, DBUF) and reloads
+  the resident program, releasing the Suspend reference only
+  once it verifies. The display suspend owner
+  (`intel_gpu_gen9_suspend`, `narf.intel.gen9_suspend=1`,
+  default off) drives these steps around turning the owned
+  panel off before system sleep and relighting it after.
 - Forcewake (`intel_gpu_forcewake`): the Gen9 domain table
   is the three aggregate domains — render 0xA278, media
   0xA270, blitter 0xA188, acks 0x0D84 / 0x0D88 / 0x130044 —

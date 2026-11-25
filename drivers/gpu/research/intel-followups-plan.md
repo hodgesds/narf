@@ -43,11 +43,11 @@ Boot options, each strict and default off:
 Each item needs its own grounding against Linux i915/xe first, as the landed
 work had.
 
-- Silicon runs of everything above. The Gen9 DC states also need a Gen9
-  display suspend owner that turns the panel off and relights it (a lit
-  panel keeps DC9 refused), `intel_cdclk_init_hw` and the PCH reset
-  handshake on resume, BXT DSI transcoders in the dark-display check, and
-  `assert_can_enable_dc9`'s interrupts-off check.
+- Silicon runs of everything above, including the Gen9 display suspend
+  owner (`narf.intel.gen9_suspend=1`) and Gen9 LP DC9. Gen9 also lacks the
+  GT across S3 (the execlists owner has no system-PM hooks, and while it
+  holds its `GT_IRQ` reference DC9 is refused) and `PP_DIVISOR` on pre-CNP
+  south displays.
 - Nova Lake-S: Thunderbolt alt mode on the LT PHY, Nova fixtures for
   MST and DSC over LT ports, DC3CO (it needs the CMTG and a LOBF,
   panel-replay or PSR2 trigger) and the DMC wakelock (`intel_dmc_wl`).
