@@ -98,6 +98,9 @@ pub struct CcsPlanes {
     pub aux: Option<(u32, u32)>,
     /// The clear-colour plane's byte offset (`_RC_CCS_CC` only).
     pub cc: Option<u32>,
+    /// The end of the last plane the display fetches (main, or AUX), which
+    /// the scanout mapping must cover.
+    pub fetch_end: u64,
 }
 
 impl Ccs {
@@ -151,6 +154,21 @@ impl Ccs {
     }
 }
 
+/// The compressed modifiers IN_FORMATS lists for display `display_ver`
+/// (the i915 personality's on display 14, flat CCS on display 20/30), in
+/// `intel_modifiers` order.
+pub fn advertised(display_ver: u16) -> &'static [u64] {
+    match display_ver {
+        14 => &[
+            I915_FORMAT_MOD_4_TILED_MTL_MC_CCS,
+            I915_FORMAT_MOD_4_TILED_MTL_RC_CCS,
+            I915_FORMAT_MOD_4_TILED_MTL_RC_CCS_CC,
+        ],
+        20..=34 => &[I915_FORMAT_MOD_4_TILED_LNL_CCS],
+        _ => &[],
+    }
+}
+
 /// `gen12_ccs_aux_stride`: one 64-byte AUX line per 512 bytes of main
 /// pitch (four Tile4 widths).
 pub const fn gen12_ccs_aux_stride(main_pitch: u32) -> u32 {
@@ -196,6 +214,7 @@ pub fn check_planes(
                 ccs,
                 aux: None,
                 cc: None,
+                fetch_end: main_end,
             })
         };
     }
@@ -207,9 +226,12 @@ pub fn check_planes(
     {
         return Err(CcsRefusal::Planes);
     }
-    // Gen12 AuxCCS: one 64-byte AUX cacheline per four 4 KiB main tiles,
-    // so one AUX line of `gen12_ccs_aux_stride` bytes per main tile row.
-    let aux_end = u64::from(offsets[1]) + u64::from(pitches[1]) * (main_rows / 32);
+    // The AUX plane (`intel_fb_plane_get_subsampling`: vsub 32) has one
+    // line per 32 main lines and is itself tiled in 64-byte x 64-line tiles
+    // (`intel_tile_width_bytes` 64 for a Gen12 CCS plane, `intel_tile_height`
+    // 4096 / 64), so its size is the AUX pitch over whole AUX tile rows.
+    let aux_lines = u64::from(height.div_ceil(32)).div_ceil(64) * 64;
+    let aux_end = u64::from(offsets[1]) + u64::from(pitches[1]) * aux_lines;
     let cc = if ccs == Ccs::MtlRcCc {
         if pitches[2] != 0 || offsets[2] % 64 != 0 || u64::from(offsets[2]) < aux_end {
             return Err(CcsRefusal::Planes);
@@ -226,6 +248,7 @@ pub fn check_planes(
         ccs,
         aux: Some((offsets[1], pitches[1])),
         cc,
+        fetch_end: aux_end,
     })
 }
 
@@ -243,6 +266,29 @@ impl CcsPlanes {
         [native as u32, (native >> 32) as u32]
     }
 
+    /// The clear colour's native value position in the object
+    /// (`intel_atomic_prepare_plane_clear_colors`: offset 16 of the CC plane).
+    pub fn cc_native_offset(&self) -> Option<u64> {
+        self.cc.map(|cc| u64::from(cc) + 16)
+    }
+
+    /// [`Self::program`]'s writes as a register list (`PLANE_CC_VAL` low and
+    /// high, `PLANE_AUX_DIST`, `PLANE_AUX_OFFSET`) for a DSB arm of the
+    /// primary of `pipe`.
+    pub fn noarm_registers(&self, pipe: u8, ccval: Option<u64>) -> alloc::vec::Vec<(u64, u32)> {
+        let mut out = alloc::vec::Vec::new();
+        if let (Some(_), Some(native)) = (self.cc, ccval) {
+            let [lo, hi] = Self::cc_val(native);
+            out.push((plane_cc_val(pipe, 0), lo));
+            out.push((plane_cc_val(pipe, 1), hi));
+        }
+        if let Some(dist) = self.aux_dist() {
+            out.push((plane_aux_dist(pipe), dist));
+            out.push((plane_aux_offset(pipe), 0));
+        }
+        out
+    }
+
     /// `skl_program_plane_noarm`'s compressed registers for the primary of
     /// `pipe`, before its `PLANE_CTL`/`PLANE_SURF` arm: `PLANE_CC_VAL` for a
     /// clear-colour layout, `PLANE_AUX_DIST` on display 14, `PLANE_AUX_OFFSET`
@@ -254,14 +300,8 @@ impl CcsPlanes {
         pipe: u8,
         ccval: Option<u64>,
     ) -> u32 {
-        if let (Some(_), Some(native)) = (self.cc, ccval) {
-            let [lo, hi] = Self::cc_val(native);
-            regs.write32(plane_cc_val(pipe, 0), lo);
-            regs.write32(plane_cc_val(pipe, 1), hi);
-        }
-        if let Some(dist) = self.aux_dist() {
-            regs.write32(plane_aux_dist(pipe), dist);
-            regs.write32(plane_aux_offset(pipe), 0);
+        for (register, value) in self.noarm_registers(pipe, ccval) {
+            regs.write32(register, value);
         }
         self.ccs.plane_ctl()
     }

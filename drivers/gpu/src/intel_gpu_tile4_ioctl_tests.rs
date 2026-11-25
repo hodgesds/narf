@@ -137,6 +137,7 @@ fn smoke_intel_tile4_source_literals_metadata_bounds_and_test_only() -> TestResu
         layout: Layout::Tile4,
         origin: Viewport { x: 33, y: 33 },
         input: Default::default(),
+        ccs: None,
     };
     assert_eq!(
         view.footprint(geometry()).unwrap(),

@@ -28,14 +28,16 @@ impl crate::intel_gpu_aux::MmioWindow for Regs {
 
 const XRGB8888: u32 = 0x3432_5258;
 const ARGB8888: u32 = 0x3432_5241;
-const MIB8: u64 = 8 << 20;
+const OBJECT_SIZE: u64 = 9 << 20;
 
 /// 1920x1080 XRGB8888 in Tile4: pitch 7680 (15 x 512), 34 tile rows of 32
 /// lines, so the main surface ends at 7680 * 1088 = 0x7f8000; the AUX pitch
-/// is 7680 / 512 * 64 = 960 and its 34 lines end at 0x7fff80, where a
-/// 64-byte clear-colour plane fits below 8 MiB.
+/// is DIV_ROUND_UP(7680, 4 * 128) * 64 = 960, and its ceil(1080 / 32) = 34
+/// lines round up to one 64-line AUX tile row (64-byte x 64-line CCS tiles):
+/// 960 * 64 = 0xf000 bytes, ending at 0x807000, where the 64-byte
+/// clear-colour plane starts. The object is 9 MiB.
 fn mtl_planes(ccs: Ccs) -> Result<CcsPlanes, CcsRefusal> {
-    let cc = if ccs == Ccs::MtlRcCc { (1, 0x7f_ff80) } else { (0, 0) };
+    let cc = if ccs == Ccs::MtlRcCc { (1, 0x80_7000) } else { (0, 0) };
     check_planes(
         ccs,
         XRGB8888,
@@ -43,7 +45,7 @@ fn mtl_planes(ccs: Ccs) -> Result<CcsPlanes, CcsRefusal> {
         [7, 7, cc.0 * 7, 0],
         [7680, 960, 0, 0],
         [0, 0x7f_8000, cc.1, 0],
-        MIB8,
+        OBJECT_SIZE,
     )
 }
 
@@ -79,21 +81,21 @@ fn smoke_ccs_modifiers_and_plane_rules_follow_intel_fb() -> TestResult {
     if rc.aux != Some((0x7f_8000, 960)) || rc.cc.is_some() {
         return TestResult::Fail("the AUX plane is plane 1 at its pitch");
     }
-    if mtl_planes(Ccs::MtlRcCc).map(|p| p.cc) != Ok(Some(0x7f_ff80)) {
+    if mtl_planes(Ccs::MtlRcCc).map(|p| (p.cc, p.fetch_end)) != Ok((Some(0x80_7000), 0x80_7000)) {
         return TestResult::Fail("the clear-colour plane is plane 2");
     }
     let refuse = |handles, pitches, offsets, size| {
         check_planes(Ccs::MtlRc, XRGB8888, 1080, handles, pitches, offsets, size).err()
     };
-    if refuse([7, 7, 0, 0], [7680, 896, 0, 0], [0, 0x7f_8000, 0, 0], MIB8)
+    if refuse([7, 7, 0, 0], [7680, 896, 0, 0], [0, 0x7f_8000, 0, 0], OBJECT_SIZE)
         != Some(CcsRefusal::Planes)
-        || refuse([7, 8, 0, 0], [7680, 960, 0, 0], [0, 0x7f_8000, 0, 0], MIB8)
+        || refuse([7, 8, 0, 0], [7680, 960, 0, 0], [0, 0x7f_8000, 0, 0], OBJECT_SIZE)
             != Some(CcsRefusal::Planes)
-        || refuse([7, 7, 0, 0], [7680, 960, 0, 0], [0, 0x7f_7000, 0, 0], MIB8)
+        || refuse([7, 7, 0, 0], [7680, 960, 0, 0], [0, 0x7f_7000, 0, 0], OBJECT_SIZE)
             != Some(CcsRefusal::Planes)
-        || refuse([7, 7, 0, 0], [7168 + 128, 960, 0, 0], [0, 0x7f_8000, 0, 0], MIB8)
+        || refuse([7, 7, 0, 0], [7168 + 128, 960, 0, 0], [0, 0x7f_8000, 0, 0], OBJECT_SIZE)
             != Some(CcsRefusal::Planes)
-        || refuse([7, 7, 0, 0], [7680, 960, 0, 0], [0, 0x7f_8000, 0, 0], 0x7f_ff00)
+        || refuse([7, 7, 0, 0], [7680, 960, 0, 0], [0, 0x7f_8000, 0, 0], 0x80_6000)
             != Some(CcsRefusal::Bounds)
         || check_planes(
             Ccs::MtlRc,
@@ -102,7 +104,7 @@ fn smoke_ccs_modifiers_and_plane_rules_follow_intel_fb() -> TestResult {
             [7, 7, 0, 0],
             [7680, 960, 0, 0],
             [0, 0x7f_8000, 0, 0],
-            MIB8,
+            OBJECT_SIZE,
         ) != Err(CcsRefusal::Format)
     {
         return TestResult::Fail("gen12_ccs_aux_stride, one object, no overlap, bounds, format");
@@ -114,8 +116,8 @@ fn smoke_ccs_modifiers_and_plane_rules_follow_intel_fb() -> TestResult {
         1080,
         [7, 7, 7, 0],
         [7680, 960, 0, 0],
-        [0, 0x7f_8000, 0x7f_ff90, 0],
-        MIB8,
+        [0, 0x7f_8000, 0x80_7010, 0],
+        OBJECT_SIZE,
     ) != Err(CcsRefusal::Planes)
     {
         return TestResult::Fail("a misaligned clear-colour plane must be refused");
@@ -128,7 +130,7 @@ fn smoke_ccs_modifiers_and_plane_rules_follow_intel_fb() -> TestResult {
         [7, 0, 0, 0],
         [7680, 0, 0, 0],
         [0, 0, 0, 0],
-        MIB8,
+        OBJECT_SIZE,
     );
     if flat.map(|p| (p.aux, p.cc)) != Ok((None, None))
         || check_planes(
@@ -138,7 +140,7 @@ fn smoke_ccs_modifiers_and_plane_rules_follow_intel_fb() -> TestResult {
             [7, 7, 0, 0],
             [7680, 960, 0, 0],
             [0, 0x7f_8000, 0, 0],
-            MIB8,
+            OBJECT_SIZE,
         ) != Err(CcsRefusal::Planes)
     {
         return TestResult::Fail("flat CCS takes exactly one plane");
@@ -189,7 +191,7 @@ fn smoke_ccs_and_xe2_scanout_plane_registers() -> TestResult {
         [7, 0, 0, 0],
         [7680, 0, 0, 0],
         [0, 0, 0, 0],
-        MIB8,
+        OBJECT_SIZE,
     )
     .expect("flat");
     if flat.program(&flat_regs, 1, None) != 0x9400 || !flat_regs.writes.borrow().is_empty() {
@@ -200,4 +202,56 @@ fn smoke_ccs_and_xe2_scanout_plane_registers() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_scanout",
     smoke_ccs_and_xe2_scanout_plane_registers
+);
+
+/// The scanout view of a compressed framebuffer: origin zero only, a
+/// mapping that covers the AUX plane, and on display 20 the DPT remap at the
+/// whole source stride (`calc_plane_remap_info` keeps `src_stride` for CCS
+/// before `plane_view_dst_stride_tiles` rounds it to a power of two).
+fn smoke_ccs_view_footprint_and_xe2_dpt_stride() -> TestResult {
+    use crate::intel_gpu_scanout::{DptLayout, Geometry, Layout, View, Viewport};
+    let planes = mtl_planes(Ccs::MtlRc).expect("planes");
+    let geometry = Geometry {
+        width: 1920,
+        height: 1080,
+        pitch: 7680,
+    };
+    let view = View {
+        layout: Layout::Tile4,
+        ccs: Some(planes),
+        ..View::default()
+    };
+    let panned = View {
+        origin: Viewport { x: 32, y: 0 },
+        ..view
+    };
+    // Tile4 1080 lines -> 34 tile rows x 7680 = 0x7f8000; the AUX plane
+    // ends at 0x807000.
+    if view.footprint(geometry).map(|(_, _, bytes)| bytes) != Ok(0x80_7000)
+        || panned.footprint(geometry) != Err(crate::intel_gpu_scanout::ScanoutError::Unsupported)
+        || view.tiled() != 0xb400
+    {
+        return TestResult::Fail("a CCS view maps its AUX plane and never pans");
+    }
+    // 1024 visible pixels (32 Tile4 columns) of a 7680-byte (60-tile)
+    // pitch: plain Tile4 remaps to roundup_pow_of_two(32) = 32 < 60 and is
+    // not owned; CCS remaps at roundup_pow_of_two(60) = 64.
+    let narrow = Geometry {
+        width: 1024,
+        height: 64,
+        pitch: 7680,
+    };
+    let origin = Viewport::default();
+    if DptLayout::with_origin(narrow, Layout::Tile4, origin).is_some()
+        || DptLayout::with_origin_for(narrow, Layout::Tile4, origin, true)
+            .map(|(l, ..)| (l.src, l.width, l.dst, l.rows))
+            != Some((60, 32, 64, 2))
+    {
+        return TestResult::Fail("the CCS DPT keeps the source stride, rounded to a power of two");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout",
+    smoke_ccs_view_footprint_and_xe2_dpt_stride
 );

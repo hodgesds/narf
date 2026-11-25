@@ -73,6 +73,7 @@ fn tiled_profile(
         origin: Default::default(),
         layout,
         input: Default::default(),
+        ccs: None,
     }
     .footprint(geometry)
     .map_err(scanout_error)?;
