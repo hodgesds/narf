@@ -63,6 +63,20 @@ kernel IPC. CI checks both native-ring feature configurations.
   selected by signed module entries augment the build-time module trust store.
 - `cargo xtask build-module --manifest-path PATH --package NAME ...` builds an
   out-of-tree module without adding it to the repository workspace.
+  The `.ko` is one `ld -r` of the crate's objects plus the archive members
+  they reach, section-GC'd and then linked with a script that folds rustc's
+  per-function and per-object sections into one section per kind (`.text`,
+  `.rodata.str`, `.rodata.cst`, `.rodata`, `.data.rel.ro`, `.data`, `.bss`);
+  any other section, `.modinfo` and `.narf_kparams` included, keeps its own
+  name. `--compress` wraps the ELF in the `NRFCMOD` LZ4 envelope with a
+  hash-chain match finder (window 64 KiB); the in-tree Wi-Fi driver modules
+  compress 2.1x to 3.9x.
+- `cargo xtask test` (kernel-test features) stages its module fixtures in the
+  initramfs: `lib/modules/{narf_test_module,narf_module_rt_smoke,
+  narf_drivers_net_e1000}.ko` raw, `narf_test_module.ko.lz4`, and the
+  whole-driver fixtures as `lib/modules/test-fixtures/<name>.ko.lz4`
+  envelopes (intel_gpu, ath9k, ath10k, ath11k, brcmfmac, iwlwifi, mt76, rtl,
+  rtw88), because the archive stays resident in guest RAM for the whole boot.
 
 - `NARF_FIRMWARE_TRUSTED_KEYS=/absolute/path/keys.txt` embeds firmware
   verification public keys (one 64-digit hex Ed25519 key per line).

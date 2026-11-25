@@ -3954,57 +3954,116 @@ fn push_lz4_len(out: &mut Vec<u8>, mut len: usize) {
     out.push(len as u8);
 }
 
-/// Small host-side LZ4 block encoder for module artifacts.
+/// Window an LZ4 match may reach back: the block format's offset is a `u16`.
+const LZ4_MAX_OFFSET: usize = 65_535;
+/// The last match must start at least this many bytes before the end.
+const LZ4_MFLIMIT: usize = 12;
+/// The block must end in at least this many literals.
+const LZ4_LAST_LITERALS: usize = 5;
+/// Hash-chain candidates examined per position. A build-time encoder can
+/// afford a deep search.
+const LZ4_CHAIN_DEPTH: usize = 64;
+const LZ4_HASH_BITS: u32 = 16;
+
+fn lz4_hash(input: &[u8], at: usize) -> usize {
+    let v = u32::from_le_bytes([input[at], input[at + 1], input[at + 2], input[at + 3]]);
+    (v.wrapping_mul(2_654_435_761) >> (32 - LZ4_HASH_BITS)) as usize
+}
+
+fn push_lz4_sequence(out: &mut Vec<u8>, literals: &[u8], offset: usize, match_len: usize) {
+    let token_at = out.len();
+    out.push(0);
+    if literals.len() >= 15 {
+        out[token_at] = 0xf0;
+        push_lz4_len(out, literals.len() - 15);
+    } else {
+        out[token_at] = (literals.len() as u8) << 4;
+    }
+    out.extend_from_slice(literals);
+    out.extend_from_slice(&(offset as u16).to_le_bytes());
+    let match_code = match_len - LZ4_MIN_MATCH;
+    if match_code >= 15 {
+        out[token_at] |= 0x0f;
+        push_lz4_len(out, match_code - 15);
+    } else {
+        out[token_at] |= match_code as u8;
+    }
+}
+
+/// Host-side LZ4 block encoder for module artifacts.
 ///
-/// It deliberately recognises only byte runs (offset 1). ELF padding and BSS
-/// metadata contain enough long zero runs to make that useful, while keeping
-/// the build tool independent of kernel crates and external `lz4` binaries.
-/// The output is standard LZ4 block format and the kernel uses its existing,
-/// fully general bounded decoder.
+/// A greedy hash-chain match finder over the full 64 KiB window. It used
+/// to recognise only byte runs (offset 1), which left code, string tables
+/// and relocation records — nearly every byte of a module — uncompressed.
+/// The output is standard LZ4 block format; the kernel decodes it with its
+/// bounded, fully general decoder (`narf_memory::compress::lz4_decode`,
+/// which takes any offset and copies overlapping matches byte by byte).
+/// The encoder stays in xtask so the build tool needs no kernel crate and
+/// no external `lz4` binary.
 fn lz4_encode_module(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + input.len() / 255 + 16);
     let mut anchor = 0usize;
-    let mut cursor = 1usize;
-    // LZ4 requires a final literal run of at least five bytes and the last
-    // match to begin at least twelve bytes before the end.
-    let match_limit = input.len().saturating_sub(5);
-    let match_start_limit = input.len().saturating_sub(12);
+    // A match ends at least LZ4_LAST_LITERALS bytes before the end and
+    // starts at least LZ4_MFLIMIT before it; a shorter block is all literals.
+    let match_limit = input.len().saturating_sub(LZ4_LAST_LITERALS);
+    let match_start_limit = input.len().saturating_sub(LZ4_MFLIMIT);
+    // `head[hash]` is the newest position with that hash; `prev[pos % W]`
+    // links each position to the previous one with the same hash.
+    let mut head = vec![u32::MAX; 1 << LZ4_HASH_BITS];
+    let mut prev = vec![u32::MAX; LZ4_MAX_OFFSET + 1];
+    let window = prev.len();
+    let mut inserted = 0usize;
+    let mut cursor = 0usize;
 
     while cursor < match_start_limit {
-        if input[cursor] != input[cursor - 1] {
+        // Index every position before `cursor`, then search its chain.
+        while inserted < cursor {
+            let h = lz4_hash(input, inserted);
+            prev[inserted % window] = head[h];
+            head[h] = inserted as u32;
+            inserted += 1;
+        }
+
+        let mut best_len = 0usize;
+        let mut best_pos = 0usize;
+        let mut candidate = head[lz4_hash(input, cursor)];
+        for _ in 0..LZ4_CHAIN_DEPTH {
+            if candidate == u32::MAX {
+                break;
+            }
+            let pos = candidate as usize;
+            if cursor - pos > LZ4_MAX_OFFSET {
+                break;
+            }
+            // Cheap reject: a longer match must also agree at `best_len`.
+            if input[pos + best_len] == input[cursor + best_len] {
+                let mut len = 0usize;
+                while cursor + len < match_limit && input[pos + len] == input[cursor + len] {
+                    len += 1;
+                }
+                if len > best_len {
+                    best_len = len;
+                    best_pos = pos;
+                    if cursor + len >= match_limit {
+                        break;
+                    }
+                }
+            }
+            candidate = prev[pos % window];
+        }
+
+        if best_len < LZ4_MIN_MATCH {
             cursor += 1;
             continue;
         }
-        let mut match_len = 1usize;
-        while cursor + match_len < match_limit && input[cursor + match_len] == input[cursor - 1] {
-            match_len += 1;
-        }
-        if match_len < LZ4_MIN_MATCH {
-            cursor += match_len;
-            continue;
-        }
-
-        let literal_len = cursor - anchor;
-        let token_at = out.len();
-        out.push(0);
-        if literal_len >= 15 {
-            out[token_at] = 0xf0;
-            push_lz4_len(&mut out, literal_len - 15);
-        } else {
-            out[token_at] = (literal_len as u8) << 4;
-        }
-        out.extend_from_slice(&input[anchor..cursor]);
-        out.extend_from_slice(&1u16.to_le_bytes());
-
-        let match_code = match_len - LZ4_MIN_MATCH;
-        if match_code >= 15 {
-            out[token_at] |= 0x0f;
-            push_lz4_len(&mut out, match_code - 15);
-        } else {
-            out[token_at] |= match_code as u8;
-        }
-        anchor = cursor + match_len;
-        cursor = anchor.saturating_add(1);
+        push_lz4_sequence(
+            &mut out,
+            &input[anchor..cursor],
+            cursor - best_pos,
+            best_len,
+        );
+        cursor += best_len;
+        anchor = cursor;
     }
 
     let literal_len = input.len() - anchor;
@@ -4196,37 +4255,119 @@ mod module_signature_tests {
         let decoded = decode_lz4(&envelope[MODULE_COMPRESSION_HEADER_LEN..], plain.len()).unwrap();
         assert_eq!(decoded, plain);
     }
+
+    /// Walk an LZ4 block's sequences and check the end-of-block rules the
+    /// reference decoder relies on: the last match starts at least
+    /// 12 bytes before the end and the block ends in at least
+    /// 5 literals. Spelled as numbers, not the encoder's constants, so a
+    /// wrong constant fails here instead of moving the check with it.
+    fn assert_lz4_end_rules(block: &[u8], plain_len: usize) {
+        let mut cursor = 0usize;
+        let mut produced = 0usize;
+        let mut last_match_start = None;
+        loop {
+            let token = block[cursor];
+            cursor += 1;
+            let mut literal_len = (token >> 4) as usize;
+            if literal_len == 15 {
+                loop {
+                    let extra = block[cursor] as usize;
+                    cursor += 1;
+                    literal_len += extra;
+                    if extra != 255 {
+                        break;
+                    }
+                }
+            }
+            cursor += literal_len;
+            produced += literal_len;
+            if cursor == block.len() {
+                if last_match_start.is_some() {
+                    assert!(literal_len >= 5, "block ends in a match");
+                }
+                break;
+            }
+            cursor += 2;
+            let mut match_len = (token & 0x0f) as usize;
+            if match_len == 15 {
+                loop {
+                    let extra = block[cursor] as usize;
+                    cursor += 1;
+                    match_len += extra;
+                    if extra != 255 {
+                        break;
+                    }
+                }
+            }
+            last_match_start = Some(produced);
+            produced += match_len + LZ4_MIN_MATCH;
+        }
+        assert_eq!(produced, plain_len);
+        if let Some(start) = last_match_start {
+            assert!(start + 12 <= plain_len, "last match starts too late");
+        }
+    }
+
+    /// Module-shaped input: code-like repeated phrases at varying distances
+    /// (some beyond the 64 KiB window), a pseudo-random stretch that does not
+    /// compress, and zero padding.
+    fn module_like(len: usize) -> Vec<u8> {
+        let phrases: [&[u8]; 4] = [
+            b"\x48\x89\xe5\x41\x57\x41\x56\x53\x48\x83\xec\x28",
+            b"_ZN26narf_drivers_wireless_rtl7rtlwifi",
+            b"\0\0\0\0\0\0\0\0\x02\0\0\0\x0b\0\0\0",
+            b"kernel_abi=0x00000000\0license=GPL\0",
+        ];
+        let mut state = 0x9e37_79b9_u32;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            match state % 7 {
+                0..=3 => out.extend_from_slice(phrases[(state >> 8) as usize % 4]),
+                4 => out.extend(std::iter::repeat_n(0, (state >> 8) as usize % 300)),
+                _ => out.extend_from_slice(&state.to_le_bytes()),
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn lz4_encoder_round_trips_and_keeps_end_of_block_rules() {
+        let mut inputs: Vec<Vec<u8>> = (0..40).map(|n| vec![0u8; n]).collect();
+        inputs.extend((0..40).map(module_like));
+        inputs.extend([
+            module_like(4096),
+            module_like(200_000),
+            vec![0xa5; 70_000],
+            (0..=255u8).cycle().take(300_000).collect(),
+        ]);
+        for plain in &inputs {
+            let block = lz4_encode_module(plain);
+            let decoded = decode_lz4(&block, plain.len())
+                .unwrap_or_else(|| panic!("{}-byte input did not decode", plain.len()));
+            assert_eq!(&decoded, plain);
+            assert_lz4_end_rules(&block, plain.len());
+        }
+    }
+
+    #[test]
+    fn lz4_encoder_finds_matches_beyond_byte_runs() {
+        // A repeating 251-byte period has no runs at all; the run-only encoder
+        // this replaced left it at full size.
+        let plain: Vec<u8> = (0..251u32)
+            .map(|i| (i * 97 % 251) as u8)
+            .cycle()
+            .take(1 << 20)
+            .collect();
+        assert!(lz4_encode_module(&plain).len() < plain.len() / 50);
+        let shaped = module_like(1 << 20);
+        assert!(lz4_encode_module(&shaped).len() < shaped.len() / 2);
+    }
 }
 
-/// Build a module crate into the single relocatable object the loader wants.
-///
-/// A module crate is `crate-type = ["staticlib"]`, which produces an
-/// **archive** — not a loadable object. Two things have to happen to it:
-///
-///  1. Root the link at the crate's own members. The archive also contains
-///     every `core`, `alloc` and `compiler_builtins` object the linker might
-///     have wanted; linking all of them would produce a multi-megabyte module
-///     out of a hundred bytes of driver, so they are only offered lazily
-///     (see below).
-///  2. `ld -r` them together. Besides combining the members, this **merges
-///     same-named sections** — which matters more than it sounds, because
-///     rustc emits one `.modinfo` section per `#[link_section]` static
-///     (seven for the reference module) and Linux's module build relies on
-///     exactly this merge. The loader tolerates the un-merged form too, but
-///     a `.ko` should be the merged one.
-///
-/// A module that calls out-of-line code in `core`, `alloc`,
-/// `compiler_builtins` or a dependency crate (a kernel-free library such as
-/// `narf-module-rt`) gets that code through the archive itself: it is passed
-/// to the link *after* the crate's own members, so the linker extracts only
-/// the members that define a still-undefined symbol, transitively — the
-/// usual archive semantics, which LLD and GNU ld apply under `-r` too. A
-/// module whose only undefined symbols are KABI exports pulls nothing (no
-/// archive member defines a `narf_*` export), so its object is unchanged.
-/// The link runs with section GC rooted at every global the crate's own
-/// objects define, so of an extracted member only the sections the crate
-/// reaches survive. Anything the closure cannot satisfy is left undefined
-/// and caught by the `nm -u` gate below.
 /// Pick a linker that can do `-r` on either target's objects.
 ///
 /// The host `ld` is built for one architecture and refuses a foreign object
@@ -4275,6 +4416,80 @@ fn module_linker(root: &Path) -> Result<(String, Vec<String>)> {
     Ok(("ld".to_string(), Vec::new()))
 }
 
+/// Linker script for the module's `ld -r`: fold rustc's per-function and
+/// per-object sections back into one section per kind.
+///
+/// rustc compiles with function and data sections, so every function lands
+/// in its own `.text.<mangled name>`, every constant in its own
+/// `.rodata..Lanon.<hash>.<n>`, and each of those carries its own
+/// `.rela.<name>`, section symbol and section header. Section GC needs that
+/// granularity, but it has done its job by the time the output is written:
+/// the names alone made `.shstrtab` the largest part of a driver `.ko`
+/// (5.3 MiB of rtl.ko), ahead of the 64 bytes of header and 24 of section
+/// symbol per section. With the output sections named here, GC still runs
+/// per input section, and the survivors are concatenated — the same merge
+/// Linux applies to clang-LTO modules in `scripts/module.lds.S`.
+///
+/// The loader is indifferent to the grouping: it places every `SHF_ALLOC`
+/// `PROGBITS`/`NOBITS` section by its flags, applies each `SHT_RELA` to the
+/// section its `sh_info` names, and resolves symbols by section index plus
+/// value — all of which `ld -r` rewrites consistently. Sections a pattern
+/// does not name keep their own output section under their own name; that
+/// is how `.modinfo` (read by name), `.narf_kparams` (read by name) and
+/// `narf.tests` stay distinct.
+///
+/// Mergeable strings and constants (`.rodata.str1.1`, `.rodata.cst16`) are
+/// collected ahead of `.rodata` so `SHF_MERGE`/`SHF_STRINGS`, which an
+/// output section takes as the union of its inputs, never mark ordinary
+/// read-only data. `.data.rel.ro` stays apart from `.data`: both are
+/// writable to the loader today, but it is what a future `ro_after_init`
+/// region would seal. An input section goes to the first description whose
+/// pattern matches it, which is what the order here relies on.
+const MODULE_LINK_SCRIPT: &str = "\
+SECTIONS
+{
+  .text : { *(.text .text.*) }
+  .rodata.str : { *(.rodata.str[0-9]*) }
+  .rodata.cst : { *(.rodata.cst[0-9]*) }
+  .rodata : { *(.rodata .rodata.*) }
+  .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) }
+  .data : { *(.data .data.*) }
+  .bss : { *(.bss .bss.*) }
+}
+";
+
+/// Build a module crate into the single relocatable object the loader wants.
+///
+/// A module crate is `crate-type = ["staticlib"]`, which produces an
+/// **archive** — not a loadable object. Three things have to happen to it:
+///
+///  1. Root the link at the crate's own members. The archive also contains
+///     every `core`, `alloc` and `compiler_builtins` object the linker might
+///     have wanted; linking all of them would produce a multi-megabyte module
+///     out of a hundred bytes of driver, so they are only offered lazily
+///     (see below).
+///  2. `ld -r` them together. Besides combining the members, this **merges
+///     same-named sections** — which matters more than it sounds, because
+///     rustc emits one `.modinfo` section per `#[link_section]` static
+///     (seven for the reference module) and Linux's module build relies on
+///     exactly this merge. The loader tolerates the un-merged form too, but
+///     a `.ko` should be the merged one.
+///  3. Merge the per-function and per-object sections as well, with
+///     [`MODULE_LINK_SCRIPT`], so the object carries a handful of sections
+///     instead of one per function.
+///
+/// A module that calls out-of-line code in `core`, `alloc`,
+/// `compiler_builtins` or a dependency crate (a kernel-free library such as
+/// `narf-module-rt`) gets that code through the archive itself: it is passed
+/// to the link *after* the crate's own members, so the linker extracts only
+/// the members that define a still-undefined symbol, transitively — the
+/// usual archive semantics, which LLD and GNU ld apply under `-r` too. A
+/// module whose only undefined symbols are KABI exports pulls nothing (no
+/// archive member defines a `narf_*` export), so its object is unchanged.
+/// The link runs with section GC rooted at every global the crate's own
+/// objects define, so of an extracted member only the sections the crate
+/// reaches survive. Anything the closure cannot satisfy is left undefined
+/// and caught by the `nm -u` gate below.
 fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     let triple = args.arch.triple();
     let package_manifest = args
@@ -4410,6 +4625,12 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     // which rustc emits `SHF_GNU_RETAIN`, so GC keeps them; a
     // `.narf_kparams` attached with objcopy after the link is untouched.
     link_args.push("--gc-sections".into());
+    // Merge the per-function / per-object sections GC leaves behind.
+    let script = work.join("module.lds");
+    std::fs::write(&script, MODULE_LINK_SCRIPT)
+        .with_context(|| format!("writing {}", script.display()))?;
+    link_args.push("-T".into());
+    link_args.push(script.into_os_string());
     for name in &roots {
         link_args.push("-u".into());
         link_args.push(name.into());
@@ -4502,11 +4723,28 @@ fn build_module_fixture(package: &str, arch: Arch, root: &Path) -> Result<Vec<u8
     build_module_fixture_with_abi(package, arch, root, None)
 }
 
+/// [`build_module_fixture`], wrapped in the bounded LZ4 `NRFCMOD` envelope
+/// (`build-module --compress`). The kernel-test initramfs stays resident in
+/// guest RAM for the whole boot, so the large driver fixtures ride this way.
+fn build_compressed_module_fixture(package: &str, arch: Arch, root: &Path) -> Result<Vec<u8>> {
+    build_module_fixture_inner(package, arch, root, None, true)
+}
+
 fn build_module_fixture_with_abi(
     package: &str,
     arch: Arch,
     root: &Path,
     kernel_abi: Option<u32>,
+) -> Result<Vec<u8>> {
+    build_module_fixture_inner(package, arch, root, kernel_abi, false)
+}
+
+fn build_module_fixture_inner(
+    package: &str,
+    arch: Arch,
+    root: &Path,
+    kernel_abi: Option<u32>,
+    compress: bool,
 ) -> Result<Vec<u8>> {
     let ko_args = BuildModuleArgs {
         arch,
@@ -4516,7 +4754,7 @@ fn build_module_fixture_with_abi(
         features: vec!["module".into()],
         no_default_features: true,
         kernel_abi: kernel_abi.map(|hash| format!("0x{hash:08x}")),
-        compress: false,
+        compress,
         signature: None,
         public_key: None,
     };
@@ -5736,56 +5974,36 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(_) => {}
             Err(e) => println!("xtask: e1000 driver module unavailable ({e})"),
         }
-        match build_module_fixture("narf-drivers-gpu-intel", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/intel_gpu.ko".into(), bytes)),
-            Err(e) => println!("xtask: Intel GPU driver module unavailable ({e})"),
-        }
-        // The whole ath11k driver as a `.ko` (WCN6855 over the KABI).
-        match build_module_fixture("narf-drivers-wireless-ath11k", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath11k.ko".into(), bytes)),
-            Err(e) => println!("xtask: ath11k driver module unavailable ({e})"),
-        }
-        // The whole mt76 driver as a `.ko` (MT7921/MT7922 over the KABI).
-        match build_module_fixture("narf-drivers-wireless-mt76", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/mt76.ko".into(), bytes)),
-            Err(e) => println!("xtask: mt76 driver module unavailable ({e})"),
-        }
-
-        // The whole ath10k driver as a `.ko` (QCA988X..QCA9377 over the KABI).
-        match build_module_fixture("narf-drivers-wireless-ath10k", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath10k.ko".into(), bytes)),
-            Err(e) => println!("xtask: ath10k driver module unavailable ({e})"),
-        }
-
-        // The whole ath9k driver as a `.ko` (every chip owner over the KABI).
-        match build_module_fixture("narf-drivers-wireless-ath9k", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath9k.ko".into(), bytes)),
-            Err(e) => println!("xtask: ath9k driver module unavailable ({e})"),
-        }
-
-        // The brcmfmac PCIe driver as a `.ko` (module `brcm`, over the KABI).
-        match build_module_fixture("narf-drivers-wireless-brcm", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/brcmfmac.ko".into(), bytes)),
-            Err(e) => println!("xtask: brcmfmac driver module unavailable ({e})"),
-        }
-
-        // The rtw88 driver as a `.ko` (RTL8821CU/RTL8822BU over the USB KABI).
-        match build_module_fixture("narf-drivers-wireless-rtw", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/rtw88.ko".into(), bytes)),
-            Err(e) => println!("xtask: rtw88 driver module unavailable ({e})"),
-        }
-
-        // rtl.ko: the rtlwifi PCIe driver and rtl8xxxu over the KABI
-        // (`modules/e2e/rtl`).
-        match build_module_fixture("narf-drivers-wireless-rtl", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/rtl.ko".into(), bytes)),
-            Err(e) => println!("xtask: rtl driver module unavailable ({e})"),
-        }
-
-        // The iwlwifi driver as a `.ko` (Sc / BE20x-BE21x over the KABI).
-        match build_module_fixture("narf-drivers-wireless-iwlwifi", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/iwlwifi.ko".into(), bytes)),
-            Err(e) => println!("xtask: iwlwifi driver module unavailable ({e})"),
+        // Whole drivers as loadable modules, for the `modules/e2e` registration
+        // smokes. They are the bulk of the initramfs, which stays resident in
+        // guest RAM for the whole boot, so they ride as `.ko.lz4` envelopes
+        // (a quarter to a half of the raw size); the smokes decompress before
+        // stamping the ABI hash (`stamp_fixture_abi`).
+        for (package, guest, what) in [
+            ("narf-drivers-gpu-intel", "intel_gpu", "Intel GPU"),
+            // WCN6855 over the KABI.
+            ("narf-drivers-wireless-ath11k", "ath11k", "ath11k"),
+            // MT7921/MT7922 over the KABI.
+            ("narf-drivers-wireless-mt76", "mt76", "mt76"),
+            // QCA988X..QCA9377 over the KABI.
+            ("narf-drivers-wireless-ath10k", "ath10k", "ath10k"),
+            // Every chip owner over the KABI.
+            ("narf-drivers-wireless-ath9k", "ath9k", "ath9k"),
+            // The brcmfmac PCIe driver (module `brcm`).
+            ("narf-drivers-wireless-brcm", "brcmfmac", "brcmfmac"),
+            // RTL8821CU/RTL8822BU over the USB KABI.
+            ("narf-drivers-wireless-rtw", "rtw88", "rtw88"),
+            // The rtlwifi PCIe driver and rtl8xxxu (`modules/e2e/rtl`).
+            ("narf-drivers-wireless-rtl", "rtl", "rtl"),
+            // Sc / BE20x-BE21x over the KABI.
+            ("narf-drivers-wireless-iwlwifi", "iwlwifi", "iwlwifi"),
+        ] {
+            match build_compressed_module_fixture(package, args.arch, &root) {
+                Ok(bytes) => {
+                    fixtures.push((format!("lib/modules/test-fixtures/{guest}.ko.lz4"), bytes))
+                }
+                Err(e) => println!("xtask: {what} driver module unavailable ({e})"),
+            }
         }
     }
 
