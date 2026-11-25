@@ -839,9 +839,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
-    /// Create a symlink. For targets ≤ 60 bytes, the link path is
-    /// stored inline in the inode's `i_block` area ("fast symlink");
-    /// longer targets get an allocated data block.
+    /// Create a symlink. A target that fits in the inode's 60-byte
+    /// `i_block` area together with its NUL — at most 59 bytes — is stored
+    /// there ("fast symlink"); a longer one gets a data block. That is
+    /// `ext4_symlink`'s `disk_link.len > EXT4_N_BLOCKS * 4` test, where
+    /// `disk_link.len` counts the NUL: e2fsck rejects a fast symlink of
+    /// 60 bytes.
     pub async fn dir_create_symlink(
         &self,
         parent_inode_no: u32,
@@ -862,7 +865,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // The data block of a slow symlink, for rollback.
         let mut slow_block: Option<u64> = None;
 
-        if target.len() <= 60 {
+        if target.len() < 60 {
             // Fast symlink — pack target bytes into block[].
             let mut bytes = [0u8; 60];
             bytes[..target.len()].copy_from_slice(target);

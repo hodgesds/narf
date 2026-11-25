@@ -4223,6 +4223,46 @@ fn smoke_ext2_symlink_fast_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_fast_round_trip);
 
+fn smoke_ext2_symlink_inline_limit_counts_the_nul() -> TestResult {
+    // `ext4_symlink`: a target goes inline only when it and its NUL fit
+    // in the 60-byte i_block, so 59 bytes is the longest fast symlink and
+    // 60 bytes gets a data block (e2fsck rejects a 60-byte fast symlink).
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    for (name, len, fast) in [(&b"s59"[..], 59usize, true), (&b"s60"[..], 60, false)] {
+        let target = alloc::vec![b't'; len];
+        let ino = match poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, name, &target)) {
+            Some(Ok(i)) => i,
+            _ => return TestResult::Fail("symlink create failed"),
+        };
+        let inode = match poll_once(volume.read_inode(ino)) {
+            Some(Ok(i)) => i,
+            _ => return TestResult::Fail("read symlink inode failed"),
+        };
+        if (inode.blocks == 0) != fast {
+            return TestResult::Fail("the inline limit is 59 bytes (60 with the NUL)");
+        }
+        match poll_once(volume.read_symlink_target(&inode)) {
+            Some(Ok(v)) if v == target => {}
+            _ => return TestResult::Fail("symlink target does not read back"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_symlink_inline_limit_counts_the_nul
+);
+
 fn smoke_ext2_symlink_slow_round_trip() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
