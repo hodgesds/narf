@@ -2156,11 +2156,20 @@ correction:
   it missed the `else` arm — and DC9 is NOT allowed on
   display 9 (the display-11 allowed mask DC9 | UPTO_DC6 =
   0xA does not carry over). This closes the grounding §17
-  display-9 `max_dc` / allowed-DC-mask item. The module is
-  the mask + target + sticky-write core only, in the
-  display-11 module's shape, and DC6 is armed only with a
-  loaded SKL/KBL DMC program (`skl_dmc_ver1_27` /
-  `kbl_dmc_ver1_04`, Lane 5's load).
+  display-9 `max_dc` / allowed-DC-mask item. On that core
+  sits the Gen9 `DC_off` service (`Gen9DcCore`), opted in
+  with `narf.intel.gen9_dc=1` (default off, nothing written
+  without it): probe holds Init (DC_STATE_DISABLE) until the
+  Gen9 DMC loaded and the internal Pipe-A panel is owned;
+  the Gen9 modeset, AUX, GMBUS (Gen9 LP only), hotplug, the
+  external pass, the panel power-off and KMS sessions hold
+  references; the last release re-enters DC6 (display 9,
+  Wa Display #1183 first) or DC5 (Broxton / Gemini Lake)
+  17 ms later, refused with power well 2 requested or on,
+  the utility pin in PWM mode (DC6), a live external route,
+  or a resident DMC program that no longer verifies. System
+  suspend holds DC states off; resume releases them only if
+  the program still verifies. DC9 is never entered.
 - Forcewake (`intel_gpu_forcewake`): the Gen9 domain table
   is the three aggregate domains — render 0xA278, media
   0xA270, blitter 0xA188, acks 0x0D84 / 0x0D88 / 0x130044 —

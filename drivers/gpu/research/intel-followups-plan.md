@@ -146,8 +146,12 @@ still read Open for work the code now has (LNL/PTL FBC, i915
 
 Still open, each needing its own grounding first:
 
-- Gen9 DC-state wiring (Skylake and Gen9 LP): the cores carry the masks
-  and targets; no `DC_off` service arms them on Gen9.
+- Gen9 DC states on hardware (Skylake and Gen9 LP): the `DC_off` service
+  and its holders are wired behind `narf.intel.gen9_dc=1` (default off),
+  fixture-validated only. Left: a silicon run on each family, DC9 for
+  Gen9 LP system suspend (`bxt_enable_dc9`, with the PPS reset), the
+  post-S3 DMC reload (a lost program keeps DC states off), and the GT's
+  `GT_IRQ` hold while unparked (`__gt_unpark`).
 - Nova Lake-S beyond the owned eDP route, its suspend relight and the LT
   external outputs (`narf.intel.nvl_modeset=1`): UHBR and Thunderbolt alt
   mode on the LT PHY, Nova fixtures for MST and DSC over LT ports (they
