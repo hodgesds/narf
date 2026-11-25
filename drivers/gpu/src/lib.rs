@@ -787,6 +787,12 @@ pub mod intel_gpu_audio;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_bxt_cdclk;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_bxt_dpll;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_bxt_phy;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ccs_control;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_color;
