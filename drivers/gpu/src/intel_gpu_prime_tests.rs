@@ -194,10 +194,12 @@ fn smoke_xe_prime_import_without_p2p_migrates_to_system_and_binds() -> TestResul
     assert!(imported.is_imported() && !imported.is_vram());
     assert_eq!(imported.size(), BO);
     assert_eq!(imported.pages().next(), None);
-    assert_eq!(
-        importer.gem.mmap_offset(imported_handle),
-        Err(FsError::Unsupported)
-    );
+    // Its MMAP_OFFSET maps the exporter's object (dma_buf_mmap), not its own
+    // pages; the import has no kernel CPU access of its own.
+    let offset = importer.gem.mmap_offset(imported_handle).unwrap();
+    let (owner, within) = importer.gem.mapping_object(offset, 4096).unwrap();
+    assert!(Arc::ptr_eq(&owner, &object) && within == 0);
+    drop(owner);
     assert_eq!(imported.read(0, &mut [0]), Err(FsError::Unsupported));
     assert_eq!(imported.write(0, &[0]), Err(FsError::Unsupported));
     assert_eq!(imported.backing(0, 4096).err(), Some(FsError::Unsupported));
