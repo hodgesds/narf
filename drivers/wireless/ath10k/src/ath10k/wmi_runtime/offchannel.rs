@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! One retained scan-backed station ROC. STARTED is not foreign-channel proof.
 use super::*;
+use crate::ath10k::platform::ap_control::{
+    RadioEmissionAuthority, RadioEventAuthority, RadioInterfaceIdentity,
+};
 use crate::ath10k::regulatory::Permission;
 use alloc::boxed::Box;
-use narf_wireless::{
-    ap_control::{RadioEmissionAuthority, RadioEventAuthority, RadioInterfaceIdentity},
-    reg::RegulatoryDomain,
-};
+use narf_wireless::reg::RegulatoryDomain;
 
 #[path = "offchannel_action.rs"]
 mod action;
@@ -46,8 +46,8 @@ pub(super) struct Work {
     home: bool,
     terminal: bool,
     stop_sent: bool,
-    duration: Option<narf_time::Deadline>,
-    acquisition: narf_time::Deadline,
+    duration: Option<crate::ath10k::platform::time::Deadline>,
+    acquisition: crate::ath10k::platform::time::Deadline,
     public: bool,
     cancelled: bool,
     action: Option<action::Action>,
@@ -55,7 +55,7 @@ pub(super) struct Work {
     wait_ms: Option<u32>,
 }
 impl Work {
-    fn response_deadline(&self) -> Option<narf_time::Deadline> {
+    fn response_deadline(&self) -> Option<crate::ath10k::platform::time::Deadline> {
         let grant = self.duration?;
         Some(
             self.action
@@ -246,7 +246,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             terminal: false,
             stop_sent: false,
             duration: None,
-            acquisition: narf_time::Deadline::after_ms(1500),
+            acquisition: crate::ath10k::platform::time::Deadline::after_ms(1500),
             public,
             cancelled: false,
             action: None,
@@ -300,7 +300,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             })
             .await?;
         }
-        let deadline = narf_time::Deadline::after_ms(1500);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
         for _ in 0..65536 {
             self.roc.as_ref().ok_or(Error::Failed)?.check(&current()?)?;
             if deadline.expired() {
@@ -316,7 +316,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 self.failed = false;
                 return Ok(());
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Err(Error::Timeout)
     }
@@ -345,7 +345,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             8 if w.started && !w.terminal && event.frequency == u32::from(w.receipt.frequency) => {
                 // A repeated event cannot extend the originally granted tail.
                 if !w.foreign && w.duration.is_none() {
-                    w.duration = Some(narf_time::Deadline::after_ms(u64::from(w.receipt.duration)));
+                    w.duration = Some(crate::ath10k::platform::time::Deadline::after_ms(
+                        u64::from(w.receipt.duration),
+                    ));
                 }
                 open = !w.foreign;
                 w.foreign = true;
@@ -420,7 +422,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if work.duration.is_none() {
             return Err(Error::Failed);
         }
-        work.duration = Some(narf_time::Deadline::after_cycles(0));
+        work.duration = Some(crate::ath10k::platform::time::Deadline::after_cycles(0));
         self.close_roc_capture()
     }
 
@@ -448,7 +450,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     .is_some_and(|d| d.expired())
             || w.duration
                 .as_ref()
-                .is_some_and(narf_time::Deadline::expired)
+                .is_some_and(crate::ath10k::platform::time::Deadline::expired)
             || w.acquisition.expired() && w.duration.is_none();
         if !stop {
             self.roc_progress().await?;
@@ -465,7 +467,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let stop = self.wire.stop_scan(sequence)?;
             self.send_scan_command(&stop, &cleanup).await?;
         }
-        let deadline = narf_time::Deadline::after_ms(1500);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
         for _ in 0..65536 {
             cleanup()?;
             if self.roc.as_ref().is_some_and(|w| w.terminal && w.home) {
@@ -475,14 +477,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             self.roc_progress().await?;
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !self.roc.as_ref().is_some_and(|w| w.terminal && w.home) {
             return Err(Error::Timeout);
         }
         // A scan COMPLETE cannot retire a still-firmware-owned frame or
         // temporary destination peer. Drain its exact TX terminal first.
-        let deadline = narf_time::Deadline::after_ms(1500);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
         for _ in 0..65536 {
             cleanup()?;
             self.retire_roc_action(&cleanup).await?;
@@ -493,7 +495,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Timeout);
             }
             self.roc_progress().await?;
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !self.roc_action_retired() {
             return Err(Error::Timeout);

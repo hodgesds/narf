@@ -4,8 +4,9 @@ use super::{
     ap::{self, Token},
     htt, management, Error, Hif, HostMemory, HttMemory, Radio,
 };
+use crate::ath10k::platform::ap_control::ApEmissionAuthority;
 use alloc::vec::Vec;
-use narf_wireless::{ap_control::ApEmissionAuthority, ControlPortTxRequest, MgmtTxRequest};
+use narf_wireless::{ControlPortTxRequest, MgmtTxRequest};
 
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     async fn ap_tx_space(
@@ -13,7 +14,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         needs_htt: bool,
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         for _ in 0..8192 {
             validate()?;
             self.ap_prefix(validate).await?;
@@ -33,7 +34,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             )
             .await?;
             self.ap_event(event)?;
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Err(Error::Exhausted)
     }
@@ -130,7 +131,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let token = Token::Htt(id);
         self.ap.as_mut().unwrap().pending.push(ap::Pending {
             token,
-            deadline: narf_time::Deadline::after_ms(3000),
+            deadline: crate::ath10k::platform::time::Deadline::after_ms(3000),
             status: None,
             control: true,
         });
@@ -282,7 +283,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 let token = Token::Wmi(id);
                 self.ap.as_mut().unwrap().pending.push(ap::Pending {
                     token,
-                    deadline: narf_time::Deadline::after_ms(3000),
+                    deadline: crate::ath10k::platform::time::Deadline::after_ms(3000),
                     status: None,
                     control: true,
                 });
@@ -298,7 +299,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         self.ap.as_mut().unwrap().pending.push(ap::Pending {
             token,
-            deadline: narf_time::Deadline::after_ms(3000),
+            deadline: crate::ath10k::platform::time::Deadline::after_ms(3000),
             status: None,
             control: true,
         });

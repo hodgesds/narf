@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Linux early-AP group-key software staging, without installed-key claims.
 use super::{ap, ap_key, Error, Hif, HostMemory, HttMemory, Radio};
+use crate::ath10k::platform::ap_control::ApEmissionAuthority;
 use alloc::boxed::Box;
-use narf_wireless::{ap_control::ApEmissionAuthority, OwnedKey};
+use narf_wireless::OwnedKey;
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn ap_prune_staging(&mut self) {
         if self

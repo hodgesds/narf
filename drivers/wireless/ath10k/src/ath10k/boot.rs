@@ -8,10 +8,10 @@
 
 use core::mem::ManuallyDrop;
 
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Write};
-use narf_io::DmaBuffer;
-use narf_lib::id::DomainId;
+use crate::ath10k::platform::dma::DmaBuffer;
+use crate::ath10k::platform::dma::DomainId;
+use crate::ath10k::platform::pci::{BusDevice, BusDeviceCap, MmioRegion};
+use crate::ath10k::platform::pci::{Cap, CapError, CapOp, NoopOp, Write};
 
 use super::bmi::{word, BmiError, Transport};
 use super::ce::{self, Ath10kMmio};
@@ -109,7 +109,7 @@ struct Resources<B = DmaBuffer> {
 }
 
 fn allocate(bytes: usize) -> Result<DmaBuffer, BmiError> {
-    narf_io::alloc_coherent_masked(bytes, DomainId::DRIVER_0, u32::MAX as u64)
+    crate::ath10k::platform::dma::alloc_coherent_masked(bytes, DomainId::DRIVER_0, u32::MAX as u64)
         .map_err(|_| BmiError::NoMemory)
 }
 
@@ -167,11 +167,11 @@ impl PciBoot {
         let ordered = self
             .mmio
             .cap
-            .derive::<narf_capabilities::Read>()
+            .derive::<crate::ath10k::platform::pci::Read>()
             .ok()
             .and_then(|read| {
-                narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&self.mmio.cap, || {
-                    narf_bus::pci_express::read_status(&read, &self.device)
+                crate::ath10k::platform::pci::invoke(&self.mmio.cap, || {
+                    crate::ath10k::platform::pci::read_status(&read, &self.device)
                 })
                 .ok()
                 .and_then(Result::ok)
@@ -214,8 +214,9 @@ impl PciBoot {
         hardware: HwRev,
     ) -> Result<Self, BmiError> {
         let registers = hardware.registers().ok_or(BmiError::Unsupported)?;
-        let command = narf_bus::pci::read_command(&cap, &device).map_err(|_| BmiError::Pci)?;
-        if command & narf_bus::pci::cmd::BUS_MASTER != 0 {
+        let command =
+            crate::ath10k::platform::pci::read_command(&cap, &device).map_err(|_| BmiError::Pci)?;
+        if command & crate::ath10k::platform::pci::cmd::BUS_MASTER != 0 {
             return Err(BmiError::Pci);
         }
         let resources = Resources::allocate(hardware)?;
@@ -248,7 +249,7 @@ impl PciBoot {
     }
 
     async fn delay(ms: u64) {
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(ms * 1_000_000)).await;
+        crate::ath10k::platform::time::sleep_ns(ms * 1_000_000).await;
     }
 
     async fn wake(&mut self) -> Result<(), BmiError> {
@@ -258,7 +259,7 @@ impl PciBoot {
         } else {
             3
         };
-        let deadline = narf_time::Deadline::after_ms(30);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(30);
         loop {
             let value = self.mmio.read32(self.registers.pcie_local);
             if value == u32::MAX {
@@ -291,7 +292,7 @@ impl PciBoot {
     }
 
     async fn target_ready(&mut self) -> Result<(), BmiError> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         loop {
             let value = self.mmio.read32(self.registers.fw_indicator);
             if value != u32::MAX && value & hw::FW_IND_EVENT_PENDING != 0 {
@@ -371,10 +372,10 @@ impl PciBoot {
         if !self.mmio.authorized() {
             return Err(BmiError::Pci);
         }
-        self.saved_aspm = narf_bus::pci_express::clear_and_set_link_control(
+        self.saved_aspm = crate::ath10k::platform::pci::clear_and_set_link_control(
             &self.mmio.cap,
             &self.device,
-            narf_bus::pci_express::LNKCTL_ASPMC,
+            crate::ath10k::platform::pci::LNKCTL_ASPMC,
             0,
         )
         .ok();
@@ -398,8 +399,12 @@ impl PciBoot {
         barrier();
         // Mark the resources as published before the first fallible enable.
         self.armed = true;
-        narf_bus::pci::set_command(&self.mmio.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
-            .map_err(|_| BmiError::Pci)?;
+        crate::ath10k::platform::pci::set_command(
+            &self.mmio.cap,
+            &self.device,
+            crate::ath10k::platform::pci::cmd::BUS_MASTER,
+        )
+        .map_err(|_| BmiError::Pci)?;
         self.configure_target(chip_revision).await?;
         let control = self.mmio.read32(self.registers.soc_core);
         self.mmio.write32(self.registers.soc_core, control | 0x2000);
@@ -569,7 +574,7 @@ impl<B: Memory> Resources<B> {
         receive: bool,
         budget_ms: u64,
     ) -> Result<u16, BmiError> {
-        let deadline = narf_time::Deadline::after_ms(budget_ms);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(budget_ms);
         let mut sent = false;
         let mut received = if receive { None } else { Some(0) };
         loop {
@@ -725,14 +730,14 @@ impl Drop for PciBoot {
                 stopped &= ce::halt_pipe(&mut self.mmio, self.hardware, pipe).is_ok();
             }
         }
-        let disabled = narf_bus::pci::clear_command(
+        let disabled = crate::ath10k::platform::pci::clear_command(
             &self.mmio.cap,
             &self.device,
-            narf_bus::pci::cmd::BUS_MASTER,
+            crate::ath10k::platform::pci::cmd::BUS_MASTER,
         )
         .is_ok()
-            && narf_bus::pci::read_command(&self.mmio.cap, &self.device)
-                .is_ok_and(|command| command & narf_bus::pci::cmd::BUS_MASTER == 0);
+            && crate::ath10k::platform::pci::read_command(&self.mmio.cap, &self.device)
+                .is_ok_and(|command| command & crate::ath10k::platform::pci::cmd::BUS_MASTER == 0);
         // After DONE, firmware may still direct writes; with BME verified off
         // and an ordered flush read those can neither start nor be in flight.
         if stopped
@@ -751,11 +756,11 @@ impl Drop for PciBoot {
         // cannot prove CPU-directed/autonomous writes have drained. Keep every
         // published mapping retained until an owned reset/drain implementation.
         if let Some(link) = self.saved_aspm {
-            let _ = narf_bus::pci_express::clear_and_set_link_control(
+            let _ = crate::ath10k::platform::pci::clear_and_set_link_control(
                 &self.mmio.cap,
                 &self.device,
-                narf_bus::pci_express::LNKCTL_ASPMC,
-                link & narf_bus::pci_express::LNKCTL_ASPMC,
+                crate::ath10k::platform::pci::LNKCTL_ASPMC,
+                link & crate::ath10k::platform::pci::LNKCTL_ASPMC,
             );
         }
     }

@@ -5,7 +5,8 @@ use super::{
     ap::{self, Session},
     ap_key, Error, Hif, HostMemory, HttMemory, Radio,
 };
-use narf_wireless::{ap_control::ApEmissionAuthority, OwnedKey};
+use crate::ath10k::platform::ap_control::ApEmissionAuthority;
+use narf_wireless::OwnedKey;
 
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) async fn ap_add_key(

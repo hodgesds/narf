@@ -5,8 +5,9 @@ use super::{
     ap::{self, Session, Token, Vdev},
     ap_wire, htt, wire, Error, Hif, HostMemory, HttMemory, Radio,
 };
+use crate::ath10k::platform::ap_control::ApEmissionAuthority;
 use alloc::{boxed::Box, vec::Vec};
-use narf_wireless::{ap_control::ApEmissionAuthority, ApConfig, ApStartSettings};
+use narf_wireless::{ApConfig, ApStartSettings};
 
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn ap_supported(&self) -> bool {
@@ -304,7 +305,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         matched: impl Fn(&Session) -> bool,
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         for _ in 0..8192 {
             validate()?;
             if matched(self.ap.as_ref().ok_or(Error::Failed)?) {
@@ -319,7 +320,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             )
             .await?;
             self.ap_event(event)?;
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Err(Error::Exhausted)
     }
@@ -327,7 +328,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         for _ in 0..8192 {
             validate()?;
             if deadline.expired() {
@@ -342,7 +343,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if self.ap_event(event)? && !deferred {
                 return Ok(());
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Err(Error::Exhausted)
     }
@@ -363,7 +364,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         publication: ap::Publication,
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         for _ in 0..8192 {
             self.ap_prefix(validate).await?;
             validate()?;
@@ -425,7 +426,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Err(Error::Exhausted)
     }
@@ -611,9 +612,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         self.htt.wmi.htc.transport.runtime_idle(false);
         if self.ap_history.is_none() {
-            self.ap_history = Some(alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
-                super::ap_key::History::default(),
-            )));
+            self.ap_history = Some(alloc::sync::Arc::new(
+                crate::ath10k::platform::IrqSafeSpinLock::new(super::ap_key::History::default()),
+            ));
         }
         self.ap = Some(Box::new(Session::new(
             policy.clone(),
@@ -803,7 +804,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         )?;
         self.ap.as_mut().unwrap().pending.push(ap::Pending {
             token: Token::Htt(id),
-            deadline: narf_time::Deadline::after_ms(3000),
+            deadline: crate::ath10k::platform::time::Deadline::after_ms(3000),
             status: None,
             control: false,
         });

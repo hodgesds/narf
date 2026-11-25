@@ -58,7 +58,7 @@ pub(super) trait Memory {
     }
 }
 
-impl Memory for narf_io::DmaBuffer {
+impl Memory for crate::ath10k::platform::dma::DmaBuffer {
     fn len(&self) -> usize {
         self.len()
     }

@@ -84,14 +84,24 @@ pub mod control;
 pub mod dma;
 mod eeprom;
 pub mod firmware;
+#[cfg(feature = "builtin")]
+mod firmware_source;
+#[cfg(feature = "module")]
+#[path = "firmware_source_module.rs"]
 mod firmware_source;
 pub mod htc;
 pub mod htt;
 pub mod htt_runtime;
 pub mod hw;
+#[cfg(feature = "module")]
+mod iface_module;
+#[cfg(feature = "builtin")]
 mod interface;
 mod irq;
 pub mod pci;
+#[cfg(feature = "module")]
+mod pci_kabi;
+pub mod platform;
 pub mod pm;
 pub mod profile;
 pub mod regulatory;
@@ -102,9 +112,12 @@ pub mod wmi_boot;
 pub mod wmi_runtime;
 
 pub use hw::{HwRev, ALL_PCI_MATCHES, ATHEROS_VENDOR, UBNT_VENDOR};
-pub use pci::{name_for, probe, register_pci_driver, Ath10kDevice, ProbeError};
+pub use pci::{name_for, Ath10kDevice, ProbeError};
+#[cfg(feature = "builtin")]
+pub use pci::{probe, register_pci_driver};
 
 /// Entry point invoked from the wireless crate's `register_initcalls`.
+#[cfg(feature = "builtin")]
 pub fn register() {
     register_pci_driver();
     // Linux `ath10k_pci_pm_ops` + mac80211 stop/start; the retire step is
@@ -112,7 +125,9 @@ pub fn register() {
     narf_power::system_pm::register_async_system_pm("ath10k", alloc::sync::Arc::new(SystemPm));
 }
 
+#[cfg(feature = "builtin")]
 struct SystemPm;
+#[cfg(feature = "builtin")]
 impl narf_power::system_pm::AsyncSystemPm for SystemPm {
     fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
         alloc::boxed::Box::pin(async {
@@ -128,6 +143,15 @@ impl narf_power::system_pm::AsyncSystemPm for SystemPm {
             Ok(())
         })
     }
+}
+
+/// Entry point of the loadable module (`narf_module_init`): the entropy
+/// source for the kernel-free crypto, then the PCI ids. Probe does the rest
+/// (`pci_kabi.rs`).
+#[cfg(feature = "module")]
+pub fn register_module() {
+    platform::install_entropy();
+    pci_kabi::register_pci_driver();
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

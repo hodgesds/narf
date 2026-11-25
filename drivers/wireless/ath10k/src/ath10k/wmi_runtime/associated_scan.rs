@@ -104,7 +104,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             )
             .await?;
         }
-        let deadline = narf_time::Deadline::after_ms(1500);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
         for _ in 0..4096 {
             if stopped {
                 break;
@@ -135,7 +135,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 // polling owner's own discard during the stop is unchanged.
                 let _ = self.route_sibling(event);
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !stopped {
             return Err(Error::Timeout);

@@ -8,19 +8,32 @@
 
 #![allow(dead_code)]
 
+#[cfg(feature = "builtin")]
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, Write};
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_time::Deadline;
+use crate::ath10k::platform::pci::{BusDevice, BusDeviceCap, MmioRegion};
+use crate::ath10k::platform::pci::{Cap, Write};
+use crate::ath10k::platform::time::Deadline;
+use crate::ath10k::platform::IrqSafeSpinLock;
+
+#[cfg(feature = "module")]
+use super::iface_module::retire as retire_host;
+#[cfg(feature = "module")]
+use super::iface_module::wait_publish;
+/// Retire the published station of one radio generation before recovery.
+#[cfg(feature = "builtin")]
+use super::interface::retire as retire_host;
+/// Station publication after the radio is up: the kernel netdev built in,
+/// the KABI netdev and `WIFI` wiphy in the module.
+#[cfg(feature = "builtin")]
+use super::interface::wait_publish;
 
 use super::hw::*;
 
 /// Retained PCI identity and the asynchronous boot transport's result.
 pub struct Ath10kDevice {
-    address: narf_bus::BusAddr,
+    address: crate::ath10k::platform::pci::BusAddr,
     /// BAR0 MMIO window.
     pub mmio_bar0: MmioRegion,
     /// Decoded hardware family.
@@ -140,8 +153,9 @@ struct HttSession {
 }
 struct RadioSession {
     quarantine: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
-    radio:
-        alloc::sync::Arc<narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>>,
+    radio: alloc::sync::Arc<
+        crate::ath10k::platform::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+    >,
     image: super::firmware::Image,
     profile: super::profile::Profile,
 }
@@ -152,7 +166,8 @@ enum DriverSession {
     Htt(HttSession),
     Radio(alloc::boxed::Box<RadioSession>),
 }
-static SESSION: narf_lib::mutex::Mutex<Option<DriverSession>> = narf_lib::mutex::Mutex::new(None);
+static SESSION: crate::ath10k::platform::Mutex<Option<DriverSession>> =
+    crate::ath10k::platform::Mutex::new(None);
 static RECOVERY_ATTEMPTS: IrqSafeSpinLock<u8> = IrqSafeSpinLock::new(0);
 
 fn live_radio(
@@ -169,10 +184,10 @@ fn live_radio(
 }
 
 pub(in crate::ath10k) async fn retire_radio<'a, T>(
-    radio: &'a alloc::sync::Arc<narf_lib::mutex::Mutex<super::wmi_runtime::Radio<T>>>,
+    radio: &'a alloc::sync::Arc<crate::ath10k::platform::Mutex<super::wmi_runtime::Radio<T>>>,
     quarantine: &core::sync::atomic::AtomicBool,
     retire_host: impl Fn(),
-) -> narf_lib::mutex::MutexGuard<'a, super::wmi_runtime::Radio<T>>
+) -> crate::ath10k::platform::MutexGuard<'a, super::wmi_runtime::Radio<T>>
 where
     T: super::control::Hif + super::wmi_boot::HostMemory + super::htt_runtime::HttMemory,
 {
@@ -201,12 +216,13 @@ pub struct RecoveryScheduled {
 static RESTART: super::restart::Gate = super::restart::Gate::new();
 static LAST_RECOVERY: IrqSafeSpinLock<Option<super::restart::Outcome>> = IrqSafeSpinLock::new(None);
 
-type RecoveryRequest =
-    super::restart::Scope<narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>>;
+type RecoveryRequest = super::restart::Scope<
+    crate::ath10k::platform::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+>;
 static GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 static PENDING_RECOVERY: IrqSafeSpinLock<
     super::restart::Requests<
-        narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+        crate::ath10k::platform::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
     >,
 > = IrqSafeSpinLock::new(super::restart::Requests::new());
 
@@ -224,7 +240,7 @@ fn queue_recovery(request: RecoveryRequest, crash: bool) {
     if !start {
         return;
     }
-    narf_scheduler::spawn(async {
+    crate::ath10k::platform::spawn(async {
         loop {
             let request = {
                 let mut pending = PENDING_RECOVERY.lock();
@@ -241,12 +257,12 @@ fn queue_recovery(request: RecoveryRequest, crash: bool) {
             let delay = super::restart::BUSY_DELAY_MS * 1_000_000;
             let outcome = super::restart::supervise_scoped(
                 || recover_scoped(&request),
-                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay)),
+                || crate::ath10k::platform::time::sleep_ns(delay),
                 super::restart::BUSY_RETRIES,
             )
             .await;
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath10k::platform::Console,
                 "  ath10k: automatic recovery {:?}",
                 outcome
             );
@@ -272,7 +288,7 @@ pub(in crate::ath10k) fn firmware_crashed() {
 /// silence that exact physical generation and arrange a fresh-ROM attempt.
 pub(in crate::ath10k) fn scan_cleanup_failed(
     radio: alloc::sync::Arc<
-        narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+        crate::ath10k::platform::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
     >,
 ) {
     queue_recovery(
@@ -286,13 +302,15 @@ pub(in crate::ath10k) fn scan_cleanup_failed(
 
 /// Declared before SESSION/Radio guards, so cancellation drops those guards
 /// before queueing physical recovery. Immediate denied preflight disarms it.
+#[cfg(feature = "builtin")]
 struct DiagnosticScan {
     request: Option<RecoveryRequest>,
 }
+#[cfg(feature = "builtin")]
 impl DiagnosticScan {
     fn new(
         radio: alloc::sync::Arc<
-            narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+            crate::ath10k::platform::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
         >,
     ) -> Self {
         Self {
@@ -308,6 +326,7 @@ impl DiagnosticScan {
         }
     }
 }
+#[cfg(feature = "builtin")]
 impl Drop for DiagnosticScan {
     fn drop(&mut self) {
         if let Some(request) = self.request.take() {
@@ -388,7 +407,7 @@ async fn recover_inner(
     let Some(attempt) = attempt else {
         return Err(RecoveryError::Exhausted);
     };
-    narf_scheduler::spawn(boot_task(
+    crate::ath10k::platform::spawn(boot_task(
         restart.device,
         restart.cap,
         restart.mmio,
@@ -408,7 +427,7 @@ async fn retire_owner_physically(
         DriverSession::Htt(owner) => owner.htt.wmi.htc.transport.retire_after_failed_scan().await,
         DriverSession::Radio(owner) => {
             let mut radio = retire_radio(&owner.radio, &owner.quarantine, || {
-                super::interface::retire(&owner.radio)
+                retire_host(&owner.radio)
             })
             .await;
             radio.htt.wmi.htc.transport.retire_after_failed_scan().await
@@ -428,7 +447,7 @@ async fn retire_owner(
         DriverSession::Htt(owner) => owner.htt.wmi.htc.transport.retire_for_restart(),
         DriverSession::Radio(owner) => {
             let mut radio = retire_radio(&owner.radio, &owner.quarantine, || {
-                super::interface::retire(&owner.radio);
+                retire_host(&owner.radio);
             })
             .await;
             radio.htt.wmi.htc.transport.retire_for_restart()
@@ -436,11 +455,14 @@ async fn retire_owner(
     }
 }
 
+#[cfg(feature = "builtin")]
 static PARKED: IrqSafeSpinLock<Option<(super::boot::Restart, u32)>> = IrqSafeSpinLock::new(None);
+#[cfg(feature = "builtin")]
 static SUSPEND_PINNED: IrqSafeSpinLock<u8> = IrqSafeSpinLock::new(0);
 
 /// System suspend without WoWLAN (`pm.rs`): retire the live generation and
 /// park the function identity for [`resume`]. A refusal leaves it usable.
+#[cfg(feature = "builtin")]
 pub async fn suspend() -> Result<(), super::pm::SuspendError> {
     let mut session = SESSION.lock().await;
     let facts = super::pm::Facts {
@@ -458,10 +480,13 @@ pub async fn suspend() -> Result<(), super::pm::SuspendError> {
         // first; its failure ("return 1") falls back to the stop below.
         if let Some(device) = super::interface::active_for(&radio.radio) {
             if let Ok(Some((arming, holder))) = device.wow_suspend() {
-                narf_scheduler::spawn(holder);
+                crate::ath10k::platform::spawn(holder);
                 if let Ok(armed) = arming.armed().await {
                     *WOW.lock() = Some(armed);
-                    let _ = writeln!(narf_console::Writer, "  ath10k: suspended (WoWLAN armed)");
+                    let _ = writeln!(
+                        crate::ath10k::platform::Console,
+                        "  ath10k: suspended (WoWLAN armed)"
+                    );
                     return Ok(());
                 }
             }
@@ -477,21 +502,25 @@ pub async fn suspend() -> Result<(), super::pm::SuspendError> {
     let revision = clear_generation().ok_or(super::pm::SuspendError::Busy)?;
     *PARKED.lock() = Some((parked, revision));
     let _ = writeln!(
-        narf_console::Writer,
+        crate::ath10k::platform::Console,
         "  ath10k: suspended (generation retired)"
     );
     Ok(())
 }
 
+#[cfg(feature = "builtin")]
 type WowSuspended = super::interface::wowlan::Suspended<super::boot::PciBoot>;
 /// A WoW-armed generation (`wow.c`); exclusive with [`PARKED`].
+#[cfg(feature = "builtin")]
 static WOW: IrqSafeSpinLock<Option<WowSuspended>> = IrqSafeSpinLock::new(None);
+#[cfg(feature = "builtin")]
 static LAST_WAKE: IrqSafeSpinLock<Option<super::wmi_runtime::wow::WakeReport>> =
     IrqSafeSpinLock::new(None);
 
 /// The firmware wake report of the last WoWLAN resume (`None` when that
 /// resume never received `WOW_WAKEUP_HOST`). The shared contract has no
 /// `ieee80211_report_wowlan_wakeup` event, so this is a driver accessor.
+#[cfg(feature = "builtin")]
 pub fn last_wowlan_wakeup() -> Option<super::wmi_runtime::wow::WakeReport> {
     LAST_WAKE.lock().clone()
 }
@@ -500,6 +529,7 @@ pub fn last_wowlan_wakeup() -> Option<super::wmi_runtime::wow::WakeReport> {
 /// the ordinary [`resume`]. A failed WoW resume, or a wake whose reason
 /// lost the association, retires that generation and boots a fresh one
 /// (Linux RESTARTING -> `ieee80211_reconfig`), outside the recovery budget.
+#[cfg(feature = "builtin")]
 pub async fn resume_async() -> bool {
     let Some(armed) = WOW.lock().take() else {
         return resume();
@@ -509,7 +539,10 @@ pub async fn resume_async() -> bool {
     let result = armed.resume().await;
     *LAST_WAKE.lock() = device.wowlan_wakeup();
     if result.is_ok() {
-        let _ = writeln!(narf_console::Writer, "  ath10k: resumed from WoWLAN");
+        let _ = writeln!(
+            crate::ath10k::platform::Console,
+            "  ath10k: resumed from WoWLAN"
+        );
         return true;
     }
     let Some(owner) = session.as_mut() else {
@@ -532,6 +565,7 @@ pub async fn resume_async() -> bool {
 
 /// `ath10k_pci_resume` + `ath10k_start`: clear config 0x41 and schedule a
 /// fresh-ROM boot of the parked function. `false` when nothing was parked.
+#[cfg(feature = "builtin")]
 pub fn resume() -> bool {
     let Some((parked, revision)) = PARKED.lock().take() else {
         return false;
@@ -540,19 +574,20 @@ pub fn resume() -> bool {
     true
 }
 
+#[cfg(feature = "builtin")]
 fn restart_parked(parked: super::boot::Restart, revision: u32) {
     let (cap, device) = (parked.cap, parked.device);
-    let read = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
-        narf_bus::pci::read_config32(&cap, &device, 0x40)
+    let read = crate::ath10k::platform::pci::invoke(&cap, || {
+        crate::ath10k::platform::pci::read_config32(&cap, &device, 0x40)
     });
     if let Ok(Ok(value)) = read {
         if let Some(cleared) = super::pm::retry_timeout(value) {
-            let _ = narf_drivers_wireless_ath_core::qualcomm_pci::invoke(&cap, || {
-                narf_bus::pci::write_config32(&cap, &device, 0x40, cleared)
+            let _ = crate::ath10k::platform::pci::invoke(&cap, || {
+                crate::ath10k::platform::pci::write_config32(&cap, &device, 0x40, cleared)
             });
         }
     }
-    narf_scheduler::spawn(boot_task(
+    crate::ath10k::platform::spawn(boot_task(
         parked.device,
         parked.cap,
         parked.mmio,
@@ -639,6 +674,7 @@ async fn initialize_wmi(
 
 /// PCI driver match registration. One entry per supported device id,
 /// each with a unique `name` so the bus registry doesn't collapse them.
+#[cfg(feature = "builtin")]
 pub fn register_pci_driver() {
     for &(vendor, device) in ALL_PCI_MATCHES {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -704,7 +740,7 @@ async fn initialize_radio(
     let result = radio.start_from_hardware().await;
     let owner = RadioSession {
         quarantine: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
-        radio: alloc::sync::Arc::new(narf_lib::mutex::Mutex::new(radio)),
+        radio: alloc::sync::Arc::new(crate::ath10k::platform::Mutex::new(radio)),
         image: htt.image,
         profile: htt.profile,
     };
@@ -715,6 +751,7 @@ async fn initialize_radio(
 /// supplies centre frequencies in MHz from the configured hardware channels.
 /// This diagnostic API grants neither station TX nor interface registration.
 /// Dropping this future closes further operations until a full owned reset.
+#[cfg(feature = "builtin")]
 pub async fn scan_passive(
     frequencies: &[u16],
 ) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
@@ -740,6 +777,7 @@ pub async fn scan_passive(
 /// initial 2.4-GHz legacy profile. Authenticated current host policy and the
 /// immutable factory CTL constrain every probe; prepared peers stay exclusive.
 /// Cancellation/failure closes the retained owner until verified full reset.
+#[cfg(feature = "builtin")]
 pub async fn scan_active(
     frequencies: &[u16],
     ssids: &[Vec<u8>],
@@ -750,6 +788,7 @@ pub async fn scan_active(
 /// Active scan with up to 256 bytes of complete caller probe IEs. Firmware
 /// generates SSID/rates; those elements cannot be duplicated by the caller.
 /// Probe content changes neither channel/power permission nor station admission.
+#[cfg(feature = "builtin")]
 pub async fn scan_active_with_ies(
     frequencies: &[u16],
     ssids: &[Vec<u8>],
@@ -757,7 +796,7 @@ pub async fn scan_active_with_ies(
 ) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
     use super::wmi_runtime::Error;
     super::wmi_runtime::validate_probe_ies(extra_ies)?;
-    let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
+    let domain = crate::ath10k::platform::reg::ensure_domain().map_err(|_| Error::Unsupported)?;
     let mut cleanup;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
@@ -768,7 +807,7 @@ pub async fn scan_active_with_ies(
     cleanup = DiagnosticScan::new(owner.radio.clone());
     let result = radio
         .active_scan(plan, || {
-            narf_wireless::reg::db::get_domain().ok_or(Error::Unsupported)
+            crate::ath10k::platform::reg::get_domain().ok_or(Error::Unsupported)
         })
         .await;
     if let Err(error) = &result {
@@ -788,11 +827,12 @@ pub async fn scan_active_with_ies(
 /// regulatory policy and immutable EEPROM CTL. This sends no MLME/data frame,
 /// installs no keys and publishes no interface or carrier. Ambiguous firmware
 /// progress or cancellation retains the nested DMA owner until full reset.
+#[cfg(feature = "builtin")]
 pub async fn prepare_station(
     bssid: [u8; 6],
     frequency: u16,
 ) -> Result<super::wmi_runtime::PeerPrepared, super::wmi_runtime::Error> {
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::ath10k::platform::reg::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
@@ -821,10 +861,11 @@ pub async fn prepare_station(
 /// matching raw peer response; no firmware association, keys, NIC or controlled
 /// port is claimed by this transport prerequisite. Cancellation retains DMA
 /// and closes the radio until full reset.
+#[cfg(feature = "builtin")]
 pub async fn exchange_initial_management(
     frame: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, super::wmi_runtime::Error> {
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::ath10k::platform::reg::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
@@ -851,12 +892,13 @@ pub async fn exchange_initial_management(
 
 /// Exchange checked legacy Open/WPA2 association and submit native peer/vdev
 /// state on the already prepared physical peer. No key, port or NIC is granted.
+#[cfg(feature = "builtin")]
 pub async fn associate_station(
     ssid: &[u8],
     security: narf_wireless::association::SecurityMode,
     sme_ies: &[u8],
 ) -> Result<super::wmi_runtime::StationAssociated, super::wmi_runtime::Error> {
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::ath10k::platform::reg::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
@@ -882,6 +924,7 @@ pub async fn associate_station(
 /// Retire the current peer and stop its station vdev with native firmware
 /// correlation. This closes the retained radio permanently even on success;
 /// its DMA and firmware resources still need the future full reset owner.
+#[cfg(feature = "builtin")]
 pub async fn disconnect_station(
 ) -> Result<super::wmi_runtime::StationDisconnected, super::wmi_runtime::Error> {
     let mut session = SESSION.lock().await;
@@ -899,10 +942,11 @@ pub async fn disconnect_station(
 
 /// Start retained Open/software-CCMP data after checked native association.
 /// This grants no netdev; the caller must keep polling the retained owner.
+#[cfg(feature = "builtin")]
 pub async fn start_station_data(
     pmk: Option<&[u8; 32]>,
 ) -> Result<super::wmi_runtime::StationLink, super::wmi_runtime::Error> {
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::ath10k::platform::reg::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
@@ -927,6 +971,7 @@ pub async fn start_station_data(
 
 /// Submit native RTS/CTS intent only after draining the actual current packet
 /// owner. Success is CE submission/current-prefix proof, not a firmware/RF ACK.
+#[cfg(feature = "builtin")]
 pub async fn set_station_protection(
     request: super::wmi_runtime::StationProtection,
 ) -> Result<super::wmi_runtime::StationProtection, super::wmi_runtime::Error> {
@@ -939,7 +984,7 @@ pub async fn set_station_protection(
             if quarantine.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(super::wmi_runtime::Error::Failed);
             }
-            narf_wireless::reg::db::ensure_domain()
+            crate::ath10k::platform::reg::ensure_domain()
                 .map_err(|_| super::wmi_runtime::Error::Unsupported)
         })
         .await
@@ -947,8 +992,9 @@ pub async fn set_station_protection(
 
 /// Submit Ethernet through the same retained RAW-mode data owner. The ID is
 /// an HTT publication identity, never a fabricated firmware delivery receipt.
+#[cfg(feature = "builtin")]
 pub async fn transmit_ethernet(bytes: &[u8]) -> Result<u16, super::wmi_runtime::Error> {
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::ath10k::platform::reg::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
@@ -967,9 +1013,10 @@ pub async fn transmit_ethernet(bytes: &[u8]) -> Result<u16, super::wmi_runtime::
 
 /// Drive actual peer/completion/RAW RX and return admitted Ethernet only after
 /// receive quiescence. This API is async; it is not a synchronous netdev hook.
+#[cfg(feature = "builtin")]
 pub async fn poll_ethernet(
 ) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, super::wmi_runtime::Error> {
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::ath10k::platform::reg::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
@@ -984,6 +1031,7 @@ pub async fn poll_ethernet(
     result
 }
 
+#[cfg(feature = "builtin")]
 fn current_station(
     permission: &super::regulatory::Permission,
     quarantine: &core::sync::atomic::AtomicBool,
@@ -991,7 +1039,7 @@ fn current_station(
     if quarantine.load(core::sync::atomic::Ordering::Acquire) {
         return Err(super::wmi_runtime::Error::Failed);
     }
-    let domain = narf_wireless::reg::db::ensure_domain()
+    let domain = crate::ath10k::platform::reg::ensure_domain()
         .map_err(|_| super::wmi_runtime::Error::Unsupported)?;
     permission.check(&domain)
 }
@@ -1017,13 +1065,14 @@ pub const fn name_for(vendor: u16, device: u16) -> &'static str {
 
 /// Probe entry called by `narf-bus::driver_match` when a matching
 /// `(vendor, device)` pair surfaces.
+#[cfg(feature = "builtin")]
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Resolve hw_rev from the PCI ID first so we can refuse AR9462
     // before doing any MMIO.
     let hw_rev = match HwRev::from_pci_id(device.id.vendor, device.id.device) {
         Some(HwRev::Ar9462Legacy) => {
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath10k::platform::Console,
                 "  ath10k: AR9462 (168c:0034) is ath9k territory, skipping"
             );
             return Err(narf_bus::ProbeError::NotForThisDriver);
@@ -1054,7 +1103,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => d,
         Err(e) => {
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath10k::platform::Console,
                 "  ath10k: bring_up failed for {} ({:04x}:{:04x}): {:?}",
                 hw_rev.short_name(),
                 device.id.vendor,
@@ -1068,7 +1117,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Log the bind. Mirrors iwlwifi's preamble — single-line summary
     // so dmesg stays readable.
     let _ = writeln!(
-        narf_console::Writer,
+        crate::ath10k::platform::Console,
         "  ath10k: probed {} ({:04x}:{:04x}, chip_id={:#010x} rev={})",
         hw_rev.short_name(),
         dev.vendor_id,
@@ -1078,7 +1127,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
     // Exact profile selection needs the asynchronous BMI target version.
     let _ = writeln!(
-        narf_console::Writer,
+        crate::ath10k::platform::Console,
         "  ath10k:   firmware required at /firmware/ath10k/{}/",
         hw_rev.short_name(),
     );
@@ -1097,7 +1146,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    narf_scheduler::spawn(boot_task(device, cap, mmio, hw_rev, revision));
+    crate::ath10k::platform::spawn(boot_task(device, cap, mmio, hw_rev, revision));
 
     Ok(())
 }
@@ -1107,12 +1156,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 ///
 /// # Safety
 /// Caller owns the device's BARs exclusively.
+#[cfg(feature = "builtin")]
 pub unsafe fn bring_up(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
     hw_rev: HwRev,
 ) -> Result<Ath10kDevice, ProbeError> {
-    narf_drivers_wireless_ath_core::qualcomm_pci::invoke(cap, || {
+    crate::ath10k::platform::pci::invoke(cap, || {
         // SAFETY: forwarded exclusive BAR/config ownership. The actual
         // mapping, wake and identity accesses stay inside this invocation.
         unsafe { bring_up_live(device, cap, hw_rev) }
@@ -1120,6 +1170,7 @@ pub unsafe fn bring_up(
     .map_err(|_| ProbeError::DeviceGone)?
 }
 
+#[cfg(feature = "builtin")]
 unsafe fn bring_up_live(
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,
@@ -1128,7 +1179,30 @@ unsafe fn bring_up_live(
     // SAFETY: caller-asserted BAR exclusivity.
     let mmio_bar0 = narf_drivers_wireless_ath_core::qualcomm_pci::map_bar_control(device, cap, 0)
         .map_err(|_| ProbeError::Bar0MapFailed)?;
+    // SAFETY: forwarded; the BAR was just mapped for this function.
+    unsafe {
+        identify(
+            mmio_bar0,
+            device.addr,
+            device.id.vendor,
+            device.id.device,
+            hw_rev,
+        )
+    }
+}
 
+/// Wake the target through mapped BAR0 and read its fuse-backed chip
+/// identity (both builds: the module maps BAR0 through the KABI).
+///
+/// # Safety
+/// Caller owns the device's BARs exclusively; `mmio_bar0` is its BAR0.
+pub(super) unsafe fn identify(
+    mmio_bar0: MmioRegion,
+    address: crate::ath10k::platform::pci::BusAddr,
+    vendor_id: u16,
+    device_id: u16,
+    hw_rev: HwRev,
+) -> Result<Ath10kDevice, ProbeError> {
     let registers = hw_rev.registers().ok_or(ProbeError::LegacyChipRejected)?;
     let required = (registers.pcie_local + 12)
         .max(registers.chip_id + 4)
@@ -1145,7 +1219,7 @@ unsafe fn bring_up_live(
     }
     let on = if hw_rev == HwRev::Qca99x0 { 7 } else { 3 };
     let mut gone = false;
-    let awake = narf_scheduler::responsive_spin_until(
+    let awake = crate::ath10k::platform::responsive_spin_until(
         || {
             // SAFETY: the BAR bounds above cover PCI-local RTC state.
             let state = unsafe { mmio_bar0.read32(registers.pcie_local + RTC_STATE_ADDRESS) };
@@ -1183,13 +1257,13 @@ unsafe fn bring_up_live(
     let rev = chip_id_rev(chip_id_raw);
 
     Ok(Ath10kDevice {
-        address: device.addr,
+        address,
         mmio_bar0,
         hw_rev,
         chip_id_raw,
         chip_id_rev: rev,
-        vendor_id: device.id.vendor,
-        device_id: device.id.device,
+        vendor_id,
+        device_id,
         target_info: None,
         boot_error: None,
         firmware_prepared: None,
@@ -1207,7 +1281,7 @@ unsafe fn bring_up_live(
     })
 }
 
-async fn boot_task(
+pub(super) async fn boot_task(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     mmio: MmioRegion,
@@ -1243,13 +1317,14 @@ async fn boot_task(
                 // whose variant (when present) replaces the SMBIOS one. The
                 // function's DT/NVMEM calibration sources are read once here.
                 let sources = super::firmware::Platform::for_device(&device);
-                let variant = sources.variant.clone().unwrap_or_else(|| {
-                    narf_drivers_wireless_ath_core::board::check_smbios().bdf_ext
-                });
+                let variant = sources
+                    .variant
+                    .clone()
+                    .unwrap_or_else(|| crate::ath10k::platform::check_smbios().bdf_ext);
                 let variant = core::str::from_utf8(&variant)
                     .map_err(|_| super::firmware::Error::Unsupported)?;
                 let address = match device.addr {
-                    narf_bus::BusAddr::Pcie(address) => address,
+                    crate::ath10k::platform::pci::BusAddr::Pcie(address) => address,
                     _ => return Err(super::firmware::Error::Unsupported),
                 };
                 super::firmware::prepare_for_address(
@@ -1284,7 +1359,7 @@ async fn boot_task(
                         controller.firmware_prepared = Some(status);
                     }
                     let _ = writeln!(
-                        narf_console::Writer,
+                        crate::ath10k::platform::Console,
                         "  ath10k: {} api {} WMI {} HTT {} calibrated image downloaded",
                         status.directory,
                         status.api,
@@ -1298,7 +1373,7 @@ async fn boot_task(
                                 controller.htc_ready = Some(ready);
                             }
                             let _ = writeln!(
-                                narf_console::Writer,
+                                crate::ath10k::platform::Console,
                                 "  ath10k: HTC WMI endpoint {} HTT endpoint {} ready",
                                 ready.wmi_endpoint,
                                 ready.htt_endpoint
@@ -1315,7 +1390,7 @@ async fn boot_task(
                                             if let Some(controller) = CONTROLLER.lock().as_mut() {
                                                 controller.htt_ready = Some(ready);
                                             }
-                                            let _=writeln!(narf_console::Writer,"  ath10k: HTT {}.{} with retained packet DMA; station registration pending",ready.major,ready.minor);
+                                            let _=writeln!(crate::ath10k::platform::Console,"  ath10k: HTT {}.{} with retained packet DMA; station registration pending",ready.major,ready.minor);
                                             let (owner, result) = initialize_radio(owner).await;
                                             let radio = match (&owner, &result) {
                                                 (DriverSession::Radio(radio), Ok(_)) => Some((
@@ -1340,24 +1415,21 @@ async fn boot_task(
                                             *SESSION.lock().await = Some(owner);
                                             match result {
                                                 Ok(ready) => {
-                                                    let _=writeln!(narf_console::Writer,"  ath10k: retained passive scan vdev with {} receive-only channels; station closed",ready.channels);
+                                                    let _=writeln!(crate::ath10k::platform::Console,"  ath10k: retained passive scan vdev with {} receive-only channels; station closed",ready.channels);
                                                     if let Some((radio, quarantine)) = radio {
-                                                        match super::interface::wait_publish(
-                                                            radio, quarantine,
-                                                        )
-                                                        .await
+                                                        match wait_publish(radio, quarantine).await
                                                         {
                                                             Ok(_) => {
-                                                                let _ = writeln!(narf_console::Writer,"  ath10k: retained legacy RAW station interface registered, carrier closed");
+                                                                let _ = writeln!(crate::ath10k::platform::Console,"  ath10k: retained legacy RAW station interface registered, carrier closed");
                                                             }
                                                             Err(error) => {
-                                                                let _ = writeln!(narf_console::Writer,"  ath10k: station interface admission: {:?}",error);
+                                                                let _ = writeln!(crate::ath10k::platform::Console,"  ath10k: station interface admission: {:?}",error);
                                                             }
                                                         }
                                                     }
                                                 }
                                                 Err(error) => {
-                                                    let _=writeln!(narf_console::Writer,"  ath10k: retained passive scan setup failed: {:?}",error);
+                                                    let _=writeln!(crate::ath10k::platform::Console,"  ath10k: retained passive scan setup failed: {:?}",error);
                                                 }
                                             }
                                         }
@@ -1367,7 +1439,7 @@ async fn boot_task(
                                             }
                                             *SESSION.lock().await = Some(owner);
                                             let _ = writeln!(
-                                                narf_console::Writer,
+                                                crate::ath10k::platform::Console,
                                                 "  ath10k: retained HTT setup failed: {:?}",
                                                 error
                                             );
@@ -1380,7 +1452,7 @@ async fn boot_task(
                                     }
                                     *SESSION.lock().await = Some(owner);
                                     let _ = writeln!(
-                                        narf_console::Writer,
+                                        crate::ath10k::platform::Console,
                                         "  ath10k: retained WMI initialization failed: {:?}",
                                         error
                                     );
@@ -1393,7 +1465,7 @@ async fn boot_task(
                             }
                             *SESSION.lock().await = Some(owner);
                             let _ = writeln!(
-                                narf_console::Writer,
+                                crate::ath10k::platform::Console,
                                 "  ath10k: retained runtime activation failed: {:?}",
                                 error
                             );
@@ -1405,7 +1477,7 @@ async fn boot_task(
                         controller.firmware_error = Some(error.clone());
                     }
                     let _ = writeln!(
-                        narf_console::Writer,
+                        crate::ath10k::platform::Console,
                         "  ath10k: firmware/BDF/OTP preparation failed: {:?}",
                         error
                     );
@@ -1417,12 +1489,24 @@ async fn boot_task(
                 controller.boot_error = Some(error);
             }
             let _ = writeln!(
-                narf_console::Writer,
+                crate::ath10k::platform::Console,
                 "  ath10k: BMI bootstrap failed: {:?}",
                 error
             );
         }
     }
+}
+
+/// The module probe's bind (`pci_kabi.rs`): the single-instance slot the
+/// built-in probe fills, refused when another radio already holds it.
+#[cfg(feature = "module")]
+pub(super) fn bind_controller(device: Ath10kDevice) -> bool {
+    let mut controller = CONTROLLER.lock();
+    if controller.is_some() {
+        return false;
+    }
+    *controller = Some(device);
+    true
 }
 
 /// Test helper — `true` if the static slot has a bound device.

@@ -18,7 +18,7 @@ const CLOCKS: [(u32, u32, u32); 8] = [
 ];
 
 async fn settled<T: Transport>(bmi: &mut Bmi<T>) -> Result<(), BmiError> {
-    let deadline = narf_time::Deadline::after_ms(1000);
+    let deadline = crate::ath10k::platform::time::Deadline::after_ms(1000);
     loop {
         if bmi.read_soc(0x1244).await? & 0x20 == 0 {
             return Ok(());
@@ -26,7 +26,7 @@ async fn settled<T: Transport>(bmi: &mut Bmi<T>) -> Result<(), BmiError> {
         if deadline.expired() {
             return Err(BmiError::Timeout);
         }
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(10_000)).await;
+        crate::ath10k::platform::time::sleep_ns(10_000).await;
     }
 }
 

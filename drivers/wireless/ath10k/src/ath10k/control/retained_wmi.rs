@@ -100,13 +100,13 @@ impl<T: Hif> Session<T> {
         &mut self,
         payload: &[u8],
     ) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         while !self.begin_retained_wmi(payload)? {
             if deadline.expired() {
                 return Err(Error::Transport(BmiError::Timeout));
             }
             self.retained_wmi_progress()?;
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         self.wait_wmi_source().await?;
         Ok(())
@@ -115,13 +115,13 @@ impl<T: Hif> Session<T> {
     /// A cancelled restore may already have its firmware scan terminal, but
     /// its last command's source bounce remains owned until this CE receipt.
     pub(in crate::ath10k) async fn wait_wmi_source(&mut self) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         while !self.retained_wmi_ready()? {
             if deadline.expired() {
                 return Err(Error::Transport(BmiError::Timeout));
             }
             self.retained_wmi_progress()?;
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Ok(())
     }

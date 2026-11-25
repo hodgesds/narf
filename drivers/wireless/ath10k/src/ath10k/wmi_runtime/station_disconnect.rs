@@ -125,9 +125,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
 
     async fn drain_before_delete(&mut self) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(3000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(3000);
         for _ in 0..4096 {
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
@@ -157,10 +157,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         bssid: [u8; 6],
         sync: bool,
     ) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(5000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(5000);
         let mut acknowledged = !sync;
         for _ in 0..65536 {
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
@@ -191,10 +191,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
 
     async fn wait_vdev_stopped(&mut self, vdev: u8, bssid: [u8; 6]) -> Result<(), Error> {
-        let deadline = narf_time::Deadline::after_ms(5000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(5000);
         let mut stopped = false;
         for _ in 0..65536 {
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }

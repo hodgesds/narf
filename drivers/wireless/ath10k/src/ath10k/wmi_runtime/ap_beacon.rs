@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Atomic validation and native firmware-owned AP template replacement.
 use super::{ap::Session, ap_wire, Error, Hif, HostMemory, HttMemory, Radio};
+use crate::ath10k::platform::ap_control::ApEmissionAuthority;
 use alloc::vec::Vec;
-use narf_wireless::ap_control::ApEmissionAuthority;
 
 pub(in crate::ath10k) type BeaconPieces = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
 

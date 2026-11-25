@@ -35,7 +35,7 @@ const INSTALL_BODY: usize = 92;
 pub(super) struct InFlight {
     pub(super) token: u32,
     pub(super) pairwise: bool,
-    pub(super) deadline: narf_time::Deadline,
+    pub(super) deadline: crate::ath10k::platform::time::Deadline,
 }
 
 /// `vdev_install_key_cmdid` per dialect: VDEV_UP + 4 in the main/TLV maps,

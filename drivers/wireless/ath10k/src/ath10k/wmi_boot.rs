@@ -608,7 +608,7 @@ impl<T: Hif + HostMemory> Runtime<T> {
         }
     }
     async fn event(&mut self, expected: u32) -> Result<Vec<u8>, Error> {
-        let deadline = narf_time::Deadline::after_ms(5000);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(5000);
         for _ in 0..512 {
             if deadline.expired() {
                 return Err(Error::Timeout);

@@ -18,10 +18,10 @@ pub(super) struct Action {
     token: Option<ManagementToken>,
     status: Option<bool>,
     retired: bool,
-    response_until: Option<narf_time::Deadline>,
+    response_until: Option<crate::ath10k::platform::time::Deadline>,
 }
 impl Action {
-    pub(super) fn response_until(&self) -> Option<narf_time::Deadline> {
+    pub(super) fn response_until(&self) -> Option<crate::ath10k::platform::time::Deadline> {
         self.response_until
     }
 }
@@ -229,7 +229,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let sync_delete = self.wire.sync_delete_required(caps);
         // The native protocol has unversioned peer/delete records. Drain the
         // ordered old receive stream before creating this new DA owner.
-        let deadline = narf_time::Deadline::after_ms(1500);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
         let mut idle = false;
         for _ in 0..4096 {
             if !emission.current() || !self.roc_current(&current()?)? || deadline.expired() {
@@ -239,7 +239,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 idle = true;
                 break;
             }
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         if !idle {
             return Err(Error::Timeout);
@@ -276,7 +276,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 permission.check(&current()?)
             })
             .await?;
-            let deadline = narf_time::Deadline::after_ms(1500);
+            let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
             for _ in 0..65536 {
                 if !self.roc_current(&current()?)? {
                     return Err(Error::Timeout);
@@ -288,7 +288,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     return Err(Error::Timeout);
                 }
                 self.roc_progress().await?;
-                narf_scheduler::yield_now().await;
+                crate::ath10k::platform::yield_now().await;
             }
             if self.roc_action()?.ids.iter().all(|b| *b == 0) {
                 return Err(Error::Timeout);
@@ -453,7 +453,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 .and_then(|w| w.action.as_mut())
                 .ok_or(Error::Failed)?;
             a.status = Some(status && a.destination[0] & 1 == 0);
-            a.response_until = wait.map(|ms| narf_time::Deadline::after_ms(u64::from(ms)));
+            a.response_until =
+                wait.map(|ms| crate::ath10k::platform::time::Deadline::after_ms(u64::from(ms)));
             if wait.is_some() {
                 self.close_roc_capture()?;
                 self.open_roc_capture()?;
@@ -510,7 +511,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Failed);
             }
             let (vdev, destination) = (a.vdev, a.destination);
-            let deadline = narf_time::Deadline::after_ms(1500);
+            let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
             let mut idle = false;
             for _ in 0..4096 {
                 cleanup()?;
@@ -521,7 +522,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                     idle = true;
                     break;
                 }
-                narf_scheduler::yield_now().await;
+                crate::ath10k::platform::yield_now().await;
             }
             if !idle {
                 return Err(Error::Timeout);
@@ -534,7 +535,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let command = self.wire.delete_offchannel_peer(vdev, destination)?;
             self.send_scan_command(&command, cleanup).await?;
         }
-        let deadline = narf_time::Deadline::after_ms(1500);
+        let deadline = crate::ath10k::platform::time::Deadline::after_ms(1500);
         for _ in 0..65536 {
             cleanup()?;
             let a = self.roc_action()?;
@@ -569,7 +570,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             // A P2P client slot's event is parked for it, not discarded.
             let _ = self.route_sibling(event);
             self.observe_roc_action_completion()?;
-            narf_scheduler::yield_now().await;
+            crate::ath10k::platform::yield_now().await;
         }
         Err(Error::Timeout)
     }

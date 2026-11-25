@@ -34,6 +34,7 @@
 //! the same sequence the hard handler + NAPI poll would: firmware-crash check
 //! first, then mask/clear, per-CE status clear, ring service, and re-enable
 //! only when the CE summary is empty (otherwise it reschedules itself).
+use crate::ath10k::platform::IrqSafeSpinLock;
 use alloc::sync::Arc;
 use core::{
     future::Future,
@@ -41,7 +42,6 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll, Waker},
 };
-use narf_lib::sync::IrqSafeSpinLock;
 
 use super::ce::Ath10kMmio;
 use super::hw::{ce_off, HwRev, FW_IND_EVENT_PENDING};

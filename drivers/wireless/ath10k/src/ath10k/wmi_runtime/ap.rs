@@ -2,10 +2,11 @@
 //! One retained AP vdev, distinct from station/ROC and firmware packet credit.
 //! Native completion and exact original source/copy guards stay independent.
 use super::{ap_key, ap_wire, htt, management, wire, Error};
+use crate::ath10k::platform::ap_control::ApEmissionAuthority;
 use crate::ath10k::regulatory::Permission;
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
-use narf_wireless::{ap_control::ApEmissionAuthority, StationConfig};
+use narf_wireless::StationConfig;
 
 /// Original signed database snapshot, not a later equal-value replacement.
 /// Both providers are fixed kernel database owners; no callback runs in Radio.
@@ -25,7 +26,7 @@ impl core::fmt::Debug for Policy {
 impl Policy {
     pub fn installed() -> Result<Self, Error> {
         Ok(Self {
-            original: narf_wireless::reg::db::snapshot().ok_or(Error::Unsupported)?,
+            original: crate::ath10k::platform::reg::snapshot().ok_or(Error::Unsupported)?,
             #[cfg(any(test, feature = "kernel-test"))]
             database: None,
         })
@@ -47,7 +48,8 @@ impl Policy {
                 .snapshot()
                 .is_some_and(|now| Arc::ptr_eq(&now, &self.original));
         }
-        narf_wireless::reg::db::snapshot().is_some_and(|now| Arc::ptr_eq(&now, &self.original))
+        crate::ath10k::platform::reg::snapshot()
+            .is_some_and(|now| Arc::ptr_eq(&now, &self.original))
     }
 }
 #[derive(Clone, Debug)]
@@ -225,7 +227,7 @@ pub(super) enum Token {
 #[derive(Debug)]
 pub(super) struct Pending {
     pub token: Token,
-    pub deadline: narf_time::Deadline,
+    pub deadline: crate::ath10k::platform::time::Deadline,
     pub status: Option<bool>,
     /// DATA is accounted independently from a control's terminal ACK.
     pub control: bool,

@@ -18,6 +18,7 @@
 //! same as the Devicetree's own.
 use super::Error;
 use alloc::vec::Vec;
+#[cfg(feature = "builtin")]
 use narf_firmware_fdt::{NvmemError, PropIter, RmemCell};
 
 /// One optional calibration source at probe time.
@@ -44,8 +45,10 @@ pub(in crate::ath10k) struct Platform {
 }
 
 /// `ATH10K_SMBIOS_BDF_EXT_STR_LENGTH`.
+#[cfg(feature = "builtin")]
 const BDF_EXT_LENGTH: usize = 0x20;
 
+#[cfg(feature = "builtin")]
 fn property<'a>(props: PropIter<'a>, name: &str) -> Option<&'a [u8]> {
     props
         .into_iter()
@@ -53,6 +56,7 @@ fn property<'a>(props: PropIter<'a>, name: &str) -> Option<&'a [u8]> {
 }
 
 /// `of_get_property` of the primary name; the legacy name only on -ENOENT.
+#[cfg(feature = "builtin")]
 fn dt_source(props: PropIter<'_>, primary: &str, legacy: &str) -> Source {
     property(props, primary)
         .or_else(|| property(props, legacy))
@@ -61,10 +65,12 @@ fn dt_source(props: PropIter<'_>, primary: &str, legacy: &str) -> Source {
 
 /// `of_property_read_string`: bytes before the first NUL; an unterminated
 /// value is `-EILSEQ` and leaves the variant unset.
+#[cfg(feature = "builtin")]
 fn dt_string(value: &[u8]) -> Option<&[u8]> {
     value.iter().position(|b| *b == 0).map(|end| &value[..end])
 }
 
+#[cfg(feature = "builtin")]
 impl Platform {
     /// Collect every source of one function node. `read` copies an
     /// `nvmem-rmem` cell's bytes; it is only called for a registered,
@@ -156,8 +162,20 @@ impl Platform {
     }
 }
 
+/// The module build: no Devicetree reaches a `.ko` (no KABI export carries
+/// the DTB or its reserved memory), so every DT/NVMEM source is absent —
+/// Linux's PCI function without an `of_node`. PCIe ath10k cards on x86 and
+/// most arm64 boards have none either; their calibration is the board file.
+#[cfg(feature = "module")]
+impl Platform {
+    pub fn for_device(_device: &crate::ath10k::platform::pci::BusDevice) -> Self {
+        Self::default()
+    }
+}
+
 /// `rmem_read`: copy one cell through a write-back mapping of the
 /// reserved region (Linux `memremap(..., MEMREMAP_WB)`).
+#[cfg(feature = "builtin")]
 fn read_rmem(cell: &RmemCell) -> Result<Vec<u8>, Error> {
     use narf_memory::ioremap::{ioremap, MmioAttrs};
     let phys = cell
