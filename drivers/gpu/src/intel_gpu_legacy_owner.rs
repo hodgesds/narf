@@ -1195,6 +1195,7 @@ impl Owner {
         runtime.unpark()?;
         let claim = context.claim_resident(epoch)?;
         let (engine, id) = runtime.context_for(&context).map_err(submit_error)?;
+        engine.set_band(id, claim.band()).map_err(submit_error)?;
         let submission = engine.submit_resident(id, batch.0).map_err(submit_error)?;
         let fence = submission.fence.clone();
         runtime.jobs.push(Job {

@@ -961,6 +961,11 @@ pub(crate) struct ContextClaim {
     published: bool,
 }
 impl ContextClaim {
+    /// This claim's GuC priority band (0 highest), raised by the requests
+    /// queued behind it; the execlists owner schedules by it.
+    pub(crate) fn band(&self) -> u8 {
+        self.context.state.lock().job_policy.0.min(3) as u8
+    }
     pub(crate) fn placements(&self) -> crate::intel_gpu_engine::EngineSet {
         self.context.placements
     }

@@ -361,6 +361,10 @@ pub(crate) const HWS_PREEMPT_BYTE: u64 = 0x32 * 4;
 /// `CONFIG_DRM_I915_TIMESLICE_DURATION`: how long ELSP[0] runs while
 /// another context waits before the engine rotates.
 pub const TIMESLICE_NS: u64 = 1_000_000;
+/// A context's default priority band: GuC's encoding (0 highest, 3
+/// lowest), here `GUC_PRIORITY_KMD_NORMAL`, where i915's default context
+/// priority maps.
+pub const DEFAULT_BAND: u8 = 2;
 
 /// `gen8_emit_bb_start`: arbitration on across the batch, so the engine
 /// can be preempted at its arbitration points, then off again.
@@ -2580,6 +2584,9 @@ struct RcsContext<A: GpuAllocator> {
     /// raw attachment's caller owns its tables; `submit_resident` instead
     /// retains their owner in the request through verified retirement.
     ppgtt_root: Option<u64>,
+    /// Priority band later requests queue and preempt by
+    /// ([`RcsEngine::set_band`]).
+    band: u8,
     /// The image holds hardware-saved engine state. Gen9/Gen11 contexts
     /// start with restore inhibited (Linux `init_common_regs` with no
     /// default image) and clear it once their first request retires.
@@ -2603,6 +2610,8 @@ impl<A: GpuAllocator> core::fmt::Debug for RcsContext<A> {
 struct Request<A: GpuAllocator> {
     ctx_slot: u32,
     ctx_gen: u32,
+    /// The context's band when the request was queued.
+    band: u8,
     seqno: u32,
     id: u64,
     batch: RequestBatch<A>,
@@ -2899,6 +2908,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         self.mmio
             .write32(self.spec.hws_pga(), self.status.ggtt_offset());
         self.reset_csb_pointers()?;
+        // Bands still order the queue; within one, the old order holds.
+        requeue.make_contiguous().sort_by_key(|r| r.band);
         self.queue = requeue;
         self.pump();
         Ok((guilty_id, ids))
@@ -3132,6 +3143,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             next_seqno: 1,
             last_completed_seqno: 0,
             ppgtt_root: None,
+            band: DEFAULT_BAND,
             restore_valid,
         });
         Ok(ContextId::pack(slot as u32, generation))
@@ -3312,8 +3324,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             batch.release(&mut self.alloc);
             return Err(SubmitError::CompletionLost);
         }
-        let (slot, generation) = match self.context(id) {
-            Ok(c) => (c.slot, c.generation),
+        let (slot, generation, band) = match self.context(id) {
+            Ok(c) => (c.slot, c.generation, c.band),
             Err(e) => {
                 batch.release(&mut self.alloc);
                 return Err(e);
@@ -3395,15 +3407,16 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         };
         self.next_request_id += 1;
         let completion = completion.unwrap_or_else(|| Arc::new(CompletionFence::new()));
-        self.queue.push_back(Request {
+        self.enqueue(Request {
             ctx_slot: slot,
             ctx_gen: generation,
+            band,
             seqno,
             id: request_id,
             batch,
             fence: completion.clone(),
         });
-        self.pump();
+        self.kick();
         Ok(ResidentSubmission {
             request: request_id,
             fence: completion,
@@ -3565,8 +3578,9 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// engine. The hardware switches at its next arbitration point. The
     /// promotion that follows unpauses; a context that completed before the
     /// switch runs again from its saved head, which is its tail, and retires
-    /// then. Returns whether the engine was reloaded. Every context has one
-    /// priority, so there is no priority preemption.
+    /// then. Slices rotate only within ELSP[0]'s band; a waiter of a
+    /// higher band preempts at once ([`Self::set_band`]). Returns whether
+    /// the engine was reloaded.
     pub fn timeslice(&mut self, now: u64) -> bool {
         if !gen8_csb(self.generation)
             || self.completion_lost
@@ -3583,7 +3597,17 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             self.slice_start = None;
             return false;
         };
-        if second.is_none() && self.queue.is_empty() {
+        // need_preempt: a waiter of a higher band preempts at once.
+        if self.need_preempt() {
+            self.preempt(first, second, false);
+            return true;
+        }
+        // Only a waiter of ELSP[0]'s own band takes a slice from it:
+        // defer_active moves ELSP[0] behind its own band alone.
+        let band = self.running_band(first);
+        let peer = second.is_some_and(|s| self.running_band(s) == band)
+            || self.queue.front().is_some_and(|r| r.band <= band);
+        if !peer {
             self.slice_start = None;
             return false;
         }
@@ -3591,11 +3615,72 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         if now.saturating_sub(start) < TIMESLICE_NS {
             return false;
         }
+        self.preempt(first, second, true);
+        true
+    }
+
+    /// The context's priority band ([`DEFAULT_BAND`] until set): GuC's
+    /// encoding, 0 highest. Requests queued afterwards take it; a request
+    /// of a higher band than every running context preempts them, and
+    /// timeslices rotate only within one band.
+    pub fn set_band(&mut self, id: ContextId, band: u8) -> Result<(), SubmitError> {
+        self.context_mut(id)?.band = band.min(3);
+        Ok(())
+    }
+
+    /// Insert behind every request of the same or a higher band.
+    fn enqueue(&mut self, r: Request<A>) {
+        let at = self
+            .queue
+            .iter()
+            .position(|q| q.band > r.band)
+            .unwrap_or(self.queue.len());
+        self.queue.insert(at, r);
+    }
+
+    /// Insert ahead of every request of the same or a lower band: a
+    /// switched-out request was submitted before them.
+    fn requeue_front(&mut self, r: Request<A>) {
+        let at = self
+            .queue
+            .iter()
+            .position(|q| q.band >= r.band)
+            .unwrap_or(self.queue.len());
+        self.queue.insert(at, r);
+    }
+
+    /// The band of a running context's request.
+    fn running_band(&self, slot: u32) -> u8 {
+        self.inflight
+            .iter()
+            .find(|r| r.ctx_slot == slot)
+            .map_or(DEFAULT_BAND, |r| r.band)
+    }
+
+    /// `need_preempt`: the best waiter outranks every running context.
+    fn need_preempt(&self) -> bool {
+        let Some(waiting) = self.queue.front().map(|r| r.band) else {
+            return false;
+        };
+        self.active
+            .iter()
+            .flatten()
+            .map(|&slot| self.running_band(slot))
+            .min()
+            .is_some_and(|running| waiting < running)
+    }
+
+    /// Pause the rings and return the running contexts' requests to the
+    /// queue (`__unwind_incomplete_requests`): each to the front of its
+    /// band, except that a timeslice (`defer`) moves ELSP[0]'s behind its
+    /// own band (`defer_active`). Then load the first two contexts into the
+    /// busy engine.
+    fn preempt(&mut self, first: u32, second: Option<u32>, defer: bool) {
         self.set_paused(true);
-        let (mut deferred, mut resumed, mut keep) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut current, mut resumed, mut keep) = (Vec::new(), Vec::new(), Vec::new());
         for r in self.inflight.drain(..) {
             if r.ctx_slot == first {
-                deferred.push(r);
+                current.push(r);
             } else if Some(r.ctx_slot) == second {
                 resumed.push(r);
             } else {
@@ -3604,13 +3689,40 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         }
         self.inflight = keep;
         for r in resumed.into_iter().rev() {
-            self.queue.push_front(r);
+            self.requeue_front(r);
         }
-        self.queue.extend(deferred);
+        if defer {
+            for r in current {
+                self.enqueue(r);
+            }
+        } else {
+            for r in current.into_iter().rev() {
+                self.requeue_front(r);
+            }
+        }
         self.preempting = true;
         self.slice_start = None;
         self.load_ports();
-        true
+    }
+
+    /// `kick_execlists`: load an idle engine, or preempt a busy Gen9/Gen11
+    /// one for a waiter of a higher band.
+    fn kick(&mut self) {
+        self.pump();
+        if !gen8_csb(self.generation)
+            || self.completion_lost
+            || self.pending.iter().any(Option::is_some)
+            || !self.need_preempt()
+        {
+            return;
+        }
+        let (first, second) = {
+            let mut running = self.active.iter().flatten().copied();
+            (running.next(), running.next())
+        };
+        if let Some(first) = first {
+            self.preempt(first, second, false);
+        }
     }
 
     /// The timeslice ELSP was promoted: unpause the rings.
@@ -6633,6 +6745,66 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_rcs",
         smoke_gen9_reset_blames_the_overdue_request
+    );
+
+    /// A request of a higher band preempts the running context at once and
+    /// takes ELSP[0]; a lower band neither preempts nor takes a slice.
+    fn smoke_gen9_priority_band_preempts() -> TestResult {
+        let skl = crate::intel_gpu::Generation::Skylake;
+        let (mut engine, mut hw) = make_engine_for_generation(skl).unwrap();
+        engine.reset_csb_pointers().unwrap();
+        hw.write_ptr = GEN9_CSB_ENTRIES - 1;
+        let a = engine.create_context().unwrap();
+        let low = engine.create_context().unwrap();
+        let high = engine.create_context().unwrap();
+        engine.set_band(low, 3).unwrap();
+        engine.set_band(high, 1).unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(a, batch).unwrap();
+        let elsp = hw.regs.writes_to(RING_ELSP);
+        let port_a = (elsp[2] as u64) << 32 | elsp[3] as u64;
+        hw.inject_csb(CsbEntry {
+            lower: GEN8_CSB_IDLE_ACTIVE,
+            upper: (port_a >> 32) as u32,
+        });
+        engine.poll_completions();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(low, batch).unwrap();
+        if hw.regs.writes_to(RING_ELSP).len() != 4
+            || engine.timeslice(0)
+            || engine.timeslice(10 * TIMESLICE_NS)
+        {
+            return TestResult::Fail("a lower band waits for the running context");
+        }
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(high, batch).unwrap();
+        let elsp = hw.regs.writes_to(RING_ELSP);
+        let port1 = (elsp[4] as u64) << 32 | elsp[5] as u64;
+        let port0 = (elsp[6] as u64) << 32 | elsp[7] as u64;
+        if elsp.len() != 8
+            || port1 != port_a
+            || port0 == port_a
+            || engine.status.read32(HWS_PREEMPT_BYTE) != 1
+        {
+            return TestResult::Fail("a higher band preempts into ELSP[0] at once");
+        }
+        hw.inject_csb(CsbEntry {
+            lower: GEN8_CSB_PREEMPTED,
+            upper: (port0 >> 32) as u32,
+        });
+        engine.poll_completions();
+        if engine.status.read32(HWS_PREEMPT_BYTE) != 0 || engine.spurious_csb() != 0 {
+            return TestResult::Fail("the preemption's promotion unpauses");
+        }
+        // SAFETY: the model never ran a request.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_gen9_priority_band_preempts
     );
 
     /// Resident batches take the Gen8 PTE format on Gen9/Gen11 and refuse
