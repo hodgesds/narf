@@ -1398,3 +1398,168 @@ fn smoke_input_evdev_lock_keys_toggle_leds() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("input", smoke_input_evdev_lock_keys_toggle_leds);
+
+// ── Secret key entry and the shared keymap ───────────────────────────────────
+
+fn smoke_input_key_to_ascii_us_layout() -> TestResult {
+    use crate::{key_to_ascii, KeyCode as K, Modifiers as M};
+    let none = M::from_bits_truncate(0);
+    let caps = M::CAPS_LOCK;
+    let shift_caps = M::from_bits_truncate(M::SHIFT.bits() | M::CAPS_LOCK.bits());
+    let cases = [
+        (K::A, none, Some(b'a')),
+        (K::A, M::SHIFT, Some(b'A')),
+        (K::A, caps, Some(b'A')),
+        (K::A, shift_caps, Some(b'a')),
+        // Caps Lock leaves digits and punctuation alone (Linux KT_LATIN).
+        (K::Key1, caps, Some(b'1')),
+        (K::Key1, M::SHIFT, Some(b'!')),
+        (K::Key1, shift_caps, Some(b'!')),
+        (K::Slash, caps, Some(b'/')),
+        (K::Slash, M::SHIFT, Some(b'?')),
+        (K::Backspace, none, Some(0x7f)),
+        (K::Enter, none, Some(b'\n')),
+        (K::Escape, none, Some(0x1b)),
+        (K::LeftShift, none, None),
+        (K::F1, none, None),
+    ];
+    for &(code, mods, want) in &cases {
+        if key_to_ascii(code, mods) != want {
+            return TestResult::Fail("key_to_ascii differs from the Linux US keymap");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/keymap", smoke_input_key_to_ascii_us_layout);
+
+fn smoke_input_secret_entry_diverts_keys() -> TestResult {
+    use crate::{
+        __reset_modifiers_for_test, begin_secret_entry, init_global_ring, pop_key, pop_secret_key,
+        push_key, secret_entry_active, KeyCode,
+    };
+    init_global_ring(8);
+    __reset_modifiers_for_test();
+    while pop_key().is_some() {}
+    let guard = match begin_secret_entry() {
+        Some(g) => g,
+        None => return TestResult::Fail("secret entry already active"),
+    };
+    if begin_secret_entry().is_some() {
+        return TestResult::Fail("a second prompt must not share secret entry");
+    }
+    let _ = push_key(KeyCode::A, true);
+    let _ = push_key(KeyCode::A, false);
+    let leaked = pop_key();
+    let first = pop_secret_key();
+    let second = pop_secret_key();
+    let third = pop_secret_key();
+    // Queued but unread keys are wiped when the guard drops.
+    let _ = push_key(KeyCode::B, true);
+    drop(guard);
+    let after_drop = pop_secret_key();
+    let active = secret_entry_active();
+    let _ = push_key(KeyCode::C, true);
+    let normal = pop_key();
+    __reset_modifiers_for_test();
+    if leaked.is_some() {
+        return TestResult::Fail("a secret keystroke reached the console key ring");
+    }
+    if !matches!(first, Some(k) if k.code == KeyCode::A && k.pressed)
+        || !matches!(second, Some(k) if k.code == KeyCode::A && !k.pressed)
+        || third.is_some()
+    {
+        return TestResult::Fail("secret queue lost or reordered keystrokes");
+    }
+    if after_drop.is_some() || active {
+        return TestResult::Fail("dropping the guard must wipe the queue and end the mode");
+    }
+    if !matches!(normal, Some(k) if k.code == KeyCode::C) {
+        return TestResult::Fail("keys must reach the console ring again after the prompt");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/secret", smoke_input_secret_entry_diverts_keys);
+
+fn smoke_input_secret_entry_withholds_evdev_keys() -> TestResult {
+    use crate::begin_secret_entry;
+    use crate::evdev::key::{BTN_LEFT, KEY_A};
+    use crate::evdev::{dispatch_key_to_node, DeviceCaps, EvdevEvent, EventType, ROUTER};
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    caps.add_key(BTN_LEFT);
+    let (id, node) = ROUTER.register_device(caps);
+    let reader = match ROUTER.open_reader(id) {
+        Some(r) => r,
+        None => return TestResult::Fail("open_reader failed"),
+    };
+    let guard = match begin_secret_entry() {
+        Some(g) => g,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("secret entry already active");
+        }
+    };
+    dispatch_key_to_node(&node, KEY_A, true);
+    node.dispatch(EvdevEvent {
+        time: 0,
+        type_: EventType::Msc,
+        code: 4, // MSC_SCAN
+        value: 0x70004,
+    });
+    dispatch_key_to_node(&node, BTN_LEFT, true);
+    drop(guard);
+    dispatch_key_to_node(&node, KEY_A, false);
+    let mut keys = alloc::vec::Vec::new();
+    let mut saw_msc = false;
+    while let Some(ev) = reader.poll_event() {
+        match ev.type_ {
+            EventType::Key => keys.push((ev.code, ev.value)),
+            EventType::Msc => saw_msc = true,
+            _ => {}
+        }
+    }
+    ROUTER.unregister_device(id);
+    if saw_msc || keys.contains(&(KEY_A, 1)) {
+        return TestResult::Fail("a keystroke typed during secret entry reached an evdev node");
+    }
+    if !keys.contains(&(BTN_LEFT, 1)) {
+        return TestResult::Fail("pointer buttons must still pass during secret entry");
+    }
+    if !keys.contains(&(KEY_A, 0)) {
+        return TestResult::Fail("keys must reach evdev again after the prompt");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "input/secret",
+    smoke_input_secret_entry_withholds_evdev_keys
+);
+
+static POLLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn count_poll() {
+    POLLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn smoke_input_keyboard_pollers_register_once() -> TestResult {
+    use crate::secret::{__restore_keyboard_pollers_for_test, __take_keyboard_pollers_for_test};
+    use crate::{poll_keyboards, register_keyboard_poller};
+    use core::sync::atomic::Ordering;
+    let saved = __take_keyboard_pollers_for_test();
+    POLLED.store(0, Ordering::Relaxed);
+    let first = register_keyboard_poller(count_poll);
+    let again = register_keyboard_poller(count_poll);
+    poll_keyboards();
+    poll_keyboards();
+    let calls = POLLED.load(Ordering::Relaxed);
+    __restore_keyboard_pollers_for_test(saved);
+    if !first || !again {
+        return TestResult::Fail("registering a poller must succeed (twice is a no-op)");
+    }
+    if calls != 2 {
+        return TestResult::Fail("each poll_keyboards must run each poller exactly once");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/secret", smoke_input_keyboard_pollers_register_once);

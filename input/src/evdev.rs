@@ -866,6 +866,11 @@ impl DeviceNode {
         if !self.alive.load(Ordering::Acquire) {
             return false;
         }
+        // Keystrokes typed at a boot credential prompt never enter a
+        // node's ring, where a later reader could replay them.
+        if crate::secret::withhold_evdev(ev.type_, ev.code) {
+            return true;
+        }
         if ev.type_ == EventType::Key && self.sysrq.filter(ev.code, ev.value) {
             // Linux's sysrq input handler swallows the command key.
             return true;

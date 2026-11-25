@@ -308,7 +308,7 @@ impl TtyPort {
                 // modifier presses translate to None and are skipped).
                 while let Some(k) = narf_input::pop_key() {
                     if k.pressed {
-                        if let Some(b) = crate::devfs::key_to_ascii(k.code, k.modifiers) {
+                        if let Some(b) = narf_input::key_to_ascii(k.code, k.modifiers) {
                             return Some(b);
                         }
                     }

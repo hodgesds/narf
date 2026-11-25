@@ -134,6 +134,29 @@ All code is derived strictly from the references below.
   field of the HID device's `MODALIAS`. Malformed items are skipped as
   Linux skips them. LINUX-GAP: no quirk table, so
   `HID_QUIRK_HAVE_SPECIAL_DRIVER` devices are scanned too.
+- `key_to_ascii(code, modifiers)` (`keymap`): the US-QWERTY translation
+  shared by the console line discipline and the boot credential prompt.
+  Caps Lock inverts Shift for letters only, as Linux's default keymap
+  does (`kbd_keycode` flips the shift map for `KT_LETTER` only).
+- Secret key entry (`secret`), for a credential prompt that runs in the
+  kernel before PID 1. `begin_secret_entry()` returns the single
+  `SecretEntry` guard (`None` while another prompt holds it). While it is
+  held:
+  - every `InputEvent::Key` reaching `push_global` goes to a private
+    64-entry queue read by `pop_secret_key()`, not to the key ring;
+  - `DeviceNode::dispatch` drops keyboard `EV_KEY` codes (everything
+    outside `BTN_MISC..KEY_OK`, 0x100..0x160) and every `EV_MSC` event,
+    so no evdev ring keeps a keystroke for a later reader. Pointer
+    buttons and other event classes still pass.
+
+  Slots are wiped (volatile stores) as they are popped and when the guard
+  drops. A full queue drops the key (`secret_keys_dropped()`); the key
+  never falls through to the public ring.
+- Keyboard pollers: `register_keyboard_poller(fn())` (at most four, no
+  duplicates) and `poll_keyboards()`, which runs each one once with no
+  lock held. A controller driver registers a function that moves pending
+  bytes through its normal decoder, so a prompt running with interrupts
+  masked still receives keys.
 
 ### Out of scope (deferred)
 - F$12 next-generation touchpad function (extends F$11 with
