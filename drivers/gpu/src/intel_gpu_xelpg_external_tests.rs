@@ -68,6 +68,8 @@ pub struct Sink {
     pub uhbr_reads: Vec<u32>,
     /// Further DPCD bytes the sink reports.
     pub extra: Vec<(u32, u8)>,
+    /// Native writes to `DP_PROTOCOL_CONVERTER_CONTROL_0..=2`, in order.
+    pub pcon_log: Vec<(u32, u8)>,
 }
 
 impl Sink {
@@ -105,6 +107,7 @@ impl Sink {
             uhbr_log: Vec::new(),
             uhbr_reads: Vec::new(),
             extra: Vec::new(),
+            pcon_log: Vec::new(),
         }
     }
     /// A DP 2.0 sink: `DP_CAP_ANSI_128B132B` with `uhbr_rates`.
@@ -270,6 +273,7 @@ impl Sink {
                     _ => self.fec_status &= !value,
                 }
             }
+            0x3050..=0x3052 => self.pcon_log.push((addr, value)),
             0x600 => {
                 self.power_log.push(value);
                 self.powered = value & 0x3 == 1;
@@ -5459,4 +5463,86 @@ fn smoke_mtl_external_dp_deep_colour_10_and_12_bpc() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_dp_deep_colour_10_and_12_bpc
+);
+
+/// The YCbCr 4:4:4 route (`narf.intel.hdmi14_ext=1`): a DPCD 1.4 PCON whose
+/// HDMI DFP converts 4:4:4 to 4:2:0 (not RGB to YCbCr) in front of a
+/// 4:2:0-only 4K60 HDMI sink. `intel_dp_output_format` drives YCbCr 4:4:4:
+/// D0 and `intel_dp_configure_protocol_converter` (HDMI mode, 4:2:0
+/// conversion on, RGB conversion cleared) before training, the MSA's
+/// `DP_MSA_MISC_COLOR_YCBCR_444_BT709`, `PIPE_MISC` YUV and the BT.709
+/// output CSC; the stop clears both and restores the 8 bpc RGB MSA.
+fn smoke_mtl_external_dp_ycbcr444_pcon_route() -> TestResult {
+    use crate::intel_gpu_xelpg_external::color::{tests, PconConfig};
+    let mut sink = Sink::new(0x14, tests::edid_4k60_with(&tests::HDMI_420_ONLY_BLOCKS));
+    sink.caps[5] = 0x11;
+    sink.extra.push((0x80, 3));
+    sink.extra.push((0x83, 0x10));
+    let io = ExtFake::new(XeLpgPort::B, sink);
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let probe = match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, true) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("the PCON sink must probe"),
+    };
+    if !probe.output.ycbcr444
+        || probe.output.pcon
+            != Some(PconConfig {
+                hdmi_sink: true,
+                ycbcr444_to_420: true,
+                rgb_to_ycbcr: false,
+            })
+        || probe.pipe_bpp != 24
+        || (probe.negotiated.rate, probe.negotiated.lanes) != (TrainRate::Hbr2, 4)
+    {
+        return TestResult::Fail("the PCON route must drive YCbCr 4:4:4 at 24 bpp on HBR2 x4");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the YCbCr 4:4:4 route must light"),
+    };
+    {
+        let sink = io.sink.borrow();
+        if sink.pcon_log != [(0x3050, 1), (0x3051, 1), (0x3052, 0)]
+            || sink.power_log.first() != Some(&1)
+        {
+            return TestResult::Fail("the PCON must be powered and configured for 4:2:0");
+        }
+        // The PCON setup precedes link training.
+        if sink.training_writes.is_empty() {
+            return TestResult::Fail("the route must train");
+        }
+    }
+    let csc_mode = 0x4_9028 + 0x100 * Pipe::B as u64;
+    let coeff = 0x4_9050 + 0x100 * Pipe::B as u64;
+    if io.writes_to(0x6_1410) != [0x3D]
+        || io.writes_to(0x7_1030) != [(1 << 23) | 0x100, (1 << 23) | 0x100 | (1 << 11)]
+        || io.read32(csc_mode) & (1 << 30) == 0
+        || io.read32(coeff) != (0x1e08 << 16 | 0x9cc0)
+    {
+        return TestResult::Fail("the pipe must run the YCbCr 4:4:4 MSA, PIPE_MISC and CSC");
+    }
+    if route.stop(&io).is_err()
+        || io.read32(0x6_1410) != 0x21
+        || io.read32(0x7_1030) & (1 << 11) != 0
+        || io.read32(csc_mode) & (1 << 30) != 0
+    {
+        return TestResult::Fail("the stop must clear the CSC and YUV and restore the MSA");
+    }
+    // The same PCON without the option: RGB, no PCON writes.
+    let mut sink = Sink::new(0x14, tests::edid_4k60_with(&tests::HDMI_420_ONLY_BLOCKS));
+    sink.caps[5] = 0x11;
+    sink.extra.push((0x80, 3));
+    sink.extra.push((0x83, 0x10));
+    let io = ExtFake::new(XeLpgPort::B, sink);
+    match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, false) {
+        Ok(p) if p.output == crate::intel_gpu_xelpg_external::color::DpOutput::default() => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("without the option the route keeps RGB"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_ycbcr444_pcon_route
 );

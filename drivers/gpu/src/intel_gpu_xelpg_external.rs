@@ -481,6 +481,9 @@ pub enum ExternalError {
     /// A second concurrent route (`narf.intel.ext_routes=2`) is refused
     /// beside the route already owned ([`SecondRouteRefusal`]).
     SecondRoute(SecondRouteRefusal),
+    /// The output format `narf.intel.hdmi14_ext=1` would drive is refused
+    /// ([`color::ColorRefusal`]).
+    Color(color::ColorRefusal),
 }
 
 /// Why a second concurrent external route is refused under
@@ -981,6 +984,10 @@ pub struct MtlSinkProbe {
     /// link's lane count and bandwidth beside the 8b/10b ceiling rate that
     /// could not.
     pub uhbr: Option<UhbrPlan>,
+    /// The output format and protocol-converter setup
+    /// (`narf.intel.hdmi14_ext=1`, [`color::dp_output`]); RGB with no PCON
+    /// writes otherwise.
+    pub output: color::DpOutput,
 }
 
 /// A 128b/132b SST route (`intel_dp_is_uhbr`).
@@ -1297,6 +1304,17 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
             crate::intel_gpu_dp::DpError::Modeset(e) => ExternalError::Modeset(e),
         })
     })?;
+    // narf.intel.hdmi14_ext=1: intel_dp_update_420's DFP facts and
+    // intel_dp_compute_formats' output format (YCbCr 4:4:4 into a PCON that
+    // converts it to 4:2:0).
+    let output = if ext {
+        let dfp = color::read_dfp_caps(&mut aux, &raw)
+            .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
+        color::dp_output(&raw, dfp, &edid[..edid_len], &mode)
+            .map_err(|e| rollback(ExternalError::Color(e)))?
+    } else {
+        color::DpOutput::default()
+    };
     let source = SourceCaps {
         max_rate: TrainRate::Hbr3,
         max_lanes: tc.map_or(4, |conn| conn.max_lanes),
@@ -1432,6 +1450,12 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
             payload_kbps: negotiated.payload_kbps,
         }));
     }
+    // intel_dp_min_bpp: a YCbCr output has no 6 bpc pipe.
+    if output.ycbcr444 && pipe_bpp < dsc::PIPE_BPP {
+        return Err(rollback(ExternalError::Color(
+            color::ColorRefusal::Ycbcr444Bpp,
+        )));
+    }
     if !io.display_access_ok() {
         return Err(rollback(ExternalError::AccessLost));
     }
@@ -1451,6 +1475,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         dsc: plan,
         pipe_bpp,
         uhbr: uhbr_plan,
+        output,
     })
 }
 
@@ -1804,6 +1829,13 @@ fn enable_port<M: MmioWindow + ?Sized>(
     // 6.c TRANS_DDI_FUNC_CTL configured without ENABLE.
     let func = stream_func(&route.probe, lanes);
     write(io, trans_ddi_func_ctl(trans), func & !TRANS_DDI_FUNC_ENABLE)?;
+    // intel_dp_set_power(D0) and intel_dp_configure_protocol_converter for
+    // a PCON under narf.intel.hdmi14_ext=1 (best effort, as in Linux).
+    if let Some(pcon) = route.probe.output.pcon {
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
+        let _ = aux.dpcd_write(dsc::DP_SET_POWER, &[dsc::DP_SET_POWER_D0]);
+        color::configure_protocol_converter(&mut aux, &pcon);
+    }
     // intel_dp_set_power(D0), intel_dp_sink_enable_decompression and
     // intel_dp_sink_set_fec_ready, before training.
     if let Some(plan) = route.probe.dsc {
@@ -2349,14 +2381,16 @@ fn finish<M: MmioWindow + ?Sized>(
     }
     let lost = |_| ExternalError::AccessLost;
     let pipe_bpp = route.probe.pipe_bpp;
+    let ycbcr444 = route.probe.output.ycbcr444;
     // intel_ddi_set_dp_msa, the last step of intel_ddi_pre_enable_dp. The
-    // 8 bpc route keeps its write stream (and leaves the MSA as it is); a
-    // 6 bpc route writes its 6 bpc MSA, and its stop restores 8 bpc.
-    if pipe_bpp != dsc::PIPE_BPP {
+    // 8 bpc RGB route keeps its write stream (and leaves the MSA as it is);
+    // any other depth or a YCbCr 4:4:4 output writes its MSA, and its stop
+    // restores the 8 bpc RGB one.
+    if pipe_bpp != dsc::PIPE_BPP || ycbcr444 {
         write(
             io,
             trans.base() + dsc::TRANS_MSA_MISC_OFFSET,
-            dsc::msa_misc(pipe_bpp),
+            color::msa_misc(pipe_bpp, ycbcr444),
         )?;
     }
     let plan = route.probe.dsc;
@@ -2378,6 +2412,14 @@ fn finish<M: MmioWindow + ?Sized>(
         (None, None) => program_mn(io, trans, &mode, pll_rate, lanes, pipe_bpp)?,
     }
     rp.pipes.program_timings(io, pipe)?;
+    // A YCbCr 4:4:4 output: bdw_set_pipe_misc's YUV colorspace and the
+    // BT.709 output CSC, pipe off.
+    if ycbcr444 {
+        let misc = pipe.base() + dsc::PIPE_MISC_OFFSET;
+        let cur = read(io, misc)?;
+        write(io, misc, cur | color::PIPE_MISC_OUTPUT_COLORSPACE_YUV)?;
+        crate::intel_gpu_modeset::program_output_csc_ycbcr(io, pipe);
+    }
     // intel_ddi_enable: 128b/132b SST's TRANS_DP2_VFREQ pair (the pixel
     // clock in Hz, bits 31:8 of each), function, then the transcoder.
     if uhbr_plan.is_some() {
@@ -2554,10 +2596,11 @@ fn disable_port<M: MmioWindow + ?Sized>(
         trans_ddi_func_ctl(trans),
         func & !(TRANS_DDI_FUNC_ENABLE | if uhbr { 0 } else { TRANS_DDI_PORT_AND_MODE }),
     )?;
-    // A 6 bpc route leaves the MSA at 8 bpc: the 8 bpc route does not
-    // write it (its write stream predates the MSA), and Linux's
-    // intel_ddi_set_dp_msa would write 8 bpc at its next enable.
-    if route.probe.pipe_bpp != dsc::PIPE_BPP {
+    // A 6, 10 or 12 bpc or YCbCr 4:4:4 route leaves the MSA at 8 bpc RGB:
+    // the 8 bpc route does not write it (its write stream predates the
+    // MSA), and Linux's intel_ddi_set_dp_msa would write it at its next
+    // enable.
+    if route.probe.pipe_bpp != dsc::PIPE_BPP || route.probe.output.ycbcr444 {
         write(
             io,
             trans.base() + dsc::TRANS_MSA_MISC_OFFSET,
@@ -2683,6 +2726,10 @@ fn stop_local<M: MmioWindow + ?Sized>(
             PipeEnableError::Timeout => stop_failed,
             e => e.into(),
         })?;
+        // The YCbCr 4:4:4 output CSC and PIPE_MISC encoding, pipe off.
+        if route.probe.output.ycbcr444 {
+            crate::intel_gpu_modeset::clear_output_csc_ycbcr(io, pipe);
+        }
         disable_port(io, route)?;
     }
     finish_port_stop(io, route)?;

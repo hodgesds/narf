@@ -13,15 +13,21 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 /// one CTA-861 revision 3 extension whose data block collection is
 /// `blocks`, checksums valid.
 pub(crate) fn edid_with(revision: u8, input: u8, blocks: &[u8]) -> Vec<u8> {
-    fn checksum(block: &mut [u8]) {
-        let sum: u32 = block[..127].iter().map(|&b| u32::from(b)).sum();
-        block[127] = ((256 - sum % 256) % 256) as u8;
-    }
     let mut e = crate::intel_gpu_xelpg_external::tests::edid_for(
         148_500, 1920, 280, 88, 44, 1080, 45, 4, 5,
     );
     e[19] = revision;
     e[20] = input;
+    with_cta(e, blocks)
+}
+
+/// `base` (one block) plus a CTA-861 revision 3 extension whose data block
+/// collection is `blocks`, checksums valid.
+pub(crate) fn with_cta(mut e: Vec<u8>, blocks: &[u8]) -> Vec<u8> {
+    fn checksum(block: &mut [u8]) {
+        let sum: u32 = block[..127].iter().map(|&b| u32::from(b)).sum();
+        block[127] = ((256 - sum % 256) % 256) as u8;
+    }
     e[126] = 1;
     checksum(&mut e[..128]);
     let mut ext = alloc::vec![0u8; 128];
@@ -175,4 +181,120 @@ fn smoke_xelpg_deep_colour_encodings_and_admission() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_color",
     smoke_xelpg_deep_colour_encodings_and_admission
+);
+
+/// The HDMI VSDB without deep colour (payload 5) and a Y420VDB naming
+/// VIC 97 (3840x2160@60): a 4:2:0-only 4K60 HDMI sink.
+pub(crate) const HDMI_420_ONLY_BLOCKS: [u8; 9] = [
+    (3 << 5) | 5,
+    0x03,
+    0x0C,
+    0x00,
+    0x10,
+    0x00,
+    (7 << 5) | 2,
+    0x0E,
+    97,
+];
+
+/// A 4K60 (CTA VIC 97 timing) EDID 1.4 sink whose CTA extension carries
+/// `blocks`.
+pub(crate) fn edid_4k60_with(blocks: &[u8]) -> Vec<u8> {
+    with_cta(
+        crate::intel_gpu_xelpg_external::tests::edid_for(
+            594_000, 3840, 560, 176, 88, 2160, 90, 8, 10,
+        ),
+        blocks,
+    )
+}
+
+/// `drm_dp_downstream_420_passthrough` / `_444_to_420_conversion` /
+/// `_rgb_to_ycbcr_conversion`, then `intel_dp_compute_formats`,
+/// `intel_dp_output_format` and `intel_dp_configure_protocol_converter`'s
+/// decisions, and `intel_ddi_set_dp_msa`'s 4:4:4 colorimetry.
+fn smoke_xelpg_dp_ycbcr444_output_format() -> TestResult {
+    // DPCD 1.4 branch with detailed downstream capabilities; DFP 0 HDMI.
+    let mut dpcd = [0u8; 16];
+    dpcd[0] = 0x14;
+    dpcd[DP_DOWNSTREAMPORT_PRESENT] = 0x11;
+    let hdmi = |byte3: u8| [3u8, 0, 0, byte3];
+    if dfp_caps(&dpcd, &hdmi(0x54))
+        != (DfpCaps {
+            ycbcr420_passthrough: true,
+            ycbcr_444_to_420: true,
+            rgb_to_ycbcr: true,
+        })
+        || !dfp_caps(&dpcd, &[0, 0, 0, 0]).ycbcr420_passthrough
+        || dfp_caps(&[0x12, 0, 0, 0, 0, 0x11], &hdmi(0x54)) != DfpCaps::default()
+        || dfp_caps(&[0x14, 0, 0, 0, 0, 0x01], &hdmi(0x54)) != DfpCaps::default()
+        || dfp_caps(&[0x14, 0, 0, 0, 0, 0x10], &hdmi(0x54)) != DfpCaps::default()
+    {
+        return TestResult::Fail("the drm_dp_downstream_* conversion facts differ");
+    }
+    let edid = edid_4k60_with(&HDMI_420_ONLY_BLOCKS);
+    let Ok(mode) = crate::intel_gpu_dp::mode_from_edid(&edid) else {
+        return TestResult::Fail("the 4K60 EDID must give its preferred mode");
+    };
+    let output = |dpcd: &[u8], byte3: u8, edid: &[u8]| {
+        dp_output(dpcd, dfp_caps(dpcd, &hdmi(byte3)), edid, &mode)
+    };
+    // 4:4:4->4:2:0 only: the pipe drives YCbCr 4:4:4, the PCON converts.
+    if output(&dpcd, 0x10, &edid)
+        != Ok(DpOutput {
+            ycbcr444: true,
+            pcon: Some(PconConfig {
+                hdmi_sink: true,
+                ycbcr444_to_420: true,
+                rgb_to_ycbcr: false,
+            }),
+        })
+    {
+        return TestResult::Fail("a 4:4:4->4:2:0 PCON must take a YCbCr 4:4:4 pipe");
+    }
+    // RGB->YCbCr and 4:4:4->4:2:0: RGB out, both conversions on.
+    if output(&dpcd, 0x50, &edid)
+        != Ok(DpOutput {
+            ycbcr444: false,
+            pcon: Some(PconConfig {
+                hdmi_sink: true,
+                ycbcr444_to_420: true,
+                rgb_to_ycbcr: true,
+            }),
+        })
+    {
+        return TestResult::Fail("an RGB->YCbCr PCON must keep the pipe RGB");
+    }
+    // A passthrough DFP or a native sink would need DP 4:2:0: refused.
+    let native = [0x14u8, 0, 0, 0, 0, 0];
+    if output(&dpcd, 0x04, &edid) != Err(ColorRefusal::Ycbcr420Output)
+        || output(&native, 0, &edid) != Err(ColorRefusal::Ycbcr420Output)
+    {
+        return TestResult::Fail("a DP 4:2:0 output must refuse");
+    }
+    // No conversion and no passthrough: 4:2:0 is not allowed, so RGB.
+    if output(&dpcd, 0x00, &edid)
+        != Ok(DpOutput {
+            ycbcr444: false,
+            pcon: Some(PconConfig {
+                hdmi_sink: true,
+                ..PconConfig::default()
+            }),
+        })
+    {
+        return TestResult::Fail("a 4:2:0 sink the DFP cannot feed must fall back to RGB");
+    }
+    // A mode that is not 4:2:0-only stays RGB on a native sink, no PCON.
+    let rgb = edid_4k60_with(&HDMI_420_ONLY_BLOCKS[..6]);
+    if output(&native, 0, &rgb) != Ok(DpOutput::default()) {
+        return TestResult::Fail("a native RGB sink must keep RGB without PCON writes");
+    }
+    // DP_MSA_MISC_COLOR_YCBCR_444_BT709 = 0x1C beside SYNC_CLOCK | 8_BPC.
+    if msa_misc(24, true) != 0x3D || msa_misc(24, false) != 0x21 || msa_misc(30, true) != 0x5D {
+        return TestResult::Fail("the 4:4:4 MSA differs from intel_ddi_set_dp_msa");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_color",
+    smoke_xelpg_dp_ycbcr444_output_format
 );

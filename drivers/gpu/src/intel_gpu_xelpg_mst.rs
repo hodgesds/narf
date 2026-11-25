@@ -251,6 +251,7 @@ impl MtlMstRoute {
                 dsc: None,
                 pipe_bpp: 24,
                 uhbr: None,
+                output: super::color::DpOutput::default(),
             };
             // Copy the EDID straight into the probe's own buffer: a
             // separate 512-byte staging array is a second stack slot in

@@ -3928,6 +3928,14 @@ pub(crate) fn program_ycbcr420_pipe<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe, 
     for (reg, val) in ycbcr420_scaler(mode).enable_writes(pipe) {
         io.write32(reg, val);
     }
+    program_output_csc_ycbcr(io, pipe);
+}
+
+/// The BT.709 limited-range RGB-to-YCbCr output CSC of a YCbCr output on
+/// display 11+ (`icl_assign_csc` with `ilk_csc_matrix_rgb_to_ycbcr`,
+/// `icl_update_output_csc`: pre-offsets, coefficients, post-offsets), then
+/// `ICL_OUTPUT_CSC_ENABLE`; shared by 4:2:0 and 4:4:4 outputs.
+pub(crate) fn program_output_csc_ycbcr<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe) {
     let base = PIPE_CSC_OUTPUT_COEFF_RY_GY + pipe as u64 * PIPE_COLOR_STRIDE;
     const COEFF: [u32; 9] = [
         0x1e08, 0x9cc0, 0xb528, 0x2ba8, 0x09d8, 0x37e8, 0xbce8, 0x9ad8, 0x1e08,
@@ -4060,6 +4068,12 @@ pub(crate) fn clear_ycbcr420_pipe<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe) {
     for (reg, val) in crate::intel_gpu_xelpg_scaler::disable_writes(pipe) {
         io.write32(reg, val);
     }
+    clear_output_csc_ycbcr(io, pipe);
+}
+
+/// Undo [`program_output_csc_ycbcr`] once the pipe is down, with the
+/// `PIPE_MISC` YUV encoding (a YCbCr 4:4:4 output has no scaler).
+pub(crate) fn clear_output_csc_ycbcr<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe) {
     let csc_mode = PIPE_CSC_MODE + pipe as u64 * PIPE_COLOR_STRIDE;
     let cur = io.read32(csc_mode);
     io.write32(csc_mode, cur & !ICL_OUTPUT_CSC_ENABLE);
