@@ -65,6 +65,61 @@ use narf_filesystem::uevent::UeventAction;
 /// Linux: `DRM_MAJOR = 226` (include/uapi/linux/major.h).
 const DRM_MAJOR: u32 = 226;
 
+/// Each card's primary minor (`dev->primary->kdev`), the kobject a
+/// connector property event is sent on.
+static CARD_NODES: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u32, Arc<Kobject>)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn remember_card_node(idx: u32, kobj: &Arc<Kobject>) {
+    let mut nodes = CARD_NODES.lock();
+    nodes.retain(|(i, _)| *i != idx);
+    nodes.push((idx, kobj.clone()));
+}
+
+/// `drm_sysfs_connector_property_event`: a `change` uevent on card `card`'s
+/// primary minor with `HOTPLUG=1`, `CONNECTOR=<id>` and `PROPERTY=<id>`,
+/// then the minor's own uevent variables (`dev_uevent`). Drivers send it
+/// when they change a property's value themselves
+/// (`drm_hdcp_update_content_protection`). Returns `false`, sending
+/// nothing, for a card without a sysfs node.
+pub(crate) fn connector_property_event(card: u32, connector: u32, property: u32) -> bool {
+    let Some(kobj) = CARD_NODES
+        .lock()
+        .iter()
+        .find(|(i, _)| *i == card)
+        .map(|(_, k)| k.clone())
+    else {
+        return false;
+    };
+    let full = kobj.path();
+    let devpath = String::from(full.strip_prefix("/sys").unwrap_or(&full));
+    let mut extras = alloc::vec![
+        (String::from("HOTPLUG"), String::from("1")),
+        (String::from("CONNECTOR"), format!("{connector}")),
+        (String::from("PROPERTY"), format!("{property}")),
+    ];
+    if let Some(text) = kobj.attr_show("uevent") {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                extras.push((String::from(k), String::from(v)));
+            }
+        }
+    }
+    narf_filesystem::emit_uevent_extras(
+        UeventAction::Change,
+        devpath,
+        String::from("drm"),
+        extras,
+    );
+    true
+}
+
+/// Test-only: make `kobj` card `idx`'s primary minor.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __set_card_node_for_test(idx: u32, kobj: &Arc<Kobject>) {
+    remember_card_node(idx, kobj);
+}
+
 /// Populate the DRM sysfs subtree for every card in the DRM registry.
 ///
 /// Called once from a `Stage::Late` initcall after all `Stage::Subsys`
@@ -294,6 +349,7 @@ fn populate_card_node(
     }
     // Writable uevent so a real udevd's `udevadm trigger` re-broadcasts the ADD.
     kobject_add_uevent_attr(&kobj, card_uevent(idx, &driver));
+    remember_card_node(idx, &kobj);
 
     // Writable `vblank_offset_ns` (default 0): the render-slack tuning knob —
     // how many ns BEFORE the true simulated vblank a flip-complete event is made
@@ -769,4 +825,49 @@ pub mod tests {
         "drivers/gpu/drm_sysfs",
         smoke_drm_device_subsystem_points_at_pci
     );
+
+    /// drm_sysfs_connector_property_event: `change` on the card's primary
+    /// minor, `HOTPLUG=1`, `CONNECTOR=`, `PROPERTY=`, then the minor's
+    /// own uevent variables; nothing for a card without a node.
+    fn smoke_drm_connector_property_event() -> TestResult {
+        let mut reader = narf_filesystem::UeventReader::new();
+        if connector_property_event(0xfff0, 3, 0x84) || !reader.drain(4).is_empty() {
+            return TestResult::Fail("event for a card without a sysfs node");
+        }
+        let node = Kobject::new_root("cp-event-card7");
+        kobject_add_uevent_attr(&node, card_uevent(7, "intel-gpu"));
+        __set_card_node_for_test(0xfff1, &node);
+        if !connector_property_event(0xfff1, 9, 0x84) {
+            return TestResult::Fail("no event for a card with a node");
+        }
+        let events = reader.drain(4);
+        let Some(ev) = events.first() else {
+            return TestResult::Fail("event not in the ring");
+        };
+        let keys: alloc::vec::Vec<(&str, &str)> = ev
+            .extras
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        if events.len() != 1
+            || ev.action != UeventAction::Change
+            || ev.subsystem != "drm"
+            || !ev.devpath.ends_with("cp-event-card7")
+            || keys.get(..5)
+                != Some(
+                    &[
+                        ("HOTPLUG", "1"),
+                        ("CONNECTOR", "9"),
+                        ("PROPERTY", "132"),
+                        ("MAJOR", "226"),
+                        ("MINOR", "7"),
+                    ][..],
+                )
+        {
+            return TestResult::Fail("connector property uevent contents");
+        }
+        CARD_NODES.lock().retain(|(i, _)| *i != 0xfff1);
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/drm_sysfs", smoke_drm_connector_property_event);
 }

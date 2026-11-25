@@ -3281,7 +3281,7 @@ const MAX_BPC_RANGE: [u64; 2] = [8, 16];
 /// drm_connector_attach_content_protection_property: "Content Protection"
 /// (drm_cp_enum_list) and, with HDCP 2.2, "HDCP Content Type"
 /// (drm_hdcp_content_type_enum_list).
-const CONTENT_PROTECTION_PROP_ID: u32 = 0x84;
+pub(crate) const CONTENT_PROTECTION_PROP_ID: u32 = 0x84;
 const HDCP_CONTENT_TYPE_PROP_ID: u32 = 0x85;
 const CONTENT_PROTECTION_ENUMS: EnumEntries = [(0, b"Undesired"), (1, b"Desired"), (2, b"Enabled")];
 const HDCP_CONTENT_TYPE_ENUMS: [(u64, &[u8]); 2] = [(0, b"HDCP Type0"), (1, b"HDCP Type1")];

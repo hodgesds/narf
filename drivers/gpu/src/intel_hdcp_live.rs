@@ -625,18 +625,26 @@ pub fn request(card: u32, connector: u32, value: u8, content_type: u8) {
     }
 }
 
-/// Write a driver-side flip into the card's uAPI state
-/// (`drm_hdcp_update_content_protection`).
+/// Write a driver-side flip into the card's uAPI state and, when the value
+/// changed, send the connector property uevent
+/// (`drm_hdcp_update_content_protection` →
+/// `drm_sysfs_connector_property_event`).
 fn publish(card: u32, connector: u32, value: CpValue) {
-    if let Some(mode) = crate::drm_registry::mode_state(card) {
-        if let Some(cp) = mode
-            .lock()
-            .content_protection
-            .iter_mut()
-            .find(|c| c.connector == connector)
-        {
-            cp.value = value as u8;
-        }
+    let Some(mode) = crate::drm_registry::mode_state(card) else {
+        return;
+    };
+    let changed = mode
+        .lock()
+        .content_protection
+        .iter_mut()
+        .find(|c| c.connector == connector)
+        .is_some_and(|cp| core::mem::replace(&mut cp.value, value as u8) != value as u8);
+    if changed {
+        crate::drm_sysfs_bridge::connector_property_event(
+            card,
+            connector,
+            crate::drm_ioctl_bridge::CONTENT_PROTECTION_PROP_ID,
+        );
     }
 }
 
