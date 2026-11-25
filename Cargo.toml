@@ -39,6 +39,7 @@ members = [
     "event_bus",
     "build/xtask",
     "verification/btrfs-host",
+    "verification/ext4-host",
     "build/cargo-narf",
     "abi",
     "io",

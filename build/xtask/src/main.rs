@@ -42,6 +42,7 @@ mod ci_clippy;
 mod composition;
 mod crate_release;
 mod efi_image;
+mod ext4_host;
 mod frame_budget;
 mod hibernate_e2e;
 mod http3_smoke;
@@ -207,6 +208,12 @@ enum Cmd {
     /// `btrfs check`/`restore`, NARF remount, and crash-consistency replay of
     /// the recorded write/flush stream (`verification/btrfs-host`).
     BtrfsHostRw(btrfs_host::Args),
+    /// Host-side (no QEMU) ext4 write harness: CachyOS-shaped fixtures made
+    /// by `mkfs.ext4 -d`, mounted through NARF's ext4 driver in a host
+    /// process, a seeded random workload checked against a model, then
+    /// `e2fsck -fn`, `debugfs rdump` and a NARF remount
+    /// (`verification/ext4-host`).
+    Ext4HostRw(ext4_host::Args),
     /// Pre-hardware validation gate for booting the installed CachyOS root:
     /// boots the real `grub-image` bundle (OVMF -> GRUB -> Limine -> NARF) on
     /// a q35 machine with a decoy NVMe and a CachyOS-layout btrfs root NVMe,
@@ -16487,6 +16494,7 @@ fn main() -> Result<()> {
         Cmd::BtrfsCycles(args) => btrfs_cycles::run(&args),
         Cmd::HibernateE2e(args) => hibernate_e2e::run(&args),
         Cmd::BtrfsHostRw(args) => btrfs_host::run(&args),
+        Cmd::Ext4HostRw(args) => ext4_host::run(&args),
         Cmd::CachyosGate(args) => cachyos_gate::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),

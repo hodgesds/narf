@@ -3159,6 +3159,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-ext4-host"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "narf-block",
+ "narf-console",
+ "narf-drivers-fs-ext2",
+ "narf-filesystem",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-fb"
 version = "0.0.0"
 dependencies = [

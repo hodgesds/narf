@@ -1,0 +1,54 @@
+//! The Linux side's verdict on an image: e2fsck, debugfs, dumpe2fs.
+
+use std::path::Path;
+use std::process::Command;
+
+use crate::model::Model;
+
+/// `e2fsck -fn`: exit code and output. 0 means no problem found.
+pub fn e2fsck(image: &Path) -> (i32, String) {
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(image)
+        .output()
+        .expect("run e2fsck");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.code().unwrap_or(-1), text)
+}
+
+/// The tree as e2fsprogs reads it (`debugfs rdump /`), `lost+found` aside.
+pub fn debugfs_tree(image: &Path, scratch: &Path) -> Model {
+    let _ = std::fs::remove_dir_all(scratch);
+    std::fs::create_dir_all(scratch).unwrap();
+    // rdump exits non-zero when it cannot chown as an unprivileged user;
+    // the contents are what matters.
+    let _ = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("rdump / {}", scratch.display()))
+        .arg(image)
+        .output()
+        .expect("run debugfs");
+    let _ = std::fs::remove_dir_all(scratch.join("lost+found"));
+    let m = Model::load_host(scratch);
+    let _ = std::fs::remove_dir_all(scratch);
+    m
+}
+
+#[allow(dead_code)] // used by the gate and lifecycle scenarios
+/// `dumpe2fs -h` fields by name ("Filesystem state", "Mount count", ...).
+pub fn superblock(image: &Path) -> std::collections::BTreeMap<String, String> {
+    let out = Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(image)
+        .output()
+        .expect("run dumpe2fs");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}

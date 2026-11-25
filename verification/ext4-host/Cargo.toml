@@ -1,0 +1,26 @@
+[package]
+name = "narf-ext4-host"
+description = "Host-side (std, no QEMU) write harness for the ext4 driver, judged by e2fsck and debugfs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "narf-ext4-host"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+narf-block = { path = "../../block" }
+narf-console = { path = "../../console" }
+narf-drivers-fs-ext2 = { path = "../../drivers/fs/ext2" }
+narf-filesystem = { path = "../../filesystem" }
+narf-lib = { path = "../../lib" }
+narf-memory = { path = "../../memory" }
+narf-scheduler = { path = "../../scheduler" }
+
+[lints]
+workspace = true
