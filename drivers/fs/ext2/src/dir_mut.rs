@@ -856,6 +856,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if target.is_empty() {
             return Err(FsError::InvalidPath);
         }
+        // `fscrypt_prepare_symlink`, before any inode exists: the target and
+        // its NUL must fit in one block (-ENAMETOOLONG).
+        if target.len() + 1 > self.block_size() {
+            return Err(FsError::NameTooLong);
+        }
         // Allocate the inode.
         let new_ino = self.alloc_inode().await?;
         let mut new_inode = Inode::new_symlink(0o777);
@@ -882,10 +887,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         } else {
             // Slow symlink — store target in a data block.
             let bs = self.block_size();
-            if target.len() > bs {
-                let _ = self.abort_inode_allocation(new_ino).await;
-                return Err(FsError::InvalidPath);
-            }
             // `ext4_symlink`: a slow symlink is extent-mapped on an ext4
             // volume, block-mapped otherwise.
             let first_block = if self.init_extent_root(&mut new_inode) {

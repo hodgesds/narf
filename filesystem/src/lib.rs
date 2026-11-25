@@ -923,6 +923,23 @@ pub enum FsError {
     /// continuation URB after its transfer failed (`proc_do_submiturb`).
     /// Linux returns `-EREMOTEIO`. Maps to `EREMOTEIO`.
     RemoteIo,
+    /// A link count would pass the filesystem's limit: a hard link to an
+    /// inode at `EXT4_LINK_MAX`, or a subdirectory of a directory that is
+    /// at it without `dir_nlink`. Linux returns `-EMLINK`. Maps to
+    /// `EMLINK`.
+    TooManyLinks,
+    /// On-disk metadata is structurally inconsistent: an extent or htree
+    /// node whose header, counts or limits are impossible. Linux reports
+    /// `-EFSCORRUPTED` (an alias of `EUCLEAN`). Maps to `EUCLEAN`.
+    Corrupted,
+    /// A metadata block failed its checksum. Linux reports `-EFSBADCRC`
+    /// (an alias of `EBADMSG`). Maps to `EBADMSG`.
+    BadChecksum,
+    /// A name or link target is longer than the filesystem can store: a
+    /// symlink target that does not fit in one block with its NUL
+    /// (`fscrypt_prepare_symlink`). Linux returns `-ENAMETOOLONG`. Maps
+    /// to `ENAMETOOLONG`.
+    NameTooLong,
     /// The work was abandoned without running to completion — a GPU job
     /// queued behind one that hung, or any job of a context that caused a
     /// hang (`-ECANCELED`). Maps to `ECANCELED`.

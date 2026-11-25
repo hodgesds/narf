@@ -2578,6 +2578,10 @@ fn open_impl_reserved(
                         narf_filesystem::FsError::HostUnreachable => 113, // EHOSTUNREACH
                         narf_filesystem::FsError::IsADirectory => 21,     // EISDIR
                         narf_filesystem::FsError::RemoteIo => 121,        // EREMOTEIO
+                        narf_filesystem::FsError::TooManyLinks => 31,     // EMLINK
+                        narf_filesystem::FsError::Corrupted => 117,       // EUCLEAN
+                        narf_filesystem::FsError::BadChecksum => 74,      // EBADMSG
+                        narf_filesystem::FsError::NameTooLong => 36,      // ENAMETOOLONG
                         narf_filesystem::FsError::Canceled => 125,        // ECANCELED
                         narf_filesystem::FsError::Interrupted => 4,       // EINTR
                         narf_filesystem::FsError::NoSpace => 28,
@@ -4575,6 +4579,9 @@ fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NoSpace => -ENOSPC,
         FsError::QuotaExceeded => -EDQUOT,
         FsError::Io(_) => -EIO,
+        // A damaged directory or inode (EFSCORRUPTED / EFSBADCRC).
+        FsError::Corrupted => -EUCLEAN,
+        FsError::BadChecksum => -EBADMSG,
         // The path walk's own failures (`lookup_slow`'s ERR_PTR).
         FsError::Interrupted => -EINTR,
         FsError::OutOfMemory => -ENOMEM,
@@ -4635,6 +4642,9 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NoSpace => -ENOSPC,  // from ->rmdir
         FsError::QuotaExceeded => -EDQUOT,  // ditto
         FsError::Io(_) => -EIO,
+        // A damaged directory or inode (EFSCORRUPTED / EFSBADCRC).
+        FsError::Corrupted => -EUCLEAN,
+        FsError::BadChecksum => -EBADMSG,
         // The path walk's own failures (`lookup_slow`'s ERR_PTR).
         FsError::Interrupted => -EINTR,
         FsError::OutOfMemory => -ENOMEM,
@@ -4673,6 +4683,12 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::SymlinkLoop => -ELOOP,
         FsError::NoSpace => -ENOSPC,
         FsError::Io(_) => -EIO,
+        // `ext4_rename`: moving a directory under a new parent that is at
+        // its link limit (`EXT4_DIR_LINK_MAX`).
+        FsError::TooManyLinks => -EMLINK,
+        // A damaged directory or inode (EFSCORRUPTED / EFSBADCRC).
+        FsError::Corrupted => -EUCLEAN,
+        FsError::BadChecksum => -EBADMSG,
         // The path walk's own failures (`lookup_slow`'s ERR_PTR).
         FsError::Interrupted => -EINTR,
         FsError::OutOfMemory => -ENOMEM,
@@ -5265,6 +5281,15 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
             Some(Some(Err(narf_filesystem::FsError::ReadOnly))) => {
                 ctx.set_return(errno_ret(EROFS))
             }
+            // `ext4_link`'s own failures: the link limit, a full or damaged
+            // filesystem, an I/O error.
+            Some(Some(Err(
+                error @ (narf_filesystem::FsError::TooManyLinks
+                | narf_filesystem::FsError::Corrupted
+                | narf_filesystem::FsError::BadChecksum
+                | narf_filesystem::FsError::NoSpace
+                | narf_filesystem::FsError::Io(_)),
+            ))) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
             _ => ctx.set_return(errno_ret(EXDEV)),
         }
         return;
@@ -5362,6 +5387,10 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
         Some(Err(narf_filesystem::FsError::PermissionDenied)) => -EACCES,
         Some(Err(narf_filesystem::FsError::NoSpace)) => -ENOSPC,
         Some(Err(narf_filesystem::FsError::Io(_))) => -EIO,
+        // `ext4_link`: the target inode is at `EXT4_LINK_MAX`.
+        Some(Err(narf_filesystem::FsError::TooManyLinks)) => -EMLINK,
+        Some(Err(narf_filesystem::FsError::Corrupted)) => -EUCLEAN,
+        Some(Err(narf_filesystem::FsError::BadChecksum)) => -EBADMSG,
         _ => -EPERM,
     }
 }
@@ -5732,6 +5761,11 @@ pub(crate) fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::HostUnreachable => 113, // EHOSTUNREACH
         narf_filesystem::FsError::IsADirectory => 21, // EISDIR
         narf_filesystem::FsError::RemoteIo => 121,   // EREMOTEIO
+        narf_filesystem::FsError::TooManyLinks => EMLINK,
+        // Linux EFSCORRUPTED / EFSBADCRC.
+        narf_filesystem::FsError::Corrupted => EUCLEAN,
+        narf_filesystem::FsError::BadChecksum => EBADMSG,
+        narf_filesystem::FsError::NameTooLong => ENAMETOOLONG,
         narf_filesystem::FsError::Canceled => 125, // ECANCELED
         narf_filesystem::FsError::Interrupted => EINTR,
     }
@@ -8567,6 +8601,8 @@ fn xattr_errno(error: narf_filesystem::FsError) -> Option<i64> {
         FsError::InvalidData => XE_INVAL,
         FsError::ReadOnly => XE_ROFS,
         FsError::ArgumentListTooLong => XE_2BIG,
+        FsError::Corrupted => -EUCLEAN,
+        FsError::BadChecksum => -EBADMSG,
         _ => XE_IO,
     })
 }

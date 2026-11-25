@@ -4256,6 +4256,23 @@ fn smoke_ext2_symlink_inline_limit_counts_the_nul() -> TestResult {
             _ => return TestResult::Fail("symlink target does not read back"),
         }
     }
+    // `fscrypt_prepare_symlink`: the target and its NUL must fit in one
+    // block, so bs - 1 bytes is the longest, and bs bytes is ENAMETOOLONG.
+    let bs = volume.block_size();
+    let longest = alloc::vec![b'u'; bs - 1];
+    if !matches!(
+        poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"sbs1", &longest)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("a target of block size - 1 bytes must fit");
+    }
+    let too_long = alloc::vec![b'u'; bs];
+    if !matches!(
+        poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"sbs", &too_long)),
+        Some(Err(narf_filesystem::FsError::NameTooLong))
+    ) {
+        return TestResult::Fail("a target of a whole block must be ENAMETOOLONG");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

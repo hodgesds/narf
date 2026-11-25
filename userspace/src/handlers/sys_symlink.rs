@@ -138,6 +138,18 @@ pub(crate) fn symlink_absolute(
         Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
             ctx.set_return(errno_ret(EPERM)) // `if (!dir->i_op->symlink)`
         }
+        // `ext4_symlink` -> `fscrypt_prepare_symlink`: the target and its NUL
+        // must fit in one block.
+        Some(Some(Err(narf_filesystem::FsError::NameTooLong))) => {
+            ctx.set_return(errno_ret(ENAMETOOLONG))
+        }
+        // A damaged parent directory (EFSCORRUPTED / EFSBADCRC).
+        Some(Some(Err(narf_filesystem::FsError::Corrupted))) => {
+            ctx.set_return(errno_ret(EUCLEAN))
+        }
+        Some(Some(Err(narf_filesystem::FsError::BadChecksum))) => {
+            ctx.set_return(errno_ret(EBADMSG))
+        }
         // Parent path/filesystem didn't resolve → the walk's errno.
         _ => ctx.set_return(errno_ret(path_lookup_errno(link_path, None))),
     }
