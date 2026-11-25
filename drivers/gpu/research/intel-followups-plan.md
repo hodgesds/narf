@@ -169,9 +169,11 @@ Still open, each needing its own grounding first:
   `narf.intel.pxp=1` (spec "MTL/Arrow PXP behind narf.intel.pxp=1") with
   native fixtures only; protected-plane decryption is refused, and the
   RUN_ALONE LRC bit and the runtime wiring have no native model.
-- HDCP. The MEI GSC proxy client it sits behind, as PXP does, is in
-  `drivers/platform/src/mei_gsc_proxy.rs` and joins the media GT's GSC
-  worker through `narf_drivers::gsc_proxy`.
+- HDCP beyond the landed SST DP/HDMI path (`narf.intel.hdcp=1`: HDCP 1.4,
+  HDCP 2.2 through the MEI HDCP client on display 12/13 and the GSC on
+  14+, the Content Protection properties): DP MST stream encryption,
+  `CP_IRQ` delivery, KMS-owner cards' property path, and a silicon run
+  (the NUC12's GOP-lit route is the first target).
 - D3cold through `_PR3` power resources (NARF evaluates no AML).
 - VRAM PRIME/P2P beyond the static attachments in `intel_gpu_prime`
   (peer-to-peer LMEM BAR mapping behind `narf.intel.prime_p2p=1`,

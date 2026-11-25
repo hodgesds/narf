@@ -885,8 +885,8 @@ generation gates below.
   set, which is partial today.
 - Power/thermal-firmware blob (PUNIT) — opaque, loaded by the
   platform.
-- HDCP / content-protection registers — out of scope for the
-  KMS-grade driver.
+- HDCP — HDCP 1.4 and 2.2 on external SST DP and HDMI landed behind
+  `narf.intel.hdcp=1` (§20, "HDCP 1.4 and 2.2"); DP MST HDCP stays out.
 
 ## 7. Lane 1 (#1010) — display correctness core + publication
 
@@ -2810,7 +2810,7 @@ DVI sinks, deep colour (10/12 bpc) and YCbCr 4:2:0 on display 11/12
 (Y420VDB/Y420CMDB, `intel_hdmi_compute_output_format`, the 1:1 pipe
 scaler, the BT.709 output CSC) are implemented with native fixtures.
 Deliberate remainders: 4:2:0 on display 14 (`intel_gpu_xelpg_hdmi`),
-HDCP (separate programme), native HDMI 2.1 FRL (i915 has none; its FRL
+HDCP (§20, behind `narf.intel.hdcp=1`), native HDMI 2.1 FRL (i915 has none; its FRL
 is the DP PCON's), Type-C HDMI alt mode.
 
 ## 16. Multi-pipe display + DP MST (lane Q11 — `intel_gpu_multipipe`, `intel_gpu_mst`, #1017)
@@ -4161,7 +4161,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
-| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR wins over FBC while enabled (PSR1: Wa_14016291713, no stepping readout; PSR2: selective update refuses FBC); an external repartition deactivates FBC before and re-activates it only on a re-proved Pipe-A layout after the latch (same CFB); MTL/Arrow panel off/on (atomic `ACTIVE=0`, `SETCRTC` off, `FBIOBLANK`, master release) with PSR and FBC disabled first and the backlight sequenced (§20); color, HDCP and Arc display remain |
+| Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; MTL/Arrow DMC, DC_off references and lit-panel DC5/DC6 implemented (§12.1, native fixtures added); FBC on the fixed MTL/Arrow Pipe-A primary for KMS-owned GEM framebuffers only, with a CFB placed in DSM excluding WOPCM, the GSC region (only with a Wa_14019821291 media GT) and boot-framebuffer pages, proven outside system RAM, carved by a chunked off-present-path job (FBC stays off until it finishes); PSR wins over FBC while enabled (PSR1: Wa_14016291713, no stepping readout; PSR2: selective update refuses FBC); an external repartition deactivates FBC before and re-activates it only on a re-proved Pipe-A layout after the latch (same CFB); MTL/Arrow panel off/on (atomic `ACTIVE=0`, `SETCRTC` off, `FBIOBLANK`, master release) with PSR and FBC disabled first and the backlight sequenced (§20); HDCP 1.4 and 2.2 on external SST DP and HDMI (display 12+; MEI firmware on 12/13, GSC on 14+) with the "Content Protection" / "HDCP Content Type" connector properties behind `narf.intel.hdcp=1` (§20, native fixtures added, no silicon run); color, DP MST HDCP and Arc display remain |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
 | Additional hwmon controls | BMG firmware-selected I1 thresholds, paired PL1/PL2 and both intervals; DG2 PL1 intervals; fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
@@ -9114,6 +9114,48 @@ intel_dpll_mgr.c, intel_dkl_phy.c, intel_dp_mst.c and their register headers;
 the existing vendor-neutral MST/DP protocol implementations are shared.
 No Intel silicon, Thunderbolt dock or Mesa acceptance is claimed by native
 register/sideband fixtures. Test and build results are recorded in STATUS.md.
+
+### HDCP 1.4 and 2.2 on external DP and HDMI (`narf.intel.hdcp=1`) — native fixtures added
+
+`intel_hdcp` (engine), `intel_hdcp_msg` (HDCP 2.2 messages and the
+firmware command set), `intel_hdcp_shim` (DP and HDMI sinks) and
+`intel_hdcp_live` (properties, routes, service), after Linux 7.4-rc4
+`intel_hdcp.c`, `intel_dp_hdcp.c`, `intel_hdmi.c`, `drm_hdcp_helper.c`,
+`mei_hdcp.c`, `intel_hdcp_gsc_message.c` and `xe_hdcp_gsc.c`.
+
+- Option: `narf.intel.hdcp=1` (strict). Without it no property is attached,
+  the MEI HDCP client does not bind and no HDCP register is touched.
+- Interface: the Intel card's non-eDP connector carries DRM "Content
+  Protection" (Undesired/Desired/Enabled; userspace may not set Enabled)
+  and "HDCP Content Type" (Type0/Type1), through GETCONNECTOR,
+  OBJ_GETPROPERTIES, GETPROPERTY, SETPROPERTY and atomic commits. The
+  driver reports DESIRED→ENABLED and ENABLED→DESIRED into the uAPI
+  value; no uevent is sent (the DRM core has no connector property
+  event).
+- Routes: the connector binds to the function's single live SST route: a
+  Gen12 HPD DP/HDMI session, a display 14+ DP/HDMI route, or the route a
+  Tiger/Alder Lake-P firmware display lit (`TRANS_DDI_FUNC_CTL` readout;
+  DP on combo DDIs whose sink is not eDP, HDMI with the DDI's default DDC
+  pin). DP MST, several routes, older displays and other platforms'
+  firmware routes are refused with typed errors (`HdcpError`).
+- HDCP 1.4: fuse key load, An/Aksv (AUX `AKSV_SELECT`, GMBUS
+  `GMBUS_AKSV_SELECT`), Bksv, R0'/Ri', repeater KSV FIFO with the hardware
+  SHA-1 V' check, topology limits, link check every 2048 ms.
+- HDCP 2.2: AKE/LC/SKE, DP stream-type errata, repeater topology and
+  stream management, HDMI line-rekey control by display stepping, link
+  check every 500 ms. Firmware: the MEI HDCP client
+  (`narf_drivers_platform::mei_hdcp`, joined through
+  `narf_drivers::hdcp_component`) on display 12/13; the media GT's GSC on
+  14+ (with `narf.intel.media_gt=1 narf.intel.gsc=1`), whose worker
+  submits each framed command from its packet object. Without the firmware
+  type-0 content falls back to HDCP 1.4 and type 1 is refused.
+- SRM: `display_hdcp_srm.bin` from the firmware registry; none revokes
+  nothing, as in Linux.
+- Not done: DP MST stream encryption, HDCP on cards driven by the Intel KMS
+  owner's ioctl path (it refuses connector properties other than
+  `CRTC_ID`), the `CP_IRQ` short pulse (RxStatus is polled every 10 ms),
+  the HDCP debugfs files, Gen9/Gen11 port-indexed HDCP registers, and any
+  silicon run.
 
 ## Completion of Intel iGPU and Discrete Arc Support
 
