@@ -465,22 +465,46 @@ ordinary encrypted CachyOS installation bootable through the native package.
 | Open common LUKS2 volumes | Implemented for one normal AES-XTS/`plain64` crypt segment with bounded PBKDF2 or Argon2i/Argon2id keyslots |
 | Read and write the unlocked payload | Implemented; LUKS metadata itself is opened read-only |
 | Supply a key from a measured NARF initramfs | Implemented with `rd.luks.key=/path` and optional `rd.luks.uuid=<uuid>` |
-| Prompt interactively for a passphrase during boot | Not implemented |
+| Prompt interactively for a passphrase during boot | Implemented: `rd.luks.prompt=console` (built-in keyboard, US layout; serial too) or `rd.luks.prompt=serial`, with `rd.luks.uuid=<container-uuid>` |
 | Format LUKS, edit keyslots, repair metadata, use integrity profiles, or resume reencryption | Not implemented |
-| Unlock an installed CachyOS root from the current Arch package entry | Not integrated or accepted as a supported workflow |
+| Unlock an installed CachyOS root from the current Arch package entry | Not integrated; use a native `efi-image` with the prompt (below) |
 
 The keyfile path names a file *inside the staged NARF initramfs*, not a path on
 the still-locked root filesystem. The current Arch package boots built-in
-userspace and does not build or attach a CachyOS-specific NARF initramfs, add
-the required kernel arguments, or offer an unlock prompt. A typical encrypted
-CachyOS root therefore remains unavailable even when its particular LUKS
-header and cipher profile are understood by the block layer.
+userspace and does not add the kernel arguments below.
 
-For now, leave an encrypted production installation unchanged. Test storage
-with a disposable unencrypted ext4 image or disk, or build a dedicated NARF
-initramfs containing a test keyfile. Never copy a production passphrase into a
-development image, and do not remove encryption from the CachyOS installation
-just to test NARF.
+An installed encrypted root is unlocked with the passphrase prompt. Never use a
+keyfile for it: the image sits unencrypted on the ESP, so a key inside it
+unlocks the disk for anyone who can read the ESP. Never copy a production
+passphrase into a development image, and do not remove encryption from the
+CachyOS installation to test NARF.
+
+The prompt runs in the kernel while the root mounts, before PID 1. It prints
+`LUKS <uuid> passphrase (no echo): ` and reads the built-in keyboard (and the
+serial console, if there is one). Each keystroke goes only to the prompt: not to
+the console, not to any `/dev/input/event*` node. Enter submits, Backspace
+deletes a character, Ctrl-U clears the line, and Escape or Ctrl-C gives up. A
+wrong passphrase prints `No key available with this passphrase.` and asks again,
+up to `rd.luks.tries=` times (default 3). Each attempt waits at most
+`rd.luks.timeout=` seconds (default 90, at most 300). USB keyboards are
+best-effort at this stage of boot; use the built-in one.
+
+A read-only trial of a LUKS root (nothing on the disk is written; systemd runs on
+a tmpfs overlay), chainloaded from GRUB like any native image. Here
+`<LUKS_UUID>` is the container's own UUID, the one `lsblk -f` shows for the
+`crypto_LUKS` partition. Under `root-ro` and `root-rw`, `root=UUID=` names the
+container too, not the filesystem inside it: the disk policy designates the
+partition by its own identity
+([block spec](../block/specification/spec.md)).
+
+```sh
+cargo xtask efi-image --output target/narf-root-ro.efi \
+  --cmdline "narf.disks=root-ro root=UUID=<LUKS_UUID> rd.luks.uuid=<LUKS_UUID> \
+rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
+```
+
+`systemd_pid1` on the command line selects the systemd PID 1 kernel build, as
+`--root-policy` does for `grub-image`.
 
 The exact accepted profiles and work limits are documented in the
 [encrypted-block specification](../block/specification/encrypted.md).
