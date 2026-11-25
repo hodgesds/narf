@@ -1100,6 +1100,8 @@ pub(crate) struct MediaGuc<
     gsc: bool,
     /// The GSC kernel queue's newest job (`GscQueue`).
     gsc_job: Option<alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>>,
+    /// The PXP kernel queues' newest job (`PxpQueue`).
+    pxp_job: Option<alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>>,
     gmd: u32,
     topology: MediaTopology,
     /// VDBOX/VEBOX domains whose kernel wake request this owner wrote.
@@ -1206,6 +1208,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
             engines: facts.engines,
             gsc: false,
             gsc_job: None,
+            pxp_job: None,
             gmd: facts.ip.gmd,
             topology: facts.topology,
             wells: 0,
@@ -1284,6 +1287,65 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
             self.begin_stop(now);
         }
         result.map(|(_, fence)| fence)
+    }
+
+    /// One PXP GSC job on GSCCS0 over the client's private PPGTT while GT1
+    /// runs (`gsc_res.q`).
+    fn submit_pxp_gsc(
+        &mut self,
+        now: u64,
+        batch: crate::intel_gpu_exec::ResidentBatch,
+    ) -> Result<
+        alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>,
+        crate::intel_gpu_guc_gt::GtError,
+    > {
+        if !self.gsc || self.state != MediaGucState::Running {
+            return Err(crate::intel_gpu_guc_gt::GtError::State);
+        }
+        // SAFETY: the batch is pxp::GemClient's fixed GSC_HECI_CMD_PKT and
+        // BB_END over its own private, unexported object, which the CPU
+        // leaves alone until the fence ends.
+        let result = unsafe { self.gt.submit_pxp_gsc(now, batch) };
+        self.track_loss(now, &result);
+        result.map(|(_, fence)| fence)
+    }
+
+    /// The first VCS of GT1 (`xe_gt_hw_engine(gt, VIDEO_DECODE, 0, true)`),
+    /// which runs PXP terminations.
+    pub(crate) fn pxp_vcs(&self) -> Option<Engine> {
+        self.engines.iter().find(|engine| engine.is_decode())
+    }
+
+    /// One PXP session termination on GT1's first VCS (`vcs_exec.q`).
+    fn submit_pxp_termination(
+        &mut self,
+        now: u64,
+        words: &[u32],
+    ) -> Result<
+        alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>,
+        crate::intel_gpu_guc_gt::GtError,
+    > {
+        let engine = self
+            .pxp_vcs()
+            .filter(|_| self.state == MediaGucState::Running)
+            .ok_or(crate::intel_gpu_guc_gt::GtError::State)?;
+        let result = self.gt.submit_pxp_termination(now, engine, words);
+        self.track_loss(now, &result);
+        result.map(|(_, fence)| fence)
+    }
+
+    /// A submission that lost the GuC stops this owner, as `submit_gsc` does.
+    fn track_loss<T>(&mut self, now: u64, result: &Result<T, crate::intel_gpu_guc_gt::GtError>) {
+        if self.gt.state() == crate::intel_gpu_guc_gt::GtState::Lost {
+            self.error.get_or_insert(MediaGucError::Gt(
+                result
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .unwrap_or(crate::intel_gpu_guc_gt::GtError::State),
+            ));
+            self.begin_stop(now);
+        }
     }
 
     /// The media HuC object (`huc->fw.bo`) for GSC authentication.
@@ -1676,6 +1738,7 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
         self.published = None;
         self.defaults = None;
         self.gsc_job = None;
+        self.pxp_job = None;
         if self.submission {
             // Linux's GGTT invalidation reverts to MMIO once submission stops.
             if self.allocator.media_guc_submission(false).is_ok() {
@@ -1778,6 +1841,87 @@ impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
 
     fn holds_wake(&self) -> bool {
         self.guc.gsc && self.guc.wells & 1 << GSC_DOMAIN != 0
+    }
+}
+
+/// The production `pxp::Port`: xe_pxp's kernel queues on the media GuC
+/// (`gsc_res.q` on GSCCS0 with the client's PPGTT, `vcs_exec.q` on the first
+/// VCS), one outstanding job at a time.
+pub(crate) struct PxpQueue<
+    'a,
+    M: MmioWindow + Clone,
+    A: crate::intel_gpu_guc_boot::BootAllocator + Clone,
+> {
+    guc: &'a mut MediaGuc<M, A>,
+    now: u64,
+}
+
+impl<'a, M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
+    PxpQueue<'a, M, A>
+{
+    pub(crate) fn new(guc: &'a mut MediaGuc<M, A>, now: u64) -> Self {
+        Self { guc, now }
+    }
+
+    fn admit(
+        &mut self,
+        submitted: Result<
+            alloc::sync::Arc<crate::intel_gpu_fence::CompletionFence>,
+            crate::intel_gpu_guc_gt::GtError,
+        >,
+    ) -> Result<(), pxp::PxpError> {
+        use crate::intel_gpu_guc_gt::GtError;
+        use crate::intel_gpu_guc_sched::SchedulingError;
+        match submitted {
+            Ok(fence) => {
+                self.guc.pxp_job = Some(fence);
+                Ok(())
+            }
+            // No running GT1, GSCCS0 or VCS: -ENODEV.
+            Err(GtError::State) => Err(pxp::PxpError::NoDevice),
+            Err(GtError::Scheduling(SchedulingError::Allocation(_))) => {
+                Err(pxp::PxpError::NoMemory)
+            }
+            Err(_) => Err(pxp::PxpError::Io),
+        }
+    }
+
+    /// The engine submits only after the previous job ended; a job an abort
+    /// left behind still blocks the queue (fail closed).
+    fn busy(&self) -> bool {
+        self.guc
+            .pxp_job
+            .as_ref()
+            .is_some_and(|job| job.result().is_none())
+    }
+}
+
+impl<M: MmioWindow + Clone, A: crate::intel_gpu_guc_boot::BootAllocator + Clone>
+    pxp::Port<pxp::GemClient> for PxpQueue<'_, M, A>
+{
+    fn submit_gsc(&mut self, client: &pxp::GemClient) -> Result<(), pxp::PxpError> {
+        if self.busy() {
+            return Err(pxp::PxpError::Io);
+        }
+        let batch = client.batch()?;
+        let submitted = self.guc.submit_pxp_gsc(self.now, batch);
+        self.admit(submitted)
+    }
+
+    fn submit_termination(&mut self, words: &[u32]) -> Result<(), pxp::PxpError> {
+        if self.busy() {
+            return Err(pxp::PxpError::Io);
+        }
+        let submitted = self.guc.submit_pxp_termination(self.now, words);
+        self.admit(submitted)
+    }
+
+    /// A job that retired with an error (reset, cancellation) is -EIO.
+    fn finished(&mut self) -> Option<Result<(), pxp::PxpError>> {
+        match self.guc.pxp_job.as_ref()?.result()? {
+            Ok(()) => Some(Ok(())),
+            Err(_) => Some(Err(pxp::PxpError::Io)),
+        }
     }
 }
 

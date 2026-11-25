@@ -129,6 +129,7 @@ impl MmioWindow for Window {
                     0x02000000 => 0x80048000, // valid OTHER0 GUC2HOST
                     0x40000000 => 0x80344000, // valid OTHER3 (GSC HECI2) GSC_IRQ_INTF(1)
                     0x80000000 => 0x80640021, // valid OTHER6 (GSCCS0) ER_COMPLETE | USER
+                    0x00080000 => 0x8044000a, // valid OTHER4 (KCR) TERMINATED | RESET_COMPLETE
                     _ => panic!("selected an unowned interrupt"),
                 };
             }
@@ -1053,4 +1054,96 @@ fn smoke_mtl_media_gt_gsc_irq_enables_decodes_and_resets() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_mtl_media_gt_gsc_irq_enables_decodes_and_resets
+);
+
+/// `narf.intel.pxp=1` on the MTL/Arrow media GT: xe_irq_enable_hwe's
+/// CRYPTO_RSVD_INTR_ENABLE = kcr_mask << 16 and CRYPTO_RSVD_INTR_MASK =
+/// ~(kcr_mask << 16) for KCR_PXP_STATE_TERMINATED (1),
+/// KCR_APP_TERMINATED_PER_FW_REQ (2) and KCR_PXP_STATE_RESET_COMPLETE (3);
+/// the bank-0 GEN11_KCR (19) identity decoded as class OTHER instance 4
+/// into latched KCR causes; gt_irq_reset's 0 / ~0 on unrouting. Without the
+/// route the bit is foreign and no CRYPTO register is written.
+fn smoke_mtl_media_gt_kcr_irq_enables_decodes_and_resets() -> TestResult {
+    let w = Window::new();
+    {
+        let mut r = w.0.lock();
+        r.words.insert(0x190040, 0x0000_1234);
+        r.words.insert(0x1900f0, 0x5678_0000);
+    }
+    let irq = install(&w);
+    assert_eq!(irq.service(0), Ok(false));
+    assert_eq!(
+        [0x190040u64, 0x1900f0].map(|reg| w.read32(reg)),
+        [0x1234, 0x5678_0000]
+    );
+    // Not owned yet: a KCR cause is a conflict, as any foreign bit.
+    w.raise(0x0008_0000);
+    assert_eq!(irq.service(1), Err(IrqError::Conflict));
+    drop(irq);
+    let w = Window::new();
+    let irq = install(&w);
+    assert_eq!(irq.service(0), Ok(false));
+    assert!(!irq.kcr_routed());
+    irq.route_kcr().unwrap();
+    assert!(irq.kcr_routed());
+    assert_eq!(irq.route_kcr(), Err(IrqError::Identity));
+    assert_eq!(w.read32(0x190040), 0x000e_0000);
+    assert_eq!(w.read32(0x1900f0), !0x000e_0000);
+    // The GSC sources are a separate route.
+    assert!(!irq.gsc_routed());
+    let from = w.0.lock().writes.len();
+    w.raise(0x0008_0000);
+    for now in 1..20 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x190018), 0);
+    assert_eq!(
+        irq.take_kcr_events(),
+        crate::intel_gpu_gt::media::pxp::KCR_PXP_STATE_TERMINATED
+            | crate::intel_gpu_gt::media::pxp::KCR_PXP_STATE_RESET_COMPLETE
+    );
+    assert_eq!(irq.take_kcr_events(), 0);
+    assert_eq!(irq.take_gsc_events(), 0);
+    let selected: Vec<_> = w.0.lock().writes[from..]
+        .iter()
+        .copied()
+        .filter(|(reg, _)| matches!(*reg, 0x190070 | 0x190060 | 0x190018))
+        .collect();
+    assert_eq!(
+        selected,
+        [
+            (0x190070, 0x0008_0000),
+            (0x190060, 0x8044_000a),
+            (0x190018, 0x0008_0000),
+        ]
+    );
+    irq.unroute_kcr();
+    assert!(!irq.kcr_routed());
+    assert_eq!(
+        [0x190040u64, 0x1900f0].map(|reg| w.read32(reg)),
+        [0, u32::MAX]
+    );
+    // A late identity is still acknowledged after unrouting.
+    w.raise(0x0008_0000);
+    for now in 20..40 {
+        if !irq.service(now).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(w.read32(0x190018), 0);
+    irq.route_kcr().unwrap();
+    let writes = w.0.lock().writes.len();
+    drop(irq);
+    assert_eq!(
+        [0x190040u64, 0x1900f0].map(|reg| w.read32(reg)),
+        [0, u32::MAX]
+    );
+    assert!(w.0.lock().writes[writes..].contains(&(0x190040, 0)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_mtl_media_gt_kcr_irq_enables_decodes_and_resets
 );

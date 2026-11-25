@@ -61,6 +61,15 @@ const HECI2_BIT: u32 = 1 << 30;
 pub(crate) const GSC_EVENT_ER_COMPLETE: u32 = 1 << 0;
 /// `take_gsc_events`: xe_gsc_proxy_irq_handler saw the HECI2 cause.
 pub(crate) const GSC_EVENT_PROXY: u32 = 1 << 1;
+// regs/xe_irq_regs.h CRYPTO_RSVD_INTR_ENABLE / _MASK. With PXP,
+// xe_irq_enable_hwe enables the three KCR causes in their ENGINE1 half and
+// unmasks them. Their bank-0 bit is i915's GEN11_KCR (19); identities decode
+// as class OTHER, OTHER_KCR_INSTANCE (4), with the causes in the low half
+// (xe_pxp_irq_handler's iir).
+pub(crate) const KCR_ENABLE: u64 = 0x190040;
+pub(crate) const KCR_MASK: u64 = 0x1900f0;
+const KCR_EVENTS: u32 = crate::intel_gpu_gt::media::pxp::KCR_EVENTS;
+const KCR_BIT: u32 = 1 << 19;
 const MEDIA_MASKS: [u64; 6] = [0x1900a8, 0x1900ac, 0x1900b0, 0x1900b4, 0x1900d0, 0x1900d4];
 const MEDIA: [Engine; 12] = [
     Engine::Vcs0,
@@ -156,6 +165,12 @@ struct State<M> {
     gsc_routed: bool,
     /// GSC causes decoded since the last `take_gsc_events`.
     gsc_events: u32,
+    /// The KCR bank-0 identity belongs to this controller (set by
+    /// `route_kcr`, kept for decoding after `unroute_kcr`).
+    kcr: bool,
+    kcr_routed: bool,
+    /// KCR causes decoded since the last `take_kcr_events`.
+    kcr_events: u32,
     tiled: bool,
     active: bool,
     pending: bool,
@@ -294,6 +309,9 @@ impl<M: MmioWindow> Controller<M> {
             gsc: false,
             gsc_routed: false,
             gsc_events: 0,
+            kcr: false,
+            kcr_routed: false,
+            kcr_events: 0,
             tiled,
             active: false,
             pending: true, // drain pre-existing owned status before enabling
@@ -502,6 +520,51 @@ impl<M: MmioWindow> Controller<M> {
         core::mem::take(&mut self.0.lock().gsc_events)
     }
 
+    /// With `narf.intel.pxp=1`, enable the media GT's KCR causes as
+    /// xe_irq.c::xe_irq_enable_hwe does when xe_pxp_is_supported:
+    /// CRYPTO_RSVD_INTR_ENABLE = kcr_mask << 16, CRYPTO_RSVD_INTR_MASK =
+    /// ~(kcr_mask << 16). Decoded causes only latch `take_kcr_events`.
+    pub(crate) fn route_kcr(&self) -> Result<(), IrqError> {
+        let mut s = self.0.lock();
+        if !s.active || !s.tiled || s.kcr_routed {
+            return Err(IrqError::Identity);
+        }
+        // As for the GSC: all-ones is the mask's valid reset value, so only
+        // the enable register proves access.
+        read(&s.mmio, KCR_ENABLE)?;
+        s.kcr = true;
+        s.kcr_routed = true;
+        let routes = [
+            (KCR_ENABLE, KCR_EVENTS << 16),
+            (KCR_MASK, !(KCR_EVENTS << 16)),
+        ];
+        for (reg, value) in routes {
+            s.mmio.write32(reg, value);
+        }
+        for (reg, value) in routes {
+            if s.mmio.read32(reg) != value {
+                return Err(IrqError::Route);
+            }
+        }
+        Ok(())
+    }
+
+    /// xe_irq.c::gt_irq_reset's CRYPTO pair: enable 0, mask all ones.
+    /// Decoding ownership stays, so a latched identity is acknowledged.
+    pub(crate) fn unroute_kcr(&self) {
+        let mut s = self.0.lock();
+        if !s.kcr_routed {
+            return;
+        }
+        s.kcr_routed = false;
+        kcr_reset(&s.mmio);
+    }
+
+    /// The KCR causes decoded since the last call (KCR_PXP_STATE_*).
+    pub(crate) fn take_kcr_events(&self) -> u32 {
+        core::mem::take(&mut self.0.lock().kcr_events)
+    }
+
     pub(crate) fn hard_irq(&self) -> narf_interrupts::dispatch::IrqStatus {
         let mut s = self.0.lock();
         if !s.active {
@@ -553,6 +616,7 @@ impl<M: MmioWindow> Controller<M> {
                     BCS8 => (RCS, 3, 8),
                     GSC_BIT => (GSC_ENGINE_EVENTS, 4, 6),
                     HECI2_BIT => (HECI2_EVENT, 4, 3),
+                    KCR_BIT => (KCR_EVENTS, 4, 4),
                     bit if bit & 0xf0 != 0 => (RCS, 5, bit.trailing_zeros() - 4),
                     _ => (0x8000, 4, 0),
                 }
@@ -569,6 +633,9 @@ impl<M: MmioWindow> Controller<M> {
             }
             if s.bank == 0 && s.selected == HECI2_BIT {
                 s.gsc_events |= GSC_EVENT_PROXY;
+            }
+            if s.bank == 0 && s.selected == KCR_BIT {
+                s.kcr_events |= identity & KCR_EVENTS;
             }
             // Identity acknowledgement must precede the bank acknowledgement.
             s.mmio.write32(IDENTITY + s.bank as u64 * 4, identity);
@@ -596,6 +663,7 @@ impl<M: MmioWindow> Controller<M> {
                             | (u32::from(s.compute) << 4)
                             | if s.copy8 { BCS8 } else { 0 }
                             | if s.gsc { GSC_BIT | HECI2_BIT } else { 0 }
+                            | if s.kcr { KCR_BIT } else { 0 }
                     } else {
                         media_bits(s.media)
                     };
@@ -701,6 +769,9 @@ impl<M: MmioWindow> Controller<M> {
         if core::mem::take(&mut s.gsc_routed) {
             gsc_reset(&s.mmio);
         }
+        if core::mem::take(&mut s.kcr_routed) {
+            kcr_reset(&s.mmio);
+        }
         // The primary/media GuCs share this enable bit. An independently
         // unmasked media GuC still needs it, even if it was clear at takeover.
         if s.mmio.read32(GUC_MASK) & (1 << 15) != 0 {
@@ -718,6 +789,12 @@ pub(crate) fn gsc_reset(mmio: &impl MmioWindow) {
     mmio.write32(GSC_ENABLE, 0);
     mmio.write32(GSC_MASK, u32::MAX);
     mmio.write32(HECI2_MASK, u32::MAX);
+}
+
+/// xe_irq.c::gt_irq_reset's KCR registers, written only once PXP routed them.
+pub(crate) fn kcr_reset(mmio: &impl MmioWindow) {
+    mmio.write32(KCR_ENABLE, 0);
+    mmio.write32(KCR_MASK, u32::MAX);
 }
 
 pub(crate) trait MessageRoute {
@@ -824,6 +901,26 @@ impl<M: MmioWindow + Send + 'static, R: MessageRoute> Delivery<M, R> {
     /// See `Controller::take_gsc_events`.
     pub(crate) fn take_gsc_events(&self) -> u32 {
         self.controller.take_gsc_events()
+    }
+
+    /// See `Controller::route_kcr`.
+    pub(crate) fn route_kcr(&self) -> Result<(), IrqError> {
+        self.controller.route_kcr()
+    }
+
+    /// See `Controller::unroute_kcr`.
+    pub(crate) fn unroute_kcr(&self) {
+        self.controller.unroute_kcr()
+    }
+
+    /// Whether the KCR sources are currently enabled on this delivery graph.
+    pub(crate) fn kcr_routed(&self) -> bool {
+        self.controller.0.lock().kcr_routed
+    }
+
+    /// See `Controller::take_kcr_events`.
+    pub(crate) fn take_kcr_events(&self) -> u32 {
+        self.controller.take_kcr_events()
     }
 }
 

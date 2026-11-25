@@ -929,6 +929,64 @@ pub(crate) trait Client {
     fn write(&self, at: u64, bytes: &[u8]) -> Result<(), PxpError>;
 }
 
+/// The production GSC client object: three private, unexported system pages
+/// no handle or mapping names (Linux: XE_BO_FLAG_SYSTEM | PINNED |
+/// NEEDS_UC, bound WB in the XE_VM_FLAG_GSC VM).
+pub(crate) struct GemClient {
+    object: Arc<crate::intel_gpu_gem::GemObject>,
+    platform: crate::intel_gpu_gt::GtPlatform,
+}
+
+impl GemClient {
+    pub(crate) fn new(platform: crate::intel_gpu_gt::GtPlatform) -> Result<Self, PxpError> {
+        let gem = crate::intel_gpu_gem::GemState::new();
+        let object = gem
+            .create(u64::from(CLIENT_PAGES) * 4096, |_, _| Ok(()))
+            .and_then(|handle| gem.object(handle))
+            .map_err(|_| PxpError::NoMemory)?;
+        Ok(Self { object, platform })
+    }
+
+    /// The client's private PPGTT with the object at `CLIENT_VA`, its batch
+    /// at the object's start (xe_vm_bind_kernel_bo, then
+    /// xe_sched_job_create(q, &batch_addr)). The GSC writes msg_out, so the
+    /// mapping is writable.
+    pub(crate) fn batch(&self) -> Result<crate::intel_gpu_exec::ResidentBatch, PxpError> {
+        use crate::intel_gpu_exec::{ExecObject, ExecRequest};
+        ExecRequest {
+            context_id: 0,
+            ring: 0,
+            no_preempt: false,
+            batch_va: CLIENT_VA,
+            batch_len: BATCH_BYTES,
+            objects: alloc::vec![ExecObject {
+                object: self.object.clone(),
+                va: CLIENT_VA,
+                writable: true,
+                asynchronous: false,
+                capture: false,
+            }],
+        }
+        .prepare_for_gt(self.platform)
+        .map_err(|error| match error {
+            narf_filesystem::FsError::OutOfMemory => PxpError::NoMemory,
+            _ => PxpError::Io,
+        })
+    }
+}
+
+impl Client for GemClient {
+    fn va(&self) -> u64 {
+        CLIENT_VA
+    }
+    fn read(&self, at: u64, bytes: &mut [u8]) -> Result<(), PxpError> {
+        self.object.read(at, bytes).map_err(|_| PxpError::Io)
+    }
+    fn write(&self, at: u64, bytes: &[u8]) -> Result<(), PxpError> {
+        self.object.write(at, bytes).map_err(|_| PxpError::Io)
+    }
+}
+
 /// The media GuC's PXP submissions, one outstanding at a time.
 pub(crate) trait Port<C: Client> {
     /// pxp_pkt_submit: the client object's batch on the GSCCS0 PXP queue.
