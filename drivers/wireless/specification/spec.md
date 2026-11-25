@@ -3071,8 +3071,8 @@ gSPI) stays built-in only: no SDIO I/O KABI exists.
      and is retried every 500 ms for a minute while no hardware attempt has
      started: the signed NBSP board selection
      (`brcm/wifi-board-selection-v1.bin`), its assets with exact length and
-     SHA-256, the signed regulatory policy, then the CR4/CA7 boot, ring
-     attach, data enable, the station transport and the station.
+     SHA-256, the kernel's regulatory domain (below), then the CR4/CA7
+     boot, ring attach, data enable, the station transport and the station.
 - **Bus seams** (`KabiBackplane`). BAR0 window select (`0x80`) and the SBMBX
   doorbell (`0x98`) are written with `narf_pci_config_write32`
   (`modules/DATAPATH_ABI_DESIGN.md`, "Device-specific PCI configuration
@@ -3089,10 +3089,30 @@ gSPI) stays built-in only: no SDIO I/O KABI exists.
   only the signed manifest selects a board. The KABI exposes no firmware
   blob identity, so a module `Proof` re-opens each file and refuses a
   missing file or a changed size or signedness; the bytes are hashed once at
-  load. The regulatory domain must come from a staged, signed
-  `wireless-regulatory.bin`: the built-in fallback to the Linux database's
-  world domain is kernel-resident and unreachable from a module, so without
-  that policy the device stays parked.
+  load.
+- **Regulatory domain** (`platform::reg`). The module reads the kernel's
+  installed domain, the one the built-in driver uses
+  (`narf_wireless::reg::db`: a staged signed `wireless-regulatory.bin`,
+  else world `00` from the Linux database, with user and Country-IE
+  changes), through `narf_wireless_regdomain` as one NRGD v1 record decoded
+  by `narf_wireless::reg::parse_domain_record`. It reads no regulatory file
+  itself. Semantics follow the built-in driver:
+  - *Fail closed.* No domain (`-ENODATA`) or an undecodable record parks
+    the device before any hardware attempt, as the built-in
+    `ensure_domain` gate does; the provisioning retry picks up a domain
+    installed later.
+  - *Country required.* The shared station programs the firmware
+    `country` iovar from the domain and refuses one that is not an
+    uppercase alpha2, so world `00` brings brcmfmac up in neither build.
+    Built in that refusal comes after the CR4 boot and is final; the module
+    checks it in the gate instead, so the device stays parked (firmware
+    never runs) and a country set within the retry window still
+    provisions it.
+  - *Live.* The station's policy source re-reads the record on every
+    check (the built-in `GlobalPolicy`); an unchanged record keeps its
+    snapshot, a same-country update is adopted, and a removed domain or a
+    different country refuses the link. The transport reset that follows
+    re-initializes the station under the domain then installed.
 - **Netdev and wiphy** (`cyw43439/interface_module.rs`).
   - The netif bridge names the netdev `wlan%d`.
   - `REGISTER_WIPHY` (§4.1) advertises the station's policy-admitted 2.4

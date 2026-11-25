@@ -2018,13 +2018,16 @@ kernel_test_in!("modules/e2e/ath9k", e2e_ath9k_module_registration);
 /// The real brcmfmac `.ko` (`narf-drivers-wireless-brcm --features module`,
 /// module name `brcm`: the brcmfmac chip discovery, CR4/CA7 firmware
 /// download, msgbuf common rings and the shared FullMAC station over
-/// `narf-module-rt` and the KABI, including `narf_pci_config_write32`).
-/// The relocations resolve and init runs; the module declares the
-/// autoconnect parameters and takes a load argument; it claims every
-/// Broadcom FullMAC PCIe id of the built-in table under its own match name
-/// (so the built-in entries survive), refuses a probe with no device
-/// context before any device access, and unloads leaving no match behind.
-/// QEMU has no Broadcom Wi-Fi, so bring-up itself is proven on hardware.
+/// `narf-module-rt` and the KABI, including `narf_pci_config_write32` and
+/// `narf_wireless_regdomain`). The relocations resolve and init runs; the
+/// module declares the autoconnect parameters and takes a load argument; it
+/// takes its regulatory domain from the kernel (it imports
+/// `narf_wireless_regdomain` and names no `wireless-regulatory.bin` of its
+/// own); it claims every Broadcom FullMAC PCIe id of the built-in table
+/// under its own match name (so the built-in entries survive), refuses a
+/// probe with no device context before any device access, and unloads
+/// leaving no match behind. QEMU has no Broadcom Wi-Fi, so bring-up itself
+/// is proven on hardware.
 fn e2e_brcmfmac_module_registration() -> TestResult {
     use narf_bus::driver_match::{__module_thunk_for_test, count};
     const BROADCOM: u16 = 0x14e4;
@@ -2044,6 +2047,15 @@ fn e2e_brcmfmac_module_registration() -> TestResult {
     else {
         return TestResult::Fail("brcmfmac module fixture absent from staged initramfs");
     };
+    // The regulatory domain is the kernel's: the import is in the symbol
+    // table (and must resolve for init to run), the signed policy file is
+    // not opened by name.
+    let names = |needle: &[u8]| staged.windows(needle.len()).any(|w| w == needle);
+    if !names(b"narf_wireless_regdomain\0") || names(b"wireless-regulatory.bin") {
+        return TestResult::Fail(
+            "brcmfmac.ko does not take its regulatory domain from narf_wireless_regdomain",
+        );
+    }
     fresh_state(0);
     let abi = crate::symbols::compute_abi_hash();
     crate::symbols::set_kernel_abi(abi);

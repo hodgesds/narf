@@ -175,14 +175,15 @@ impl Retained {
     }
 }
 
-/// The fixed signed regulatory domain the module was provisioned under:
-/// the built-in `GlobalPolicy` reads the kernel's live database, which a
-/// module cannot reach, so the station keeps the snapshot it booted with
-/// (a different country needs a reload, as the built-in requires a reset).
-struct FixedPolicy(Arc<narf_wireless::reg::RegulatoryDomain>);
-impl PolicySource for FixedPolicy {
+/// The built-in `GlobalPolicy` over the KABI: every policy check reads the
+/// kernel's live domain ([`platform::reg`]), so a same-country update is
+/// adopted and a removed domain or a different country refuses the link,
+/// exactly as built in; the reset that follows re-initializes the station
+/// under the domain then installed.
+struct KernelPolicy;
+impl PolicySource for KernelPolicy {
     fn snapshot(&self) -> Option<Arc<narf_wireless::reg::RegulatoryDomain>> {
-        Some(self.0.clone())
+        platform::reg::snapshot()
     }
 }
 
@@ -202,8 +203,6 @@ pub struct ModuleNetdev {
     /// A reset failed (or the limit was reached): nothing is serviced.
     dead: AtomicBool,
     resets: AtomicU32,
-    /// The signed domain every generation's station is initialized under.
-    domain: Arc<narf_wireless::reg::RegulatoryDomain>,
     retained: IrqSafeSpinLock<Option<Retained>>,
     tx: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
 }
@@ -363,7 +362,7 @@ impl ModuleNetdev {
             let rebuilt = ModuleStation::initialize_live(
                 alloc::boxed::Box::new(fresh),
                 &[],
-                Arc::new(FixedPolicy(self.domain.clone())),
+                Arc::new(KernelPolicy),
             )
             .await?;
             if rebuilt.mac != self.mac {
@@ -895,17 +894,14 @@ fn encode_register_wiphy(ifindex: u32, station: &ModuleStation) -> Option<Vec<u8
 
 /// Initialize the station on the attached transport and publish it (the
 /// module build's `interface::attach_runtime`): firmware IOCTLs, country,
-/// PHY and event setup under the fixed signed domain, then the session,
-/// the netdev, the wiphy, the service loop and, with `brcm.ssid=`, the
-/// autoconnect.
-pub async fn attach(
-    adapter: ModuleAdapter,
-    domain: Arc<narf_wireless::reg::RegulatoryDomain>,
-) -> Result<(), &'static str> {
+/// PHY and event setup under the kernel's live regulatory domain, then the
+/// session, the netdev, the wiphy, the service loop and, with
+/// `brcm.ssid=`, the autoconnect.
+pub async fn attach(adapter: ModuleAdapter) -> Result<(), &'static str> {
     let station = ModuleStation::initialize_live(
         alloc::boxed::Box::new(adapter),
         &[],
-        Arc::new(FixedPolicy(domain.clone())),
+        Arc::new(KernelPolicy),
     )
     .await
     .map_err(|_| "station initialization failed")?;
@@ -951,7 +947,6 @@ pub async fn attach(
         failed: AtomicBool::new(false),
         dead: AtomicBool::new(false),
         resets: AtomicU32::new(0),
-        domain: domain.clone(),
         retained: IrqSafeSpinLock::new(None),
         tx: IrqSafeSpinLock::new(VecDeque::new()),
     });
