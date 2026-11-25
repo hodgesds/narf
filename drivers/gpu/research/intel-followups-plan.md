@@ -37,6 +37,12 @@ Boot options, each strict and default off:
 | `narf.intel.prime_p2p=1` | Peer-to-peer VRAM PRIME attachments |
 | `narf.intel.pxp=1` | Xe PXP on MTL/Arrow GT1 (with `media_gt=1` and `gsc=1`) |
 | `narf.intel.hdcp=1` | HDCP 1.4 and 2.2 on external SST DP and HDMI, display 12+ |
+| `narf.intel.gen9_irq=1` | Gen9 and Gen9 LP interrupt owner: MSI, hotplug-driven external pass, `intel_irq_suspend`/`resume` |
+| `narf.intel.execlists_suspend=1` | Gen9/Gen11 execlists GT stopped for system sleep (drain, RPS/RC6 off, reset, `GT_IRQ` dropped) and brought up after |
+| `narf.intel.pp_divisor=1` | `PP_DIVISOR` on display-9 panels with an SPT/KBP/CMP-V south display |
+| `narf.intel.gen9_dpll=1` | Gen9 DPLL1-3 arbitration and sharing between external outputs |
+| `narf.intel.rkl_edp=1` | The Rocket Lake internal panel on the owned eDP route |
+| `narf.intel.dg1_kms=1` | The DG1 KMS owner over its firmware-lit Pipe A |
 
 ## Still open
 
@@ -44,10 +50,7 @@ Each item needs its own grounding against Linux i915/xe first, as the landed
 work had.
 
 - Silicon runs of everything above, including the Gen9 display suspend
-  owner (`narf.intel.gen9_suspend=1`) and Gen9 LP DC9. Gen9 also lacks the
-  GT across S3 (the execlists owner has no system-PM hooks, and while it
-  holds its `GT_IRQ` reference DC9 is refused) and `PP_DIVISOR` on pre-CNP
-  south displays.
+  owner (`narf.intel.gen9_suspend=1`) and Gen9 LP DC9.
 - Nova Lake-S: DC3CO (a typed refusal until the route has a LOBF,
   panel-replay or PSR2 trigger and owns the CMTG), and silicon runs of the
   DC service and of a TBT dock. Thunderbolt alt mode on the LT PHY and the
@@ -62,9 +65,17 @@ work had.
   tunnel BW allocation), LTTPR non-transparent mode, the reduced-parameter
   retry after a failed 128b/132b training, HDCP on 128b/132b, VBT C20
   vswing overrides, and a silicon run.
-- Older display: the Rocket Lake internal panel, a DG1 KMS owner, Gen9
-  DPLL arbitration between two external outputs, and the Gen9 interrupt
-  handler (`intel_gpu_gen9_irq` has no caller).
+- Older display: the Gen9 interrupt owner (`narf.intel.gen9_irq=1`), the
+  execlists GT across system sleep (`narf.intel.execlists_suspend=1`),
+  `PP_DIVISOR` on pre-CNP south displays (`narf.intel.pp_divisor=1`), Gen9
+  DPLL1-3 arbitration between external outputs (`narf.intel.gen9_dpll=1`),
+  the Rocket Lake internal panel (`narf.intel.rkl_edp=1`) and a DG1 KMS
+  owner (`narf.intel.dg1_kms=1`) have native fixtures and no silicon run.
+  Still open there: Gen9 pipe B/C interrupts once PW_2 comes up after the
+  install (`gen8_irq_power_well_post_enable`), vblank, flip-done and
+  underrun consumers, PSR (PSR1; PSR2 is defeatured, Wa_16011181250) and a
+  KMS presenter on the Rocket Lake panel, and the DG1 presenter (refused,
+  as DG2's is, by the integrated Gen12 primary owner).
 - PXP: protected planes decrypt or go black on linear XR24 only (tiled and
   XR30 protected framebuffers are refused), the RUN_ALONE LRC bit and the
   runtime wiring have no native model, and there is no silicon run.

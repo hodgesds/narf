@@ -716,7 +716,11 @@ Internal display programming admits qualified Gen12 (Tiger Lake / Alder Lake /
 Raptor Lake), Gen11, Gen9 and Gen9 LP, and the separate Meteor/Arrow Lake
 Xe-LPG sequence. Rocket Lake
 has an exact GT and VBT metadata profile; its external outputs on DDI B and
-TC1/TC2 are admitted, and its internal display-programming gate stays closed.
+TC1/TC2 are admitted, and its internal display-programming gate stays closed
+unless `narf.intel.rkl_edp=1` admits the panel: then a VBT declaring eDP on
+port A routes it through the Tiger Lake panel modeset on combo PHY A
+(`rkl_pll_mgr`'s DPLL0, the RKL `DPCLKA_CFGCR0` layout, no PW_2, the RKL
+CDCLK and eDP buffer tables) with the CNP-layout PWM and no PSR.
 Arrow Lake shares the `MeteorLake` classification and Linux's `mtl_desc`
 display descriptor. Lunar, Panther and Wildcat Lake and Nova Lake-S keep
 their headless execution profile unless their per-device route is requested
@@ -1134,6 +1138,11 @@ Public interface:
   T10 500 ms, T11+T12 610 ms). `init_registers` programs the
   delay registers and the PP_CONTROL cycle-delay field
   (100 ms granularity on CNP+ PCH — there is no PP_DIVISOR).
+  On a display-9 panel with a pre-CNP south display (SPT, KBP,
+  CMP-V) `narf.intel.pp_divisor=1` programs `PP_DIVISOR`
+  instead (`(100 * rawclk_MHz) / 2 - 1` and the cycle delay
+  plus one, `pps_init_registers`), decodes the cycle from it,
+  and the Gen9 resume relight reprograms it.
   `power_on` enforces the power cycle (status-side
   IDLE_CYCLE poll plus the software remainder of T11+T12
   from the recorded power-off stamp) before setting
@@ -1457,7 +1466,10 @@ Public interface:
   registers the resident copy with the PM core for the
   resume reload. Non-fatal: any failure only disables
   runtime power management and the display still modesets.
-  DG1 has no Gen12 modeset path and is not wired.
+  DG1 has no Gen12 modeset path and is not wired; with
+  `narf.intel.dg1_kms=1` its firmware-lit Pipe A gets the
+  discrete KMS owner DG2 has (`DiscreteDisplayIp::Dg1`,
+  display 12, the Tiger Lake KMS profile).
 
 Invariants:
 
@@ -1884,7 +1896,11 @@ correction:
   the Gen9 modeset, AUX, GMBUS (Gen9 LP only), hotplug, the
   external pass, the panel power-off and KMS sessions hold
   references, and the execlists GT holds `GT_IRQ` while
-  unparked (`__gt_unpark`); the last release re-enters DC6
+  unparked (`__gt_unpark`; with
+  `narf.intel.execlists_suspend=1` its system-sleep
+  preparation drains, disables RPS/RC6, resets the GT and
+  drops it, and the resume brings the GT up again); the last
+  release re-enters DC6
   (display 9, Wa Display #1183 first) or DC5 (Broxton /
   Gemini Lake) 17 ms later (100 ms after the GT parks),
   refused with power well 2 requested or on,
@@ -2079,15 +2095,27 @@ programme's last lane; `external_display_supported()` and
   touched. Verification method: each constant and sequence
   was transcribed from the named Linux source and pinned by
   a fixture that asserts the exact register write sequence
-  — the module is register-level routing only. Live
-  IRQ-handler wiring is a named remainder (no
-  interrupt-domain registration exists in this crate yet).
+  — the primitives are register-level. With
+  `narf.intel.gen9_irq=1` the interrupt owner wires them:
+  MSI with a hard handler that only turns the master off and
+  latches it, and a task-context pass in `gen8_irq_handler`'s
+  order (GT banks, DE misc, DE port, pipes, the SPT PCH) that
+  turns it on again, with Linux's postinstall masks and the
+  hotplug monitor acknowledging and latching its own pins;
+  a trigger runs the external-output pass, and
+  `intel_irq_suspend` / `intel_irq_resume` bracket system
+  sleep (DC9 also refuses while its software flag is set).
 - HPD / external sessions: the session layer
   (`enable_external_hpd`, `poll_external_hpd`, `dp_connect` /
   `hdmi_connect` / `mst_connect`) admits Gen9 through
   `SourceFamily::Gen9`, with the SPT-class south hotplug bank
   (`HpdBank::Spt`, polled) and the SPT DDC pins, and MST runs
-  on the same sources. `intel_gpu_gen9_irq` has no caller.
+  on the same sources. Without `narf.intel.gen9_irq=1`
+  hotplug is polled at probe only. Two external outputs
+  share DPLL1 unless `narf.intel.gen9_dpll=1` arbitrates
+  DPLL1-3 from the hardware (`intel_find_dpll`: a live port's
+  DPLL at the same state is shared, else the first free one,
+  else a typed refusal; a shared DPLL is never retuned).
 - Backlight: Skylake drives the SPT PWM block
   (`intel_bl.rs` `PwmLayout::Spt`: max = `BLC_PWM_PCH_CTL2`
   0xC8254 >> 16, duty RMW into CTL2's low 16 bits,
