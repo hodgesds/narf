@@ -115,8 +115,9 @@
 //! Pipe C/D MMIO restored before enable, no read flush, the 7.4-rc4
 //! `gen9_dc_mask` ([`XE3PLPD_DC_MASK`]) and the CMTG status bits out of the
 //! sticky-write comparison ([`dc_state_ro_mask`]). The target is DC6
-//! ([`XE3PLPD_ALLOWED_DC_MASK`]); DC3CO, which needs the CMTG, is never
-//! armed. `xe3plpd_pwdoms_dc_off` adds every AUX channel to the well, so
+//! ([`XE3PLPD_ALLOWED_DC_MASK`]); DC3CO, which needs the CMTG and a LOBF,
+//! panel-replay or PSR2 trigger the owned route does not have, is never
+//! armed ([`xe3plpd_dc3co_refusal`]). `xe3plpd_pwdoms_dc_off` adds every AUX channel to the well, so
 //! besides the conversation-level holders (modeset, KMS, external passes)
 //! each display-35 AUX transfer (`IntelAux`) and LT PHY message-bus
 //! transaction (`intel_gpu_lt_phy::LtPhy`) takes its own reference through
@@ -229,10 +230,124 @@ pub const XE2LPD_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
 /// `sanitize_target_dc_state(DC6)` starts at DC6.
 /// `intel_display_power_select_target_dc_state` moves to DC3CO only for a
 /// DC3CO trigger (LOBF, panel replay or PSR2 selective update on a 1:1 CMTG
-/// pipe/port), none of which this driver configures, so DC6 stays the
-/// runtime target. DC9 belongs to display-core uninit, which this driver
-/// does not run.
+/// pipe/port), none of which this driver configures: the owned Nova panel
+/// is refused DC3CO with [`Dc3coRefusal::NoTrigger`]
+/// ([`xe3plpd_dc3co_refusal`] of [`Dc3coState::OWNED_NOVA_PANEL`]), so DC6
+/// stays the runtime target. DC9 belongs to display-core uninit, which this
+/// driver does not run.
 pub const XE3PLPD_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
+
+/// `DC3CO_TRIGGER_PSR2` (`intel_display_power.h`, Linux 7.4-rc4).
+pub const DC3CO_TRIGGER_PSR2: u32 = 1 << 0;
+/// `DC3CO_TRIGGER_LOBF`.
+pub const DC3CO_TRIGGER_LOBF: u32 = 1 << 1;
+/// `DC3CO_TRIGGER_PANEL_REPLAY`.
+pub const DC3CO_TRIGGER_PANEL_REPLAY: u32 = 1 << 2;
+
+/// The committed display-35 state `intel_display_power_dc3co_compute`
+/// (Linux 7.4-rc4) reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dc3coState {
+    /// `intel_calc_active_pipes` after the commit, one bit per pipe.
+    pub active_pipes: u8,
+    /// Every encoder on the single active pipe is `INTEL_OUTPUT_EDP`.
+    pub edp: bool,
+    /// That eDP's `enum port` (`PORT_A` = 0, `PORT_B` = 1).
+    pub port: u8,
+    /// `intel_crtc_num_joined_pipes`.
+    pub joined_pipes: u8,
+    /// `intel_psr2_in_deep_sleep`.
+    pub psr2_deep_sleep: bool,
+    /// `crtc_state->has_lobf`.
+    pub lobf: bool,
+    /// `crtc_state->has_panel_replay && intel_dp->as_sdp_supported`.
+    pub panel_replay_as_sdp: bool,
+    /// `crtc_state->has_sel_update` (PSR2 selective update).
+    pub sel_update: bool,
+    /// `intel_alpm_pr_as_sdp_skip_frames_enabled`.
+    pub pr_skip_frames: bool,
+}
+
+impl Dc3coState {
+    /// The owned Nova Lake-S route (`narf.intel.nvl_modeset=1`): the eDP
+    /// panel alone on Pipe A and port A, with no PSR, panel replay or LOBF
+    /// on display 35.
+    pub const OWNED_NOVA_PANEL: Self = Self {
+        active_pipes: 1,
+        edp: true,
+        port: 0,
+        joined_pipes: 1,
+        psr2_deep_sleep: false,
+        lobf: false,
+        panel_replay_as_sdp: false,
+        sel_update: false,
+        pr_skip_frames: false,
+    };
+}
+
+/// Why display 35 does not target DC3CO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dc3coRefusal {
+    /// More or fewer than one active pipe.
+    NotSinglePipe,
+    /// An encoder on the active pipe is not eDP.
+    NotEdp,
+    /// `intel_dc3co_port_pipe_compatible` on display 35: one unjoined pipe,
+    /// Pipe A on port A or Pipe B on port B (the CMTG's 1:1 mapping).
+    PortPipe,
+    /// PSR2 is in deep sleep.
+    Psr2DeepSleep,
+    /// No LOBF, panel replay with AS SDP or PSR2 selective update, or panel
+    /// replay's AS SDP skip frames cleared the trigger.
+    NoTrigger,
+    /// A trigger exists, but DC3CO needs the CMTG (`intel_cmtg_program`:
+    /// sync to port, the DC3CO hardware guardband, secondary mode, and its
+    /// restore after DC6), which this driver does not own.
+    CmtgUnowned,
+}
+
+/// `intel_display_power_dc3co_compute` on display 35: the trigger
+/// (`DC3CO_TRIGGER_*`) that would make `intel_display_power_dc3co_allowed`
+/// true, or why there is none.
+pub const fn dc3co_trigger(state: &Dc3coState) -> Result<u32, Dc3coRefusal> {
+    if state.active_pipes.count_ones() != 1 {
+        return Err(Dc3coRefusal::NotSinglePipe);
+    }
+    if !state.edp {
+        return Err(Dc3coRefusal::NotEdp);
+    }
+    let pipe = state.active_pipes.trailing_zeros();
+    if state.joined_pipes != 1 || !((pipe == 0 && state.port == 0) || (pipe == 1 && state.port == 1))
+    {
+        return Err(Dc3coRefusal::PortPipe);
+    }
+    if state.psr2_deep_sleep {
+        return Err(Dc3coRefusal::Psr2DeepSleep);
+    }
+    let mut trigger = 0;
+    if state.lobf {
+        trigger |= DC3CO_TRIGGER_LOBF;
+    }
+    if state.panel_replay_as_sdp {
+        trigger |= DC3CO_TRIGGER_PANEL_REPLAY;
+    }
+    if state.sel_update {
+        trigger |= DC3CO_TRIGGER_PSR2;
+    }
+    if state.pr_skip_frames || trigger == 0 {
+        return Err(Dc3coRefusal::NoTrigger);
+    }
+    Ok(trigger)
+}
+
+/// The display-35 service's DC3CO answer: Linux's trigger decision, then the
+/// CMTG this driver does not own. DC3CO is never targeted.
+pub const fn xe3plpd_dc3co_refusal(state: &Dc3coState) -> Dc3coRefusal {
+    match dc3co_trigger(state) {
+        Ok(_) => Dc3coRefusal::CmtgUnowned,
+        Err(refusal) => refusal,
+    }
+}
 /// `DC_STATE_EN_CSR_MASK_CMTG_1` (display >= 20).
 pub const DC_STATE_EN_CSR_MASK_CMTG_1: u32 = 1 << 11;
 /// `DC_STATE_EN_CSR_MASK_CMTG_0` (display >= 13 except DG2).

@@ -518,3 +518,107 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xe3plpd_dc",
     smoke_xe3plpd_dc_guard_releases_what_it_took
 );
+
+/// `intel_display_power_dc3co_compute` (Linux 7.4-rc4) on display 35: one
+/// active pipe, eDP only, the CMTG's 1:1 pipe/port (A/A or B/B, unjoined,
+/// `intel_dc3co_port_pipe_compatible`), PSR2 not in deep sleep, and a
+/// trigger (`DC3CO_TRIGGER_LOBF`, `_PANEL_REPLAY` with AS SDP, `_PSR2` for
+/// selective update) that AS SDP skip frames clears. The owned Nova panel
+/// has none of the triggers, and a triggered state is still refused for
+/// the unowned CMTG, so the service keeps DC6.
+fn smoke_xe3plpd_dc3co_trigger_and_owned_refusal() -> TestResult {
+    let panel = Dc3coState::OWNED_NOVA_PANEL;
+    let psr2 = Dc3coState {
+        sel_update: true,
+        ..panel
+    };
+    let cases = [
+        (panel, Err(Dc3coRefusal::NoTrigger)),
+        (psr2, Ok(1)),
+        (Dc3coState { lobf: true, ..panel }, Ok(2)),
+        (
+            Dc3coState {
+                panel_replay_as_sdp: true,
+                lobf: true,
+                ..panel
+            },
+            Ok(6),
+        ),
+        (
+            Dc3coState {
+                pr_skip_frames: true,
+                ..psr2
+            },
+            Err(Dc3coRefusal::NoTrigger),
+        ),
+        (
+            Dc3coState {
+                active_pipes: 0b11,
+                ..psr2
+            },
+            Err(Dc3coRefusal::NotSinglePipe),
+        ),
+        (
+            Dc3coState {
+                active_pipes: 0,
+                ..psr2
+            },
+            Err(Dc3coRefusal::NotSinglePipe),
+        ),
+        (Dc3coState { edp: false, ..psr2 }, Err(Dc3coRefusal::NotEdp)),
+        (
+            Dc3coState {
+                active_pipes: 0b10,
+                port: 1,
+                ..psr2
+            },
+            Ok(1),
+        ),
+        (
+            Dc3coState {
+                active_pipes: 0b10,
+                ..psr2
+            },
+            Err(Dc3coRefusal::PortPipe),
+        ),
+        (
+            Dc3coState {
+                active_pipes: 0b100,
+                port: 2,
+                ..psr2
+            },
+            Err(Dc3coRefusal::PortPipe),
+        ),
+        (
+            Dc3coState {
+                joined_pipes: 2,
+                ..psr2
+            },
+            Err(Dc3coRefusal::PortPipe),
+        ),
+        (
+            Dc3coState {
+                psr2_deep_sleep: true,
+                ..psr2
+            },
+            Err(Dc3coRefusal::Psr2DeepSleep),
+        ),
+    ];
+    for (state, expected) in cases {
+        if dc3co_trigger(&state) != expected {
+            return TestResult::Fail("DC3CO trigger must follow intel_display_power_dc3co_compute");
+        }
+    }
+    if xe3plpd_dc3co_refusal(&panel) != Dc3coRefusal::NoTrigger
+        || xe3plpd_dc3co_refusal(&psr2) != Dc3coRefusal::CmtgUnowned
+        || XE3PLPD_ALLOWED_DC_MASK & DC_STATE_EN_DC3CO != 0
+        || XE3PLPD_ALLOWED_DC_MASK != DC6
+    {
+        return TestResult::Fail("the owned Nova panel keeps DC6 and never targets DC3CO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe3plpd_dc",
+    smoke_xe3plpd_dc3co_trigger_and_owned_refusal
+);
