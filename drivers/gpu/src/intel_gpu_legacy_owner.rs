@@ -564,9 +564,9 @@ struct Context {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Service {
     Ok,
-    /// A job overran its deadline on this engine: RCS0 resets alone, any
-    /// other engine through the full GT reset.
-    Hung(HwEngine),
+    /// A job (this request) overran its deadline on this engine, which
+    /// resets alone where it can, else through the full GT reset.
+    Hung(HwEngine, u64),
     /// Completion tracking is lost: only a full GT reset recovers.
     Lost,
 }
@@ -723,6 +723,12 @@ impl Runtime {
                 self.jobs.swap_remove(i).job.finish(false);
             }
         }
+        // Rotate an engine whose ELSP[0] has used its slice while another
+        // context waits (Linux's execlists timeslice timer).
+        self.engine.timeslice(now);
+        for lane in &mut self.xcs {
+            lane.engine.timeslice(now);
+        }
         let engine = &mut self.engine;
         self.contexts.retain(|context| {
             context.user.strong_count() != 0 || engine.destroy_context(context.id).is_err()
@@ -737,7 +743,7 @@ impl Runtime {
             return Service::Lost;
         }
         if let Some(job) = self.jobs.iter().find(|job| now >= job.deadline) {
-            return Service::Hung(job.which);
+            return Service::Hung(job.which, job.request);
         }
         {
             let busy = !self.jobs.is_empty()
@@ -1074,16 +1080,18 @@ impl Owner {
                         log(self.index, "completion lost; resetting the GT");
                         true
                     }
-                    Service::Hung(engine) => match self.reset_engine(engine).await {
-                        Ok(()) => false,
-                        Err(_) => {
-                            log(
-                                self.index,
-                                "engine reset unavailable or failed; resetting the GT",
-                            );
-                            true
+                    Service::Hung(engine, request) => {
+                        match self.reset_engine(engine, request).await {
+                            Ok(()) => false,
+                            Err(_) => {
+                                log(
+                                    self.index,
+                                    "engine reset unavailable or failed; resetting the GT",
+                                );
+                                true
+                            }
                         }
-                    },
+                    }
                 };
                 if full_reset {
                     self.tear_down().await;
@@ -1100,7 +1108,7 @@ impl Owner {
     /// (`__intel_engine_reset_bh`). Every surviving job gets a fresh
     /// deadline. An error, or an engine with no reset domain of its own,
     /// leaves the full GT reset to the caller.
-    async fn reset_engine(&self, which: HwEngine) -> Result<(), InitError> {
+    async fn reset_engine(&self, which: HwEngine, request: u64) -> Result<(), InitError> {
         let mut state = self.state.lock().await;
         let runtime = state.as_mut().ok_or(InitError::Unavailable)?;
         let domain = engine_reset_domain(runtime.gt, which).ok_or(InitError::Unavailable)?;
@@ -1138,7 +1146,8 @@ impl Owner {
         };
         // SAFETY: the engine-domain reset above completed, so this engine no
         // longer reads or writes any of its batch, ring or context memory.
-        let (guilty, failed) = unsafe { engine.reset_rewind() }.map_err(InitError::Engine)?;
+        let (guilty, failed) =
+            unsafe { engine.reset_rewind_blaming(Some(request)) }.map_err(InitError::Engine)?;
         if let Some(guilty) = guilty {
             contexts
                 .retain(|context| context.id != guilty || engine.destroy_context(guilty).is_err());

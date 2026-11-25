@@ -350,6 +350,44 @@ fn render_breadcrumb(address: u64, seqno: u32) -> [u32; 12] {
 const PIPE_CONTROL6: u32 = 0x7a00_0004;
 /// `MI_ARB_CHECK`.
 const MI_ARB_CHECK: u32 = 0x0280_0000;
+/// `MI_USER_INTERRUPT`.
+const MI_USER_INTERRUPT: u32 = 0x0100_0000;
+/// `MI_SEMAPHORE_WAIT | MI_SEMAPHORE_GLOBAL_GTT | MI_SEMAPHORE_POLL |
+/// MI_SEMAPHORE_SAD_EQ_SDD`: poll a GGTT dword until it equals the data.
+const MI_SEMAPHORE_WAIT_POLL_EQ: u32 = 0x0e00_0002 | 1 << 22 | 1 << 15 | 4 << 12;
+/// `I915_GEM_HWS_PREEMPT`: the engine status page dword every Gen9/Gen11
+/// request's breadcrumb busywaits on while it is set (`ring_set_paused`).
+pub(crate) const HWS_PREEMPT_BYTE: u64 = 0x32 * 4;
+/// `CONFIG_DRM_I915_TIMESLICE_DURATION`: how long ELSP[0] runs while
+/// another context waits before the engine rotates.
+pub const TIMESLICE_NS: u64 = 1_000_000;
+
+/// `gen8_emit_bb_start`: arbitration on across the batch, so the engine
+/// can be preempted at its arbitration points, then off again.
+fn legacy_bb_start(words: &mut Vec<u32>, start: [u32; 3]) {
+    words.push(MI_ARB_ENABLE);
+    words.extend_from_slice(&start);
+    words.extend_from_slice(&[MI_ARB_DISABLE, MI_NOOP]);
+}
+
+/// `gen8_emit_fini_breadcrumb_tail` and `gen8_emit_wa_tail`: the user
+/// interrupt, arbitration on, `emit_preempt_busywait` on `preempt` (the
+/// engine status page's `I915_GEM_HWS_PREEMPT`), and the arbitration point
+/// and NOOP `WaIdleLiteRestore` reserves.
+fn legacy_fini_tail(words: &mut Vec<u32>, preempt: u32) {
+    words.extend_from_slice(&[
+        MI_USER_INTERRUPT,
+        MI_ARB_ENABLE,
+        MI_ARB_CHECK,
+        MI_SEMAPHORE_WAIT_POLL_EQ,
+        0,
+        preempt,
+        0,
+        MI_NOOP,
+        MI_ARB_CHECK,
+        MI_NOOP,
+    ]);
+}
 /// `LRC_PPHWSP_SCRATCH_ADDR`: the per-context HWSP scratch dword the
 /// invalidate's store-data-index post-sync lands in.
 const PPHWSP_SCRATCH: u32 = 0x34 * 4;
@@ -357,13 +395,19 @@ const PPHWSP_SCRATCH: u32 = 0x34 * 4;
 /// One Gen9/Gen11 render request, MIT Linux v6.12 `gen8_engine_cs.c`:
 /// `gen8_emit_flush_rcs` / `gen11_emit_flush_rcs` with `EMIT_INVALIDATE`
 /// (Gen9 first emits the null PIPE_CONTROL its VF invalidate needs), the
-/// no-arbitration `gen8_emit_bb_start_noarb`, then
-/// `gen8_emit_fini_breadcrumb_rcs` / `gen11_...`: a cache-flush
-/// PIPE_CONTROL (Gen11 adds the tile cache), the GGTT QW seqno write and
-/// `gen8_emit_wa_tail`. The KBL-before-C0 DC flush workaround is not
-/// emitted (pre-production steppings only).
-fn legacy_render_request(gen11: bool, start: [u32; 3], address: u64, seqno: u32) -> Vec<u32> {
-    let mut words = Vec::with_capacity(30);
+/// preemptible `gen8_emit_bb_start`, then `gen8_emit_fini_breadcrumb_rcs` /
+/// `gen11_...`: a cache-flush PIPE_CONTROL (Gen11 adds the tile cache), the
+/// GGTT QW seqno write and the breadcrumb tail busywaiting on `preempt`.
+/// The KBL-before-C0 DC flush workaround is not emitted (pre-production
+/// steppings only).
+fn legacy_render_request(
+    gen11: bool,
+    start: [u32; 3],
+    address: u64,
+    seqno: u32,
+    preempt: u32,
+) -> Vec<u32> {
+    let mut words = Vec::with_capacity(40);
     if !gen11 {
         words.extend_from_slice(&[PIPE_CONTROL6, 0, 0, 0, 0, 0]);
     }
@@ -371,8 +415,7 @@ fn legacy_render_request(gen11: bool, start: [u32; 3], address: u64, seqno: u32)
     // invalidate, QW write with store-data-index (Gen11: command cache).
     let invalidate = 0x0034_4c1c | if gen11 { 1 << 29 } else { 0 };
     words.extend_from_slice(&[PIPE_CONTROL6, invalidate, PPHWSP_SCRATCH, 0, 0, 0]);
-    words.push(MI_ARB_DISABLE);
-    words.extend_from_slice(&start);
+    legacy_bb_start(&mut words, start);
     // CS stall, TLB invalidate, render target / depth / DC flush (Gen11:
     // tile cache flush).
     let flush = 0x0014_1021 | if gen11 { 1 << 28 } else { 0 };
@@ -386,33 +429,39 @@ fn legacy_render_request(gen11: bool, start: [u32; 3], address: u64, seqno: u32)
         seqno,
         0,
     ]);
-    words.extend_from_slice(&[MI_ARB_CHECK, MI_NOOP]);
+    legacy_fini_tail(&mut words, preempt);
     words
 }
 
 /// One Gen9/Gen11 copy or media request, MIT Linux v6.12
 /// `gen8_engine_cs.c`: `gen8_emit_flush_xcs` with `EMIT_INVALIDATE` (TLB,
 /// plus the BSD cache on video decode, with a store-index write to the
-/// PPHWSP scratch as its command barrier), the no-arbitration
-/// `gen8_emit_bb_start_noarb`, then `gen8_emit_fini_breadcrumb_xcs`'s GGTT
-/// seqno write. Each resident batch brings its own PPGTT, so the TLB
-/// invalidate is what keeps a previous job's translations out.
-fn legacy_xcs_request(video: bool, start: [u32; 3], address: u64, seqno: u32) -> Vec<u32> {
+/// PPHWSP scratch as its command barrier), the preemptible
+/// `gen8_emit_bb_start`, then `gen8_emit_fini_breadcrumb_xcs`'s GGTT seqno
+/// write and the breadcrumb tail busywaiting on `preempt`. Each resident
+/// batch brings its own PPGTT, so the TLB invalidate is what keeps a
+/// previous job's translations out.
+fn legacy_xcs_request(
+    video: bool,
+    start: [u32; 3],
+    address: u64,
+    seqno: u32,
+    preempt: u32,
+) -> Vec<u32> {
     // MI_FLUSH_DW (4 dwords) | STORE_INDEX | OP_STOREDW | INVALIDATE_TLB,
     // plus INVALIDATE_BSD on VCS.
     let invalidate = 0x1300_0002 | 1 << 21 | 1 << 14 | 1 << 18 | if video { 1 << 7 } else { 0 };
-    let mut words = Vec::with_capacity(14);
-    words.extend_from_slice(&[invalidate, PPHWSP_SCRATCH, 0, 0, MI_ARB_DISABLE]);
-    words.extend_from_slice(&start);
+    let mut words = Vec::with_capacity(24);
+    words.extend_from_slice(&[invalidate, PPHWSP_SCRATCH, 0, 0]);
+    legacy_bb_start(&mut words, start);
     // MI_FLUSH_DW | OP_STOREDW, GGTT address (USE_GTT), seqno.
     words.extend_from_slice(&[
         0x1300_4002,
         address as u32 | 4,
         (address >> 32) as u32,
         seqno,
-        MI_ARB_CHECK,
-        MI_NOOP,
     ]);
+    legacy_fini_tail(&mut words, preempt);
     words
 }
 
@@ -2632,6 +2681,11 @@ pub struct RcsEngine<M: MmioWindow, A: GpuAllocator> {
     /// media pool state joins the indirect-context batch and the golden
     /// render state ([`Self::set_pooled_eu`]).
     pooled_eu: bool,
+    /// When ELSP[0]'s current slice began ([`Self::timeslice`]).
+    slice_start: Option<u64>,
+    /// A timeslice ELSP is outstanding: every ring is paused at its
+    /// breadcrumb and the switched-out contexts' requests are queued again.
+    preempting: bool,
 }
 
 impl<M: MmioWindow, A: GpuAllocator> core::fmt::Debug for RcsEngine<M, A> {
@@ -2706,6 +2760,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             wa_bb: None,
             default_image: None,
             pooled_eu: false,
+            slice_start: None,
+            preempting: false,
         })
     }
 
@@ -2762,6 +2818,10 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         let _ = self.mmio.read32(ptr);
         self.csb_head = entries - 1;
         self.status.write32(csb_write_byte(self.generation), reset);
+        // No timeslice survives a reset: every ring runs unpaused.
+        self.status.write32(HWS_PREEMPT_BYTE, 0);
+        self.preempting = false;
+        self.slice_start = None;
         for i in 0..u64::from(entries) {
             self.status.write32(CSB_BUF_BYTE + i * 8, u32::MAX);
             self.status.write32(CSB_BUF_BYTE + i * 8 + 4, u32::MAX);
@@ -2775,8 +2835,8 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// `execlists_reset_rewind` after the caller reset this engine alone
     /// (`intel_engine_reset`). The context on port 0 hung: every request of
     /// it, in flight or queued, fails with [`JobError::Hang`] and its batches
-    /// are released. Ports load only while the engine is idle, so no other
-    /// context had started: their requests go back to the queue in order,
+    /// are released. Other contexts resume from their saved images (a
+    /// timeslice may have switched one out): their requests go back to the queue in order,
     /// with their images untouched. The status page address and the CSB
     /// pointers are restored (the reset clears both) and the queue is pumped.
     /// Returns the hung context and the failed request ids.
@@ -2785,10 +2845,32 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// The caller completed a reset of this engine, so the hardware no
     /// longer references any of its batch, ring or context memory.
     pub unsafe fn reset_rewind(&mut self) -> Result<(Option<ContextId>, Vec<u64>), SubmitError> {
+        // SAFETY: the caller's contract is this function's.
+        unsafe { self.reset_rewind_blaming(None) }
+    }
+
+    /// [`Self::reset_rewind`] with the overdue `request` named: its context
+    /// is the guilty one even when a timeslice switched it out of ELSP[0]
+    /// (Linux cancels the expired request, wherever it is). Unknown or
+    /// already retired, ELSP[0]'s context is blamed.
+    ///
+    /// # Safety
+    /// As [`Self::reset_rewind`].
+    pub unsafe fn reset_rewind_blaming(
+        &mut self,
+        request: Option<u64>,
+    ) -> Result<(Option<ContextId>, Vec<u64>), SubmitError> {
         if self.completion_lost {
             return Err(SubmitError::CompletionLost);
         }
-        let guilty = self.active[0].or(self.pending[0]);
+        let named = request.and_then(|id| {
+            self.inflight
+                .iter()
+                .chain(self.queue.iter())
+                .find(|r| r.id == id)
+                .map(|r| r.ctx_slot)
+        });
+        let guilty = named.or(self.active[0]).or(self.pending[0]);
         let guilty_id = guilty.and_then(|slot| {
             self.contexts
                 .get(slot as usize)
@@ -3249,6 +3331,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         let render = self.spec.class == EngineClass::Render;
         let video = self.spec.class == EngineClass::VideoDecode;
         let engine_generation = self.generation;
+        let preempt = self.status.ggtt_offset() + HWS_PREEMPT_BYTE as u32;
         let seqno = {
             let ctx = self.context_mut(id)?;
             let seqno = ctx.next_seqno;
@@ -3267,9 +3350,10 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                         start,
                         address,
                         seqno,
+                        preempt,
                     )
                 } else {
-                    legacy_xcs_request(video, start, address, seqno)
+                    legacy_xcs_request(video, start, address, seqno, preempt)
                 }
             });
             let length = if legacy.is_some() {
@@ -3418,13 +3502,18 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         {
             return;
         }
-        // Gen9/Gen11 batches run with arbitration off and this engine has
-        // no preemption handling, so ports are only loaded into an idle
-        // engine: every load is then idle→active, never a preemption or
-        // lite restore of a running context.
+        // A busy Gen9/Gen11 engine is reloaded only by a timeslice
+        // ([`Self::timeslice`]), which pauses the rings first: a load is then
+        // never a lite restore of the running context.
         if gen8_csb(self.generation) && self.active.iter().any(|a| a.is_some()) {
             return;
         }
+        self.load_ports();
+    }
+
+    /// Cover the first two distinct queued contexts and write them to the
+    /// ELSP.
+    fn load_ports(&mut self) {
         let first = self.queue[0].ctx_slot;
         let mut chosen = [Some(first), None];
         for r in self.queue.iter() {
@@ -3460,6 +3549,79 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// is the doorbell. Followed by the posting read the PRM
     /// prescribes (ELSP is write-only, so a neighbouring status
     /// register is read instead).
+    /// `ring_set_paused`: while set, every request's breadcrumb busywaits, so
+    /// no context completes under a preemption in flight.
+    fn set_paused(&mut self, paused: bool) {
+        self.status.write32(HWS_PREEMPT_BYTE, u32::from(paused));
+        fence(Ordering::SeqCst);
+    }
+
+    /// Gen9/Gen11 timeslicing (`timeslice_expired`, `execlists_dequeue`):
+    /// once ELSP[0]'s context has run [`TIMESLICE_NS`] while another
+    /// context waits, in ELSP[1] or the queue (`needs_timeslice`), pause
+    /// the rings, return ELSP[1]'s requests to the queue front and
+    /// ELSP[0]'s behind every waiter (`__unwind_incomplete_requests`,
+    /// `defer_active`), and load the first two contexts into the busy
+    /// engine. The hardware switches at its next arbitration point. The
+    /// promotion that follows unpauses; a context that completed before the
+    /// switch runs again from its saved head, which is its tail, and retires
+    /// then. Returns whether the engine was reloaded. Every context has one
+    /// priority, so there is no priority preemption.
+    pub fn timeslice(&mut self, now: u64) -> bool {
+        if !gen8_csb(self.generation)
+            || self.completion_lost
+            || self.pending.iter().any(Option::is_some)
+        {
+            return false;
+        }
+        // After an element switch the running context is in ELSP[1].
+        let (first, second) = {
+            let mut running = self.active.iter().flatten().copied();
+            (running.next(), running.next())
+        };
+        let Some(first) = first else {
+            self.slice_start = None;
+            return false;
+        };
+        if second.is_none() && self.queue.is_empty() {
+            self.slice_start = None;
+            return false;
+        }
+        let start = *self.slice_start.get_or_insert(now);
+        if now.saturating_sub(start) < TIMESLICE_NS {
+            return false;
+        }
+        self.set_paused(true);
+        let (mut deferred, mut resumed, mut keep) = (Vec::new(), Vec::new(), Vec::new());
+        for r in self.inflight.drain(..) {
+            if r.ctx_slot == first {
+                deferred.push(r);
+            } else if Some(r.ctx_slot) == second {
+                resumed.push(r);
+            } else {
+                keep.push(r);
+            }
+        }
+        self.inflight = keep;
+        for r in resumed.into_iter().rev() {
+            self.queue.push_front(r);
+        }
+        self.queue.extend(deferred);
+        self.preempting = true;
+        self.slice_start = None;
+        self.load_ports();
+        true
+    }
+
+    /// The timeslice ELSP was promoted: unpause the rings.
+    fn finish_preemption(&mut self) {
+        self.slice_start = None;
+        if self.preempting {
+            self.preempting = false;
+            self.set_paused(false);
+        }
+    }
+
     fn elsp_write(&mut self, port0: u64, port1: u64) {
         fence(Ordering::Release);
         if uses_submit_queue(self.generation) {
@@ -3554,22 +3716,36 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                     if self.pending.iter().any(|p| p.is_some()) {
                         self.active = self.pending;
                         self.pending = [None, None];
+                        self.finish_preemption();
                     } else {
                         self.spurious_csb += 1;
                     }
                 }
                 CsbStep::Preempt => {
-                    if let Some(slot) = first {
+                    // A timeslice already queued the switched-out contexts'
+                    // requests again.
+                    if let Some(slot) = first.filter(|_| !self.preempting) {
                         self.unschedule(slot);
                     }
                     self.active = self.pending;
                     self.pending = [None, None];
+                    self.finish_preemption();
                 }
-                CsbStep::Complete => {
-                    if let Some(slot) = first {
-                        self.retire(slot, done);
+                CsbStep::Complete => match first {
+                    // Completed under a timeslice ELSP: its requests are queued
+                    // again and retire when the context next runs.
+                    Some(slot) if self.preempting => {
+                        if let Some(port) = self.active.iter_mut().find(|a| **a == Some(slot)) {
+                            *port = None;
+                        }
                     }
-                }
+                    Some(slot) => {
+                        self.retire(slot, done);
+                        // The next context starts a slice of its own.
+                        self.slice_start = None;
+                    }
+                    None => {}
+                },
                 CsbStep::Nop => self.spurious_csb += 1,
             }
             return;
@@ -4361,6 +4537,7 @@ pub mod tests {
             let tail = tail & mask;
             let mut guard = 0u32;
             let gfx_before = self.gfx_commands;
+            let mut stop = None;
             while pos != tail && guard < RING_BYTES {
                 guard += 4;
                 let dw = mem_rd(&ring, pos as u64);
@@ -4422,13 +4599,29 @@ pub mod tests {
                         self.write_ggtt(lo | (hi << 32), data);
                         pos = (pos + 16) & mask;
                     }
+                    0x1c => {
+                        // MI_SEMAPHORE_WAIT (poll, equal): a paused ring stops
+                        // here, as the hardware busywaits, and saves its head.
+                        let data = mem_rd(&ring, ((pos + 4) & mask) as u64);
+                        let lo = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
+                        let hi = mem_rd(&ring, ((pos + 12) & mask) as u64) as u64;
+                        if self.read_ggtt(lo | (hi << 32)) != data {
+                            stop = Some(pos);
+                            break;
+                        }
+                        pos = (pos + 16) & mask;
+                    }
                     _ => pos = (pos + 4) & mask,
                 }
             }
             if self.gfx_commands != gfx_before {
                 mem_wr(&image, SAVED_3D_BYTE, SAVED_3D_MARKER | self.gfx_commands);
             }
-            mem_wr(&image, rs + ((CTX_RING_HEAD + 1) as u64) * 4, tail);
+            mem_wr(
+                &image,
+                rs + ((CTX_RING_HEAD + 1) as u64) * 4,
+                stop.unwrap_or(tail),
+            );
         }
 
         fn execute_batch(&mut self, ggtt: u32) {
@@ -4475,6 +4668,17 @@ pub mod tests {
                 }
             }
             panic!("fake hw: store to unmapped GGTT address");
+        }
+
+        fn read_ggtt(&self, addr: u64) -> u32 {
+            let reg = self.registry.borrow();
+            for (base, mem) in reg.iter() {
+                let size = mem.borrow().len() as u64;
+                if addr >= *base as u64 && addr + 4 <= *base as u64 + size {
+                    return mem_rd(mem, addr - *base as u64);
+                }
+            }
+            panic!("fake hw: load from unmapped GGTT address");
         }
 
         fn push_csb(&mut self, entry: CsbEntry) {
@@ -6098,8 +6302,8 @@ pub mod tests {
     /// The Gen9/Gen11 request stream, hand-expanded from gen8_engine_cs.c.
     fn smoke_legacy_request_stream_follows_linux() -> TestResult {
         let start = mi_batch_buffer_start_ppgtt(0x1_2345_6000);
-        let gen9 = legacy_render_request(false, start, 0xabc0, 7);
-        let want9: [u32; 30] = [
+        let gen9 = legacy_render_request(false, start, 0xabc0, 7, 0x1000_00c8);
+        let want9: [u32; 40] = [
             0x7a00_0004,
             0,
             0,
@@ -6112,10 +6316,12 @@ pub mod tests {
             0,
             0,
             0, // EMIT_INVALIDATE into PPHWSP scratch
-            0x0400_0000,
+            0x0400_0001,
             start[0],
             start[1],
-            start[2], // ARB off, batch
+            start[2],
+            0x0400_0000,
+            0, // ARB on across the batch, then off
             0x7a00_0004,
             0x0014_1021,
             0,
@@ -6128,17 +6334,25 @@ pub mod tests {
             0,
             7,
             0, // GGTT seqno
+            0x0100_0000,
+            0x0400_0001, // user interrupt, ARB on
+            0x0280_0000,
+            0x0e40_c002,
+            0,
+            0x1000_00c8,
+            0,
+            0, // preempt busywait on I915_GEM_HWS_PREEMPT
             0x0280_0000,
             0, // MI_ARB_CHECK, MI_NOOP
         ];
         if gen9 != want9 {
             return TestResult::Fail("Gen9 render request");
         }
-        let gen11 = legacy_render_request(true, start, 0xabc0, 7);
-        if gen11.len() != 24
+        let gen11 = legacy_render_request(true, start, 0xabc0, 7, 0x1000_00c8);
+        if gen11.len() != 34
             || gen11[..6] != [0x7a00_0004, 0x2034_4c1c, 0xd0, 0, 0, 0]
-            || gen11[10..12] != [0x7a00_0004, 0x1014_1021]
-            || gen11[16..] != want9[22..]
+            || gen11[12..14] != [0x7a00_0004, 0x1014_1021]
+            || gen11[18..] != want9[24..]
         {
             return TestResult::Fail(
                 "Gen11 adds the command / tile cache bits, no null PIPE_CONTROL",
@@ -6286,6 +6500,139 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_rcs",
         smoke_gen9_ports_load_only_when_idle
+    );
+
+    /// A full timeslice with a waiter pauses the rings and reloads the busy
+    /// engine with the waiter first. The switched-out context stops at its
+    /// breadcrumb busywait, the PREEMPTED promotion unpauses, and both
+    /// contexts then retire in their new order.
+    fn smoke_gen9_timeslice_rotates_contexts() -> TestResult {
+        let skl = crate::intel_gpu::Generation::Skylake;
+        let (mut engine, mut hw) = make_engine_for_generation(skl).unwrap();
+        engine.reset_csb_pointers().unwrap();
+        hw.write_ptr = GEN9_CSB_ENTRIES - 1;
+        let a = engine.create_context().unwrap();
+        let b = engine.create_context().unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(a, batch).unwrap();
+        let elsp = hw.regs.writes_to(RING_ELSP);
+        let port_a = (elsp[2] as u64) << 32 | elsp[3] as u64;
+        hw.inject_csb(CsbEntry {
+            lower: GEN8_CSB_IDLE_ACTIVE,
+            upper: (port_a >> 32) as u32,
+        });
+        engine.poll_completions();
+        // Alone, ELSP[0] is never sliced.
+        if engine.timeslice(0) || engine.timeslice(10 * TIMESLICE_NS) {
+            return TestResult::Fail("no waiter, no timeslice");
+        }
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        engine.submit(b, batch).unwrap();
+        if engine.timeslice(20 * TIMESLICE_NS)
+            || engine.timeslice(21 * TIMESLICE_NS - 1)
+            || hw.regs.writes_to(RING_ELSP).len() != 4
+        {
+            return TestResult::Fail("the slice runs its full duration");
+        }
+        if !engine.timeslice(21 * TIMESLICE_NS)
+            || engine.status.read32(HWS_PREEMPT_BYTE) != 1
+            || engine.timeslice(30 * TIMESLICE_NS)
+        {
+            return TestResult::Fail("an expired slice pauses and reloads once");
+        }
+        let elsp = hw.regs.writes_to(RING_ELSP);
+        let port1 = (elsp[4] as u64) << 32 | elsp[5] as u64;
+        let port_b = (elsp[6] as u64) << 32 | elsp[7] as u64;
+        if elsp.len() != 8 || port1 != port_a || port_b == port_a {
+            return TestResult::Fail("the waiter takes ELSP[0], the sliced context ELSP[1]");
+        }
+        // A runs into its paused breadcrumb and stops there; a submission to
+        // it is refused while it is loaded.
+        hw.execute(port_a);
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        if !matches!(engine.submit(a, batch), Err(SubmitError::ContextBusy)) {
+            return TestResult::Fail("a context under a timeslice stays covered");
+        }
+        hw.inject_csb(CsbEntry {
+            lower: GEN8_CSB_PREEMPTED,
+            upper: (port_b >> 32) as u32,
+        });
+        if !engine.poll_completions().is_empty()
+            || engine.status.read32(HWS_PREEMPT_BYTE) != 0
+            || engine.active[0].is_none()
+            || engine.active[1].is_none()
+        {
+            return TestResult::Fail("the promotion unpauses without retiring");
+        }
+        hw.execute(port_b);
+        hw.inject_csb(CsbEntry {
+            lower: 1 << 4 | 1 << 3,
+            upper: (port_b >> 32) as u32,
+        });
+        let done = engine.poll_completions();
+        if done.len() != 1 || done[0].ctx != b {
+            return TestResult::Fail("the waiter retires first");
+        }
+        // A resumes from the busywait, now released, to its tail.
+        hw.execute(port_a);
+        hw.inject_csb(CsbEntry {
+            lower: 1 << 4,
+            upper: (port_a >> 32) as u32,
+        });
+        let done = engine.poll_completions();
+        if done.len() != 1 || done[0].ctx != a || engine.spurious_csb() != 0 {
+            return TestResult::Fail("the sliced context retires after resuming");
+        }
+        // SAFETY: every modelled request completed.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_gen9_timeslice_rotates_contexts
+    );
+
+    /// An engine reset for an overdue request blames its context even when
+    /// another context holds ELSP[0]; ELSP[0]'s request is requeued.
+    fn smoke_gen9_reset_blames_the_overdue_request() -> TestResult {
+        let skl = crate::intel_gpu::Generation::Skylake;
+        let (mut engine, mut hw) = make_engine_for_generation(skl).unwrap();
+        engine.reset_csb_pointers().unwrap();
+        hw.write_ptr = GEN9_CSB_ENTRIES - 1;
+        let a = engine.create_context().unwrap();
+        let b = engine.create_context().unwrap();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        let ra = engine.submit(a, batch).unwrap();
+        let elsp = hw.regs.writes_to(RING_ELSP);
+        let port_a = (elsp[2] as u64) << 32 | elsp[3] as u64;
+        hw.inject_csb(CsbEntry {
+            lower: GEN8_CSB_IDLE_ACTIVE,
+            upper: (port_a >> 32) as u32,
+        });
+        engine.poll_completions();
+        let batch = engine.write_batch(&[MI_BATCH_BUFFER_END]).unwrap();
+        let rb = engine.submit(b, batch).unwrap();
+        // SAFETY: the model runs nothing; this stands for a completed reset.
+        let (guilty, failed) = unsafe { engine.reset_rewind_blaming(Some(rb)) }.unwrap();
+        if guilty != Some(b) || failed != [rb] {
+            return TestResult::Fail("the overdue request's context is guilty");
+        }
+        let elsp = hw.regs.writes_to(RING_ELSP);
+        let reloaded = (elsp[elsp.len() - 2] as u64) << 32 | elsp[elsp.len() - 1] as u64;
+        if reloaded != port_a || ra == rb {
+            return TestResult::Fail("ELSP[0]'s innocent request is reloaded");
+        }
+        // SAFETY: the model never ran a request.
+        unsafe {
+            engine.release_after_reset();
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_gen9_reset_blames_the_overdue_request
     );
 
     /// Resident batches take the Gen8 PTE format on Gen9/Gen11 and refuse
