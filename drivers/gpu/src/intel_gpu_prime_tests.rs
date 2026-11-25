@@ -578,3 +578,72 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_prime",
     smoke_xe_prime_dynamic_host_import_follows_exporter_migration
 );
+
+// CPU mmap of a VRAM export through a peer's import: the importer's offset
+// maps the exporter's LMEM BAR frames write-combining (xe_gem_object_mmap
+// of the exporter, reached by dma_buf_mmap), and the live alias keeps the
+// export in place: an eviction would move pages a process maps.
+fn smoke_xe_prime_foreign_import_mmap_maps_exporter_bar_and_holds_placement() -> TestResult {
+    let (frame, pool, backend, info) = evict_fixture(GtPlatform::Battlemage, 0xdfc);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let epoch = backend.status().unwrap().epoch;
+    let handle = create_vram_bo(&file, &info, &user, BO, 3).unwrap();
+    let object = file.gem.object(handle).unwrap();
+    object.write(0, &pattern(13)).unwrap();
+    let bus = frame.start_address().raw() + object.pages().next().unwrap();
+    let peer = attach_dynamic(
+        file.gem.export_object(handle).unwrap(),
+        exporter(&backend),
+        &Fabric,
+        Some(EXPORTER),
+        Some(PEER),
+        true,
+    )
+    .unwrap();
+    let importer = RenderFile::new();
+    let imported_handle = importer
+        .gem
+        .import_attachment(Import::new(EXPORTER_CARD, peer))
+        .unwrap();
+    let offset = importer.gem.mmap_offset(imported_handle).unwrap();
+    assert_ne!(Ok(offset), file.gem.mmap_offset(handle));
+    let view = importer.gem.mmap_backing(offset + 4096, 8192).unwrap();
+    assert_eq!(view.frames, [bus + 4096, bus + 8192]);
+    assert_eq!(view.memory_type, narf_memory::MemoryType::WriteCombining);
+    // The alias is the exporter's: no eviction while it is mapped.
+    assert!(!object.is_evictable(false));
+    assert_eq!(
+        block_on_spin(object.evict_to_system(backend.as_ref(), epoch, false)),
+        Err(FsError::Busy)
+    );
+    assert!(object.is_vram());
+    drop(view);
+    assert_eq!(
+        block_on_spin(object.evict_to_system(backend.as_ref(), epoch, false)),
+        Ok(BO)
+    );
+    // After the move the same offset maps the exporter's system pages.
+    let view = importer.gem.mmap_backing(offset, 4096).unwrap();
+    assert_eq!(view.frames[0], object.pages().next().unwrap());
+    assert_eq!(view.memory_type, narf_memory::MemoryType::WriteBack);
+    drop(view);
+    let mut back = alloc::vec![0; BO as usize];
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(13));
+
+    importer.gem.close(imported_handle).unwrap();
+    drop(importer);
+    drop(object);
+    drop(file);
+    drop(info);
+    drop(backend);
+    drop(pool);
+    vram_clear::fixture_finish();
+    narf_memory::frame::free_pages(frame, 6);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    smoke_xe_prime_foreign_import_mmap_maps_exporter_bar_and_holds_placement
+);

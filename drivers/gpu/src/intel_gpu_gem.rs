@@ -819,7 +819,8 @@ impl GemObject {
             return Err(FsError::InvalidData);
         }
         // A foreign import's pages belong to the exporter (or are a peer
-        // BAR): no kernel copy, CPU alias or mmap reaches them here.
+        // BAR): no kernel copy or CPU alias reaches them through the import.
+        // Its mmap maps the exporter's object instead (`mapping_object`).
         if self.is_imported() {
             return Err(FsError::Unsupported);
         }
@@ -1884,8 +1885,9 @@ impl GemState {
     /// `xe_dma_buf_create_obj` + `drm_gem_handle_create` for a foreign
     /// dma-buf: a system-placed object over the attachment, sharing the
     /// exporter's reservation. Its pages appear when the attachment is mapped
-    /// (first VM bind). It is never CPU-mapped, migrated or compressed and is
-    /// not charged to the system-memory bound: the exporter owns the memory.
+    /// (first VM bind). It is never migrated or compressed, its mmap maps the
+    /// exporter's object, and it is not charged to the system-memory bound:
+    /// the exporter owns the memory.
     pub(crate) fn import_attachment(
         &self,
         import: crate::intel_gpu_prime::Import,
@@ -1970,14 +1972,19 @@ impl GemState {
         Ok(())
     }
 
+    /// The fake mmap offset of `handle`. A foreign import has one too
+    /// (`xe_gem_mmap_offset_ioctl` creates it for any BO): mapping it maps
+    /// the exporter's object ([`Self::mapping_object`]).
     pub fn mmap_offset(&self, handle: u32) -> Result<u64, FsError> {
         let object = self.object(handle)?;
-        if object.is_gpu_only()
-            || object.private_staging
-            || object.is_userptr()
-            || object.is_imported()
-        {
+        if object.is_gpu_only() || object.private_staging || object.is_userptr() {
             return Err(FsError::Unsupported);
+        }
+        if let Some(import) = object.import() {
+            let exporter = import.exporter_object();
+            if exporter.is_gpu_only() || exporter.private_staging {
+                return Err(FsError::Unsupported);
+            }
         }
         Ok(object.offset)
     }
@@ -1998,6 +2005,20 @@ impl GemState {
             .cloned()
             .ok_or(FsError::NotFound)?;
         let within = offset - object.offset;
+        drop(handles);
+        // TTM refuses to fault an imported sg BO's pages ("handled (if at all)
+        // by redirecting mmap to the exporter"); NARF redirects, as
+        // drm_gem_shmem_mmap does for an import: dma_buf_mmap(obj->dma_buf,
+        // vma, 0) bounds the range by the buffer (-EINVAL past its end) and
+        // maps the exporter's pages through the exporter's own mmap
+        // (drm_gem_dmabuf_mmap -> xe_gem_object_mmap): its system pages or
+        // its LMEM BAR, with the exporter's caching, alias census and
+        // eviction exclusion. CPU access is ordered by DMA_BUF_IOCTL_SYNC on
+        // the shared reservation (dma_buf_begin_cpu_access).
+        let exporter = object
+            .import()
+            .map(|import| import.exporter_object().clone());
+        let object = exporter.unwrap_or(object);
         object.range(within, len)?;
         Ok((object, within))
     }

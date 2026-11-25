@@ -401,3 +401,124 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_prime",
     smoke_intel_prime_mapping_and_shared_fences_outlive_handles_and_descriptors
 );
+
+/// An exporting card with no running GT: enough for a system-memory export,
+/// which an attachment never migrates.
+#[derive(Debug)]
+struct NoGt;
+impl crate::intel_gpu_user::UserBackend for NoGt {
+    fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+        None
+    }
+    fn submit<'a>(
+        &'a self,
+        _: Arc<crate::intel_gpu_user::UserContext>,
+        _: crate::intel_gpu_user::UserBatch,
+    ) -> narf_filesystem::FsFuture<'a, Arc<CompletionFence>> {
+        alloc::boxed::Box::pin(async { Err(FsError::NoDevice) })
+    }
+}
+
+/// `xe_gem_prime_import` of `exporter` from another card: a dynamic host
+/// attachment and the importing open's sg object.
+fn foreign_import(exporter: &Arc<GemObject>) -> (GemState, u32, Arc<GemObject>) {
+    use crate::intel_gpu_prime::fixture::{Fabric, DISTANT, EXPORTER};
+    let attachment = crate::intel_gpu_prime::attach_dynamic(
+        exporter.clone(),
+        crate::intel_gpu_prime::Exporter {
+            platform: crate::intel_gpu_gt::GtPlatform::Battlemage,
+            backend: Arc::new(NoGt),
+        },
+        &Fabric,
+        Some(EXPORTER),
+        Some(DISTANT),
+        false,
+    )
+    .unwrap();
+    let importer = GemState::new();
+    let handle = importer
+        .import_attachment(crate::intel_gpu_prime::Import::new(778, attachment))
+        .unwrap();
+    let imported = importer.object(handle).unwrap();
+    (importer, handle, imported)
+}
+
+// CPU mmap of a foreign import: xe gives the import a fake offset
+// (xe_gem_mmap_offset_ioctl), TTM refuses to fault an sg BO's pages
+// (ttm_bo_vm_reserve, TTM_TT_FLAG_EXTERNAL) and the redirect is
+// dma_buf_mmap's (drm_gem_shmem_mmap for an import): the exporter's own
+// pages, bounded by the buffer. DMA_BUF_IOCTL_SYNC on the import's dma-buf,
+// which names the exporter's buffer, orders CPU access against the
+// importer's GPU work in the shared reservation.
+fn smoke_intel_prime_foreign_import_mmap_maps_exporter_pages_under_cpu_sync() -> TestResult {
+    let gem = GemState::new();
+    let exporter = gem
+        .object(gem.create(4 * PAGE, |_, _| Ok(())).unwrap())
+        .unwrap();
+    exporter.write(PAGE, &[0x5a; 16]).unwrap();
+    let (importer, handle, imported) = foreign_import(&exporter);
+    let offset = importer.mmap_offset(handle).unwrap();
+    let pages: Vec<u64> = exporter.pages().collect();
+    let view = importer
+        .mmap_backing(offset + PAGE, 2 * PAGE as usize)
+        .unwrap();
+    assert_eq!(view.frames, pages[1..3].to_vec());
+    assert_eq!(view.memory_type, narf_memory::MemoryType::WriteBack);
+    let (owner, within) = importer
+        .mapping_object(offset + PAGE, PAGE as usize)
+        .unwrap();
+    assert!(Arc::ptr_eq(&owner, &exporter) && within == PAGE);
+    // dma_buf_mmap: pgoff + vma_pages beyond the buffer is -EINVAL.
+    assert_eq!(
+        importer
+            .mmap_backing(offset + 3 * PAGE, 2 * PAGE as usize)
+            .err(),
+        Some(FsError::InvalidData)
+    );
+    // The import still has no kernel CPU copy of its own.
+    assert_eq!(imported.read(0, &mut [0]), Err(FsError::Unsupported));
+    drop(view);
+
+    // dma_buf_begin_cpu_access waits for the importer's GPU writer.
+    let file = intel_dma_buf_file(778, imported.clone());
+    let writer = Arc::new(CompletionFence::new());
+    reserve_gpu_explicit(&[(imported.clone(), true)], &writer);
+    let cpu = Cpu::new();
+    cpu.request(DMA_BUF_SYNC_READ as u32, 0);
+    assert_eq!(
+        run(file.ioctl_user(DMA_BUF_IOCTL_SYNC, 0, &cpu)),
+        Err(FsError::WouldBlock)
+    );
+    assert_eq!(exporter.read(PAGE, &mut [0]), Err(FsError::WouldBlock));
+    writer.signal(Ok(()));
+    cpu.request(DMA_BUF_SYNC_RW as u32, 0);
+    assert_eq!(run(file.ioctl_user(DMA_BUF_IOCTL_SYNC, 0, &cpu)), Ok(0));
+    // A CPU store through the import's mapping lands in the exporter's page.
+    let view = importer.mmap_backing(offset + PAGE, PAGE as usize).unwrap();
+    // SAFETY: the frame is the exporter's retained, direct-mapped WB page,
+    // held by the view.
+    unsafe {
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(view.frames[0]).kernel_mut_ptr::<u8>(),
+            0xa5,
+        )
+    };
+    cpu.request((DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW) as u32, 0);
+    assert_eq!(run(file.ioctl_user(DMA_BUF_IOCTL_SYNC, 0, &cpu)), Ok(0));
+    let mut bytes = [0; 2];
+    exporter.read(PAGE, &mut bytes).unwrap();
+    assert_eq!(bytes, [0xa5, 0x5a]);
+    drop(view);
+    // The mapping is the exporter's: it outlives the import's handle.
+    let view = importer.mmap_backing(offset, PAGE as usize).unwrap();
+    importer.close(handle).unwrap();
+    drop(imported);
+    drop(file);
+    assert_eq!(view.frames[0], pages[0]);
+    drop(view);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    smoke_intel_prime_foreign_import_mmap_maps_exporter_pages_under_cpu_sync
+);
