@@ -1573,6 +1573,35 @@ impl XeFile {
             }
         }
     }
+    /// One GPU page fault on `vm_id`, as the GuC reports it in a
+    /// `REPORT_PAGE_FAULT_REQ_DESC` payload (`xe_guc_pagefault_handler`),
+    /// serviced with the VM state held (`xe_pagefault_service`) and answered
+    /// with the reply `guc_ack_fault` sends. A malformed payload is EPROTO
+    /// with no reply; an unknown VM is a failed fault (`asid_to_vm` found
+    /// none). The service collects pages through `user`, which must be the
+    /// VM creator's context. Nothing routes a hardware fault here yet: NARF
+    /// contexts carry no ASID (see `intel_gpu_xe_svm`).
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    pub(crate) async fn service_page_fault(
+        &self,
+        vm_id: u32,
+        payload: &[u32],
+        user: &dyn IoctlContext,
+    ) -> Result<crate::intel_gpu_xe_vm::svm::guc::ServicedFault, FsError> {
+        use crate::intel_gpu_xe_vm::svm::guc;
+        let fault = guc::PageFault::from_guc(payload)?;
+        let result = match self.vm(vm_id) {
+            Ok(vm) => {
+                let state = vm.state.lock().await;
+                guc::service(&vm, &state, &fault, user)
+            }
+            Err(_) => Err(FsError::InvalidData),
+        };
+        Ok(guc::ServicedFault {
+            result,
+            reply: fault.guc_reply(result.is_err()),
+        })
+    }
     async fn wait_user(&self, address: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
         self.wait_user_clock(address, user, narf_time::monotonic_ns)
             .await

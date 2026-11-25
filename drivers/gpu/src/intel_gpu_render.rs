@@ -942,6 +942,13 @@ impl RenderFile {
         }
     }
 
+    /// The native Xe namespace, for fixtures that drive it below the ioctl
+    /// boundary (a GPU page fault arrives through no ioctl).
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn xe(&self) -> &crate::intel_gpu_xe::XeFile {
+        &self.xe
+    }
+
     pub(crate) fn dispatch_card(
         &self,
         card: u32,

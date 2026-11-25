@@ -20,12 +20,16 @@
 //!
 //! - **Fault delivery.** NARF's GPU takes no recoverable page fault: every
 //!   job runs on private page tables built at EXEC, and contexts carry no
-//!   ASID, so no hardware fault reaches the SVM. Pages can only be collected
+//!   ASID. [`guc::PageFault`] decodes the GuC `REPORT_PAGE_FAULT_REQ_DESC`
+//!   descriptor (`xe_guc_pagefault_handler`) and encodes the
+//!   `PAGE_FAULT_RES_DESC` reply (`guc_ack_fault`), and
+//!   `XeFile::service_page_fault` services it (`xe_pagefault_service`), but
+//!   nothing routes a hardware fault there yet. Pages can only be collected
 //!   from the creator's own syscall context (NARF pins fault user memory in
-//!   through the active address space), so a fault is serviced there and
-//!   another process is refused with ENOSYS, as USERPTR re-collection is.
+//!   through the active address space), so the service runs there and
+//!   refuses another process with ENOSYS, as USERPTR re-collection does.
 //!   `DRM_XE_VM_BIND_OP_PREFETCH` over a mirror VMA (`prefetch_ranges`) is the
-//!   populate path userspace can reach.
+//!   populate path userspace can reach today.
 //! - **Zap and refault at the job boundary.** Invalidation callbacks run under
 //!   IRQ-masked mapping locks and cannot wait for jobs or touch page tables.
 //!   The registry publishes the new sequence before the callback runs, so a
@@ -581,4 +585,162 @@ fn budget(state: &State, scratch: bool, ranges: &[Range]) -> (u64, usize) {
         TABLE_BYTES.saturating_sub(mapped),
         MAX_MAPPINGS.saturating_sub(state.mappings.len() + ranges.len()),
     )
+}
+
+/// GPU page-fault reports (`xe_guc_pagefault.c`, `xe_pagefault.c`). Nothing
+/// routes a hardware fault here yet (see the module notes), so outside the
+/// native fixtures only `XeFile::service_page_fault` names it.
+pub(crate) mod guc {
+    #![cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    use super::{pagemap, State, Vm};
+    use narf_filesystem::{FsError, IoctlContext};
+
+    /// `XE_GUC_ACTION_REPORT_PAGE_FAULT_REQ_DESC`.
+    pub(crate) const ACTION_REPORT_PAGE_FAULT_REQ_DESC: u32 = 0x6002;
+    /// `XE_GUC_ACTION_PAGE_FAULT_RES_DESC`.
+    pub(crate) const ACTION_PAGE_FAULT_RES_DESC: u32 = 0x6003;
+    /// `enum xe_pagefault_access_type`.
+    pub(crate) const ACCESS_READ: u8 = 0;
+    pub(crate) const ACCESS_WRITE: u8 = 1;
+    pub(crate) const ACCESS_ATOMIC: u8 = 2;
+    /// `XE_PAGEFAULT_ACCESS_TYPE_MASK`, `XE_PAGEFAULT_ACCESS_PREFETCH`.
+    const ACCESS_TYPE_MASK: u8 = 3;
+    pub(crate) const ACCESS_PREFETCH: u8 = 1 << 7;
+    /// `XE_PAGEFAULT_TYPE_LEVEL_NACK`: the producer asks for a NACK.
+    pub(crate) const TYPE_LEVEL_NACK: u8 = 0xff;
+
+    const fn field(word: u32, low: u32, bits: u32) -> u32 {
+        (word >> low) & ((1 << bits) - 1)
+    }
+
+    /// One GPU page fault (`struct xe_pagefault`): the consumer fields
+    /// `xe_guc_pagefault_handler` decodes, and the producer message the reply
+    /// echoes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct PageFault {
+        /// `consumer.page_addr`: `PFD_VIRTUAL_ADDR_HI:LO`, page aligned.
+        pub page_addr: u64,
+        /// `PFD_ASID`.
+        pub asid: u32,
+        /// `PFD_SRC_ID`.
+        pub srcid: u8,
+        /// `PFD_ACCESS_TYPE`, with [`ACCESS_PREFETCH`] for `PFD_PREFETCH`.
+        pub access_type: u8,
+        /// `PFD_FAULT_LEVEL` in bits 2:0 and `PFD_FAULT_TYPE` from bit 3, or
+        /// [`TYPE_LEVEL_NACK`] for an `XE2_PFD_TRVA_FAULT`.
+        pub fault_type_level: u8,
+        /// `PFD_ENG_CLASS`, `PFD_ENG_INSTANCE`.
+        pub engine_class: u8,
+        pub engine_instance: u8,
+        msg: [u32; 4],
+    }
+
+    impl PageFault {
+        /// `xe_guc_pagefault_handler`: a G2H `REPORT_PAGE_FAULT_REQ_DESC` payload
+        /// is exactly the four dwords of `struct xe_guc_pagefault_desc`
+        /// (-EPROTO otherwise).
+        pub(crate) fn from_guc(msg: &[u32]) -> Result<Self, FsError> {
+            let msg: [u32; 4] = msg.try_into().map_err(|_| FsError::Protocol)?;
+            let fault_type_level = if msg[0] & 1 << 18 != 0 {
+                TYPE_LEVEL_NACK
+            } else {
+                (field(msg[0], 0, 3) | field(msg[2], 2, 2) << 3) as u8
+            };
+            let prefetch = if msg[2] & 1 << 11 != 0 {
+                ACCESS_PREFETCH
+            } else {
+                0
+            };
+            Ok(Self {
+                page_addr: u64::from(msg[3]) << 32 | u64::from(field(msg[2], 12, 20)) << 12,
+                asid: field(msg[1], 12, 20),
+                srcid: field(msg[0], 3, 8) as u8,
+                access_type: field(msg[2], 0, 2) as u8 | prefetch,
+                fault_type_level,
+                engine_class: field(msg[0], 25, 3) as u8,
+                engine_instance: field(msg[0], 19, 6) as u8,
+                msg,
+            })
+        }
+
+        /// `xe_pagefault_access_is_atomic`.
+        pub(crate) fn atomic(&self) -> bool {
+            self.access_type & ACCESS_TYPE_MASK == ACCESS_ATOMIC
+        }
+
+        /// `guc_ack_fault`: the `PAGE_FAULT_RES_DESC` H2G (action, then
+        /// `struct xe_guc_pagefault_reply` dw0 and dw1). `PFR_SUCCESS` carries
+        /// `!!err`, and `PFR_PREFETCH` echoes the request only on error, exactly
+        /// as Linux sends them.
+        pub(crate) fn guc_reply(&self, error: bool) -> [u32; 3] {
+            let msg = &self.msg;
+            let pdata = field(msg[0], 28, 4) | field(msg[1], 0, 12) << 4;
+            let prefetch = if error { field(msg[2], 11, 1) } else { 0 };
+            [
+                ACTION_PAGE_FAULT_RES_DESC,
+                // PFR_VALID | PFR_SUCCESS | PFR_REPLY = PFR_ACCESS |
+                // PFR_DESC_TYPE = FAULT_RESPONSE_DESC | PFR_ASID.
+                1 | u32::from(error) << 1 | 1 << 10 | field(msg[1], 12, 20) << 12,
+                field(msg[2], 4, 6)
+                    | prefetch << 6
+                    | field(msg[0], 19, 6) << 7
+                    | field(msg[0], 25, 3) << 13
+                    | pdata << 16,
+            ]
+        }
+    }
+
+    /// The outcome of one serviced fault: the service's result (the SVM range
+    /// or VMA bounds Linux records as the ack hint) and the reply to the GuC.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct ServicedFault {
+        pub result: Result<(u64, u64), FsError>,
+        pub reply: [u32; 3],
+    }
+
+    /// `xe_pagefault_service` once the producer's VM is known: a NACK is -EFAULT,
+    /// a VM not in fault mode -EINVAL, a closed one -ENOENT, an address no VMA
+    /// holds -EINVAL, and a write or atomic access to a read-only VMA -EPERM. A
+    /// mirror VMA goes to `xe_svm_handle_pagefault`; any other VMA is already in
+    /// every job's tables (NARF binds all mappings at EXEC), so it is valid.
+    pub(crate) fn service(
+        vm: &Vm,
+        state: &State,
+        fault: &PageFault,
+        user: &dyn IoctlContext,
+    ) -> Result<(u64, u64), FsError> {
+        if fault.fault_type_level == TYPE_LEVEL_NACK {
+            return Err(FsError::BadAddress);
+        }
+        if !vm.fault {
+            return Err(FsError::InvalidData);
+        }
+        vm.check()?;
+        let address = fault.page_addr;
+        let read = fault.access_type == ACCESS_READ;
+        let mirror = vm.svm.as_ref().and_then(|svm| Some((svm, svm.vma_at(address)?)));
+        if let Some((svm, vma)) = mirror {
+            if vma.read_only && !read {
+                return Err(FsError::OperationNotPermitted);
+            }
+            // xe_vma_need_vram_for_atomic is 0 on an iGPU, and without a pagemap
+            // `devmem_only` is false on a dGPU: an atomic fault collects system
+            // pages like any other.
+            if fault.atomic() {
+                if let Some(pagemap) = pagemap(1) {
+                    match pagemap {}
+                }
+            }
+            return svm.fault(vm, state, &vma, address, user);
+        }
+        let mapping = state
+            .mappings
+            .iter()
+            .find(|m| (m.va..m.va + m.length).contains(&address))
+            .ok_or(FsError::InvalidData)?;
+        if !mapping.writable && !read {
+            return Err(FsError::OperationNotPermitted);
+        }
+        Ok((mapping.va, mapping.va + mapping.length))
+    }
 }
