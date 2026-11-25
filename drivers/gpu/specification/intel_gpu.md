@@ -3010,9 +3010,13 @@ ADDFB2 only under `narf.intel.ccs=1` (`intel_gpu_scanout::ccs`): display
 the i915 personality (AuxCCS plane, clear-colour plane; xe has no AuxCCS
 on MTL) and display 20/30's `_LNL_CCS` (flat CCS, compression from the
 BO's PAT, no AUX plane), with `intel_framebuffer_init`'s CCS plane rules;
-their `PLANE_CTL` decompression bits, `PLANE_AUX_DIST` and `PLANE_CC_VAL`
-are implemented with native fixtures. The presenter still refuses them at
-commit (`Unsupported`): only plain X and Tile4 reach it.
+they are advertised in IN_FORMATS and reach the presenter as an unpanned
+Tile4 view whose DSB arm carries `PLANE_CC_VAL` (the CC plane's native
+value at offset 16), `PLANE_AUX_DIST`/`PLANE_AUX_OFFSET` and the
+decompression bits, which the latch proof verifies; on display 20 the
+DPT remaps at the source stride (`calc_plane_remap_info` for CCS). The
+AUX plane is sized in 64-byte x 64-line CCS tiles. Implemented with native
+fixtures.
 
 Xe `SCANOUT` at creation. `DRM_XE_GEM_CREATE_FLAG_SCANOUT` is admitted on
 the display-preserving profile (`UserBackend::display_preserving`) as
