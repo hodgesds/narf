@@ -117,6 +117,19 @@ impl UsbDev {
         (self.descriptor[4], self.descriptor[5], self.descriptor[6])
     }
 
+    /// `(parent hub slot, port on that hub)` for a device behind a hub:
+    /// the route string's deepest tier is the device's own port.
+    pub fn hub_port(&self) -> Option<(u8, u8)> {
+        let parent = self.parent_slot?;
+        let mut r = self.route & 0x000F_FFFF;
+        let mut port = 0u8;
+        while r & 0xf != 0 {
+            port = (r & 0xf) as u8;
+            r >>= 4;
+        }
+        (port != 0).then_some((parent, port))
+    }
+
     /// Active `bConfigurationValue` (0 when unconfigured).
     pub fn config_value(&self) -> u8 {
         self.state.lock().config
@@ -473,34 +486,41 @@ pub fn __reset_for_test() {
     DEVMAPS.lock().clear();
 }
 
+/// Build a record from `spec` without registering it.
 #[doc(hidden)]
-pub fn __insert_for_test(dev: UsbDevSpec) -> Arc<UsbDev> {
-    let dev = Arc::new(UsbDev {
-        controller: dev.controller,
-        slot: dev.slot,
+pub fn __spec_for_test(spec: UsbDevSpec) -> UsbDev {
+    UsbDev {
+        controller: spec.controller,
+        slot: spec.slot,
         generation: 1,
-        busnum: dev.busnum,
-        devnum: dev.devnum,
-        root_port: dev.root_port,
-        route: dev.route,
-        devpath: dev.devpath,
-        speed: dev.speed,
+        busnum: spec.busnum,
+        devnum: spec.devnum,
+        root_port: spec.root_port,
+        route: spec.route,
+        devpath: spec.devpath,
+        speed: spec.speed,
         parent_slot: None,
-        descriptor: dev.descriptor,
-        configs: dev.configs,
+        descriptor: spec.descriptor,
+        configs: spec.configs,
         manufacturer: None,
         product: None,
         serial: None,
         state: IrqSafeSpinLock::new(DevState {
-            config: dev.config,
+            config: spec.config,
             claims: Vec::new(),
         }),
-    });
+    }
+}
+
+/// Build and register a record from `spec`.
+#[doc(hidden)]
+pub fn __insert_for_test(spec: UsbDevSpec) -> Arc<UsbDev> {
+    let dev = Arc::new(__spec_for_test(spec));
     DEVICES.lock().push(dev.clone());
     dev
 }
 
-/// Fields for [`__insert_for_test`].
+/// Fields for [`__spec_for_test`] / [`__insert_for_test`].
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct UsbDevSpec {

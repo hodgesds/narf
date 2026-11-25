@@ -2341,6 +2341,10 @@ impl Xhci {
     pub fn max_ports(&self) -> u8 {
         self.caps.max_ports
     }
+    /// The controller's bus address (its PCI function), as probed.
+    pub fn bus_addr(&self) -> narf_bus::BusAddr {
+        self.bus_addr
+    }
     /// `true` when the controller advertises `HCCPARAMS1.CSZ = 1`
     /// (64-byte device + input contexts). Both 32-byte and 64-byte
     /// strides are supported; this accessor is kept for tests +

@@ -77,6 +77,9 @@ pub mod logitech_dj;
 pub mod logitech_hidpp;
 pub mod microsoft;
 pub mod mouse;
+pub mod raw;
+#[cfg(feature = "kernel-test")]
+mod raw_tests;
 pub mod report_descriptor;
 pub mod rmi_elan;
 pub mod touchpad;
@@ -159,6 +162,9 @@ pub struct BootKeyboard {
     /// The live binding owns the same evdev-aware decoder used by the
     /// report-keyboard path. Its node survives until this binding is dropped.
     input: keyboard::UsbKeyboard,
+    /// The interface's HID device (`/dev/hidrawN`), fed every report
+    /// this binding reads; unregistered with the binding.
+    raw: Option<raw::RawHidHandle>,
 }
 
 /// Walk a Configuration Descriptor (§9.6.3) tree looking for a HID
@@ -245,6 +251,7 @@ impl BootKeyboard {
                 interrupt_in_ep,
                 identity,
             ),
+            raw: None,
         }
     }
 
@@ -325,8 +332,11 @@ impl BootKeyboard {
             .poll_interrupt_in(self.slot_id, self.interrupt_in_ep, &mut buf)
             .map_err(HidError::Xhci)?
         {
-            Some(_) => {
+            Some(n) => {
                 REPORTS_READ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if let Some(raw) = &self.raw {
+                    raw.report_in(&buf[..n.min(buf.len())]);
+                }
                 Ok(Some(KbdReport::from_bytes(buf)))
             }
             None => Ok(None),
@@ -773,11 +783,14 @@ async fn bind_kbd_addressed_slot(
             u16::from_le_bytes([desc[12], desc[13]]),
         )
     });
-    let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci, hub_port, identity)
+    let mut kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci, hub_port, identity)
         .await
         .inspect_err(|e| {
             note_attach_fail(xhci_dev.id(), port, AttachStep::SetProtocol, e);
         })?;
+    // The keyboard interface is also a HID device: hidraw users (ykman's
+    // OTP feature reports on a YubiKey) reach it beside the evdev node.
+    kbd.raw = raw::register_binder_interface(xhci_dev, slot_id, iface).await;
     {
         KEYBOARDS.of(xhci_dev.id()).lock().push(kbd);
         ATTACHED_KEYBOARD_COUNT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -918,6 +931,7 @@ pub fn hub_ports(controller: u8) -> alloc::vec::Vec<(u8, u8)> {
     v.extend(rmi_elan::hub_ports(controller));
     v.extend(consumer::hub_ports(controller));
     v.extend(generic::hub_ports(controller));
+    v.extend(raw::hub_ports(controller));
     v.sort_unstable();
     v.dedup();
     v

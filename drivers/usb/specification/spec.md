@@ -1210,7 +1210,10 @@ also consult upstream Linux GPL sources.
   the bytes go out at once (Linux `usb_serial_generic_write` /
   `acm_tty_write`). The pumps send one 64-byte chunk per pass and kick
   again while bytes remain and output is not stopped.
-- `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
+- The in-kernel CCID binding is behind the `usb-ccid` feature, which is off
+  by default. As on Linux, pcscd drives smart-card readers itself through
+  usbfs, so a reader's interface is left unclaimed. With the feature on,
+  `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The
   node is clone-on-open: `write` submits one raw APDU via
@@ -1226,29 +1229,67 @@ also consult upstream Linux GPL sources.
   `CcidReader::get_slot_status`. The bridge depends on the narrow
   `CcidTransport` seam (production: the bound reader over xHCI);
   fixtures drive the published surface against a modelled card.
-- FIDO2 authenticators (CTAP2 over USB HID, issue #999) bind via
-  `ctap::try_bind_ctap_already_addressed`, late in the attach
-  cascade after CCID. Discrimination is the fetched HID report
-  descriptor, not the interface class: a token is an interface
-  whose report descriptor declares the FIDO Alliance usage page
-  (0xF1D0, usage 0x01) with 64-byte Input and Output fields and
-  no report IDs (`ctap::descriptor_is_fido`); every HID
-  interface on a composite device is scanned. The binder
-  requires a 64-byte interrupt IN/OUT endpoint pair
-  (`ctap::find_fido_endpoints`), issues SET_CONFIGURATION,
-  configures both endpoints, arms the first interrupt-IN TRB,
-  and registers the token in `ctap::CTAP_TOKENS` (append-only,
-  mirroring `CCID_READERS`; detach removal is the #748
-  follow-up, the slot itself is reclaimed by `detach_slot`).
-  `ctap::open_client(token)` builds a `narf_ctap2::Client` over
-  `ctap::XhciHidPipe` with `ctap::CryptoRandom` (narf-crypto's
-  HW-entropy-gated fill) for the suspend service. Interrupt-OUT
-  transfers are `Xhci::arm_interrupt_out` /
-  `Xhci::poll_interrupt_out`, the mirror of the interrupt-IN
-  pair: one Normal TRB carries one 64-byte report from the
-  endpoint's DMA page; polling reports bytes consumed or a
-  controller error; the pipe bounds its poll loop and surfaces
-  exhaustion as a CTAP Timeout rather than blocking.
+- FIDO2 authenticators (CTAP2 over USB HID, issue #999) are no
+  longer bound by a cascade binder. A FIDO interface is a HID
+  interface whose report descriptor declares the FIDO Alliance usage
+  page (0xF1D0, usage 0x01) with 64-byte Input and Output fields and
+  no report IDs (`ctap::descriptor_is_fido`).
+  - Like every HID interface no input binder takes, it binds as raw
+    HID in `attach::settle_outcome` and is served as `/dev/hidrawN`.
+  - `ctap::fido_devices` finds authenticators in the
+    `narf_input::hid_device` registry.
+  - `ctap::open_client(dev)` builds a `narf_ctap2::Client` over
+    `ctap::HidDevicePipe` with `ctap::CryptoRandom` (narf-crypto's
+    HW-entropy-gated fill) for the suspend service.
+  - The pipe reads 64-byte input reports from a
+    `HidDevice::subscribe` sink, pumping the endpoint itself
+    (`hid::raw::pump_device`), so it works with no other task running.
+    It writes `0 + report` through the transport's `output_report`.
+    The interrupt pair therefore has one owner, the raw binding.
+- The device registry (`usbdev`) keeps Linux's `struct usb_device`
+  bookkeeping for every addressed device:
+  - **Bus numbers:** per controller in probe order, the USB 2 root hub
+    then the USB 3 root hub when there are USB 3 ports.
+  - **Root-hub-relative port numbers.**
+  - **`choose_devnum` device numbers:** round-robin from `devnum_next`,
+    with the root hub at 1.
+  - **`devpath` and the name `busnum-devpath`.**
+  - **Descriptors and strings:** the device descriptor, every
+    configuration descriptor, and the manufacturer, product and serial
+    strings.
+  - **The active configuration and per-interface claims**, each held by
+    a kernel driver or a usbfs file.
+  - **Lifecycle:** `dispatch_after_address` registers the device after
+    its device descriptor read; `release_slot` and controller recovery
+    remove it.
+- `attach::settle_outcome` runs after the class cascade:
+  - **A binder took the device:** it records configuration index 0 (the
+    binders' choice), claims the interfaces the binder holds (its one
+    HID interface for HID binders, every non-HID interface otherwise),
+    then binds the remaining HID interfaces as raw HID.
+  - **No binder took it:** the device is no longer released. Its
+    configuration is chosen as `usb_choose_configuration` chooses (the
+    first whose first interface is not vendor-specific on a non-vendor
+    device, else the first) and set. Its HID interfaces bind as raw HID
+    (`AttachOutcome::RawHid`), or the device stays addressed for usbfs
+    (`AttachOutcome::Unbound`). The supervisor counts both as claimed.
+- `hid::raw` is usbhid's raw half:
+  - `parse_interface` reads the HID class descriptor and the interrupt
+    endpoints.
+  - Binding: SET_IDLE(0), GET_DESCRIPTOR(REPORT), configure the
+    endpoints, arm interrupt IN for `hid_find_max_report` bytes (at
+    least the max packet). It then registers a `hid_device` with
+    usbhid's identity: name manufacturer + product or `HID vvvv:pppp`,
+    phys `usb-<pci slot>-<devpath>/input<n>`, uniq the serial, version
+    bcdHID, the country code, and `sysfs_parent` the interface's path.
+  - `UsbHidTransport` is `usbhid_output_report` (interrupt OUT, a
+    leading 0 ID not sent but counted) and `usbhid_raw_request`
+    (GET/SET_REPORT, with ID 0 kept in `buf[0]` and counted).
+  - Raw-bound devices stay out of idle suspend.
+  - The boot-keyboard binding also registers its interface
+    (`register_binder_interface`) and tees every report, so a
+    keyboard's hidraw node exists beside its evdev node (a YubiKey's
+    OTP interface for ykman).
 - WBDI fingerprint readers (issue #919): `wbdi` recognises a
   sensor by its MS OS 2.0 Compatible-ID (WINUSB with a WBDI
   sub-compatible-ID) and runs last in the attach cascade, after

@@ -346,6 +346,9 @@ fn pump_bound_devices(controller: &xhci::Xhci) {
     // and a bound-but-unpumped generic device would be silently
     // dead. Pump it alongside the other HID classes.
     hid::generic::pump_all(controller);
+    // Raw HID (FIDO, vendor HID): every interface no input binder
+    // took, feeding /dev/hidrawN.
+    hid::raw::pump_all(controller);
     cdc_acm::pump_all(controller);
     serial::port::pump_all(controller);
     xpad::pump_all(controller);
@@ -652,7 +655,8 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     | AttachOutcome::WbdiFingerprint
                     | AttachOutcome::Fingerprint
                     | AttachOutcome::CcidReader
-                    | AttachOutcome::CtapToken
+                    | AttachOutcome::RawHid
+                    | AttachOutcome::Unbound
                     | AttachOutcome::UsbClassDriver
                     | AttachOutcome::Hub => {
                         claimed_root |= bit;
@@ -822,7 +826,8 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                         | AttachOutcome::WbdiFingerprint
                         | AttachOutcome::Fingerprint
                         | AttachOutcome::CcidReader
-                        | AttachOutcome::CtapToken
+                        | AttachOutcome::RawHid
+                        | AttachOutcome::Unbound
                         | AttachOutcome::UsbClassDriver
                         | AttachOutcome::Hub => {
                             new_bound_bits |= dpb;

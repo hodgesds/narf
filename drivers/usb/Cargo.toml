@@ -29,6 +29,7 @@ narf-aml          = { path = "../../aml" }
 narf-console      = { path = "../../console" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
+async-trait       = "0.1"
 narf-block        = { path = "../../block" }
 narf-net          = { path = "../../net" }
 narf-firmware     = { path = "../../firmware" }
@@ -55,6 +56,10 @@ ftdi-module-only = []
 # binder skips it and does not register its class entry, so the stick falls
 # through to module matches. Used by `cargo xtask usb-storage-module-block-smoke`.
 msc-module-only = []
+# Bind USB CCID smart-card readers in the kernel and publish /dev/ccid<N>.
+# Off by default: as on Linux, pcscd drives readers itself through usbfs,
+# which needs the interface unclaimed.
+usb-ccid = []
 
 [lints]
 workspace = true

@@ -122,19 +122,21 @@ pub enum AttachOutcome {
     /// subclass 0x00 / protocol 0x00). Slot stays alive; entry in
     /// `ccid::CCID_READERS`. PC/SC daemon attaches via /dev/ccid0.
     CcidReader,
-    /// Device bound as a FIDO2 authenticator (CTAP2 over USB HID;
-    /// the report descriptor carries the FIDO Alliance usage page
-    /// 0xF1D0 with 64-byte in/out reports). Slot stays alive;
-    /// entry in `ctap::CTAP_TOKENS`. The suspend service opens a
-    /// `narf_ctap2::Client` over the token via `ctap::open_client`.
-    CtapToken,
+    /// No in-kernel class driver, but at least one HID interface bound
+    /// as raw HID (`hid::raw`, `/dev/hidrawN`) — FIDO authenticators,
+    /// vendor HID. Slot stays alive.
+    RawHid,
+    /// No kernel driver at all: the device stays addressed and
+    /// configured, owned by the registry, for usbfs (Linux keeps an
+    /// unbound device the same way). Slot stays alive.
+    Unbound,
     /// Device claimed by a driver registered in the USB class-driver
     /// registry (e.g. rtl8xxxu USB-WiFi). Slot stays alive; the
     /// registered driver owns the device.
     UsbClassDriver,
-    /// We addressed the device but couldn't bind a class driver
-    /// (unknown class, or a class driver we don't have). The slot
-    /// has been disabled to free it for re-use.
+    /// Enumeration failed, or (from the cascade alone) no class driver
+    /// took the device. Out of `dispatch_after_address` it means the
+    /// slot was disabled to free it for re-use.
     UnknownClass,
 }
 
@@ -924,6 +926,7 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     hid::rmi_elan::unregister_rmi_elan_evdev(controller, slot_id);
     hid::consumer::detach_consumer(controller, slot_id);
     hid::generic::unregister_generic_evdev(controller, slot_id);
+    hid::raw::detach(controller, slot_id);
     crate::cdc_acm::detach_acm(controller, slot_id);
     crate::serial::port::detach_serial(controller, slot_id);
     crate::xpad::detach_xpad(controller, slot_id);
@@ -1000,6 +1003,7 @@ pub fn detach_all_bindings(controller: u8) {
     hid::rmi_elan::unregister_all_rmi_elan(controller);
     hid::consumer::clear_consumers(controller);
     hid::generic::unregister_all_generic(controller);
+    hid::raw::detach_all(controller);
     crate::cdc_acm::clear_acm(controller);
     crate::serial::port::clear_serial(controller);
     crate::xpad::clear_xpad(controller);
@@ -1225,6 +1229,135 @@ async fn dispatch_after_address(
         return AttachOutcome::Hub;
     }
 
+    let outcome = class_cascade(
+        xhci_dev,
+        slot_id,
+        port,
+        speed,
+        parent_hub_slot,
+        dev_vid,
+        dev_pid,
+    )
+    .await;
+    settle_outcome(xhci_dev, slot_id, port, outcome).await
+}
+
+/// `usb_choose_configuration` (drivers/usb/core/generic.c), without its
+/// power-budget and RNDIS rules: the first configuration whose first
+/// interface is not vendor-specific on a non-vendor device, else the
+/// first configuration.
+pub fn choose_configuration(dev: &crate::usbdev::UsbDev) -> Option<u8> {
+    const USB_CLASS_VENDOR_SPEC: u8 = 0xff;
+    let mut best = None;
+    for cfg in &dev.configs {
+        let Some(&value) = cfg.get(5) else { continue };
+        let first = crate::usbdev::interfaces_of(cfg).first().map(|i| i.class);
+        if dev.class_triple().0 != USB_CLASS_VENDOR_SPEC
+            && first.is_some_and(|c| c != USB_CLASS_VENDOR_SPEC)
+        {
+            return Some(value);
+        }
+        best.get_or_insert(value);
+    }
+    best
+}
+
+/// Which interfaces of configuration `cfg` a class binder holds after
+/// returning `outcome`. HID-class binders hold the one HID interface they
+/// drive; other binders hold every non-HID interface, leaving any HID
+/// interfaces of a composite device to raw HID.
+fn claims_for(outcome: &AttachOutcome, cfg: &[u8]) -> alloc::vec::Vec<u8> {
+    let hid_iface = match outcome {
+        AttachOutcome::Keyboard => hid::find_boot_keyboard(cfg).ok().map(|(i, _)| i),
+        AttachOutcome::Mouse => hid::mouse::find_boot_mouse(cfg).ok().map(|(i, _)| i),
+        AttachOutcome::Touchpad => hid::touchpad::find_hid_interface(cfg).map(|(i, _, _)| i),
+        AttachOutcome::ConsumerControl => {
+            hid::consumer::find_consumer_interface(cfg).map(|(i, _, _)| i)
+        }
+        _ => {
+            return crate::usbdev::interfaces_of(cfg)
+                .into_iter()
+                .filter(|i| i.class != 0x03)
+                .map(|i| i.number)
+                .collect();
+        }
+    };
+    hid_iface.into_iter().collect()
+}
+
+/// Settle what the cascade decided (`usb_new_device` → `usb_set_configuration`
+/// → driver binding):
+///
+/// - A class binder took the device: record the configuration it set,
+///   claim the interfaces it holds, and bind the device's remaining HID
+///   interfaces as raw HID (a YubiKey's FIDO interface beside its OTP
+///   keyboard).
+/// - None did: keep the device addressed, set the configuration Linux
+///   would choose, and bind its HID interfaces as raw HID (`RawHid`) or
+///   leave it for usbfs (`Unbound`). Only a device without a registry
+///   record is released.
+async fn settle_outcome(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    port: u8,
+    outcome: AttachOutcome,
+) -> AttachOutcome {
+    let Some(usb) = crate::usbdev::find(xhci_dev.id(), slot_id) else {
+        if matches!(outcome, AttachOutcome::UnknownClass) {
+            log_unknown_device_classes(xhci_dev, slot_id, port).await;
+            let _ = release_slot(xhci_dev, slot_id).await;
+        }
+        return outcome;
+    };
+    if !matches!(outcome, AttachOutcome::UnknownClass) {
+        // Every class binder configures index 0.
+        if let Some(cfg) = usb.configs.first() {
+            if let Some(&value) = cfg.get(5) {
+                usb.set_config_value(value);
+            }
+            let owner = crate::usbdev::Owner::Driver("kernel");
+            for iface in claims_for(&outcome, cfg) {
+                let _ = usb.claim(iface, owner.clone());
+            }
+        }
+        hid::raw::bind_unclaimed(xhci_dev, &usb).await;
+        return outcome;
+    }
+    if let Some(value) = choose_configuration(&usb) {
+        let set = xhci_dev
+            .control_out_generation(
+                slot_id,
+                usb.generation,
+                0x00,
+                0x09,
+                u16::from(value),
+                0,
+                &[],
+            )
+            .await;
+        if set.is_ok() {
+            usb.set_config_value(value);
+        }
+    }
+    if hid::raw::bind_unclaimed(xhci_dev, &usb).await > 0 {
+        return AttachOutcome::RawHid;
+    }
+    log_unknown_device_classes(xhci_dev, slot_id, port).await;
+    AttachOutcome::Unbound
+}
+
+/// The class-probe cascade for a non-hub device: the first binder that
+/// takes the device wins. `UnknownClass` when none does; the slot is
+/// left to the caller.
+async fn class_cascade(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+    port: u8,
+    speed: PortSpeed,
+    parent_hub_slot: Option<u8>,
+    dev_vid: u16,
+    dev_pid: u16,
+) -> AttachOutcome {
     // Not a hub — run the class-probe cascade. The dispatcher owns
     // slot lifecycle: each class binder is called with the same
     // already-addressed `slot_id` and MUST NOT call `disable_slot`
@@ -1488,26 +1621,20 @@ async fn dispatch_after_address(
             return AttachOutcome::Fingerprint;
         }
         // USB CCID smart-card reader — class 0x0B / subclass 0x00 /
-        // protocol 0x00. `find_ccid_interface` walks the config blob;
-        // returns NotCcid if not present.
+        // protocol 0x00. Off by default: as on Linux, pcscd drives
+        // readers itself through usbfs, so the interface is left
+        // unclaimed. `usb-ccid` restores the in-kernel `/dev/ccid<N>`.
+        #[cfg(feature = "usb-ccid")]
         if crate::ccid::try_bind_ccid_already_addressed(xhci_dev, slot_id, &cfg_blob)
             .await
             .is_ok()
         {
             return AttachOutcome::CcidReader;
         }
-        // FIDO2 authenticator — CTAP2 over USB HID (issue #999).
-        // Runs late in the cascade on purpose: the binder's own
-        // discrimination is the report descriptor's FIDO usage
-        // page (0xF1D0), fetched per HID interface, so dedicated
-        // HID classes above keep their devices and only genuine
-        // tokens (which nothing above claims) land here.
-        if crate::ctap::try_bind_ctap_already_addressed(xhci_dev, slot_id, &cfg_blob)
-            .await
-            .is_ok()
-        {
-            return AttachOutcome::CtapToken;
-        }
+        // FIDO2 authenticators (CTAP2 over USB HID, issue #999) are not
+        // bound here: like every HID interface no input binder takes,
+        // they bind as raw HID in `settle_outcome` (`/dev/hidrawN`), and
+        // `ctap` finds them in the HID registry.
         // Vendor USB-serial adapter (FTDI / Silicon Labs CP210x /
         // Prolific PL2303 / WCH CH341) — exact VID/PID match via
         // `serial::identify`; the binder programs the default line
@@ -1608,14 +1735,8 @@ async fn dispatch_after_address(
         }
     }
 
-    // Terminal mismatch: every class probe returned UnknownClass.
-    // Free the slot here, in the dispatcher, so the next port-reset
-    // / enable-slot pair on this port doesn't trip the controller's
-    // "port already assigned" Slot Context conflict. Log what the
-    // device's interface descriptors looked like so a future class-
-    // driver pass has a starting point.
-    log_unknown_device_classes(xhci_dev, slot_id, port).await;
-    let _ = release_slot(xhci_dev, slot_id).await;
+    // Terminal mismatch: every class probe returned UnknownClass. The
+    // caller (`settle_outcome`) decides what becomes of the device.
     AttachOutcome::UnknownClass
 }
 
