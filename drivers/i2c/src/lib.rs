@@ -24,6 +24,7 @@
 extern crate alloc;
 
 pub mod amd_fch;
+pub mod client;
 pub mod dw;
 pub mod dw_speed;
 pub mod gsb;
@@ -31,6 +32,8 @@ pub mod i801;
 pub mod lpss;
 pub mod piix4;
 pub mod registry;
+pub mod smbus;
+pub mod spd;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod dw_model;
@@ -70,6 +73,20 @@ pub enum I2cError {
     /// from the DW component-type register, etc.). Usually means the
     /// MMIO mapping points at the wrong place.
     BadHardware,
+    /// The host is owned by someone else and did not become free: a
+    /// stuck status register, or firmware (the FCH IMC) holding the
+    /// SMBus semaphore. Linux returns `-EBUSY`.
+    Busy,
+    /// The adapter cannot run this kind of transfer: an SMBus-only
+    /// host asked for raw I2C, or a size it has no hardware for.
+    /// Linux returns `-EOPNOTSUPP`.
+    Unsupported,
+    /// The request itself is malformed — for example a block write
+    /// longer than [`smbus::SMBUS_BLOCK_MAX`]. Linux returns `-EINVAL`.
+    InvalidArgs,
+    /// The device broke the protocol — for example an SMBus block read
+    /// whose count is 0 or over 32. Linux returns `-EPROTO`.
+    Protocol,
 }
 
 /// Async I2C bus interface. The implementor owns the controller's
@@ -84,6 +101,21 @@ pub trait I2cBus: Send + Sync + core::fmt::Debug {
     /// Identifier for the registry — typically the ACPI path of the
     /// controller (e.g. `\_SB.I2CA`). Unique within a single boot.
     fn name(&self) -> &str;
+
+    /// Run one SMBus protocol transaction (Linux `smbus_xfer`). The
+    /// default emulates it with I2C messages through
+    /// [`I2cBus::transfer`] ([`smbus::emulate`]); SMBus-only hosts
+    /// override it with their native transactions.
+    async fn smbus_xfer(&self, addr: u8, op: smbus::SmbusOp<'_>) -> Result<(), I2cError> {
+        smbus::emulate(self, addr, op).await
+    }
+
+    /// What this adapter can do (Linux `functionality`). The default
+    /// matches the default [`I2cBus::smbus_xfer`]: raw I2C plus the
+    /// SMBus sizes [`smbus::emulate`] can build.
+    fn functionality(&self) -> smbus::I2cFunc {
+        smbus::I2cFunc::EMULATED
+    }
 }
 
 /// Discover, instantiate, and register every supported I2C controller.
@@ -160,3 +192,6 @@ pub fn registered_bus_count() -> u32 {
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod smbus_tests;

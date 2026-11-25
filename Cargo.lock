@@ -1636,12 +1636,14 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-firmware-smbios",
  "narf-init",
  "narf-interrupts",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]

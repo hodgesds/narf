@@ -191,6 +191,15 @@ impl I801Smbus {
 
 #[async_trait]
 impl I2cBus for I801Smbus {
+    /// The SMBus sizes `transfer` maps onto host transactions: receive
+    /// byte (`Read[1]`), byte-data read/write (`Write[1]+Read[1]`,
+    /// `Write[2]`) and word-data read (`Write[1]+Read[2]`). Not raw
+    /// I2C: this host runs SMBus protocols only.
+    fn functionality(&self) -> crate::smbus::I2cFunc {
+        use crate::smbus::I2cFunc;
+        I2cFunc::SMBUS_READ_BYTE | I2cFunc::SMBUS_BYTE_DATA | I2cFunc::SMBUS_READ_WORD_DATA
+    }
+
     async fn transfer(&self, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(I2cError::BadHardware);
