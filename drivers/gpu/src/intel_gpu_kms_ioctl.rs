@@ -1743,10 +1743,11 @@ async fn execute_plan<B: Backend>(
     // This is the completion linearization witness. A reset/loss after the
     // final await must not turn an abandoned surface into a success event.
     backend.valid()?;
-    let card_index = (!plan.protection.is_empty())
-        .then(|| card_index_of(mode))
-        .flatten()
-        .unwrap_or(u32::MAX);
+    let card_index = if plan.protection.is_empty() {
+        u32::MAX
+    } else {
+        card_index_of(mode).unwrap_or(u32::MAX)
+    };
     let mut hdcp = Vec::new();
     let published = {
         let mut card = mode.lock();

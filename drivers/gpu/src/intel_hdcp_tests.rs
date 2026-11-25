@@ -1303,10 +1303,11 @@ impl crate::dp_aux::AuxChannel for IrqAux {
         reply[0] = 0;
         let n = match req.cmd {
             AuxCommand::NativeRead => {
-                for i in 0..req.data.len() {
-                    reply[1 + i] = self.mem.get(&(req.address + i as u32)).copied().unwrap_or(0);
+                let n = req.data.len();
+                for (i, b) in reply[1..=n].iter_mut().enumerate() {
+                    *b = self.mem.get(&(req.address + i as u32)).copied().unwrap_or(0);
                 }
-                req.data.len()
+                n
             }
             AuxCommand::NativeWrite => {
                 self.writes.push((req.address, req.data.to_vec()));
