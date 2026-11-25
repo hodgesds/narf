@@ -494,6 +494,16 @@ fn smoke_gen9_dc_lost_program_and_faults() -> TestResult {
     {
         return TestResult::Fail("an all-ones DC_STATE_EN must refuse the reference");
     }
+    // A boot that could not write DC_STATE_DISABLE keeps Init for good,
+    // even with a program handed over.
+    let mut core = Gen9DcCore::new(Gen9Platform::Skylake);
+    if core.boot(&fake) != Err(DcError::Unavailable) {
+        return TestResult::Fail("boot over an all-ones DC_STATE_EN must fail");
+    }
+    core.provide_program(resident(), SKL_DMC_MAX_FW_SIZE);
+    if core.release_init(0).is_some() || core.refs(Gen9DcUser::Init) != 1 {
+        return TestResult::Fail("a failed boot must keep the Init reference");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

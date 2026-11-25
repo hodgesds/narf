@@ -441,6 +441,8 @@ pub struct Gen9DcCore {
     program: Option<Resident>,
     /// The main program stopped verifying: never re-entered again.
     lost: bool,
+    /// [`Self::boot`] read the field and wrote `DC_STATE_DISABLE`.
+    booted: bool,
     arms: u64,
     last_block: Option<Gen9ArmBlock>,
 }
@@ -457,6 +459,7 @@ impl Gen9DcCore {
             arm_at: None,
             program: None,
             lost: false,
+            booted: false,
             arms: 0,
             last_block: None,
         }
@@ -513,10 +516,12 @@ impl Gen9DcCore {
     /// `bxt_display_core_init`): adopt the hardware field
     /// (`gen9_sanitize_dc_state`), write `DC_STATE_DISABLE`
     /// (`gen9_set_dc_state`, unconditional as in Linux), and hold the Init
-    /// reference whatever the outcome: a failed write is latched, so DC
-    /// states are never re-entered.
+    /// reference whatever the outcome: after a failure (an all-ones read,
+    /// or a write that did not stick) [`Self::release_init`] keeps it, so
+    /// DC states are never re-entered.
     pub fn boot<M: MmioWindow + ?Sized>(&mut self, regs: &M) -> Result<(), DcError> {
         let result = self.dc.sanitize(regs).and_then(|()| self.dc.disable(regs));
+        self.booted = result.is_ok();
         self.arm_at = None;
         let slot = &mut self.refs[Gen9DcUser::Init as usize];
         *slot = slot.saturating_add(1);
@@ -579,12 +584,12 @@ impl Gen9DcCore {
         self.lost = false;
     }
 
-    /// End of probe: release the Init reference, but only with a program
-    /// and no latched fault (Linux keeps `POWER_DOMAIN_INIT` without a
-    /// DMC: "runtime suspend *requires* a working DMC"). Returns the
-    /// re-entry deadline.
+    /// End of probe: release the Init reference, but only after a
+    /// successful [`Self::boot`], with a program and no latched fault
+    /// (Linux keeps `POWER_DOMAIN_INIT` without a DMC: "runtime suspend
+    /// *requires* a working DMC"). Returns the re-entry deadline.
     pub fn release_init(&mut self, now: u64) -> Option<u64> {
-        if self.program.is_none() || self.lost || self.dc.fault().is_some() {
+        if !self.booted || self.program.is_none() || self.lost || self.dc.fault().is_some() {
             return None;
         }
         let mut deadline = None;
