@@ -261,27 +261,43 @@ pub const fn tmds_clock_for(pixel_clock_khz: u32, bpc: u8, format: SinkFormat) -
     tmds_clock_khz(clock, bpc)
 }
 
-/// The PLL hole `hdmi_port_clock_valid` refuses for `ddi` on `family`
-/// (exclusive kHz bounds): ICL+ combo PHYs cannot generate 500-533.2 MHz,
-/// ICL+ Type-C PHYs 500-532.8 MHz. Display 9 has none.
-fn pll_hole(family: crate::intel_gpu_aux::SourceFamily, ddi: Option<Ddi>) -> Option<(u32, u32)> {
+/// The PLL holes `hdmi_port_clock_valid` refuses for `ddi` on `family`
+/// (exclusive bounds): the ICL/TGL combo and Type-C PHY's (500, 533.2) and
+/// (500, 532.8) MHz, and Gen9 LP's DPLL ranges (`MODE_CLOCK_RANGE`):
+/// Broxton and Gemini Lake cannot generate (223.333, 240) MHz, Gemini Lake
+/// not (446.666, 480) MHz either. Skylake has none.
+fn pll_holes(
+    family: crate::intel_gpu_aux::SourceFamily,
+    ddi: Option<Ddi>,
+) -> [Option<(u32, u32)>; 2] {
     use crate::intel_gpu_aux::SourceFamily;
-    let ddi = ddi?;
+    use crate::intel_gpu_gt::Gen9Platform;
     let tc = match family {
-        SourceFamily::Gen9 { .. } => return None,
-        SourceFamily::Gen11(platform) => matches!(
-            crate::intel_gpu_gen11_ddi::phy_for_port(platform, ddi),
-            Some(crate::intel_gpu_gen11_ddi::Gen11Phy::Mg { .. })
-        ),
+        SourceFamily::Gen9 {
+            platform: Gen9Platform::GeminiLake,
+            ..
+        } => return [Some((223_333, 240_000)), Some((446_666, 480_000))],
+        SourceFamily::Gen9 {
+            platform: Gen9Platform::Broxton,
+            ..
+        } => return [Some((223_333, 240_000)), None],
+        SourceFamily::Gen9 { .. } => return [None, None],
+        _ if ddi.is_none() => return [None, None],
+        SourceFamily::Gen11(platform) => ddi.is_some_and(|ddi| {
+            matches!(
+                crate::intel_gpu_gen11_ddi::phy_for_port(platform, ddi),
+                Some(crate::intel_gpu_gen11_ddi::Gen11Phy::Mg { .. })
+            )
+        }),
         // Rocket Lake's and Alder Lake S's TC ports are combo PHYs
         // (`intel_phy_is_tc` false).
         SourceFamily::Gen12(
             crate::intel_gpu_gt::Gen12Platform::RocketLake
             | crate::intel_gpu_gt::Gen12Platform::AlderLakeS,
         ) => false,
-        SourceFamily::Gen12(_) => ddi as u8 >= Ddi::D as u8,
+        SourceFamily::Gen12(_) => ddi.is_some_and(|ddi| ddi as u8 >= Ddi::D as u8),
     };
-    Some((500_000, if tc { 532_800 } else { 533_200 }))
+    [Some((500_000, if tc { 532_800 } else { 533_200 })), None]
 }
 
 /// `hdmi_port_clock_valid` with downstream limits: at least 25 MHz, at
@@ -306,7 +322,10 @@ fn port_clock_valid(
         && tmds <= source_max_tmds_khz(family)
         && (sink_max == 0 || tmds <= sink_max)
         && (tmds <= SCRAMBLING_THRESHOLD_KHZ || hf.scdc_present)
-        && !pll_hole(family, ddi).is_some_and(|(lo, hi)| tmds > lo && tmds < hi)
+        && !pll_holes(family, ddi)
+            .iter()
+            .flatten()
+            .any(|&(lo, hi)| tmds > lo && tmds < hi)
 }
 
 /// `intel_hdmi_compute_clock` for `format`, from 12 bpc down (the max_bpc
@@ -3003,7 +3022,7 @@ pub mod tests {
             || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Cnp), Ddi::D) != Some(PinPair::Pin3Bxt)
             || ddc_pin(rkl, &ddc, Some(GmbusPinTable::Cnp), Ddi::E) != Some(PinPair::Pin4Cnp)
             || ddc_pin(rkl, &ddc, None, Ddi::D).is_some()
-            || pll_hole(rkl, Some(Ddi::D)) != Some((500_000, 533_200))
+            || pll_holes(rkl, Some(Ddi::D)) != [Some((500_000, 533_200)), None]
         {
             return TestResult::Fail(
                 "RKL TC1/TC2 DDC pins and PLL hole must follow rkl_encoder_to_ddc_pin",
@@ -3021,6 +3040,69 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_hdmi",
         smoke_hdmi_gen11_gen9_source_families
+    );
+
+    /// Gen9 LP's `hdmi_port_clock_valid`: the DPLL ranges Broxton and
+    /// Gemini Lake cannot generate are refused at their exclusive bounds;
+    /// Gemini Lake reaches 594 MHz on an SCDC sink (scrambled), Broxton
+    /// stops at 300 MHz, Skylake has no hole.
+    fn smoke_hdmi_gen9_lp_pll_holes_and_scrambling() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gen9_ddi::SkuFamily;
+        use crate::intel_gpu_gt::Gen9Platform;
+        let gen9 = |platform| SourceFamily::Gen9 {
+            platform,
+            sku: SkuFamily::Ult,
+        };
+        let (bxt, glk, skl) = (
+            gen9(Gen9Platform::Broxton),
+            gen9(Gen9Platform::GeminiLake),
+            gen9(Gen9Platform::Skylake),
+        );
+        let vsdb = Some(HdmiVsdb {
+            max_tmds_khz: 340_000,
+            ..HdmiVsdb::default()
+        });
+        let hf = HfVsdb {
+            present: true,
+            scdc_present: true,
+            max_tmds_char_rate_khz: 600_000,
+            ..HfVsdb::default()
+        };
+        let ok = |family, tmds| port_clock_valid(family, Some(Ddi::B), tmds, vsdb, &hf);
+        for (family, tmds, want) in [
+            (bxt, 223_333, true),
+            (bxt, 223_334, false),
+            (bxt, 239_999, false),
+            (bxt, 240_000, true),
+            (bxt, 300_000, true),
+            (bxt, 300_001, false),
+            (glk, 230_000, false),
+            (glk, 446_666, true),
+            (glk, 446_667, false),
+            (glk, 479_999, false),
+            (glk, 480_000, true),
+            (glk, 594_000, true),
+            (glk, 594_001, false),
+            (skl, 230_000, true),
+        ] {
+            if ok(family, tmds) != want {
+                return TestResult::Fail("Gen9 LP HDMI clock range");
+            }
+        }
+        // Above 340 Mcsc only an SCDC sink is admitted.
+        let no_scdc = HfVsdb {
+            scdc_present: false,
+            ..hf
+        };
+        if port_clock_valid(glk, Some(Ddi::B), 594_000, vsdb, &no_scdc) {
+            return TestResult::Fail("594 MHz needs an SCDC sink");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_hdmi",
+        smoke_hdmi_gen9_lp_pll_holes_and_scrambling
     );
 
     /// `is_hdmi_sink`: only the HDMI Licensing VSDB (00-0C-03) in a CTA
