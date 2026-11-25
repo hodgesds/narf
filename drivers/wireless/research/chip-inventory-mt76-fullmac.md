@@ -121,6 +121,13 @@ upstream subsystem-specific4355/4365 entries, MT7925/CONNAC3 or arbitrary
 USB/SDIO Broadcom families. They are outside these counts and estimates.
 The loadable MT module is ID-registration-only, not the built-in native owner.
 
+Loadable build (supersedes the line above): every `14c3`/`0e8d` tuple in the
+MT table is also claimed by `mt76.ko`, which is the same driver source over
+the KABI. It carries the station subset only: no AP/P2P/monitor, WoW, system
+PM, scheduled scan, roaming or userspace SME
+(`drivers/wireless/specification/spec.md` §4.4). MT7925 stays unmatched in
+both builds.
+
 ## Remaining shared work packages
 
 | Package | Deliverable and dependency |

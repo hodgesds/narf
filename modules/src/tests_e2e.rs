@@ -1763,6 +1763,84 @@ fn e2e_ath11k_module_registration() -> TestResult {
 }
 kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
 
+// ── mt76.ko ────────────────────────────────────────────────────────────
+
+/// The real mt76 `.ko` (`narf-drivers-wireless-mt76 --features module`: the
+/// MT7921/MT7922 driver — PCI binding, WFDMA rings, MCU, firmware download,
+/// the station join with its supplicant and the packet path — over
+/// `narf-module-rt` and the KABI). Its relocations resolve and init runs to
+/// Live; the `debug` parameter is declared and a load argument applies; it
+/// claims exactly the six CONNAC2 PCI ids the built-in table names (not
+/// MT7925); a probe with no device context is refused before any device
+/// access; unload leaves no match behind. QEMU emulates no MediaTek Wi-Fi,
+/// so bring-up itself is proven on hardware.
+fn e2e_mt76_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const MTK: u16 = 0x14c3;
+    const ITTIM: u16 = 0x0e8d;
+    const IDS: [(u16, u16); 6] = [
+        (MTK, 0x7961),
+        (MTK, 0x7922),
+        (MTK, 0x0608),
+        (MTK, 0x0616),
+        (MTK, 0x7920),
+        (ITTIM, 0x7922),
+    ];
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/mt76.ko")
+    else {
+        return TestResult::Fail("mt76 module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("mt76 module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module_with_params(&image, "debug=1") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("mt76.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let applied = crate::params::find(&module.params, "debug").is_some_and(|s| s.read() == "1");
+    let claims = module.name() == "mt76"
+        && count() == before + IDS.len()
+        && IDS
+            .iter()
+            .all(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
+        && __module_thunk_for_test(MTK, 0x7925).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let refused = __module_thunk_for_test(MTK, 0x7922).is_some_and(|thunk| thunk(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("mt76").is_err() {
+        return TestResult::Fail("could not unload mt76.ko");
+    }
+    if !live || !applied {
+        return TestResult::Fail("mt76.ko not Live, or its debug parameter missing or not applied");
+    }
+    if !claims {
+        return TestResult::Fail("mt76.ko did not claim exactly the CONNAC2 PCI ids");
+    }
+    if !refused {
+        return TestResult::Fail("mt76.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || IDS
+            .iter()
+            .any(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
+    {
+        return TestResult::Fail("mt76.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/mt76", e2e_mt76_module_registration);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]

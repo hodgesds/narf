@@ -2579,6 +2579,93 @@ feature off).
   leaves no match. QEMU emulates no WCN6855, so bring-up and RF behavior
   are first proven on hardware (`docs/BOOTING_ON_CACHYOS.md`).
 
+### 4.4 `mt76.ko`: the MT7921/MT7922 driver as a loadable module
+
+`narf-drivers-wireless-mt76 --no-default-features --features module` is the
+CONNAC2 PCI station driver built into a `.ko` (x86_64 and aarch64) from the
+same source as the built-in: the L1 register planner, WFDMA rings, MCU
+framing, patch/RAM firmware download, the post-firmware NIC/EFUSE/MAC
+initialization, the station join with its in-driver WPA2/WPA3 supplicant
+(SAE, PMF, rekeys), BA/reorder/defragmentation and the packet path. Kernel
+services come from `src/platform/`: `kernel.rs` re-exports the kernel crates;
+`kabi.rs` implements the same names over `narf-module-rt` and the KABI.
+`narf-crypto` and `narf-wireless` are linked kernel-free.
+
+- **Claim.** The built-in table: `14c3:{7961,7922,0608,0616,7920}` and
+  `0e8d:7922`. MT7925 (`14c3:7925`, CONNAC3) is matched by neither build.
+  `narf-drivers-wireless/mt76-module-only` leaves the built-in PCI ids
+  unclaimed so an early-loaded `mt76.ko` owns the function; the private
+  family host below stays registered.
+- **Probe** (`mt7921/pci_kabi.rs`, the built-in `bring_up_current`).
+  1. `narf_pci_identity` against the table; firmware-owned DMA is retained
+     on teardown from the start.
+  2. `narf_pci_prepare_probe`; the parked command register is verified
+     through `narf_pci_command`.
+  3. BAR0 mapped; every identity/power register must lie inside it.
+  4. Memory decode with INTx disabled, bus mastering off (the function may
+     carry WFDMA ring bases from firmware or a previous OS).
+  5. ASPM off (`narf_pcie_aspm`).
+  6. Chip id/revision/bond and the MT7961 → MT7920 retag.
+  7. Driver ownership and the WFSYS reset.
+  8. The 1 ms poller drives the module executor, which runs the built-in
+     `boot_radio` task: firmware download, radio initialization, netdev
+     publication, then the built-in retry/recovery schedule.
+  Bus mastering is granted only by the firmware transport after it has
+  programmed its own rings; stop/reset sequences clear and re-read it
+  through `narf_pci_command` (memory decode, bus master and INTx disable
+  only; a bit in both masks is refused). Every call keeps the masks
+  disjoint: restoring the bus clears bus mastering while it sets decode and
+  INTx disable.
+- **DMA and interrupts.** Rings and frame buffers come from
+  `narf_dma_alloc_mapped` (a 4–64 KiB size-class pool over 1 MiB chunks:
+  KABI DMA handles are never reused). The memory is untranslated, so the
+  IOMMU block/restore steps are no-ops and the device-side evidence is the
+  stop proof, as built in outside `IommuMode::PerDomain`. On x86_64 one MSI
+  vector (`narf_msi_enable` + `narf_irq_set_handler`) raises the driver's
+  interrupt line and runs the executor; elsewhere the owner stays polled, as
+  built in.
+- **Firmware and regulatory.** Patch and RAM code are read with
+  `narf_firmware_open`/`_read` (the `Firmware` manifest cap) under the
+  built-in 16 MiB bound. The regulatory domain is the kernel's installed one
+  (the built-in driver's), read through `narf_wireless_regdomain` as an
+  NRGD v1 record and decoded with `narf_wireless::reg::parse_domain_record`.
+  It is read again on every query, as built in reads the database; the
+  station owner compares domains by value, so a policy change re-admits or
+  revokes the link as built in. When the kernel has no domain (`-ENODATA`)
+  or the record does not decode, the module fails closed exactly as built
+  in: no transmit permission, no active scan, no join. It has no
+  regulatory fallback of its own.
+- **Netdev and wiphy** (`iface_module.rs`).
+  - The netif bridge names the netdev `wlan%d`.
+  - `REGISTER_WIPHY` (§4.1) advertises the firmware-reported bands, HT/VHT,
+    the built-in eight cipher suites and `PSK_OFFLOAD | SAE_OFFLOAD |
+    REPORTS_DISCONNECT`, four scan SSIDs and 600 bytes of scan IEs.
+  - Scan, connect (open, PSK, SAE) and disconnect run the same boot-owner
+    entry points and scan/join helpers (`iface_station.rs`) as the built-in
+    netdev. A `CONNECT` without a BSSID or frequency takes the strongest
+    matching network of the last scan.
+  - The service task is the built-in worker pass: sources masked and
+    acknowledged, one packet step, key service, unmask. RX goes through
+    `narf_netif_rx` under the receive-epoch publication gate; TX frames are
+    queued and serviced on the next pass. Peer loss is reported as
+    `DISCONNECTED` with the AP's reason; a firmware failure resets the radio
+    on the built-in 1 s / 5 s / 30 s schedule.
+- **Parameters.** `.narf_kparams` declares `debug`; `mt76.debug=1` enables
+  the routine traces the built-in prints under `mt76.dyndbg=+p`.
+- **Not carried (built-in only).** AP, P2P and monitor roles (the AP/P2P
+  owner code is linked but no authority can be minted); WoW and system PM;
+  scheduled scan; roaming; CQM, survey and station statistics; power-save
+  control; the association-comeback event; the userspace SME.
+- **Private family.** The mt76 copy-mode family (`0x6d74_3736`, version 1,
+  `module_host.rs`) stays registered unchanged in the built-in build. No
+  in-tree `.ko` opens it any more; it can be retired once no out-of-tree
+  frontend depends on it.
+- **Proof.** `modules/e2e/mt76` loads the real `.ko`: relocations resolve,
+  init runs to Live, the `debug` parameter is declared and applies, exactly
+  the six ids are claimed (not MT7925), a probe with no device context is
+  refused, and unload leaves no match. QEMU emulates no MediaTek Wi-Fi, so
+  bring-up, firmware download and RF behavior are first proven on hardware.
+
 ## 5. Buffer Management
 
 - **Data Path**: Uses standard `DmaBuffer` caps provided by `io/spec`.

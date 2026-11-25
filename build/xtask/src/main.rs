@@ -5745,6 +5745,11 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath11k.ko".into(), bytes)),
             Err(e) => println!("xtask: ath11k driver module unavailable ({e})"),
         }
+        // The whole mt76 driver as a `.ko` (MT7921/MT7922 over the KABI).
+        match build_module_fixture("narf-drivers-wireless-mt76", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/mt76.ko".into(), bytes)),
+            Err(e) => println!("xtask: mt76 driver module unavailable ({e})"),
+        }
     }
 
     if !fixtures.is_empty() {

@@ -349,6 +349,12 @@ services sit behind one `platform` module that re-exports the kernel crates
 names. Pure protocol crates are linked with their `kernel` feature off.
 `modules/e2e/ath11k` loads it.
 
+`drivers/wireless/mt76` (`mt76.ko`, MT7921/MT7922) follows the same shape
+for a driver whose kernel-only features (AP/P2P control authorities, WoW,
+system PM) are woven through its shared owner: `src/platform/kabi.rs` gives
+those types an unconstructible stand-in, so the owner code links unchanged
+and the paths that need them cannot be reached. `modules/e2e/mt76` loads it.
+
 ## Lifecycle symbols
 
 Every NARF module exports two C-ABI symbols the kernel calls:

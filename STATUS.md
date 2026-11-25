@@ -914,6 +914,39 @@ WCN6855, so bring-up through the module (MHI, FW_READY, scan, association)
 is first proven on the Lenovo 21ME (`docs/BOOTING_ON_CACHYOS.md`); that boot
 has not yet run.
 
+## Loadable mt76 (MT7921/MT7922)
+
+The mt76 driver now builds from one source either built in or as `mt76.ko`.
+Until now the `.ko` was a thin frontend over the private mt76 copy-mode host,
+which kept MCU/WFDMA execution in the kernel. The module now runs the PCI
+station path itself over the KABI:
+
+- PCI binding, WFDMA rings, MCU and patch/RAM firmware download;
+- NIC/EFUSE/MAC initialization;
+- the station join with its in-driver WPA2/WPA3 supplicant, and the packet
+  path;
+- one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
+  family host.
+
+It claims the built-in table (`14c3:{7961,7922,0608,0616,7920}`,
+`0e8d:7922`); MT7925 is not matched. `narf-drivers-wireless/mt76-module-only`
+steps the built-in PCI claim aside. The shared `narf_pci_command` export lets
+the stop/reset sequences clear and re-read bus mastering, and
+`narf_wireless_regdomain` gives the module the kernel's installed regulatory
+domain, the one the built-in driver uses. With no installed domain the module
+fails closed (no transmission, no join), exactly as built in; it has no
+regulatory fallback of its own. The private mt76 family host stays
+registered; no in-tree `.ko` uses it now.
+
+`modules/e2e/mt76` loads the real `.ko` and checks relocations and init, the
+`debug` parameter, the exact PCI claim, refusal of a probe with no device
+context, and clean unload. The test is written; it has not been run yet.
+
+Not in the module build: AP/P2P/monitor, WoW and system PM, scheduled scan,
+roaming, CQM/survey/station statistics, power-save control and the userspace
+SME. QEMU has no MediaTek Wi-Fi, so firmware download, scan and association
+through the module are unverified until a hardware boot.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion
