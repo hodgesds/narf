@@ -839,6 +839,12 @@ pub enum FsError {
     /// PCM underrun or overrun (EPIPE), without the SIGPIPE side effect of
     /// writing to a pipe or socket whose peer closed.
     StreamXrun,
+    /// The device stalled the request: a USB endpoint STALL, which Linux
+    /// returns as `-EPIPE` from `usb_control_msg` / `usb_interrupt_msg` and
+    /// hidraw hands to userspace unchanged. Maps to `EPIPE`, without the
+    /// SIGPIPE that [`FsError::BrokenPipe`] raises — a write to a device is
+    /// not a write to a pipe.
+    Stalled,
     /// A suspended PCM stream needs RESUME or PREPARE (ESTRPIPE).
     StreamSuspended,
     /// The operation ran against a descriptor whose open mode forbids it —

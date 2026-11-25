@@ -2210,9 +2210,16 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::BadAddress) => {
             ctx.set_return(errno_ret(EFAULT));
         }
-        Err(narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun) => {
-            ctx.set_return(errno_ret(EPIPE))
-        }
+        Err(
+            narf_filesystem::FsError::BrokenPipe
+            | narf_filesystem::FsError::StreamXrun
+            | narf_filesystem::FsError::Stalled,
+        ) => ctx.set_return(errno_ret(EPIPE)),
+        // A device I/O failure is EIO, never the EINVAL of a malformed
+        // request: hidraw's HIDIOCGFEATURE returns the transport's -EIO
+        // unchanged (drivers/hid/hidraw.c:242), as every driver's ioctl
+        // returns its transfer errors.
+        Err(narf_filesystem::FsError::Io(_)) => ctx.set_return(errno_ret(EIO)),
         Err(narf_filesystem::FsError::NoDevice) => ctx.set_return(errno_ret(ENODEV)),
         Err(narf_filesystem::FsError::BadFileState) => ctx.set_return(errno_ret(77)),
         Err(narf_filesystem::FsError::StreamSuspended) => ctx.set_return(errno_ret(86)),
