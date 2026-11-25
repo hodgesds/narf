@@ -224,6 +224,6 @@ impl<I: Io, M: BtMpSource> Hal for BtcHal<'_, I, M> {
         self.ampdu = Some(cfg);
     }
     fn now_ms(&mut self) -> u64 {
-        narf_time::wall::monotonic_ns() / 1_000_000
+        crate::platform::time::wall::monotonic_ns() / 1_000_000
     }
 }

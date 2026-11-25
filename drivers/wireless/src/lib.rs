@@ -147,10 +147,13 @@ pub fn register_initcalls() {
         cyw43439::register();
         InitResult::Ok
     });
+    // rtl.ko owns both tables under `rtl-module-only`.
+    #[cfg(not(feature = "rtl-module-only"))]
     narf_init::register(Stage::Subsys, "rtl8xxxu", || {
         rtl8xxxu::register();
         InitResult::Ok
     });
+    #[cfg(not(feature = "rtl-module-only"))]
     narf_init::register(Stage::Subsys, "rtlwifi", || {
         rtlwifi::register();
         InitResult::Ok

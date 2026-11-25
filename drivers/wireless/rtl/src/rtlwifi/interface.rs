@@ -9,6 +9,9 @@ use super::{
         Memory, Phase, Prepared,
     },
 };
+use crate::platform::lib::{mutex::Mutex, sync::IrqSafeSpinLock};
+use crate::platform::net::{Frame, Interface, RX_RING_N, TX_RING_N};
+use crate::platform::wireless::WirelessNetIface;
 use alloc::{
     boxed::Box,
     string::String,
@@ -17,11 +20,8 @@ use alloc::{
     vec::Vec,
 };
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
-use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
     AssociateRequest, BssInfo, ScanRequest, SecurityConfig, WirelessConfig, WirelessError,
-    WirelessNetIface,
 };
 use zeroize::Zeroizing;
 #[path = "rtl8723ae/native_activation.rs"]
@@ -46,8 +46,8 @@ pub(crate) mod supervisor;
 mod system_sleep;
 type Error = station::Error;
 struct EndpointState {
-    rx: narf_ipc::Producer<Frame, RX_RING_N>,
-    tx: narf_ipc::Consumer<Frame, TX_RING_N>,
+    rx: crate::platform::ipc::Producer<Frame, RX_RING_N>,
+    tx: crate::platform::ipc::Consumer<Frame, TX_RING_N>,
     pending: Option<Frame>,
     /// Receipt belongs to this one retained pending frame, never a packet class.
     special_notified: bool,
@@ -98,8 +98,8 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     /// RTL8723BE `rtl8723be::ht::host_capabilities` bits (0 otherwise).
     rtl8723be_caps: AtomicU8,
     rts_threshold: AtomicU32,
-    rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
-    tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+    rx: Arc<IrqSafeSpinLock<Option<crate::platform::ipc::Consumer<Frame, RX_RING_N>>>>,
+    tx: IrqSafeSpinLock<Option<crate::platform::ipc::Producer<Frame, TX_RING_N>>>,
     leisure: IrqSafeSpinLock<Leisure>,
     lifecycle: lifecycle::Lifecycle,
     work: Mutex<Option<supervisor::Work>>,
@@ -250,7 +250,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     pub(crate) fn configured_rts_threshold(&self) -> Option<u16> {
         u16::try_from(self.rts_threshold.load(Ordering::Acquire)).ok()
     }
-    fn commit_close(&self, _publication: narf_lib::sync::IrqSafeSpinLockGuard<'_, ()>) {
+    fn commit_close(&self, _publication: crate::platform::lib::sync::IrqSafeSpinLockGuard<'_, ()>) {
         self.admission.closed.store(true, Ordering::Release);
         self.ht.store(false, Ordering::Release);
         self.ht40.store(false, Ordering::Release);
@@ -275,8 +275,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             .admission()
             .cloned()
             .unwrap_or_else(|| Arc::new(station::Admission::new()));
-        let (rx, consumer) = narf_ipc::channel();
-        let (producer, tx) = narf_ipc::channel();
+        let (rx, consumer) = crate::platform::ipc::channel();
+        let (producer, tx) = crate::platform::ipc::channel();
         Self {
             prepared,
             state: Mutex::new(EndpointState {
@@ -326,9 +326,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let was = self.up.swap(up, Ordering::AcqRel);
         // Physical carrier preserves operator-controlled IFF_UP and never
         // invokes an administrative open/stop hook under retained locks.
-        narf_net::iface::set_link_metadata(&self.name, up, None, None);
+        crate::platform::net::iface::set_link_metadata(&self.name, up, None, None);
         if was && !up {
-            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            crate::platform::wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
     }
     fn link(&self, peer: Option<[u8; 6]>) {
@@ -505,7 +505,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         }
         Ok(())
     }
-    pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    pub(super) fn enqueue(
+        &self,
+        bytes: &[u8],
+        meta: crate::platform::net::TxMeta,
+    ) -> Result<(), ()> {
         if self.admission.closed.load(Ordering::Acquire)
             || !self.up.load(Ordering::Acquire)
             || !admitted(bytes, self.factory.mac)
@@ -526,8 +530,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 })?;
             (publication, self.lifecycle.generation())
         };
-        let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
-            .map_err(|_| ())?;
+        let buffer = crate::platform::io::alloc_coherent(
+            bytes.len(),
+            crate::platform::lib::id::DomainId::DRIVER_0,
+        )
+        .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
         frame.set_tx_meta(meta);
@@ -663,7 +670,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             })?;
             let (_, epoch) = owner.station_receive_epoch();
             if state.epoch != epoch {
-                let (producer, consumer) = narf_ipc::channel();
+                let (producer, consumer) = crate::platform::ipc::channel();
                 state.rx = producer;
                 *self.rx.lock() = Some(consumer);
                 state.epoch = epoch;
@@ -728,9 +735,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 return Ok(Vec::new());
             }
             for bytes in &frames {
-                if let Ok(buffer) =
-                    narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
-                {
+                if let Ok(buffer) = crate::platform::io::alloc_coherent(
+                    bytes.len(),
+                    crate::platform::lib::id::DomainId::DRIVER_0,
+                ) {
                     let mut frame = Frame::new(buffer, bytes.len() as u32);
                     frame.payload_mut().copy_from_slice(bytes);
                     publication.invoke(&self.environment.domain()?, || {
@@ -902,9 +910,14 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         }
         let cookie = self.route.swap(0, Ordering::AcqRel);
         ROUTES.lock().remove(cookie, Arc::as_ptr(self) as *const ());
-        narf_wireless::registry::unregister(&self.name);
-        narf_net::registry().unregister(&self.name);
-        narf_net::iface::unregister(&self.name);
+        #[cfg(feature = "builtin")]
+        {
+            narf_wireless::registry::unregister(&self.name);
+            crate::platform::net::registry().unregister(&self.name);
+            crate::platform::net::iface::unregister(&self.name);
+        }
+        #[cfg(feature = "module")]
+        crate::module_netdev::withdraw();
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn removed_for_test(&self) -> bool {
@@ -1054,7 +1067,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             let result = self.environment.domain().and_then(|domain| {
                 frame.publication.invoke(&domain, || {
                     if !self.admission.closed.load(Ordering::Acquire) {
-                        narf_net::iface::on_rx_frame_from(&self.name, &mut bytes);
+                        crate::platform::net::iface::on_rx_frame_from(&self.name, &mut bytes);
                     }
                     Ok(())
                 })
@@ -1094,8 +1107,13 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn attach_stack_for_test(self: &Arc<Self>) -> Result<(), Error> {
         let cookie = self.attach_route()?;
-        narf_net::iface::register_with_context(&self.name, self.factory.mac, cookie, send);
-        narf_net::iface::install_rx_drain(drain);
+        crate::platform::net::iface::register_with_context(
+            &self.name,
+            self.factory.mac,
+            cookie,
+            send,
+        );
+        crate::platform::net::iface::install_rx_drain(drain);
         self.published.store(true, Ordering::Release);
         Ok(())
     }
@@ -1140,7 +1158,7 @@ fn admitted(bytes: &[u8], own: [u8; 6]) -> bool {
         && u16::from_be_bytes([bytes[12], bytes[13]]) >= 0x600
         && !matches!(&bytes[12..14], [0x88, 0x8e] | [0x80, 0xf3] | [0x81, 0x37])
 }
-fn offloads(meta: narf_net::TxMeta) -> bool {
+fn offloads(meta: crate::platform::net::TxMeta) -> bool {
     meta.csum_l4.is_none() && meta.tso_mss.is_none() && meta.vlan_tag.is_none()
 }
 fn error(error: Error) -> WirelessError {
@@ -1167,10 +1185,14 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     fn link_up(&self) -> bool {
         !self.admission.closed.load(Ordering::Acquire) && self.up.load(Ordering::Acquire)
     }
-    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>> {
+    fn rx_ring(
+        &self,
+    ) -> &IrqSafeSpinLock<Option<crate::platform::ipc::Consumer<Frame, RX_RING_N>>> {
         &self.rx
     }
-    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>> {
+    fn tx_ring(
+        &self,
+    ) -> &IrqSafeSpinLock<Option<crate::platform::ipc::Producer<Frame, TX_RING_N>>> {
         &self.tx
     }
 }
@@ -1626,7 +1648,10 @@ pub(super) mod publication_test {
         E: Environment + 'static,
     >(
         device: &Device<I, M, E>,
-        source: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+        source: crate::platform::capabilities::Cap<
+            crate::platform::firmware::FirmwareBlob,
+            crate::platform::capabilities::Read,
+        >,
     ) -> Result<(), &'static str> {
         let frame = device
             .progress()
@@ -1736,7 +1761,7 @@ pub(super) mod publication_test {
         device.link(Some(peer));
         if device.link_up()
             || device.connected_bssid().is_some()
-            || narf_net::iface::lookup(device.name())
+            || crate::platform::net::iface::lookup(device.name())
                 .is_none_or(|iface| !iface.link_up || iface.carrier)
         {
             return Err("EE paused publisher survived completed close");
@@ -1770,7 +1795,7 @@ pub(super) mod publication_test {
         device.link(storage.as_ref().and_then(Prepared::station_peer));
         if device.link_up()
             || device.connected_bssid().is_some()
-            || narf_net::iface::lookup(device.name())
+            || crate::platform::net::iface::lookup(device.name())
                 .is_none_or(|iface| iface.carrier || !iface.link_up)
         {
             return Err("EE stale native publisher reopened closed station");
@@ -2102,7 +2127,7 @@ impl Environment for NativeEnvironment {
         Some(&self.admission)
     }
     fn now_ms(&self) -> u64 {
-        narf_time::wall::monotonic_ns() / 1_000_000
+        crate::platform::time::wall::monotonic_ns() / 1_000_000
     }
     fn fresh_nonce(&self) -> Option<[u8; 32]> {
         let mut bytes = [0; 32];
@@ -2111,10 +2136,11 @@ impl Environment for NativeEnvironment {
             .map(|()| bytes)
     }
     fn domain(&self) -> Result<narf_wireless::reg::RegulatoryDomain, Error> {
-        installed_domain(narf_wireless::reg::db::snapshot())
+        installed_domain(crate::platform::regdb::snapshot())
     }
     async fn pause(&self) {
-        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+        crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(1_000_000))
+            .await;
     }
     fn preparation_failed(&self) -> bool {
         self.firmware().status().stage == super::firmware_transport::Stage::Failed
@@ -2142,13 +2168,13 @@ pub(super) type Native = Device<
     NativeEnvironment,
 >;
 trait Endpoint: Send + Sync {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
+    fn send(&self, bytes: &[u8], meta: crate::platform::net::TxMeta) -> Result<(), ()>;
     fn drain(&self) -> bool;
 }
 impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> Endpoint
     for Device<I, M, E>
 {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    fn send(&self, bytes: &[u8], meta: crate::platform::net::TxMeta) -> Result<(), ()> {
         self.enqueue(bytes, meta)
     }
     fn drain(&self) -> bool {
@@ -2157,7 +2183,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
 }
 static ROUTES: IrqSafeSpinLock<endpoint_routes::Routes> =
     IrqSafeSpinLock::new(endpoint_routes::Routes::new());
-fn send(cookie: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+pub(super) fn send(
+    cookie: u64,
+    bytes: &[u8],
+    meta: crate::platform::net::TxMeta,
+) -> Result<(), ()> {
     let owner = ROUTES.lock().get(cookie).ok_or(())?;
     owner.send(bytes, meta)
 }
@@ -2169,8 +2199,12 @@ fn drain() -> bool {
     }
     received
 }
+/// Publish the native station: the netdev and wiphy (the kernel's
+/// registries built in, the netif bridge and `WIFI` host in `rtl.ko`),
+/// then MSI, the watchdog and the station worker, which both builds share.
 pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
-    let authority = narf_net::trusted_net_authority()
+    #[cfg(feature = "builtin")]
+    let authority = crate::platform::net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
     let cookie = device.attach_route()?;
@@ -2181,35 +2215,51 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             .wowlan_capable
             .store(true, Ordering::Release);
     }
-    if narf_net::registry()
+    #[cfg(feature = "builtin")]
+    let registered = crate::platform::net::registry()
         .register(&authority, Registered(device.clone()))
-        .is_err()
-    {
+        .is_ok();
+    #[cfg(feature = "module")]
+    let registered = crate::module_netdev::attach(
+        device.clone(),
+        Box::new(move |bytes| send(cookie, bytes, crate::platform::net::TxMeta::default())),
+    )
+    .is_ok();
+    if !registered {
         ROUTES
             .lock()
             .remove(cookie, Arc::as_ptr(&device) as *const ());
         device.route.store(0, Ordering::Release);
         return Err(Error::Profile);
     }
-    narf_net::iface::register_with_context(&device.name, device.factory.mac, cookie, send);
+    #[cfg(feature = "builtin")]
+    crate::platform::net::iface::register_with_context(
+        &device.name,
+        device.factory.mac,
+        cookie,
+        send,
+    );
     device.link(None);
     device.published.store(true, Ordering::Release);
-    narf_net::iface::install_rx_drain(drain);
-    narf_wireless::registry::register(device.clone());
-    let pm = Arc::new(system_sleep::SystemPm {
-        device: Arc::downgrade(&device),
-        config: IrqSafeSpinLock::new(None),
-        wake: IrqSafeSpinLock::new(None),
-    });
-    narf_power::system_pm::register_async_system_pm(&device.name, pm.clone());
-    narf_power::device_pm::register_device_pm_ops(&device.name, pm);
+    #[cfg(feature = "builtin")]
+    {
+        crate::platform::net::iface::install_rx_drain(drain);
+        narf_wireless::registry::register(device.clone());
+        let pm = Arc::new(system_sleep::SystemPm {
+            device: Arc::downgrade(&device),
+            config: IrqSafeSpinLock::new(None),
+            wake: IrqSafeSpinLock::new(None),
+        });
+        narf_power::system_pm::register_async_system_pm(&device.name, pm.clone());
+        narf_power::device_pm::register_device_pm_ops(&device.name, pm);
+    }
     // Linux `rtl_pci_intr_mode_decide`: MSI first. Without a vector the
     // owner keeps every IMR clear and this worker polls at 1 ms.
     device.environment.firmware().native().arm_msi();
     // `rtl_watch_dog_timer` → `rtl_watchdog_wq_callback`, every
     // `RTL_WATCH_DOG_TIME`, until `rtl_pci_remove`.
     crate::watchdog_work::start(&device, WATCHDOG_MS);
-    narf_scheduler::spawn(async move {
+    crate::platform::scheduler::spawn(async move {
         let mut retries = 0;
         let mut retry_at = 0;
         loop {
@@ -2278,12 +2328,17 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
                 (Some(signal), Some(seen)) => {
                     // Station deadlines are millisecond timers; a slow
                     // housekeeping tick replaces 1 ms polling.
-                    let tick = Box::pin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
-                        HOUSEKEEPING_NS,
-                    )));
+                    let tick = Box::pin(crate::platform::time::sleep_cycles(
+                        crate::platform::time::wall::ns_to_cycles(HOUSEKEEPING_NS),
+                    ));
                     signal.wait(seen, tick).await;
                 }
-                _ => narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await,
+                _ => {
+                    crate::platform::time::sleep_cycles(crate::platform::time::wall::ns_to_cycles(
+                        1_000_000,
+                    ))
+                    .await
+                }
             }
         }
     });
@@ -2306,7 +2361,9 @@ where
 }
 /// Housekeeping tick while a bound vector drives RX/TX service.
 const HOUSEKEEPING_NS: u64 = 20_000_000;
+#[cfg(feature = "builtin")]
 struct Registered(Arc<Native>);
+#[cfg(feature = "builtin")]
 impl Interface for Registered {
     fn name(&self) -> &str {
         self.0.name()
@@ -2320,10 +2377,14 @@ impl Interface for Registered {
     fn link_up(&self) -> bool {
         self.0.link_up()
     }
-    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>> {
+    fn rx_ring(
+        &self,
+    ) -> &IrqSafeSpinLock<Option<crate::platform::ipc::Consumer<Frame, RX_RING_N>>> {
         self.0.rx_ring()
     }
-    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>> {
+    fn tx_ring(
+        &self,
+    ) -> &IrqSafeSpinLock<Option<crate::platform::ipc::Producer<Frame, TX_RING_N>>> {
         self.0.tx_ring()
     }
 }

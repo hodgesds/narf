@@ -52,9 +52,9 @@ pub const IRQ_DISABLED: u32 = 0x0;
 /// `rtl_cam_reset_all_entry`: `BIT(31) | BIT(30)` into `REG_CAMCMD`.
 pub const CAM_RESET: u32 = 0xc000_0000;
 
-pub const REG_HIMR: u16 = 0x0120;
+pub const REG_HIMR: u16 = crate::rtlwifi::regs::REG_HIMR_92C;
 pub const REG_HISR: u16 = 0x0124;
-pub const REG_HIMRE: u16 = 0x0128;
+pub const REG_HIMRE: u16 = crate::rtlwifi::regs::REG_HIMRE_92C;
 pub const REG_HISRE: u16 = 0x012c;
 pub const REG_TRXDMA_CTRL: u16 = 0x010c;
 pub const REG_TRXFF_BNDY: u16 = 0x0114;

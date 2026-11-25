@@ -52,7 +52,7 @@ mod tests {
         }
     }
     impl Endpoint for Sink {
-        fn send(&self, _: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
+        fn send(&self, _: &[u8], _: crate::platform::net::TxMeta) -> Result<(), ()> {
             self.sends.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
@@ -71,11 +71,12 @@ mod tests {
         routes
             .get(second)
             .unwrap()
-            .send(&[], narf_net::TxMeta::default())
+            .send(&[], crate::platform::net::TxMeta::default())
             .unwrap();
         routes.remove(first, Arc::as_ptr(&a) as *const ());
         let third = routes.insert(a.clone()).unwrap();
-        old.send(&[], narf_net::TxMeta::default()).unwrap();
+        old.send(&[], crate::platform::net::TxMeta::default())
+            .unwrap();
         if routes.get(first).is_some()
             || third <= second
             || a.sends.load(Ordering::Acquire) != 1

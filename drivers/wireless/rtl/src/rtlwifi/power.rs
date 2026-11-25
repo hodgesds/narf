@@ -22,8 +22,7 @@
 
 #![allow(dead_code)]
 
-use narf_bus::MmioRegion;
-use narf_time::Deadline;
+use crate::platform::{responsive_spin_until, Deadline, MmioRegion};
 
 // ── Command IDs (pwrseqcmd.h:12–16) ───────────────────────────────────────
 
@@ -150,7 +149,7 @@ pub trait Io {
     fn read8(&self, offset: u16) -> Result<u8, PwrSeqError>;
     fn write8(&self, offset: u16, value: u8) -> Result<(), PwrSeqError>;
     fn delay_us(&self, micros: u64) {
-        narf_scheduler::responsive_spin_until(|| false, Deadline::after_us(micros));
+        responsive_spin_until(|| false, Deadline::after_us(micros));
     }
 }
 struct MmioIo<'a>(&'a MmioRegion);
@@ -205,7 +204,7 @@ pub fn run_with(
             }
             PWR_CMD_POLLING => {
                 let mut access = Ok(());
-                let done = narf_scheduler::responsive_spin_until(
+                let done = responsive_spin_until(
                     || match io.read8(cfg.offset) {
                         Ok(value) => value & cfg.msk == cfg.value & cfg.msk,
                         Err(error) => {

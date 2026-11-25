@@ -17,7 +17,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         let permission = self.rtl8821ae_power.ok_or(Error::State)?;
-        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::State)?;
+        let domain = crate::platform::regdb::snapshot().ok_or(Error::State)?;
         if base
             .permission_for(&domain, permission.operating())
             .map_err(|_| Error::State)?

@@ -2,8 +2,8 @@
 //! Reserve a PCI function before hardware access and quarantine only that
 //! function until its actual retirement completes. No guard crosses I/O.
 use super::RtlwifiDevice;
+use crate::platform::bus::BusAddr;
 use alloc::vec::Vec;
-use narf_bus::BusAddr;
 pub(super) enum Admission {
     Bound,
     Initialize,

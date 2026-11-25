@@ -95,10 +95,18 @@ impl core::fmt::Debug for Publication {
 #[derive(Clone)]
 enum PublicationSource {
     Guarded(alloc::sync::Arc<PublicationGuard>),
+    #[cfg(feature = "builtin")]
     Native(
         narf_bus::BusDevice,
-        narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+        crate::platform::capabilities::Cap<
+            narf_bus::BusDeviceCap,
+            crate::platform::capabilities::Write,
+        >,
     ),
+    /// `rtl.ko`: the bound function, whose authority the kernel's device
+    /// context holds and re-validates on every export.
+    #[cfg(feature = "module")]
+    Native,
     #[cfg(any(test, feature = "kernel-test"))]
     Model(alloc::sync::Arc<dyn Fn() -> Result<(), Error> + Send + Sync>),
 }
@@ -107,11 +115,19 @@ impl Publication {
         Self(PublicationSource::Guarded(guard))
     }
 
+    #[cfg(feature = "builtin")]
     pub(crate) fn native(
         device: narf_bus::BusDevice,
-        cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+        cap: crate::platform::capabilities::Cap<
+            narf_bus::BusDeviceCap,
+            crate::platform::capabilities::Write,
+        >,
     ) -> Self {
         Self(PublicationSource::Native(device, cap))
+    }
+    #[cfg(feature = "module")]
+    pub(crate) fn native() -> Self {
+        Self(PublicationSource::Native)
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn model(
@@ -133,6 +149,7 @@ impl Publication {
                 })?;
                 result.ok_or(Error::State)?
             }
+            #[cfg(feature = "builtin")]
             PublicationSource::Native(device, cap) => {
                 narf_drivers_wireless_rtw::rtw88::pci_park::invoke(cap, || {
                     let cmd = narf_bus::pci::read_command(cap, device)
@@ -146,6 +163,19 @@ impl Publication {
                     operation()
                 })
                 .map_err(|_| Error::Access(super::AccessError::Access))?
+            }
+            // The same Command test over `narf_pci_command`.
+            #[cfg(feature = "module")]
+            PublicationSource::Native => {
+                let bits = super::super::firmware_native::cmd::MEM_SPACE
+                    | super::super::firmware_native::cmd::BUS_MASTER
+                    | super::super::firmware_native::cmd::INTX_DISABLE;
+                let cmd = super::super::firmware_native::command()
+                    .map_err(|_| Error::Access(super::AccessError::Access))?;
+                if cmd == u16::MAX || cmd & bits != bits {
+                    return Err(Error::State);
+                }
+                operation()
             }
             #[cfg(any(test, feature = "kernel-test"))]
             PublicationSource::Model(check) => {

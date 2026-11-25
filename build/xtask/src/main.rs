@@ -5745,6 +5745,12 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath11k.ko".into(), bytes)),
             Err(e) => println!("xtask: ath11k driver module unavailable ({e})"),
         }
+        // rtl.ko: the rtlwifi PCIe driver and rtl8xxxu over the KABI
+        // (`modules/e2e/rtl`).
+        match build_module_fixture("narf-drivers-wireless-rtl", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/rtl.ko".into(), bytes)),
+            Err(e) => println!("xtask: rtl driver module unavailable ({e})"),
+        }
     }
 
     if !fixtures.is_empty() {

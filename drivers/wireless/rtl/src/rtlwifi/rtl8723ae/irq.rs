@@ -7,8 +7,8 @@ use crate::rtlwifi::{
     prepare::Error,
 };
 pub const ISR: u16 = 0x3a0;
-pub const MASK0: u16 = 0x3a8;
-pub const MASK1: u16 = 0x3ac;
+pub const MASK0: u16 = crate::rtlwifi::regs::REG_HIMR_8723AE;
+pub const MASK1: u16 = crate::rtlwifi::regs::REG_HIMRE_8723AE;
 pub const IRQ0: u32 = 0xff | (1 << 10) | (1 << 11) | (1 << 24) | (1 << 25) | (1 << 29);
 pub const IRQ1: u32 = 1 << 8;
 /// Mask both actual source banks; readbacks are native restrictions.

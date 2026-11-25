@@ -26,9 +26,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use narf_bus::MmioRegion;
-use narf_io::{alloc_coherent, DmaBuffer, IoError};
-use narf_lib::id::DomainId;
+use crate::platform::bus::MmioRegion;
+use crate::platform::io::{alloc_coherent, DmaBuffer, IoError};
+use crate::platform::lib::id::DomainId;
 
 use super::mac::{
     bd_num_reg_for_queue, desa_reg_for_queue, REG_BCNQ_DESA, REG_BKQ_DESA, REG_HQ0_DESA,

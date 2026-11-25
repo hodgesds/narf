@@ -9,9 +9,9 @@ use super::{
     protection,
     tracking::{self, Gains},
 };
+use crate::platform::capabilities::{Cap, CapError, CapOp, Read};
+use crate::platform::firmware::{FirmwareBlob, FirmwareError};
 use alloc::{format, string::String, sync::Arc};
-use narf_capabilities::{Cap, CapError, CapOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
 use narf_wireless::reg::RegulatoryDomain;
 #[path = "antenna_hw.rs"]
 mod hardware;
@@ -123,7 +123,7 @@ impl Grant {
         if program.kind().is_err() {
             return Ok(None);
         }
-        let authority = narf_firmware::trusted_loader_authority()
+        let authority = crate::platform::firmware::trusted_loader_authority()
             .and_then(|c| c.derive::<Read>().ok())
             .ok_or(Error::Power(super::channel_power::Error::Authority))?;
         let source =

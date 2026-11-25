@@ -7,13 +7,25 @@
 //! promoted crates: the shared Realtek USB transport
 //! (`narf-drivers-wireless-rtl-usb`), the iwlwifi MLME builder
 //! (`narf_drivers_wireless_iwlwifi::iwlwifi::mlme`) and rtw88's efuse decoder
-//! (`narf_drivers_wireless_rtw::rtw88::efuse`).
+//! (`narf_drivers_wireless_rtw::rtw88::efuse`), which forwards to the
+//! kernel-free Realtek chip core (`narf_drivers_wireless_rtl_chip::efuse`) that
+//! `rtlwifi::efuse` calls directly so the `.ko` can link it.
 //!
-//! The real drivers in [`rtl8xxxu`]/[`rtlwifi`] compile only for the built-in
-//! build. The `module` build registers BOTH buses — rtl8xxxu's Realtek USB
-//! VID/PIDs through `narf_register_usb_driver` and rtlwifi's Realtek PCIe ids
-//! through `narf_register_pci_driver` — with a probe thunk that returns
-//! `-ENOSYS` (registration-only proof), matching the net and iwlwifi `.ko`s.
+//! Built in, [`rtl8xxxu`] and [`rtlwifi`] are the whole drivers. The `module`
+//! build (`rtl.ko`) runs the drivers' own code inside the `.ko` over
+//! `narf-module-rt` and the KABI (kernel services come from [`platform`], the
+//! same names in both builds), as far as it is carried today:
+//!
+//! - **rtlwifi (PCIe)** — every rtlwifi id. Probe runs the built-in probe's
+//!   identification stage ([`rtlwifi::identity`]: BAR2 checks, ASPM off,
+//!   the chip's NIC-enable power table, interrupt masking, the factory EFUSE
+//!   map and MAC), then publishes `wlan%d` and its wiphy through the netif
+//!   bridge and the `WIFI` family host. That is the built-in's diagnostic
+//!   profile: firmware, native preparation and the station are not carried
+//!   yet, so scan and connect are refused.
+//! - **rtl8xxxu (USB)** — every `RTL8XXXU_USB_IDS` row. Probe classifies the
+//!   dongle with the driver's own chip-family table and claims it, as the
+//!   built-in probe does; the firmware/station owners are not carried yet.
 //!
 //! ## Hardware validation is gated
 //!
@@ -25,26 +37,40 @@
 #![no_std]
 #![allow(dead_code)]
 
-#[cfg(feature = "builtin")]
 extern crate alloc;
+
+/// Kernel services under one name in both builds.
+pub mod platform;
+
+/// The id tables `rtl.ko` registers (also read by its e2e load test).
+pub mod module_ids;
+#[cfg(feature = "kernel-test")]
+mod module_ids_tests;
 
 use narf_driver_macros::narf_driver;
 
-// Shared, driver-agnostic helpers live in `narf-drivers-wireless-core`.
-// Re-exported at the crate root so the inner drivers' `crate::firmware_asset` /
-// `crate::future_heap` / `crate::watchdog_work` references resolve unchanged
-// after promotion.
-#[cfg(feature = "builtin")]
-pub(crate) use narf_drivers_wireless_core::{firmware_asset, future_heap, watchdog_work};
+// Shared, driver-agnostic helpers live in `narf-drivers-wireless-core`
+// (built in) or the module platform. Re-exported at the crate root so the
+// inner drivers' `crate::firmware_asset` / `crate::future_heap` /
+// `crate::watchdog_work` references resolve unchanged in both builds.
+pub(crate) use platform::{firmware_asset, future_heap, watchdog_work};
 
 #[cfg(feature = "builtin")]
 pub mod rtl8xxxu;
 
-#[cfg(feature = "builtin")]
+/// The module build's rtl8xxxu: the chip-family table and the USB binding.
+#[cfg(feature = "module")]
+pub mod rtl8xxxu {
+    pub mod regs;
+    pub mod usb_kabi;
+}
+
 pub mod rtlwifi;
 
+/// The module build's netdev and wiphy, which either driver's station
+/// publishes through; the platform forwards the drivers' kernel calls here.
 #[cfg(feature = "module")]
-mod module_probe;
+pub(crate) mod module_netdev;
 
 narf_driver! {
     name: "rtl",
@@ -67,5 +93,8 @@ fn do_register() {
 
 #[cfg(feature = "module")]
 fn do_register() {
-    module_probe::register();
+    // The kernel DRBG feeds `narf-crypto` (EAPOL nonces) before any probe.
+    platform::install_entropy();
+    rtl8xxxu::usb_kabi::register();
+    rtlwifi::pci_kabi::register_pci_driver();
 }

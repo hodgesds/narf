@@ -3,9 +3,9 @@
 //! A reporting index-to-dBm estimate cannot mint transmit permission: actual
 //! per-board signed upper envelopes qualify every final conducted gain.
 use super::{efuse::Factory, radio};
+use crate::platform::capabilities::{Cap, CapError, CapOp, NoopOp, Read};
+use crate::platform::firmware::{FirmwareBlob, FirmwareError};
 use alloc::{format, vec::Vec};
-use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
-use narf_firmware::{FirmwareBlob, FirmwareError};
 const HEADER: usize = 96;
 const ROW: usize = 260;
 const UNKNOWN: i16 = i16::MAX;
@@ -129,7 +129,7 @@ impl Calibration {
             factory.mac[4],
             factory.mac[5]
         );
-        let authority = narf_firmware::trusted_loader_authority()
+        let authority = crate::platform::firmware::trusted_loader_authority()
             .and_then(|cap| cap.derive::<Read>().ok())
             .ok_or(Error::Authority)?;
         let asset = crate::firmware_asset::load(&authority, &name, HEADER + 11 * ROW, true)
