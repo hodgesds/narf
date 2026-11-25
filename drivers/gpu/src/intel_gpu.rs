@@ -1494,8 +1494,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // panel (a desktop, or a panel takeover that failed) still scanning the
     // GOP framebuffer: retain it for fixed-mode KMS, as an external-only
     // Gen12 board does, and keep hotplug modesets and system suspend off the
-    // inherited pipe. Broxton and Gemini Lake, whose DPIO PHY display is
-    // never programmed, have only this route, panel or not. Displays 9 to 11
+    // inherited pipe. Broxton and Gemini Lake take this route too when no
+    // panel is owned. Displays 9 to 11
     // have three pipes, with Skylake's universal-plane registers. On
     // Gen9/Gen11 the execlists owner already starts beside it (its planes
     // fetch below the GT arena); Meteor Lake's GuC owner takes the firmware

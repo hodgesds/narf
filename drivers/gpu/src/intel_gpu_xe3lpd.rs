@@ -79,10 +79,11 @@
 //! Tile4 primary flips through DPT, the 64x64 cursor, CTM and double-buffered
 //! LUTs, DSB transactions, the Xe `SCANOUT` create flag, and DP 1.4 on
 //! TC1–TC4 USB-C and on the C20 DDI B beside the panel through the
-//! fixed-refresh VRR timing generator. Refused on display 30: eDP on Type-C
-//! and its untranscribed intermediate C20 tables, HDMI FRL, PSR and panel
-//! replay, FBC (and its dirty
-//! rectangles), compressed primaries, DC states, system suspend and relight.
+//! fixed-refresh VRR timing generator. The KMS owner also runs PSR and FBC
+//! on display 30, and the DC-state service, system suspend and relight cover
+//! it. Refused on display 30: eDP on Type-C and its untranscribed
+//! intermediate C20 tables, native HDMI FRL, panel replay and compressed
+//! primaries.
 //! Wildcat Lake additionally retains only Pipes A-C and ports A/B/TC1/TC2;
 //! its distinct production option carries the proved 30.02 identity through
 //! KMS, hotplug, resource capture and recovery.

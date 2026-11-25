@@ -12,7 +12,9 @@
 //! 14.00 is `xe_lpdp_display` (MTL/ARL) and 20.00 is `xe2_lpd_display`
 //! (LNL): `XE_LPDP_FEATURES` plus FBC on all four pipes and DBUF overlap
 //! detection. 14.01 (BMG, `xe2_hpd_display`), 30.00/30.02 (PTL/WCL) and
-//! 35.00 are other IPs and are refused by type here. `INTEL_LNL_IDS` binds
+//! 35.00 (NVL-S) are other IPs: [`DisplayIp::decode`] refuses them, and only
+//! [`DisplayIp::decode_all`] admits 30.00, 30.02 and 35.00, for their own
+//! routes. `INTEL_LNL_IDS` binds
 //! the three LNL PCI IDs to `lnl_desc`, which carries no display info:
 //! display 20 is known only from the hardware's GMD.
 //! `__intel_display_device_info_runtime_init` then drops fused pipes
