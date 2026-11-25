@@ -142,7 +142,8 @@ still read Open for work the code now has (LNL/PTL FBC, i915
 
 Still open, each needing its own grounding first:
 
-- Gen9-LP display remainders: DC states.
+- Gen9 DC-state wiring (Skylake and Gen9 LP): the cores carry the masks
+  and targets; no `DC_off` service arms them on Gen9.
 - Nova Lake-S beyond the opted-in eDP takeover (`narf.intel.nvl_modeset=1`):
   external DP/HDMI and Type-C on the LT PHY, a display-35 relight owner for
   system suspend, and the DMC/DC states.
