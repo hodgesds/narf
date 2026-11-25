@@ -4630,7 +4630,7 @@ mod nova {
                     .contains(&(r.wrapping_sub(base)))
         }
         /// DDI B's relocated `PORT_BUF_CTL1/3`, AUX and message-bus timer.
-        fn from_pica(&self, r: u64) -> Option<u64> {
+        fn display14_offset(&self, r: u64) -> Option<u64> {
             if self.ext.port != XeLpgPort::B {
                 return None;
             }
@@ -4668,7 +4668,7 @@ mod nova {
             if self.lt_reg(r) {
                 return self.lt.read32(r);
             }
-            let value = self.ext.read32(self.from_pica(r).unwrap_or(r));
+            let value = self.ext.read32(self.display14_offset(r).unwrap_or(r));
             if r == self.aux_ctl() && value & XELPDP_AUX_CH_CTL_POWER_REQUEST != 0 {
                 value | crate::intel_gpu_aux::XELPDP_AUX_CH_CTL_POWER_STATUS
             } else {
@@ -4684,7 +4684,7 @@ mod nova {
                 self.ext.writes.borrow_mut().push((r, v));
                 return self.lt.write32(r, v);
             }
-            self.ext.write32(self.from_pica(r).unwrap_or(r), v)
+            self.ext.write32(self.display14_offset(r).unwrap_or(r), v)
         }
     }
 
