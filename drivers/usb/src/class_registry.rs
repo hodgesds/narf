@@ -241,8 +241,9 @@ static SUSPEND_HOOKS: IrqSafeSpinLock<Vec<SuspendEntry>> = IrqSafeSpinLock::new(
 
 /// Bound on match entries registered by loadable modules (all modules
 /// together). Separate from [`MAX_DRIVERS`]: a module's id table must not
-/// crowd built-in drivers out of their slots.
-const MAX_MODULE_MATCHES: usize = 64;
+/// crowd built-in drivers out of their slots. Sized for the Wi-Fi modules
+/// loaded together: `rtw88.ko` claims 50 ids and `rtl.ko` 23.
+const MAX_MODULE_MATCHES: usize = 128;
 
 /// One match entry registered by a loadable module through the
 /// `narf_register_usb_driver` kernel-ABI export (via
