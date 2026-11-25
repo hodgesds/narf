@@ -43,6 +43,7 @@ mod composition;
 mod crate_release;
 mod efi_image;
 mod ext4_host;
+mod ext4_interop;
 mod frame_budget;
 mod hibernate_e2e;
 mod http3_smoke;
@@ -214,6 +215,14 @@ enum Cmd {
     /// `e2fsck -fn`, `debugfs rdump` and a NARF remount
     /// (`verification/ext4-host`).
     Ext4HostRw(ext4_host::Args),
+    /// Build a GPT disk whose root is LUKS1 around a `mkfs.ext4 -d`
+    /// filesystem (host defaults, indexed directories) unprivileged, boot it
+    /// under `narf.disks=root-rw rd.luks.prompt=console`, type the
+    /// passphrase on the emulated PS/2 keyboard, run pacman-/systemd-shaped
+    /// writes, remount read-only; then decrypt on the host and require
+    /// `e2fsck -fn` clean, the filesystem clean with the mount counted, the
+    /// content exact and every byte outside the payload unchanged.
+    Ext4RootrwInterop(ext4_interop::Args),
     /// Pre-hardware validation gate for booting the installed CachyOS root:
     /// boots the real `grub-image` bundle (OVMF -> GRUB -> Limine -> NARF) on
     /// a q35 machine with a decoy NVMe and a CachyOS-layout btrfs root NVMe,
@@ -16495,6 +16504,7 @@ fn main() -> Result<()> {
         Cmd::HibernateE2e(args) => hibernate_e2e::run(&args),
         Cmd::BtrfsHostRw(args) => btrfs_host::run(&args),
         Cmd::Ext4HostRw(args) => ext4_host::run(&args),
+        Cmd::Ext4RootrwInterop(args) => ext4_interop::run_cmd(&args),
         Cmd::CachyosGate(args) => cachyos_gate::run(&args),
         Cmd::Http3Smoke(args) => http3_smoke::run(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),

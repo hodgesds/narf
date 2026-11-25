@@ -1423,6 +1423,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-block",
+ "narf-boot",
  "narf-capabilities",
  "narf-console",
  "narf-driver-runtime",
@@ -4897,6 +4898,7 @@ dependencies = [
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "aes",
  "anyhow",
  "blake3",
  "clap",
@@ -4916,6 +4918,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "wait-timeout",
+ "xts-mode",
  "zstd",
 ]
 

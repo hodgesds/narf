@@ -35,6 +35,7 @@ pub mod fitrim;
 pub mod group_desc;
 pub mod htree;
 pub mod inode;
+pub mod interop;
 pub mod journal;
 pub mod metadata_csum;
 pub mod mount_opts;

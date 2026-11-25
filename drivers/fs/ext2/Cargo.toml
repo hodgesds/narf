@@ -19,6 +19,7 @@ narf-driver-runtime = { path = "../../runtime" }
 narf-capabilities = { path = "../../../capabilities" }
 narf-memory       = { path = "../../../memory" }
 narf-block        = { path = "../../../block" }
+narf-boot         = { path = "../../../boot" }
 narf-console      = { path = "../../../console" }
 narf-filesystem   = { path = "../../../filesystem" }
 narf-io           = { path = "../../../io" }
