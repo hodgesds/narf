@@ -894,11 +894,10 @@ fn finish(i: usize, done: OpDone) {
             return;
         };
         let now = narf_time::monotonic_ns();
-        match (&done.result, done.kind) {
-            (Ok(()), OpKind::Enable | OpKind::Retype | OpKind::Check) => {
-                s.next_check_ns = now + done.link.check_period_ms() * 1_000_000;
-            }
-            _ => {}
+        if let (Ok(()), OpKind::Enable | OpKind::Retype | OpKind::Check) =
+            (&done.result, done.kind)
+        {
+            s.next_check_ns = now + done.link.check_period_ms() * 1_000_000;
         }
         s.last = done.result.err();
         let changed = hdcp::report(&mut s.uapi, done.link.value);

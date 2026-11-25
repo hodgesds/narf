@@ -834,7 +834,6 @@ fn hdcp14_dp_sink() -> TestResult {
     if drive(link.enable(&mut cx, 0)) != Some(Ok(())) {
         return TestResult::Fail("HDCP 1.4 DP enable failed");
     }
-    drop(cx);
     if link.value != CpValue::Enabled || !link.hdcp_encrypted || link.hdcp2_encrypted {
         return TestResult::Fail("not ENABLED with HDCP 1.4 encryption");
     }
@@ -885,7 +884,6 @@ fn hdcp14_dp_sink() -> TestResult {
     {
         return TestResult::Fail("failed re-authentication not DESIRED");
     }
-    drop(cx);
     // Encryption dropped under an enabled link: DESIRED at once.
     let mut link = HdcpLink::new(Protocol::Dp, 1, LineRekey::None, true);
     let mut s = DpShim::new(DpSink::hdcp14(false));
@@ -965,7 +963,6 @@ fn hdcp14_dp_repeater() -> TestResult {
     if drive(link.enable(&mut cx, 0)) != Some(Ok(())) {
         return TestResult::Fail("HDCP 1.4 repeater enable failed (KSV list or V')");
     }
-    drop(cx);
     // HDCP_REP_CTL armed with the repeater bits before signalling.
     if regs.wrote(HDCP_REP_CTL).first() != Some(&HdcpLink::repeater_ctl(0)) {
         return TestResult::Fail("REP_CTL not armed for the repeater");
@@ -1019,7 +1016,6 @@ fn hdcp14_dp_repeater() -> TestResult {
     if drive(link.enable(&mut cx, 0)) != Some(Err(HdcpError::Revoked)) {
         return TestResult::Fail("revoked downstream KSV accepted");
     }
-    drop(cx);
     // intel_hdcp1_enable's three tries each read the whole list and stop
     // at drm_hdcp_check_ksvs_revoked, before any V' comparison.
     if s.dpcd
@@ -1071,7 +1067,6 @@ fn smoke_intel_hdcp14_hdmi() -> TestResult {
     if drive(link.check_link(&mut cx)).is_none_or(|r| r.is_ok()) || link.value != CpValue::Desired {
         return TestResult::Fail("Ri' mismatch not DESIRED");
     }
-    drop(cx);
     // Disable clears signalling.
     let mut link = HdcpLink::new(Protocol::Hdmi, 2, LineRekey::None, true);
     let mut s = HdmiShim::new(HdmiSink::hdcp14());
@@ -1149,7 +1144,6 @@ fn hdcp22_dp_mei() -> TestResult {
         env: &mut env,
     };
     let r = drive(link.enable(&mut cx, 0));
-    drop(cx);
     if let Some(bad) = fw.bad {
         return TestResult::Fail(bad);
     }
@@ -1213,7 +1207,6 @@ fn hdcp22_dp_mei() -> TestResult {
     {
         return TestResult::Fail("reauth request not DESIRED");
     }
-    drop(cx);
     if fw.log.last() != Some(&0x0003_100a)
         || regs.get(trans_hdcp2_ctl(1)) & CTL_LINK_ENCRYPTION_REQ != 0
     {
@@ -1287,7 +1280,6 @@ fn hdcp22_hdmi_gsc() -> TestResult {
         env: &mut env,
     };
     let r = drive(link.enable(&mut cx, 1));
-    drop(cx);
     let gsc = &framing.port;
     if let Some(bad) = gsc.bad.or(gsc.fw.bad) {
         return TestResult::Fail(bad);
@@ -1370,7 +1362,6 @@ fn hdcp22_fallback() -> TestResult {
     if drive(link.enable(&mut cx, 0)) != Some(Ok(())) || !link.hdcp_encrypted {
         return TestResult::Fail("type 0 did not fall back to HDCP 1.4");
     }
-    drop(cx);
     // The firmware rejects H' every time: three tries, each closing its
     // session, then HDCP 1.4.
     let regs = Regs::new(0);
@@ -1391,7 +1382,6 @@ fn hdcp22_fallback() -> TestResult {
         env: &mut env,
     };
     let r = drive(link.enable(&mut cx, 0));
-    drop(cx);
     let closes = fw.log.iter().filter(|&&c| c == 0x0003_100a).count();
     let hprimes = fw.log.iter().filter(|&&c| c == 0x0003_1002).count();
     if r != Some(Ok(())) || !link.hdcp_encrypted || link.hdcp2_encrypted {
