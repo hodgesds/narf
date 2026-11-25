@@ -969,6 +969,24 @@ chip-id constant, only a `case 0x7925` firmware-name expectation), so
 real-hardware probe stays closed until that value is read off the card.
 Register translation and selector encoding follow the local Linux reference at `ecd997b0189a`.
 
+MT7925 DMA uses the CONNAC3 queue numbering, not CONNAC2's: TX
+MCU_WM is queue 15 and FWDL is 16; RX data is BAND0 queue 2 and the
+MCU event ring is queue 0 (upstream `mt7925.h:218-241`). RX queue 1
+(MCU_WM2, TX-done) is MT7928-only and is not wired for MT7925.
+`dma::allocate_ring_set_for_chip` builds the five-ring
+`mt7925_dma_layout` (TX data BAND0, TX MCU, TX FWDL, RX MCU, RX data
+BAND0; upstream `mt7925/pci.c:710-742`) for either MT7925 PCI id and
+the nine-ring MT7921 layout otherwise; `program_ring_set_for_chip`
+programs each set through its own queue-id map, with the shared
+disable/reset/EXT_CTRL/enable sequence on both chips. Linux ring
+depths are TX 2048 / TX MCU 256 / TX FWDL 128 / RX 1536 / RX MCU 512
+with an 8192-entry token table (`mt7925.h:27-43`); TXWI is 64 bytes
+(32-byte TXD + 32-byte `mt76_connac_hw_txp`,
+`mt7925/pci.c:1113`). The bring-up baseline still programs 16
+entries per ring: the single-page `DmaBuffer` cap is
+chip-independent, and the Linux depths land with the multi-page DMA
+allocator.
+
 ### MT76 MCU/DMA firmware transport
 
 `mt7921::firmware_transport::Firmware::prepare` validates and owns patch and

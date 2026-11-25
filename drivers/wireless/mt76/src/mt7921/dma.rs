@@ -23,6 +23,12 @@
 //! - `RingRegs` — the 16-byte MMIO offset quadruple for one ring.
 //! - `mt7921_tx_ring_regs` / `mt7921_rx_ring_regs` — per-ring lookup
 //!   following the Linux per-ring stride.
+//! - `mt7925_tx_ring_regs` / `mt7925_rx_ring_regs` — the same lookup
+//!   under the CONNAC3 queue numbering (TX MCU_WM 15 / FWDL 16, RX
+//!   BAND0 2 / MCU_WM 0). `allocate_ring_set_for_chip` /
+//!   `program_ring_set_for_chip` select the MT7925 maps (and the
+//!   5-ring layout) when the PCI id is MT7925; every other id keeps
+//!   the MT7921 maps and the 9-ring layout.
 //! - `RingAllocator::allocate` — `DmaBuffer`-backed ring memory + buffer
 //!   pool with the device's TX/RX queue indexes.
 //! - `program_ring` — write the four MMIO doublewords that arm a ring.
@@ -36,7 +42,10 @@
 //! - Multi-page ring memory. The in-tree `DmaBuffer` allocator caps a
 //!   single buffer at one 4 KiB page, so 16-entry rings are the
 //!   bring-up baseline. Linux uses 1536+ entries; we lift the cap once
-//!   the multi-page DmaBuffer landing arrives.
+//!   the multi-page DmaBuffer landing arrives. The cap is
+//!   chip-independent: the Linux MT7925 depths (2048/256/128/1536/512,
+//!   token 8192, TXWI 64) are recorded in `regs.rs` but program at
+//!   the same 16-entry baseline until the multi-page allocator lands.
 //!
 //! ## References (all GPL-2.0)
 //!
@@ -193,6 +202,43 @@ pub fn mt7921_rx_ring_regs(q_idx: u8) -> Result<RingRegs, DmaError> {
         0 => Ok(RingRegs::for_block(MT_RX_DATA_RING_BASE, 0)),
         1 => Ok(RingRegs::for_block(MT_RX_EVENT_RING_BASE, 0)),
         2 => Ok(RingRegs::for_block(MT_RX_MCU_WA_RING_BASE, 0)),
+        _ => Err(DmaError::UnknownQueue),
+    }
+}
+
+/// MMIO offsets for one MT7925 TX ring.
+///
+/// `q_idx` follows the Linux `enum mt7925_txq_id` numbering
+/// (`mt7925.h:218-241`) — CONNAC3, not CONNAC2: MCU_WM is 15, FWDL
+/// is 16, and there is no BAND1 data ring in the MT7925 layout.
+/// Slots follow the same allocation-order convention as the MT7921
+/// map (data rings first, then MCU/FWDL contiguously after them),
+/// in the `mt7925_dma_layout` order (`mt7925/pci.c:710-742`):
+/// BAND0 (0) lands in slot 0, MCU_WM (15) in slot 1, FWDL (16) in
+/// slot 2.
+pub fn mt7925_tx_ring_regs(q_idx: u8) -> Result<RingRegs, DmaError> {
+    match q_idx {
+        MT7925_TXQ_BAND0 => Ok(RingRegs::for_block(MT_TX_RING_BASE, 0)),
+        MT7925_TXQ_MCU_WM => Ok(RingRegs::for_block(MT_TX_RING_BASE, 1)),
+        MT7925_TXQ_FWDL => Ok(RingRegs::for_block(MT_TX_RING_BASE, 2)),
+        _ => Err(DmaError::UnknownQueue),
+    }
+}
+
+/// MMIO offsets for one MT7925 RX ring.
+///
+/// `q_idx` follows the Linux `enum mt7925_rxq_id` numbering
+/// (`mt7925.h:218-241`) — CONNAC3, not CONNAC2: the MCU event ring
+/// is 0 and data is BAND0 = 2. The bases are the shared
+/// `mt792x_regs.h` WFDMA0 bases, the same ones MT7921's MCU-event
+/// and data rings use: MCU_WM (0) lands at `MT_RX_EVENT_RING_BASE`,
+/// data BAND0 (2) at `MT_RX_DATA_RING_BASE`.
+/// MCU_WM2 (1, TX-done) is MT7928-only and is not wired in the 7925
+/// layout, so it errors here — as does BAND1 (3).
+pub fn mt7925_rx_ring_regs(q_idx: u8) -> Result<RingRegs, DmaError> {
+    match q_idx {
+        MT7925_RXQ_MCU_WM => Ok(RingRegs::for_block(MT_RX_EVENT_RING_BASE, 0)),
+        MT7925_RXQ_BAND0 => Ok(RingRegs::for_block(MT_RX_DATA_RING_BASE, 0)),
         _ => Err(DmaError::UnknownQueue),
     }
 }
@@ -589,6 +635,13 @@ pub const fn l1_remapped_offset(addr: u32) -> u32 {
 // ── Stage-4 collected device rings ────────────────────────────────
 
 /// The complete ring set Stage-4 allocates at probe.
+///
+/// MT7921 shape: 9 rings (5 TX data + FWDL q16 + MCU q17 + RX data
+/// q0 + RX MCU event q1). MT7925 shape (`allocate_ring_set_for_chip`
+/// with an MT7925 did): 5 rings (1 TX data BAND0 q0 + TX MCU q15 +
+/// TX FWDL q16 + RX data BAND0 q2 + RX MCU_WM q0) per upstream
+/// `mt7925_dma_layout` (`mt7925/pci.c:710-742`). The fields are the
+/// same; only the TX-data count and the queue ids differ.
 pub struct RingSet {
     /// TX data rings (one per AC + BMC). Linux: `MT7921_TXQ_AC_*`.
     pub tx_data: Vec<Ring>,
@@ -619,8 +672,10 @@ impl core::fmt::Debug for RingSet {
 /// a single page allocation.
 pub const RX_BUF_LEN: usize = 1664;
 
-/// Allocate every ring Stage-4 needs (5 TX-data + FWDL + MCU + RX-data
-/// + RX-mcu-event = 9 rings total, ≤16 entries each).
+/// Allocate every ring Stage-4 needs for MT7921 (5 TX-data + FWDL +
+/// MCU + RX-data + RX-mcu-event = 9 rings total, ≤16 entries each).
+/// This is the default shape; `allocate_ring_set_for_chip` dispatches
+/// per chip.
 pub fn allocate_ring_set() -> Result<RingSet, DmaError> {
     // 5 TX data rings (AC_VO/VI/BE/BK + BMC).
     let mut tx_data = Vec::with_capacity(MT7921_TX_RING_COUNT);
@@ -641,6 +696,77 @@ pub fn allocate_ring_set() -> Result<RingSet, DmaError> {
     })
 }
 
+/// Allocate the ring set for the chip behind `did`.
+///
+/// MT7925 (`is_mt7925_did(did)` — `0x7925` or its `0x0717` alias)
+/// gets the 5-ring CONNAC3 layout; every other registered id gets
+/// the 9-ring MT7921 layout. Depths stay at the
+/// `MT7921_BASELINE_RING_DEPTH` bring-up baseline for both chips:
+/// the single-page `DmaBuffer` cap is chip-independent, and the
+/// Linux depths (`LINUX_MT7925_*_RING_SIZE`) land when the
+/// multi-page DMA allocator does.
+pub fn allocate_ring_set_for_chip(did: u16) -> Result<RingSet, DmaError> {
+    if is_mt7925_did(did) {
+        return allocate_mt7925_ring_set();
+    }
+    allocate_ring_set()
+}
+
+/// Allocate the MT7925 5-ring set: TX data BAND0 (q0), TX MCU (q15),
+/// TX FWDL (q16), RX data BAND0 (q2), RX MCU_WM (q0) — upstream
+/// `mt7925_dma_layout` (`mt7925/pci.c:710-742`). No BAND1 data ring,
+/// no TX-done ring.
+fn allocate_mt7925_ring_set() -> Result<RingSet, DmaError> {
+    let mut tx_data = Vec::with_capacity(MT7925_TX_DATA_RING_COUNT);
+    tx_data.push(alloc_tx_ring(MT7925_TXQ_BAND0, MT7921_BASELINE_RING_DEPTH)?);
+    let tx_fwdl = alloc_tx_ring(MT7925_TXQ_FWDL, MT7921_BASELINE_RING_DEPTH)?;
+    let tx_mcu = alloc_tx_ring(MT7925_TXQ_MCU_WM, MT7921_BASELINE_RING_DEPTH)?;
+    let rx_data = alloc_rx_ring(MT7925_RXQ_BAND0, MT7921_BASELINE_RING_DEPTH, RX_BUF_LEN)?;
+    let rx_mcu_evt = alloc_rx_ring(MT7925_RXQ_MCU_WM, MT7921_BASELINE_RING_DEPTH, RX_BUF_LEN)?;
+
+    Ok(RingSet {
+        tx_data,
+        tx_fwdl,
+        tx_mcu,
+        rx_data,
+        rx_mcu_evt,
+    })
+}
+
+/// Per-chip queue-id map for ring programming: the ring-register
+/// lookups plus the FWDL / MCU / RX queue ids the shared program
+/// sequence needs.
+struct RingMap {
+    tx_regs: fn(u8) -> Result<RingRegs, DmaError>,
+    rx_regs: fn(u8) -> Result<RingRegs, DmaError>,
+    tx_fwdl_q: u8,
+    tx_mcu_q: u8,
+    rx_data_q: u8,
+    rx_evt_q: u8,
+}
+
+/// MT7921 queue-id map (CONNAC2 numbering: FWDL 16, MCU 17, RX
+/// data 0, RX MCU event 1).
+const MT7921_RING_MAP: RingMap = RingMap {
+    tx_regs: mt7921_tx_ring_regs,
+    rx_regs: mt7921_rx_ring_regs,
+    tx_fwdl_q: 16,
+    tx_mcu_q: 17,
+    rx_data_q: 0,
+    rx_evt_q: 1,
+};
+
+/// MT7925 queue-id map (CONNAC3 numbering: FWDL 16, MCU 15, RX
+/// data BAND0 2, RX MCU_WM 0).
+const MT7925_RING_MAP: RingMap = RingMap {
+    tx_regs: mt7925_tx_ring_regs,
+    rx_regs: mt7925_rx_ring_regs,
+    tx_fwdl_q: MT7925_TXQ_FWDL,
+    tx_mcu_q: MT7925_TXQ_MCU_WM,
+    rx_data_q: MT7925_RXQ_BAND0,
+    rx_evt_q: MT7925_RXQ_MCU_WM,
+};
+
 /// Program every ring in the set into the device's MMIO rings. Mirrors
 /// the Linux `mt7921_dma_init` sequence:
 ///
@@ -651,37 +777,81 @@ pub fn allocate_ring_set() -> Result<RingSet, DmaError> {
 ///      isn't covered by any other path yet.
 ///   4. Enable TX/RX DMA via `dma_enable`.
 ///
+/// This is the MT7921 shape; `program_ring_set_for_chip` dispatches
+/// per chip.
+///
 /// # Safety
 /// BAR0 mapped + owned.
 pub unsafe fn program_ring_set(mmio: &MmioRegion, rings: &RingSet) -> Result<(), DmaError> {
+    // SAFETY: forwarded.
+    unsafe { program_ring_set_with(mmio, rings, &MT7921_RING_MAP) }
+}
+
+/// Program every ring in the set, dispatching on `did`.
+///
+/// MT7925 uses the `mt7925_*_ring_regs` maps; other ids use the
+/// MT7921 maps. The disable/reset/EXT_CTRL/enable sequence is the
+/// shared `mt792x_dma_*` shape on both chips.
+///
+/// # Safety
+/// BAR0 mapped + owned.
+pub unsafe fn program_ring_set_for_chip(
+    mmio: &MmioRegion,
+    rings: &RingSet,
+    did: u16,
+) -> Result<(), DmaError> {
+    let map = if is_mt7925_did(did) {
+        &MT7925_RING_MAP
+    } else {
+        &MT7921_RING_MAP
+    };
+    // SAFETY: forwarded.
+    unsafe { program_ring_set_with(mmio, rings, map) }
+}
+
+/// Shared program sequence for both chips: disable + reset, program
+/// each ring through the chip's queue-id map, poke EXT_CTRL, enable.
+/// TX data rings are looked up by their own `q_idx`, so the same loop
+/// serves the 5-ring MT7921 set and the 1-ring MT7925 set.
+///
+/// # Safety
+/// BAR0 mapped + owned.
+unsafe fn program_ring_set_with(
+    mmio: &MmioRegion,
+    rings: &RingSet,
+    map: &RingMap,
+) -> Result<(), DmaError> {
     // SAFETY: forwarded.
     unsafe { dma_disable(mmio)? };
     // SAFETY: forwarded.
     unsafe { dma_reset(mmio) };
 
-    for (i, ring) in rings.tx_data.iter().enumerate() {
-        let regs = mt7921_tx_ring_regs(i as u8)?;
+    for ring in rings.tx_data.iter() {
+        let regs = (map.tx_regs)(ring.q_idx())?;
         // SAFETY: forwarded.
         unsafe { program_ring(mmio, regs, ring) };
     }
-    let fwdl_regs = mt7921_tx_ring_regs(16)?;
+    let fwdl_regs = (map.tx_regs)(map.tx_fwdl_q)?;
     // SAFETY: forwarded.
     unsafe { program_ring(mmio, fwdl_regs, &rings.tx_fwdl) };
-    let mcu_regs = mt7921_tx_ring_regs(17)?;
+    let mcu_regs = (map.tx_regs)(map.tx_mcu_q)?;
     // SAFETY: forwarded.
     unsafe { program_ring(mmio, mcu_regs, &rings.tx_mcu) };
 
-    let rx_data_regs = mt7921_rx_ring_regs(0)?;
+    let rx_data_regs = (map.rx_regs)(map.rx_data_q)?;
     // SAFETY: forwarded.
     unsafe { program_ring(mmio, rx_data_regs, &rings.rx_data) };
-    let rx_evt_regs = mt7921_rx_ring_regs(1)?;
+    let rx_evt_regs = (map.rx_regs)(map.rx_evt_q)?;
     // SAFETY: forwarded.
     unsafe { program_ring(mmio, rx_evt_regs, &rings.rx_mcu_evt) };
 
     // The MT_WFDMA0_TX_RING0_EXT_CTRL = 0x4 poke from
     // `mt7921_dma_init` (pci.c:185). The bit means "enable per-ring
     // descriptor-pre-fetch arbitration"; without it the device serves
-    // ring 0 in lock-step with the other AC rings.
+    // ring 0 in lock-step with the other AC rings. The shared
+    // `mt792x_dma_enable` path pokes the same EXT_CTRL block on
+    // MT7925 (`mt792x_dma.c:160-170`), so the poke stays in the
+    // shared sequence for both chips.
     // SAFETY: BAR0 mapped + owned per `# Safety`.
     unsafe { mmio.write32((MT_WFDMA0_BASE + 0x600) as u64, 0x4) };
 
