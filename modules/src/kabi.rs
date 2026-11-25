@@ -1887,6 +1887,93 @@ kernel_abi! {
             Err(errno) => errno,
         }
     }
+
+    // ── Control-BAR mapping and 8/16-bit MMIO (rtl.ko) ──────────────────
+    //
+    // Additive. The first consumer is rtlwifi (`rtl.ko`), whose SYS, EFUSE
+    // and power-sequence registers are byte- and word-addressed: emulating
+    // them with a read-modify-write of the enclosing dword would also write
+    // back neighbouring write-1-to-clear and trigger bytes. Same handle,
+    // owner and bounds rules as `narf_mmio_read32`/`_write32`; 16-bit
+    // offsets must be 2-byte aligned. See `modules/DATAPATH_ABI_DESIGN.md`,
+    // "Control BARs and 8/16-bit MMIO".
+
+    /// Map BAR `bar_idx` like `narf_bar_map`, but with Device (uncached,
+    /// unmerged) attributes even when the BAR is prefetchable — the mapping
+    /// built-in drivers use for control registers. Returns a 1-based BAR
+    /// handle shared with `narf_bar_map`'s, or 0 on failure.
+    ///
+    /// # Safety
+    /// `dev` must be the token the module's probe was invoked with.
+    fn narf_bar_map_control(dev: u64, bar_idx: u8) -> u64 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_bar_map_control(owner, dev, bar_idx)
+    }
+
+    /// Read the 8-bit device register at `off` in BAR handle `bar` into
+    /// `out`. Returns 0, or `-EINVAL` for a bad handle/offset/pointer.
+    ///
+    /// # Safety
+    /// `out` must point to a writable `u8`. `dev`/`bar` identify a mapped BAR.
+    fn narf_mmio_read8(dev: u64, bar: u64, off: u64, out: *mut u8) -> i32 {
+        if out.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_mmio_read8(owner, dev, bar, off) {
+            Some(v) => {
+                // SAFETY: `out` is non-null; the module promises it is writable.
+                unsafe { out.write(v) };
+                0
+            }
+            None => -22,
+        }
+    }
+
+    /// Read the 2-byte-aligned 16-bit device register at `off` in BAR handle
+    /// `bar` into `out`. Returns 0, or `-EINVAL` for a bad handle, offset,
+    /// alignment or pointer.
+    ///
+    /// # Safety
+    /// `out` must point to a writable, aligned `u16`. `dev`/`bar` identify a
+    /// mapped BAR.
+    fn narf_mmio_read16(dev: u64, bar: u64, off: u64, out: *mut u16) -> i32 {
+        if out.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::driver_match::module_mmio_read16(owner, dev, bar, off) {
+            Some(v) => {
+                // SAFETY: `out` is non-null; the module promises it is writable.
+                unsafe { out.write(v) };
+                0
+            }
+            None => -22,
+        }
+    }
+
+    /// Write `val` to the 8-bit device register at `off` in BAR handle `bar`.
+    /// Returns 0, or `-EINVAL` for a bad handle/offset.
+    ///
+    /// # Safety
+    /// `dev`/`bar` identify a mapped BAR of the module's device.
+    fn narf_mmio_write8(dev: u64, bar: u64, off: u64, val: u8) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_mmio_write8(owner, dev, bar, off, val)
+    }
+
+    /// Write `val` to the 2-byte-aligned 16-bit device register at `off` in
+    /// BAR handle `bar`. Returns 0, or `-EINVAL` for a bad handle, offset or
+    /// alignment.
+    ///
+    /// # Safety
+    /// `dev`/`bar` identify a mapped BAR of the module's device.
+    fn narf_mmio_write16(dev: u64, bar: u64, off: u64, val: u16) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_mmio_write16(owner, dev, bar, off, val)
+    }
+
+    // ── end rtl.ko block ───────────────────────────────────────────────
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────

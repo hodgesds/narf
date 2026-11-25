@@ -1261,6 +1261,97 @@ pub fn module_mmio_wait32(
     .unwrap_or(-19)
 }
 
+// ── rtlwifi (rtl.ko): control-BAR mapping and 8/16-bit MMIO ────────────
+//
+// Additive, for byte- and word-addressed register files (Realtek's SYS /
+// EFUSE / power-sequence registers): a read-modify-write of the enclosing
+// dword would also write back neighbouring write-1-to-clear and trigger
+// bytes. Same owner/token/handle resolution and bounds rules as the 32-bit
+// accessors above.
+
+/// Map a BAR of a module-owned device with Device attributes even when the
+/// BAR is prefetchable (`bar::map_bar_control`, what built-in drivers use
+/// for control registers), and return a 1-based handle shared with
+/// `module_bar_map` (0 = fail). Reached from `narf_bar_map_control`.
+pub fn module_bar_map_control(owner: u64, token: u64, idx: u8) -> u64 {
+    let (device, cap) = {
+        let g = DEVICE_CTXS.lock();
+        match g.iter().find(|c| c.owner == owner && c.token == token) {
+            Some(c) => (c.device, c.cap),
+            None => return 0,
+        }
+    };
+    let region = match cap.invoke(DeviceOp(|| {
+        // SAFETY: the live device cap gates the exclusive cfg-space ownership
+        // required by `map_bar_control`.
+        unsafe { crate::bar::map_bar_control(&device, idx) }
+    })) {
+        Ok(Ok(region)) => region,
+        _ => return 0,
+    };
+    let mut g = DEVICE_CTXS.lock();
+    match g.iter_mut().find(|c| c.owner == owner && c.token == token) {
+        Some(c) => {
+            c.bars.push(region);
+            c.bars.len() as u64
+        }
+        None => 0,
+    }
+}
+
+/// `off..off + width` lies inside the region and `off` is width-aligned.
+fn sized_access_ok(region: &crate::bar::MmioRegion, off: u64, width: u64) -> bool {
+    off % width == 0 && off.checked_add(width).is_some_and(|end| end <= region.len)
+}
+
+/// Read an 8-bit register. Reached from `narf_mmio_read8`. `None` on a bad
+/// token/handle/offset.
+pub fn module_mmio_read8(owner: u64, token: u64, handle: u64, off: u64) -> Option<u8> {
+    with_bar(owner, token, handle, |region| {
+        // SAFETY: offset bounds-checked against the mapped region length.
+        sized_access_ok(region, off, 1).then(|| unsafe { region.read8(off) })
+    })
+    .flatten()
+}
+
+/// Read a naturally aligned 16-bit register. Reached from `narf_mmio_read16`.
+pub fn module_mmio_read16(owner: u64, token: u64, handle: u64, off: u64) -> Option<u16> {
+    with_bar(owner, token, handle, |region| {
+        // SAFETY: aligned, bounds-checked against the mapped region length.
+        sized_access_ok(region, off, 2).then(|| unsafe { region.read16(off) })
+    })
+    .flatten()
+}
+
+/// Write an 8-bit register. Reached from `narf_mmio_write8`. 0 or `-EINVAL`.
+pub fn module_mmio_write8(owner: u64, token: u64, handle: u64, off: u64, val: u8) -> i32 {
+    with_bar(owner, token, handle, |region| {
+        if !sized_access_ok(region, off, 1) {
+            return -22;
+        }
+        // SAFETY: offset bounds-checked against the mapped region length.
+        unsafe { region.write8(off, val) };
+        0
+    })
+    .unwrap_or(-22)
+}
+
+/// Write a naturally aligned 16-bit register. Reached from
+/// `narf_mmio_write16`. 0 or `-EINVAL`.
+pub fn module_mmio_write16(owner: u64, token: u64, handle: u64, off: u64, val: u16) -> i32 {
+    with_bar(owner, token, handle, |region| {
+        if !sized_access_ok(region, off, 2) {
+            return -22;
+        }
+        // SAFETY: aligned, bounds-checked against the mapped region length.
+        unsafe { region.write16(off, val) };
+        0
+    })
+    .unwrap_or(-22)
+}
+
+// ── end rtl.ko block ───────────────────────────────────────────────────
+
 /// Allocate coherent DMA memory in the module's effective domain and return a
 /// 1-based opaque handle (`0` on failure). The module never receives the CPU
 /// pointer; subsequent copies go through the bounded accessors below.

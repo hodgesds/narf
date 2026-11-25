@@ -401,6 +401,40 @@ narf_pci_config_write32(dev:u64, offset:u16, value:u32)->i32
   built against them fails to resolve on an older kernel instead of being
   called with the wrong layout.
 
+## Control BARs and 8/16-bit MMIO
+
+Status: **implemented**; rtlwifi (`rtl.ko`) is the first consumer. Additive
+exports, all primitive-only, in their own block of `modules/src/kabi.rs`:
+
+```text
+narf_bar_map_control(dev:u64, bar_idx:u8)->u64
+narf_mmio_read8(dev:u64, bar:u64, off:u64, out:*mut u8)->i32
+narf_mmio_read16(dev:u64, bar:u64, off:u64, out:*mut u16)->i32
+narf_mmio_write8(dev:u64, bar:u64, off:u64, val:u8)->i32
+narf_mmio_write16(dev:u64, bar:u64, off:u64, val:u16)->i32
+```
+
+- **Why the widths.** Realtek's SYS, EFUSE and power-sequence registers are
+  addressed by byte and by word. Linux drives them with
+  `rtl_read_byte`/`rtl_write_word`. Emulating a byte write with a
+  read-modify-write of the enclosing dword also writes back the neighbouring
+  bytes. Some of those are write-1-to-clear status or self-clearing
+  triggers, such as `REG_EFUSE_CTRL+3`'s read strobe and `APS_FSMCO`'s power
+  request. Stage 1's "add widths only with a concrete driver" condition is
+  met by this one.
+- **Rules.** The handle, owner and bounds resolution is
+  `narf_mmio_read32`/`_write32`'s. A 16-bit offset must also be 2-byte
+  aligned, matching `MmioRegion::read16`'s contract. A bad handle, offset or
+  alignment is `-EINVAL`, and a write is then not issued.
+- **Control mapping.** `narf_bar_map` maps a prefetchable BAR
+  write-combining. A register BAR must not be mapped that way: posted writes
+  could merge and reorder. `narf_bar_map_control` is the built-in
+  `map_bar_control` with Device attributes. It shares `narf_bar_map`'s
+  handle space, `narf_bar_len` and teardown.
+- **No new authority.** No config-space read or write is added. A module
+  still learns its function only through `narf_pci_identity` and changes
+  config only through `narf_pci_enable` / `narf_pcie_aspm`.
+
 ## Wireless copy-mode host services
 
 The wireless extension uses permanent family host adapters. The loadable

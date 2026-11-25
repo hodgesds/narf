@@ -167,6 +167,11 @@ plus the device-independent `narf_udelay`, `narf_random_bytes`,
 `narf_smbios_read`, `narf_firmware_signed` and `narf_module_param`. Each is
 additive and goes through the same CRC/whole-table hash and cap-at-resolution
 gates.
+A driver with byte- and word-addressed control registers (rtlwifi, `rtl.ko`)
+also has `narf_bar_map_control` (Device attributes regardless of the BAR's
+prefetchable bit) and `narf_mmio_read8/16` / `narf_mmio_write8/16`, with the
+32-bit accessors' handle and bounds rules
+([design](DATAPATH_ABI_DESIGN.md#control-bars-and-816-bit-mmio)).
 The exit hook now saves/sets/restores the same execution-owner context as
 probe/poller gates, so owner-scoped cleanup addresses the exiting module's
 existing resources. State/refcount/domain admission is unchanged; mandatory
