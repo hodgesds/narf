@@ -46,6 +46,9 @@ struct GemBacking {
     /// its attachment is mapped (`xe_bo_move` of a `ttm_bo_type_sg` BO). The
     /// exporter owns the memory; nothing here is freed.
     foreign: Vec<u64>,
+    /// The attachment's move count `foreign` was mapped at: a later move
+    /// notification makes the pages stale until the import maps again.
+    foreign_generation: u64,
     /// `size` is charged to the system-memory LIVE_BYTES bound.
     charged: bool,
 }
@@ -55,6 +58,9 @@ pub struct GemPages<'a> {
     pins: &'a [narf_memory::address_space::UserPagePin],
     wc: Option<&'a narf_memory::pageattr::WcPages>,
     index: usize,
+    /// An import whose exporter moved since its pages were mapped: it has
+    /// no pages until it maps again.
+    stale: bool,
 }
 
 impl core::fmt::Debug for GemPages<'_> {
@@ -69,6 +75,9 @@ impl Iterator for GemPages<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.stale {
+            return None;
+        }
         if !self.backing.foreign.is_empty() {
             let page = self.backing.foreign.get(self.index).copied();
             self.index += usize::from(page.is_some());
@@ -245,6 +254,7 @@ impl GemObject {
                 vram: None,
                 ccs_backup: None,
                 foreign: Vec::new(),
+                foreign_generation: 0,
                 charged: true,
             }),
             storage: AtomicU8::new(STORAGE_SYSTEM),
@@ -533,19 +543,40 @@ impl GemObject {
             .as_ref()
             .map(|import| (import.card(), import.exporter_object().clone()))
     }
-    /// The mapped attachment's pages are installed (see `GemBacking::foreign`).
+    /// The mapped attachment's pages are installed (see `GemBacking::foreign`)
+    /// and no move notification has made them stale since.
     pub(crate) fn import_mapped(&self) -> bool {
-        !self.backing.lock().foreign.is_empty()
+        let backing = self.backing.lock();
+        !backing.foreign.is_empty() && self.import_current(backing.foreign_generation)
     }
-    /// Install an import's mapped pages once; they must cover the object.
-    pub(crate) fn install_import_pages(&self, pages: Vec<u64>) -> Result<(), FsError> {
+    fn import_current(&self, generation: u64) -> bool {
+        self.import
+            .as_ref()
+            .is_some_and(|import| import.attachment().current(generation))
+    }
+    /// Install an import's pages, mapped at the attachment's move count
+    /// `generation`; they must cover the object. A move notified since that
+    /// mapping refuses with `WouldBlock`: the caller maps again. Checked
+    /// under the backing lock that [`Self::pages`] reads under, so a
+    /// notification either precedes the check or makes the installed pages
+    /// stale.
+    pub(crate) fn install_import_pages(
+        &self,
+        pages: Vec<u64>,
+        generation: u64,
+    ) -> Result<(), FsError> {
         if self.import.is_none() || pages.len() as u64 * PAGE != self.size {
             return Err(FsError::InvalidData);
         }
-        let mut backing = self.backing.lock();
-        if backing.foreign.is_empty() {
-            backing.foreign = pages;
-        }
+        let stale = {
+            let mut backing = self.backing.lock();
+            if !self.import_current(generation) {
+                return Err(FsError::WouldBlock);
+            }
+            backing.foreign_generation = generation;
+            core::mem::replace(&mut backing.foreign, pages)
+        };
+        drop(stale);
         Ok(())
     }
     /// `xe_dma_buf_attach` / `xe_dma_buf_detach` on this exporter object.
@@ -618,6 +649,32 @@ impl GemObject {
         let mut prime = self.prime.lock();
         prime.pins = prime.pins.checked_sub(1).expect("balanced dma-buf pin");
     }
+    /// `xe_dma_buf_map`'s placement step for an unpinned (dynamic)
+    /// attachment, under the lock every move of this object takes (Linux
+    /// holds the reservation): an importer without peer-to-peer needs system
+    /// memory (`xe_bo_migrate(bo, XE_PL_TT)`, which notifies the dynamic
+    /// importers first), while a peer takes the object where it is (NARF's
+    /// `xe_bo_validate` keeps the current placement). A pinned object is not
+    /// moved (`xe_bo_is_pinned` skips the migration). The returned guard
+    /// holds the placement while the caller builds its table.
+    pub(crate) async fn validate_for_dma_buf(
+        self: &Arc<Self>,
+        backend: &dyn crate::intel_gpu_user::UserBackend,
+        epoch: Option<u64>,
+        peer2peer: bool,
+    ) -> Result<narf_lib::mutex::MutexGuard<'_, ()>, FsError> {
+        let placement = self.migrating.lock().await;
+        let pinned = self.externally_pinned() || (self.scanout() && self.is_vram());
+        if !peer2peer && self.is_vram() && !pinned {
+            if !self.can_migrate_to_system() {
+                return Err(FsError::Unsupported);
+            }
+            let epoch = epoch.ok_or(FsError::NoDevice)?;
+            self.wait_idle(true, None).await?;
+            self.evict_locked(backend, epoch, false).await?;
+        }
+        Ok(placement)
+    }
     pub(crate) fn vram_page_size(&self) -> u64 {
         self.vram_page_sz.load(Ordering::Acquire)
     }
@@ -669,11 +726,14 @@ impl GemObject {
     }
 
     pub fn pages(&self) -> GemPages<'_> {
+        let backing = self.backing.lock();
+        let stale = self.import.is_some() && !self.import_current(backing.foreign_generation);
         GemPages {
-            backing: self.backing.lock(),
+            backing,
             pins: &self.pins,
             wc: self.wc.as_ref(),
             index: 0,
+            stale,
         }
     }
 
@@ -1058,6 +1118,10 @@ impl GemObject {
             return Err(FsError::Busy);
         }
         cpu_mapping::retire_object(self)?;
+        // xe_bo_move_notify: dynamic importers drop their mappings before
+        // the move (dma_buf_invalidate_mappings). Their submitted work is in
+        // the shared reservation, which the swap finds idle or refuses.
+        self.dma_buf.invalidate_mappings();
         let requires_ccs = {
             let backing = self.backing.lock();
             let Some(vram) = &backing.vram else {
@@ -1159,6 +1223,8 @@ impl GemObject {
             return Err(FsError::Busy);
         }
         cpu_mapping::retire_object(self)?;
+        // xe_bo_move_notify, as for eviction.
+        self.dma_buf.invalidate_mappings();
         let ccs_backup = self.backing.lock().ccs_backup.clone();
         let allocation = pool.allocate_class(self.size, visible)?;
         let target_storage = Self::storage_of(&allocation);

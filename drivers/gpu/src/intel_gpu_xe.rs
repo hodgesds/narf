@@ -1435,6 +1435,19 @@ impl XeFile {
             // xe_vm_userptr_pin: re-collect invalidated MAP_USERPTR bindings
             // before this job's private tables are built from the mappings.
             queue.vm.revalidate_userptrs(&mut state, user)?;
+            // xe_vm_validate_rebind: a foreign import whose exporter moved
+            // (xe_dma_buf_move_notify) maps its attachment again, so the
+            // tables below are built from the new pages.
+            let imports: Vec<Arc<GemObject>> = state
+                .mappings
+                .iter()
+                .filter_map(|m| m.object.as_ref())
+                .filter(|object| object.is_imported())
+                .cloned()
+                .collect();
+            for object in &imports {
+                crate::intel_gpu_prime::ensure_mapped(object).await?;
+            }
             let status = backend
                 .status()
                 .filter(|s| s.platform == info.platform)
@@ -1458,7 +1471,7 @@ impl XeFile {
                 ensure_vram_residency(backend.as_ref(), pool, &state.mappings, status.epoch, None)
                     .await;
             }
-            let resident = if parallel.is_some() {
+            let built = if parallel.is_some() {
                 ResidentBatch::from_vm_parallel(
                     status.platform,
                     &state.mappings,
@@ -1466,7 +1479,7 @@ impl XeFile {
                     width,
                     queue.vm.scratch,
                     sync.user_fence,
-                )?
+                )
             } else {
                 ResidentBatch::from_vm(
                     status.platform,
@@ -1474,12 +1487,21 @@ impl XeFile {
                     batch,
                     queue.vm.scratch,
                     sync.user_fence,
-                )?
+                )
+            };
+            let resident = match built {
+                // An import notified of a move while the tables were built
+                // has no pages (`from_vm` refuses holes): map it again.
+                Err(FsError::WouldBlock) if crate::intel_gpu_prime::imports_stale(&imports) => {
+                    continue
+                }
+                built => built?,
             };
             // __xe_vm_userptr_needs_repin at the point of no return: a binding
             // invalidated while the tables were built is re-collected and the
-            // tables rebuilt (xe_exec_ioctl's -EAGAIN retry).
-            if queue.vm.userptrs_stale() {
+            // tables rebuilt (xe_exec_ioctl's -EAGAIN retry). A move notified
+            // to an import meanwhile does the same.
+            if queue.vm.userptrs_stale() || crate::intel_gpu_prime::imports_stale(&imports) {
                 continue;
             }
             // Per-batch OA query (issue #1774): refuse to submit while
