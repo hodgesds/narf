@@ -81,7 +81,7 @@ Splitting `initramfs/` out of `narf-filesystem/` gains:
 
 ## 3. Design principles
 
-Boot-policy interface: `rd.luks.key`, `rd.luks.prompt=serial`,
+Boot-policy interface: `rd.luks.key`, `rd.luks.prompt=serial|console`,
 `rd.luks.uuid`, `rd.luks.tries`, and `rd.luks.timeout` configure the
 credential provider described in §5. Root selection remains the filesystem
 and block layers' responsibility; the EFI loader only hands off the archive.
@@ -266,16 +266,39 @@ command-line option is absent. Zeroization covers the per-attempt copy; the
 measured, read-only source bytes remain in the permanently staged initramfs and
 therefore should be treated as a boot-lifetime secret.
 
-Alternatively, `rd.luks.prompt=serial rd.luks.uuid=<container-uuid>` installs a
-no-echo serial provider. Keyfile and prompt policies are mutually exclusive.
-It reads the raw serial byte ring/UART before userspace, accepts printable
-ASCII with backspace, and cancels on Ctrl-C/Escape. Passphrases are limited to
-512 bytes, held in one preallocated zeroizing buffer, and never logged.
+Alternatively, `rd.luks.prompt=<source> rd.luks.uuid=<container-uuid>`
+installs a no-echo passphrase prompt. Keyfile and prompt policies are mutually
+exclusive, and any other `<source>` stops the boot.
+
+- `serial` reads the raw serial byte ring/UART before userspace.
+- `console` reads the keyboard as well, for machines with no serial port.
+  - It holds `narf_input`'s secret key entry for the whole prompt, so each
+    keystroke goes only to the prompt: never to the console key ring, never
+    into an evdev node's ring.
+  - Interrupts are still masked on the BSP while the root mounts, so the
+    prompt runs the registered keyboard pollers itself (`i8042::poll`; the
+    8042 is registered once it initialises).
+  - Keys are translated with the US layout, GRUB's default.
+  - Before giving the keyboard back, it drains the controllers once more, so
+    no byte typed during the prompt reaches the IRQ handler later.
+  - USB keyboards are best-effort: their HID supervisor runs only if an AP
+    happens to pick it up.
+
+Both sources share one line editor:
+- printable ASCII is accepted;
+- Backspace deletes a byte and Ctrl-U clears the line;
+- Ctrl-C or Escape cancels;
+- a chord with Ctrl (other than C or U), Alt or Meta inserts nothing.
+
+Passphrases are limited to 512 bytes, held in one preallocated zeroizing
+buffer, and never echoed or logged. The prompt prints at KERN_ALERT, so it
+shows under `quiet` and `loglevel=3`. A wrong passphrase prints cryptsetup's
+"No key available with this passphrase." before the next attempt.
 `rd.luks.timeout=<seconds>` bounds each attempt (default 90, range 1–300);
 `rd.luks.tries=<n>` bounds wrong-passphrase attempts (default 3, range 1–5).
 The self-waking input future runs through `block_on_spin` without holding a
-lock across a poll. USB keyboard, TPM-unseal, and early-userspace policy are
-separate follow-ups. Both credential policies require a valid explicit `root=`;
+lock across a poll. TPM-unseal and early-userspace policy are separate
+follow-ups. Both credential policies require a valid explicit `root=`;
 a failed required root mount terminates boot rather than launching a fallback
 initramfs shell. The EFI loader never sees credentials or opens LUKS volumes.
 

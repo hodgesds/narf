@@ -155,6 +155,13 @@ pub fn open_luks_with_provider(
         {
             return result;
         }
+        // cryptsetup's wording, at the boot prompt's KERN_ALERT level so it
+        // shows wherever the prompt does.
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::PriorityWriter::<1>,
+            "No key available with this passphrase."
+        );
     }
     unreachable!("attempt count is nonzero")
 }

@@ -124,7 +124,13 @@ holding its registry lock, and keeps the returned passphrase in
 `Zeroizing<Vec<u8>>` only through KDF/keyslot authentication. The initramfs
 integration supplies an opt-in measured keyfile provider with
 `rd.luks.key=/path` and optional `rd.luks.uuid=<uuid>` selection. Keyfile bytes
-are consumed exactly; text decoding and newline stripping are forbidden.
+are consumed exactly; text decoding and newline stripping are forbidden. It
+also supplies no-echo passphrase prompts with `rd.luks.prompt=serial|console`
+(initramfs spec §5).
+
+`install_luks_passphrase_provider_with_attempts` retries only a wrong
+passphrase (1 to 5 attempts in total). Before each retry it prints cryptsetup's
+"No key available with this passphrase." at KERN_ALERT, the prompt's level.
 
 ## 4. Operation: Read/Write Flow
 
