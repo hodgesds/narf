@@ -49,6 +49,13 @@ pub const MTK_DEV_MT7921: u16 = 0x0608;
 pub const MTK_DEV_MT7921_ALT: u16 = 0x0616;
 /// MT7920 (DBDC variant). Cited at line 26 of `mt7921_pci_device_table`.
 pub const MTK_DEV_MT7920: u16 = 0x7920;
+/// MT7925 (Wi-Fi 7 2x2, CONNAC3). Cited as `0x7925` in upstream
+/// `mt7925/pci.c::mt7925_pci_device_table`.
+pub const MTK_DEV_MT7925: u16 = 0x7925;
+/// MT7925 alternate SKU — the PCI device id on Daniel's Alder Lake card
+/// (`14c3:0717`). Cited as `0x0717` in upstream
+/// `mt7925/pci.c::mt7925_pci_device_table`.
+pub const MTK_DEV_MT7925_ALT: u16 = 0x0717;
 
 /// Every PCI device id we register a match for. Sync with `name_for`.
 pub const ALL_DEV_IDS: &[u16] = &[
@@ -57,7 +64,19 @@ pub const ALL_DEV_IDS: &[u16] = &[
     MTK_DEV_MT7921,
     MTK_DEV_MT7921_ALT,
     MTK_DEV_MT7920,
+    MTK_DEV_MT7925,
+    MTK_DEV_MT7925_ALT,
 ];
+
+/// True when `did` is an MT7925 PCI id — `0x7925` or its `0x0717`
+/// alias. Per-chip branches (DMA layout, register map) key off this,
+/// not off the raw `MT_HW_CHIPID` value: the probe's chip-id gate
+/// (`pci.rs:441`) is still closed for MT7925 pending the Q1 hardware
+/// read, so the PCI id is the only 7925 identity the driver can
+/// trust today.
+pub const fn is_mt7925_did(did: u16) -> bool {
+    matches!(did, MTK_DEV_MT7925 | MTK_DEV_MT7925_ALT)
+}
 
 // ── Identity / revision (absolute addresses) ───────────────────────
 //
@@ -209,6 +228,12 @@ pub const MT7961_ROM_PATCH: &str = "mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin";
 pub const MT7920_ROM_PATCH: &str = "mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin";
 /// ROM patch blob for MT7922.
 pub const MT7922_ROM_PATCH: &str = "mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin";
+/// Runtime ("WM") firmware blob name for MT7925-class silicon. Per
+/// upstream `mt792x.h:51` (`MT7925_FIRMWARE_WM`).
+pub const MT7925_FIRMWARE_WM: &str = "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin";
+/// ROM patch blob for MT7925. Per upstream `mt792x.h:59`
+/// (`MT7925_ROM_PATCH`).
+pub const MT7925_ROM_PATCH: &str = "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin";
 
 // ── EFUSE access ───────────────────────────────────────────────────
 //
@@ -259,6 +284,34 @@ pub const MT7921_RXQ_MCU_EVENT: u8 = 1;
 /// Number of RX rings provisioned (data + event).
 pub const MT7921_RX_RING_COUNT: usize = 2;
 
+/// MT7925 TX queue ids — per upstream `mt7925.h:218-241`
+/// (`enum mt7925_txq_id`). CONNAC3 numbering differs from CONNAC2:
+/// MCU_WM is 15 (not 17) and FWDL keeps 16.
+pub const MT7925_TXQ_BAND0: u8 = 0;
+/// TX queue 1 — BAND1 data. In the enum, but not wired in the MT7925
+/// DMA layout (no BAND1 data ring), so `mt7925_tx_ring_regs` rejects it.
+pub const MT7925_TXQ_BAND1: u8 = 1;
+/// TX queue 15 — MCU command ring (CONNAC2: 17).
+pub const MT7925_TXQ_MCU_WM: u8 = 15;
+/// TX queue 16 — firmware-download ring.
+pub const MT7925_TXQ_FWDL: u8 = 16;
+/// Number of TX data rings in the MT7925 DMA layout (BAND0 only).
+pub const MT7925_TX_DATA_RING_COUNT: usize = 1;
+
+/// MT7925 RX queue ids — per upstream `mt7925.h:218-241`
+/// (`enum mt7925_rxq_id`). Data is BAND0 = 2 (CONNAC2: 0) and the
+/// MCU event ring is 0.
+pub const MT7925_RXQ_MCU_WM: u8 = 0;
+/// RX queue 1 — MCU_WM2 (TX-done). In the enum, but MT7928-only: it
+/// is not wired in the MT7925 DMA layout, so `mt7925_rx_ring_regs`
+/// rejects it.
+pub const MT7925_RXQ_MCU_WM2: u8 = 1;
+/// RX queue 2 — host-bound data frames (BAND0).
+pub const MT7925_RXQ_BAND0: u8 = 2;
+/// RX queue 3 — BAND1 data. In the enum, but not wired in the MT7925
+/// DMA layout (no BAND1 data ring).
+pub const MT7925_RXQ_BAND1: u8 = 3;
+
 /// Default per-ring depth. Linux uses 128 entries for the data rings
 /// and 32 for the MCU event ring; the baseline picks a single power-
 /// of-two depth that fits both — DMA ring init in `mac.rs` will
@@ -279,6 +332,31 @@ pub const LINUX_MT7921_RX_RING_SIZE: usize = 1536;
 pub const LINUX_MT7921_RX_MCU_RING_SIZE: usize = 8;
 /// Post-firmware MCU "WA" event RX ring depth (`MT7921_RX_MCU_WA_RING_SIZE`).
 pub const LINUX_MT7921_RX_MCU_WA_RING_SIZE: usize = 512;
+
+/// MT7925 ring sizes + token size — per upstream `mt7925.h:27-43`
+/// (torvalds/linux `8d7fe988`). TX / TX_MCU / FWDL / RX / TOKEN are
+/// identical to MT7921; only RX_MCU differs (512 vs 7921's 8).
+/// `MT7928_RX_MCU_WA_RING_SIZE` (512) is a 7928-only constant and is
+/// deliberately not used here.
+///
+/// TX data ring depth (`MT7925_TX_RING_SIZE`).
+pub const LINUX_MT7925_TX_RING_SIZE: usize = 2048;
+/// MCU command TX ring depth (`MT7925_TX_MCU_RING_SIZE`).
+pub const LINUX_MT7925_TX_MCU_RING_SIZE: usize = 256;
+/// Firmware-download TX ring depth (`MT7925_TX_FWDL_RING_SIZE`).
+pub const LINUX_MT7925_TX_FWDL_RING_SIZE: usize = 128;
+/// Data RX ring depth (`MT7925_RX_RING_SIZE`).
+pub const LINUX_MT7925_RX_RING_SIZE: usize = 1536;
+/// MCU event RX ring depth (`MT7925_RX_MCU_RING_SIZE`). The only
+/// size that differs from MT7921.
+pub const LINUX_MT7925_RX_MCU_RING_SIZE: usize = 512;
+/// Token-table size (`MT7925_TOKEN_SIZE`). Same value as MT7921's
+/// (`packet_tx.rs::TOKEN_LIMIT`).
+pub const LINUX_MT7925_TOKEN_SIZE: usize = 8192;
+/// TXWI size in bytes. Upstream `mt7925/pci.c:1113`: `.txwi_size =
+/// MT_TXD_SIZE + sizeof(struct mt76_connac_hw_txp)` = 32 + 32.
+/// Same value as MT7921 (`txrx.rs::TXD_SIZE` = 32).
+pub const MT7925_TXWI_SIZE: usize = 64;
 
 /// Stage-4 baseline ring depth (one 4 KiB DmaBuffer = 16 entries of
 /// 16-byte mt76_desc).
@@ -335,6 +413,79 @@ pub const MT_HIF_REMAP_BASE_L1: u32 = 0x40000;
 
 /// `MT_WFSYS_SW_RST_B` — Wi-Fi subsystem soft-reset.
 pub const MT_WFSYS_SW_RST_B: u32 = 0x18000140;
+
+// ── MT7925 (CONNAC3) L1 remap + reset (mt7925/regs.h:80..92) ───────
+//
+// Verified against torvalds/linux 8d7fe9885c62. The 7925 values are
+// NOT the 7921 values shifted: the selector is a literal `0x155024`
+// (not `MT_INFRA(0x24c)` — 7925's `MT_INFRA_CFG_BASE` is `0xd1000`,
+// so that would be `0xd124c`), the page field sits in the HIGH half
+// of the selector (`GENMASK(31, 16)`, where 7921 uses the low half),
+// and the remapped slab lands at `0x130000`, not `0x40000`.
+// `MT_HIF_REMAP_L1_OFFSET` (`GENMASK(15, 0)`) is the same on both
+// chips, so the window offset is `base + (addr & 0xffff)` either way.
+
+/// `MT_HIF_REMAP_L1` on MT7925 — upstream `mt7925/regs.h:83`.
+pub const MT7925_HIF_REMAP_L1: u32 = 0x155024;
+/// `MT_HIF_REMAP_L1_MASK` on MT7925 — `GENMASK(31, 16)`.
+pub const MT7925_HIF_REMAP_L1_MASK: u32 = 0xFFFF_0000;
+/// `MT_HIF_REMAP_BASE_L1` on MT7925.
+pub const MT7925_HIF_REMAP_BASE_L1: u32 = 0x130000;
+/// `MT_WFSYS_SW_RST_B` on MT7925 — upstream `mt7925/regs.h:92`.
+pub const MT7925_WFSYS_SW_RST_B: u32 = 0x7c000140;
+
+/// Per-chip L1 remap geometry: selector BAR0 offset, selector field
+/// mask, and window base. Both chips take the page from the same
+/// bits of the chip address (`addr >> 16`); only where the field
+/// lands in the selector differs, so [`L1Remap::field`] shifts the
+/// page to the mask's low bit (`FIELD_PREP(mask, page)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct L1Remap {
+    /// BAR0 offset of the L1 selector register.
+    pub selector: u32,
+    /// Selector field mask holding the page (`GENMASK(15, 0)` on
+    /// CONNAC2, `GENMASK(31, 16)` on MT7925).
+    pub mask: u32,
+    /// BAR0 offset where the L1-remapped slab lands.
+    pub base: u32,
+}
+impl L1Remap {
+    /// L1 geometry for `did`: MT7925 ids select the CONNAC3 values,
+    /// every other registered id keeps the CONNAC2 values.
+    pub const fn for_chip(did: u16) -> Self {
+        if is_mt7925_did(did) {
+            Self {
+                selector: MT7925_HIF_REMAP_L1,
+                mask: MT7925_HIF_REMAP_L1_MASK,
+                base: MT7925_HIF_REMAP_BASE_L1,
+            }
+        } else {
+            Self {
+                selector: MT_HIF_REMAP_L1,
+                mask: MT_HIF_REMAP_L1_MASK,
+                base: MT_HIF_REMAP_BASE_L1,
+            }
+        }
+    }
+    /// `FIELD_PREP(mask, page)`: the page value placed in the
+    /// selector field, preserving the unrelated selector bits
+    /// outside the mask when ORed in by the caller.
+    pub const fn field(&self, page: u16) -> u32 {
+        (page as u32) << self.mask.trailing_zeros()
+    }
+}
+
+/// WFSYS soft-reset chip address for `did`: MT7925 ids select the
+/// CONNAC3 address, every other registered id keeps the CONNAC2 one.
+/// Both addresses route through the per-chip L1/fixed map in
+/// `registers::plan`, so callers pass the chip address unchanged.
+pub const fn wfsys_sw_rst_b(did: u16) -> u32 {
+    if is_mt7925_did(did) {
+        MT7925_WFSYS_SW_RST_B
+    } else {
+        MT_WFSYS_SW_RST_B
+    }
+}
 
 // ── Extra MCU command opcodes (mt76_connac_mcu.h:1215..L1313) ──────
 

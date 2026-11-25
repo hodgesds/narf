@@ -44,6 +44,9 @@ pub mod platform;
 /// The driver. One source tree in both builds.
 pub mod mt7921;
 
+/// The CONNAC3 UNI MCU layer (kernel-free; its smokes are built-in only).
+pub mod mt7925;
+
 #[cfg(feature = "builtin")]
 pub mod iface;
 

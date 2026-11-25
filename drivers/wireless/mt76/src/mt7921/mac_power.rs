@@ -14,6 +14,15 @@ pub(super) enum Stage {
 
 pub(super) trait Io {
     fn stage(&mut self, _stage: Stage) {}
+    /// WFSYS soft-reset chip address for the chip behind this `Io`:
+    /// `0x18000140` on CONNAC2, `0x7c000140` on MT7925 (upstream
+    /// `mt7921/regs.h:72` vs `mt7925/regs.h:92`). The default is the
+    /// CONNAC2 address; CONNAC3 implementations override it, because
+    /// on MT7925 the CONNAC2 address routes through L1 to an unrelated
+    /// register, not to WFSYS reset.
+    fn sw_rst_b(&self) -> u32 {
+        MT_WFSYS_SW_RST_B
+    }
     fn read(&mut self, address: u32) -> Result<u32, PowerError>;
     fn write(&mut self, address: u32, value: u32) -> Result<(), PowerError>;
     fn delay(&mut self, ms: u64);
@@ -75,21 +84,22 @@ fn ownership_cycle(io: &mut impl Io) -> Result<(), PowerError> {
 }
 
 fn reset(io: &mut impl Io) -> Result<(), PowerError> {
+    let rst = io.sw_rst_b();
     io.stage(Stage::ResetAssert);
-    let value = read(io, MT_WFSYS_SW_RST_B)?;
-    io.write(MT_WFSYS_SW_RST_B, value & !1)?;
-    if read(io, MT_WFSYS_SW_RST_B)? & 1 != 0 {
+    let value = read(io, rst)?;
+    io.write(rst, value & !1)?;
+    if read(io, rst)? & 1 != 0 {
         return Err(PowerError::ResetRejected);
     }
     io.delay(50);
     io.stage(Stage::ResetRelease);
-    let value = read(io, MT_WFSYS_SW_RST_B)?;
-    io.write(MT_WFSYS_SW_RST_B, value | 1)?;
-    if read(io, MT_WFSYS_SW_RST_B)? & 1 == 0 {
+    let value = read(io, rst)?;
+    io.write(rst, value | 1)?;
+    if read(io, rst)? & 1 == 0 {
         return Err(PowerError::ResetRejected);
     }
     io.stage(Stage::ResetReady);
-    if !io.poll(MT_WFSYS_SW_RST_B, 1 << 4, 1 << 4, 500)? {
+    if !io.poll(rst, 1 << 4, 1 << 4, 500)? {
         return Err(PowerError::ResetTimeout);
     }
     Ok(())

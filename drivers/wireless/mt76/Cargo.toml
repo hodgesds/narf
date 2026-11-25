@@ -19,7 +19,9 @@
 # Named `mt76` (the upstream mt76-*family* driver) rather than `mt7921`, so the
 # sibling CONNAC2/CONNAC3 parts (MT7925/MT7996) can land in the same crate. The
 # inner module path stays `mt7921` to preserve existing `super::`/`crate::`
-# references and the `drivers/wireless/mt7921` kernel-test tags.
+# references and the `drivers/wireless/mt7921` kernel-test tags. The CONNAC3
+# UNI MCU layer lives in the sibling `src/mt7925/` module; it shares the
+# CONNAC2 bring-up and registers its smokes under the same test tag.
 
 [package]
 name         = "narf-drivers-wireless-mt76"

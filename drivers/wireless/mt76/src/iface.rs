@@ -1256,7 +1256,11 @@ impl WirelessNetIface for Mt76Iface {
                 ht_supported: self.radio.capabilities.phy.ht,
                 vht_supported: crate::mt7921::vht::qualified(self.radio),
                 he_supported: false,
-                eht_supported: false,
+                // MT7925 (either band qualified) advertises EHT; the
+                // native HE path stays out of scope, so `he_supported`
+                // remains false.
+                eht_supported: crate::mt7921::eht::qualified(self.radio, true)
+                    || crate::mt7921::eht::qualified(self.radio, false),
             },
         }
     }

@@ -703,11 +703,8 @@ pub fn dcn20_modeset_sequence(
 ///
 /// H_TOTAL, H_BLANK, H_SYNC_A, V_TOTAL and OTG_STATUS did not.
 ///
-/// LINUX-GAP: nothing can select this path. `STRIX_POINT` maps to
-/// `Family::Phoenix`, so there is no family value that reaches
-/// `dcn35_modeset_sequence`, and Phoenix itself is DCN 3.1.4. It is kept
-/// because the register deltas above are real and a Strix bring-up will need
-/// them — but a Strix family has to exist first.
+/// Selected for `Family::Strix` from `set_mode` and `plan_modeset`;
+/// Phoenix is DCN 3.1.4 and never takes this path.
 pub const DCN35_OTG0_OTG_H_TOTAL: u32 = 0x1b2a;
 pub const DCN35_OTG0_OTG_H_BLANK_START_END: u32 = 0x1b2b;
 pub const DCN35_OTG0_OTG_H_SYNC_A: u32 = 0x1b2c;
@@ -967,11 +964,13 @@ pub fn dcn32_modeset_sequence(
     Some(writes)
 }
 
-/// Build a DCN 2.0 modeset write list from the IP discovery
-/// table. Returns `None` when the discovery blob does not enumerate
-/// a `HW_ID_DCN` block (older silicon / QEMU / parse failed); the
-/// caller falls back to `build_modeset` against the static
-/// `amdgpu_offsets` registry.
+/// Build a modeset write list from the IP discovery table. Returns
+/// `None` when the discovery blob does not enumerate a `HW_ID_DCN`
+/// block (older silicon / QEMU / parse failed); the caller falls back
+/// to `build_modeset` against the static `amdgpu_offsets` registry.
+/// DCN 3.5.0 takes the 3.5 sequence (its OTG registers moved — see the
+/// `DCN35_OTG0_*` constants); every other version takes the 2.0
+/// sequence, which DCN 3.1.4 agrees with on all nine OTG registers.
 pub fn build_modeset_from_discovery(
     blocks: &[IpBlock],
     timing: &ModeTiming,
@@ -982,6 +981,14 @@ pub fn build_modeset_from_discovery(
     let dcn_base = dcn.base_addrs[0];
     if dcn_base == 0 {
         return None;
+    }
+    if (dcn.major, dcn.minor, dcn.revision) == (3, 5, 0) {
+        return Some(dcn35_modeset_sequence(
+            timing,
+            surface_addr_bytes,
+            stride_pixels,
+            dcn_base,
+        ));
     }
     Some(dcn20_modeset_sequence(
         timing,

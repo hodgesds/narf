@@ -368,7 +368,7 @@ fn bring_up_current(
     // SAFETY: caller-asserted BAR exclusivity.
     let mmio_bar0 = unsafe { map_bar_control(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
 
-    validate_probe_window(mmio_bar0.len)?;
+    validate_probe_window(device.id.device, mmio_bar0.len)?;
     use narf_bus::pci::{self, cmd};
     pci::set_command(cap, device, PROBE_COMMAND).map_err(|_| ProbeError::Authority)?;
     let command = pci::read_command(cap, device).map_err(|_| ProbeError::Authority)?;
@@ -392,11 +392,13 @@ fn bring_up_current(
         mmio_bar0.len
     );
     // SAFETY: caller owns BAR0/latch; checked access validates every word.
-    let chip_id = unsafe { chip_id_read(&mmio_bar0)? };
+    // The PCI id selects the fixed table: the chip-id gate below has not
+    // run yet, so there is no effective id to pass here.
+    let chip_id = unsafe { chip_id_read(device.id.device, &mmio_bar0)? };
     // SAFETY: same ownership and checked transaction.
-    let hw_rev = unsafe { hw_rev_read(&mmio_bar0)? };
+    let hw_rev = unsafe { hw_rev_read(device.id.device, &mmio_bar0)? };
     // SAFETY: same ownership and checked transaction.
-    let bound = unsafe { hw_bound_read(&mmio_bar0)? };
+    let bound = unsafe { hw_bound_read(device.id.device, &mmio_bar0)? };
     if [chip_id, hw_rev, bound].contains(&u32::MAX) {
         return Err(ProbeError::DeviceGone);
     }
@@ -425,7 +427,7 @@ fn bring_up_current(
     }
     // SAFETY: exclusive current invocation, verified BME-off, mapped control
     // window, and no published controller/transport or host DMA allocations.
-    match unsafe { mac::initialize_probe(&mmio_bar0) } {
+    match unsafe { mac::initialize_probe(&mmio_bar0, effective_did) } {
         Ok(()) => {}
         Err(mac::PowerError::Timeout) => return Err(ProbeError::DriverOwnTimeout),
         Err(mac::PowerError::DeviceGone) => return Err(ProbeError::DeviceGone),

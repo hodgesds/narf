@@ -76,6 +76,13 @@ fn smoke_mt7921_name_for_known_ids() -> TestResult {
     if name_for(MTK_DEV_MT7920) != "mt7921-7920" {
         return TestResult::Fail("MT7920 name mismatch");
     }
+    if name_for(MTK_DEV_MT7925) != "mt7921-7925" {
+        return TestResult::Fail("MT7925 name mismatch");
+    }
+    // 0717 is a PCI alias for MT7925, not an MT7921 variant.
+    if name_for(MTK_DEV_MT7925_ALT) != "mt7925-0717" {
+        return TestResult::Fail("MT7925 PCI alias (0717) name mismatch");
+    }
     if name_for(0xFFFF) != "mt7921" {
         return TestResult::Fail("default name mismatch");
     }
@@ -168,11 +175,13 @@ fn smoke_mt7921_probe_validates_real_bar_geometry() -> TestResult {
     use super::pci::validate_probe_window;
     // Regression: the 1 MiB hardware window now covers the selector,
     // fixed ownership CSR, and indirect identity window.
-    if validate_probe_window(0x100000).is_err() {
+    if validate_probe_window(MTK_DEV_MT7922, 0x100000).is_err() {
         return TestResult::Fail("real MT7922 BAR refused");
     }
     let end = u64::from(MT_HIF_REMAP_L1) + 4;
-    if validate_probe_window(end - 1).is_ok() || validate_probe_window(end).is_err() {
+    if validate_probe_window(MTK_DEV_MT7922, end - 1).is_ok()
+        || validate_probe_window(MTK_DEV_MT7922, end).is_err()
+    {
         return TestResult::Fail("selector bounds are not end-exclusive");
     }
     TestResult::Pass
@@ -206,9 +215,9 @@ kernel_test_in!(
 );
 
 fn smoke_mt7921_l1_remap_direct_window() -> TestResult {
-    if l1_remap(0) != 0
-        || l1_remap(MT_PCIE_MAC_INT_ENABLE) != 0x10188
-        || l1_remap(0x00ffffff) != u32::MAX
+    if l1_remap(MTK_DEV_MT7922, 0) != 0
+        || l1_remap(MTK_DEV_MT7922, MT_PCIE_MAC_INT_ENABLE) != 0x10188
+        || l1_remap(MTK_DEV_MT7922, 0x00ffffff) != u32::MAX
     {
         return TestResult::Fail("direct BAR window is not bounded to 1 MiB");
     }
@@ -220,16 +229,40 @@ kernel_test_in!(
 );
 
 fn smoke_mt7921_l1_remap_high_window() -> TestResult {
-    if l1_remap(MT_HW_CHIPID) != 0x40200
-        || l1_remap(MT_HW_REV) != 0x40204
-        || l1_remap(MT_HW_BOUND) != 0x40020
-        || l1_remap(MT_CONN_ON_LPCTL) != 0xe0010
+    if l1_remap(MTK_DEV_MT7922, MT_HW_CHIPID) != 0x40200
+        || l1_remap(MTK_DEV_MT7922, MT_HW_REV) != 0x40204
+        || l1_remap(MTK_DEV_MT7922, MT_HW_BOUND) != 0x40020
+        || l1_remap(MTK_DEV_MT7922, MT_CONN_ON_LPCTL) != 0xe0010
     {
         return TestResult::Fail("identity/ownership register mapping differs from Linux");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_l1_remap_high_window);
+
+/// MT7925 (CONNAC3) `l1_remap` selects the per-chip fixed table: the
+/// new windows resolve, the shrunk PCIe MAC window rejects its old
+/// tail, and the shared ownership window agrees with CONNAC2. The
+/// identity register routes through the per-chip L1 window instead:
+/// 0x130200 on MT7925 (selector 0x155024, slab 0x130000) vs 0x40200
+/// on CONNAC2.
+fn smoke_mt7925_l1_remap_connac3_windows() -> TestResult {
+    if l1_remap(MTK_DEV_MT7925, 0x830c0000) != 0
+        || l1_remap(MTK_DEV_MT7925_ALT, 0x830c0000) != 0
+        || l1_remap(MTK_DEV_MT7925, 0x7c500000) != 0x60000
+        || l1_remap(MTK_DEV_MT7925, MT_HW_CHIPID) != 0x130200
+        || l1_remap(MTK_DEV_MT7925, MT_CONN_ON_LPCTL) != 0xe0010
+        || l1_remap(MTK_DEV_MT7925, 0x74031000) != u32::MAX
+        || l1_remap(MTK_DEV_MT7922, 0x74031000) != 0x11000
+    {
+        return TestResult::Fail("MT7925 l1_remap does not use the CONNAC3 table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7925_l1_remap_connac3_windows
+);
 
 // ── Firmware blob resolution ───────────────────────────────────────
 
@@ -243,6 +276,14 @@ fn smoke_mt7921_firmware_blobs_for_each_chip() -> TestResult {
     let (p, r) = firmware_blobs_for(MTK_DEV_MT7920);
     if p != MT7920_ROM_PATCH || r != MT7920_FIRMWARE_WM {
         return TestResult::Fail("MT7920 firmware blob names drift");
+    }
+    // MT7925 ships its own patch + RAM code (upstream `mt792x.h:51,59`).
+    // Both the 0x7925 DID and the 0717 PCI alias select the same pair.
+    for &did in [MTK_DEV_MT7925, MTK_DEV_MT7925_ALT].iter() {
+        let (p, r) = firmware_blobs_for(did);
+        if p != MT7925_ROM_PATCH || r != MT7925_FIRMWARE_WM {
+            return TestResult::Fail("MT7925 firmware blob names drift");
+        }
     }
     // PCI alias 0616 selects MT7922 firmware, as in the Linux match table.
     if firmware_blobs_for(MTK_DEV_MT7921_ALT) != firmware_blobs_for(MTK_DEV_MT7922) {
@@ -766,12 +807,18 @@ fn smoke_mt7921_l1_remap_helper() -> TestResult {
     // accessing absolute address 0x7c060010 lands at BAR0 offset
     // MT_HIF_REMAP_BASE_L1 + (addr & MT_HIF_REMAP_L1_MASK)
     //                     = 0x40000 + 0x0010 = 0x40010.
-    let off = l1_remapped_offset(MT_CONN_ON_LPCTL);
+    let off = l1_remapped_offset(MTK_DEV_MT7922, MT_CONN_ON_LPCTL);
     if off & MT_HIF_REMAP_L1_BASE != MT_HIF_REMAP_BASE_L1 {
         return TestResult::Fail("L1 remap base bits wrong");
     }
     if off & MT_HIF_REMAP_L1_MASK != (MT_CONN_ON_LPCTL & MT_HIF_REMAP_L1_MASK) {
         return TestResult::Fail("L1 remap offset bits wrong");
+    }
+    // MT7925 lands the same window at 0x130000 instead.
+    if l1_remapped_offset(MTK_DEV_MT7925, MT_CONN_ON_LPCTL) != 0x130010
+        || l1_remapped_offset(MTK_DEV_MT7925_ALT, MT_CONN_ON_LPCTL) != 0x130010
+    {
+        return TestResult::Fail("MT7925 L1 remap window wrong");
     }
     TestResult::Pass
 }
@@ -828,6 +875,160 @@ kernel_test_in!(
     "drivers/wireless/mt7921",
     smoke_mt7921_linux_ring_sizes_visible
 );
+
+// ── Stage-4: MT7925 DMA (CONNAC3) ──────────────────────────────────
+
+fn smoke_mt7925_did_branch() -> TestResult {
+    // Both MT7925 PCI ids take the 7925 branch; every other
+    // registered id keeps the MT7921 shape.
+    if !is_mt7925_did(MTK_DEV_MT7925) {
+        return TestResult::Fail("MTK_DEV_MT7925 not on the MT7925 branch");
+    }
+    if !is_mt7925_did(MTK_DEV_MT7925_ALT) {
+        return TestResult::Fail("MTK_DEV_MT7925_ALT (0717) not on the MT7925 branch");
+    }
+    if is_mt7925_did(MTK_DEV_MT7921_ALT) {
+        return TestResult::Fail("MT7921 alias (0616) wrongly on the MT7925 branch");
+    }
+    if is_mt7925_did(MTK_DEV_MT7922) {
+        return TestResult::Fail("MT7922 wrongly on the MT7925 branch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7925_did_branch);
+
+fn smoke_mt7925_linux_ring_sizes_visible() -> TestResult {
+    // Pin the Linux ring sizes + token size against drift in
+    // mt7925.h:27-43. TX / TX_MCU / FWDL / RX / TOKEN match MT7921;
+    // only RX_MCU differs (512 vs 7921's 8).
+    if LINUX_MT7925_TX_RING_SIZE != 2048 {
+        return TestResult::Fail("LINUX_MT7925_TX_RING_SIZE drifted");
+    }
+    if LINUX_MT7925_TX_MCU_RING_SIZE != 256 {
+        return TestResult::Fail("LINUX_MT7925_TX_MCU_RING_SIZE drifted");
+    }
+    if LINUX_MT7925_TX_FWDL_RING_SIZE != 128 {
+        return TestResult::Fail("LINUX_MT7925_TX_FWDL_RING_SIZE drifted");
+    }
+    if LINUX_MT7925_RX_RING_SIZE != 1536 {
+        return TestResult::Fail("LINUX_MT7925_RX_RING_SIZE drifted");
+    }
+    if LINUX_MT7925_RX_MCU_RING_SIZE != 512 {
+        return TestResult::Fail("LINUX_MT7925_RX_MCU_RING_SIZE drifted");
+    }
+    if LINUX_MT7925_TOKEN_SIZE != 8192 {
+        return TestResult::Fail("LINUX_MT7925_TOKEN_SIZE drifted");
+    }
+    // TXWI = MT_TXD_SIZE (32) + sizeof(struct mt76_connac_hw_txp)
+    // (32) per mt7925/pci.c:1113; TXD_SIZE is the in-tree MT_TXD_SIZE.
+    if MT7925_TXWI_SIZE != TXD_SIZE + 32 {
+        return TestResult::Fail("MT7925_TXWI_SIZE not 32 + 32");
+    }
+    if MT7925_TXWI_SIZE != 64 {
+        return TestResult::Fail("MT7925_TXWI_SIZE drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7925_linux_ring_sizes_visible
+);
+
+fn smoke_mt7925_ring_regs_per_chip() -> TestResult {
+    use super::dma::{mt7925_rx_ring_regs, mt7925_tx_ring_regs};
+    // TX: BAND0 slot 0, MCU_WM (15) slot 1, FWDL (16) slot 2.
+    let tx0 = match mt7925_tx_ring_regs(MT7925_TXQ_BAND0) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("MT7925 TX BAND0 lookup failed"),
+    };
+    if tx0.base_lo != MT_TX_RING_BASE {
+        return TestResult::Fail("MT7925 TX BAND0 not at MT_TX_RING_BASE");
+    }
+    let mcu = mt7925_tx_ring_regs(MT7925_TXQ_MCU_WM).unwrap();
+    if mcu.base_lo != MT_TX_RING_BASE + RING_REG_STRIDE {
+        return TestResult::Fail("MT7925 TX MCU_WM slot wrong");
+    }
+    let fwdl = mt7925_tx_ring_regs(MT7925_TXQ_FWDL).unwrap();
+    if fwdl.base_lo != MT_TX_RING_BASE + 2 * RING_REG_STRIDE {
+        return TestResult::Fail("MT7925 TX FWDL slot wrong");
+    }
+    // BAND1 (1) is in the enum but not wired in the 7925 layout; 17
+    // is the CONNAC2 MCU id and must NOT resolve on MT7925.
+    if mt7925_tx_ring_regs(MT7925_TXQ_BAND1).is_ok() {
+        return TestResult::Fail("MT7925 TX BAND1 was accepted");
+    }
+    if mt7925_tx_ring_regs(17).is_ok() {
+        return TestResult::Fail("CONNAC2 MCU queue 17 was accepted for MT7925");
+    }
+    if mt7925_tx_ring_regs(127).is_ok() {
+        return TestResult::Fail("invalid MT7925 TX queue id was accepted");
+    }
+    // RX: MCU_WM (0) at the event base, BAND0 data (2) at the data
+    // base. Note RX 0 is the MCU event on 7925, where it is the data
+    // ring on 7921 — the numbering differs, the bases do not.
+    let rx_mcu = mt7925_rx_ring_regs(MT7925_RXQ_MCU_WM).unwrap();
+    if rx_mcu.base_lo != MT_RX_EVENT_RING_BASE {
+        return TestResult::Fail("MT7925 RX MCU_WM not at MT_RX_EVENT_RING_BASE");
+    }
+    let rx_data = mt7925_rx_ring_regs(MT7925_RXQ_BAND0).unwrap();
+    if rx_data.base_lo != MT_RX_DATA_RING_BASE {
+        return TestResult::Fail("MT7925 RX BAND0 not at MT_RX_DATA_RING_BASE");
+    }
+    // MCU_WM2 (1) is MT7928-only; BAND1 (3) is not wired.
+    if mt7925_rx_ring_regs(MT7925_RXQ_MCU_WM2).is_ok() {
+        return TestResult::Fail("MT7928-only RX MCU_WM2 was accepted for MT7925");
+    }
+    if mt7925_rx_ring_regs(MT7925_RXQ_BAND1).is_ok() {
+        return TestResult::Fail("MT7925 RX BAND1 was accepted");
+    }
+    if mt7925_rx_ring_regs(99).is_ok() {
+        return TestResult::Fail("invalid MT7925 RX queue id was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7925_ring_regs_per_chip);
+
+fn smoke_mt7925_ring_set_allocates() -> TestResult {
+    use super::dma::allocate_ring_set_for_chip;
+    // Both MT7925 PCI ids get the 5-ring layout.
+    for &did in [MTK_DEV_MT7925, MTK_DEV_MT7925_ALT].iter() {
+        let set = match allocate_ring_set_for_chip(did) {
+            Ok(s) => s,
+            Err(_) => return TestResult::Skip("ring set alloc unavailable"),
+        };
+        if set.tx_data.len() != MT7925_TX_DATA_RING_COUNT {
+            return TestResult::Fail("MT7925 ring set TX data count wrong");
+        }
+        if set.tx_data[0].q_idx() != MT7925_TXQ_BAND0 {
+            return TestResult::Fail("MT7925 TX data q_idx wrong");
+        }
+        if set.tx_fwdl.q_idx() != MT7925_TXQ_FWDL {
+            return TestResult::Fail("MT7925 FWDL q_idx wrong");
+        }
+        if set.tx_mcu.q_idx() != MT7925_TXQ_MCU_WM {
+            return TestResult::Fail("MT7925 MCU q_idx wrong");
+        }
+        if set.rx_data.q_idx() != MT7925_RXQ_BAND0 {
+            return TestResult::Fail("MT7925 RX data q_idx wrong");
+        }
+        if set.rx_mcu_evt.q_idx() != MT7925_RXQ_MCU_WM {
+            return TestResult::Fail("MT7925 RX MCU event q_idx wrong");
+        }
+    }
+    // A non-7925 id keeps the 9-ring MT7921 shape.
+    let set = match allocate_ring_set_for_chip(MTK_DEV_MT7921_ALT) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Skip("ring set alloc unavailable"),
+    };
+    if set.tx_data.len() != MT7921_TX_RING_COUNT {
+        return TestResult::Fail("MT7921 ring set TX count wrong via chip branch");
+    }
+    if set.tx_mcu.q_idx() != 17 {
+        return TestResult::Fail("MT7921 MCU q_idx wrong via chip branch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7925_ring_set_allocates);
 
 fn smoke_mt7921_extended_mcu_opcodes() -> TestResult {
     // Pin the Linux MCU_EXT_CMD_* opcodes against drift in

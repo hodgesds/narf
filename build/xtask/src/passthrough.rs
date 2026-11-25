@@ -629,6 +629,13 @@ pub fn firmware_globs_for(vendor: u16, device: u16) -> &'static [&'static str] {
         (0x1002, 0x73c0..=0x73df) => &["amdgpu/navy_flounder*"],
         // MediaTek MT7922 802.11ax Wi-Fi.
         (0x14c3, 0x0616) => &["mediatek/WIFI_MT7922*", "mediatek/WIFI_RAM_CODE_MT7922*"],
+        // MediaTek MT7925 802.11be Wi-Fi (CONNAC3 blobs live under
+        // mediatek/mt7925/; native boot loads them at Stage::Late from the
+        // rootfs, these globs serve the passthrough/initramfs path).
+        (0x14c3, 0x0717) => &[
+            "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr*",
+            "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1*",
+        ],
         _ => &[],
     }
 }
@@ -1364,6 +1371,13 @@ mod tests {
         assert_eq!(
             firmware_globs_for(0x14c3, 0x0616),
             &["mediatek/WIFI_MT7922*", "mediatek/WIFI_RAM_CODE_MT7922*",]
+        );
+        assert_eq!(
+            firmware_globs_for(0x14c3, 0x0717),
+            &[
+                "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr*",
+                "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1*",
+            ]
         );
         // Its HD-audio function and unrelated cards need nothing.
         assert!(firmware_globs_for(0x1002, 0xab28).is_empty());

@@ -1,14 +1,14 @@
 # aqc1xx — Aquantia/Marvell AQC1xx (Atlantic) NIC family, dual-build.
 #
-# AQC113 first (hw_atl2 generation): the common modern 2.5–10 GbE chip
-# in laptops, mini-PCs and docks. The older AQC100/107/108/109/111/112
+# AQC113 (hw_atl2 generation): the common modern 2.5–10 GbE chip in
+# laptops, mini-PCs and docks. The older AQC100/107/108/109/111/112
 # (hw_atl B1) and D-series (hw_atl A0/B0) generations use a different
-# register backend and are a remainder (see the driver docs).
+# register backend (see aqc100.rs).
 # See narf-drivers-net-e1000 for the reference shape.
 
 [package]
 name         = "narf-drivers-net-aqc1xx"
-description  = "Aquantia/Marvell AQC113 (Atlantic) NIC family — built-in or loadable module."
+description  = "Aquantia/Marvell AQC1xx (Atlantic) NIC family — built-in or loadable module."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

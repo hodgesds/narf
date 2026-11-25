@@ -1770,20 +1770,23 @@ kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
 /// the station join with its supplicant and the packet path — over
 /// `narf-module-rt` and the KABI). Its relocations resolve and init runs to
 /// Live; the `debug` parameter is declared and a load argument applies; it
-/// claims exactly the six CONNAC2 PCI ids the built-in table names (not
-/// MT7925); a probe with no device context is refused before any device
-/// access; unload leaves no match behind. QEMU emulates no MediaTek Wi-Fi,
+/// claims exactly the eight PCI ids the built-in table names (MT7925 and
+/// its 0717 alias included; the chip-id gate still refuses MT7925 silicon,
+/// as built in); a probe with no device context is refused before any
+/// device access; unload leaves no match behind. QEMU emulates no MediaTek Wi-Fi,
 /// so bring-up itself is proven on hardware.
 fn e2e_mt76_module_registration() -> TestResult {
     use narf_bus::driver_match::{__module_thunk_for_test, count};
     const MTK: u16 = 0x14c3;
     const ITTIM: u16 = 0x0e8d;
-    const IDS: [(u16, u16); 6] = [
+    const IDS: [(u16, u16); 8] = [
         (MTK, 0x7961),
         (MTK, 0x7922),
         (MTK, 0x0608),
         (MTK, 0x0616),
         (MTK, 0x7920),
+        (MTK, 0x7925),
+        (MTK, 0x0717),
         (ITTIM, 0x7922),
     ];
 
@@ -1814,7 +1817,8 @@ fn e2e_mt76_module_registration() -> TestResult {
         && IDS
             .iter()
             .all(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
-        && __module_thunk_for_test(MTK, 0x7925).is_none();
+        // The ITTIM vendor id only carries the MT7922 SKU.
+        && __module_thunk_for_test(ITTIM, 0x7925).is_none();
     // A bogus token (no device context): the identity read fails first.
     let refused = __module_thunk_for_test(MTK, 0x7922).is_some_and(|thunk| thunk(0, 0) != 0);
     drop(module);

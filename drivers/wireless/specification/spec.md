@@ -957,8 +957,53 @@ PCI discovery does not publish a zero-MAC netdev/wiphy. Firmware, radio and
 station initialization precede packet admission through the retained transport. The legacy
 `full_bring_up` boundary returns `NotImplemented` without allocating or
 programming rings until it can retain every published allocation.
-PCI alias `14c3:0616` selects the MT7922 firmware pair. Register translation
-and selector encoding follow the local Linux reference at `ecd997b0189a`.
+PCI alias `14c3:0616` selects the MT7922 firmware pair. MT7925 is
+registered the same way: PCI ids `14c3:7925` and `14c3:0717` match
+(`name_for` gives `mt7921-7925` / `mt7925-0717`), and both select the
+MT7925 patch/RAM pair (`mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin`,
+`mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin`, per upstream
+`mt792x.h:51,59`). The probe's chip-id gate still rejects anything
+outside `{0x7961, 0x7922, 0x7920}`: no verified `MT_HW_CHIPID` value
+exists for the `14c3:0717` card yet (upstream has no explicit MT7925
+chip-id constant, only a `case 0x7925` firmware-name expectation), so
+real-hardware probe stays closed until that value is read off the card.
+Register translation is per-chip: `registers::plan` selects the fixed
+table by device id. MT7925 ids (`0x7925`, `0x0717`) use the CONNAC3
+table `FIXED_MT7925`, transcribed entry-for-entry from upstream
+`default_fixed_map` (`mt7925/pci.c:178-232` at torvalds/linux
+`8d7fe9885c62`); every other registered id keeps the CONNAC2 table.
+Against CONNAC2 the MT7925 table adds windows `0x830c0000`,
+`0x56000000`, `0x57000000`, `0x820ca000`, `0x820c4000`, `0x820b0000`,
+`0x70020000`, `0x7c500000` (remap, length `0x200000`), lengthens PP
+(`0x820cc000`, `0x1000` -> `0x2000`), shrinks the PCIe MAC window
+(`0x74030000`, `0x10000` -> `0x1000`), and drops `0x820cd000`, which
+has no MT7925 counterpart (addresses there now route through the
+lengthened PP window). The sibling `mt7928_fixed_map` is not used.
+Probe-time callers pass the PCI id (no effective id exists before
+the chip-id gate); later callers pass the effective id. The
+`mt76_mt7925_fixed_map_matches_upstream_default_fixed_map` golden
+test asserts the table entry-for-entry against upstream, and
+`mt76_mt7925_plan_uses_connac3_windows` asserts the dispatch, the
+new windows, and both length changes through `plan()`.
+Register translation and selector encoding follow the local Linux reference at `ecd997b0189a`.
+
+MT7925 DMA uses the CONNAC3 queue numbering, not CONNAC2's: TX
+MCU_WM is queue 15 and FWDL is 16; RX data is BAND0 queue 2 and the
+MCU event ring is queue 0 (upstream `mt7925.h:218-241`). RX queue 1
+(MCU_WM2, TX-done) is MT7928-only and is not wired for MT7925.
+`dma::allocate_ring_set_for_chip` builds the five-ring
+`mt7925_dma_layout` (TX data BAND0, TX MCU, TX FWDL, RX MCU, RX data
+BAND0; upstream `mt7925/pci.c:710-742`) for either MT7925 PCI id and
+the nine-ring MT7921 layout otherwise; `program_ring_set_for_chip`
+programs each set through its own queue-id map, with the shared
+disable/reset/EXT_CTRL/enable sequence on both chips. Linux ring
+depths are TX 2048 / TX MCU 256 / TX FWDL 128 / RX 1536 / RX MCU 512
+with an 8192-entry token table (`mt7925.h:27-43`); TXWI is 64 bytes
+(32-byte TXD + 32-byte `mt76_connac_hw_txp`,
+`mt7925/pci.c:1113`). The bring-up baseline still programs 16
+entries per ring: the single-page `DmaBuffer` cap is
+chip-independent, and the Linux depths land with the multi-page DMA
+allocator.
 
 ### MT76 MCU/DMA firmware transport
 
@@ -2686,8 +2731,10 @@ services come from `src/platform/`: `kernel.rs` re-exports the kernel crates;
 `kabi.rs` implements the same names over `narf-module-rt` and the KABI.
 `narf-crypto` and `narf-wireless` are linked kernel-free.
 
-- **Claim.** The built-in table: `14c3:{7961,7922,0608,0616,7920}` and
-  `0e8d:7922`. MT7925 (`14c3:7925`, CONNAC3) is matched by neither build.
+- **Claim.** The built-in table: `14c3:{7961,7922,0608,0616,7920,7925,0717}`
+  and `0e8d:7922`. Both builds match MT7925 (`14c3:7925` and its `0717`
+  alias, CONNAC3), and both chip-id gates still refuse it: what
+  `MT_HW_CHIPID` reads on that silicon is open (#2494).
   `narf-drivers-wireless/mt76-module-only` leaves the built-in PCI ids
   unclaimed so an early-loaded `mt76.ko` owns the function; the private
   family host below stays registered.
@@ -2757,7 +2804,7 @@ services come from `src/platform/`: `kernel.rs` re-exports the kernel crates;
   frontend depends on it.
 - **Proof.** `modules/e2e/mt76` loads the real `.ko`: relocations resolve,
   init runs to Live, the `debug` parameter is declared and applies, exactly
-  the six ids are claimed (not MT7925), a probe with no device context is
+  the eight ids are claimed, a probe with no device context is
   refused, and unload leaves no match. QEMU emulates no MediaTek Wi-Fi, so
   bring-up, firmware download and RF behavior are first proven on hardware.
 

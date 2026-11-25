@@ -285,6 +285,8 @@ pub mod amdgpu_dmub_boot;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_dmub_dcn32;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_dmub_dcn35;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_dmub_firmware;
 #[path = "amdgpu_dmub_navi22.rs"]
 #[cfg(feature = "amdgpu")]
@@ -712,6 +714,8 @@ pub mod amdgpu_smu_v14;
 pub mod amdgpu_smuio14;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_strix_boot;
+#[cfg(all(feature = "kernel-test", feature = "amdgpu"))]
+mod amdgpu_strix_tests;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_uapi;
 #[cfg(feature = "amdgpu")]

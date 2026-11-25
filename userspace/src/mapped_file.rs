@@ -644,6 +644,49 @@ fn existing_mapping_owners(address_space_id: u64) -> Option<MappingOwners> {
         .map(Arc::clone)
 }
 
+/// A bucket's rows are kept sorted by `base` and non-overlapping
+/// (publication punches overlapping rows before inserting), so a point
+/// lookup is a binary search, not a linear scan (#745). Every site that
+/// adds rows to a bucket must preserve the order: single rows go through
+/// [`insert_owner_sorted`], whole batches through
+/// [`extend_owners_sorted`]; [`punch_locked`] rebuilds in order and
+/// [`commit_prepared_punch_locked`] removes in place. A point belongs to
+/// at most one row, so the binary search and the old linear `find`
+/// return the identical unique answer.
+fn find_owner(owners: &[MappingOwner], addr: u64) -> Option<&MappingOwner> {
+    let index = owners.partition_point(|mapping| mapping.base <= addr);
+    let mapping = owners.get(index.checked_sub(1)?)?;
+    (addr < mapping.base.saturating_add(mapping.len)).then_some(mapping)
+}
+
+/// [`find_owner`] for the writeback-registration half of a fault, which
+/// mutates the covering row's fallback table.
+fn find_owner_mut(owners: &mut [MappingOwner], addr: u64) -> Option<&mut MappingOwner> {
+    let index = owners.partition_point(|mapping| mapping.base <= addr);
+    let mapping = owners.get_mut(index.checked_sub(1)?)?;
+    (addr < mapping.base.saturating_add(mapping.len)).then_some(mapping)
+}
+
+/// Insert one row into a base-sorted bucket, keeping the order.
+fn insert_owner_sorted(owners: &mut Vec<MappingOwner>, row: MappingOwner) {
+    let index = owners.partition_point(|mapping| mapping.base < row.base);
+    owners.insert(index, row);
+}
+
+/// Merge a base-sorted batch into a base-sorted bucket. The batch is a
+/// contiguous partition of its range (relocated owners, aliases, a resize
+/// replacement) and the rows it replaces were punched first, so a merge
+/// keeps the order; a plain `extend` would append the batch after rows
+/// whose bases are larger. Cold paths only (mremap, resize, alias).
+fn extend_owners_sorted(owners: &mut Vec<MappingOwner>, batch: Vec<MappingOwner>) {
+    let mut start = 0usize;
+    for row in batch {
+        let index = owners[start..].partition_point(|mapping| mapping.base < row.base) + start;
+        owners.insert(index, row);
+        start = index + 1;
+    }
+}
+
 /// The file object a `MAP_SHARED` mapping at `va` exposes, and the absolute
 /// file offset of `va` in it — the `(inode, pgoff)` half of a shared
 /// `get_futex_key`. `None` for an address no file owner covers, and for a
@@ -651,9 +694,8 @@ fn existing_mapping_owners(address_space_id: u64) -> Option<MappingOwners> {
 pub(crate) fn shared_file_at(address_space_id: u64, va: u64) -> Option<(Arc<dyn FileOps>, u64)> {
     let bucket = existing_mapping_owners(address_space_id)?;
     let owners = bucket.lock();
-    owners
-        .iter()
-        .find(|m| m.base <= va && va - m.base < m.len && !m.private_copy && m.pfn.is_none())
+    find_owner(&owners, va)
+        .filter(|m| !m.private_copy && m.pfn.is_none())
         .map(|m| (Arc::clone(&m.ops), m.file_offset + (va - m.base)))
 }
 
@@ -789,22 +831,25 @@ fn publish_mapping_owner(
     if replace {
         punch_locked(&mut owners, base, len);
     }
-    owners.push(MappingOwner {
-        mapper,
-        base,
-        len,
-        file_offset,
-        ops,
-        lifetime,
-        private_copy,
-        writeback: writeback_phys.map(|phys| FileWriteback {
-            offset: file_offset,
-            phys,
-        }),
-        zero_from,
-        provenance,
-        pfn,
-    });
+    insert_owner_sorted(
+        &mut owners,
+        MappingOwner {
+            mapper,
+            base,
+            len,
+            file_offset,
+            ops,
+            lifetime,
+            private_copy,
+            writeback: writeback_phys.map(|phys| FileWriteback {
+                offset: file_offset,
+                phys,
+            }),
+            zero_from,
+            provenance,
+            pfn,
+        },
+    );
     // Publication and owner registration are now atomic with respect to
     // faults. Release the IRQ-safe global table before PTE materialization,
     // which may walk many pages and must not serialize unrelated processes.
@@ -1069,7 +1114,7 @@ fn publish_owner_relocation<T>(
             }
             if source_owned {
                 commit_prepared_punch_locked(&mut owners, old_addr, old_len, source_suffixes);
-                owners.extend(destination);
+                extend_owners_sorted(&mut owners, destination);
             }
             drop(owners);
             // The source range moved away and the fixed target was
@@ -1136,7 +1181,7 @@ pub(crate) fn publish_current_owner_resize<T>(
     let result = publish();
     if result.is_ok() {
         commit_prepared_punch_locked(&mut owners, base, old_len, suffixes);
-        owners.extend(replacement);
+        extend_owners_sorted(&mut owners, replacement);
         drop(owners);
         // The row's extent changed: a batch recorded against the old
         // extent is stale past the point the extents agree (#737
@@ -1211,7 +1256,7 @@ fn publish_owner_alias<T>(
             if let Some(suffixes) = suffixes {
                 commit_prepared_punch_locked(&mut owners, new_addr, len, suffixes);
             }
-            owners.extend(aliases);
+            extend_owners_sorted(&mut owners, aliases);
             drop(owners);
             if fixed {
                 // The fixed target was retired and replaced (#737
@@ -2041,18 +2086,245 @@ pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, Fil
 
 /// The batch fill hook installed in `narf-memory` beside
 /// [`demand_frame`]: supply frames for a run of pages a bulk fault
-/// claimed, through the same fill core, one page at a time. A page
+/// claimed — a fully cached run in one fill ([`fill_cached_run`]),
+/// anything else one page at a time through the same fill core. A page
 /// that cannot be supplied keeps its zero slot — a per-page refusal
 /// the batch skips. Fill-only by construction: this path never calls
 /// [`demand_frame`] (so it never expands a window) and never installs
 /// a leaf, so a batch fill cannot re-enter the fault machinery.
 pub(crate) fn demand_frames_batch(address_space_id: u64, first_vaddr: u64, out: &mut [u64]) {
-    for (index, slot) in out.iter_mut().enumerate() {
+    // One cached run at a time: a run that is fully cached fills in one
+    // owner resolution, one cache reservation, and one owner-bucket lock
+    // hold for the writeback registrations. Anything a run cannot serve
+    // — an uncached page, a row change, a private-copy or provider row —
+    // falls back to one page through `demand_frame_inner`, which is the
+    // same fill the batch used to run for every page, and the run is
+    // retried from the next page (its row may differ).
+    let mut index = 0usize;
+    while index < out.len() {
         let vaddr = first_vaddr.saturating_add((index as u64).saturating_mul(4096));
-        if let Ok((phys, _)) = demand_frame_inner(address_space_id, vaddr) {
-            *slot = phys;
+        if let Some(consumed) = fill_cached_run(address_space_id, vaddr, &mut out[index..]) {
+            index += consumed;
+        } else {
+            if let Ok((phys, _)) = demand_frame_inner(address_space_id, vaddr) {
+                out[index] = phys;
+            }
+            index += 1;
         }
     }
+}
+
+/// Fill a run of pages from one generic shared owner, resolving the
+/// owner once and reserving the whole cached run in one cache-lock
+/// hold (#745). Returns the number of pages consumed — always the whole
+/// run: a page whose retain or writeback registration fails keeps its
+/// zero slot, exactly as the per-page fill leaves it — or `None` when
+/// the run cannot be served this way (no covering row, a private-copy
+/// or direct-provider row, a page at or past EOF, or any page of the
+/// run missing from the cache), in which case the caller fills one page
+/// through [`demand_frame_inner`] and retries from the next page.
+///
+/// The fill is the per-page generic-fallback fill with the per-page
+/// repetitions removed: one owner resolution, one
+/// `reserve_cached_shared_file_pages` for the run, one retain per page,
+/// one publication commit, one owner-bucket lock hold for the writeback
+/// registrations. Every per-page decision — the EOF check, the
+/// generation revalidation, the covering-row re-check at registration —
+/// is the same check the single-page fill makes, at the same point
+/// relative to its fill; a concurrent replace, truncate, or write lands
+/// a page in the same outcome (`Recorded`, `Revoked`, or a zero slot
+/// with its hold released) either way.
+fn fill_cached_run(address_space_id: u64, first_vaddr: u64, out: &mut [u64]) -> Option<usize> {
+    let first_page = first_vaddr & !0xFFFu64;
+    let owner_bucket = existing_mapping_owners(address_space_id)?;
+    let (offset, ops, owner_base, owner_len, writable) = {
+        let owners = owner_bucket.lock();
+        let owner = find_owner(&owners, first_page)?;
+        if owner.private_copy || owner.writeback.is_none() {
+            return None;
+        }
+        (
+            owner.file_offset.checked_add(first_page - owner.base)?,
+            Arc::clone(&owner.ops),
+            owner.base,
+            owner.len,
+            // A row that does not say is taken to be writable.
+            owner
+                .provenance
+                .as_ref()
+                .is_none_or(|provenance| provenance.writable),
+        )
+    };
+    // The run is the pages of `out` the covering row serves, clamped to
+    // the file: the single-page fill SIGBUSes a page at or past EOF, so
+    // such a page is left to it — and every later page of the row is
+    // past EOF too, so the clamp ends the run.
+    let row_end = owner_base.saturating_add(owner_len);
+    let mut run = (row_end.saturating_sub(first_page) / 4096) as usize;
+    run = run.min(out.len());
+    if run == 0 {
+        return None;
+    }
+    let size = ops.stat().size;
+    if offset >= size {
+        return None;
+    }
+    run = run.min(((size - offset).div_ceil(4096)) as usize);
+    if run == 0 {
+        return None;
+    }
+    let expected_generation = ops.mmap_cache_generation();
+    let (phys, publication) = reserve_cached_shared_file_pages(&ops, offset, run)?;
+    // Retain before the commit, as the single-page fill does; a page
+    // whose retain fails (its cache page went away between the reserve
+    // and here) keeps a zero slot and no hold.
+    let mut retained = Vec::new();
+    if retained.try_reserve_exact(run).is_err() {
+        drop(publication);
+        return None;
+    }
+    retained.resize(run, false);
+    let mut any_retained = false;
+    for (index, page_phys) in phys.iter().enumerate() {
+        let ok = if writable {
+            retain_shared_file_page_writable(page_phys.raw())
+        } else {
+            retain_shared_file_page(page_phys.raw())
+        };
+        retained[index] = ok;
+        any_retained |= ok;
+    }
+    publication.commit();
+    if writable && any_retained {
+        // Idempotent per open (see `note_writer`): one call per run
+        // names the same writer the single-page fill names per page.
+        writeback::note_writer(&ops);
+    }
+    // One owner-bucket lock hold for the whole run's registrations. The
+    // row cannot change under the lock, but it may have been replaced
+    // between resolution and here, so each page re-checks its covering
+    // row exactly as the single-page fill does; a page whose row is
+    // gone keeps a zero slot, and its hold is released below. `out`
+    // arrives zeroed (the batch hook contract), so a slot stays zero
+    // exactly when its page was not retained or its registration
+    // failed, and the failures are re-derived from `out` rather than
+    // collected in a second allocation.
+    {
+        let mut owners = owner_bucket.lock();
+        for index in 0..run {
+            if !retained[index] {
+                continue;
+            }
+            let page = first_page.saturating_add((index as u64).saturating_mul(4096));
+            // The reserve proved every run offset in range, so this
+            // cannot saturate; the re-check below would refuse the page
+            // if it ever did.
+            let page_offset = offset.saturating_add((index as u64).saturating_mul(4096));
+            let outcome = match find_owner_mut(&mut owners, page).filter(|mapping| {
+                Arc::ptr_eq(&mapping.ops, &ops)
+                    && mapping.file_offset.checked_add(page - mapping.base) == Some(page_offset)
+            }) {
+                None => WritebackRegistration::Failed,
+                Some(mapping) => register_writeback(
+                    mapping,
+                    page,
+                    page_offset,
+                    phys[index],
+                    &ops,
+                    expected_generation,
+                ),
+            };
+            if !matches!(outcome, WritebackRegistration::Failed) {
+                out[index] = phys[index].raw();
+            }
+        }
+    }
+    for (index, page_phys) in phys.iter().enumerate() {
+        if retained[index] && out[index] == 0 {
+            let released = release_shared_file_page(page_phys.raw());
+            debug_assert!(released);
+        }
+    }
+    Some(run)
+}
+
+/// Recording a fetched frame as its owner row's writeback fallback has
+/// three outcomes, because a fill runs lock-free and the world may have
+/// moved since its entry checks:
+///
+/// - `Recorded`: the slot now names the frame. It is written only for
+///   a fill publication can still adopt — see `Revoked`.
+/// - `Revoked`: the file changed under the fill — its size shrank
+///   past this page, or its cache generation moved (any content
+///   mutation bumps it). The filesystems publish the new EOF and bump
+///   the generation BEFORE revoking mappings (the #690 truncate
+///   ordering), and this check runs under the same owner-bucket lock
+///   as the zap's owner mirror (`zap_owner_rows_locked`), so a
+///   shrink that crossed this page is always visible here by the
+///   time registration could land after the mirror pass. In that
+///   interleave the truncate zap has cancelled this fault's demand
+///   claim, `finish_demand_page` will refuse publication, and the
+///   fault path will release the frame's mapping hold through its
+///   false path; writing the slot anyway would leave the RETAINED
+///   row naming a frame no mapping holds, and a later msync would
+///   write back through it. So the slot is left empty — the "no
+///   fallback frame" state every consumer already honours — and the
+///   frame is still returned, with its hold, for memory's finish to
+///   dispose of. A generation move without a shrink (a racing write)
+///   takes the same branch: the page may well publish, just without
+///   a fallback record; the frame remains the canonical cache page,
+///   reachable by the cache-side flush (`flush_shared_pages_for_ops`),
+///   which is the same reach the flush lifecycle gives any fallback
+///   page whose owner has unmapped it.
+/// - `Failed`: the row (or its writeback table, or the capacity to
+///   extend it) is gone, so no publication may proceed — the
+///   historical outcome: release the hold here and fail the fault.
+enum WritebackRegistration {
+    Recorded,
+    Revoked,
+    Failed,
+}
+
+/// Record one fetched frame as `mapping`'s writeback fallback. The
+/// caller holds the owner-bucket lock and has already re-checked that
+/// `mapping` is still the row covering `page` for `ops` at `offset`
+/// (the race the single-page fill's second lookup guards). Shared by
+/// the single-page fill and the batch run fill so the two paths cannot
+/// drift: the slot logic, the EOF/generation revalidation, and the
+/// stale-identity overwrite are one implementation.
+fn register_writeback(
+    mapping: &mut MappingOwner,
+    page: u64,
+    offset: u64,
+    phys: PhysAddr,
+    ops: &Arc<dyn FileOps>,
+    expected_generation: Option<u64>,
+) -> WritebackRegistration {
+    let Some(writeback) = mapping.writeback.as_mut() else {
+        return WritebackRegistration::Failed;
+    };
+    let index = ((page - mapping.base) >> 12) as usize;
+    if index >= writeback.phys.len()
+        && writeback
+            .phys
+            .try_reserve_exact(index + 1 - writeback.phys.len())
+            .is_err()
+    {
+        return WritebackRegistration::Failed;
+    }
+    if index >= writeback.phys.len() {
+        writeback.phys.resize(index + 1, PhysAddr::new(0));
+    }
+    if offset >= ops.stat().size || ops.mmap_cache_generation() != expected_generation {
+        return WritebackRegistration::Revoked;
+    }
+    let slot = &mut writeback.phys[index];
+    // A prior leaf-install failure can leave a safe, unretained cache
+    // identity in this writeback slot. The memory fault path balanced
+    // that page's mapping reference; overwrite the stale identity on
+    // retry before publication.
+    *slot = phys;
+    WritebackRegistration::Recorded
 }
 
 /// Resolve one page for a demand fault, returning the frame and, for a
@@ -2069,10 +2341,7 @@ fn demand_frame_inner(
     let owner_bucket = existing_mapping_owners(address_space_id).ok_or(FileFaultError::NoOwner)?;
     let (offset, ops, generic_fallback, private_copy, zero_from, owner_base, owner_len, writable) = {
         let owners = owner_bucket.lock();
-        let owner = owners
-            .iter()
-            .find(|mapping| page >= mapping.base && page < mapping.base.saturating_add(mapping.len))
-            .ok_or(FileFaultError::NoOwner)?;
+        let owner = find_owner(&owners, page).ok_or(FileFaultError::NoOwner)?;
         (
             owner
                 .file_offset
@@ -2198,86 +2467,22 @@ fn demand_frame_inner(
     }
 
     // Recording the fetched frame as the owner row's writeback fallback
-    // has three outcomes, because this fill ran lock-free and the world
-    // may have moved since its entry checks:
-    //
-    // - `Recorded`: the slot now names the frame. It is written only for
-    //   a fill publication can still adopt — see `Revoked`.
-    // - `Revoked`: the file changed under the fill — its size shrank
-    //   past this page, or its cache generation moved (any content
-    //   mutation bumps it). The filesystems publish the new EOF and bump
-    //   the generation BEFORE revoking mappings (the #690 truncate
-    //   ordering), and this check runs under the same owner-bucket lock
-    //   as the zap's owner mirror (`zap_owner_rows_locked`), so a
-    //   shrink that crossed this page is always visible here by the
-    //   time registration could land after the mirror pass. In that
-    //   interleave the truncate zap has cancelled this fault's demand
-    //   claim, `finish_demand_page` will refuse publication, and the
-    //   fault path will release the frame's mapping hold through its
-    //   false path; writing the slot anyway would leave the RETAINED
-    //   row naming a frame no mapping holds, and a later msync would
-    //   write back through it. So the slot is left empty — the "no
-    //   fallback frame" state every consumer already honours — and the
-    //   frame is still returned, with its hold, for memory's finish to
-    //   dispose of. A generation move without a shrink (a racing write)
-    //   takes the same branch: the page may well publish, just without
-    //   a fallback record; the frame remains the canonical cache page,
-    //   reachable by the cache-side flush (`flush_shared_pages_for_ops`),
-    //   which is the same reach the flush lifecycle gives any fallback
-    //   page whose owner has unmapped it.
-    // - `Failed`: the row (or its writeback table, or the capacity to
-    //   extend it) is gone, so no publication may proceed — the
-    //   historical outcome: release the hold here and fail the fault.
-    enum Registration {
-        Recorded,
-        Revoked,
-        Failed,
-    }
+    // re-checks the covering row: this fill ran lock-free and the world
+    // may have moved since the resolution above (see
+    // [`WritebackRegistration`]).
     let registration = {
         let mut owners = owner_bucket.lock();
-        let found = owners.iter_mut().find(|mapping| {
-            page >= mapping.base
-                && page < mapping.base.saturating_add(mapping.len)
-                && Arc::ptr_eq(&mapping.ops, &ops)
+        match find_owner_mut(&mut owners, page).filter(|mapping| {
+            Arc::ptr_eq(&mapping.ops, &ops)
                 && mapping.file_offset.checked_add(page - mapping.base) == Some(offset)
-        });
-        match found {
-            None => Registration::Failed,
-            Some(mapping) => match mapping.writeback.as_mut() {
-                None => Registration::Failed,
-                Some(writeback) => {
-                    let index = ((page - mapping.base) >> 12) as usize;
-                    if index >= writeback.phys.len()
-                        && writeback
-                            .phys
-                            .try_reserve_exact(index + 1 - writeback.phys.len())
-                            .is_err()
-                    {
-                        Registration::Failed
-                    } else {
-                        if index >= writeback.phys.len() {
-                            writeback.phys.resize(index + 1, PhysAddr::new(0));
-                        }
-                        if offset >= ops.stat().size
-                            || ops.mmap_cache_generation() != expected_generation
-                        {
-                            Registration::Revoked
-                        } else {
-                            let slot = &mut writeback.phys[index];
-                            // A prior leaf-install failure can leave a safe,
-                            // unretained cache identity in this writeback
-                            // slot. The memory fault path balanced that
-                            // page's mapping reference; overwrite the stale
-                            // identity on retry before publication.
-                            *slot = phys;
-                            Registration::Recorded
-                        }
-                    }
-                }
-            },
+        }) {
+            None => WritebackRegistration::Failed,
+            Some(mapping) => {
+                register_writeback(mapping, page, offset, phys, &ops, expected_generation)
+            }
         }
     };
-    if matches!(registration, Registration::Failed) {
+    if matches!(registration, WritebackRegistration::Failed) {
         let released = release_shared_file_page(phys.raw());
         debug_assert!(released);
         return Err(FileFaultError::NoOwner);
@@ -2813,10 +3018,8 @@ fn restore_recorded_batch(address_space_id: u64, fault_page: u64) -> bool {
     };
     let (first_va, owner_base, owner_end, file_offset, ops) = {
         let owners = bucket.lock();
-        let Some(owner) = owners.iter().find(|mapping| {
-            fault_page >= mapping.base
-                && fault_page - mapping.base < mapping.len
-                && mapping.writeback.is_some()
+        let Some(owner) = find_owner(&owners, fault_page).filter(|mapping| {
+            mapping.writeback.is_some()
                 && !mapping.private_copy
                 && Arc::ptr_eq(&mapping.ops, &record.ops)
         }) else {
@@ -2898,16 +3101,13 @@ fn classify_owner(address_space_id: u64, page: u64) -> OwnerClass {
     // constant leaf getter, but the discipline costs nothing).
     let snapshot = {
         let owners = bucket.lock();
-        owners
-            .iter()
-            .find(|mapping| page >= mapping.base && page < mapping.base.saturating_add(mapping.len))
-            .map(|owner| {
-                (
-                    owner.private_copy,
-                    owner.writeback.is_some(),
-                    Arc::clone(&owner.ops),
-                )
-            })
+        find_owner(&owners, page).map(|owner| {
+            (
+                owner.private_copy,
+                owner.writeback.is_some(),
+                Arc::clone(&owner.ops),
+            )
+        })
     };
     let Some((private_copy, has_writeback, ops)) = snapshot else {
         return OwnerClass::None;
@@ -3660,20 +3860,25 @@ fn register(
     writeback: Option<FileWriteback>,
 ) {
     let mapper = FileMapper::new(ops.as_ref(), address_space_id);
-    mapping_owners(address_space_id).lock().push(MappingOwner {
-        mapper,
-        base,
-        len,
-        file_offset,
-        ops,
-        lifetime,
-        private_copy: false,
-        writeback,
-        // Not an ELF segment: no `padzero` window.
-        zero_from: None,
-        provenance: None,
-        pfn: None,
-    });
+    let owner_bucket = mapping_owners(address_space_id);
+    let mut owners = owner_bucket.lock();
+    insert_owner_sorted(
+        &mut owners,
+        MappingOwner {
+            mapper,
+            base,
+            len,
+            file_offset,
+            ops,
+            lifetime,
+            private_copy: false,
+            writeback,
+            // Not an ELF segment: no `padzero` window.
+            zero_from: None,
+            provenance: None,
+            pfn: None,
+        },
+    );
 }
 
 #[cfg(any(target_arch = "x86_64", feature = "native-ring"))]
@@ -4046,8 +4251,10 @@ fn prepare_punch_locked(
 }
 
 /// Apply a punch after [`prepare_punch_locked`] has made every split
-/// allocation infallible. Order is not semantically significant; fault lookup
-/// selects by range.
+/// allocation infallible. Rows stay sorted by `base` for [`find_owner`]:
+/// a surviving row keeps its place, a split row's suffix is inserted in
+/// order, and a fully covered row is removed in place (not swapped with
+/// the last row).
 fn commit_prepared_punch_locked(
     owners: &mut Vec<MappingOwner>,
     base: u64,
@@ -4057,11 +4264,11 @@ fn commit_prepared_punch_locked(
     let end = base
         .checked_add(len)
         .expect("prepared owner punch range changed");
-    let original_count = owners.len();
+    let mut total = owners.len();
     let mut index = 0usize;
     let mut suffixes = suffixes.into_iter();
     let mut visited = 0usize;
-    while visited < original_count {
+    while visited < total {
         visited += 1;
         let mapping_end = owners[index].base.saturating_add(owners[index].len);
         if mapping_end <= base || owners[index].base >= end {
@@ -4077,7 +4284,15 @@ fn commit_prepared_punch_locked(
             }
             index += 1;
             if split {
-                owners.push(suffixes.next().expect("prepared owner suffix disappeared"));
+                insert_owner_sorted(
+                    owners,
+                    suffixes.next().expect("prepared owner suffix disappeared"),
+                );
+                // The suffix lands in the scan's path and is visited
+                // (and skipped, its base at the punch end) on the next
+                // iteration; the scan still owes every original row a
+                // visit.
+                total += 1;
             }
         } else if mapping_end > end {
             let skipped = end - owners[index].base;
@@ -4091,12 +4306,16 @@ fn commit_prepared_punch_locked(
             }
             index += 1;
         } else {
-            owners.swap_remove(index);
+            owners.remove(index);
         }
     }
     assert!(suffixes.next().is_none(), "unused prepared owner suffix");
 }
 
+/// Punch `[base, base + len)` out of the bucket, splitting a straddled
+/// row into a prefix and a suffix. Rebuilds in order — survivors keep
+/// their relative order and a split row's suffix follows its prefix —
+/// so the base-sorted order [`find_owner`] relies on is preserved.
 fn punch_locked(owners: &mut Vec<MappingOwner>, base: u64, len: u64) {
     let Some(end) = base.checked_add(len) else {
         return;

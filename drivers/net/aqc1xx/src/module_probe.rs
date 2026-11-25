@@ -2,8 +2,8 @@
 //!
 //! Registration-only: the probe thunk returns `-ENOSYS` because the device
 //! datapath ABI is not yet exported. The built-in build registers the
-//! full AQC113-family id table; this registers one representative id
-//! (AQC113) as the module-build proof.
+//! full AQC1xx-family id tables; this registers one representative id
+//! per generation (AQC113, AQC100) as the module-build proof.
 
 unsafe extern "C" {
     fn narf_register_pci_driver(
@@ -19,8 +19,8 @@ extern "C" fn probe_c(_dev_token: u64, _reserved: u64) -> i32 {
     -38
 }
 
-/// `(vendor, device, name)` representative: AQC113.
-const IDS: &[(u16, u16, &[u8])] = &[(0x1D6A, 0x04C0, b"aqc113")];
+/// `(vendor, device, name)` representatives: AQC113 and AQC100.
+const IDS: &[(u16, u16, &[u8])] = &[(0x1D6A, 0x04C0, b"aqc113"), (0x1D6A, 0x00B1, b"aqc100")];
 
 pub fn register() {
     for &(vendor, device, name) in IDS {

@@ -312,11 +312,13 @@ pub(crate) unsafe fn discover(
             unsafe { rom::read_discrete(gpu, device, cap) }
         }
         // Raphael is an APU in the coarse Navi2 family; its VBIOS shadow sits
-        // in the carve-out like the other APUs'.
+        // in the carve-out like the other APUs'. Strix is a native APU family.
         Err(Error::NotFound)
             if matches!(
                 gpu.chip.family,
-                crate::amdgpu::Family::Renoir | crate::amdgpu::Family::Phoenix
+                crate::amdgpu::Family::Renoir
+                    | crate::amdgpu::Family::Phoenix
+                    | crate::amdgpu::Family::Strix
             ) || gpu.chip.did == crate::amdgpu::RAPHAEL =>
         {
             // SAFETY: the APU framebuffer mapping and exclusive probe ownership

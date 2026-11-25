@@ -1,6 +1,13 @@
 //! Display layouts verified against Linux dcn_3_0_0/dcn_3_1_2/dcn_3_1_4/dcn_3_1_5/
-//! dcn_3_2_0/dcn_3_2_1 headers and dcn30/dcn31/dcn314/dcn315/dcn32/dcn321 resource
-//! tables. Register compatibility is block-specific.
+//! dcn_3_2_0/dcn_3_2_1/dcn_3_5_0 headers and dcn30/dcn31/dcn314/dcn315/dcn32/dcn321
+//! resource tables. Register compatibility is block-specific.
+//!
+//! DCN 3.5 (Strix) has no `dcn35_resource.c` in the ref tree, so
+//! [`Profile::Dcn35`]'s caps are borrowed from the Dcn314/Dcn315/Dcn32
+//! shape (4 pipes, 5 streams, 5 channels) and marked `linux: n/a` until
+//! lane 6 verifies them against `dcn35_resource.c`. Its OTG register
+//! layout IS grounded: `dcn_3_5_0_offset.h` against
+//! `dcn_3_1_4_offset.h` (see `amdgpu_dcn_otg::layout_shift`).
 //!
 //! DCN 3.1.5 (Raphael) is "DCN31 proper": `dcn315_resource.c` builds hubp31,
 //! dpp3, mpc31, opp31 and hubbub31 exactly as `dcn314_resource.c` does, and
@@ -39,6 +46,11 @@ pub(crate) enum Profile {
     Dcn320,
     /// Navi33: DCN 3.2.1 (`dcn321_resource.c`).
     Dcn321,
+    /// Strix Point (`1002:150E`): DCN 3.5.0. Caps are borrowed from the
+    /// Dcn314/Dcn315/Dcn32 shape (4/5/5) pending `dcn35_resource.c`
+    /// verification (lane 6); the OTG layout shift is grounded in
+    /// `dcn_3_5_0_offset.h`.
+    Dcn35,
 }
 
 #[cfg(feature = "kernel-test")]
@@ -378,6 +390,59 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/dcn-profile", dcn32_resolves_with_four_pipes);
+
+    /// DCN 3.5.0 (Strix Point) resolves to its own profile with the
+    /// borrowed 4/5/5 caps (pending `dcn35_resource.c` verification,
+    /// lane 6), and the OTG constructor bounds all four pipes. DCN 3.5.1
+    /// stays unsupported: no shipping part carrying it is grounded.
+    fn dcn35_resolves_with_four_pipes() -> TestResult {
+        let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        gpu.chip.did = crate::amdgpu::STRIX_POINT;
+        let mut dcn = gpu.ip_blocks[0];
+        dcn.hw_id = ip::HW_ID_DCN;
+        dcn.instance = 0;
+        dcn.major = 3;
+        dcn.minor = 5;
+        dcn.revision = 0;
+        dcn.num_bases = 4;
+        dcn.base_addrs[..4].copy_from_slice(&[0, 0x1000, 0x4000, 0x9000]);
+        gpu.ip_blocks.push(dcn);
+        let Ok(profile) = Profile::resolve(&gpu) else {
+            return TestResult::Fail("DCN 3.5 did not resolve");
+        };
+        if profile != Profile::Dcn35
+            || profile.is_dcn32()
+            || profile.is_dcn314()
+            || (profile.pipes(), profile.streams(), profile.channels()) != (4, 5, 5)
+            || !profile.has_plane_power_gating()
+        {
+            return TestResult::Fail("DCN 3.5 resource caps are not the borrowed 4/5/5");
+        }
+        let cap = Cap::bootstrap();
+        // SAFETY: constructors only validate the inert maps, never access them.
+        unsafe {
+            if Otg::new(&gpu, cap, 3).is_err() || Otg::new(&gpu, cap, 4).is_ok() {
+                return TestResult::Fail("DCN 3.5 OTG capacity is not four pipes");
+            }
+        }
+        // (3, 5, 1) is no grounded shipping DCN: still unsupported.
+        let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        gpu.chip.did = crate::amdgpu::STRIX_POINT;
+        let mut dcn = gpu.ip_blocks[0];
+        dcn.hw_id = ip::HW_ID_DCN;
+        dcn.instance = 0;
+        dcn.major = 3;
+        dcn.minor = 5;
+        dcn.revision = 1;
+        dcn.num_bases = 4;
+        dcn.base_addrs[..4].copy_from_slice(&[0, 0x1000, 0x4000, 0x9000]);
+        gpu.ip_blocks.push(dcn);
+        if Profile::resolve(&gpu).is_ok() {
+            return TestResult::Fail("DCN 3.5.1 admitted without a resource table");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/dcn-profile", dcn35_resolves_with_four_pipes);
 }
 impl Profile {
     pub fn is_dcn30(self) -> bool {
@@ -399,6 +464,9 @@ impl Profile {
             // linux: n/a (literals in dcn32_resource.c / dcn321_resource.c:
             // res_cap_dcn32.num_ddc / res_cap_dcn321.num_ddc)
             Self::Dcn320 | Self::Dcn321 => 5,
+            // linux: n/a (borrowed Dcn314/Dcn315/Dcn32 shape pending
+            // dcn35_resource.c verification, lane 6)
+            Self::Dcn35 => 5,
         }
     }
     /// Whether this profile's timing generator, DCCG, stream encoder and
@@ -481,6 +549,14 @@ impl Profile {
             // either version, so both arms stay unguarded like Dcn314's.
             (3, 2, 0) => Ok(Self::Dcn320), // linux: n/a (DCN 3.2.0 path)
             (3, 2, 1) => Ok(Self::Dcn321), // linux: n/a (DCN 3.2.1 path)
+            // DCN 3.5.0 is Strix Point only among shipping parts
+            // (amdgpu_discovery.c's DCN 3.5.0 case); DCN 3.5.1 stays
+            // unsupported until a part carrying it is grounded.
+            (3, 5, 0)
+                if gpu.chip.vid == amdgpu::AMD_VENDOR && gpu.chip.did == amdgpu::STRIX_POINT =>
+            {
+                Ok(Self::Dcn35)
+            }
             _ => Err(Error::Unsupported),
         }
     }
@@ -503,6 +579,9 @@ impl Profile {
             // linux: n/a (literals in dcn32_resource.c / dcn321_resource.c:
             // res_cap_dcn32.num_timing_generator / res_cap_dcn321.num_timing_generator)
             Self::Dcn320 | Self::Dcn321 => 4,
+            // linux: n/a (borrowed Dcn314/Dcn315/Dcn32 shape pending
+            // dcn35_resource.c verification, lane 6)
+            Self::Dcn35 => 4,
         }
     }
     pub fn streams(self) -> u8 {
@@ -524,6 +603,9 @@ impl Profile {
             // linux: n/a (literals in dcn32_resource.c / dcn321_resource.c:
             // res_cap_dcn32.num_stream_encoder / res_cap_dcn321.num_stream_encoder)
             Self::Dcn320 | Self::Dcn321 => 5,
+            // linux: n/a (borrowed Dcn314/Dcn315/Dcn32 shape pending
+            // dcn35_resource.c verification, lane 6)
+            Self::Dcn35 => 5,
         }
     }
     pub fn bank(self, gpu: &amdgpu::AmdGpu, index: usize, last: u32) -> Result<u64, Error> {
@@ -537,6 +619,7 @@ impl Profile {
             Self::Dcn315 => &[(3, 1, 5)], // linux: n/a (DCE_HWIP IP_VERSION(3, 1, 5))
             Self::Dcn320 => &[(3, 2, 0)], // linux: n/a (DCN 3.2.0 path)
             Self::Dcn321 => &[(3, 2, 1)], // linux: n/a (DCN 3.2.1 path)
+            Self::Dcn35 => &[(3, 5, 0)],  // linux: n/a (DCN 3.5.0 path)
         };
         crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_DCN, versions, index, last)
             .map_err(|_| Error::Unsupported)

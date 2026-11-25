@@ -37,6 +37,8 @@ mod cipher_tests;
 mod dfs_tests;
 #[path = "dynamic_wmm_tests.rs"]
 mod dynamic_wmm_tests;
+#[path = "eht_tests.rs"]
+mod eht_tests;
 #[path = "frag_tests.rs"]
 mod frag_tests;
 #[path = "greenfield_tests.rs"]

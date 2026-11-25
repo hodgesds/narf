@@ -218,6 +218,7 @@ pub struct JoinPlan {
     ht20: Option<super::ht20::Profile>,
     vht: Option<super::vht::Profile>,
     he: Option<super::he::Profile>,
+    eht: Option<super::eht::Profile>,
     ap_phy: Option<narf_wireless::association::phy::ApElements>,
 }
 impl core::ops::Deref for JoinPlan {
@@ -336,8 +337,133 @@ impl JoinPlan {
             ht20: None,
             vht: None,
             he: None,
+            eht: None,
             ap_phy: None,
         })
+    }
+    /// Build one shared management plan on the heap. `#[inline(never)]`
+    /// is load-bearing: the inlined `prepare_with_options` body (and its
+    /// `Result<ManagementPlan>` temporary) would otherwise live on the
+    /// caller's frame — the frame-budget gate measures `prepare_native`.
+    #[inline(never)]
+    fn prepare_with_options_boxed(
+        bss: &ScanBss,
+        own: [u8; 6],
+        ssid: &[u8],
+        mode: SecurityMode,
+        local: Option<narf_wireless::association::phy::LocalPhy>,
+        options: narf_wireless::association::JoinOptions,
+    ) -> Result<alloc::boxed::Box<ManagementPlan>, super::firmware_transport::Error> {
+        use super::firmware_transport::Error as NativeError;
+        Ok(alloc::boxed::Box::new(
+            ManagementPlan::prepare_with_options(bss, own, ssid, mode, local, options)
+                .map_err(|_| NativeError::UnsupportedFirmware)?,
+        ))
+    }
+    /// The shared management plan for a 2.4/5 GHz join: 160 MHz candidate,
+    /// 80 MHz narrow fallback, then HT; HT-only and open plans when the AP
+    /// offers no VHT/HT. Kept out of [`JoinPlan::prepare_native`] behind
+    /// `#[inline(never)]` so the candidate/narrow plans and their
+    /// `Result<ManagementPlan>` temporaries do not live on its frame
+    /// (frame-budget gate: `prepare_native` is allowlisted at 9048 bytes).
+    /// The plan is returned boxed: the caller holds an 8-byte box and
+    /// moves the plan straight into the `JoinPlan`, with no intermediate
+    /// `ManagementPlan` slot on its own frame.
+    #[allow(clippy::too_many_arguments)]
+    // reason: direct extraction of `prepare_native`'s body; the args are its own inputs plus the two parsed-IE inputs.
+    #[inline(never)]
+    fn prepare_native_common(
+        bss: &ScanBss,
+        own: [u8; 6],
+        ssid: &[u8],
+        mode: SecurityMode,
+        info: super::firmware_transport::RadioInfo,
+        permission: TxPermission,
+        options: narf_wireless::association::JoinOptions,
+        wmm_present: bool,
+        ap: &narf_wireless::association::phy::ApElements,
+    ) -> Result<alloc::boxed::Box<ManagementPlan>, super::firmware_transport::Error> {
+        Ok(
+            if bss.channel > 14
+                && super::vht::qualified(info)
+                && wmm_present
+                && ap.vht_capability().is_some()
+            {
+                let candidate = Self::prepare_with_options_boxed(
+                    bss,
+                    own,
+                    ssid,
+                    mode,
+                    Some(super::eht::with_eht(
+                        super::he::with_he(super::vht::local(info)?, info, true, true)?,
+                        info,
+                        true,
+                        true,
+                    )?),
+                    options,
+                )?;
+                if candidate.offered_phy().is_some_and(|offer| {
+                    permission.vht_available()
+                        && offer
+                            .occupied_channels()
+                            .iter()
+                            .all(|ch| permission.channels().contains(ch))
+                }) {
+                    candidate
+                } else {
+                    let narrow = Self::prepare_with_options_boxed(
+                        bss,
+                        own,
+                        ssid,
+                        mode,
+                        Some(super::eht::with_eht(
+                            super::he::with_he(super::vht::local80(info)?, info, true, false)?,
+                            info,
+                            true,
+                            false,
+                        )?),
+                        options,
+                    )?;
+                    if narrow.offered_phy().is_some_and(|offer| {
+                        permission.vht_available()
+                            && offer
+                                .occupied_channels()
+                                .iter()
+                                .all(|ch| permission.channels().contains(ch))
+                    }) {
+                        narrow
+                    } else {
+                        Self::prepare_with_options_boxed(
+                            bss,
+                            own,
+                            ssid,
+                            mode,
+                            Some(super::vht::ht_fallback(
+                                info,
+                                permission.native_width() != 0,
+                            )?),
+                            options,
+                        )?
+                    }
+                }
+            } else if info.capabilities.phy.ht && wmm_present && ap.ht_capability().is_some() {
+                let local = super::vht::ht_fallback(info, permission.native_width() != 0)?;
+                // mt7921_init_he_caps also registers 2.4GHz HE on the HT companion.
+                let local = if bss.channel <= 14 {
+                    super::eht::with_eht(
+                        super::he::with_he(local, info, false, false)?,
+                        info,
+                        false,
+                        false,
+                    )?
+                } else {
+                    local
+                };
+                Self::prepare_with_options_boxed(bss, own, ssid, mode, Some(local), options)?
+            } else {
+                Self::prepare_with_options_boxed(bss, own, ssid, mode, None, options)?
+            },
+        )
     }
     /// `ciphers` is the supplicant's selection ([`supplicant_ciphers`]);
     /// `None` keeps CCMP-128 with BIP-CMAC-128.
@@ -366,87 +492,18 @@ impl JoinPlan {
             wmm::Parameters::parse(&bss.information_elements).map_err(|_| NativeError::Bounds)?;
         let ap = narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
             .map_err(|_| NativeError::Bounds)?;
-        let common = if bss.channel > 14
-            && super::vht::qualified(info)
-            && wmm.is_some()
-            && ap.vht_capability().is_some()
-        {
-            let candidate = ManagementPlan::prepare_with_options(
+        let mut plan = Self {
+            common: *Self::prepare_native_common(
                 bss,
                 own,
                 ssid,
                 mode,
-                Some(super::he::with_he(
-                    super::vht::local(info)?,
-                    info,
-                    true,
-                    true,
-                )?),
+                info,
+                permission,
                 options,
-            )
-            .map_err(|_| NativeError::UnsupportedFirmware)?;
-            if candidate.offered_phy().is_some_and(|offer| {
-                permission.vht_available()
-                    && offer
-                        .occupied_channels()
-                        .iter()
-                        .all(|ch| permission.channels().contains(ch))
-            }) {
-                candidate
-            } else {
-                let narrow = ManagementPlan::prepare_with_options(
-                    bss,
-                    own,
-                    ssid,
-                    mode,
-                    Some(super::he::with_he(
-                        super::vht::local80(info)?,
-                        info,
-                        true,
-                        false,
-                    )?),
-                    options,
-                )
-                .map_err(|_| NativeError::UnsupportedFirmware)?;
-                if narrow.offered_phy().is_some_and(|offer| {
-                    permission.vht_available()
-                        && offer
-                            .occupied_channels()
-                            .iter()
-                            .all(|ch| permission.channels().contains(ch))
-                }) {
-                    narrow
-                } else {
-                    ManagementPlan::prepare_with_options(
-                        bss,
-                        own,
-                        ssid,
-                        mode,
-                        Some(super::vht::ht_fallback(
-                            info,
-                            permission.native_width() != 0,
-                        )?),
-                        options,
-                    )
-                    .map_err(|_| NativeError::UnsupportedFirmware)?
-                }
-            }
-        } else if info.capabilities.phy.ht && wmm.is_some() && ap.ht_capability().is_some() {
-            let local = super::vht::ht_fallback(info, permission.native_width() != 0)?;
-            // mt7921_init_he_caps also registers 2.4GHz HE on the HT companion.
-            let local = if bss.channel <= 14 {
-                super::he::with_he(local, info, false, false)?
-            } else {
-                local
-            };
-            ManagementPlan::prepare_with_options(bss, own, ssid, mode, Some(local), options)
-                .map_err(|_| NativeError::UnsupportedFirmware)?
-        } else {
-            ManagementPlan::prepare_with_options(bss, own, ssid, mode, None, options)
-                .map_err(|_| NativeError::UnsupportedFirmware)?
-        };
-        let mut plan = Self {
-            common,
+                wmm.is_some(),
+                &ap,
+            )?,
             peer: bss.bssid,
             channel: bss.channel,
             security: mode,
@@ -455,6 +512,7 @@ impl JoinPlan {
             ht20: None,
             vht: None,
             he: None,
+            eht: None,
             ap_phy: None,
         };
         if permission.native_width() >= super::cmd::CH_BW_80
@@ -482,6 +540,10 @@ impl JoinPlan {
     /// profile and the grant's regulatory rule. The grant must be the one
     /// `TxPermission::from_ap` derived for this BSS: same primary, centre,
     /// width and power type as the plan (`six_ghz::plan` is deterministic).
+    /// `#[inline(never)]` keeps its inlined `prepare_6ghz` body and
+    /// `SixGhzLocal` temporaries off `prepare_native`'s frame (same
+    /// frame-budget gate as `prepare_native_common`).
+    #[inline(never)]
     fn prepare_native_6ghz(
         bss: &ScanBss,
         own: [u8; 6],
@@ -506,6 +568,16 @@ impl JoinPlan {
             grant.rule(),
         )
         .map_err(|_| NativeError::UnsupportedFirmware)?;
+        // EHT on top of HE when the firmware reports it. The grant
+        // (`six_ghz::local`) negotiates the same profile, so grant and
+        // join agree on the EHT width.
+        let local = if super::eht::qualified(info, true) {
+            local
+                .with_eht(super::eht::local_eht(info, true, true)?)
+                .map_err(|_| NativeError::UnsupportedFirmware)?
+        } else {
+            local
+        };
         let wmm =
             wmm::Parameters::parse(&bss.information_elements).map_err(|_| NativeError::Bounds)?;
         let common = ManagementPlan::prepare_6ghz(bss, own, ssid, security.mode(), &local, options)
@@ -527,6 +599,7 @@ impl JoinPlan {
             ht20: None,
             vht: None,
             he: None,
+            eht: None,
             ap_phy: None,
         })
     }
@@ -663,6 +736,17 @@ impl JoinPlan {
                     return Err(Error::Protocol);
                 }
             }
+            // EHT on top of the 6 GHz HE profile, when the plan negotiated it.
+            self.eht = match six.eht() {
+                Some(e) => match super::eht::Profile::from_eht(e, six.he()) {
+                    Ok(profile) => Some(profile),
+                    Err(_) => {
+                        self.cancel();
+                        return Err(Error::Protocol);
+                    }
+                },
+                None => None,
+            };
         } else if let Some(n) = self.common.negotiated_phy() {
             if n.vht().is_none() {
                 let width = match n.width() {
@@ -705,6 +789,18 @@ impl JoinPlan {
             } else {
                 None
             };
+            // EHT on top of HE, when the plan negotiated it.
+            self.eht = if n.eht().is_some() {
+                match super::eht::Profile::negotiated(n) {
+                    Ok(profile) => Some(profile),
+                    Err(_) => {
+                        self.cancel();
+                        return Err(Error::Protocol);
+                    }
+                }
+            } else {
+                None
+            };
             self.ap_phy = Some(narf_wireless::association::phy::ApElements::parse(
                 &bytes[30..],
             )?);
@@ -726,6 +822,7 @@ impl JoinPlan {
         self.ht20 = None;
         self.vht = None;
         self.he = None;
+        self.eht = None;
         self.ap_phy = None;
         self.wmm_association.clear();
         self.common.cancel();
@@ -738,6 +835,9 @@ impl JoinPlan {
     }
     pub(crate) fn he(&self) -> Option<super::he::Profile> {
         self.he
+    }
+    pub(crate) fn eht(&self) -> Option<super::eht::Profile> {
+        self.eht
     }
     pub(crate) fn ap_phy(&self) -> Option<narf_wireless::association::phy::ApElements> {
         self.ap_phy
@@ -873,6 +973,13 @@ impl JoinPlan {
                 out.extend_from_slice(&he.sta_v2());
                 out[2] += 2;
             }
+            // mt7925_mcu_sta_eht_tlv: STA_REC_EHT after HE/HE_V2, and
+            // PHY_TYPE_BIT_BE (get_phy_mode_v2) for an EHT peer.
+            if let Some(eht) = self.eht {
+                out[phy + 6] |= super::eht::PHY_TYPE_BIT_BE;
+                out.extend_from_slice(&eht.sta());
+                out[2] += 1;
+            }
         } else if let (Some(six), Some(he), true) = (six, self.he, associated) {
             // mt76_connac_mcu_sta_cmd for a 6 GHz HE peer: no HT/VHT
             // capability, so WTBL_HT/WTBL_VHT come from he_6ghz_capa
@@ -902,6 +1009,13 @@ impl JoinPlan {
             out.extend_from_slice(&he.sta_v2());
             out.extend_from_slice(&super::six_ghz::sta_he_6g(peer));
             out[2] += 4;
+            // mt7925_mcu_sta_eht_tlv: STA_REC_EHT after the 6 GHz HE
+            // records, and PHY_TYPE_BIT_BE for an EHT peer.
+            if let Some(eht) = self.eht {
+                out[phy + 6] |= super::eht::PHY_TYPE_BIT_BE;
+                out.extend_from_slice(&eht.sta());
+                out[2] += 1;
+            }
         }
         Ok(out)
     }
@@ -944,6 +1058,72 @@ impl JoinPlan {
         out[sec + 11] = len as u8;
         out[sec + 12..sec + 12 + len].copy_from_slice(key);
         Ok(out)
+    }
+
+    /// UNI station update for `link`'s peer (MT7925/CONNAC3):
+    /// `mt7925_mcu_sta_update` → `mt7925_mcu_sta_cmd`
+    /// (`MCU_UNI_CMD(STA_REC_UPDATE)`).
+    ///
+    /// Same guards as [`Self::peer_record_on`]: aid range, phase,
+    /// and the associated/aid agreement. The body is
+    /// `sta_req_hdr` + BASIC + `cap_tlvs` (empty until slice 7
+    /// wires the HT/VHT/HE/EHT capability TLVs) + STATE (+ MLD +
+    /// EHT MLD when `mld` is set and the state is not NONE), built
+    /// by `crate::mt7925::mcu::build_uni_sta_update_req`. The
+    /// caller sends one such message per active link, primary
+    /// first; the CONNAC2 WTBL nested TLVs of `peer_record_on`
+    /// have no UNI-station-update counterpart (WTBL programming on
+    /// 7925 is a separate WTBL-update path).
+    pub(crate) fn peer_record_uni_on(
+        &self,
+        link: Link,
+        aid: u16,
+        associated: bool,
+        mld: Option<crate::mt7925::mcu::MldLinks>,
+    ) -> Result<Vec<u8>, Error> {
+        if aid > 2007 || associated && aid == 0 {
+            return Err(Error::Protocol);
+        }
+        if self.phase() == Phase::Failed
+            || associated && self.phase() != (Phase::Associated { aid })
+        {
+            return Err(Error::Busy);
+        }
+        if !associated && aid != 0 {
+            return Err(Error::Protocol);
+        }
+        let params = crate::mt7925::mcu::UniStaParams {
+            bss_idx: link.bss(),
+            wcid_idx: u16::from(link.peer()),
+            omac_idx: link.omac(),
+            conn_type: crate::mt7925::mcu::CONN_TYPE_INFRA_STA,
+            conn_state: crate::mt7925::mcu::CONN_STATE_PORT_SECURE,
+            aid,
+            peer_addr: self.peer,
+            qos: associated && self.wmm.is_some(),
+            newly: !associated,
+            state: if associated {
+                crate::mt7925::mcu::STA_STATE_ASSOC
+            } else {
+                crate::mt7925::mcu::STA_STATE_NONE
+            },
+            cap_tlvs: &[],
+            mld,
+        };
+        Ok(crate::mt7925::mcu::build_uni_sta_update_req(&params))
+    }
+
+    /// UNI station remove for `link`'s peer (MT7925/CONNAC3):
+    /// `sta_req_hdr` + `STA_REC_REMOVE` + bare `STA_REC_MLD_OFF`
+    /// (`mt7925/mcu.c:2237-2244`). No phase guard: removal is valid
+    /// from any phase, including after a failed association.
+    pub(crate) fn sta_remove_uni_on(&self, link: Link) -> Vec<u8> {
+        let _ = self;
+        crate::mt7925::mcu::build_uni_sta_remove_req(
+            link.bss(),
+            u16::from(link.peer()),
+            link.omac(),
+        )
     }
 }
 /// The VIF's BMC WCID (19), used for received group keys. Linux uses the
@@ -1116,6 +1296,85 @@ pub(crate) fn bss_record_on(link: Link, bss: &ScanBss, connected: bool) -> Resul
         out[34] = super::six_ghz::PHY_MODE_AX_6G;
     }
     Ok(out)
+}
+
+/// UNI BSS info for `link`'s vif (MT7925/CONNAC3):
+/// `mt7925_mcu_add_bss_info` → `mt7925_mcu_add_bss_info_sta`
+/// (`MCU_UNI_CMD(BSS_INFO_UPDATE)`).
+///
+/// Same validation as [`bss_record_on`] (unicast BSSID, known band,
+/// non-zero beacon interval) and the same field derivations
+/// (PHY_MODE_A on 5/6 GHz, PHY_MODE_B | PHY_MODE_G on 2.4 GHz,
+/// non-HT basic PHY 8 vs 3, `phymode_ext = PHY_MODE_AX_6G` on
+/// 6 GHz). `sec`/`mld`/`he`/`rlm` are caller-supplied: the SEC
+/// cipher byte is the vif's `CONNAC3_CIPHER_*` value, the RLM
+/// channel comes from the negotiated operating width (slice 7 owns
+/// width negotiation), and MBSSID defaults to (0, 0) — `ScanBss`
+/// carries no MBSSID indicator/index. `slot_time` is the BSS slot
+/// time in µs (9 short / 20 long; upstream `phy->slottime`).
+/// `connected` maps to the builder's `enable` (RLM + MBSSID only
+/// when enabling).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bss_record_uni_on(
+    link: Link,
+    bss: &ScanBss,
+    connected: bool,
+    sec: crate::mt7925::mcu::UniBssSec,
+    mld: crate::mt7925::mcu::UniBssMld,
+    he: Option<crate::mt7925::mcu::UniBssHe>,
+    rlm: Option<crate::mt7925::mcu::UniBssRlm>,
+    slot_time: u16,
+) -> Result<Vec<u8>, Error> {
+    use crate::mt7925::mcu;
+    let six = is_six_ghz(bss);
+    if !unicast(bss.bssid)
+        || if six {
+            super::channel::rx_channel(super::channel::Band::Ghz6, bss.channel).is_none()
+        } else {
+            super::channel::band(bss.channel).is_none()
+        }
+        || bss.beacon_interval == 0
+    {
+        return Err(Error::InvalidBss);
+    }
+    let five = six || super::channel::band(bss.channel) == Some(super::channel::Band::Ghz5);
+    let params = mcu::UniBssParams {
+        bss_idx: link.bss(),
+        enable: connected,
+        conn_type: mcu::CONN_TYPE_INFRA_STA,
+        omac_idx: link.omac(),
+        hw_bss_idx: link.bss(),
+        band_idx: 0,
+        wmm_idx: link.wmm(),
+        bssid: bss.bssid,
+        bmc_tx_wlan_idx: u16::from(link.bmc()),
+        bcn_interval: bss.beacon_interval,
+        dtim_period: 0,
+        phymode: if five { 1 } else { 6 },
+        sta_idx: u16::from(link.bmc()),
+        nonht_basic_phy: if five { 8 } else { 3 },
+        phymode_ext: if six {
+            super::six_ghz::PHY_MODE_AX_6G
+        } else {
+            0
+        },
+        link_idx: link.bss(),
+        sec,
+        basic_rate: if five {
+            mcu::BSS_BASIC_RATE_5G
+        } else {
+            mcu::BSS_BASIC_RATE_2G
+        },
+        short_preamble: !five,
+        fixed_rate_idx: 0,
+        qos: true,
+        mld,
+        slot_time,
+        he,
+        rlm,
+        mbssid: connected.then_some((0, 0)),
+    };
+    Ok(mcu::build_uni_bss_info_sta_req(&params))
 }
 
 /// Linux mt76_connac_mcu_uni_add_bss appends UNI_BSS_INFO_QBSS to

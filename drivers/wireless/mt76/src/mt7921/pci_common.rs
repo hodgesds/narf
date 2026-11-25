@@ -44,7 +44,9 @@ pub enum ProbeError {
 }
 
 /// Validate all identity/power accesses, including the indirect selector.
-pub(super) fn validate_probe_window(len: u64) -> Result<(), ProbeError> {
+/// `did` is the PCI device id: the probe calls this before the chip-id
+/// gate computes the effective id.
+pub(super) fn validate_probe_window(did: u16, len: u64) -> Result<(), ProbeError> {
     for addr in [
         MT_PCIE_MAC_INT_ENABLE,
         MT_HW_CHIPID,
@@ -52,28 +54,29 @@ pub(super) fn validate_probe_window(len: u64) -> Result<(), ProbeError> {
         MT_HW_BOUND,
         MT_CONN_ON_LPCTL,
     ] {
-        super::registers::plan(addr, len).map_err(|_| ProbeError::UnsupportedRegisterWindow)?;
+        super::registers::plan(did, addr, len)
+            .map_err(|_| ProbeError::UnsupportedRegisterWindow)?;
     }
     Ok(())
 }
 
 /// # Safety
 /// Caller exclusively owns BAR0 and the L1 selector.
-pub(super) unsafe fn chip_id_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+pub(super) unsafe fn chip_id_read(did: u16, mmio: &MmioRegion) -> Result<u32, ProbeError> {
     // SAFETY: forwarded ownership; access validates the complete word.
-    unsafe { super::registers::read32(mmio, MT_HW_CHIPID) }.map_err(register_error)
+    unsafe { super::registers::read32(did, mmio, MT_HW_CHIPID) }.map_err(register_error)
 }
 /// # Safety
 /// Caller exclusively owns BAR0 and the L1 selector.
-pub(super) unsafe fn hw_rev_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+pub(super) unsafe fn hw_rev_read(did: u16, mmio: &MmioRegion) -> Result<u32, ProbeError> {
     // SAFETY: forwarded ownership; access validates the complete word.
-    unsafe { super::registers::read32(mmio, MT_HW_REV) }.map_err(register_error)
+    unsafe { super::registers::read32(did, mmio, MT_HW_REV) }.map_err(register_error)
 }
 /// # Safety
 /// Caller exclusively owns BAR0 and the L1 selector.
-pub(super) unsafe fn hw_bound_read(mmio: &MmioRegion) -> Result<u32, ProbeError> {
+pub(super) unsafe fn hw_bound_read(did: u16, mmio: &MmioRegion) -> Result<u32, ProbeError> {
     // SAFETY: forwarded ownership; access validates the complete word.
-    unsafe { super::registers::read32(mmio, MT_HW_BOUND) }.map_err(register_error)
+    unsafe { super::registers::read32(did, mmio, MT_HW_BOUND) }.map_err(register_error)
 }
 
 pub(super) fn register_error(error: super::registers::Error) -> ProbeError {
@@ -87,8 +90,16 @@ pub(super) fn register_error(error: super::registers::Error) -> ProbeError {
 /// Return the checked PCI register offset, or `u32::MAX` if unsupported.
 /// An indirect offset alone is not sufficient for I/O: use the checked
 /// register transaction, which programs and flushes the L1 selector first.
-pub fn l1_remap(abs: u32) -> u32 {
-    super::registers::plan(abs, 0x100000).map_or(u32::MAX, |plan| plan.offset)
+/// The mapped BAR length is per-chip: MT7925 silicon reports a 2 MiB
+/// BAR0 (a 14c3:0717 card reports `[size=2M]`), so the 7925 selector
+/// at 0x155024 fits; CONNAC2 keeps the 1 MiB probe BAR.
+pub fn l1_remap(did: u16, abs: u32) -> u32 {
+    let len = if super::regs::is_mt7925_did(did) {
+        0x200000
+    } else {
+        0x100000
+    };
+    super::registers::plan(did, abs, len).map_or(u32::MAX, |plan| plan.offset)
 }
 
 /// Human-readable name for a known device id. Used as the
@@ -102,6 +113,10 @@ pub const fn name_for(did: u16) -> &'static str {
         // bound-driver/log label aligned with the firmware and raw chip ID.
         MTK_DEV_MT7921_ALT => "mt7922-0616",
         MTK_DEV_MT7920 => "mt7921-7920",
+        MTK_DEV_MT7925 => "mt7921-7925",
+        // 0717 is a PCI alias for MT7925, not an MT7921 variant. Keep the
+        // bound-driver/log label aligned with the firmware and raw chip ID.
+        MTK_DEV_MT7925_ALT => "mt7925-0717",
         _ => "mt7921",
     }
 }
@@ -112,6 +127,7 @@ pub fn firmware_blobs_for(did: u16) -> (&'static str, &'static str) {
     match did {
         MTK_DEV_MT7922 | MTK_DEV_MT7921_ALT => (MT7922_ROM_PATCH, MT7922_FIRMWARE_WM),
         MTK_DEV_MT7920 => (MT7920_ROM_PATCH, MT7920_FIRMWARE_WM),
+        MTK_DEV_MT7925 | MTK_DEV_MT7925_ALT => (MT7925_ROM_PATCH, MT7925_FIRMWARE_WM),
         // MT7921 + MT7961 share the 7961 patch and RAM code.
         _ => (MT7961_ROM_PATCH, MT7961_FIRMWARE_WM),
     }

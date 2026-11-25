@@ -151,19 +151,52 @@ pub enum State {
 /// DCN30 has one register before `OTG_CLOCK_CONTROL` that DCN 3.1.4 dropped;
 /// DCN 3.1.5 has `OTG_CRC_CNTL2` lower down, at [`DCN315_INSERTED`]. Both
 /// move what follows by one dword.
-fn layout_shift(profile: Profile, reg: u64) -> u64 {
+///
+/// DCN 3.5 moves registers both ways against 3.1.4
+/// (`dcn_3_5_0_offset.h` vs `dcn_3_1_4_offset.h`), so the shift is
+/// signed and piecewise:
+///
+/// * `reg < 0x1b34`: identical (`H_TOTAL` through `V_TOTAL_CONTROL`).
+/// * `0x1b34..=0x1b43`: +2 — 3.5 inserts `V_COUNT_STOP_CONTROL` and
+///   `V_COUNT_STOP_CONTROL2` at 0x1b34/0x1b35 (`V_BLANK_START_END`
+///   0x1b36→0x1b38, `V_SYNC_A` 0x1b37→0x1b39, `OTG_CONTROL`
+///   0x1b41→0x1b43).
+/// * `0x1b44..=0x1b46`: +1 — 3.5 inserts `DLPC_CONTROL` at 0x1b44
+///   (`INTERLACE_CONTROL` 0x1b44→0x1b45) and drops `FLOW_CONTROL`.
+/// * `0x1b47..=0x1b4a`: identical (`PIXEL_DATA_READBACK`,
+///   `OTG_STATUS`, `STATUS_POSITION`).
+/// * `0x1b4b..=0x1b5c`: +1 — 3.5 inserts `LONG_VBLANK_STATUS` at
+///   0x1b4b (`NOM_VERT_POSITION` 0x1b4b→0x1b4c, `MASTER_EN`
+///   0x1b5c→0x1b5d).
+/// * `0x1b5d..=0x1b7a`: -3 — 3.5 starts the vertical-interrupt block
+///   at 0x1b5f instead of 0x1b62 and the CRC block at 0x1b65 instead
+///   of 0x1b68.
+/// * `0x1b7b..=0x1b88`: -1 — 3.5 inserts eight CRC readback registers
+///   at 0x1b78..=0x1b7f (`CLOCK_CONTROL` 0x1b85→0x1b84,
+///   `VSTARTUP_PARAM` 0x1b86→0x1b85, `VREADY_PARAM` 0x1b88→0x1b87).
+fn layout_shift(profile: Profile, reg: u64) -> i64 {
     match profile {
-        Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 => u64::from(reg >= OTG_CLOCK_CONTROL),
+        Profile::Navi22 | Profile::Dcn302 | Profile::Dcn303 => i64::from(reg >= OTG_CLOCK_CONTROL),
         // DCN 3.1.2 and 3.1.5 share the DCN31 timing generator
         // (`OPTC_COMMON_REG_LIST_DCN3_1`; `OPTC_COMMON_MASK_SH_LIST_DCN31X`
         // is exactly `OPTC_COMMON_MASK_SH_LIST_DCN3_1`).
-        Profile::Dcn312 | Profile::Dcn315 => u64::from(reg >= DCN315_INSERTED),
+        Profile::Dcn312 | Profile::Dcn315 => i64::from(reg >= DCN315_INSERTED),
         // DCN 3.2 agrees with 3.1.4 on every OTG register this module
         // touches (dcn_3_2_0_offset.h vs dcn_3_1_4_offset.h: H_TOTAL
         // 0x1b2a through VREADY 0x1b88 identical, no 3.1.5-style insert).
         // DCN 2.1 joins the zero arm: no inserted register is known in
         // its OTG block; revisit when the DCN 2.1 OTG block is ported.
         Profile::Dcn21 | Profile::Dcn314 | Profile::Dcn320 | Profile::Dcn321 => 0,
+        Profile::Dcn35 => match reg {
+            0..=0x1b33 => 0,
+            0x1b34..=0x1b43 => 2,
+            0x1b44..=0x1b46 => 1,
+            0x1b47..=0x1b4a => 0,
+            0x1b4b..=0x1b5c => 1,
+            0x1b5d..=0x1b7a => -3,
+            0x1b7b..=0x1b88 => -1,
+            _ => 0,
+        },
     }
 }
 
@@ -180,7 +213,7 @@ struct Engine<I: Io> {
 }
 impl<I: Io> Engine<I> {
     fn otg(&self, reg: u64) -> u64 {
-        reg + self.instance as u64 * OTG_STRIDE + layout_shift(self.profile, reg)
+        reg.wrapping_add_signed(layout_shift(self.profile, reg)) + self.instance as u64 * OTG_STRIDE
     }
     fn segment_shift(&self) -> u32 {
         if self.profile.is_dcn30() {
@@ -535,8 +568,7 @@ impl Otg {
         if instance >= profile.pipes() {
             return Err(Error::Invalid);
         }
-        let last = OTG_VREADY_PARAM
-            + layout_shift(profile, OTG_VREADY_PARAM)
+        let last = OTG_VREADY_PARAM.wrapping_add_signed(layout_shift(profile, OTG_VREADY_PARAM))
             + u64::from(profile.pipes() - 1) * OTG_STRIDE;
         let base = profile.bank(gpu, 2, last as u32)?; // linux-lit: 2=mmOTG0_OTG_H_TOTAL_BASE_IDX
                                                        // linux-ctx: reset

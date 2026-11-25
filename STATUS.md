@@ -928,8 +928,9 @@ station path itself over the KABI:
 - one `wlan%d` netdev and wiphy through the netif bridge and the `WIFI` v2
   family host.
 
-It claims the built-in table (`14c3:{7961,7922,0608,0616,7920}`,
-`0e8d:7922`); MT7925 is not matched. `narf-drivers-wireless/mt76-module-only`
+It claims the built-in table (`14c3:{7961,7922,0608,0616,7920,7925,0717}`,
+`0e8d:7922`); as built in, the chip-id gate still refuses MT7925 silicon.
+`narf-drivers-wireless/mt76-module-only`
 steps the built-in PCI claim aside. The shared `narf_pci_command` export lets
 the stop/reset sequences clear and re-read bus mastering, and
 `narf_wireless_regdomain` gives the module the kernel's installed regulatory

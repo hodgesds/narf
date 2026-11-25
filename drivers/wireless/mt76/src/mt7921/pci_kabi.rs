@@ -75,6 +75,8 @@ pub const MODULE_IDS: &[(u16, u16)] = &[
     (MTK_VENDOR, MTK_DEV_MT7921),
     (MTK_VENDOR, MTK_DEV_MT7921_ALT),
     (MTK_VENDOR, MTK_DEV_MT7920),
+    (MTK_VENDOR, MTK_DEV_MT7925),
+    (MTK_VENDOR, MTK_DEV_MT7925_ALT),
     (ITTIM_VENDOR, MTK_DEV_MT7922),
 ];
 
@@ -228,7 +230,7 @@ fn bring_up(dev: u64, id: PciId) -> Result<Controller, ProbeError> {
         return Err(ProbeError::Bar0MapFailed);
     }
     let mmio = MmioRegion::new(bar, len);
-    validate_probe_window(mmio.len)?;
+    validate_probe_window(id.device, mmio.len)?;
     // SAFETY: argument-only call on our probe token.
     if unsafe { ffi::narf_pci_enable(dev, PROBE_COMMAND) } != 0
         || command(dev, 0, 0)? & PARKED != PROBE_COMMAND
@@ -249,9 +251,9 @@ fn bring_up(dev: u64, id: PciId) -> Result<Controller, ProbeError> {
     // validates every word.
     let (chip_id, hw_rev, bound) = unsafe {
         (
-            chip_id_read(&mmio)?,
-            hw_rev_read(&mmio)?,
-            hw_bound_read(&mmio)?,
+            chip_id_read(id.device, &mmio)?,
+            hw_rev_read(id.device, &mmio)?,
+            hw_bound_read(id.device, &mmio)?,
         )
     };
     if [chip_id, hw_rev, bound].contains(&u32::MAX) {
@@ -276,7 +278,7 @@ fn bring_up(dev: u64, id: PciId) -> Result<Controller, ProbeError> {
     }
     // SAFETY: probe owns BAR0, bus mastering is verified off and no host DMA
     // allocation or transport exists.
-    match unsafe { mac::initialize_probe(&mmio) } {
+    match unsafe { mac::initialize_probe(&mmio, effective_did) } {
         Ok(()) => {}
         Err(mac::PowerError::Timeout) => return Err(ProbeError::DriverOwnTimeout),
         Err(mac::PowerError::DeviceGone) => return Err(ProbeError::DeviceGone),

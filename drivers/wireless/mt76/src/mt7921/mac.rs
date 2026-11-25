@@ -52,7 +52,12 @@ pub enum PowerError {
     ResetTimeout,
 }
 
-struct ProbePower<'a>(&'a MmioRegion);
+struct ProbePower<'a> {
+    mmio: &'a MmioRegion,
+    /// PCI id at probe time, effective id afterwards; selects the
+    /// CONNAC2/CONNAC3 fixed table in `registers::plan`.
+    did: u16,
+}
 impl super::mac_power::Io for ProbePower<'_> {
     fn stage(&mut self, stage: super::mac_power::Stage) {
         if crate::mt7921::debug::enabled() {
@@ -62,13 +67,20 @@ impl super::mac_power::Io for ProbePower<'_> {
             );
         }
     }
+    fn sw_rst_b(&self) -> u32 {
+        // Per-chip reset register: 0x18000140 on CONNAC2, 0x7c000140
+        // on MT7925 (upstream `mt7921/regs.h:72` vs `mt7925/regs.h:92`).
+        wfsys_sw_rst_b(self.did)
+    }
     fn read(&mut self, address: u32) -> Result<u32, PowerError> {
         // SAFETY: the enclosing probe owns the mapped BAR and L1 selector.
-        unsafe { registers::read32(self.0, address) }.map_err(|_| PowerError::InvalidWindow)
+        unsafe { registers::read32(self.did, self.mmio, address) }
+            .map_err(|_| PowerError::InvalidWindow)
     }
     fn write(&mut self, address: u32, value: u32) -> Result<(), PowerError> {
         // SAFETY: same current probe invocation and checked register window.
-        unsafe { registers::write32(self.0, address, value) }.map_err(|_| PowerError::InvalidWindow)
+        unsafe { registers::write32(self.did, self.mmio, address, value) }
+            .map_err(|_| PowerError::InvalidWindow)
     }
     fn delay(&mut self, ms: u64) {
         crate::platform::responsive_spin_until(|| false, Deadline::after_ms(ms));
@@ -108,13 +120,13 @@ impl super::mac_power::Io for ProbePower<'_> {
 /// # Safety
 /// The caller owns BAR0 and its selector under the current PCI invocation,
 /// has verified PCI bus mastering is disabled, and has no live DMA owner.
-pub(super) unsafe fn initialize_probe(mmio: &MmioRegion) -> Result<(), PowerError> {
-    let result = super::mac_power::initialize(&mut ProbePower(mmio));
+pub(super) unsafe fn initialize_probe(mmio: &MmioRegion, did: u16) -> Result<(), PowerError> {
+    let result = super::mac_power::initialize(&mut ProbePower { mmio, did });
     if let Err(error) = result {
         if !matches!(error, PowerError::DeviceGone | PowerError::InvalidWindow) {
             // SAFETY: the failed probe still holds the current PCI invocation;
             // mastering remains parked and the checked selector is exclusive.
-            let own = unsafe { registers::read32(mmio, MT_CONN_ON_LPCTL) };
+            let own = unsafe { registers::read32(did, mmio, MT_CONN_ON_LPCTL) };
             // Only the always-accessible HIF ownership register is safe here.
             // A timeout is not permission to access unowned WFSYS registers.
             let _ = writeln!(
@@ -132,16 +144,16 @@ pub(super) unsafe fn initialize_probe(mmio: &MmioRegion) -> Result<(), PowerErro
 ///
 /// # Safety
 /// `mmio` is the live BAR0 region; caller owns the device.
-pub unsafe fn take_driver_own(mmio: &MmioRegion) -> Result<(), PowerError> {
-    super::mac_power::take_driver(&mut ProbePower(mmio))
+pub unsafe fn take_driver_own(mmio: &MmioRegion, did: u16) -> Result<(), PowerError> {
+    super::mac_power::take_driver(&mut ProbePower { mmio, did })
 }
 
 /// Give HIF ownership to firmware through the checked CONN_HOST_CSR window.
 ///
 /// # Safety
 /// `mmio` is the live BAR0 region; caller owns the device and selector.
-pub unsafe fn give_firmware_own(mmio: &MmioRegion) -> Result<(), PowerError> {
-    super::mac_power::give_firmware(&mut ProbePower(mmio))
+pub unsafe fn give_firmware_own(mmio: &MmioRegion, did: u16) -> Result<(), PowerError> {
+    super::mac_power::give_firmware(&mut ProbePower { mmio, did })
 }
 
 /// Disable PCIe L0s entry while the driver owns the link. Mirrors
