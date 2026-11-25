@@ -621,8 +621,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let _ = self
             .dir_delete(parent_inode_no, &mut parent_inode, name)
             .await?;
-        self.truncate_inode(&mut target).await?;
+        // Unlinked before its blocks go, so the inode written with them
+        // gone is never a live directory with no blocks.
         target.links_count = 0;
+        self.truncate_inode(target_ino, &mut target).await?;
         self.write_inode(target_ino, &target).await?;
         self.note_dir_count_delta(target_ino, -1).await?;
         self.free_inode(target_ino).await?;
@@ -750,8 +752,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 // Released exactly as `dir_rmdir` does: the empty directory's
                 // blocks and inode are freed, and the parent loses the
                 // victim's ".." back-link.
-                self.truncate_inode(&mut victim_inode).await?;
                 victim_inode.links_count = 0;
+                self.truncate_inode(victim_ino, &mut victim_inode).await?;
                 victim_inode.touch_ctime(now);
                 self.write_inode(victim_ino, &victim_inode).await?;
                 self.note_dir_count_delta(victim_ino, -1).await?;

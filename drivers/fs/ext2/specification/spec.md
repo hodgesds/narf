@@ -221,6 +221,48 @@ A device without `BlockFeature::Discard` fails the ioctl with
   - Freeing anything in such a group is `Corrupted`.
 - **Group count** is `DIV_ROUND_UP(blocks_count - first_data_block,
   blocks_per_group)`, as `ext4_fill_super` computes it.
+- **Extent trees grow to any depth** (`volume/extent_write.rs`, Linux
+  `ext4_ext_insert_extent`), up to `EXT4_MAX_EXTENT_DEPTH` (5).
+  - A full leaf gets a sibling, indexed from the deepest index level with
+    room. Every full level between gets a new node holding the new child
+    and the entries right of the path (`ext4_ext_split`).
+  - When every level is full, the root's entries move to a new block and
+    the root indexes it, one level deeper (`ext4_ext_grow_indepth`).
+  - An index key equals its child's first key, corrected upward while the
+    child is its parent's first entry (`ext4_ext_correct_indexes`).
+- **Extent blocks are checked before a change** (`__ext4_ext_check`):
+  magic, depth, `eh_max` within what the node holds, `eh_entries` within
+  `eh_max`, no empty index, entries in order and inside the filesystem, the
+  first key equal to the parent's, and below the root the tail checksum.
+  - Structural damage is `Corrupted` (EFSCORRUPTED), a bad checksum
+    `BadChecksum` (EFSBADCRC); both are recorded with `fs_error`.
+  - The tail checksum covers the header and `eh_max` entry slots and sits
+    right after them (`EXT4_EXTENT_TAIL_OFFSET`), not at the block's end:
+    the two differ at 2 KiB blocks.
+  - LINUX-GAP: reads do not verify extent blocks. Linux verifies once per
+    buffer and caches the result; NARF has no per-buffer verified state, and
+    a CRC of every extent block on every mapping lookup is too costly.
+- **Extent inserts allocate first and commit once.** Every block the
+  change needs (the caller's data block, new tree nodes) is allocated
+  before anything is written. New nodes are written, then the one node that
+  makes them reachable (the commit: an index block, or the inode for a
+  root change), then the old nodes lose what moved, then keys above are
+  corrected.
+  - Before the commit, a failure frees every block it took, the data block
+    too, and leaves the inode as it was. After it, the error is recorded
+    and the inode, counting the new blocks, is still written.
+  - A crash between the commit and the trim leaves entries reachable from
+    two nodes, which e2fsck repairs; no entry is ever unreachable.
+- **Blocks are freed after nothing maps them** (`volume/free_list.rs`).
+  Truncate, punch and unlink, for extent trees and block maps alike, write
+  the trimmed nodes bottom-up, then the inode, and only then free. A crash
+  in between leaks blocks e2fsck reclaims; a block is never free while an
+  inode on disk still maps it, so it cannot end up shared by two files.
+  Frees are collected as runs and applied one bitmap and descriptor write
+  per group per run.
+- **A failed write still persists a changed block map.** When the first
+  page of a write fails after its block was allocated and mapped, the inode
+  is written anyway, so `i_blocks` counts the block.
 
 ## 5. Architecture notes
 

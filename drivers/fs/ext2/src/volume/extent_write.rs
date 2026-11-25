@@ -41,6 +41,8 @@ use narf_filesystem::FsError;
 
 use super::super::extent::{ExtentHeader, ExtentIndex, ExtentLeaf, EXT4_EXTENT_MAGIC};
 use super::super::inode::Inode;
+use super::free_list::FreeList;
+use super::sb_state::ErrorSite;
 use super::{metadata_csum, Ext2Volume};
 
 /// `EXT_INIT_MAX_LEN`.
@@ -49,9 +51,12 @@ const EXT_INIT_MAX_LEN: u16 = 32768;
 const EXT_UNWRITTEN_MAX_LEN: u16 = EXT_INIT_MAX_LEN - 1;
 /// Root node capacity inside `i_block` (60 bytes - 12-byte header).
 const ROOT_MAX: u16 = 4;
+/// `EXT4_MAX_EXTENT_DEPTH`.
+const MAX_DEPTH: u16 = 5;
 
+/// `EFSCORRUPTED`.
 fn corrupt() -> FsError {
-    FsError::Io(narf_block::BlockError::IOError)
+    FsError::Corrupted
 }
 
 pub(super) fn root_bytes(inode: &Inode) -> Vec<u8> {
@@ -133,6 +138,81 @@ fn decode_indexes(node: &[u8], hdr: &ExtentHeader) -> Result<Vec<ExtentIndex>, F
         .collect()
 }
 
+/// A node's `eh_max`: its capacity.
+fn node_max(node: &[u8]) -> u16 {
+    u16::from_le_bytes([node[4], node[5]])
+}
+
+/// A node's `eh_entries`.
+fn node_count(node: &[u8]) -> u16 {
+    u16::from_le_bytes([node[2], node[3]])
+}
+
+/// The key of a node's first entry (leaf or index: both start with it).
+fn first_key(node: &[u8]) -> u32 {
+    u32::from_le_bytes([node[12], node[13], node[14], node[15]])
+}
+
+/// A leaf node of `len` bytes holding `entries`, the rest zeroed (the tail
+/// checksum is written with the block).
+fn leaf_node(len: usize, max: u16, entries: &[ExtentLeaf]) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    write_header(&mut out, entries.len() as u16, max, 0);
+    for (i, e) in entries.iter().enumerate() {
+        encode_leaf(&mut out, 12 + i * 12, e);
+    }
+    out
+}
+
+/// An index node of `len` bytes at `depth` holding `entries`.
+fn index_node(len: usize, max: u16, depth: u16, entries: &[ExtentIndex]) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    write_header(&mut out, entries.len() as u16, max, depth);
+    for (i, idx) in entries.iter().enumerate() {
+        encode_index(&mut out, 12 + i * 12, idx);
+    }
+    out
+}
+
+/// `ext4_ext_correct_indexes`, in memory: from the node at `from` upward,
+/// each parent's key for the path's child becomes the child's first key,
+/// continuing while the child is its parent's first entry. Returns the
+/// highest level changed (`from` when none above it was).
+fn fix_keys(path: &mut [PathNode], from: usize) -> usize {
+    let mut top = from;
+    let mut k = from;
+    while k > 0 {
+        if node_count(&path[k].bytes) == 0 {
+            break;
+        }
+        let key = first_key(&path[k].bytes);
+        let slot = path[k].slot_in_parent;
+        let off = 12 + slot * 12;
+        let parent = &mut path[k - 1].bytes;
+        if parent[off..off + 4] == key.to_le_bytes() {
+            break;
+        }
+        parent[off..off + 4].copy_from_slice(&key.to_le_bytes());
+        top = k - 1;
+        if slot != 0 {
+            break;
+        }
+        k -= 1;
+    }
+    top
+}
+
+/// The errno an extent-tree failure is recorded with.
+fn fs_errno(error: &FsError) -> i64 {
+    use narf_lib::errno::{EBADMSG, EIO, ENOSPC, EUCLEAN};
+    match error {
+        FsError::Corrupted => EUCLEAN,
+        FsError::BadChecksum => EBADMSG,
+        FsError::NoSpace => ENOSPC,
+        _ => EIO,
+    }
+}
+
 /// One node on the root-to-leaf path: `block == 0` is the in-inode root.
 struct PathNode {
     block: u64,
@@ -176,195 +256,423 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.write_block(block, &zeros).await
     }
 
+    /// `__ext4_ext_check` for one node: magic, the expected depth, an
+    /// `eh_max` the node can hold, `eh_entries` within it, no empty index,
+    /// entries in order and inside the filesystem, a first key equal to the
+    /// parent's index key, and below the root the tail checksum. Structural
+    /// damage is EFSCORRUPTED (`Corrupted`), a bad checksum EFSBADCRC
+    /// (`BadChecksum`).
+    fn check_extent_node(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+        bytes: &[u8],
+        depth: u16,
+        parent_key: Option<u32>,
+    ) -> Result<ExtentHeader, FsError> {
+        let is_root = parent_key.is_none();
+        let hdr = ExtentHeader::parse(bytes).ok_or(FsError::Corrupted)?;
+        let cap = if is_root {
+            ROOT_MAX
+        } else {
+            self.extent_block_max()
+        };
+        if hdr.depth != depth
+            || depth > MAX_DEPTH
+            || hdr.max == 0
+            || hdr.max > cap
+            || hdr.entries > hdr.max
+            || (hdr.entries == 0 && depth > 0)
+        {
+            return Err(FsError::Corrupted);
+        }
+        let first_data = u64::from(self.superblock.first_data_block);
+        let total = self.superblock.total_blocks();
+        let inside = |start: u64, len: u64| {
+            start >= first_data && start.checked_add(len).is_some_and(|end| end <= total)
+        };
+        let mut next = 0u64;
+        let first = if hdr.is_leaf() {
+            let leaves = decode_leaves(bytes, &hdr)?;
+            for e in &leaves {
+                let (start, len) = (u64::from(e.logical), u64::from(e.len));
+                if len == 0 || start + len > 1 << 32 || start < next || !inside(e.physical, len) {
+                    return Err(FsError::Corrupted);
+                }
+                next = start + len;
+            }
+            leaves.first().map(|e| e.logical)
+        } else {
+            let indexes = decode_indexes(bytes, &hdr)?;
+            for idx in &indexes {
+                if u64::from(idx.logical) < next || !inside(idx.leaf, 1) {
+                    return Err(FsError::Corrupted);
+                }
+                next = u64::from(idx.logical) + 1;
+            }
+            indexes.first().map(|idx| idx.logical)
+        };
+        if let (Some(key), Some(first)) = (parent_key, first) {
+            if key != first {
+                return Err(FsError::Corrupted);
+            }
+        }
+        if !is_root
+            && !metadata_csum::verify_extent_block_checksum(
+                &self.superblock,
+                inode_no,
+                inode.generation,
+                bytes,
+            )
+        {
+            return Err(FsError::BadChecksum);
+        }
+        Ok(hdr)
+    }
+
     /// Descend from the root to the leaf that covers (or would hold)
-    /// `logical`.
-    async fn extent_path(&self, inode: &Inode, logical: u32) -> Result<Vec<PathNode>, FsError> {
+    /// `logical` (`ext4_find_extent`), checking every node on the way. A
+    /// write never starts from a node that fails the check; the failure is
+    /// recorded with `fs_error`, as `ext4_error_inode_err` records it.
+    async fn extent_path(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+        logical: u32,
+    ) -> Result<Vec<PathNode>, FsError> {
+        let walked = self.extent_path_checked(inode_no, inode, logical).await;
+        if let Err((error, block)) = &walked {
+            if matches!(error, FsError::Corrupted | FsError::BadChecksum) {
+                self.fs_error(ErrorSite {
+                    func: "ext4_find_extent",
+                    ino: inode_no,
+                    block: *block,
+                    errno: fs_errno(error),
+                })
+                .await;
+            }
+        }
+        walked.map_err(|(error, _)| error)
+    }
+
+    async fn extent_path_checked(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+        logical: u32,
+    ) -> Result<Vec<PathNode>, (FsError, u64)> {
+        let root = root_bytes(inode);
+        let depth = ExtentHeader::parse(&root)
+            .ok_or((FsError::Corrupted, 0))?
+            .depth;
+        let hdr = self
+            .check_extent_node(inode_no, inode, &root, depth, None)
+            .map_err(|e| (e, 0))?;
         let mut path = vec![PathNode {
             block: 0,
-            bytes: root_bytes(inode),
+            bytes: root,
             slot_in_parent: 0,
         }];
-        for _ in 0..8 {
-            let node = &path.last().ok_or_else(corrupt)?.bytes;
-            let hdr = ExtentHeader::parse(node).ok_or_else(corrupt)?;
-            if hdr.is_leaf() {
-                return Ok(path);
-            }
-            let indexes = decode_indexes(node, &hdr)?;
-            if indexes.is_empty() {
-                return Err(corrupt());
-            }
+        let mut hdr = hdr;
+        for child_depth in (0..depth).rev() {
+            let node = &path.last().expect("root").bytes;
+            let indexes = decode_indexes(node, &hdr).map_err(|e| (e, 0))?;
             // `ext4_ext_binsearch_idx`: the last index whose key <= logical,
             // or the first one when logical precedes them all.
             let slot = indexes
                 .iter()
                 .rposition(|idx| idx.logical <= logical)
                 .unwrap_or(0);
+            let idx = indexes[slot];
             let mut child = vec![0u8; self.block_size()];
-            self.read_block(indexes[slot].leaf, &mut child).await?;
+            self.read_block(idx.leaf, &mut child)
+                .await
+                .map_err(|e| (e, idx.leaf))?;
+            hdr = self
+                .check_extent_node(inode_no, inode, &child, child_depth, Some(idx.logical))
+                .map_err(|e| (e, idx.leaf))?;
             path.push(PathNode {
-                block: indexes[slot].leaf,
+                block: idx.leaf,
                 bytes: child,
                 slot_in_parent: slot,
             });
         }
-        Err(corrupt())
+        Ok(path)
     }
 
-    /// Store `entries` into the path's leaf, growing or splitting the tree
-    /// when they no longer fit. `inode.block` / `inode.blocks` are updated
-    /// in place; the caller writes the inode.
+    /// Free blocks nothing on disk refers to yet (the rollback before a
+    /// commit write). A failure leaves the block allocated: a leak e2fsck
+    /// reclaims, never a double use.
+    async fn discard_blocks(&self, blocks: &[u64]) {
+        for &block in blocks {
+            let _ = self.free_block(block).await;
+        }
+    }
+
+    /// After the commit write: an error is recorded (`ext4_std_error`), and
+    /// the inode, which already counts the new blocks, is still written.
+    async fn extent_committed(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+        block: u64,
+        result: Result<(), FsError>,
+    ) -> Result<(), FsError> {
+        if let Err(error) = &result {
+            self.fs_error(ErrorSite {
+                func: "ext4_ext_insert_extent",
+                ino: inode_no,
+                block,
+                errno: fs_errno(error),
+            })
+            .await;
+            let _ = self.write_inode(inode_no, inode).await;
+        }
+        result
+    }
+
+    /// Write one path node: a block with its tail checksum, or the root
+    /// into the in-memory inode.
+    async fn write_path_node(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        node: &mut PathNode,
+    ) -> Result<(), FsError> {
+        if node.block == 0 {
+            store_root(inode, &node.bytes);
+            Ok(())
+        } else {
+            self.write_extent_node(inode_no, inode, node.block, &mut node.bytes)
+                .await
+        }
+    }
+
+    /// Store `entries` into the path's leaf (`ext4_ext_insert_extent`),
+    /// growing the tree when they no longer fit: a sibling leaf indexed from
+    /// the deepest index level with room, with new index nodes for every
+    /// full level below it (`ext4_ext_split`), or, when every level is full,
+    /// one more level under the root first (`ext4_ext_grow_indepth`). Any
+    /// depth up to `EXT4_MAX_EXTENT_DEPTH`.
+    ///
+    /// `fresh` is a data block the caller allocated for this change; it is
+    /// counted in `i_blocks` only once the change lands, and freed with the
+    /// tree blocks when it does not.
+    ///
+    /// Without a journal the writes keep one order. Every block is
+    /// allocated first. The new nodes are written, then the one node that
+    /// makes them reachable (the commit), then the old nodes lose what
+    /// moved, then index keys above are corrected. Before the commit a
+    /// failure frees what was allocated and leaves `inode` as it was. After
+    /// it, a crash leaves entries reachable twice, which e2fsck repairs, and
+    /// an error is recorded with `fs_error`. A root change below the commit
+    /// is written with the inode before the old nodes shrink. The caller
+    /// writes the inode afterwards as before.
     async fn store_leaf(
         &self,
         inode_no: u32,
         inode: &mut Inode,
         mut path: Vec<PathNode>,
         entries: Vec<ExtentLeaf>,
+        fresh: Option<u64>,
     ) -> Result<(), FsError> {
         let spb = (self.block_size() / 512) as u32;
+        let fresh_count = u32::from(fresh.is_some());
+        let fresh_blocks: Vec<u64> = fresh.into_iter().collect();
+        let mut saved = *inode;
         let leaf_i = path.len() - 1;
-        let is_root = leaf_i == 0;
-        let max = if is_root {
-            ROOT_MAX
-        } else {
-            self.extent_block_max()
-        };
-        if entries.len() <= max as usize {
-            let node = &mut path[leaf_i];
-            write_header(&mut node.bytes, entries.len() as u16, max, 0);
-            for (i, e) in entries.iter().enumerate() {
-                encode_leaf(&mut node.bytes, 12 + i * 12, e);
+        let leaf_max = node_max(&path[leaf_i].bytes);
+
+        if entries.len() <= usize::from(leaf_max) {
+            let len = path[leaf_i].bytes.len();
+            path[leaf_i].bytes = leaf_node(len, leaf_max, &entries);
+            inode.blocks = inode.blocks.saturating_add(fresh_count * spb);
+            if leaf_i == 0 {
+                store_root(inode, &path[0].bytes);
+                return Ok(());
             }
-            if is_root {
-                store_root(inode, &node.bytes);
+            let top = fix_keys(&mut path, leaf_i);
+            let leaf_block = path[leaf_i].block;
+            // The leaf write is the commit; the keys above follow it.
+            let result = async {
+                for k in (top..=leaf_i).rev() {
+                    self.write_path_node(inode_no, inode, &mut path[k]).await?;
+                }
+                Ok::<(), FsError>(())
+            }
+            .await;
+            return self
+                .extent_committed(inode_no, inode, leaf_block, result)
+                .await;
+        }
+
+        // The deepest index level with a free slot (`EXT_HAS_FREE_INDEX`).
+        let mut at = (0..leaf_i)
+            .rev()
+            .find(|&k| node_count(&path[k].bytes) < node_max(&path[k].bytes));
+        if at.is_none() {
+            if leaf_i >= usize::from(MAX_DEPTH) {
+                self.discard_blocks(&fresh_blocks).await;
+                return Err(FsError::NoSpace);
+            }
+            let bs = self.block_size();
+            let root_hdr = ExtentHeader::parse(&path[0].bytes).ok_or(FsError::Corrupted)?;
+            // `ext4_ext_grow_indepth`: prepend the new node to the old first
+            // child, or place it by the data.
+            let goal = if leaf_i == 0 {
+                entries.first().map_or(0, |e| e.physical)
             } else {
-                let block = node.block;
-                let mut bytes = core::mem::take(&mut node.bytes);
-                self.write_extent_node(inode_no, inode, block, &mut bytes)
-                    .await?;
-                // `ext4_ext_correct_indexes`: the parent's key follows this
-                // leaf's first extent.
-                if let Some(first) = entries.first() {
-                    let slot = path[leaf_i].slot_in_parent;
-                    self.set_index_key(inode_no, inode, &mut path[leaf_i - 1], slot, first.logical)
-                        .await?;
+                path[1].block.saturating_sub(1)
+            };
+            let grown = match self.alloc_block_near(goal).await {
+                Ok(block) => block,
+                Err(error) => {
+                    self.discard_blocks(&fresh_blocks).await;
+                    return Err(error);
+                }
+            };
+            let mut node = if leaf_i == 0 {
+                // A full in-inode leaf: everything, the new entries too,
+                // fits in one block leaf.
+                leaf_node(bs, self.extent_block_max(), &entries)
+            } else {
+                let indexes = decode_indexes(&path[0].bytes, &root_hdr)?;
+                index_node(bs, self.extent_block_max(), root_hdr.depth, &indexes)
+            };
+            if let Err(error) = self
+                .write_extent_node(inode_no, inode, grown, &mut node)
+                .await
+            {
+                self.discard_blocks(&[grown]).await;
+                self.discard_blocks(&fresh_blocks).await;
+                return Err(error);
+            }
+            let key = if leaf_i == 0 {
+                entries.first().map_or(0, |e| e.logical)
+            } else {
+                first_key(&path[0].bytes)
+            };
+            let root = index_node(
+                60,
+                ROOT_MAX,
+                root_hdr.depth + 1,
+                &[ExtentIndex {
+                    logical: key,
+                    leaf: grown,
+                }],
+            );
+            store_root(inode, &root);
+            inode.blocks = inode.blocks.saturating_add(spb);
+            if leaf_i == 0 {
+                // The caller's inode write commits.
+                inode.blocks = inode.blocks.saturating_add(fresh_count * spb);
+                return Ok(());
+            }
+            // A deeper copy of the same tree: commit it on its own.
+            if let Err(error) = self.write_inode(inode_no, inode).await {
+                self.discard_blocks(&fresh_blocks).await;
+                return self
+                    .extent_committed(inode_no, inode, grown, Err(error))
+                    .await;
+            }
+            saved = *inode;
+            path[0].bytes = root;
+            path.insert(
+                1,
+                PathNode {
+                    block: grown,
+                    bytes: node,
+                    slot_in_parent: 0,
+                },
+            );
+            at = Some(1);
+        }
+        let at = at.expect("an index level with room");
+        let leaf_i = path.len() - 1;
+        let bs = self.block_size();
+        let block_max = self.extent_block_max();
+
+        // `ext4_ext_split`: the entries past the leaf's capacity move to a
+        // new leaf; every full index level between it and `at` gets a new
+        // node holding the new child and the entries right of the path.
+        let (keep, moved) = entries.split_at(usize::from(leaf_max));
+        let border = moved[0].logical;
+        let mut blocks = Vec::with_capacity(leaf_i - at);
+        for _ in at..leaf_i {
+            match self.alloc_block_near(moved[0].physical).await {
+                Ok(block) => blocks.push(block),
+                Err(error) => {
+                    self.discard_blocks(&blocks).await;
+                    self.discard_blocks(&fresh_blocks).await;
+                    *inode = saved;
+                    return Err(error);
                 }
             }
-            return Ok(());
         }
-        if is_root {
-            // `ext4_ext_grow_indepth`: move the root's extents into a new
-            // leaf block; the root becomes a one-entry index at depth 1.
-            let goal = entries.first().map_or(0, |e| e.physical);
-            let child = self.alloc_block_near(goal).await?;
-            let mut bytes = vec![0u8; self.block_size()];
-            let child_max = self.extent_block_max();
-            write_header(&mut bytes, entries.len() as u16, child_max, 0);
-            for (i, e) in entries.iter().enumerate() {
-                encode_leaf(&mut bytes, 12 + i * 12, e);
-            }
-            self.write_extent_node(inode_no, inode, child, &mut bytes)
-                .await?;
-            inode.blocks = inode.blocks.saturating_add(spb);
-            let mut root = path.remove(0).bytes;
-            let key = entries.first().map_or(0, |e| e.logical);
-            write_header(&mut root, 1, ROOT_MAX, 1);
-            encode_index(
-                &mut root,
-                12,
-                &ExtentIndex {
-                    logical: key,
+        let mut new_nodes = Vec::with_capacity(blocks.len());
+        new_nodes.push((blocks[0], leaf_node(bs, block_max, moved)));
+        let mut child = blocks[0];
+        for k in (at + 1..leaf_i).rev() {
+            let hdr = ExtentHeader::parse(&path[k].bytes).ok_or(FsError::Corrupted)?;
+            let indexes = decode_indexes(&path[k].bytes, &hdr)?;
+            let slot = path[k + 1].slot_in_parent;
+            let mut right = vec![ExtentIndex {
+                logical: border,
+                leaf: child,
+            }];
+            right.extend_from_slice(&indexes[slot + 1..]);
+            let block = blocks[leaf_i - k];
+            new_nodes.push((block, index_node(bs, block_max, hdr.depth, &right)));
+            let len = path[k].bytes.len();
+            path[k].bytes = index_node(len, hdr.max, hdr.depth, &indexes[..=slot]);
+            child = block;
+        }
+        let len = path[leaf_i].bytes.len();
+        path[leaf_i].bytes = leaf_node(len, leaf_max, keep);
+        {
+            let hdr = ExtentHeader::parse(&path[at].bytes).ok_or(FsError::Corrupted)?;
+            let mut indexes = decode_indexes(&path[at].bytes, &hdr)?;
+            let slot = path[at + 1].slot_in_parent;
+            indexes.insert(
+                slot + 1,
+                ExtentIndex {
+                    logical: border,
                     leaf: child,
                 },
             );
-            store_root(inode, &root);
-            return Ok(());
+            let len = path[at].bytes.len();
+            path[at].bytes = index_node(len, hdr.max, hdr.depth, &indexes);
         }
-        // `ext4_ext_split` at the leaf: the entries past `max` move to a new
-        // sibling leaf, indexed from the parent right after this one.
-        let parent_i = leaf_i - 1;
-        let parent_hdr = ExtentHeader::parse(&path[parent_i].bytes).ok_or_else(corrupt)?;
-        let mut indexes = decode_indexes(&path[parent_i].bytes, &parent_hdr)?;
-        if indexes.len() >= parent_hdr.max as usize {
-            return Err(FsError::NoSpace);
-        }
-        let (keep, moved) = entries.split_at(max as usize);
-        let goal = moved[0].physical;
-        let sibling = self.alloc_block_near(goal).await?;
-        let child_max = self.extent_block_max();
-        let mut sib = vec![0u8; self.block_size()];
-        write_header(&mut sib, moved.len() as u16, child_max, 0);
-        for (i, e) in moved.iter().enumerate() {
-            encode_leaf(&mut sib, 12 + i * 12, e);
-        }
-        self.write_extent_node(inode_no, inode, sibling, &mut sib)
-            .await?;
-        inode.blocks = inode.blocks.saturating_add(spb);
-        {
-            let node = &mut path[leaf_i];
-            write_header(&mut node.bytes, keep.len() as u16, max, 0);
-            for (i, e) in keep.iter().enumerate() {
-                encode_leaf(&mut node.bytes, 12 + i * 12, e);
-            }
-            let block = node.block;
-            let mut bytes = core::mem::take(&mut node.bytes);
-            self.write_extent_node(inode_no, inode, block, &mut bytes)
-                .await?;
-        }
-        let slot = path[leaf_i].slot_in_parent;
-        indexes[slot].logical = keep[0].logical;
-        indexes.insert(
-            slot + 1,
-            ExtentIndex {
-                logical: moved[0].logical,
-                leaf: sibling,
-            },
-        );
-        let parent = &mut path[parent_i];
-        write_header(
-            &mut parent.bytes,
-            indexes.len() as u16,
-            parent_hdr.max,
-            parent_hdr.depth,
-        );
-        for (i, idx) in indexes.iter().enumerate() {
-            encode_index(&mut parent.bytes, 12 + i * 12, idx);
-        }
-        if parent_i == 0 {
-            store_root(inode, &parent.bytes);
-        } else {
-            let block = parent.block;
-            let mut bytes = core::mem::take(&mut parent.bytes);
-            self.write_extent_node(inode_no, inode, block, &mut bytes)
-                .await?;
-        }
-        Ok(())
-    }
+        let top = fix_keys(&mut path, leaf_i);
 
-    async fn set_index_key(
-        &self,
-        inode_no: u32,
-        inode: &mut Inode,
-        parent: &mut PathNode,
-        slot: usize,
-        key: u32,
-    ) -> Result<(), FsError> {
-        let off = 12 + slot * 12;
-        if parent.bytes.len() < off + 4 {
-            return Err(corrupt());
+        for (block, node) in new_nodes.iter_mut() {
+            if let Err(error) = self.write_extent_node(inode_no, inode, *block, node).await {
+                self.discard_blocks(&blocks).await;
+                self.discard_blocks(&fresh_blocks).await;
+                *inode = saved;
+                return Err(error);
+            }
         }
-        if parent.bytes[off..off + 4] == key.to_le_bytes() {
-            return Ok(());
+        inode.blocks = inode
+            .blocks
+            .saturating_add((blocks.len() as u32 + fresh_count) * spb);
+        let commit_block = path[at].block;
+        let result = async {
+            self.write_path_node(inode_no, inode, &mut path[at]).await?;
+            if at == 0 {
+                self.write_inode(inode_no, inode).await?;
+            }
+            for node in &mut path[at + 1..=leaf_i] {
+                self.write_path_node(inode_no, inode, node).await?;
+            }
+            for k in (top..at).rev() {
+                self.write_path_node(inode_no, inode, &mut path[k]).await?;
+            }
+            Ok::<(), FsError>(())
         }
-        parent.bytes[off..off + 4].copy_from_slice(&key.to_le_bytes());
-        if parent.block == 0 {
-            store_root(inode, &parent.bytes);
-            Ok(())
-        } else {
-            let mut bytes = parent.bytes.clone();
-            self.write_extent_node(inode_no, inode, parent.block, &mut bytes)
-                .await
-        }
+        .await;
+        self.extent_committed(inode_no, inode, commit_block, result)
+            .await
     }
 
     /// `ext4_ext_map_blocks(..., EXT4_GET_BLOCKS_CREATE)` for one block:
@@ -378,7 +686,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     ) -> Result<u64, FsError> {
         let logical = u32::try_from(logical)
             .map_err(|_| FsError::Io(narf_block::BlockError::InvalidRange))?;
-        let path = self.extent_path(inode, logical).await?;
+        let path = self.extent_path(inode_no, inode, logical).await?;
         let leaf = &path.last().ok_or_else(corrupt)?.bytes;
         let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
         let mut entries = decode_leaves(leaf, &hdr)?;
@@ -418,7 +726,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // Its old contents are "unwritten": what a partial write does
             // not cover must read back as zeros.
             self.zero_block(phys).await?;
-            self.store_leaf(inode_no, inode, path, entries).await?;
+            self.store_leaf(inode_no, inode, path, entries, None)
+                .await?;
             return Ok(phys);
         }
         let prev = entries.iter().rposition(|e| e.logical < logical);
@@ -426,10 +735,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             entries[p].physical + (logical - entries[p].logical) as u64
         });
         let block = self.alloc_block_near(goal).await?;
-        self.zero_block(block).await?;
-        inode.blocks = inode
-            .blocks
-            .saturating_add((self.block_size() / 512) as u32);
+        if let Err(error) = self.zero_block(block).await {
+            self.discard_blocks(&[block]).await;
+            return Err(error);
+        }
         let merges = prev.is_some_and(|p| {
             let e = &entries[p];
             !e.is_uninitialized
@@ -452,7 +761,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 );
             }
         }
-        self.store_leaf(inode_no, inode, path, entries).await?;
+        self.store_leaf(inode_no, inode, path, entries, Some(block))
+            .await?;
         Ok(block)
     }
 
@@ -487,7 +797,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     ) -> Result<bool, FsError> {
         let logical = u32::try_from(logical)
             .map_err(|_| FsError::Io(narf_block::BlockError::InvalidRange))?;
-        let path = self.extent_path(inode, logical).await?;
+        let path = self.extent_path(inode_no, inode, logical).await?;
         let leaf = &path.last().ok_or_else(corrupt)?.bytes;
         let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
         let mut entries = decode_leaves(leaf, &hdr)?;
@@ -499,9 +809,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             entries[p].physical + (logical - entries[p].logical) as u64
         });
         let block = self.alloc_block_near(goal).await?;
-        inode.blocks = inode
-            .blocks
-            .saturating_add((self.block_size() / 512) as u32);
         let merges = prev.is_some_and(|p| {
             let e = &entries[p];
             e.is_uninitialized
@@ -524,7 +831,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 );
             }
         }
-        self.store_leaf(inode_no, inode, path, entries).await?;
+        self.store_leaf(inode_no, inode, path, entries, Some(block))
+            .await?;
         Ok(true)
     }
 
@@ -546,7 +854,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         while logical < end {
             let l32 = u32::try_from(logical)
                 .map_err(|_| FsError::Io(narf_block::BlockError::InvalidRange))?;
-            let path = self.extent_path(inode, l32).await?;
+            let path = self.extent_path(inode_no, inode, l32).await?;
             let leaf = &path.last().ok_or_else(corrupt)?.bytes;
             let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
             let mut entries = decode_leaves(leaf, &hdr)?;
@@ -627,7 +935,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 repl.push(mid);
             }
             entries.splice(start..=stop, repl);
-            self.store_leaf(inode_no, inode, path, entries).await?;
+            self.store_leaf(inode_no, inode, path, entries, None)
+                .await?;
             logical = mid_hi;
         }
         Ok(())
@@ -646,7 +955,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if at == 0 {
             return Ok(());
         }
-        let path = self.extent_path(inode, at).await?;
+        let path = self.extent_path(inode_no, inode, at).await?;
         let leaf = &path.last().ok_or_else(corrupt)?.bytes;
         let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
         let mut entries = decode_leaves(leaf, &hdr)?;
@@ -665,7 +974,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 physical: e.physical + u64::from(head),
             },
         );
-        self.store_leaf(inode_no, inode, path, entries).await
+        self.store_leaf(inode_no, inode, path, entries, None).await
     }
 
     /// `ext4_ext_shift_extents`: move every extent starting at logical
@@ -744,8 +1053,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// `ext4_ext_remove_space(inode, 0, EXT_MAX_BLOCKS - 1)`: free every
     /// extent and every tree block, leave an empty depth-0 root. Returns the
     /// number of 512-byte sectors released.
-    pub(super) async fn extent_free_all(&self, inode: &mut Inode) -> Result<u32, FsError> {
-        let freed = self.extent_free_subtree(0, root_bytes(inode)).await?;
+    pub(super) async fn extent_free_all(
+        &self,
+        inode: &mut Inode,
+        deferred: &mut FreeList,
+    ) -> Result<u32, FsError> {
+        let freed = self
+            .extent_free_subtree(0, root_bytes(inode), deferred)
+            .await?;
         let mut root = root_bytes(inode);
         root.iter_mut().for_each(|b| *b = 0);
         write_header(&mut root, 0, ROOT_MAX, 0);
@@ -768,6 +1083,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode: &mut Inode,
         first: u32,
         end: u64,
+        deferred: &mut FreeList,
     ) -> Result<u32, FsError> {
         if end <= u64::from(first) {
             return Ok(0);
@@ -776,11 +1092,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // that is the only case that ADDS an entry, and `store_leaf` grows
         // the tree for it. Everything after only removes or shortens.
         let mut freed = self
-            .extent_split_around(inode_no, inode, first, end)
+            .extent_split_around(inode_no, inode, first, end, deferred)
             .await?;
         let mut root = root_bytes(inode);
         let (entries, sub, _) = self
-            .extent_trim_node(inode_no, *inode, &mut root, first, end, 0)
+            .extent_trim_node(inode_no, *inode, &mut root, (first, end), 0, deferred)
             .await?;
         freed = freed.saturating_add(sub);
         if entries == 0 {
@@ -800,6 +1116,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode: &mut Inode,
         first: u32,
         end: u64,
+        deferred: &mut FreeList,
     ) -> Result<u32, FsError> {
         let Ok(end32) = u32::try_from(end) else {
             return Ok(0); // nothing maps past the 32-bit logical space
@@ -807,7 +1124,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if first == 0 {
             return Ok(0);
         }
-        let path = self.extent_path(inode, first).await?;
+        let path = self.extent_path(inode_no, inode, first).await?;
         let leaf = &path.last().ok_or_else(corrupt)?.bytes;
         let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
         let mut entries = decode_leaves(leaf, &hdr)?;
@@ -821,11 +1138,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let spb = (self.block_size() / 512) as u32;
         let head = (first - e.logical) as u16;
         let skip = (end32 - e.logical) as u16;
-        let mut freed = 0u32;
-        for b in u64::from(head)..u64::from(skip) {
-            self.free_block(e.physical + b).await?;
-            freed = freed.saturating_add(spb);
-        }
         let tail = ExtentLeaf {
             logical: end32,
             len: e.len - skip,
@@ -834,8 +1146,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         };
         entries[i].len = head;
         entries.insert(i + 1, tail);
-        self.store_leaf(inode_no, inode, path, entries).await?;
-        Ok(freed)
+        self.store_leaf(inode_no, inode, path, entries, None)
+            .await?;
+        // The blocks between are free once no extent maps them.
+        deferred.push_run(e.physical + u64::from(head), u64::from(skip - head));
+        Ok(u32::from(skip - head).saturating_mul(spb))
     }
 
     /// Trim one node (`node`, already read) of the logical blocks in
@@ -849,9 +1164,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode_no: u32,
         inode: Inode,
         node: &'a mut [u8],
-        first: u32,
-        end: u64,
+        (first, end): (u32, u64),
         level: usize,
+        deferred: &'a mut FreeList,
     ) -> super::TreeFuture<'a, (usize, u32, Option<u32>)> {
         alloc::boxed::Box::pin(async move {
             // The tree's depth is bounded by `eh_depth` (at most 5); refuse a
@@ -875,10 +1190,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     // Blocks [lo, hi) of this extent (relative) go.
                     let lo = first64.saturating_sub(start);
                     let hi = (end.min(stop)) - start;
-                    for b in lo..hi {
-                        self.free_block(e.physical + b).await?;
-                        freed = freed.saturating_add(spb);
-                    }
+                    deferred.push_run(e.physical + lo, hi - lo);
+                    freed = freed.saturating_add(((hi - lo) as u32).saturating_mul(spb));
                     if lo > 0 {
                         // Keeps its head (the split case was handled first,
                         // so nothing of it survives past `end`).
@@ -917,15 +1230,25 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 self.read_block(idx.leaf, &mut child).await?;
                 if lo >= first64 && hi <= end {
                     // The whole subtree lies inside the range.
-                    freed = freed.saturating_add(self.extent_free_subtree(idx.leaf, child).await?);
+                    freed = freed.saturating_add(
+                        self.extent_free_subtree(idx.leaf, child, &mut *deferred)
+                            .await?,
+                    );
                     continue;
                 }
                 let (left, sub, head) = self
-                    .extent_trim_node(inode_no, inode, &mut child, first, end, level + 1)
+                    .extent_trim_node(
+                        inode_no,
+                        inode,
+                        &mut child,
+                        (first, end),
+                        level + 1,
+                        &mut *deferred,
+                    )
                     .await?;
                 freed = freed.saturating_add(sub);
                 if left == 0 {
-                    self.free_block(idx.leaf).await?;
+                    deferred.push(idx.leaf);
                     freed = freed.saturating_add(spb);
                 } else {
                     self.write_extent_node(inode_no, &inode, idx.leaf, &mut child)
@@ -949,7 +1272,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Free the subtree rooted at `block` (`0` = the in-inode root, which is
     /// not itself freed), every extent's blocks and every tree block in it.
     /// Returns the number of 512-byte sectors released.
-    async fn extent_free_subtree(&self, block: u64, node: Vec<u8>) -> Result<u32, FsError> {
+    async fn extent_free_subtree(
+        &self,
+        block: u64,
+        node: Vec<u8>,
+        deferred: &mut FreeList,
+    ) -> Result<u32, FsError> {
         let spb = (self.block_size() / 512) as u32;
         let mut freed = 0u32;
         // Depth-first over (block, bytes) nodes.
@@ -960,10 +1288,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let hdr = ExtentHeader::parse(&node).ok_or_else(corrupt)?;
             if hdr.is_leaf() {
                 for e in decode_leaves(&node, &hdr)? {
-                    for b in 0..e.len as u64 {
-                        self.free_block(e.physical + b).await?;
-                        freed = freed.saturating_add(spb);
-                    }
+                    deferred.push_run(e.physical, u64::from(e.len));
+                    freed = freed.saturating_add(u32::from(e.len).saturating_mul(spb));
                 }
             } else {
                 for idx in decode_indexes(&node, &hdr)? {
@@ -973,7 +1299,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 }
             }
             if block != 0 {
-                self.free_block(block).await?;
+                deferred.push(block);
                 freed = freed.saturating_add(spb);
             }
         }

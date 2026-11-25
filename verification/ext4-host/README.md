@@ -36,6 +36,11 @@ Scenarios:
 - `gate`: root-rw must refuse, with EROFS and without changing a byte, an
   unclean filesystem (`ssv state 0`), one with recorded errors
   (`ssv state 3`), and one with an orphan list (`ssv last_orphan 12`).
+- `extents`: a sparse file written one block in two, in shuffled order, so
+  inserts split leaves and index nodes mid-tree and ahead of a subtree's
+  first key. 30000 extents reach depth 3 at 1 KiB blocks and depth 2 at
+  2 KiB, where the extent tail checksum sits 8 bytes before the block's
+  end. `debugfs ex` must report the depth.
 - `uninit`: a 4 GiB image whose small tree leaves most groups lazily
   initialized (`BLOCK_UNINIT`, `INODE_UNINIT`), then 1.5 GiB of data and
   9000 files: allocation must move into those groups (dumpe2fs counts fewer

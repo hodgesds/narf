@@ -784,11 +784,17 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
+            let before = inode;
             let result = self.write_file(&mut inode, offset, buf).await;
+            // A first page that failed after its block was allocated and
+            // mapped still changed the block map (and maybe a leaf on disk):
+            // the inode must count it, or e2fsck finds a block nothing owns
+            // or an `i_blocks` that is short.
+            let remapped = inode.blocks != before.blocks || inode.block != before.block;
             let persisted = match &result {
                 // Nothing reached the file: leave the inode as it was.
-                Err(_) => Ok(()),
-                Ok(_) => self.volume.write_inode(inode_no, &inode).await,
+                Err(_) if !remapped => Ok(()),
+                _ => self.volume.write_inode(inode_no, &inode).await,
             };
             if persisted.is_err() || result.is_err() {
                 // The cached inode ran ahead of the disk while the write was
@@ -1057,7 +1063,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
                 }
             }
             if len == 0 {
-                if let Err(error) = self.volume.truncate_inode(&mut inode).await {
+                if let Err(error) = self.volume.truncate_inode(inode_no, &mut inode).await {
                     self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
                     return Err(error);
                 }

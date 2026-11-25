@@ -31,7 +31,8 @@ USAGE: narf-ext4-host [OPTIONS]
   --seed N          first workload seed (default 1)
   --seeds N         seeds per scenario (default 2)
   --ops N           operations per run (default 1500)
-  --scenario LIST   comma-separated subset of: baseline,lifecycle,gate,uninit
+  --scenario LIST   comma-separated subset of: baseline,lifecycle,gate,uninit,
+                    extents
                     (default all)
   --workdir DIR     scratch directory (default target/ext4-host)
   --keep            keep the images of passing runs
@@ -338,16 +339,92 @@ fn uninit(o: &Opts, seed: u64) -> Result<String, String> {
     ))
 }
 
+/// Extent trees past one index level: a sparse file written one block in
+/// two, in shuffled order, so inserts land mid-leaf and ahead of a
+/// subtree's first key, splitting leaves and index nodes and growing the
+/// tree. At 1 KiB (4 entries in the root, 84 in a block) 30000 extents need
+/// depth 3; at 2 KiB the tail checksum sits before the block's end
+/// (`EXT4_EXTENT_TAIL_OFFSET` = 2040). Judged by e2fsck's extent checks and
+/// a byte compare.
+fn extents(o: &Opts, seed: u64) -> Result<String, String> {
+    let mut report = Vec::new();
+    for (block_size, want_depth) in [(1024u32, 3u32), (2048, 2)] {
+        let name = format!("extents-{seed}-{block_size}");
+        let spec = fixture::Spec {
+            block_size,
+            size_mib: 256,
+            lib_files: 20,
+            packages: 5,
+            ..fixture::Spec::root()
+        };
+        let fx = fixture::build(&o.workdir, &name, &spec, seed);
+        let mut model = Model::load_host(&fx.tree);
+        let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+        let fs = narf::mount(dev)?;
+        let root = fs.root();
+        let bs = u64::from(block_size);
+        let n = 30_000u64;
+        let mut rng = rng::Rng::new(seed);
+        let mut order: Vec<u64> = (0..n).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.below(i + 1));
+        }
+        let mut data = vec![0u8; ((2 * n - 1) * bs) as usize];
+        for &i in &order {
+            let off = (2 * i * bs) as usize;
+            for (k, b) in data[off..off + bs as usize].iter_mut().enumerate() {
+                *b = (i as usize * 7 + k) as u8 | 1;
+            }
+        }
+        host::block_on(async {
+            let work = narf::dir_at(&root, "/work").await?;
+            let f = work.create("sparse").await?;
+            for &i in &order {
+                let off = 2 * i * bs;
+                let mut rest = &data[off as usize..(off + bs) as usize];
+                let mut at = off;
+                while !rest.is_empty() {
+                    let k = f.write(at, rest).await?;
+                    at += k as u64;
+                    rest = &rest[k..];
+                }
+            }
+            root.syncfs().await
+        })
+        .map_err(|e| format!("{block_size}-byte blocks: sparse writes: {e:?}"))?;
+        model
+            .nodes
+            .insert("/work/sparse".into(), model::Node::File(data));
+        drop(root);
+        drop(fs);
+        narf_block::registry::__reset_for_test();
+        let depth = check::extent_depth(&fx.image, "/work/sparse");
+        if depth.is_none_or(|d| d < want_depth) {
+            return Err(format!(
+                "{block_size}-byte blocks: the tree should reach depth {want_depth}, has {depth:?}"
+            ));
+        }
+        verdict(&fx.image, &model, &o.workdir.join(format!("{name}/rdump")))
+            .map_err(|e| format!("{block_size}-byte blocks: {e}"))?;
+        if !o.keep {
+            let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+        }
+        report.push(format!("{block_size}: depth {}", depth.unwrap_or(0)));
+    }
+    Ok(report.join(", "))
+}
+
 fn main() {
     let o = parse_args();
     host::init();
     std::fs::create_dir_all(&o.workdir).unwrap();
     type Scenario = fn(&Opts, u64) -> Result<String, String>;
-    let all: [(&str, Scenario); 4] = [
+    let all: [(&str, Scenario); 5] = [
         ("baseline", baseline),
         ("lifecycle", lifecycle),
         ("gate", gate),
         ("uninit", uninit),
+        ("extents", extents),
     ];
     let mut failed = 0;
     for (name, run) in all {

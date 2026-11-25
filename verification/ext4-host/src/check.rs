@@ -68,3 +68,19 @@ pub fn uninit_groups(image: &Path) -> (usize, usize) {
     }
     (block, inode)
 }
+
+/// `debugfs ex <file>`: the depth of the file's extent tree (the `b` of the
+/// first row's `a/ b` level column).
+pub fn extent_depth(image: &Path, file: &str) -> Option<u32> {
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("ex {file}"))
+        .arg(image)
+        .output()
+        .expect("run debugfs");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().find_map(|l| {
+        let (_, depth) = l.trim().split_once('/')?;
+        depth.split_whitespace().next()?.parse().ok()
+    })
+}

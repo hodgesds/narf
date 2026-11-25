@@ -17,10 +17,11 @@ use super::group_desc::GroupDesc;
 use super::inode::Inode;
 use super::metadata_csum::{
     bitmap_checksum, crc32c, directory_block_checksum, extent_block_checksum, group_desc_checksum,
-    htree_block_checksum, inode_checksum, seed, verify_group_desc_checksum,
-    verify_htree_block_checksum, verify_inode_checksum, verify_superblock, write_bitmap_checksum,
-    write_directory_block_checksum, write_extent_block_checksum, write_group_desc_checksum,
-    write_htree_block_checksum, write_inode_checksum, write_superblock_checksum,
+    htree_block_checksum, inode_checksum, seed, verify_extent_block_checksum,
+    verify_group_desc_checksum, verify_htree_block_checksum, verify_inode_checksum,
+    verify_superblock, write_bitmap_checksum, write_directory_block_checksum,
+    write_extent_block_checksum, write_group_desc_checksum, write_htree_block_checksum,
+    write_inode_checksum, write_superblock_checksum,
 };
 use super::superblock::Superblock;
 
@@ -227,15 +228,40 @@ fn smoke_ext4_csum_seed_metadata_writers_cover_checksum_fields() -> TestResult {
         return TestResult::Fail("HTREE checksum accepted a changed index entry");
     }
 
-    let mut extent = vec![0xa5; 4096];
-    let extent_before = match extent_block_checksum(&sb, 42, 0x0102_0304, &extent) {
-        Some(v) => v,
-        None => return TestResult::Fail("extent checksum unavailable"),
-    };
-    if write_extent_block_checksum(&sb, 42, 0x0102_0304, &mut extent).is_none()
-        || extent_block_checksum(&sb, 42, 0x0102_0304, &extent) != Some(extent_before)
-    {
-        return TestResult::Fail("extent checksum was not stable");
+    // `EXT4_EXTENT_TAIL_OFFSET` follows `eh_max`: the block's last four
+    // bytes at 4 KiB (340 entries), but 2040 of 2048 (169 entries).
+    for (bs, max, tail) in [
+        (4096usize, 340u16, 4092usize),
+        (2048, 169, 2040),
+        (1024, 84, 1020),
+    ] {
+        let mut extent = vec![0xa5; bs];
+        extent[0..2].copy_from_slice(&0xf30au16.to_le_bytes());
+        extent[2..4].copy_from_slice(&3u16.to_le_bytes());
+        extent[4..6].copy_from_slice(&max.to_le_bytes());
+        extent[6..8].fill(0);
+        let extent_before = match extent_block_checksum(&sb, 42, 0x0102_0304, &extent) {
+            Some(v) => v,
+            None => return TestResult::Fail("extent checksum unavailable"),
+        };
+        let mut want = crc32c(seed(&sb), &42u32.to_le_bytes());
+        want = crc32c(want, &0x0102_0304u32.to_le_bytes());
+        want = crc32c(want, &extent[..tail]);
+        if extent_before != want {
+            return TestResult::Fail("extent checksum does not cover exactly the eh_max slots");
+        }
+        let after_tail = extent[tail + 4..].to_vec();
+        if write_extent_block_checksum(&sb, 42, 0x0102_0304, &mut extent).is_none()
+            || extent[tail..tail + 4] != want.to_le_bytes()
+            || extent[tail + 4..] != after_tail[..]
+            || !verify_extent_block_checksum(&sb, 42, 0x0102_0304, &extent)
+        {
+            return TestResult::Fail("extent checksum not stored at EXT4_EXTENT_TAIL_OFFSET");
+        }
+        extent[12] ^= 1;
+        if verify_extent_block_checksum(&sb, 42, 0x0102_0304, &extent) {
+            return TestResult::Fail("extent checksum accepted a changed entry");
+        }
     }
     let mut superblock = sb_bytes;
     if write_superblock_checksum(&sb, &mut superblock).is_none()
@@ -8130,4 +8156,152 @@ fn smoke_ext4_uninit_group_layout_follows_linux() -> TestResult {
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext4_uninit_group_layout_follows_linux
+);
+
+/// `i_block` of the extent fixture's `data` (inode 12, 128-byte inodes).
+const DATA_IBLOCK: usize = 5 * 1024 + 11 * 128 + 40;
+
+/// `__ext4_ext_check` before an extent change: a leaf whose tail checksum
+/// fails refuses the write with EFSBADCRC (`BadChecksum`); one whose first
+/// extent does not start at its index key refuses with EFSCORRUPTED
+/// (`Corrupted`). Either way nothing is allocated and the error is recorded
+/// in the superblock (`ERROR_FS`, `s_error_count`).
+fn smoke_ext4_extent_write_checks_the_tree_first() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    for csum in [true, false] {
+        let mut image = clean_ext4_extent_image(b"x");
+        if csum && sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+            return TestResult::Fail("could not sign the metadata_csum fixture");
+        }
+        let device = RamBlockDevice::from_image(512, image);
+        let (volume, file) = match mount_ext4_data(device.clone()) {
+            Ok(v) => v,
+            Err(e) => return TestResult::Fail(e),
+        };
+        for block in [2u64, 4, 6, 8] {
+            if !matches!(poll_once(file.write(block * 1024, b"e")), Some(Ok(1))) {
+                return TestResult::Fail("writing extents into holes failed");
+            }
+        }
+        drop(file);
+        drop(volume);
+        let mut img = device.snapshot();
+        if u16::from_le_bytes([img[DATA_IBLOCK + 6], img[DATA_IBLOCK + 7]]) != 1 {
+            return TestResult::Fail("five extents should have grown the tree to depth 1");
+        }
+        let leaf_no = u32::from_le_bytes([
+            img[DATA_IBLOCK + 16],
+            img[DATA_IBLOCK + 17],
+            img[DATA_IBLOCK + 18],
+            img[DATA_IBLOCK + 19],
+        ]);
+        let leaf = leaf_no as usize * 1024;
+        let want = if csum {
+            // An unused entry slot: inside what the tail checksum covers.
+            img[leaf + 12 + 12 * 40] ^= 1;
+            FsError::BadChecksum
+        } else {
+            // The first extent no longer starts at its index key, 0.
+            put_u32(&mut img, leaf + 12, 1);
+            FsError::Corrupted
+        };
+        let used = count_used_blocks(&img);
+        let device = RamBlockDevice::from_image(512, img);
+        let (volume, file) = match mount_ext4_data(device.clone()) {
+            Ok(v) => v,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let got = poll_once(file.write(10 * 1024, b"z"));
+        drop(file);
+        drop(volume);
+        if got != Some(Err(want)) {
+            return TestResult::Fail(if csum {
+                "a write into a leaf with a bad tail checksum must be EBADMSG"
+            } else {
+                "a write into a leaf whose first key is not its index's must be EUCLEAN"
+            });
+        }
+        let after = device.snapshot();
+        if count_used_blocks(&after) != used {
+            return TestResult::Fail("a refused extent change allocated a block");
+        }
+        let error_count = u32::from_le_bytes([
+            after[1024 + 0x194],
+            after[1024 + 0x195],
+            after[1024 + 0x196],
+            after[1024 + 0x197],
+        ]);
+        if sb_on(&device).state & super::superblock::EXT2_ERROR_FS == 0 || error_count == 0 {
+            return TestResult::Fail("a damaged extent tree was not recorded in the superblock");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_write_checks_the_tree_first
+);
+
+/// An extent insert whose tree cannot grow (ENOSPC for the new leaf block
+/// after the data block was taken) frees the data block and leaves the
+/// inode as it was: the bitmap and the descriptor's count match the state
+/// before the write, `i_blocks` is unchanged, the file reads as before.
+fn smoke_ext4_extent_grow_enospc_frees_the_data_block() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    let mut image = clean_ext4_extent_image(b"x");
+    // Four free blocks (60..=63): three take the root to its four extents,
+    // the fourth is the data block of the write that cannot grow the tree.
+    for bit in 11..59usize {
+        image[3 * 1024 + bit / 8] |= 1 << (bit % 8);
+    }
+    set_free_counts(&mut image, 64, 32);
+    let device = RamBlockDevice::from_image(512, image);
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    for block in [2u64, 4, 6] {
+        if !matches!(poll_once(file.write(block * 1024, b"e")), Some(Ok(1))) {
+            return TestResult::Fail("writing extents into holes failed");
+        }
+    }
+    let before = device.snapshot();
+    let blocks_before = file.stat().blocks;
+    if poll_once(file.write(8 * 1024, b"f")) != Some(Err(FsError::NoSpace)) {
+        return TestResult::Fail("an extent insert that cannot grow the tree must be ENOSPC");
+    }
+    drop(file);
+    drop(volume);
+    let after = device.snapshot();
+    if count_used_blocks(&after) != count_used_blocks(&before) {
+        return TestResult::Fail("the data block of the refused insert leaked");
+    }
+    if after[2048 + 12..2048 + 14] != before[2048 + 12..2048 + 14] {
+        return TestResult::Fail("the descriptor's free count drifted from the bitmap");
+    }
+    if after[DATA_IBLOCK..DATA_IBLOCK + 60] != before[DATA_IBLOCK..DATA_IBLOCK + 60] {
+        return TestResult::Fail("the refused insert changed the extent root");
+    }
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if file.stat().blocks != blocks_before {
+        return TestResult::Fail("i_blocks counts the refused insert's block");
+    }
+    let mut got = vec![0u8; 9 * 1024];
+    let n = match poll_once(file.read(0, &mut got)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("reading the file back failed"),
+    };
+    if n != 6 * 1024 + 1 || got[0] != b'x' || got[2048] != b'e' || got[6 * 1024] != b'e' {
+        return TestResult::Fail("the file changed after a refused insert");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_grow_enospc_frees_the_data_block
 );

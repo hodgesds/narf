@@ -39,6 +39,7 @@ use super::superblock::{ExtFlavour, Superblock};
 
 mod extent_write;
 mod file_data;
+mod free_list;
 pub mod sb_state;
 pub(crate) mod uninit;
 pub(crate) mod xattr;
@@ -1457,7 +1458,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if inode.links_count != 0 {
             return Ok(());
         }
-        self.truncate_inode(&mut inode).await?;
+        self.truncate_inode(inode_no, &mut inode).await?;
         self.write_inode(inode_no, &inode).await?;
         self.free_inode(inode_no).await
     }
@@ -1489,7 +1490,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             return Ok(());
         }
-        self.truncate_inode(inode).await?;
+        self.truncate_inode(inode_no, inode).await?;
         self.write_inode(inode_no, inode).await?;
         self.free_inode(inode_no).await
     }
@@ -2293,10 +2294,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok((new as u64, true))
     }
 
-    /// Free every block an inode owns (direct, indirect, double-indirect, and
-    /// triple-indirect), zeroing the inode's `block[]` field. Caller persists
-    /// the inode.
-    pub async fn truncate_inode(&self, inode: &mut Inode) -> Result<(), FsError> {
+    /// Free every block an inode's map owns (an extent tree, or direct and
+    /// indirect blocks) and leave an empty map, `i_size` 0. The inode is
+    /// written with the empty map before any block is freed
+    /// ([`free_list`]); the caller writes it again with its other changes.
+    pub async fn truncate_inode(&self, inode_no: u32, inode: &mut Inode) -> Result<(), FsError> {
         // A fast symlink's `i_block` is the link text, not block pointers:
         // walking it frees whatever blocks the text bytes happen to name
         // (or fails with EIO when they are out of range, which made
@@ -2305,90 +2307,19 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if inode.is_fast_symlink(self.block_size() as u32) {
             return Ok(());
         }
-        if self.superblock.uses_extents() && inode.uses_extents() {
-            // `ext4_ext_remove_space` over the whole file; this answered
-            // `Unsupported` (-EINVAL), so O_TRUNC and unlink failed for every
-            // extent-mapped file.
-            let freed = self.extent_free_all(inode).await?;
-            inode.size = 0;
-            inode.blocks = inode.blocks.saturating_sub(freed);
-            return Ok(());
-        }
-        let bs = self.block_size();
-        let p = self.pointers_per_block() as u64;
-        for i in 0..super::inode::N_DIRECT {
-            let b = inode.block[i];
-            if b != 0 {
-                self.free_block(b as u64).await?;
-                inode.block[i] = 0;
-            }
-        }
-        // Single-indirect.
-        let single = inode.block[super::inode::SINGLE_IND_IDX];
-        if single != 0 {
-            self.free_indirect_one(single as u64, p, bs).await?;
-            self.free_block(single as u64).await?;
-            inode.block[super::inode::SINGLE_IND_IDX] = 0;
-        }
-        // Double-indirect.
-        let dbl = inode.block[super::inode::DOUBLE_IND_IDX];
-        if dbl != 0 {
-            let mut mid_buf = vec![0u8; bs];
-            self.read_block(dbl as u64, &mut mid_buf).await?;
-            for i in 0..p {
-                let off = (i as usize) * 4;
-                let mid = u32::from_le_bytes([
-                    mid_buf[off],
-                    mid_buf[off + 1],
-                    mid_buf[off + 2],
-                    mid_buf[off + 3],
-                ]);
-                if mid != 0 {
-                    self.free_indirect_one(mid as u64, p, bs).await?;
-                    self.free_block(mid as u64).await?;
-                }
-            }
-            self.free_block(dbl as u64).await?;
-            inode.block[super::inode::DOUBLE_IND_IDX] = 0;
-        }
-        // Triple-indirect.
-        let tri = inode.block[super::inode::TRIPLE_IND_IDX];
-        if tri != 0 {
-            let mut top_buf = vec![0u8; bs];
-            self.read_block(tri as u64, &mut top_buf).await?;
-            for i in 0..p {
-                let off = (i as usize) * 4;
-                let mid = u32::from_le_bytes([
-                    top_buf[off],
-                    top_buf[off + 1],
-                    top_buf[off + 2],
-                    top_buf[off + 3],
-                ]);
-                if mid != 0 {
-                    let mut mid_buf = vec![0u8; bs];
-                    self.read_block(mid as u64, &mut mid_buf).await?;
-                    for j in 0..p {
-                        let o2 = (j as usize) * 4;
-                        let leaf = u32::from_le_bytes([
-                            mid_buf[o2],
-                            mid_buf[o2 + 1],
-                            mid_buf[o2 + 2],
-                            mid_buf[o2 + 3],
-                        ]);
-                        if leaf != 0 {
-                            self.free_indirect_one(leaf as u64, p, bs).await?;
-                            self.free_block(leaf as u64).await?;
-                        }
-                    }
-                    self.free_block(mid as u64).await?;
-                }
-            }
-            self.free_block(tri as u64).await?;
-            inode.block[super::inode::TRIPLE_IND_IDX] = 0;
-        }
+        let mut deferred = free_list::FreeList::default();
+        let freed = if self.superblock.uses_extents() && inode.uses_extents() {
+            // `ext4_ext_remove_space` over the whole file.
+            self.extent_free_all(inode, &mut deferred).await?
+        } else {
+            self.blockmap_free_range(inode, 0, u64::MAX, &mut deferred)
+                .await?
+        };
         inode.size = 0;
-        inode.blocks = 0;
-        Ok(())
+        // What the file still owns outside its map (an external xattr
+        // block) stays counted.
+        inode.blocks = inode.blocks.saturating_sub(freed);
+        self.release_deferred(inode_no, inode, deferred).await
     }
 
     /// `ext4_truncate` for a shrink to a nonzero size: free every block
@@ -2409,7 +2340,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Release every block mapped at logical `first..end` and any tree block
     /// left mapping nothing (`ext4_ext_remove_space` / `ext4_ind_remove_space`):
     /// the block-freeing half of truncate and of `FALLOC_FL_PUNCH_HOLE`.
-    /// `i_blocks` drops by what was released; the caller writes the inode.
+    /// `i_blocks` drops by what was released. The trimmed nodes, then the
+    /// inode, are written before any block is freed ([`free_list`]); the
+    /// caller writes the inode again with its other changes.
     pub(crate) async fn free_block_range(
         &self,
         inode_no: u32,
@@ -2420,18 +2353,23 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if inode.is_fast_symlink(self.block_size() as u32) || end <= first {
             return Ok(());
         }
+        let mut deferred = free_list::FreeList::default();
         let freed = if self.superblock.uses_extents() && inode.uses_extents() {
             // Logical block numbers are 32-bit in an extent tree; nothing is
             // mapped at or past 2^32.
             match u32::try_from(first) {
-                Ok(first) => self.extent_free_range(inode_no, inode, first, end).await?,
+                Ok(first) => {
+                    self.extent_free_range(inode_no, inode, first, end, &mut deferred)
+                        .await?
+                }
                 Err(_) => 0,
             }
         } else {
-            self.blockmap_free_range(inode, first, end).await?
+            self.blockmap_free_range(inode, first, end, &mut deferred)
+                .await?
         };
         inode.blocks = inode.blocks.saturating_sub(freed);
-        Ok(())
+        self.release_deferred(inode_no, inode, deferred).await
     }
 
     /// `ext4_alloc_file_blocks` over logical blocks `first..end`: every hole
@@ -2535,6 +2473,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode: &mut Inode,
         first: u64,
         end: u64,
+        deferred: &mut free_list::FreeList,
     ) -> Result<u32, FsError> {
         use super::inode::{DOUBLE_IND_IDX, N_DIRECT, SINGLE_IND_IDX, TRIPLE_IND_IDX};
         let spb = (self.block_size() / 512) as u32;
@@ -2544,7 +2483,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         for slot in first.min(N_DIRECT as u64)..direct_end {
             let slot = slot as usize;
             if inode.block[slot] != 0 {
-                self.free_block(u64::from(inode.block[slot])).await?;
+                deferred.push(u64::from(inode.block[slot]));
                 inode.block[slot] = 0;
                 freed = freed.saturating_add(spb);
             }
@@ -2566,11 +2505,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                         level,
                         first.saturating_sub(base),
                         end.saturating_sub(base),
+                        deferred,
                     )
                     .await?;
                 freed = freed.saturating_add(sub);
                 if empty {
-                    self.free_block(root).await?;
+                    deferred.push(root);
                     inode.block[slot] = 0;
                     freed = freed.saturating_add(spb);
                 }
@@ -2585,13 +2525,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// relative logical blocks `start..end`. Returns whether the block now
     /// maps nothing (the caller frees it) and the sectors released below it;
     /// a block that keeps entries is written back.
-    fn blockmap_free_branch(
-        &self,
+    fn blockmap_free_branch<'a>(
+        &'a self,
         block: u64,
         level: u32,
         start: u64,
         end: u64,
-    ) -> TreeFuture<'_, (bool, u32)> {
+        deferred: &'a mut free_list::FreeList,
+    ) -> TreeFuture<'a, (bool, u32)> {
         alloc::boxed::Box::pin(async move {
             let spb = (self.block_size() / 512) as u32;
             let p = self.pointers_per_block() as u64;
@@ -2624,13 +2565,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                             level - 1,
                             start.saturating_sub(child_first),
                             end.saturating_sub(child_first).min(child_span),
+                            &mut *deferred,
                         )
                         .await?;
                     freed = freed.saturating_add(sub);
                     empty
                 };
                 if empty {
-                    self.free_block(child).await?;
+                    deferred.push(child);
                     freed = freed.saturating_add(spb);
                     buf[off..off + 4].fill(0);
                     changed = true;
@@ -2643,20 +2585,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             Ok((!live, freed))
         })
-    }
-
-    /// Free every pointer in a single-indirect block.
-    async fn free_indirect_one(&self, ind_block: u64, p: u64, bs: usize) -> Result<(), FsError> {
-        let mut buf = vec![0u8; bs];
-        self.read_block(ind_block, &mut buf).await?;
-        for i in 0..p {
-            let off = (i as usize) * 4;
-            let v = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
-            if v != 0 {
-                self.free_block(v as u64).await?;
-            }
-        }
-        Ok(())
     }
 
     /// Read the on-disk inode `inode_no`.
