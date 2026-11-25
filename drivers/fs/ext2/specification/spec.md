@@ -13,10 +13,10 @@ NARF.
   feature set is supported mount read/write; inode, classic-directory,
   bitmap, group-descriptor, HTREE, and primary-superblock mutations regenerate
   the corresponding CRC32C before returning.
-- **Out of Scope (this iteration):** journal writes (ext3+), HTREE leaf
-  splitting/rebalancing and multi-level insertion, extended attributes,
-  `fsck`-style repair, and
-  extents-tree writes.
+- **Out of Scope (this iteration):** journal writes (ext3+), HTREE
+  rebalancing on delete, `largedir` (a third HTREE level), converting a
+  linear directory to an index (`make_indexed_dir`), and `fsck`-style
+  repair.
 
 ## 2. Assumptions
 
@@ -221,6 +221,41 @@ A device without `BlockFeature::Discard` fails the ioctl with
   - Freeing anything in such a group is `Corrupted`.
 - **Group count** is `DIV_ROUND_UP(blocks_count - first_data_block,
   blocks_per_group)`, as `ext4_fill_super` computes it.
+- **HTREE inserts split as Linux does** (`dir_mut.rs`, `ext4_dx_add_entry`).
+  - `dx_probe` checks every index level: the root's `limit` equals what
+    the block holds (`dx_root_limit`), each node opens with a fake dirent
+    spanning the block and has `dx_node_limit`, `count` is within `limit`,
+    child blocks lie inside the directory, and the `dx_tail` checksum
+    holds. Damage is `Corrupted`, a bad checksum `BadChecksum`.
+  - A full leaf splits at `do_split`'s point: from the highest hash down,
+    entries move while they fill at most half a block. The new block is
+    indexed with the first moved hash, plus one when that hash continues
+    from the block before (`continued`).
+  - A full index node splits in two when the root has room. A full root at
+    `indirect_levels` 0 moves into a new node and the root indexes it
+    (0 → 1). A full tree at the maximum depth (two levels without
+    `largedir`) is ENOSPC before any write.
+  - Without a journal: the new block, then the inode that maps it, then
+    the one index block that makes it reachable (the commit), then the old
+    block shrinks. Before the commit a failure frees the block and restores
+    the inode; after it the error is recorded.
+  - LINUX-GAP: a full one-block linear directory grows linearly; it is not
+    converted to an index (`make_indexed_dir`).
+- **Namespace changes keep a no-journal-safe order** (`dir_mut.rs`).
+  - A new inode is written before its dirent, which is the commit. A
+    failure before it clears the inode slot, then frees its data block.
+  - `link` raises and writes the link count before the new name exists,
+    so a crash can leave the count too high (e2fsck lowers it), never a
+    name the count does not cover.
+  - A rename onto an existing name repoints that dirent in place
+    (`ext4_setent`), so the name exists throughout. The old name goes
+    next, then the replaced inode's link, then a moved directory's `..`,
+    written with the dx root's checksum when the directory is indexed.
+  - Link limits are Linux's. `link` of an inode at `EXT4_LINK_MAX` (65000)
+    links is EMLINK. So is `mkdir`, or a rename moving a directory, into a
+    directory at that limit, unless `dir_nlink` lets an indexed directory
+    go on at a count of 1 (`EXT4_DIR_LINK_MAX`, `ext4_inc_count`). `rmdir`
+    and a rename leave a parent at 1 or 2 alone (`ext4_dec_count`).
 - **Extent trees grow to any depth** (`volume/extent_write.rs`, Linux
   `ext4_ext_insert_extent`), up to `EXT4_MAX_EXTENT_DEPTH` (5).
   - A full leaf gets a sibling, indexed from the deepest index level with
@@ -274,11 +309,11 @@ A device without `BlockFeature::Discard` fails the ioctl with
   allocated under pressure, the same interface falls back to one fallibly
   allocated filesystem-block buffer, bounded independently of directory size.
 - **Write scope.** Legacy direct/indirect block allocation, inode metadata,
-  classic directory mutation, checksum-aware bitmaps/descriptors, and writes
-  inside an already mapped extent persist. Extent-tree growth/truncation,
-  HTREE leaf splitting/multi-level insertion, and dirty-journal commit remain
-  unsupported. Existing one-level HTREE leaves accept checksum-safe insertion
-  and deletion without changing the index.
+  classic directory mutation, checksum-aware bitmaps/descriptors, extent
+  trees of any depth (growth, unwritten conversion, truncation, punch), and
+  HTREE inserts with leaf and index splits up to two index levels persist.
+  Dirty-journal commit remains unsupported: a volume needing recovery is
+  refused read-write by the write gate.
   If the JBD2 superblock and orphan file are both clean, stale `RECOVER` and
   `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
 - **Block-size flexibility.** Block size is `1024 << s_log_block_size`;

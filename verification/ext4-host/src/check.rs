@@ -69,6 +69,20 @@ pub fn uninit_groups(image: &Path) -> (usize, usize) {
     (block, inode)
 }
 
+/// `debugfs htree <dir>`: the directory's `Indirect levels`, if indexed.
+pub fn htree_levels(image: &Path, dir: &str) -> Option<u32> {
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("htree {dir}"))
+        .arg(image)
+        .output()
+        .expect("run debugfs");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("Indirect levels:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
 /// `debugfs ex <file>`: the depth of the file's extent tree (the `b` of the
 /// first row's `a/ b` level column).
 pub fn extent_depth(image: &Path, file: &str) -> Option<u32> {

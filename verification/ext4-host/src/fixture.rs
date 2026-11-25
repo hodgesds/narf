@@ -21,6 +21,8 @@ pub struct Spec {
     pub packages: usize,
     /// Extra `mkfs.ext4` arguments (`-O`, `-E`).
     pub mkfs_args: Vec<String>,
+    /// Index every directory (`e2fsck -fyD`) after packing.
+    pub index_dirs: bool,
 }
 
 impl Spec {
@@ -32,6 +34,7 @@ impl Spec {
             lib_files: 1500,
             packages: 120,
             mkfs_args: Vec::new(),
+            index_dirs: true,
         }
     }
 }
@@ -102,5 +105,20 @@ pub fn build(work: &Path, name: &str, spec: &Spec, seed: u64) -> Fixture {
         .status()
         .expect("run mkfs.ext4");
     assert!(status.success(), "mkfs.ext4 failed for {name}");
+    if spec.index_dirs {
+        // `mkfs -d` writes directories linearly; `e2fsck -D` rebuilds each
+        // as Linux would index it (exit 1: "filesystem modified").
+        let code = Command::new("e2fsck")
+            .arg("-fyD")
+            .arg(&image)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run e2fsck -D")
+            .code();
+        assert!(
+            matches!(code, Some(0 | 1)),
+            "e2fsck -D failed for {name}: {code:?}"
+        );
+    }
     Fixture { image, tree }
 }

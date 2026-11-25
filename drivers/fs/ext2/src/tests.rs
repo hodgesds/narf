@@ -8305,3 +8305,120 @@ kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext4_extent_grow_enospc_frees_the_data_block
 );
+
+/// The namespace keeps Linux's no-journal-safe shapes and link limits.
+/// - A rename over an existing name repoints that name's dirent in place
+///   (`ext4_setent`): the dirent stays where it was, naming the new inode,
+///   and the replaced inode is freed.
+/// - `link` of an inode at `EXT4_LINK_MAX` (65000) links is EMLINK, and
+///   changes nothing.
+/// - `mkdir` in a directory at 65000 links is EMLINK; `dir_nlink` lifts that
+///   only for an indexed directory (`EXT4_DIR_LINK_MAX`).
+fn smoke_ext2_namespace_follows_linux_link_rules() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const ROOT_BLOCK: usize = 9 * 1024;
+    const ITAB: usize = 5 * 1024;
+    let dirent_of = |img: &[u8], name: &[u8]| -> Option<(usize, u32)> {
+        let mut off = 0usize;
+        while off + 8 <= 1024 {
+            let at = ROOT_BLOCK + off;
+            let ino = u32::from_le_bytes([img[at], img[at + 1], img[at + 2], img[at + 3]]);
+            let rec_len = usize::from(u16::from_le_bytes([img[at + 4], img[at + 5]]));
+            let len = usize::from(img[at + 6]);
+            if rec_len < 8 {
+                return None;
+            }
+            if ino != 0 && &img[at + 8..at + 8 + len] == name {
+                return Some((off, ino));
+            }
+            off += rec_len;
+        }
+        None
+    };
+
+    // Rename over an existing name.
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"old"));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    if !matches!(poll_once(root.create("tmp")), Some(Ok(_))) {
+        return TestResult::Fail("could not create the replacement source");
+    }
+    let Some((_, tmp_ino)) = dirent_of(&device.snapshot(), b"tmp") else {
+        return TestResult::Fail("the created name is not in the root block");
+    };
+    let Some((data_off, 12)) = dirent_of(&device.snapshot(), b"data") else {
+        return TestResult::Fail("fixture has no `data` -> 12");
+    };
+    if !matches!(poll_once(root.rename("tmp", "data")), Some(Ok(()))) {
+        return TestResult::Fail("rename over an existing name failed");
+    }
+    drop(root);
+    drop(volume);
+    let img = device.snapshot();
+    if dirent_of(&img, b"data") != Some((data_off, tmp_ino)) {
+        return TestResult::Fail("a replacing rename must repoint the dirent in place");
+    }
+    if dirent_of(&img, b"tmp").is_some() {
+        return TestResult::Fail("the source name survived the rename");
+    }
+    if img[4 * 1024 + 1] & (1 << 3) != 0 {
+        return TestResult::Fail("the replaced inode 12 was not freed");
+    }
+
+    // link at EXT4_LINK_MAX.
+    let mut img = build_ext2_image(b"x");
+    put_u16(&mut img, ITAB + 11 * 128 + 26, 65000);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    if poll_once(volume.root().link("data", "again")) != Some(Err(FsError::TooManyLinks)) {
+        return TestResult::Fail("link of an inode at 65000 links must be EMLINK");
+    }
+    drop(volume);
+    let img = device.snapshot();
+    if u16::from_le_bytes([img[ITAB + 11 * 128 + 26], img[ITAB + 11 * 128 + 27]]) != 65000
+        || dirent_of(&img, b"again").is_some()
+    {
+        return TestResult::Fail("a refused link changed the link count or the directory");
+    }
+
+    // mkdir in a directory at EXT4_LINK_MAX, without and with dir_nlink: the
+    // root is not indexed, so dir_nlink does not lift the limit.
+    for dir_nlink in [false, true] {
+        let mut img = build_ext2_image(b"x");
+        put_u16(&mut img, ITAB + 128 + 26, 65000);
+        if dir_nlink {
+            put_u32(
+                &mut img,
+                1024 + 100,
+                super::superblock::ro_compat::DIR_NLINK,
+            );
+        }
+        let device = RamBlockDevice::from_image(512, img);
+        let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("mount failed"),
+        };
+        let made = poll_once(volume.root().mkdir("sub")).map(|r| r.map(|_| ()));
+        if made != Some(Err(FsError::TooManyLinks)) {
+            return TestResult::Fail(
+                "mkdir in a linear directory at 65000 links must be EMLINK, dir_nlink or not",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_namespace_follows_linux_link_rules
+);

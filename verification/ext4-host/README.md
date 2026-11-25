@@ -36,6 +36,10 @@ Scenarios:
 - `gate`: root-rw must refuse, with EROFS and without changing a byte, an
   unclean filesystem (`ssv state 0`), one with recorded errors
   (`ssv state 3`), and one with an orphan list (`ssv last_orphan 12`).
+- `htree`: 1 KiB blocks, so the root index holds 123 leaves; a workload
+  into the indexed `/usr/lib`, then 6000 long names, enough leaves that the
+  index gains its second level and its nodes split, then every third
+  deleted. `debugfs htree` must report `Indirect levels: 1`.
 - `extents`: a sparse file written one block in two, in shuffled order, so
   inserts split leaves and index nodes mid-tree and ahead of a subtree's
   first key. 30000 extents reach depth 3 at 1 KiB blocks and depth 2 at

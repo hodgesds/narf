@@ -32,7 +32,7 @@ USAGE: narf-ext4-host [OPTIONS]
   --seeds N         seeds per scenario (default 2)
   --ops N           operations per run (default 1500)
   --scenario LIST   comma-separated subset of: baseline,lifecycle,gate,uninit,
-                    extents
+                    htree,extents
                     (default all)
   --workdir DIR     scratch directory (default target/ext4-host)
   --keep            keep the images of passing runs
@@ -339,6 +339,74 @@ fn uninit(o: &Opts, seed: u64) -> Result<String, String> {
     ))
 }
 
+/// Indexed directories: inserts that split full leaves, fill the root
+/// index and add the second index level (1 KiB blocks, so the root holds
+/// 123 leaves), then deletes, judged by e2fsck's htree checks.
+fn htree(o: &Opts, seed: u64) -> Result<String, String> {
+    let name = format!("htree-{seed}");
+    let spec = fixture::Spec {
+        block_size: 1024,
+        size_mib: 512,
+        lib_files: 600,
+        packages: 20,
+        ..fixture::Spec::root()
+    };
+    let fx = fixture::build(&o.workdir, &name, &spec, seed);
+    let model = Model::load_host(&fx.tree);
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+    let fs = narf::mount(dev)?;
+    let mut w = Workload::new(seed, model, fs.root());
+    // Mostly creates into the indexed /usr/lib, with the usual mix around.
+    w.run(&Params {
+        ops: o.ops * 3,
+        roots: vec!["/usr/lib".into(), "/work".into()],
+        hot_dirs: vec!["/usr/lib".into()],
+        max_file: 4096,
+    })?;
+    // 6000 long names: about 430 leaves at 1 KiB, past the root's 123, so
+    // the index gains its second level and its nodes split.
+    let root = fs.root();
+    let mut names = Vec::new();
+    host::block_on(async {
+        let lib = narf::dir_at(&root, "/usr/lib").await?;
+        for i in 0..6000 {
+            let n = format!("bulk_{i:05}_{}", "x".repeat(50));
+            lib.create(&n).await?;
+            names.push(n);
+        }
+        // Then delete every third through the index.
+        for n in names.iter().step_by(3) {
+            lib.unlink(n).await?;
+        }
+        Ok::<(), narf_filesystem::FsError>(())
+    })
+    .map_err(|e| format!("bulk htree inserts: {e:?}"))?;
+    drop(root);
+    for (i, n) in names.iter().enumerate() {
+        if i % 3 != 0 {
+            w.model
+                .nodes
+                .insert(format!("/usr/lib/{n}"), model::Node::File(Vec::new()));
+        }
+    }
+    host::block_on(fs.root().syncfs()).map_err(|e| format!("syncfs: {e:?}"))?;
+    let levels = check::htree_levels(&fx.image, "/usr/lib");
+    if levels != Some(1) {
+        return Err(format!(
+            "/usr/lib should have grown a second index level, has {levels:?}"
+        ));
+    }
+    let (model, counts) = (w.model.clone(), format!("{:?}", w.counts));
+    drop(w);
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    verdict(&fx.image, &model, &o.workdir.join(format!("{name}/rdump")))?;
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+    }
+    Ok(format!("/usr/lib indirect levels {levels:?}; {counts}"))
+}
+
 /// Extent trees past one index level: a sparse file written one block in
 /// two, in shuffled order, so inserts land mid-leaf and ahead of a
 /// subtree's first key, splitting leaves and index nodes and growing the
@@ -419,11 +487,12 @@ fn main() {
     host::init();
     std::fs::create_dir_all(&o.workdir).unwrap();
     type Scenario = fn(&Opts, u64) -> Result<String, String>;
-    let all: [(&str, Scenario); 5] = [
+    let all: [(&str, Scenario); 6] = [
         ("baseline", baseline),
         ("lifecycle", lifecycle),
         ("gate", gate),
         ("uninit", uninit),
+        ("htree", htree),
         ("extents", extents),
     ];
     let mut failed = 0;
