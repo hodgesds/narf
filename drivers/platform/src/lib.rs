@@ -60,6 +60,10 @@ pub mod mei;
 /// to the display driver through `narf_drivers::gsc_proxy`.
 #[cfg(target_arch = "x86_64")]
 pub mod mei_gsc_proxy;
+/// MEI HDCP client: the CSME's HDCP 2.2 firmware, handed to the display
+/// driver through `narf_drivers::hdcp_component` (`narf.intel.hdcp=1`).
+#[cfg(target_arch = "x86_64")]
+pub mod mei_hdcp;
 /// Register-level CSME HECI model driving the MEI smokes.
 #[cfg(target_arch = "x86_64")]
 #[doc(hidden)]
@@ -153,6 +157,8 @@ pub mod surface_acpi;
 #[cfg(target_arch = "x86_64")]
 pub mod system76_acpi;
 
+#[cfg(target_arch = "x86_64")]
+mod mei_hdcp_tests;
 #[cfg(target_arch = "x86_64")]
 mod mei_tests;
 mod tests;

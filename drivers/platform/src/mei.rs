@@ -87,8 +87,8 @@
 //! ([`MeiDevice::cl_send`] / [`MeiDevice::cl_recv`]), disconnect in
 //! both directions, and teardown on device loss, protocol error and
 //! power-down ([`MeiDevice::power_down`]). The `/dev/mei0` character
-//! device is **not** implemented; the only consumer is the GSC proxy
-//! client.
+//! device is **not** implemented; the consumers are the GSC proxy
+//! client and the HDCP client (`crate::mei_hdcp`).
 //!
 //! ## Polling instead of interrupts
 //!
@@ -2497,6 +2497,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let dev = Arc::new(dev);
     *CONTROLLER.lock() = Some(dev.clone());
     crate::mei_gsc_proxy::bind(&dev);
+    crate::mei_hdcp::bind(&dev);
     narf_power::device_pm::register_device_pm("mei-me", pm_suspend, pm_resume);
     Ok(())
 }
@@ -2509,6 +2510,7 @@ fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     if let Some(dev) = dev {
         dev.power_down();
         crate::mei_gsc_proxy::unbind();
+        crate::mei_hdcp::unbind();
     }
     Ok(())
 }
@@ -2525,6 +2527,7 @@ fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
             let dev = Arc::new(dev);
             *CONTROLLER.lock() = Some(dev.clone());
             crate::mei_gsc_proxy::bind(&dev);
+            crate::mei_hdcp::bind(&dev);
             Ok(())
         }
         Err(e) => {
