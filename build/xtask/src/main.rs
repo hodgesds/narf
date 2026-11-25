@@ -4420,8 +4420,11 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     // undefined. This is how out-of-line `core`/`alloc`/dependency code
     // reaches the `.ko` without dragging in the whole sysroot.
     link_args.push(archive.clone().into_os_string());
+    // Inline only a small command line: the NARF host refuses an exec at
+    // about 1023 argv entries or 64 KiB of arguments (EFAULT), so a link
+    // near either bound goes through a response file.
     let arg_bytes: usize = link_args.iter().map(|a| a.len() + 1).sum();
-    if arg_bytes > 64 * 1024 {
+    if arg_bytes > 32 * 1024 || link_args.len() > 512 {
         // lld response-file quoting: each argument on its own line, quoted,
         // with `\` and `"` escaped.
         let mut rsp = String::new();
