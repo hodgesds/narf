@@ -295,6 +295,12 @@ A device without `BlockFeature::Discard` fails the ioctl with
   inode on disk still maps it, so it cannot end up shared by two files.
   Frees are collected as runs and applied one bitmap and descriptor write
   per group per run.
+- **`i_blocks` is 32 bits of sectors.** It is stored as Linux stores a
+  count that fits (`ext4_inode_blocks_set`): `l_i_blocks_high` zero,
+  `HUGE_FILE_FL` clear. A sum past 32 bits is EFBIG.
+  - LINUX-GAP: on a huge_file volume, an inode already using the high half
+    or `HUGE_FILE_FL` (a file holding 2 TiB or more) is refused a rewrite
+    with EFBIG, rather than having its count corrupted.
 - **A failed write still persists a changed block map.** When the first
   page of a write fails after its block was allocated and mapped, the inode
   is written anyway, so `i_blocks` counts the block.

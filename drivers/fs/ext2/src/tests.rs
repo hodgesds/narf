@@ -8422,3 +8422,60 @@ kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_namespace_follows_linux_link_rules
 );
+
+/// `ext4_inode_blocks` / `ext4_inode_blocks_set`. With huge_file, an inode
+/// whose `i_blocks` uses its high half (`l_i_blocks_high`, byte 116) or
+/// `HUGE_FILE_FL` holds 2 TiB or more, which NARF's 32-bit count cannot
+/// keep: rewriting it is EFBIG and leaves the high half alone. Without
+/// huge_file Linux never reads those bits, and a write stores them as it
+/// does: zero.
+fn smoke_ext4_inode_blocks_high_half_follows_huge_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const DATA_INODE: usize = 5 * 1024 + 11 * 128;
+    for huge_file in [true, false] {
+        let mut img = build_ext2_image(b"data");
+        put_u16(&mut img, DATA_INODE + 116, 1);
+        if huge_file {
+            put_u32(
+                &mut img,
+                1024 + 100,
+                super::superblock::ro_compat::HUGE_FILE,
+            );
+        }
+        let device = RamBlockDevice::from_image(512, img);
+        let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("mount failed"),
+        };
+        let file = match poll_once(volume.root().lookup_async("data")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("lookup of `data` failed"),
+        };
+        let wrote = poll_once(file.write(4, b"more"));
+        drop(file);
+        drop(volume);
+        let high = {
+            let img = device.snapshot();
+            u16::from_le_bytes([img[DATA_INODE + 116], img[DATA_INODE + 117]])
+        };
+        if huge_file {
+            if wrote != Some(Err(FsError::FileTooLarge)) || high != 1 {
+                return TestResult::Fail(
+                    "an inode with a 48-bit i_blocks must refuse a rewrite with EFBIG",
+                );
+            }
+        } else if wrote != Some(Ok(4)) || high != 0 {
+            return TestResult::Fail("without huge_file the high half must be written as 0");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_inode_blocks_high_half_follows_huge_file
+);

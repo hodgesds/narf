@@ -1306,6 +1306,26 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
         } else {
             self.read_byte_range(inode_byte_off, &mut buf).await?;
+            // `ext4_inode_blocks`: with huge_file, `i_blocks` is 48 bits
+            // (`l_i_blocks_high` at 116), and counts filesystem blocks under
+            // `HUGE_FILE_FL`. NARF keeps 32 bits of sectors; rewriting such
+            // an inode would leave the high half and the flag over a low
+            // half counted another way.
+            // LINUX-GAP: a file holding 2 TiB or more cannot be changed.
+            let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+            if self.superblock.feature_ro_compat & super::superblock::ro_compat::HUGE_FILE != 0
+                && (u16::from_le_bytes([buf[116], buf[117]]) != 0
+                    || flags & super::inode::I_FLAGS_HUGE_FILE != 0)
+            {
+                return Err(FsError::FileTooLarge);
+            }
+        }
+        // `ext4_inode_blocks_set`: a count past 32 bits is EFBIG unless the
+        // high half is used, which NARF does not do. Every real count is a
+        // multiple of the sectors per block, so `u32::MAX` is only ever a
+        // saturated sum.
+        if inode.blocks == u32::MAX {
+            return Err(FsError::FileTooLarge);
         }
         // `ext4_update_inode`: the first file past 2 GiB turns the volume's
         // RO_COMPAT_LARGE_FILE on, or an older kernel / e2fsck would take
@@ -1315,6 +1335,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             self.set_large_file_feature().await?;
         }
         inode.encode_into(&mut buf);
+        // A count that fits 32 bits is stored as Linux stores it: high half
+        // zero, `HUGE_FILE_FL` clear (without huge_file Linux never reads
+        // either).
+        buf[116..118].fill(0);
+        let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]])
+            & !super::inode::I_FLAGS_HUGE_FILE;
+        buf[32..36].copy_from_slice(&flags.to_le_bytes());
         // Keep this self-contained so every inode metadata writer
         // (chmod/chown, truncate, directory links, and data writes) inherits
         // the correct checksum.
