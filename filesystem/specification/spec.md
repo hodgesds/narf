@@ -581,7 +581,10 @@ pub mod dma_buf {
     pub struct DmaResvRetired; // drop after releasing driver admission locks
     // DmaResv::snapshot() polls outside locks; add_prepared(snapshot, batch)
     // publishes without fence callbacks and returns retired references.
-    pub struct DmaBufObject { pub resv: DmaResv, /* name */ }
+    pub struct DmaBufObject { pub resv: DmaResv, /* name, dynamic importers */ }
+    // attach_dynamic(Weak<dyn DmaBufAttachOps>), detach_dynamic(&Weak),
+    // dynamic_importers(), invalidate_mappings() -> notified count
+    pub trait DmaBufAttachOps: Send + Sync { fn invalidate_mappings(&self); }
     pub fn dma_buf_ioctl(obj: &DmaBufObject, cmd: u32, arg: u64,
                          ctx: &dyn IoctlContext) -> Result<u64, FsError>;
 }
@@ -1944,6 +1947,13 @@ entries; it never discards later work. It returns `DmaResvRetired`, whose final
 references must be dropped after the admission lock. Retain snapshots and
 prepared inputs until that lock is dropped too. Empty batches change nothing.
 This also avoids foreign destructor callbacks while either lock is held.
+A dynamic importer (Linux `dma_buf_dynamic_attach` with `importer_ops`)
+registers its `DmaBufAttachOps` weakly with `attach_dynamic` and leaves with
+`detach_dynamic`; the exporter calls `invalidate_mappings` before it moves
+the backing store (`dma_buf_invalidate_mappings`), and each importer drops
+its mappings and maps again before further DMA. Callbacks run after the
+attachment list lock is released and must not block. Static importers
+register nothing and keep the exporter's pin-on-map.
 
 sync_file fds belong to the syscall layer: `IoctlContext::sync_file_fences` is `sync_file_get_fence` +
 `dma_fence_unwrap` (`None` for a bad fd or a non-sync_file), and

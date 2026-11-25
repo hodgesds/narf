@@ -3168,19 +3168,36 @@ every attachment is peer-to-peer, else migrates the idle object through the
 eviction copy. An object already pinned in VRAM, or a VRAM scanout object,
 refuses a system pin with EINVAL. Mapping returns the exporter's system
 pages, or for a peer the LMEM BAR bus addresses in segments of at most
-2 GiB; VRAM that is not wholly CPU-visible refuses with EOPNOTSUPP. NARF
-importers are static (no `xe_dma_buf_move_notify`): mapping pins for the
-attachment's life, which excludes eviction, exec re-migration and the
-suspend drain, so a pinned VRAM export refuses system suspend. The
-exporter's runtime-PM reference is held from that pin. The import is a
-system-placed object sharing the exporter's reservation, mapped at its
-first native VM_BIND (XE_COH_NONE and compressed indices refuse). It has no
-CPU copy, mmap, migration, i915 compatibility exec, ADDFB or cursor use. A
-reimport returns its handle; a re-export names the original buffer. Live
-imports request peer-to-peer only with `narf.intel.prime_p2p=1`. Native
-fixtures (`drivers/gpu/intel_gpu_prime`, the smallbar suite and
-`io/p2pdma`) cover BAR bus addresses, migration, the pinned, VRAM-only and
-nonvisible refusals and import binding.
+2 GiB; VRAM that is not wholly CPU-visible refuses with EOPNOTSUPP. Live
+importers are dynamic (`xe_dma_buf_attach_ops` over the generic
+`DmaBufAttachOps` hook): mapping validates the placement without a pin, so
+the exporter still evicts and migrates the object. Each move first calls
+`invalidate_mappings` (`xe_bo_move_notify`); the importer's
+`xe_dma_buf_move_notify` makes its installed pages stale, and its next
+VM_BIND or exec maps the attachment again before building page tables
+(exec retries when a move overtakes it). A static attachment still pins on
+map. At system suspend, a dma-buf-pinned VRAM export is copied to a system
+backup while its allocation stays reserved (`xe_bo_evict_pinned`), and the
+resume copies it back to the same device address once the GT runs
+(`xe_bo_restore_pinned`); until then it refuses CPU access, mapping,
+scanout and eviction, and an exec or importer map restores it first. The
+exporter's runtime-PM reference is held from the first map or pin. The
+import is a system-placed object sharing the exporter's reservation,
+mapped at its first native VM_BIND (XE_COH_NONE and compressed indices
+refuse). Its MMAP_OFFSET maps the exporter's object (`dma_buf_mmap`: system
+pages or the LMEM BAR, bounded by the buffer); DMA_BUF_IOCTL_SYNC on the
+shared reservation orders CPU access. An integrated display takes it as a
+framebuffer (no FORCE_WC needed, so it may be bound) and pins the export
+(`dma_buf_pin`) for the import's life before the GGTT maps its pages; a
+discrete display refuses it (`__xe_pin_fb_vma` pins to VRAM0). It has no
+kernel CPU copy, migration, i915 compatibility exec or mmap, CPU-copy
+presentation or cursor use. A reimport returns its handle; a re-export names
+the original buffer. Live imports request peer-to-peer only with
+`narf.intel.prime_p2p=1`. Native fixtures (`drivers/gpu/intel_gpu_prime`,
+the smallbar suite and `io/p2pdma`) cover BAR bus addresses, migration, the
+pinned, VRAM-only and nonvisible refusals, import binding, move
+notification and rebind, suspend of a pinned export, import mmap and
+import scanout.
 
 Native terminal fences now back the shared per-object dma-buf reservation.
 GuC and Gen12 resident admission check synchronous conflicts across the
@@ -3735,7 +3752,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
 | VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20). Swap, lazy-free and compaction now refuse pinned pages, and VRAM CPU mappings are revoked and refaulted across runtime suspend (§20); i915 GEM_USERPTR (`i915_gem_userptr_ioctl`) and the Xe LR_MODE/FAULT_MODE VM flags with PREFETCH are admitted ("Completion of Intel iGPU and Discrete Arc Support"); CPU-address-mirror VMs remain |
-| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations; dynamic dma-buf importers and in-place suspend of pinned VRAM exports | Open; DG2/BMG evict VRAM to system memory (flat-CCS saved) and migrate it back, evict under OOM at GEM_CREATE, re-migrate at exec and drain for suspend ("Completion of Intel iGPU and Discrete Arc Support"); CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20); DG1 publishes VRAM below `GSMBASE` (§5); cross-device VRAM PRIME runs with static attachments, and peer-to-peer behind `narf.intel.prime_p2p=1` (§19), unvalidated on hardware. Dynamic (move-notify) importers, in-place suspend of a pinned VRAM export, alias revocation and nonvisible allocation beyond the BMG headless profile remain |
+| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations | Open; DG2/BMG evict VRAM to system memory (flat-CCS saved) and migrate it back, evict under OOM at GEM_CREATE, re-migrate at exec and drain for suspend ("Completion of Intel iGPU and Discrete Arc Support"); CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20); DG1 publishes VRAM below `GSMBASE` (§5); cross-device VRAM PRIME runs with static attachments, and peer-to-peer behind `narf.intel.prime_p2p=1` (§19), unvalidated on hardware. Dynamic (move-notify) importers, in-place suspend of a pinned VRAM export, import mmap through the exporter and integrated-display scanout of an import are implemented with native fixtures (§19); alias revocation and nonvisible allocation beyond the BMG headless profile remain |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |

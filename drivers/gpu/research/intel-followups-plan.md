@@ -70,9 +70,12 @@ work had.
   HDCP on 128b/132b links, and a silicon run (the NUC12's GOP-lit route is
   the first target). The firmware-lit Gen12 route has no hotplug owner, so
   its HDCP 2.2 waits still poll RxStatus every 10 ms.
-- VRAM PRIME beyond static attachments: dynamic importers with move
-  notification (`xe_dma_buf_move_notify`), system suspend with a pinned VRAM
-  export, CPU mmap and scanout of a foreign import, AMD exporters and
-  importers.
+- VRAM PRIME/P2P beyond `intel_gpu_prime` (dynamic move-notify
+  importers, peer-to-peer LMEM BAR mapping behind
+  `narf.intel.prime_p2p=1`, migration fallback, in-place suspend of a
+  pinned VRAM export, import mmap through the exporter, integrated-display
+  scanout of an import): AMD exporters and importers, the
+  `xe_dma_buf_begin_cpu_access` migration to system memory for CPU reads,
+  and validation of the P2P and suspend paths on hardware.
 - CPU-address-mirror VMs.
 - D3cold through `_PR3` power resources (NARF evaluates no AML).

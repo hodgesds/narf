@@ -38,6 +38,19 @@
 //! NARF's runtime resume is asynchronous; it holds the BAR decoding while a
 //! peer may DMA into it.
 //!
+//! A pinned VRAM export survives system suspend in place
+//! (`GemObject::backup_pinned` / `restore_pinned`, Linux
+//! `xe_bo_evict_pinned` / `xe_bo_restore_pinned`); an importer's map
+//! restores it first ([`Attachment::restore_export`]). An import's mmap is
+//! the exporter's (`GemState::mapping_object`, `dma_buf_mmap`), and an
+//! integrated display scans an import out after [`pin_for_scanout`]
+//! (`__xe_pin_fb_vma`, with `dma_buf_pin`).
+//!
+//! LINUX-GAP: `xe_dma_buf_begin_cpu_access` migrates a VRAM export to
+//! system memory for CPU reads when it can. NARF's DMA_BUF_IOCTL_SYNC is
+//! synchronous and has no exporter hook, so CPU access always takes place in
+//! the current placement, which is what Linux falls back to.
+//!
 //! Peer-to-peer into another function's BAR is unvalidated on hardware:
 //! the live importer asks for it only with `narf.intel.prime_p2p=1`, and
 //! otherwise takes the migration path.
