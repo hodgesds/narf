@@ -175,11 +175,13 @@ fn smoke_mt7921_probe_validates_real_bar_geometry() -> TestResult {
     use super::pci::validate_probe_window;
     // Regression: the 1 MiB hardware window now covers the selector,
     // fixed ownership CSR, and indirect identity window.
-    if validate_probe_window(0x100000).is_err() {
+    if validate_probe_window(MTK_DEV_MT7922, 0x100000).is_err() {
         return TestResult::Fail("real MT7922 BAR refused");
     }
     let end = u64::from(MT_HIF_REMAP_L1) + 4;
-    if validate_probe_window(end - 1).is_ok() || validate_probe_window(end).is_err() {
+    if validate_probe_window(MTK_DEV_MT7922, end - 1).is_ok()
+        || validate_probe_window(MTK_DEV_MT7922, end).is_err()
+    {
         return TestResult::Fail("selector bounds are not end-exclusive");
     }
     TestResult::Pass
@@ -213,9 +215,9 @@ kernel_test_in!(
 );
 
 fn smoke_mt7921_l1_remap_direct_window() -> TestResult {
-    if l1_remap(0) != 0
-        || l1_remap(MT_PCIE_MAC_INT_ENABLE) != 0x10188
-        || l1_remap(0x00ffffff) != u32::MAX
+    if l1_remap(MTK_DEV_MT7922, 0) != 0
+        || l1_remap(MTK_DEV_MT7922, MT_PCIE_MAC_INT_ENABLE) != 0x10188
+        || l1_remap(MTK_DEV_MT7922, 0x00ffffff) != u32::MAX
     {
         return TestResult::Fail("direct BAR window is not bounded to 1 MiB");
     }
@@ -227,16 +229,37 @@ kernel_test_in!(
 );
 
 fn smoke_mt7921_l1_remap_high_window() -> TestResult {
-    if l1_remap(MT_HW_CHIPID) != 0x40200
-        || l1_remap(MT_HW_REV) != 0x40204
-        || l1_remap(MT_HW_BOUND) != 0x40020
-        || l1_remap(MT_CONN_ON_LPCTL) != 0xe0010
+    if l1_remap(MTK_DEV_MT7922, MT_HW_CHIPID) != 0x40200
+        || l1_remap(MTK_DEV_MT7922, MT_HW_REV) != 0x40204
+        || l1_remap(MTK_DEV_MT7922, MT_HW_BOUND) != 0x40020
+        || l1_remap(MTK_DEV_MT7922, MT_CONN_ON_LPCTL) != 0xe0010
     {
         return TestResult::Fail("identity/ownership register mapping differs from Linux");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_l1_remap_high_window);
+
+/// MT7925 (CONNAC3) `l1_remap` selects the per-chip fixed table: the
+/// new windows resolve, the shrunk PCIe MAC window rejects its old
+/// tail, and the shared identity/ownership windows agree with CONNAC2.
+fn smoke_mt7925_l1_remap_connac3_windows() -> TestResult {
+    if l1_remap(MTK_DEV_MT7925, 0x830c0000) != 0
+        || l1_remap(MTK_DEV_MT7925_ALT, 0x830c0000) != 0
+        || l1_remap(MTK_DEV_MT7925, 0x7c500000) != 0x60000
+        || l1_remap(MTK_DEV_MT7925, MT_HW_CHIPID) != 0x40200
+        || l1_remap(MTK_DEV_MT7925, MT_CONN_ON_LPCTL) != 0xe0010
+        || l1_remap(MTK_DEV_MT7925, 0x74031000) != u32::MAX
+        || l1_remap(MTK_DEV_MT7922, 0x74031000) != 0x11000
+    {
+        return TestResult::Fail("MT7925 l1_remap does not use the CONNAC3 table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7925_l1_remap_connac3_windows
+);
 
 // ── Firmware blob resolution ───────────────────────────────────────
 

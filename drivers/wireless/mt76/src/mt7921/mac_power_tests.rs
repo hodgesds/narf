@@ -86,10 +86,11 @@ impl registers::Io for Hif {
 }
 impl mac_power::Io for Hif {
     fn read(&mut self, address: u32) -> Result<u32, PowerError> {
-        registers::transaction(self, address, None).map_err(|_| PowerError::InvalidWindow)
+        registers::transaction(MTK_DEV_MT7922, self, address, None)
+            .map_err(|_| PowerError::InvalidWindow)
     }
     fn write(&mut self, address: u32, value: u32) -> Result<(), PowerError> {
-        registers::transaction(self, address, Some(value))
+        registers::transaction(MTK_DEV_MT7922, self, address, Some(value))
             .map(|_| ())
             .map_err(|_| PowerError::InvalidWindow)
     }
