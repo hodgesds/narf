@@ -1763,6 +1763,81 @@ fn e2e_ath11k_module_registration() -> TestResult {
 }
 kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
 
+// ── iwlwifi.ko ──────────────────────────────────────────────────────────
+
+/// The real iwlwifi `.ko` (`narf-drivers-wireless-iwlwifi --features
+/// module`: the driver's PCIe transport, firmware loader, MLD station path and
+/// in-driver supplicant over `narf-module-rt` and the KABI). The relocations
+/// for the driver, `core`/`alloc` and the protocol crates resolve and init
+/// runs; the module claims exactly the six Sc (BE20x/BE21x) ids of the
+/// built-in table and none of the built-in-only Gen2/Ty/So/Ma/Bz ids; a probe
+/// with no device context is refused before any device access; and unload
+/// leaves no match. QEMU has no Intel Wi-Fi device, so bring-up itself is
+/// proven on hardware.
+fn e2e_iwlwifi_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const INTEL: u16 = 0x8086;
+    const SC: [u16; 6] = [0x6e70, 0x9327, 0xd240, 0xd340, 0xe340, 0xe440];
+    // AX200, AX201, AX210, AX211 (So/Ma), BE200 (Bz): built in only.
+    const BUILTIN_ONLY: [u16; 6] = [0x2723, 0x02f0, 0x2725, 0x51f0, 0x2729, 0x272b];
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/iwlwifi.ko")
+    else {
+        return TestResult::Fail("iwlwifi module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("iwlwifi module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module_with_params(&image, "") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("iwlwifi.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let claims = module.name() == "iwlwifi"
+        && count() == before + SC.len()
+        && SC
+            .iter()
+            .all(|&did| __module_thunk_for_test(INTEL, did).is_some())
+        && BUILTIN_ONLY
+            .iter()
+            .all(|&did| __module_thunk_for_test(INTEL, did).is_none());
+    // A bogus token (no device context): the identity read fails first.
+    let refused = SC
+        .iter()
+        .all(|&did| __module_thunk_for_test(INTEL, did).is_some_and(|thunk| thunk(0, 0) != 0));
+    drop(module);
+    if sys_delete_module("iwlwifi").is_err() {
+        return TestResult::Fail("could not unload iwlwifi.ko");
+    }
+    if !live {
+        return TestResult::Fail("iwlwifi.ko did not reach Live");
+    }
+    if !claims {
+        return TestResult::Fail("iwlwifi.ko did not claim exactly the Sc PCI ids");
+    }
+    if !refused {
+        return TestResult::Fail("iwlwifi.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || SC
+            .iter()
+            .any(|&did| __module_thunk_for_test(INTEL, did).is_some())
+    {
+        return TestResult::Fail("iwlwifi.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/iwlwifi", e2e_iwlwifi_module_registration);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]

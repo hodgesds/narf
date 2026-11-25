@@ -1,5 +1,6 @@
 //! All-owned-RFH MLD BAID retirement. Firmware echoes an opaque host cookie,
 //! type and BAID after each queue's prefix (Linux mld/{agg,rx}.c,rx.h).
+#[cfg(feature = "builtin")]
 use super::super::scan_api;
 use super::*;
 use alloc::sync::Arc;
@@ -137,6 +138,7 @@ impl Hardware {
     }
     /// MLD EMPTY (type0) is an ordered all-owned-RFH prefix proof, not a
     /// temporarily empty descriptor ring or a key-command acknowledgement.
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn synchronize_receive_epoch(
         &mut self,
     ) -> Result<Vec<Packet>, &'static str> {
@@ -150,12 +152,14 @@ impl Hardware {
     /// Only a matching native marker permits host BAID/window reuse. Return
     /// bounded original management packets for the Connection's existing
     /// peer/PHY/PMF checks; discard old data without committing its PN.
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn synchronize_rx_baid(
         &mut self,
         baid: u8,
     ) -> Result<Vec<Packet>, &'static str> {
         self.synchronize_rx(Some(baid)).await
     }
+    #[cfg(feature = "builtin")]
     async fn synchronize_rx(&mut self, baid: Option<u8>) -> Result<Vec<Packet>, &'static str> {
         // Ordinary Qu station/BAID retirement retains its original MVM
         // receiver. Only the complete selected API77 AP consumer with its
@@ -199,6 +203,7 @@ impl Hardware {
             }
         }
     }
+    #[cfg(feature = "builtin")]
     async fn rx_baid_marker(
         &mut self,
         baid: Option<u8>,

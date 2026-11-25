@@ -104,6 +104,7 @@ impl Hardware {
     pub(in crate::iwlwifi) fn scan_tpc_supported(&self) -> bool {
         self.mld_station || self.scan_six_capabilities & 2 != 0
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) fn install_six_tx_profile(
         &mut self,
         profile: alloc::sync::Arc<super::super::six_ghz_station::Profile>,
@@ -112,6 +113,7 @@ impl Hardware {
         self.six_tx_profile = Some(profile);
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) fn check_six_tx_publication(&mut self) -> Result<(), &'static str> {
         let result = self
             .mld_link
@@ -130,12 +132,14 @@ impl Hardware {
         }
         result
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn service_six_power(&mut self) -> Result<(), &'static str> {
         if let Some(profile) = self.six_tx_profile.clone() {
             profile.apply_pending(self).await?;
         }
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) fn install_mld_link(
         &mut self,
         link: alloc::sync::Arc<super::super::sc_mlo::Binding>,
@@ -152,6 +156,7 @@ impl Hardware {
         self.command(3, 0xa, &peer[..length]).await?;
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) fn install_ap_owner(
         &mut self,
         owner: alloc::sync::Arc<super::super::ap_owner::Owner>,
@@ -163,6 +168,7 @@ impl Hardware {
         self.ap_owner = Some(owner);
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn ap_tlc(
         &mut self,
         body: &[u8; 44],
@@ -179,6 +185,7 @@ impl Hardware {
         }
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn ap_peer(
         &mut self,
         peer: &[u8; 104],
@@ -199,6 +206,7 @@ impl Hardware {
         }
         Ok(())
     }
+    #[cfg(feature = "builtin")]
     pub(in crate::iwlwifi) async fn ap_phy(
         &mut self,
         canonical: &[u8; 32],

@@ -5,12 +5,15 @@
 //! `drivers/wireless/mt76/` and `drivers/net/tg3/` for the reference dual-build
 //! shape.
 //!
-//! The real driver in [`iwlwifi`] (PCIe gen2/gen3 transport, firmware TLV
-//! parsing and the filename ladder, the MLD station control/data path)
-//! compiles only for the built-in build. The `module` build registers the
-//! Intel PCI ids through the `narf_register_pci_driver` KSYMTAB export; its
-//! probe thunk returns `-ENOSYS` because the Wi-Fi device datapath ABI is not
-//! yet exported, matching the net `.ko`s (registration-only proof).
+//! The driver in [`iwlwifi`] (PCIe gen2/gen3 transport, firmware TLV parsing
+//! and the filename ladder, the MLD station control/data path) is one source
+//! tree in both builds. Built in, all of it runs. The `module` build compiles
+//! the identity, firmware and transport layers kernel-free and runs them
+//! inside the `.ko` for the Sc (BE20x/BE21x) ids over `narf-module-rt` and
+//! the KABI ([`iwlwifi::module`]): firmware boot to ALIVE, NVM and the
+//! runtime commands, one `wlan%d` netdev and wiphy through the netif bridge
+//! and the `WIFI` family host, and passive scan. Association, the data path,
+//! AP/P2P and the Gen2/Ty/So/Ma/Bz profiles stay built in.
 //!
 //! ## Hardware validation is gated
 //!
@@ -22,7 +25,6 @@
 #![no_std]
 #![allow(dead_code)]
 
-#[cfg(feature = "builtin")]
 extern crate alloc;
 
 use narf_driver_macros::narf_driver;
@@ -30,14 +32,14 @@ use narf_driver_macros::narf_driver;
 // Shared, driver-agnostic helpers live in `narf-drivers-wireless-core`.
 // Re-exported at the crate root so the inner driver's `crate::firmware_asset`
 // and `crate::future_heap` references resolve unchanged after promotion.
+#[cfg(feature = "module")]
+pub(crate) use iwlwifi::module::firmware_asset;
 #[cfg(feature = "builtin")]
 pub(crate) use narf_drivers_wireless_core::{firmware_asset, future_heap};
 
-#[cfg(feature = "builtin")]
+/// The driver. Built in, every layer; as a module, the kernel-free subset
+/// plus [`iwlwifi::module`] (see the crate docs).
 pub mod iwlwifi;
-
-#[cfg(feature = "module")]
-mod module_probe;
 
 narf_driver! {
     name: "iwlwifi",
@@ -47,7 +49,7 @@ narf_driver! {
         author: "narf",
         description: "Intel iwlwifi PCIe Wi-Fi (AX200/AX201/AX210/AX211/BE200)",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write,Firmware:Read",
     },
     register: do_register,
 }
@@ -59,5 +61,5 @@ fn do_register() {
 
 #[cfg(feature = "module")]
 fn do_register() {
-    module_probe::register();
+    iwlwifi::module::register();
 }

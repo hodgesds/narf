@@ -17,12 +17,14 @@
 //! and never transmitted partially checksummed. RX verdicts are reported only
 //! when the hardware's result proves the checksum; an unverifiable result
 //! leaves software verification in place.
+#[cfg(feature = "builtin")]
 use narf_net::{L4CsumKind, OffloadCapabilities, RxMeta};
 
 /// Advertised frame-ring offloads: L4 checksum generation and RX checksum
 /// verdicts. TSO is a driver-side A-MSDU segmentation in Linux
 /// (`iwl_mld_tx_tso_segment`), not a firmware offload; VLAN insertion is
 /// not supported.
+#[cfg(feature = "builtin")]
 pub const OFFLOADS: OffloadCapabilities = OffloadCapabilities {
     tx_checksum: true,
     rx_checksum: true,
@@ -139,6 +141,7 @@ fn layout(eth: &[u8]) -> Option<Layout> {
 
 /// Offset of the L4 checksum field after validating the L4 header against
 /// the requested kind.
+#[cfg(feature = "builtin")]
 fn l4_field(eth: &[u8], l: &Layout, kind: L4CsumKind) -> Option<usize> {
     match (l.proto, kind) {
         (IPPROTO_TCP, L4CsumKind::Tcp) => {
@@ -164,6 +167,7 @@ fn l4_field(eth: &[u8], l: &Layout, kind: L4CsumKind) -> Option<usize> {
 /// only requested for A-MSDU, which this station profile never builds.
 /// `None` means no offload was requested. A refused request is an error and
 /// the frame must not be transmitted.
+#[cfg(feature = "builtin")]
 pub fn prepare_tx(eth: &mut [u8], kind: Option<L4CsumKind>) -> Result<u32, &'static str> {
     let Some(kind) = kind else {
         return Ok(0);
@@ -176,6 +180,7 @@ pub fn prepare_tx(eth: &mut [u8], kind: Option<L4CsumKind>) -> Result<u32, &'sta
 
 /// Complete the exact already-validated native PARTIAL contract before
 /// host group encryption. Firmware cannot inspect encrypted IP/L4 bytes.
+#[cfg(feature = "builtin")]
 pub(super) fn complete_prepared(eth: &mut [u8], assist: u32) -> Result<(), &'static str> {
     if assist == 0 {
         return Ok(());
@@ -205,6 +210,7 @@ pub(super) fn complete_prepared(eth: &mut [u8], assist: u32) -> Result<(), &'sta
 
 /// Validate a TX metadata request for this offload contract without
 /// changing the frame. Used before an Ethernet frame is queued.
+#[cfg(feature = "builtin")]
 pub fn tx_admissible(eth: &[u8], meta: narf_net::TxMeta) -> bool {
     meta.tso_mss.is_none()
         && meta.vlan_tag.is_none()
@@ -218,6 +224,7 @@ pub fn tx_admissible(eth: &[u8], meta: narf_net::TxMeta) -> bool {
 /// checksum OK or an IPv6 packet. The firmware's L3 classification must
 /// match the delivered EtherType; the ring contract reports `csum_l4` only
 /// for a whole TCP/UDP packet and `csum_l3` only for IPv4.
+#[cfg(feature = "builtin")]
 pub fn rx_meta_l3l4(flags: u16, eth: &[u8]) -> RxMeta {
     let mut meta = RxMeta::default();
     let l3 = (flags >> L3_PROTO_POS) & 0xf;
@@ -252,6 +259,7 @@ pub fn rx_meta_l3l4(flags: u16, eth: &[u8]) -> RxMeta {
 /// the SNAP and IP header contributions, add the pseudo header and require
 /// the folded total to be `0xffff`. A raw sum covering different bytes
 /// therefore fails closed instead of claiming verification.
+#[cfg(feature = "builtin")]
 pub fn rx_meta_complete(raw: u16, includes_snap: bool, eth: &[u8]) -> RxMeta {
     let mut meta = RxMeta::default();
     let Some(l) = layout(eth) else {

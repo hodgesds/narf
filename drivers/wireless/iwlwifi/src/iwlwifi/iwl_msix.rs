@@ -4,12 +4,15 @@
 //! and non-RX table entries use slots 0/1, delivered to one host vector.
 
 use super::transport::IwlMmio;
+#[cfg(feature = "builtin")]
 use alloc::boxed::Box;
+#[cfg(feature = "builtin")]
 use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
+#[cfg(feature = "builtin")]
 use narf_lib::sync::IrqSafeSpinLock;
 
 pub const CSR_MSIX_FH_INT_CAUSES_AD: u32 = 0x2800;
@@ -93,6 +96,7 @@ fn acknowledge(mmio: &mut impl IwlMmio) -> Causes {
     causes
 }
 
+#[cfg(feature = "builtin")]
 struct Shared {
     mmio: super::IwlMmioImpl,
     pending: Causes,
@@ -101,12 +105,14 @@ struct Shared {
 /// Owns the handler cookie until device delivery is disabled and handlers
 /// are synchronized. The hard IRQ only acknowledges/latches causes; all
 /// DMA processing stays in the driver task.
+#[cfg(feature = "builtin")]
 pub struct Interrupts {
     cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     table: narf_bus::MsixTable,
     vector: u8,
     shared: Box<IrqSafeSpinLock<Shared>>,
 }
+#[cfg(feature = "builtin")]
 impl core::fmt::Debug for Interrupts {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IwlInterrupts")
@@ -114,6 +120,7 @@ impl core::fmt::Debug for Interrupts {
             .finish_non_exhaustive()
     }
 }
+#[cfg(feature = "builtin")]
 fn handler(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
     // SAFETY: Interrupts owns this stable Box until disable + synchronize.
     let shared = unsafe { &*(cookie as *const IrqSafeSpinLock<Shared>) };
@@ -127,6 +134,7 @@ fn handler(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
         narf_interrupts::dispatch::IrqStatus::None
     }
 }
+#[cfg(feature = "builtin")]
 impl Interrupts {
     pub fn new(
         cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
@@ -231,6 +239,7 @@ impl Interrupts {
         self.vector
     }
 }
+#[cfg(feature = "builtin")]
 impl Drop for Interrupts {
     fn drop(&mut self) {
         let masked = self.mask();
@@ -248,12 +257,14 @@ impl Drop for Interrupts {
 
 /// Construct BEFORE inspecting rings, so completion between drain and await
 /// cannot be lost. The timer also bounds waits for lost interrupts/recovery.
+#[cfg(feature = "builtin")]
 #[derive(Debug)]
 pub struct Activity {
     irq: Option<narf_interrupts::wait::WaitForIrq>,
     timer: narf_time::SleepUntil,
     yielded: bool,
 }
+#[cfg(feature = "builtin")]
 impl Activity {
     pub fn new(vector: Option<u8>, max_ms: u64) -> Self {
         Self {
@@ -265,6 +276,7 @@ impl Activity {
         }
     }
 }
+#[cfg(feature = "builtin")]
 impl Future for Activity {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -284,6 +296,14 @@ impl Future for Activity {
         Pin::new(&mut self.timer).poll(cx)
     }
 }
+
+/// The module build's interrupt owner and wait: the same names over the
+/// KABI's MSI-X vectors and task-context callbacks.
+#[cfg(feature = "module")]
+#[path = "module/msix.rs"]
+mod kabi;
+#[cfg(feature = "module")]
+pub use kabi::{Activity, Interrupts};
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {

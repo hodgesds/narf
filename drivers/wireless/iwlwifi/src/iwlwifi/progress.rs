@@ -1,5 +1,7 @@
 //! Driver-owned work shared by executor polls and synchronous network drains.
 
+#[cfg(feature = "module")]
+use crate::iwlwifi::module::kernel::*;
 use alloc::boxed::Box;
 use core::{
     future::Future,

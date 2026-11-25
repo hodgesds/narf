@@ -131,7 +131,11 @@ pub fn register_initcalls() {
     });
     // Register wireless drivers with the bus dispatcher.
     narf_init::register(Stage::Subsys, "iwlwifi", || {
+        #[cfg(not(feature = "iwlwifi-module-only"))]
         iwlwifi::register();
+        // iwlwifi.ko owns the Sc ids; the other generations stay built in.
+        #[cfg(feature = "iwlwifi-module-only")]
+        iwlwifi::register_builtin_only();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "mt76", || {
