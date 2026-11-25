@@ -42,6 +42,10 @@ struct GemBacking {
     /// Saved Flat-CCS auxiliary metadata retained while an Alchemist VRAM
     /// object is evicted to system memory.
     ccs_backup: Option<Arc<GemObject>>,
+    /// A foreign dma-buf's mapped DMA addresses, one per 4 KiB page, once
+    /// its attachment is mapped (`xe_bo_move` of a `ttm_bo_type_sg` BO). The
+    /// exporter owns the memory; nothing here is freed.
+    foreign: Vec<u64>,
     /// `size` is charged to the system-memory LIVE_BYTES bound.
     charged: bool,
 }
@@ -65,6 +69,11 @@ impl Iterator for GemPages<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if !self.backing.foreign.is_empty() {
+            let page = self.backing.foreign.get(self.index).copied();
+            self.index += usize::from(page.is_some());
+            return page;
+        }
         let frame_count = self.backing.frames.len();
         if self.index < frame_count {
             let phys = self.backing.frames[self.index].start_address().raw();
@@ -130,6 +139,9 @@ pub struct GemObject {
     system_ccs: Mutex<bool>,
     /// Published VM bindings naming this object (Linux xe_bo_is_vm_bound).
     vm_binds: core::sync::atomic::AtomicU32,
+    /// `bo->pxp_key_instance`: the PXP key iteration a HWDRM object was
+    /// created against (xe_pxp_key_assign); 0 for an unprotected object.
+    pxp_key: core::sync::atomic::AtomicU32,
     size: u64,
     offset: u64,
     vm_owner: Option<u64>,
@@ -137,7 +149,29 @@ pub struct GemObject {
     pat_index: Option<u8>,
     /// Serializes kernel CPU copies; never forms references to mapped data.
     cpu: IrqSafeSpinLock<()>,
-    pub(crate) dma_buf: DmaBufObject,
+    /// The reservation and name every dma-buf of this object shares, and
+    /// that a foreign import shares too (Linux `dma_buf->resv`).
+    pub(crate) dma_buf: Arc<DmaBufObject>,
+    /// Exported dma-buf attachments and their pins.
+    prime: IrqSafeSpinLock<PrimeState>,
+    /// DRM_XE_GEM_CREATE placed this object in VRAM only: no system
+    /// placement, so `xe_bo_can_migrate(bo, XE_PL_TT)` is false.
+    vram_only: AtomicBool,
+    /// Another device's dma-buf imported into this open: Linux
+    /// `xe_dma_buf_create_obj`'s `ttm_bo_type_sg` BO and its attachment.
+    import: Option<crate::intel_gpu_prime::Import>,
+}
+
+/// The dma-buf side of an exporter object (Linux `dmabuf->attachments` and
+/// `xe_bo_pin_external`'s pin count).
+#[derive(Debug, Default)]
+struct PrimeState {
+    /// Attachments whose importer reaches this object peer-to-peer.
+    peer: u32,
+    /// Attachments that need system memory.
+    host: u32,
+    /// External (dma-buf) pins.
+    pins: u32,
 }
 
 /// Where [`GemState::create_placed`] puts an object's storage.
@@ -210,6 +244,7 @@ impl GemObject {
                 frames,
                 vram: None,
                 ccs_backup: None,
+                foreign: Vec::new(),
                 charged: true,
             }),
             storage: AtomicU8::new(STORAGE_SYSTEM),
@@ -226,13 +261,17 @@ impl GemObject {
             no_compression: AtomicBool::new(false),
             system_ccs: Mutex::new(false),
             vm_binds: core::sync::atomic::AtomicU32::new(0),
+            pxp_key: core::sync::atomic::AtomicU32::new(0),
             size,
             offset,
             vm_owner: None,
             read_only: false,
             pat_index: None,
             cpu: IrqSafeSpinLock::new(()),
-            dma_buf: DmaBufObject::new(),
+            dma_buf: Arc::new(DmaBufObject::new()),
+            prime: IrqSafeSpinLock::new(PrimeState::default()),
+            vram_only: AtomicBool::new(false),
+            import: None,
         })
     }
 
@@ -336,6 +375,16 @@ impl GemObject {
 
     pub(crate) fn mark_scanout(&self) {
         self.scanout.store(true, Ordering::Release);
+    }
+
+    /// xe_pxp_key_assign: mark a new HWDRM object with the current key.
+    pub(crate) fn set_pxp_key(&self, instance: u32) {
+        self.pxp_key.store(instance, Ordering::Release);
+    }
+
+    /// `bo->pxp_key_instance` (xe_bo_is_protected when nonzero).
+    pub(crate) fn pxp_key(&self) -> u32 {
+        self.pxp_key.load(Ordering::Acquire)
     }
 
     /// Bound in some VM's published mapping set (Linux xe_bo_is_vm_bound).
@@ -453,10 +502,121 @@ impl GemObject {
         if !allow_scanout && self.scanout() {
             return false;
         }
-        if !self.idle(true) {
+        if self.externally_pinned() || !self.idle(true) {
             return false;
         }
         !cpu_mapping::has_active_aliases(self)
+    }
+
+    /// Record a VRAM-only DRM_XE_GEM_CREATE placement (no system bit).
+    pub(crate) fn mark_vram_only(&self) {
+        self.vram_only.store(true, Ordering::Release);
+    }
+    /// Linux `xe_bo_can_migrate(bo, XE_PL_TT)`: the creation placements
+    /// include system memory. It is a property of the placement list, not of
+    /// the current placement: an evicted VRAM-only object still answers no.
+    /// An imported (`ttm_bo_type_sg`) object never migrates.
+    pub(crate) fn can_migrate_to_system(&self) -> bool {
+        !self.vram_only.load(Ordering::Acquire) && self.import.is_none()
+    }
+    /// A foreign device's dma-buf imported into this open.
+    pub(crate) fn is_imported(&self) -> bool {
+        self.import.is_some()
+    }
+    pub(crate) fn import(&self) -> Option<&crate::intel_gpu_prime::Import> {
+        self.import.as_ref()
+    }
+    /// The exporter object and card a re-export of this import names: Linux
+    /// `drm_gem_prime_handle_to_dmabuf` returns `import_attach->dmabuf`.
+    pub(crate) fn prime_origin(&self) -> Option<(u32, Arc<GemObject>)> {
+        self.import
+            .as_ref()
+            .map(|import| (import.card(), import.exporter_object().clone()))
+    }
+    /// The mapped attachment's pages are installed (see `GemBacking::foreign`).
+    pub(crate) fn import_mapped(&self) -> bool {
+        !self.backing.lock().foreign.is_empty()
+    }
+    /// Install an import's mapped pages once; they must cover the object.
+    pub(crate) fn install_import_pages(&self, pages: Vec<u64>) -> Result<(), FsError> {
+        if self.import.is_none() || pages.len() as u64 * PAGE != self.size {
+            return Err(FsError::InvalidData);
+        }
+        let mut backing = self.backing.lock();
+        if backing.foreign.is_empty() {
+            backing.foreign = pages;
+        }
+        Ok(())
+    }
+    /// `xe_dma_buf_attach` / `xe_dma_buf_detach` on this exporter object.
+    pub(crate) fn prime_attach(&self, peer2peer: bool) {
+        let mut prime = self.prime.lock();
+        if peer2peer {
+            prime.peer += 1;
+        } else {
+            prime.host += 1;
+        }
+    }
+    pub(crate) fn prime_detach(&self, peer2peer: bool) {
+        let mut prime = self.prime.lock();
+        let count = if peer2peer {
+            &mut prime.peer
+        } else {
+            &mut prime.host
+        };
+        *count = count.checked_sub(1).expect("balanced dma-buf attachment");
+    }
+    /// Pinned by a dma-buf importer (`xe_bo_pin_external`).
+    pub(crate) fn externally_pinned(&self) -> bool {
+        self.prime.lock().pins != 0
+    }
+    /// The CPU (and PCI bus) address of a wholly CPU-visible VRAM object
+    /// through the LMEM BAR; `None` for system memory or any nonvisible part
+    /// (`xe_ttm_vram_mgr_alloc_sgt` refuses `used_visible_size < size`).
+    pub(crate) fn lmem_bar_address(&self) -> Option<u64> {
+        self.backing.lock().vram.as_ref()?.cpu_address()
+    }
+
+    /// `xe_dma_buf_pin`'s placement rules, then `xe_bo_pin_external`.
+    /// VRAM stays only while every attachment of the buffer is
+    /// peer-to-peer; otherwise an unpinned object migrates to system memory
+    /// first (`xe_bo_migrate(bo, XE_PL_TT)`, here the eviction copy job). An
+    /// object already pinned in VRAM refuses a system-memory pin (EINVAL,
+    /// "Can't migrate pinned bo for dma-buf pin"). NARF has no display pin
+    /// count, so a VRAM scanout object counts as pinned. Pins exclude
+    /// eviction and migration until [`Self::unpin_external`].
+    pub(crate) async fn pin_external(
+        self: &Arc<Self>,
+        backend: &dyn crate::intel_gpu_user::UserBackend,
+        epoch: Option<u64>,
+    ) -> Result<(), FsError> {
+        let _migrating = self.migrating.lock().await;
+        let (allow_vram, pinned) = {
+            let prime = self.prime.lock();
+            (prime.host == 0, prime.pins != 0)
+        };
+        let pinned = pinned || (self.scanout() && self.is_vram());
+        if pinned && self.is_vram() && !allow_vram {
+            return Err(FsError::InvalidData);
+        }
+        if !allow_vram && self.is_vram() {
+            // xe_bo_migrate: -EINVAL without a system placement.
+            if !self.can_migrate_to_system() {
+                return Err(FsError::InvalidData);
+            }
+            let epoch = epoch.ok_or(FsError::NoDevice)?;
+            // TTM waits for the object's fences before the move; the NARF
+            // eviction copy requires an idle object.
+            self.wait_idle(true, None).await?;
+            self.evict_locked(backend, epoch, false).await?;
+        }
+        self.prime.lock().pins += 1;
+        Ok(())
+    }
+    /// `xe_bo_unpin_external`.
+    pub(crate) fn unpin_external(&self) {
+        let mut prime = self.prime.lock();
+        prime.pins = prime.pins.checked_sub(1).expect("balanced dma-buf pin");
     }
     pub(crate) fn vram_page_size(&self) -> u64 {
         self.vram_page_sz.load(Ordering::Acquire)
@@ -598,6 +758,11 @@ impl GemObject {
         if self.is_userptr() || matches!(self.ccs.load(Ordering::Acquire), 1..=3) {
             return Err(FsError::InvalidData);
         }
+        // A foreign import's pages belong to the exporter (or are a peer
+        // BAR): no kernel copy, CPU alias or mmap reaches them here.
+        if self.is_imported() {
+            return Err(FsError::Unsupported);
+        }
         if offset
             .checked_add(len as u64)
             .is_none_or(|end| end > self.size)
@@ -711,6 +876,7 @@ impl GemObject {
         access: &mut dyn FnMut() -> bool,
     ) -> bool {
         if self.is_vram()
+            || self.is_imported()
             || offset % PAGE != 0
             || bytes.is_empty()
             || bytes.len() > 16384
@@ -871,13 +1037,24 @@ impl GemObject {
         allow_scanout: bool,
     ) -> Result<u64, FsError> {
         let _migrating = self.migrating.lock().await;
+        self.evict_locked(backend, epoch, allow_scanout).await
+    }
+
+    /// [`Self::evict_to_system`] under the caller's `migrating` guard. A
+    /// dma-buf pin holds the placement (`xe_bo_migrate` -EBUSY).
+    async fn evict_locked(
+        self: &Arc<Self>,
+        backend: &dyn crate::intel_gpu_user::UserBackend,
+        epoch: u64,
+        allow_scanout: bool,
+    ) -> Result<u64, FsError> {
         if !self.is_vram() {
             return Ok(0);
         }
         if self.vm_owner.is_some() || self.private_staging || self.is_userptr() || self.is_wc() {
             return Err(FsError::Unsupported);
         }
-        if (!allow_scanout && self.scanout()) || !self.idle(true) {
+        if (!allow_scanout && self.scanout()) || self.externally_pinned() || !self.idle(true) {
             return Err(FsError::Busy);
         }
         cpu_mapping::retire_object(self)?;
@@ -967,13 +1144,18 @@ impl GemObject {
                 Err(FsError::InvalidData)
             };
         }
-        if self.vm_owner.is_some() || self.private_staging || self.is_userptr() || self.is_wc() {
+        if self.vm_owner.is_some()
+            || self.private_staging
+            || self.is_userptr()
+            || self.is_wc()
+            || self.is_imported()
+        {
             return Err(FsError::Unsupported);
         }
         if self.size == 0 || self.size % pool.page_size() != 0 {
             return Err(FsError::InvalidData);
         }
-        if !self.idle(true) {
+        if self.externally_pinned() || !self.idle(true) {
             return Err(FsError::Busy);
         }
         cpu_mapping::retire_object(self)?;
@@ -1604,16 +1786,88 @@ impl GemState {
             .ok_or(FsError::NotFound)
     }
 
+    /// `xe_gem_prime_export`'s admission. A VRAM object exports as it is:
+    /// each importer's attachment decides peer-to-peer access or migration
+    /// (`crate::intel_gpu_prime`). A same-card import shares the object.
+    // LINUX-GAP: xe_gem_prime_export first validates the object into its
+    // preferred placement; NARF leaves an evicted object where it is.
     pub(crate) fn export_object(&self, handle: u32) -> Result<Arc<GemObject>, FsError> {
         let object = self.object(handle)?;
         if object.vm_owner.is_some() || object.is_userptr() {
             return Err(FsError::InvalidData);
         }
-        // Importers expect host pages; VRAM would need migration or P2P.
-        if object.is_vram() {
-            return Err(FsError::NotImplemented);
-        }
         Ok(object)
+    }
+
+    /// The handle this open already holds for an import of `exporter`
+    /// (`drm_prime_lookup_buf_handle` on a reimport of the same dma-buf).
+    pub(crate) fn imported_handle(&self, exporter: &Arc<GemObject>) -> Option<u32> {
+        self.handles
+            .lock()
+            .objects
+            .iter()
+            .find(|(_, object)| {
+                object
+                    .import
+                    .as_ref()
+                    .is_some_and(|import| Arc::ptr_eq(import.exporter_object(), exporter))
+            })
+            .map(|(handle, _)| *handle)
+    }
+
+    /// `xe_dma_buf_create_obj` + `drm_gem_handle_create` for a foreign
+    /// dma-buf: a system-placed object over the attachment, sharing the
+    /// exporter's reservation. Its pages appear when the attachment is mapped
+    /// (first VM bind). It is never CPU-mapped, migrated or compressed and is
+    /// not charged to the system-memory bound: the exporter owns the memory.
+    pub(crate) fn import_attachment(
+        &self,
+        import: crate::intel_gpu_prime::Import,
+    ) -> Result<u32, FsError> {
+        let exporter = import.exporter_object().clone();
+        let size = exporter.size;
+        let offset = NEXT_MMAP
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |offset| {
+                offset
+                    .checked_add(size + PAGE)
+                    .filter(|next| *next < 1 << 63)
+            })
+            .map_err(|_| FsError::OutOfMemory)?;
+        let mut object = GemObject::allocate(0, offset)?;
+        object.backing.lock().charged = false;
+        object.size = size;
+        object.dma_buf = exporter.dma_buf.clone();
+        object.no_compression.store(true, Ordering::Release);
+        object.import = Some(import);
+        let object = Arc::new(object);
+        let mut handles = self.handles.lock();
+        let existing = handles
+            .objects
+            .iter()
+            .find(|(_, entry)| {
+                entry
+                    .import
+                    .as_ref()
+                    .is_some_and(|import| Arc::ptr_eq(import.exporter_object(), &exporter))
+            })
+            .map(|(handle, _)| *handle);
+        let next = handles.next.checked_add(1);
+        let result = match (existing, next) {
+            // A racing reimport won; this attachment detaches below.
+            (Some(handle), _) => Ok(handle),
+            (None, Some(next)) if self.capacity(&handles, size) => {
+                let handle = handles.next;
+                handles.next = next;
+                handles.objects.insert(handle, object.clone());
+                handles.bytes += size;
+                Ok(handle)
+            }
+            (None, _) => Err(FsError::OutOfMemory),
+        };
+        drop(handles);
+        // An unpublished import's attachment detaches outside the handle lock.
+        drop(object);
+        result
     }
 
     /// Same-card PRIME import. Reimporting the same object on an open returns
@@ -1652,7 +1906,11 @@ impl GemState {
 
     pub fn mmap_offset(&self, handle: u32) -> Result<u64, FsError> {
         let object = self.object(handle)?;
-        if object.is_gpu_only() || object.private_staging || object.is_userptr() {
+        if object.is_gpu_only()
+            || object.private_staging
+            || object.is_userptr()
+            || object.is_imported()
+        {
             return Err(FsError::Unsupported);
         }
         Ok(object.offset)

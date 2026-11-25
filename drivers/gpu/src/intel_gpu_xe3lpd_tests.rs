@@ -91,11 +91,16 @@ fn smoke_xe3lpd_gmd_decode_admits_display30_through_decode_all() -> TestResult {
         DisplayIp::decode(30 << 22),
         Err(IpError::Unqualified { ver: 30, rel: 0 })
     );
+    // Nova Lake-S 35.00 is decode_all's too; its own route admits it.
+    assert_eq!(DisplayIp::decode_all(35 << 22), Ok(DisplayIp::NovaLakeS));
+    assert_eq!(
+        DisplayIp::decode(35 << 22),
+        Err(IpError::Unqualified { ver: 35, rel: 0 })
+    );
     for gmd in [
         14 << 22,
         20 << 22,
         0,
-        35 << 22,
         (14 << 22) | (1 << 14),
         (20 << 22) | (1 << 14),
     ] {

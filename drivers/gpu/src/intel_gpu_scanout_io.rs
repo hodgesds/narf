@@ -56,7 +56,7 @@ pub(crate) const fn display_pte(generation: Generation) -> Option<(PteFormat, u8
         // Gen11 has no KMS owner in Lane 1 (display lands in Lane 4).
         Generation::IceLake => None,
         // Gen9 has no KMS owner in Lane 1 (display lands in Lane 5).
-        Generation::Skylake => None,
+        Generation::Skylake | Generation::Broxton => None,
         Generation::RocketLake => None,
         Generation::MeteorLake => Some((PteFormat::XeLpg, 1)),
         Generation::LunarLake => Some((PteFormat::Xe2, 3)),
@@ -165,7 +165,7 @@ pub(crate) fn display_pat_programmed(
         // Gen11 has no display owner in Lane 1; nothing programmed it.
         Generation::IceLake => false,
         // Gen9 has no display owner in Lane 1; nothing programmed it.
-        Generation::Skylake => false,
+        Generation::Skylake | Generation::Broxton => false,
         Generation::RocketLake => false,
         Generation::MeteorLake => io.read32(0x4804) == 4,
         Generation::LunarLake => io.read32(0x480c) == 0x3c,

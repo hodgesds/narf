@@ -46,6 +46,18 @@ pub(super) fn scanout(
     len: u64,
     fb: GenericFb,
 ) -> Option<GenericFb> {
+    scanout_on(io, aperture, len, fb, 4)
+}
+
+/// [`scanout`] over the first `pipes` pipes: displays 9 and 11 have three,
+/// and their Pipe D registers are not read.
+pub(super) fn scanout_on(
+    io: &impl MmioWindow,
+    aperture: u64,
+    len: u64,
+    fb: GenericFb,
+    pipes: usize,
+) -> Option<GenericFb> {
     let offset = fb.addr.checked_sub(aperture)?;
     // Hotplug and native scanout may use the fixed GGTT windows starting
     // at 16 MiB. Their PTEs must never alias the retained firmware mapping.
@@ -66,6 +78,7 @@ pub(super) fn scanout(
     }
     if ![Pipe::A, Pipe::B, Pipe::C, Pipe::D]
         .into_iter()
+        .take(pipes)
         .any(|pipe| matches_pipe(io, pipe, fb, offset))
         || !io.display_access_ok()
     {
@@ -100,6 +113,27 @@ impl FirmwareRenderHandoff {
             TigerLake => 6,
             Dg1 => return None,
         };
+        Self::with_sprites(sprites, io, aperture, len, fb)
+    }
+
+    /// The Meteor/Arrow Lake (display 14) desktop handoff: the same skl
+    /// universal-plane proof with display 14's four sprites per pipe.
+    pub(super) fn discover_display14(
+        io: &impl MmioWindow,
+        aperture: u64,
+        len: u64,
+        fb: GenericFb,
+    ) -> Option<Self> {
+        Self::with_sprites(4, io, aperture, len, fb)
+    }
+
+    fn with_sprites(
+        sprites: u64,
+        io: &impl MmioWindow,
+        aperture: u64,
+        len: u64,
+        fb: GenericFb,
+    ) -> Option<Self> {
         const {
             assert!(
                 crate::intel_gpu_gtt::SCANOUT_GTT_OFFSET_PIPE_A
@@ -307,6 +341,8 @@ mod tests {
             assert!(FirmwareRenderHandoff::discover(family, &io, aperture, size, fb).is_some());
         }
         assert!(FirmwareRenderHandoff::discover(Dg1, &io, aperture, size, fb).is_none());
+        // Meteor/Arrow Lake desktops: display 14's universal planes.
+        assert!(FirmwareRenderHandoff::discover_display14(&io, aperture, size, fb).is_some());
         let handoff = FirmwareRenderHandoff::discover(AlderLakeP, &io, aperture, size, fb).unwrap();
         let pipe = Pipe::B.base();
         let mut frame = None;
@@ -358,6 +394,31 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/drm_ioctl", smoke_gen12_firmware_render_handoff);
+
+    /// Displays 9 and 11 have three pipes: a GOP primary on Pipe B matches
+    /// over three pipes, and a Pipe D one is found only when four are read.
+    fn smoke_firmware_scanout_on_three_pipes() -> TestResult {
+        let (io, aperture, size, fb) = external_gop();
+        if scanout_on(&io, aperture, size, fb, 3).is_none() {
+            return TestResult::Fail("a Pipe B GOP primary matches on a three-pipe display");
+        }
+        let shift = Pipe::D.base() - Pipe::B.base();
+        let pipe_d = Registers(
+            io.0.iter()
+                .map(|&(reg, value)| (reg + shift, value))
+                .collect(),
+        );
+        if scanout_on(&pipe_d, aperture, size, fb, 3).is_some()
+            || scanout(&pipe_d, aperture, size, fb).is_none()
+        {
+            return TestResult::Fail("Pipe D is read only on four-pipe displays");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm_ioctl",
+        smoke_firmware_scanout_on_three_pipes
+    );
 
     fn smoke_gen12_external_firmware_kms() -> TestResult {
         let (mut io, aperture, size, fb) = external_gop();

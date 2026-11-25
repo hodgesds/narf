@@ -214,6 +214,18 @@ pub enum Gen9Platform {
     Skylake,
     KabyLake,
     CometLake,
+    /// Broxton / Apollo Lake (`IS_BROXTON`, Gen9 LP).
+    Broxton,
+    /// Gemini Lake (`IS_GEMINILAKE`, Gen9 LP).
+    GeminiLake,
+}
+
+impl Gen9Platform {
+    /// `IS_GEN9_LP`: no LLC, one slice, the CHV-style PPAT and the
+    /// Broxton MOCS table. No Gen9 big-core display path applies.
+    pub const fn is_lp(self) -> bool {
+        matches!(self, Self::Broxton | Self::GeminiLake)
+    }
 }
 
 /// The first Comet Lake PCI revision that takes the `cml_*` GuC and HuC
@@ -334,6 +346,8 @@ impl GtPlatform {
                 "skylake" => Some(Gen9Platform::Skylake),
                 "kabylake" | "coffeelake" | "whiskeylake" => Some(Gen9Platform::KabyLake),
                 "cometlake" => Some(Gen9Platform::CometLake),
+                "broxton" => Some(Gen9Platform::Broxton),
+                "geminilake" => Some(Gen9Platform::GeminiLake),
                 _ => None,
             };
             return Some(gen9.map_or(Self::Integrated(entry.generation), Self::Gen9));
@@ -511,7 +525,8 @@ impl GtPlatform {
                 | Generation::RocketLake
                 | Generation::AlderLake
                 | Generation::IceLake
-                | Generation::Skylake,
+                | Generation::Skylake
+                | Generation::Broxton,
             ) => 39,
         }
     }
@@ -602,6 +617,9 @@ impl GtPlatform {
             // Lane 7's. This arm is CML below revision 5; the
             // rev>=5 blob is `guc_for_revision`'s.
             Self::Gen9(Gen9Platform::Skylake) => ("i915/skl_guc_70.1.1.bin", (70, 1, 1)),
+            // `fw_def(BROXTON, 0, guc_mmp(bxt, 70, 1, 1))`, likewise GLK.
+            Self::Gen9(Gen9Platform::Broxton) => ("i915/bxt_guc_70.1.1.bin", (70, 1, 1)),
+            Self::Gen9(Gen9Platform::GeminiLake) => ("i915/glk_guc_70.1.1.bin", (70, 1, 1)),
             Self::Gen9(Gen9Platform::KabyLake | Gen9Platform::CometLake) => {
                 ("i915/kbl_guc_70.1.1.bin", (70, 1, 1))
             }
@@ -719,6 +737,18 @@ mod tests {
                 (70, 1, 1),
             ),
             (
+                0x5a85,
+                GtPlatform::Gen9(Gen9Platform::Broxton),
+                "i915/bxt_guc_70.1.1.bin",
+                (70, 1, 1),
+            ),
+            (
+                0x3185,
+                GtPlatform::Gen9(Gen9Platform::GeminiLake),
+                "i915/glk_guc_70.1.1.bin",
+                (70, 1, 1),
+            ),
+            (
                 0x56a0,
                 GtPlatform::Alchemist,
                 "i915/dg2_guc_70.bin",
@@ -819,6 +849,8 @@ mod tests {
             GtPlatform::Gen9(Gen9Platform::Skylake),
             GtPlatform::Gen9(Gen9Platform::KabyLake),
             GtPlatform::Gen9(Gen9Platform::CometLake),
+            GtPlatform::Gen9(Gen9Platform::Broxton),
+            GtPlatform::Gen9(Gen9Platform::GeminiLake),
             GtPlatform::Gen11(Gen11Platform::IceLake),
             GtPlatform::Gen11(Gen11Platform::ElkhartLake),
             GtPlatform::Gen11(Gen11Platform::JasperLake),
@@ -866,6 +898,9 @@ mod tests {
             (GtPlatform::Gen9(Gen9Platform::Skylake), 39),
             (GtPlatform::Gen9(Gen9Platform::KabyLake), 39),
             (GtPlatform::Gen9(Gen9Platform::CometLake), 39),
+            // GEN9_LP_FEATURES `.dma_mask_size = 39`.
+            (GtPlatform::Gen9(Gen9Platform::Broxton), 39),
+            (GtPlatform::Gen9(Gen9Platform::GeminiLake), 39),
             (GtPlatform::Integrated(Generation::MeteorLake), 46),
             (GtPlatform::ArcticSoundM, 46),
             (GtPlatform::Alchemist, 46),

@@ -131,6 +131,21 @@ struct State {
     gsc_reported: Option<crate::intel_gpu_gt::media::gsc::load::Status>,
     /// Routing the GSC sources onto GT0's delivery failed; the GSC is polled.
     gsc_irq_failed: bool,
+    /// `narf.intel.pxp=1` beside the GSC: struct xe_pxp and its hardware
+    /// half for the device's lifetime, once xe_pxp_init succeeded.
+    pxp: Option<PxpOwner>,
+    /// xe_pxp_init ran (once per device, on the first eligible GT1).
+    pxp_tried: bool,
+    /// Routing the KCR causes failed: terminations then never complete and
+    /// a start that needs one times out.
+    kcr_irq_failed: bool,
+}
+
+/// `struct xe_pxp`: the state the uAPI shares, and the worker's engine over
+/// the GSC client object.
+struct PxpOwner {
+    pxp: Arc<crate::intel_gpu_gt::media::pxp::Pxp>,
+    engine: crate::intel_gpu_gt::media::pxp::Engine<crate::intel_gpu_gt::media::pxp::GemClient>,
 }
 
 type GscOwner = crate::intel_gpu_gt::media::gsc::owner::GscOwner<
@@ -197,6 +212,29 @@ enum DisplayOwner {
     LunarLake,
     PantherLake,
     Firmware(crate::intel_gpu::FirmwareRenderHandoff),
+    /// Nova Lake-S display 35 still scanning its firmware primary
+    /// (`narf.intel.nvl_display`): fixed-mode KMS, and the GT starts
+    /// display-preserving beside it, never with the headless driver FLR.
+    NovaLake,
+    /// Nova Lake-S display 35 owned by its route (`narf.intel.nvl_modeset`):
+    /// the panel lit through the LT PHY, an owned console with its KMS owner,
+    /// and the display-preserving GT beside it. Turns the panel off before
+    /// system suspend and relights it on resume (`intel_gpu_xe3plpd::relight`).
+    NovaLakeOwned,
+}
+
+/// Whether a GT owner beside `display` may take part in system suspend. A
+/// retained firmware surface (a Gen12 GOP or Nova's firmware primary) has no
+/// S3 relight owner; Nova's owned route does.
+const fn display_suspend_admitted(display: DisplayOwner, smallbar: bool) -> bool {
+    !matches!(display, DisplayOwner::Firmware(_) | DisplayOwner::NovaLake)
+        && system_suspend_admitted(
+            smallbar,
+            matches!(
+                display,
+                DisplayOwner::LunarLake | DisplayOwner::PantherLake | DisplayOwner::NovaLakeOwned
+            ),
+        )
 }
 
 struct Pending {
@@ -215,14 +253,7 @@ struct Pending {
 
 impl Pending {
     fn allows_system_suspend(&self) -> bool {
-        !matches!(self.display, DisplayOwner::Firmware(_))
-            && system_suspend_admitted(
-                self.smallbar,
-                matches!(
-                    self.display,
-                    DisplayOwner::LunarLake | DisplayOwner::PantherLake
-                ),
-            )
+        display_suspend_admitted(self.display, self.smallbar)
     }
 }
 
@@ -275,10 +306,29 @@ pub(crate) fn ptl_profile(
     }
 }
 
+/// [`lnl_profile`] for Nova Lake-S's owned display-35 route: the
+/// display-preserving profile only for Nova Lake-S with the owned route and
+/// its lit mode; `Headless` for every function without the route.
+pub(crate) fn nvl_profile(
+    platform: GtPlatform,
+    nvl_owned: bool,
+    has_mode: bool,
+) -> Option<LnlProfile> {
+    if !platform.is_headless_integrated() {
+        return None;
+    }
+    match (nvl_owned, platform == GtPlatform::NovaLakeS && has_mode) {
+        (false, _) => Some(LnlProfile::Headless),
+        (true, true) => Some(LnlProfile::DisplayPreserving),
+        (true, false) => None,
+    }
+}
+
 /// Small-BAR discrete profiles remain D0-only until aperture-free CPU/GTT
-/// eviction lands; Display 20 (Lunar Lake) and Display 30 (Panther Lake)
-/// own panel power-off/on and relight across S3.
-pub(crate) fn system_suspend_admitted(smallbar: bool, _lnl_display: bool) -> bool {
+/// eviction lands; Display 20 (Lunar Lake), Display 30 (Panther Lake) and
+/// Nova Lake-S's owned display 35 own panel power-off/on and relight across
+/// S3.
+pub(crate) const fn system_suspend_admitted(smallbar: bool, _lnl_display: bool) -> bool {
     !smallbar
 }
 
@@ -302,6 +352,8 @@ struct Owner {
     user_engines: Arc<core::sync::atomic::AtomicU32>,
     /// Published standalone media GT (native Xe gt_id 1), opt-in only.
     user_media: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::MediaGtStatus>>>,
+    /// `xe->pxp` once xe_pxp_init succeeded (`narf.intel.pxp=1`).
+    user_pxp: IrqSafeSpinLock<Option<Arc<crate::intel_gpu_gt::media::pxp::Pxp>>>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     eu_info: IrqSafeSpinLock<Option<crate::intel_gpu_eu_stall::Info>>,
     oa_info: IrqSafeSpinLock<Option<crate::intel_gpu_oa::Device>>,
@@ -1065,8 +1117,10 @@ impl crate::intel_gpu_user::UserBackend for Backend {
         // observed its two firmware frames. Advertise Mesa submission on
         // that route only after the live engine has passed the normal probes.
         self.owner.upgrade().is_some_and(|owner| {
-            !matches!(owner.pending.display, DisplayOwner::Firmware(_))
-                || self.epoch.load(Ordering::Acquire) != 0
+            !matches!(
+                owner.pending.display,
+                DisplayOwner::Firmware(_) | DisplayOwner::NovaLake
+            ) || self.epoch.load(Ordering::Acquire) != 0
         })
     }
     fn display_preserving(&self) -> bool {
@@ -1078,6 +1132,9 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             ) == Some(LnlProfile::DisplayPreserving)
                 || (matches!(owner.pending.display, DisplayOwner::PantherLake)
                     && ptl_profile(self.platform, true, owner.pending.mode.is_some())
+                        == Some(LnlProfile::DisplayPreserving))
+                || (matches!(owner.pending.display, DisplayOwner::NovaLakeOwned)
+                    && nvl_profile(self.platform, true, owner.pending.mode.is_some())
                         == Some(LnlProfile::DisplayPreserving))
         })
     }
@@ -1143,6 +1200,19 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 GtError::State => FsError::NoDevice,
                 _ => crate::intel_gpu_user::io_error(),
             })
+        })
+    }
+    fn pxp(&self) -> Option<Arc<crate::intel_gpu_gt::media::pxp::Pxp>> {
+        self.owner.upgrade()?.user_pxp.lock().clone()
+    }
+    fn pxp_wakeref(&self) -> narf_filesystem::FsFuture<'_, Box<dyn core::any::Any + Send>> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let awake = owner.pxp_wakeref().await?;
+            Ok(Box::new(awake) as Box<dyn core::any::Any + Send>)
         })
     }
     fn media_gt(&self) -> Option<crate::intel_gpu_user::MediaGtStatus> {
@@ -1495,6 +1565,25 @@ impl narf_filesystem::mmap_relocation::DeviceFrameRefault for VramRefault {
 static PENDING: IrqSafeSpinLock<Vec<Pending>> = IrqSafeSpinLock::new(Vec::new());
 static OWNERS: IrqSafeSpinLock<Vec<Arc<Owner>>> = IrqSafeSpinLock::new(Vec::new());
 
+/// The PCI function behind DRM card `card`, when a GT owner (started or
+/// still pending) holds it: the provider or client of a cross-device dma-buf
+/// attachment's P2P distance (`crate::intel_gpu_prime`).
+pub(crate) fn pci_function(card: u32) -> Option<BusDevice> {
+    if let Some(device) = OWNERS
+        .lock()
+        .iter()
+        .find(|owner| owner.pending.index == card)
+        .map(|owner| owner.pending.device)
+    {
+        return Some(device);
+    }
+    PENDING
+        .lock()
+        .iter()
+        .find(|pending| pending.index == card)
+        .map(|pending| pending.device)
+}
+
 /// Probe installs only identity and authority. Late spawns survive executor
 /// startup; firmware scanning completes before these tasks start polling.
 pub(crate) fn install(
@@ -1563,6 +1652,41 @@ pub(crate) fn install_ptl_display(
     )
 }
 
+/// The Nova Lake-S display-35 route's GT owner after the owned takeover:
+/// with the owned console (`owned`), the display-preserving profile beside
+/// the panel's `mode`, admitting system suspend; with the firmware surface
+/// retained, the firmware route's owner. Refused for anything that is not
+/// Nova Lake-S with a lit mode.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_nvl_display(
+    index: u32,
+    card: Arc<IntelGpuCard>,
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    bar: narf_bus::bar::MmioRegion,
+    mode: Option<crate::intel_gpu_modeset::Mode>,
+    owned: bool,
+) -> bool {
+    let profile = GtPlatform::from_pci(device.id.vendor, device.id.device)
+        .and_then(|platform| nvl_profile(platform, true, mode.is_some()));
+    if profile != Some(LnlProfile::DisplayPreserving) {
+        return false;
+    }
+    if owned {
+        install_profile(
+            index,
+            card,
+            device,
+            cap,
+            bar,
+            mode,
+            DisplayOwner::NovaLakeOwned,
+        )
+    } else {
+        install_profile(index, card, device, cap, bar, None, DisplayOwner::NovaLake)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_profile(
     index: u32,
@@ -1579,8 +1703,26 @@ fn install_profile(
         .and_then(crate::intel_gpu_legacy_gt::LegacyGt::for_platform)
         .is_some()
     {
-        let revision = narf_bus::pci::read_config32(&cap, &device, 0x08).map_or(0, |v| v as u8);
-        return crate::intel_gpu_legacy_owner::install(index, card, &device, revision, bar);
+        let config = |offset| narf_bus::pci::read_config32(&cap, &device, offset).ok();
+        let revision = config(0x08).map_or(0, |v| v as u8);
+        // INTEL_BSM and SNB_GMCH_CTRL: the DSM Gen9 LP's BIOS RC6 setup uses.
+        let dsm = config(0x5c)
+            .zip(config(0x50))
+            .and_then(|(bsm, gmch)| crate::intel_gpu_legacy_power::gen9_dsm(bsm, gmch));
+        return crate::intel_gpu_legacy_owner::install(index, card, &device, revision, dsm, bar);
+    }
+    // A graphics 9 or 11 part without an execlists profile never takes the
+    // GuC start below, though it has a GuC blob: i915 submits through the
+    // GuC only from graphics 12 (`uc_expand_default_options`).
+    if matches!(
+        GtPlatform::from_pci(device.id.vendor, device.id.device),
+        Some(GtPlatform::Gen9(_) | GtPlatform::Gen11(_))
+    ) {
+        log(
+            index,
+            "no execlists profile for this graphics 9 part; GT not started",
+        );
+        return false;
     }
     if GtPlatform::from_pci(device.id.vendor, device.id.device)
         .and_then(GtPlatform::guc)
@@ -1718,6 +1860,9 @@ pub(crate) fn start_pending() {
                 gsc: None,
                 gsc_reported: None,
                 gsc_irq_failed: false,
+                pxp: None,
+                pxp_tried: false,
+                kcr_irq_failed: false,
             }),
             suspended: AtomicBool::new(false),
             user_epoch,
@@ -1726,6 +1871,7 @@ pub(crate) fn start_pending() {
             user_version: Arc::new(AtomicU32::new(0)),
             user_engines: Arc::new(core::sync::atomic::AtomicU32::new(0)),
             user_media: Arc::new(IrqSafeSpinLock::new(None)),
+            user_pxp: IrqSafeSpinLock::new(None),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
             eu_info: IrqSafeSpinLock::new(None),
             oa_info: IrqSafeSpinLock::new(None),
@@ -2105,6 +2251,32 @@ impl Owner {
                 return Err(RuntimeError::Configuration);
             }
             let receipt = crate::intel_gpu_gt::lnl::Receipt::admit_display_ptl(
+                p.device,
+                p.bar,
+                &mmio,
+                || validate_pci(p, &mmio).is_ok(),
+            )
+            .map_err(RuntimeError::Takeover)?;
+            SharedArena::new(
+                GgttArena::for_lnl_gt(p.bar, p.cap, p.device, receipt)
+                    .map_err(|_| RuntimeError::State)?,
+            )
+        } else if matches!(
+            p.display,
+            DisplayOwner::NovaLake | DisplayOwner::NovaLakeOwned
+        ) {
+            // Nova Lake-S display 35 on its firmware primary or its owned
+            // console: the display-preserving cold start (GT-only GuC and
+            // full reset, no driver FLR), admitted while only Pipe A's
+            // primary fetches. The owned route must still hold Pipe A.
+            if matches!(p.display, DisplayOwner::NovaLakeOwned)
+                && (nvl_profile(platform, true, p.mode.is_some())
+                    != Some(LnlProfile::DisplayPreserving)
+                    || !crate::intel_gpu_xe2lpd::route_owns_pipe_a())
+            {
+                return Err(RuntimeError::Configuration);
+            }
+            let receipt = crate::intel_gpu_gt::lnl::Receipt::admit_display_nvl(
                 p.device,
                 p.bar,
                 &mmio,
@@ -3137,6 +3309,18 @@ impl Owner {
                 irq.unroute_media();
                 irq.unroute_gsc();
             }
+            // GT1 left Running (a poll may also be pending while it runs): a
+            // PXP job in flight cannot finish, and the next GT1 start
+            // resumes PXP (xe_pxp_pm_suspend/resume).
+            if guc.state() != MediaGucState::Running {
+                if let Some(irq) = state.irq.as_ref() {
+                    irq.unroute_kcr();
+                }
+                if let Some(owner) = state.pxp.as_mut() {
+                    owner.engine.abort(&owner.pxp);
+                    owner.pxp.suspend();
+                }
+            }
         } else if let Some(publication) = guc.publication() {
             // Every engine executed and retired its private PPGTT job.
             *self.user_media.lock() = Some(crate::intel_gpu_user::MediaGtStatus {
@@ -3287,18 +3471,181 @@ impl Owner {
                 if gsc.wedged() { ", wedged" } else { "" }
             );
         }
+        self.service_pxp(state, now);
+    }
+
+    /// `narf.intel.pxp=1` beside a running GT1 with GSCCS0: xe_pxp_init
+    /// once, xe_pxp_pm_resume after every later GT1 start, the KCR route,
+    /// the readiness the uAPI reads, and the worker's PXP hardware steps.
+    /// Without the option nothing here runs.
+    fn service_pxp(&self, state: &mut State, now: u64) {
+        use crate::intel_gpu_gt::media::{pxp, MediaGucState, MediaWindow, PxpQueue};
+        use core::fmt::Write as _;
+        let platform =
+            GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device);
+        if !pxp::admitted(platform, narf_boot::args()) {
+            return;
+        }
+        let Some(platform) = platform else {
+            return;
+        };
+        let State {
+            gsc,
+            media_guc,
+            irq,
+            pxp: owner,
+            pxp_tried,
+            kcr_irq_failed,
+            ..
+        } = state;
+        let (Some(gsc), Some(guc)) = (gsc.as_mut(), media_guc.as_mut()) else {
+            return;
+        };
+        if guc.state() != MediaGucState::Running || !guc.gsccs_scheduled() {
+            return;
+        }
+        let media = MediaWindow::new(&self.pending.window);
+        if owner.is_none() {
+            if core::mem::replace(pxp_tried, true) {
+                return;
+            }
+            // xe_pxp_init: GSCCS0, loadable GSC firmware and (below media
+            // 35) loadable HuC firmware, then a VCS for terminations.
+            let gsc_ok = gsc.status().loadable();
+            let huc_ok = guc.huc_object().is_some();
+            if !gsc_ok || !huc_ok || guc.pxp_vcs().is_none() {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gt card{}: PXP skipped: unsatisfied deps (GSC {}, HuC {}, VCS {})",
+                    self.pending.index,
+                    gsc_ok,
+                    huc_ok,
+                    guc.pxp_vcs().is_some()
+                );
+                return;
+            }
+            pxp::kcr_set(&media, true);
+            let client = match pxp::GemClient::new(platform) {
+                Ok(client) => client,
+                Err(error) => {
+                    // out_kcr_disable; Linux then fails the probe.
+                    pxp::kcr_set(&media, false);
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "intel-gt card{}: PXP initialization failed ({}); PXP disabled",
+                        self.pending.index,
+                        error.errno()
+                    );
+                    return;
+                }
+            };
+            // xe_gsc_create_host_session_id: a random handle (never logged).
+            let session = narf_memory::kaslr::random_u64().0;
+            let shared = pxp::Pxp::new();
+            *owner = Some(PxpOwner {
+                pxp: shared.clone(),
+                engine: pxp::Engine::new(client, session),
+            });
+            *self.user_pxp.lock() = Some(shared);
+            log(self.pending.index, "PXP initialized; KCR enabled");
+        }
+        let owner = owner.as_mut().expect("PXP owner");
+        // xe_irq_enable_hwe's KCR pair, beside the GSC sources.
+        if let Some(irq) = irq.as_ref() {
+            if !irq.kcr_routed() && !*kcr_irq_failed {
+                if let Err(error) = irq.route_kcr() {
+                    *kcr_irq_failed = true;
+                    irq.unroute_kcr();
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "intel-gt card{}: KCR IRQ routing refused ({:?}); PXP terminations cannot complete",
+                        self.pending.index,
+                        error
+                    );
+                }
+            }
+        }
+        let events = irq.as_ref().map_or(0, |irq| irq.take_kcr_events());
+        // xe_pxp_pm_resume once GT1 runs again and no GSC load is pending.
+        // KCR causes latched before it belong to the stopped GT1 and are
+        // dropped, as xe_pm_runtime_get_if_active drops them.
+        if !owner.pxp.live() {
+            if !gsc.idle() {
+                return;
+            }
+            pxp::kcr_set(&media, true);
+            owner.pxp.resume(true);
+        } else {
+            owner.pxp.irq(events);
+        }
+        // The HuC is in error once either authentication failed.
+        let huc_error = gsc.huc() == Some(false) || guc.huc_outcome() == Some(false);
+        owner
+            .pxp
+            .publish(pxp::readiness(gsc.status().error(), huc_error, &media));
+        // New PXP work waits while the GSC worker runs; work in flight goes on.
+        let begin = gsc.idle();
+        let _ = owner
+            .engine
+            .poll(&owner.pxp, now, &mut PxpQueue::new(guc, now), &media, begin);
+    }
+
+    /// xe_pxp_pm_suspend before GT1 stops: the worker's PXP job finishes
+    /// (each step is bounded) or, when the stop cannot `wait`, fails as its
+    /// job would; then queues are killed and keys invalidated. `false`
+    /// while a job still runs.
+    fn suspend_pxp(&self, state: &mut State, now: u64, wait: bool) -> bool {
+        use crate::intel_gpu_gt::media::{MediaGucState, MediaWindow, PxpQueue};
+        let State { pxp, media_guc, .. } = state;
+        let Some(owner) = pxp.as_mut() else {
+            return true;
+        };
+        if !owner.engine.idle() {
+            let media = MediaWindow::new(&self.pending.window);
+            let done = match media_guc
+                .as_mut()
+                .filter(|guc| guc.state() == MediaGucState::Running)
+            {
+                Some(guc) => {
+                    owner
+                        .engine
+                        .quiesce(&owner.pxp, now, &mut PxpQueue::new(guc, now), &media)
+                }
+                // GT1 no longer runs: the job can never finish.
+                None => {
+                    owner.engine.abort(&owner.pxp);
+                    true
+                }
+            };
+            if !done {
+                if wait {
+                    return false;
+                }
+                owner.engine.abort(&owner.pxp);
+            }
+        }
+        owner.pxp.suspend();
+        true
     }
 
     /// Release the media GT owner's wake requests and advance a verified
     /// media GuC stop before any GT0 stop, park, suspend or fault cleanup.
     fn retire_media(&self, state: &mut State, now: u64) -> MediaRetire {
+        // xe_pxp_pm_suspend first: a PXP job in flight finishes before the
+        // media GuC stops, or fails when fault cleanup cannot wait.
+        let wait = !matches!(state.phase, Phase::Failed | Phase::Cleaning);
+        if !self.suspend_pxp(state, now, wait) {
+            return MediaRetire::Pending;
+        }
         *self.user_media.lock() = None;
         if let Some(irq) = state.irq.as_ref() {
             irq.unroute_media();
             irq.unroute_gsc();
+            irq.unroute_kcr();
         }
         state.media_irq_failed = false;
         state.gsc_irq_failed = false;
+        state.kcr_irq_failed = false;
         state.media_reported = false;
         state.media_guc_tried = false;
         state.media_recovered = false;
@@ -3335,6 +3682,12 @@ impl Owner {
     /// Await a proven media stop before GT0 leaves D0. False leaves the media
     /// GuC retained; the caller must not power down or rebuild the arena.
     async fn stop_media(&self, state: &mut State) -> bool {
+        // xe_pxp_pm_suspend: let a PXP job finish (bounded by its own
+        // deadlines) before the media GuC stops.
+        while !self.suspend_pxp(state, narf_time::monotonic_ns(), true) {
+            narf_scheduler::yield_now().await;
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(1000).as_instant()).await;
+        }
         // xe_gsc_stop_prepare: wait for a running GSC load (bounded by its
         // own step deadlines) before the media GuC stops.
         loop {
@@ -3533,6 +3886,14 @@ impl Owner {
     /// accessible: the function is in D0 and any runtime-resume bring-up has
     /// finished, its publication having reopened local memory. A resume that
     /// failed leaves local memory closed: `NoDevice`.
+    /// xe_pm_runtime_get for PXP: the function resumes and stays in D0 while
+    /// the reference lives (a PXP queue on the list, a readiness query).
+    async fn pxp_wakeref(&self) -> Result<Awake, narf_filesystem::FsError> {
+        let awake = Awake::take(self).await?;
+        drop(self.lock_running().await);
+        Ok(awake)
+    }
+
     async fn vram_wakeref(&self) -> Result<Awake, narf_filesystem::FsError> {
         let awake = Awake::take(self).await?;
         let state = self.lock_running().await;
@@ -3801,6 +4162,13 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             drop(state);
             if result.is_err() {
                 let _ = crate::intel_dpcd_bl::resume_for_bar(&self.pending.bar);
+                // Nova's quiesce turned the panel off; the function is still
+                // in D0, so the resume relight lights it again in place.
+                if let (DisplayOwner::NovaLakeOwned, Some(mode)) =
+                    (self.pending.display, self.pending.mode)
+                {
+                    let _ = crate::intel_gpu::relight_display(&mode);
+                }
             } else if let Some(awake) = awake {
                 let old = self.system_awake.lock().replace(awake);
                 drop(old);
@@ -3959,6 +4327,72 @@ fn seed_discrete_display_card(
 
 /// Arc cards bind to a GT-only device or discrete display (`DG2` / `BMG`).
 /// BAR0 and authority remain with the per-function startup service.
+/// The Nova Lake-S display-35 route (`narf.intel.nvl_display=1`) once the
+/// firmware primary matched the boot framebuffer `fb`: register fixed-mode
+/// KMS over it (the CPU copies each flip into it, as for an external-only
+/// Gen12 board) and install the display-preserving GT owner beside it. The
+/// probe takes this route without `narf.intel.nvl_modeset=1`, or after the
+/// owned takeover refused; system suspend stays refused on it.
+pub(crate) fn probe_nvl_display(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    fb: narf_graphics_driver::generic::GenericFb,
+) -> Result<(), narf_bus::ProbeError> {
+    if GtPlatform::from_pci(device.id.vendor, device.id.device) != Some(GtPlatform::NovaLakeS) {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    if PENDING.lock().iter().any(|p| p.device.addr == device.addr)
+        || OWNERS
+            .lock()
+            .iter()
+            .any(|o| o.pending.device.addr == device.addr)
+    {
+        return Ok(());
+    }
+    narf_bus::pci::set_command(
+        &cap,
+        &device,
+        narf_bus::pci::cmd::MEM_SPACE
+            | narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::INTX_DISABLE,
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // SAFETY: the PCI probe grants exclusive ownership of this function's BAR0.
+    let bar = unsafe { narf_bus::bar::map_bar(&device, 0) }
+        .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    let index = crate::drm_registry::count() as u32;
+    let card = Arc::new(IntelGpuCard::new(
+        alloc::format!("card{index}"),
+        device.id.vendor,
+        device.id.device,
+        device.id.subsystem_vendor,
+        device.id.subsystem_id,
+    ));
+    let assigned = crate::drm_registry::register_drm_card_with_state(
+        card.clone(),
+        crate::intel_gpu::firmware_fixed_mode_card(fb),
+    );
+    if !install_profile(
+        assigned,
+        card,
+        device,
+        cap,
+        bar,
+        None,
+        DisplayOwner::NovaLake,
+    ) {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name: alloc::string::String::from("intel-gpu"),
+        kind: narf_drivers::BoundKind::Graphics,
+        pci_vid: Some(device.id.vendor),
+        pci_did: Some(device.id.device),
+        domain: narf_drivers::BoundKind::Graphics.default_domain(),
+    });
+    Ok(())
+}
+
 pub(crate) fn probe_discrete(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
@@ -4370,5 +4804,36 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_gt_discrete_display_admits_fetches_below_the_arena
+    );
+
+    /// Nova Lake-S: only the owned display-35 route (an owned console with
+    /// its resume relight) admits system suspend; the firmware primary keeps
+    /// refusing it. The owned route's display-preserving profile needs Nova
+    /// Lake-S and a lit mode.
+    fn smoke_gt_nvl_owned_display_admits_system_suspend() -> TestResult {
+        assert!(!display_suspend_admitted(DisplayOwner::NovaLake, false));
+        assert!(display_suspend_admitted(DisplayOwner::NovaLakeOwned, false));
+        assert!(!display_suspend_admitted(DisplayOwner::NovaLakeOwned, true));
+        assert!(display_suspend_admitted(DisplayOwner::PantherLake, false));
+        assert!(display_suspend_admitted(DisplayOwner::Standard, false));
+        let nvl = GtPlatform::NovaLakeS;
+        assert_eq!(
+            nvl_profile(nvl, true, true),
+            Some(LnlProfile::DisplayPreserving)
+        );
+        assert_eq!(nvl_profile(nvl, true, false), None);
+        assert_eq!(nvl_profile(nvl, false, true), Some(LnlProfile::Headless));
+        let ptl = GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake);
+        assert_eq!(nvl_profile(ptl, true, true), None);
+        assert_eq!(nvl_profile(ptl, false, true), Some(LnlProfile::Headless));
+        assert_eq!(nvl_profile(GtPlatform::Battlemage, true, true), None);
+        // Neither the display-30 nor the display-20 route admits Nova.
+        assert_eq!(ptl_profile(nvl, true, true), None);
+        assert_eq!(lnl_profile(nvl, true, true), None);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_gt_nvl_owned_display_admits_system_suspend
     );
 }

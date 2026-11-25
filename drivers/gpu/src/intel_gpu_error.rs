@@ -117,15 +117,24 @@ pub(crate) struct Capture {
     pub now_ns: u64,
     pub state: GtState,
     pub engines: EngineSet,
-    pub process_name: Option<&'static str>,
-    pub pid: Option<u32>,
+    /// The guilty context's process, when the hang has one.
+    pub process: Option<narf_filesystem::caller::Caller>,
     pub snapshot_time: Option<(u64, u32)>,
 }
+/// `ktime_get_real` at capture: the wall clock as (seconds, nanoseconds),
+/// the devcoredump header's "Snapshot time". Before the wall clock is
+/// anchored this counts from boot.
+pub(crate) fn wall_snapshot() -> (u64, u32) {
+    let wall = (narf_time::monotonic_ns() as i64)
+        .saturating_add(narf_time::wall_offset_ns())
+        .max(0) as u64;
+    (wall / 1_000_000_000, (wall % 1_000_000_000) as u32)
+}
+
 impl Capture {
     #[allow(dead_code)]
-    pub(crate) fn with_process(mut self, name: &'static str, pid: u32) -> Self {
-        self.process_name = Some(name);
-        self.pid = Some(pid);
+    pub(crate) fn with_process(mut self, name: &str, pid: u32) -> Self {
+        self.process = Some(narf_filesystem::caller::Caller::new(name, pid));
         self
     }
     #[allow(dead_code)]

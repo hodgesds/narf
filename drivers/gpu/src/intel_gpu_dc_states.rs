@@ -103,7 +103,27 @@
 //! `xe3lpd_3002_dmc.bin`. Both use the display >= 20 flip-queue/interrupt
 //! brackets, but unlike Lunar Lake restore Pipe C/D DMC MMIO before enable.
 //! A broad `Generation::PantherLake` without that exact identity installs no
-//! service. Display 35 remains disconnected.
+//! service.
+//!
+//! Display 35 (Nova Lake-S 35.00, the owned route behind
+//! `narf.intel.nvl_display=1` and `narf.intel.nvl_modeset=1`): KMS install
+//! passes `DisplayIp::NovaLakeS` and the service runs under
+//! [`DmcPlatform::Xe3pLpd`] (Linux 7.4-rc4): `i915/xe3p_lpd_dmc.bin` under
+//! the 0x8000 ceiling, `DC_COUNT_EN` after each load
+//! (`xe3lpd_enable_dc_count`), the pipe-DMC interrupts
+//! `PIPEDMC_FLIPQ_PROG_DONE | PIPEDMC_ERROR` (`pipedmc_interrupt_mask`),
+//! Pipe C/D MMIO restored before enable, no read flush, the 7.4-rc4
+//! `gen9_dc_mask` ([`XE3PLPD_DC_MASK`]) and the CMTG status bits out of the
+//! sticky-write comparison ([`dc_state_ro_mask`]). The target is DC6
+//! ([`XE3PLPD_ALLOWED_DC_MASK`]); DC3CO, which needs the CMTG, is never
+//! armed. `xe3plpd_pwdoms_dc_off` adds every AUX channel to the well, so
+//! besides the conversation-level holders (modeset, KMS, external passes)
+//! each display-35 AUX transfer (`IntelAux`) and LT PHY message-bus
+//! transaction (`intel_gpu_lt_phy::LtPhy`) takes its own reference through
+//! [`Xe3pLpdDcOff`], as `intel_dp_aux_xfer` and
+//! `intel_lt_phy_transaction_begin` do. The probe-time load and the
+//! post-resume reload run from the same card-worker publication pass as on
+//! Panther Lake; the suspend preparation is the shared KMS quiesce.
 //!
 //! Stricter than the pinned tree, and why: re-entry is refused (not
 //! merely warned about) with the utility pin in PWM mode, with a pipe
@@ -112,7 +132,8 @@
 //! the main program no longer verifies. A pipe program that does not
 //! verify is not enabled. DC3CO and DC9 are never targeted. Program
 //! loss found at re-entry is repaired by a reload before the next
-//! attempt.
+//! attempt. The DMC wakelock (`intel_dmc_wl`, on by default on display
+//! >= 30) is not used: every display access holds `DC_off` instead.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -203,6 +224,25 @@ pub const XELPDP_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
 /// The display-20 targets: `get_allowed_dc_mask` caps display >= 20 at
 /// `max_dc` 2 (DC6, no DC3CO); DC9 stays untargeted as on display 14.
 pub const XE2LPD_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
+/// The display-35 targets. `get_allowed_dc_mask` (Linux 7.4-rc4) gives
+/// display >= 35 `max_dc` 4 (DC3CO | DC6, DC9 always), and
+/// `sanitize_target_dc_state(DC6)` starts at DC6.
+/// `intel_display_power_select_target_dc_state` moves to DC3CO only for a
+/// DC3CO trigger (LOBF, panel replay or PSR2 selective update on a 1:1 CMTG
+/// pipe/port), none of which this driver configures, so DC6 stays the
+/// runtime target. DC9 belongs to display-core uninit, which this driver
+/// does not run.
+pub const XE3PLPD_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
+/// `DC_STATE_EN_CSR_MASK_CMTG_1` (display >= 20).
+pub const DC_STATE_EN_CSR_MASK_CMTG_1: u32 = 1 << 11;
+/// `DC_STATE_EN_CSR_MASK_CMTG_0` (display >= 13 except DG2).
+pub const DC_STATE_EN_CSR_MASK_CMTG_0: u32 = 1 << 10;
+/// `gen9_dc_mask` for display >= 12 in Linux 7.4-rc4, used on display 35:
+/// DC3CO is field value 3 of `DC_STATE_EN_UPTO_DC3CO_DC5_DC6_MASK` there
+/// (`DC_STATE_EN_UPTO_DC3CO`), so the mask is UPTO_DC5 | UPTO_DC6 | DC9 and
+/// bit 30 is not a DC state. Display 14/20/30 keep the pinned tree's
+/// [`GEN12_DC_MASK`].
+pub const XE3PLPD_DC_MASK: u32 = DC_STATE_EN_UPTO_DC5 | DC_STATE_EN_UPTO_DC6 | DC_STATE_EN_DC9;
 /// Upper bound on the retained container copy: 32 FW-info entries of
 /// a 256-byte v3 header plus a 0x7000-byte payload, plus the CSS and
 /// package headers, fit well below this.
@@ -216,13 +256,25 @@ pub const PIPEDMC_ENABLE_MTL_ALL: u32 =
 /// and restarts the count, at most [`DC_WRITE_MAX_REWRITES`] times.
 /// On failure returns the last value read (i915 logs it).
 pub fn write_dc_state_sticky<M: MmioWindow + ?Sized>(regs: &M, state: u32) -> Result<(), u32> {
+    write_dc_state_sticky_masked(regs, state, 0)
+}
+
+/// [`write_dc_state_sticky`] comparing only the bits outside `ro_mask`:
+/// Linux 7.4-rc4's `gen9_write_dc_state` masks the read-only status bits
+/// (`dc_state_ro_mask`) the hardware may set on its own out of the
+/// read-back comparison.
+pub fn write_dc_state_sticky_masked<M: MmioWindow + ?Sized>(
+    regs: &M,
+    state: u32,
+    ro_mask: u32,
+) -> Result<(), u32> {
     regs.write32(DC_STATE_EN, state);
     let mut rewrites = 0u32;
     let mut rereads = 0u32;
     let mut value;
     loop {
         value = regs.read32(DC_STATE_EN);
-        if value != state {
+        if value & !ro_mask != state & !ro_mask {
             regs.write32(DC_STATE_EN, state);
             rewrites += 1;
             rereads = 0;
@@ -237,10 +289,30 @@ pub fn write_dc_state_sticky<M: MmioWindow + ?Sized>(regs: &M, state: u32) -> Re
             break;
         }
     }
-    if value == state {
+    if value & !ro_mask == state & !ro_mask {
         Ok(())
     } else {
         Err(value)
+    }
+}
+
+/// The `gen9_dc_mask` a service core tracks and rewrites `DC_STATE_EN`
+/// under: display 35 takes Linux 7.4-rc4's ([`XE3PLPD_DC_MASK`]), every
+/// other platform the pinned [`GEN12_DC_MASK`].
+pub const fn dc_mask(platform: DmcPlatform) -> u32 {
+    match platform {
+        DmcPlatform::Xe3pLpd => XE3PLPD_DC_MASK,
+        _ => GEN12_DC_MASK,
+    }
+}
+
+/// `dc_state_ro_mask` (Linux 7.4-rc4) on display 35: the CMTG CSR mask
+/// status bits. The pinned display-14/20/30 service predates it and
+/// compares every bit.
+pub const fn dc_state_ro_mask(platform: DmcPlatform) -> u32 {
+    match platform {
+        DmcPlatform::Xe3pLpd => DC_STATE_EN_CSR_MASK_CMTG_1 | DC_STATE_EN_CSR_MASK_CMTG_0,
+        _ => 0,
     }
 }
 
@@ -292,8 +364,12 @@ pub enum DcUser {
     /// teardown. A route that stays live between passes is reported by the
     /// registered liveness predicate ([`register_external_live`]).
     External = 8,
+    /// One LT PHY message-bus transaction (display 35):
+    /// `intel_lt_phy_transaction_begin` holds `POWER_DOMAIN_DC_OFF` around
+    /// every PLL enable/disable and signal-level update.
+    Phy = 10,
 }
-const USER_COUNT: usize = 10;
+const USER_COUNT: usize = 11;
 
 /// Why a DC transition could not be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,8 +464,8 @@ pub enum ArmBlock {
 #[derive(Clone, Debug)]
 pub struct DcCore {
     refs: [u32; USER_COUNT],
-    /// i915's `power_domains->dc_state`: DC_STATE_EN & GEN12_DC_MASK
-    /// as last written or sanitized.
+    /// i915's `power_domains->dc_state`: DC_STATE_EN & [`dc_mask`] as last
+    /// written or sanitized.
     tracked: u32,
     allowed: u32,
     target: u32,
@@ -471,7 +547,7 @@ impl DcCore {
     pub fn fault(&self) -> Option<DcError> {
         self.fault
     }
-    /// The tracked `DC_STATE_EN & GEN12_DC_MASK`.
+    /// The tracked `DC_STATE_EN & dc_mask`.
     pub fn tracked(&self) -> u32 {
         self.tracked
     }
@@ -589,7 +665,7 @@ impl DcCore {
         if value == u32::MAX {
             return Err(DcError::Unavailable);
         }
-        self.tracked = value & GEN12_DC_MASK;
+        self.tracked = value & dc_mask(self.platform);
         Ok(())
     }
 
@@ -616,7 +692,7 @@ impl DcCore {
             if value == u32::MAX {
                 return Err(DcError::Unavailable);
             }
-            if value & GEN12_DC_MASK != 0 || self.tracked != 0 {
+            if value & dc_mask(self.platform) != 0 || self.tracked != 0 {
                 self.set_dc_state(regs, DC_STATE_DISABLE)?;
             }
         }
@@ -642,7 +718,7 @@ impl DcCore {
         }
     }
 
-    /// `gen9_set_dc_state` for display 14.
+    /// `gen9_set_dc_state` for display 14 and later.
     fn set_dc_state<M: MmioWindow + ?Sized>(
         &mut self,
         regs: &M,
@@ -650,11 +726,12 @@ impl DcCore {
     ) -> Result<(), DcError> {
         // Never program anything outside the allowed mask.
         let state = state & self.allowed;
+        let mask = dc_mask(self.platform);
         let value = regs.read32(DC_STATE_EN);
         if value == u32::MAX {
             return Err(DcError::Unavailable);
         }
-        if value & GEN12_DC_MASK != self.tracked {
+        if value & mask != self.tracked {
             self.mismatches = self.mismatches.saturating_add(1);
         }
         let enable_dc6 = state & DC_STATE_EN_UPTO_DC6 != 0;
@@ -662,11 +739,13 @@ impl DcCore {
         if !dc6_was_enabled && enable_dc6 {
             self.dc6_start = regs.read32(DG1_DMC_DEBUG_DC5_COUNT);
         }
-        let wanted = (value & !GEN12_DC_MASK) | state;
-        if let Err(found) = write_dc_state_sticky(regs, wanted) {
+        let wanted = (value & !mask) | state;
+        if let Err(found) =
+            write_dc_state_sticky_masked(regs, wanted, dc_state_ro_mask(self.platform))
+        {
             let error = DcError::DidNotStick { wanted, found };
             self.fault = Some(error);
-            self.tracked = found & GEN12_DC_MASK;
+            self.tracked = found & mask;
             return Err(error);
         }
         if !enable_dc6 && dc6_was_enabled {
@@ -676,7 +755,7 @@ impl DcCore {
                 .wrapping_add(current.wrapping_sub(self.dc6_start));
             self.dc6_start = current;
         }
-        self.tracked = wanted & GEN12_DC_MASK;
+        self.tracked = wanted & mask;
         Ok(())
     }
 
@@ -895,8 +974,9 @@ impl DcCore {
         }
         self.get(regs, DcUser::Load)?;
         self.recheck = false;
+        let platform = self.platform;
         let verified = self.blob.clone().is_some_and(|blob| {
-            parse_dmc_firmware_xelpdp(&blob, b'*', b'*')
+            parse_for(platform, &blob)
                 .is_ok_and(|firmware| verify_program(regs, &firmware, DmcId::Main).is_ok())
         });
         if !verified {
@@ -1062,6 +1142,8 @@ fn acquire_firmware(platform: DmcPlatform) -> Result<Arc<Vec<u8>>, DcRefusal> {
 pub(crate) struct DcService {
     window: ServiceWindow,
     bar: narf_bus::MmioRegion,
+    /// The core's container rules, fixed at install.
+    platform: DmcPlatform,
     core: IrqSafeSpinLock<DcCore>,
     arming: AtomicBool,
 }
@@ -1125,7 +1207,10 @@ pub fn external_live() -> bool {
 /// A held `DC_off` reference. Dropping it releases the reference and,
 /// for the last one, schedules deferred re-entry; nothing is written
 /// to hardware on drop. Inert (holds nothing) where no display-14
-/// service exists — every Gen12 path and every fixture platform.
+/// service exists — every Gen12 path and every fixture platform —
+/// except that, there, [`acquire`] and [`acquire_for_bar`] carry the Gen9
+/// service's reference (`intel_gpu_gen9_dc_states`, opted in with
+/// `narf.intel.gen9_dc=1`), itself inert without that service.
 ///
 /// Once the GT owner bound the function's runtime-PM device, a reference
 /// also holds a display wakeref (`intel_display_power_get` →
@@ -1137,6 +1222,9 @@ pub(crate) struct DcRef {
     user: DcUser,
     /// Dropped after [`Drop::drop`] released `DC_off`.
     _wakeref: Option<crate::intel_gpu_gt_runtime::display_rpm::Wakeref>,
+    /// The Gen9 service's reference, taken only where no display-14
+    /// service exists.
+    _gen9: Option<crate::intel_gpu_gen9_dc_states::Gen9DcRef>,
 }
 
 impl DcRef {
@@ -1146,7 +1234,21 @@ impl DcRef {
             service: None,
             user,
             _wakeref: None,
+            _gen9: None,
         }
+    }
+
+    /// No display-14 service: carry the Gen9 service's reference instead.
+    fn gen9(
+        user: DcUser,
+        gen9: Result<crate::intel_gpu_gen9_dc_states::Gen9DcRef, DcError>,
+    ) -> Result<Self, DcError> {
+        Ok(Self {
+            service: None,
+            user,
+            _wakeref: None,
+            _gen9: Some(gen9?),
+        })
     }
 }
 
@@ -1196,13 +1298,18 @@ fn take(service: Option<Arc<DcService>>, user: DcUser) -> Result<DcRef, DcError>
         service: Some(service),
         user,
         _wakeref: wakeref,
+        _gen9: None,
     })
 }
 
 /// Take a `DC_off` reference on the display-14 service, if one is
-/// installed. On `Ok` DC states are off until the reference drops.
+/// installed (otherwise on the Gen9 service, if that one is). On `Ok` DC
+/// states are off until the reference drops.
 pub(crate) fn acquire(user: DcUser) -> Result<DcRef, DcError> {
-    take(service(), user)
+    match service() {
+        Some(service) => take(Some(service), user),
+        None => DcRef::gen9(user, crate::intel_gpu_gen9_dc_states::acquire(user.into())),
+    }
 }
 
 /// [`acquire`] for the service of exactly this BAR.
@@ -1223,7 +1330,13 @@ pub(crate) fn acquire(user: DcUser) -> Result<DcRef, DcError> {
 /// An owner that prefers a held reference instead may keep a
 /// [`DcUser::ExternalRoute`] reference for the route's lifetime.
 pub(crate) fn acquire_for_bar(bar: &narf_bus::MmioRegion, user: DcUser) -> Result<DcRef, DcError> {
-    take(service_for(bar), user)
+    match service_for(bar) {
+        Some(service) => take(Some(service), user),
+        None => DcRef::gen9(
+            user,
+            crate::intel_gpu_gen9_dc_states::acquire_for_bar(bar, user.into()),
+        ),
+    }
 }
 
 /// A pipe owner lit `pipe` on this BAR's display (after enabling it, or
@@ -1335,6 +1448,111 @@ impl PipeDmc for NoPipeDmc {
     fn disable_pipe(&self, _pipe: u32) {}
 }
 
+// ── Display-35 holders below the conversation ───────────────────
+
+/// A `DC_off` holder's view of a service, for the display-35 hardware that
+/// Linux brackets itself: every AUX transfer (`intel_dp_aux_xfer` takes the
+/// channel's AUX domain, and `xe3plpd_pwdoms_dc_off` lists every AUX
+/// channel) and every LT PHY message-bus transaction
+/// (`intel_lt_phy_transaction_begin`). The production hook is
+/// [`Xe3pLpdDcOff`]; a fixture passes its own core. `regs` is the holder's
+/// window; the production hook writes through the service's own window
+/// instead.
+pub trait DcOff: Sync {
+    /// Take `user`'s reference (see [`DcCore::get`]). `Ok(true)` when one
+    /// was counted and must be released.
+    fn get(&self, regs: &dyn MmioWindow, user: DcUser) -> Result<bool, DcError>;
+    /// Release a reference `get` counted.
+    fn put(&self, user: DcUser);
+}
+
+/// The holder's window as a `dyn MmioWindow` (register access only).
+struct RegsRef<'b, M: ?Sized>(&'b M);
+
+impl<M: MmioWindow + ?Sized> MmioWindow for RegsRef<'_, M> {
+    fn read32(&self, off: u64) -> u32 {
+        self.0.read32(off)
+    }
+    fn write32(&self, off: u64, val: u32) {
+        self.0.write32(off, val)
+    }
+    fn display_access_ok(&self) -> bool {
+        self.0.display_access_ok()
+    }
+}
+
+/// A held reference on a [`DcOff`]; dropping it releases it, which for the
+/// last reference schedules the deferred re-entry.
+#[must_use = "dropping the guard releases DC_off immediately"]
+pub(crate) struct DcGuard<'a> {
+    hook: &'a dyn DcOff,
+    user: DcUser,
+    held: bool,
+}
+
+impl core::fmt::Debug for DcGuard<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DcGuard")
+            .field("user", &self.user)
+            .field("held", &self.held)
+            .finish()
+    }
+}
+
+impl Drop for DcGuard<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            self.hook.put(self.user);
+        }
+    }
+}
+
+/// Take `user`'s reference on `hook` before touching `regs`' display
+/// registers. `Err` means DC states could not be exited: the caller runs
+/// nothing.
+pub(crate) fn hold<'a, M: MmioWindow + ?Sized>(
+    hook: &'a dyn DcOff,
+    regs: &M,
+    user: DcUser,
+) -> Result<DcGuard<'a>, DcError> {
+    let held = hook.get(&RegsRef(regs), user)?;
+    Ok(DcGuard { hook, user, held })
+}
+
+/// The production [`DcOff`]: the installed display-35 service through its
+/// own authorized window, inert without one (every other platform, every
+/// boot without both Nova options, every fixture). Nova Lake-S is D0-only
+/// (its GT profile is refused runtime PM as a headless-takeover platform),
+/// so no display wakeref is held here; a function that is suspending or
+/// suspended still refuses before any register access.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Xe3pLpdDcOff;
+
+fn xe3plpd_service() -> Option<Arc<DcService>> {
+    service().filter(|service| service.platform == DmcPlatform::Xe3pLpd)
+}
+
+impl DcOff for Xe3pLpdDcOff {
+    fn get(&self, _regs: &dyn MmioWindow, user: DcUser) -> Result<bool, DcError> {
+        let Some(service) = xe3plpd_service() else {
+            return Ok(false);
+        };
+        crate::intel_gpu_gt_runtime::display_rpm::wakeref_if_active(service.bar.phys.raw())
+            .map_err(|_| DcError::Unavailable)?;
+        service.core.lock().get(&service.window, user)?;
+        Ok(true)
+    }
+    fn put(&self, user: DcUser) {
+        let Some(service) = xe3plpd_service() else {
+            return;
+        };
+        let due = service.core.lock().put(user, narf_time::monotonic_ns());
+        if due.is_some() {
+            schedule_arm(&service);
+        }
+    }
+}
+
 fn schedule_arm(service: &Arc<DcService>) {
     if service.arming.swap(true, Ordering::AcqRel) {
         return;
@@ -1392,13 +1610,31 @@ async fn arm_task(service: Arc<DcService>) {
 }
 
 /// The service profile a KMS-owned generation installs: display 14 on
-/// Meteor/Arrow Lake, display 20 on Lunar Lake, or an exact display-30
-/// identity retained by the Panther/Wildcat Lake KMS install. `(container
-/// rules, allowed DC mask, Wa_15015404425 read flush)`; `None` installs
-/// nothing. Display 35 remains disconnected.
+/// Meteor/Arrow Lake, display 20 on Lunar Lake, or an exact display-30/35
+/// identity retained by the Panther/Wildcat/Nova Lake KMS install.
+/// `(container rules, allowed DC mask, Wa_15015404425 read flush)`; `None`
+/// installs nothing. Display 35 installs only behind both Nova options
+/// ([`nova_requested`]).
 pub(crate) fn service_profile(
     generation: crate::intel_gpu::Generation,
     display30: Option<(crate::intel_gpu_xe2lpd::DisplayIp, bool)>,
+) -> Option<(DmcPlatform, u32, bool)> {
+    service_profile_for(generation, display30, nova_requested(narf_boot::args()))
+}
+
+/// Both Nova Lake-S options: the firmware display route
+/// (`narf.intel.nvl_display=1`) and its owned modeset
+/// (`narf.intel.nvl_modeset=1`), each with the strict grammar.
+pub(crate) fn nova_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_lt_phy::requested(args) && crate::intel_gpu_xe3plpd::modeset_requested(args)
+}
+
+/// [`service_profile`] with the Nova options' answer given: display 35.00
+/// (`xe3p_lpd_dmc.bin`, DC6, no Wa_15015404425) only when `nova` holds.
+pub(crate) fn service_profile_for(
+    generation: crate::intel_gpu::Generation,
+    display30: Option<(crate::intel_gpu_xe2lpd::DisplayIp, bool)>,
+    nova: bool,
 ) -> Option<(DmcPlatform, u32, bool)> {
     match generation {
         crate::intel_gpu::Generation::MeteorLake => {
@@ -1414,14 +1650,20 @@ pub(crate) fn service_profile(
             Some((crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake, flush)) => {
                 Some((DmcPlatform::WildcatLake, XE2LPD_ALLOWED_DC_MASK, flush))
             }
+            // xe_device_wa_oob.rules scopes Wa_15015404425 to Lunar and
+            // Panther Lake: Nova's read flush is never applied.
+            Some((crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS, _)) if nova => {
+                Some((DmcPlatform::Xe3pLpd, XE3PLPD_ALLOWED_DC_MASK, false))
+            }
             _ => None,
         },
         _ => None,
     }
 }
 
-/// KMS install for a qualified display-14/20/30 function: create the service
-/// and hold the Init reference (DC states exited) until the program is loaded.
+/// KMS install for a qualified display-14/20/30/35 function: create the
+/// service and hold the Init reference (DC states exited) until the program
+/// is loaded.
 pub(crate) fn install(
     generation: crate::intel_gpu::Generation,
     display30: Option<(crate::intel_gpu_xe2lpd::DisplayIp, bool)>,
@@ -1441,6 +1683,7 @@ pub(crate) fn install(
             flush_reads,
         },
         bar,
+        platform,
         core: IrqSafeSpinLock::new(DcCore::new_for(platform, allowed)),
         arming: AtomicBool::new(false),
     };
@@ -1540,3 +1783,7 @@ pub(crate) mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_xe2lpd_dc_tests.rs"]
 mod xe2lpd_dc_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_xe3plpd_dc_tests.rs"]
+pub(crate) mod xe3plpd_dc_tests;

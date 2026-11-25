@@ -112,6 +112,17 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn media_gt(&self) -> Option<MediaGtStatus> {
         None
     }
+    /// `xe->pxp`: Xe PXP on the media GT, published with `narf.intel.pxp=1`
+    /// once xe_pxp_init succeeded. Default: none, so xe_pxp_is_enabled is
+    /// false and every protected request keeps Linux's no-PXP errnos.
+    fn pxp(&self) -> Option<Arc<crate::intel_gpu_gt::media::pxp::Pxp>> {
+        None
+    }
+    /// xe_pm_runtime_get for PXP: the function resumes and stays in D0 while
+    /// the returned reference lives. Default: nothing to hold.
+    fn pxp_wakeref(&self) -> FsFuture<'_, Box<dyn core::any::Any + Send>> {
+        Box::pin(async { Ok(Box::new(()) as Box<dyn core::any::Any + Send>) })
+    }
     /// Confirmed SLPC status (limits, range, profile) for the standalone media GT (GT1).
     fn media_gt_slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
         None
@@ -408,6 +419,9 @@ struct State {
     low_latency: bool,
     /// Bound VM runs in long-running mode (no 5s job watchdog timeout).
     lr: bool,
+    /// A PXP queue on RCS/CCS below graphics 20: every LRC runs alone
+    /// (xe_lrc.c XE_LRC_CREATE_RUNALONE, CTX_CTRL_RUN_ALONE).
+    run_alone: bool,
 }
 
 #[derive(Debug)]
@@ -437,6 +451,9 @@ pub struct UserContext {
     placements: crate::intel_gpu_engine::EngineSet,
     parallel: Option<ParallelPlacements>,
     capture_policy: Option<Arc<CapturePolicy>>,
+    /// The process that created the context (`task->comm`, `task->pid` of
+    /// the ioctl caller), which a devcoredump names for its hang.
+    owner: Option<narf_filesystem::caller::Caller>,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -560,6 +577,7 @@ impl UserContext {
             placements,
             parallel,
             capture_policy,
+            owner: narf_filesystem::caller::current(),
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
                 busy: false,
@@ -578,6 +596,7 @@ impl UserContext {
                 staged: None,
                 low_latency: false,
                 lr: false,
+                run_alone: false,
             }),
         })
     }
@@ -786,6 +805,16 @@ impl UserContext {
         state.lr = true;
         Ok(())
     }
+    /// A PXP queue on RCS/CCS below graphics 20 (xe_exec_queue.c
+    /// __xe_exec_queue_init's XE_LRC_CREATE_RUNALONE): set before any claim.
+    pub(crate) fn configure_run_alone(&self) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        if state.epoch != 0 || state.busy {
+            return Err(FsError::Busy);
+        }
+        state.run_alone = true;
+        Ok(())
+    }
     pub(crate) fn banned(&self) -> bool {
         self.state.lock().banned
     }
@@ -957,6 +986,11 @@ pub(crate) struct ContextClaim {
     published: bool,
 }
 impl ContextClaim {
+    /// This claim's GuC priority band (0 highest), raised by the requests
+    /// queued behind it; the execlists owner schedules by it.
+    pub(crate) fn band(&self) -> u8 {
+        self.context.state.lock().job_policy.0.min(3) as u8
+    }
     pub(crate) fn placements(&self) -> crate::intel_gpu_engine::EngineSet {
         self.context.placements
     }
@@ -977,6 +1011,10 @@ impl ContextClaim {
     /// submit time to program the image slot.
     pub(crate) fn oa_oactxcontrol(&self) -> Option<u32> {
         self.context.oa_oactxcontrol()
+    }
+    /// The context's LRC must carry CTX_CTRL_RUN_ALONE (a PXP RCS/CCS queue).
+    pub(crate) fn run_alone(&self) -> bool {
+        self.context.state.lock().run_alone
     }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
         self.restore_lane(image, 0);
@@ -1019,6 +1057,10 @@ pub(crate) struct UserJob {
     epoch: u64,
 }
 impl UserJob {
+    /// The process that created this job's context.
+    pub(crate) fn owner(&self) -> Option<narf_filesystem::caller::Caller> {
+        self.context.owner
+    }
     pub(crate) fn diagnostic_protected(&self) -> bool {
         self.context
             .capture_policy

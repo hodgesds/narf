@@ -1159,10 +1159,9 @@ fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
     let dpa = object.pages().next().unwrap();
     assert_eq!(cpu_view.frames, [base + dpa, base + dpa + 4096]);
     drop(cpu_view);
-    assert_eq!(
-        file.gem.export_object(handle).err(),
-        Some(FsError::NotImplemented)
-    );
+    // xe_gem_prime_export admits a VRAM object; attachments decide
+    // peer-to-peer or migration (intel_gpu_prime).
+    assert!(Arc::ptr_eq(&file.gem.export_object(handle).unwrap(), &object));
     assert_eq!(u64_at(&xe_query(&file, &info, &user, 1), 112), 8192);
     // Execute: the batch's store lands in VRAM through a DM-bit PPGTT leaf.
     let vm = create_vm(&file, &info, &user);
@@ -2675,4 +2674,7 @@ mod lr {
 }
 mod vram_evict {
     include!("intel_gpu_vram_evict_tests.rs");
+}
+mod prime {
+    include!("intel_gpu_prime_tests.rs");
 }

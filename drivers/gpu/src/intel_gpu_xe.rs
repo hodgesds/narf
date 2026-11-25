@@ -101,17 +101,61 @@ pub(crate) fn low_latency_supported(info: &DeviceInfo) -> bool {
 
 /// DRM_XE_EXEC_QUEUE_SET_PROPERTY_PXP_TYPE and enum drm_xe_pxp_session_type.
 const PXP_TYPE: u32 = 2;
-const PXP_TYPE_NONE: u64 = 0;
-const PXP_TYPE_HWDRM: u64 = 1;
+const PXP_TYPE_NONE: u64 = crate::intel_gpu_gt::media::pxp::TYPE_NONE;
+const PXP_TYPE_HWDRM: u64 = crate::intel_gpu_gt::media::pxp::TYPE_HWDRM;
+/// DRM_XE_VM_BIND_FLAG_CHECK_PXP.
+const BIND_CHECK_PXP: u32 = 1 << 4;
+type Pxp = crate::intel_gpu_gt::media::pxp::Pxp;
 /// MAX_USER_EXTENSIONS of xe_bo.c::gem_create_user_extensions and
 /// xe_exec_queue.c::__exec_queue_user_extensions (each defines it as 16).
 const MAX_USER_EXTENSIONS: usize = 16;
 
-/// xe_pxp_is_enabled(xe->pxp) is false on every NARF device: Linux enables
-/// PXP only with CONFIG_INTEL_MEI_GSC_PROXY (xe_pxp_is_supported), and NARF
-/// has no MEI GSC proxy component, so every protected request is -ENODEV.
+/// xe_pxp_is_enabled(xe->pxp) is false unless `narf.intel.pxp=1` published
+/// `xe->pxp` (UserBackend::pxp): every protected request is then -ENODEV,
+/// as Linux without CONFIG_INTEL_MEI_GSC_PROXY answers.
 fn pxp_disabled() -> FsError {
     FsError::NoDevice
+}
+
+/// `xe->pxp`, when PXP is enabled on this device.
+fn pxp_of(info: &DeviceInfo) -> Option<Arc<Pxp>> {
+    info.backend.as_ref().and_then(|backend| backend.pxp())
+}
+
+/// xe_pxp_bo_key_check's refusal as an ioctl error. Linux answers -ENOEXEC,
+/// which `FsError` cannot carry: NARF answers EINVAL, as it did for E2BIG
+/// before `ArgumentListTooLong` existed.
+fn key_refused(_: crate::intel_gpu_gt::media::pxp::KeyError) -> FsError {
+    FsError::InvalidData
+}
+
+/// xe_vm.c::xe_vm_validate_protected: every protected object `mappings`
+/// name must still carry the current PXP key.
+fn validate_protected(pxp: &Pxp, mappings: &[VmMapping]) -> Result<(), FsError> {
+    for object in mappings
+        .iter()
+        .filter_map(|mapping| mapping.object.as_ref())
+    {
+        let key = object.pxp_key();
+        if key != 0 {
+            pxp.key_check(key).map_err(key_refused)?;
+        }
+    }
+    Ok(())
+}
+
+/// A queue on `xe->pxp`'s list (xe_pxp_exec_queue_add), removed with the
+/// queue or with a creation that fails after the add
+/// (xe_pxp_exec_queue_remove).
+#[derive(Debug)]
+struct PxpMembership {
+    pxp: Arc<Pxp>,
+    context: Arc<UserContext>,
+}
+impl Drop for PxpMembership {
+    fn drop(&mut self) {
+        self.pxp.exec_queue_remove(&self.context);
+    }
 }
 
 /// xe_bo.c::gem_create_user_extensions over DRM_XE_GEM_CREATE_EXTENSION_
@@ -120,7 +164,13 @@ fn pxp_disabled() -> FsError {
 /// property, pad), then gem_create_set_pxp_type. The result is applied after
 /// the object exists, as xe_gem_create_ioctl runs the chain after
 /// xe_bo_create_user.
-fn gem_create_extensions(user: &dyn IoctlContext, mut next: u64) -> Result<(), FsError> {
+/// Returns the key iteration a HWDRM extension assigned (0 for none).
+fn gem_create_extensions(
+    user: &dyn IoctlContext,
+    mut next: u64,
+    pxp: Option<&Pxp>,
+) -> Result<u32, FsError> {
+    let mut key = 0;
     let mut count = 0;
     while next != 0 {
         // `if (ext_number >= MAX_USER_EXTENSIONS) return -E2BIG;` comes
@@ -139,16 +189,17 @@ fn gem_create_extensions(user: &dyn IoctlContext, mut next: u64) -> Result<(), F
         if u32_at(&ext, 16) >= 1 || u32_at(&ext, 20) != 0 {
             return Err(FsError::InvalidData);
         }
-        // gem_create_set_pxp_type, then xe_pxp_key_assign(NULL): -ENODEV.
+        // gem_create_set_pxp_type, then xe_pxp_key_assign: -ENODEV without
+        // PXP, else the current key iteration.
         match u64_at(&ext, 24) {
             PXP_TYPE_NONE => {}
-            PXP_TYPE_HWDRM => return Err(pxp_disabled()),
+            PXP_TYPE_HWDRM => key = pxp.ok_or_else(pxp_disabled)?.key_assign(),
             _ => return Err(FsError::InvalidData),
         }
         next = u64_at(&base, 0);
         count += 1;
     }
-    Ok(())
+    Ok(key)
 }
 
 /// DRM_XE_EXEC_QUEUE_SET_PROPERTY_*: the indices of xe_exec_queue.c's
@@ -176,6 +227,8 @@ struct QueueProperties {
     timeslice: u32,
     /// DRM_XE_EXEC_QUEUE_SET_HANG_REPLAY_STATE copied an LRC image.
     replay: Option<Vec<u8>>,
+    /// xe_pxp_exec_queue_set_type: a HWDRM session queue.
+    pxp: bool,
 }
 
 /// xe_lrc.c::xe_gt_lrc_hang_replay_size for a UAPI engine class. A VM_BIND
@@ -200,11 +253,13 @@ fn exec_queue_extensions(
     mut next: u64,
     class: u16,
     xe2: bool,
+    pxp: bool,
 ) -> Result<QueueProperties, FsError> {
     let mut queue = QueueProperties {
         priority: 2,
         timeslice: 1000,
         replay: None,
+        pxp: false,
     };
     let mut properties = 0u64;
     let mut ext_number = 0;
@@ -253,12 +308,13 @@ fn exec_queue_extensions(
             }
             TIMESLICE => return Err(FsError::InvalidData),
             // xe_exec_queue.c::exec_queue_set_pxp_type: NONE is the
-            // default; only HWDRM is a session type, and without an
-            // enabled PXP (xe->pxp is NULL: no MEI GSC proxy, see
-            // xe_pxp_is_supported) it is -ENODEV.
+            // default (and never clears an earlier HWDRM); only HWDRM is a
+            // session type, and without an enabled PXP (xe->pxp is NULL) it
+            // is -ENODEV.
             PXP_TYPE if value == PXP_TYPE_NONE => {}
             PXP_TYPE if value != PXP_TYPE_HWDRM => return Err(FsError::InvalidData),
-            PXP_TYPE => return Err(pxp_disabled()),
+            PXP_TYPE if !pxp => return Err(pxp_disabled()),
+            PXP_TYPE => queue.pxp = true,
             // exec_queue_set_hang_replay_state: vmemdup_user of the class's
             // replay size, so an unreadable image is -EFAULT here.
             HANG_REPLAY_STATE => {
@@ -293,6 +349,19 @@ struct Queue {
     context: Arc<UserContext>,
     bind: bool,
     dead: AtomicBool,
+    /// A PXP queue on `xe->pxp`'s list.
+    pxp: Option<PxpMembership>,
+}
+
+/// An EXEC_QUEUE_CREATE whose arguments, extensions and context are ready,
+/// before xe_pxp_exec_queue_add and the queue's publication.
+struct PreparedQueue {
+    wire: Vec<u8>,
+    context: Arc<UserContext>,
+    class: u16,
+    priority: u32,
+    low_latency: bool,
+    pxp: Option<Arc<Pxp>>,
 }
 impl Queue {
     fn check(&self) -> Result<(), FsError> {
@@ -379,12 +448,15 @@ impl XeFile {
                 // SCANOUT (2) is admitted where a WC system object satisfies
                 // it: the iGPU. Arc display is not supported. An integrated
                 // Xe2/Xe3 function has no scanout (or FlatCCS) representation
-                // on its headless profile; the Lunar Lake display-20 and Panther
-                // Lake display-30 routes' display-preserving profiles take XE_BO_FLAG_SCANOUT
+                // on its headless profile; the Lunar Lake display-20, Panther
+                // Lake display-30 and Nova Lake-S owned display-35 routes'
+                // display-preserving profiles take XE_BO_FLAG_SCANOUT
                 // (xe_bo.c::xe_gem_create_ioctl) as a WC system object.
                 let supported_flags = match info.platform {
                     _ if info.platform.is_headless_integrated() => {
-                        if (info.platform.is_lnl() || info.platform.is_ptl())
+                        if (info.platform.is_lnl()
+                            || info.platform.is_ptl()
+                            || info.platform == crate::intel_gpu_gt::GtPlatform::NovaLakeS)
                             && info
                                 .backend
                                 .as_ref()
@@ -447,7 +519,11 @@ impl XeFile {
                 // Read the extension chain before any lock; its verdict
                 // applies once the object exists, as xe_gem_create_ioctl
                 // runs gem_create_user_extensions after xe_bo_create_user.
-                let extensions = gem_create_extensions(user, u64_at(&wire, 0));
+                let (extensions, key) =
+                    match gem_create_extensions(user, u64_at(&wire, 0), pxp_of(info).as_deref()) {
+                        Ok(key) => (Ok(()), key),
+                        Err(error) => (Err(error), 0),
+                    };
                 // Serialize VM removal through allocation/copyout/publication.
                 let names = self.names.lock();
                 let vm = if u32_at(&wire, 24) != 0 {
@@ -481,6 +557,9 @@ impl XeFile {
                     },
                 )?;
                 if let Ok(object) = gem.object(handle) {
+                    if key != 0 {
+                        object.set_pxp_key(key);
+                    }
                     if flags & 2 != 0 {
                         // XE_BO_FLAG_SCANOUT; ADDFB may also set it later.
                         object.mark_scanout();
@@ -578,16 +657,83 @@ impl XeFile {
             _ => Err(FsError::InvalidData),
         }
     }
+    /// EXEC_QUEUE_CREATE without waiting: a PXP queue gets one step of
+    /// xe_pxp_exec_queue_add, and a session start still running is EBUSY
+    /// ("try again later"). Native Xe files reach `create_queue_user`.
     fn create_queue(
         &self,
         info: &DeviceInfo,
         address: u64,
         user: &dyn IoctlContext,
     ) -> Result<(), FsError> {
+        let prepared = self.prepare_queue(info, address, user)?;
+        let membership = match &prepared.pxp {
+            Some(pxp) => {
+                let mut add =
+                    crate::intel_gpu_gt::media::pxp::QueueAdd::new(&prepared.context, Box::new(()));
+                match pxp.add_step(&mut add, narf_time::monotonic_ns()) {
+                    core::task::Poll::Ready(Ok(())) => Some(PxpMembership {
+                        pxp: pxp.clone(),
+                        context: prepared.context.clone(),
+                    }),
+                    core::task::Poll::Ready(Err(error)) => return Err(error.fs()),
+                    core::task::Poll::Pending => return Err(FsError::Busy),
+                }
+            }
+            None => None,
+        };
+        self.publish_queue(info, address, user, prepared, membership)
+    }
+
+    /// EXEC_QUEUE_CREATE, waiting as xe_pxp_exec_queue_add does for a PXP
+    /// queue: under a runtime-PM reference the default session is started
+    /// if needed (pxp_start) and the queue joins the PXP list, which keeps
+    /// the reference until the queue goes.
+    async fn create_queue_user(
+        &self,
+        info: &DeviceInfo,
+        address: u64,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
+        let prepared = self.prepare_queue(info, address, user)?;
+        let membership = match &prepared.pxp {
+            Some(pxp) => {
+                let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
+                let wakeref = backend.pxp_wakeref().await?;
+                let mut add =
+                    crate::intel_gpu_gt::media::pxp::QueueAdd::new(&prepared.context, wakeref);
+                loop {
+                    match pxp.add_step(&mut add, narf_time::monotonic_ns()) {
+                        core::task::Poll::Ready(Ok(())) => break,
+                        core::task::Poll::Ready(Err(error)) => return Err(error.fs()),
+                        core::task::Poll::Pending => {
+                            narf_time::SleepUntil::new(
+                                narf_time::Deadline::after_us(1000).as_instant(),
+                            )
+                            .await
+                        }
+                    }
+                }
+                Some(PxpMembership {
+                    pxp: pxp.clone(),
+                    context: prepared.context.clone(),
+                })
+            }
+            None => None,
+        };
+        self.publish_queue(info, address, user, prepared, membership)
+    }
+
+    fn prepare_queue(
+        &self,
+        info: &DeviceInfo,
+        address: u64,
+        user: &dyn IoctlContext,
+    ) -> Result<PreparedQueue, FsError> {
         if !info.submission_ready() {
             return Err(FsError::NoDevice);
         }
-        let mut wire = read(user, address, 48)?;
+        let wire = read(user, address, 48)?;
         let flags = u32_at(&wire, 16);
         if flags & !abi::EXEC_QUEUE_LOW_LATENCY_HINT != 0 {
             return Err(FsError::InvalidData);
@@ -696,16 +842,34 @@ impl XeFile {
         // extensions. Publication repeats the lookup under the name lock.
         let vm = self.vm(u32_at(&wire, 12))?;
         vm.check()?;
+        let pxp = pxp_of(info);
         let QueueProperties {
             priority,
             timeslice,
             replay,
-        } = exec_queue_extensions(user, u64_at(&wire, 0), class, info.platform.is_xe2())?;
+            pxp: protected,
+        } = exec_queue_extensions(
+            user,
+            u64_at(&wire, 0),
+            class,
+            info.platform.is_xe2(),
+            pxp.is_some(),
+        )?;
+        // __xe_exec_queue_init's XE_LRC_CREATE_RUNALONE for a PXP RCS/CCS
+        // queue. NARF builds RUN_ALONE into width-one LRCs only; a parallel
+        // compute PXP queue (impossible with MTL's single CCS) is refused.
+        let run_alone = protected && matches!(class, 0 | 4);
+        if run_alone && lanes.is_some() {
+            return Err(FsError::Unsupported);
+        }
         let context = match lanes {
             Some(lanes) => UserContext::for_parallel(lanes)?,
             None if class == 5 => UserContext::new(),
             None => UserContext::for_placements(placements)?,
         };
+        if run_alone {
+            context.configure_run_alone()?;
+        }
         if let Some(replay) = &replay {
             context.init_hang_replay(replay)?;
         }
@@ -716,6 +880,35 @@ impl XeFile {
         if low_latency {
             context.configure_low_latency()?;
         }
+        Ok(PreparedQueue {
+            wire,
+            context,
+            class,
+            priority,
+            low_latency,
+            pxp: pxp.filter(|_| protected),
+        })
+    }
+
+    /// The queue's publication, as xe_exec_queue_create_ioctl ends after
+    /// xe_exec_queue_create: a failure here drops `membership`, which takes
+    /// the queue off the PXP list again.
+    fn publish_queue(
+        &self,
+        info: &DeviceInfo,
+        address: u64,
+        user: &dyn IoctlContext,
+        prepared: PreparedQueue,
+        membership: Option<PxpMembership>,
+    ) -> Result<(), FsError> {
+        let PreparedQueue {
+            mut wire,
+            context,
+            class,
+            priority,
+            low_latency,
+            ..
+        } = prepared;
         let mut names = self.names.lock();
         let vm = names
             .vms
@@ -733,6 +926,7 @@ impl XeFile {
             context,
             bind: class == 5,
             dead: AtomicBool::new(false),
+            pxp: membership,
         });
         // Revalidate the current creator after all extension copies and VM
         // preparation, immediately before publishing a name. Like Linux,
@@ -775,6 +969,9 @@ impl XeFile {
                     .map(|_| 0),
             ),
             abi::EXEC => Some(self.exec(info, address, user, syncobjs).await.map(|_| 0)),
+            abi::EXEC_QUEUE_CREATE => {
+                Some(self.create_queue_user(info, address, user).await.map(|_| 0))
+            }
             abi::WAIT_USER_FENCE => Some(self.wait_user(address, user).await.map(|_| 0)),
             abi::OBSERVATION => Some(self.observation(info, address, user, syncobjs).await),
             _ => self.dispatch(info, cmd, address, user, gem),
@@ -865,7 +1062,11 @@ impl XeFile {
         // gem_create_user_extensions' verdict, applied once the object
         // exists (xe_gem_create_ioctl), never before a VM or allocation
         // refusal.
-        let extensions = gem_create_extensions(user, u64_at(&wire, 0));
+        let (extensions, key) =
+            match gem_create_extensions(user, u64_at(&wire, 0), pxp_of(info).as_deref()) {
+                Ok(key) => (Ok(()), key),
+                Err(error) => (Err(error), 0),
+            };
         let vm_id = u32_at(&wire, 24);
         let vm = if vm_id == 0 {
             None
@@ -878,6 +1079,9 @@ impl XeFile {
         let owner = vm.as_ref().map(|vm| vm.identity);
         // bo->cpu_caching and XE_BO_FLAG_NO_COMPRESSION, for bind admission.
         let mark = |object: &crate::intel_gpu_gem::GemObject| {
+            if key != 0 {
+                object.set_pxp_key(key);
+            }
             if caching == 2 {
                 object.mark_wc_caching();
             }
@@ -949,6 +1153,11 @@ impl XeFile {
         // before any clear is submitted.
         extensions?;
         mark(&pending.object());
+        // No system region: xe_bo_can_migrate(bo, XE_PL_TT) is false, which
+        // decides a non-P2P dma-buf attachment (crate::intel_gpu_prime).
+        if placement & 1 == 0 {
+            pending.object().mark_vram_only();
+        }
         let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
         let epoch = backend
             .status()
@@ -1047,8 +1256,25 @@ impl XeFile {
             read(user, u64_at(&wire, 24), count * 80)?
         };
         let mut binds = alloc::vec::Vec::new();
+        let pxp = pxp_of(info);
         for op in vector.chunks_exact(80) {
-            binds.push(Bind::read(op, &vm, gem, info.platform)?);
+            let bind = Bind::read(op, &vm, gem, info.platform)?;
+            // xe_vm_bind_ioctl_validate_bo: with DRM_XE_VM_BIND_FLAG_CHECK_PXP
+            // a protected object maps only while its key is current (any
+            // xe_pxp_bo_key_check refusal, ENODEV included, is -ENOEXEC).
+            // UNMAP and UNMAP_ALL are never checked.
+            if u32_at(op, 44) & BIND_CHECK_PXP != 0 && u32_at(op, 40) == 0 {
+                if let Some(object) = bind.mapping.as_ref().and_then(|m| m.object.as_ref()) {
+                    let key = object.pxp_key();
+                    if key != 0 {
+                        pxp.as_ref()
+                            .ok_or(FsError::InvalidData)?
+                            .key_check(key)
+                            .map_err(key_refused)?;
+                    }
+                }
+            }
+            binds.push(bind);
         }
         for bind in &mut binds {
             bind.pin(&vm, user)?;
@@ -1068,6 +1294,15 @@ impl XeFile {
             {
                 ensure_system_ccs(info, object).await?;
             }
+        }
+        // A foreign dma-buf import is validated (its attachment mapped and
+        // pinned) before its first PTE, as xe_bo_validate maps an sg BO.
+        for object in binds
+            .iter()
+            .filter_map(|bind| bind.mapping.as_ref()?.object.as_ref())
+            .filter(|object| object.is_imported())
+        {
+            crate::intel_gpu_prime::ensure_mapped(object).await?;
         }
         let _order = match &queue {
             Some(queue) => Some(queue.context.serial.lock().await),
@@ -1214,6 +1449,11 @@ impl XeFile {
                 status.epoch
             };
             queue.context.check_epoch(epoch).map_err(canceled)?;
+            // xe_exec_ioctl: a PXP queue runs only while every protected
+            // object its VM maps carries the current key.
+            if let Some(membership) = &queue.pxp {
+                validate_protected(&membership.pxp, &state.mappings)?;
+            }
             if let Some(pool) = info.vram.as_ref() {
                 ensure_vram_residency(backend.as_ref(), pool, &state.mappings, status.epoch, None)
                     .await;

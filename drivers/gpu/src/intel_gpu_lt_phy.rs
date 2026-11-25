@@ -1260,7 +1260,7 @@ pub(crate) const fn hdmi_signal_level(vbt_level: Option<u8>) -> (u8, LtTxLevel) 
     (index, DP14_LEVELS[index as usize])
 }
 
-const fn txy_ctl(tx: u8, register: u16) -> Option<u16> {
+pub(crate) const fn txy_ctl(tx: u8, register: u16) -> Option<u16> {
     if tx < 2 {
         Some(0x0400 + tx as u16 * 0x0200 + register)
     } else {
@@ -1336,14 +1336,19 @@ struct LtEnablePlan<'a> {
     hdmi_frl: bool,
 }
 
-/// Nova Lake LT-PHY message-bus transport. Construction is family-qualified but
-/// this type is not reachable from any display route.
+/// Nova Lake LT-PHY message-bus transport. Construction is family-qualified:
+/// only an LT-PHY window (display 35) builds one.
 pub(crate) struct LtPhy<'a, M: MmioWindow + ?Sized> {
     mmio: LtPortView<'a, M>,
     port: LtPort,
     lanes: PhyLaneConfig,
     dp_alt: bool,
     max_lanes: u8,
+    /// The display-35 `DC_off` well each transaction holds
+    /// (`intel_lt_phy_transaction_begin`): the production service, inert
+    /// unless the Nova Lake-S route installed it, or a fixture's own
+    /// ([`LtPhy::with_dc_off`]).
+    dc_off: &'a dyn crate::intel_gpu_dc_states::DcOff,
 }
 
 impl<M: MmioWindow + ?Sized> core::fmt::Debug for LtPhy<'_, M> {
@@ -1378,7 +1383,30 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
             lanes,
             dp_alt,
             max_lanes,
+            dc_off: &crate::intel_gpu_dc_states::Xe3pLpdDcOff,
         })
+    }
+
+    /// Hold `dc` as the display-35 `DC_off` well across each transaction
+    /// instead of the production service.
+    pub(crate) fn with_dc_off(mut self, dc: &'a dyn crate::intel_gpu_dc_states::DcOff) -> Self {
+        self.dc_off = dc;
+        self
+    }
+
+    /// `intel_lt_phy_transaction_begin`'s `POWER_DOMAIN_DC_OFF`: DC states
+    /// are exited before the transaction's first register access and
+    /// re-entry is deferred after the guard drops. Nested inside a modeset
+    /// or external pass it counts without a write. A refused exit runs
+    /// nothing (`PhyError`). PSR, which the Linux bracket also pauses, is
+    /// not offered on display 35.
+    fn transaction_begin(&self) -> Result<crate::intel_gpu_dc_states::DcGuard<'a>, Cx0Error> {
+        crate::intel_gpu_dc_states::hold(
+            self.dc_off,
+            self.mmio.0,
+            crate::intel_gpu_dc_states::DcUser::Phy,
+        )
+        .map_err(|_| Cx0Error::PhyError)
     }
 
     fn cx0(&self) -> Cx0Phy<'_, LtPortView<'a, M>> {
@@ -1658,10 +1686,13 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
 
     /// Program the source DP PLL image through the normal Cx0 VDR transport.
     pub(crate) fn program_dp_pll(&self, rate: LtDpRate) -> Result<(), Cx0Error> {
+        let _dc = self.transaction_begin()?;
         self.program_pll_state(dp_pll_state(rate))
     }
 
+    /// `intel_lt_phy_pll_enable`, inside its transaction bracket.
     fn enable_pll_state(&self, plan: LtEnablePlan<'_>) -> Result<(), Cx0Error> {
+        let _dc = self.transaction_begin()?;
         let port = self.port.xelpg();
         let owned = self.lanes.owned_mask();
         let mut pulse = 0;
@@ -1731,6 +1762,28 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         })
     }
 
+    /// The DP PLL enable on an eDP output: `intel_lt_phy_pll_calc_state`
+    /// takes `xe3plpd_lt_edp_tables` and sets `config[2] = 1` on every eDP
+    /// image, including the four rates shared with DP. SSC is not requested
+    /// (Linux enables it only for a VBT panel-SSC sink advertising 0.5%
+    /// downspread).
+    pub(crate) fn enable_edp(&self, rate: LtEdpRate, lane_count: u8) -> Result<(), Cx0Error> {
+        if self.dp_alt || !matches!(lane_count, 1 | 2 | 4) || lane_count > self.max_lanes {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        let mut state = *edp_pll_state(rate);
+        state.config[2] = 1;
+        self.enable_pll_state(LtEnablePlan {
+            state: &state,
+            clock_khz: rate.clock_khz(),
+            lane_count,
+            pin_assignment_d: false,
+            plla_ssc: false,
+            pllb_ssc: false,
+            hdmi_frl: false,
+        })
+    }
+
     /// Run the source LT-PHY PLL/transmitter enable order for HDMI TMDS. This
     /// remains disconnected from the display route and deliberately refuses
     /// HDMI 2.1 FRL clocks, whose packet/training owner is not implemented.
@@ -1755,8 +1808,10 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         })
     }
 
-    /// Assert lane reset and gate MacCLK in Linux's LT-PHY disable order.
+    /// Assert lane reset and gate MacCLK in Linux's LT-PHY disable order
+    /// (`intel_lt_phy_pll_disable`, inside its transaction bracket).
     pub(crate) fn disable(&self) -> Result<(), Cx0Error> {
+        let _dc = self.transaction_begin()?;
         let port = self.port.xelpg();
         let owned = self.lanes.owned_mask();
         let mut resets = 0;
@@ -1808,6 +1863,7 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         )
         .ok_or(Cx0Error::ProtocolMismatch)?;
         let writes = tx_enable_writes(mask).ok_or(Cx0Error::ProtocolMismatch)?;
+        let _dc = self.transaction_begin()?;
         for write in writes {
             if write.address != write.mac_offset || write.data != write.expected_mac {
                 return Err(Cx0Error::ProtocolMismatch);
@@ -1826,6 +1882,8 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         if level_indices.is_empty() || level_indices.len() > 4 {
             return Err(Cx0Error::ProtocolMismatch);
         }
+        // intel_lt_phy_set_signal_levels's transaction bracket.
+        let _dc = self.transaction_begin()?;
         let cx0 = self.cx0();
         for (link_lane, &index) in level_indices.iter().enumerate() {
             let phy_lane = (link_lane / 2) as u8;
@@ -1856,24 +1914,26 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
 }
 
 #[cfg(feature = "kernel-test")]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloc::{collections::BTreeMap, vec::Vec};
     use core::cell::{Cell, RefCell};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct Transaction {
-        lane: u8,
-        address: u16,
-        data: u8,
+    pub(crate) struct Transaction {
+        pub(crate) lane: u8,
+        pub(crate) address: u16,
+        pub(crate) data: u8,
     }
 
+    /// The LT PHY's message bus, P2P status, lane reset/pulse status and
+    /// MacCLK request/ACK at the PICA offsets of ports A, B, TC1 and TC2.
     #[derive(Debug)]
-    struct FakeLtMmio {
-        regs: RefCell<BTreeMap<u64, u32>>,
-        vdr: RefCell<BTreeMap<(u8, u16), u8>>,
-        transactions: RefCell<Vec<Transaction>>,
+    pub(crate) struct FakeLtMmio {
+        pub(crate) regs: RefCell<BTreeMap<u64, u32>>,
+        pub(crate) vdr: RefCell<BTreeMap<(u8, u16), u8>>,
+        pub(crate) transactions: RefCell<Vec<Transaction>>,
         resets: Cell<u32>,
         bad_ack: Cell<bool>,
         lt_phy: bool,

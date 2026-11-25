@@ -31,8 +31,7 @@ fn capture(platform: GtPlatform, reason: Reason) -> Capture {
         } else {
             EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0])
         },
-        process_name: None,
-        pid: None,
+        process: None,
         snapshot_time: None,
     }
 }

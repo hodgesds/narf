@@ -786,9 +786,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
             batches,
             batch_count: batch_count as u8,
             wq,
-            comm: None,
-            pid: None,
-            snapshot_time: None,
+            process: context
+                .user
+                .as_ref()
+                .and_then(crate::intel_gpu_user::UserJob::owner),
+            snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
         })
     }
 
@@ -1096,6 +1098,57 @@ impl<A: BootAllocator> GuCScheduler<A> {
         self.submit(now, Engine::Gsccs0, None, Some(words))
     }
 
+    /// One PXP GSC job on GSCCS0 (xe_pxp_submit.c::pxp_pkt_submit on
+    /// `gsc_res.q`: EXEC_QUEUE_FLAG_KERNEL over the client's private PPGTT,
+    /// XE_VM_FLAG_GSC). The batch is the client object's GSC_HECI_CMD_PKT,
+    /// started from that PPGTT by __emit_job_gen12_simple, as Linux does for
+    /// every GSCCS job.
+    ///
+    /// # Safety
+    /// Same trusted resident-batch contract as `submit_resident`; the batch
+    /// object is the kernel's private, unexported PXP client object.
+    pub(crate) unsafe fn submit_pxp_gsc(
+        &mut self,
+        now: u64,
+        batch: ResidentBatch,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.admit()?;
+        if !self.media_gt || !self.engines.contains(Engine::Gsccs0) || !self.defaults_ready() {
+            return Err(SchedulingError::State);
+        }
+        // SAFETY: the forwarded trusted-batch contract.
+        unsafe { self.submit_resident_on(now, Engine::Gsccs0, batch) }
+    }
+
+    /// xe_pxp_submit_session_termination on the media GT's first VCS
+    /// (`vcs_exec.q`, EXEC_QUEUE_FLAG_KERNEL, no VM). Only the exact
+    /// termination stream of one session is admitted; it runs inline in the
+    /// kernel context's ring ahead of the breadcrumb, where Linux places it in
+    /// a GGTT batch. Both are privileged.
+    pub(crate) fn submit_pxp_termination(
+        &mut self,
+        now: u64,
+        engine: Engine,
+        words: &[u32],
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.admit()?;
+        if !self.media_gt
+            || !engine.is_decode()
+            || !self.engines.contains(engine)
+            || !self.defaults_ready()
+        {
+            return Err(SchedulingError::State);
+        }
+        if !crate::intel_gpu_gt::media::pxp::termination_valid(words) {
+            return Err(SchedulingError::Address);
+        }
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(words.len())
+            .map_err(|_| SchedulingError::Full)?;
+        copy.extend_from_slice(words);
+        self.submit(now, engine, None, Some(copy))
+    }
+
     /// # Safety
     /// The batch and every nested command stream must be trusted kernel code.
     /// It must access only resident mappings, return with BB_END and leave
@@ -1334,6 +1387,19 @@ impl<A: BootAllocator> GuCScheduler<A> {
         } else {
             context_image(&image, self.platform, ring.ggtt_offset());
         }
+        // xe_lrc.c XE_LRC_CREATE_RUNALONE: a PXP queue on RCS/CCS below
+        // graphics 20 keeps the EUs to itself. The masked enable joins the
+        // CTX_CONTEXT_CONTROL value after every restore above.
+        if user.as_ref().is_some_and(|claim| claim.run_alone())
+            && (engine == Engine::Rcs0 || engine.is_compute())
+        {
+            const CTX_CTRL_RUN_ALONE: u32 = 1 << 7;
+            let control = image.read32(REGS + 3 * 4);
+            image.write32(
+                REGS + 3 * 4,
+                control | CTX_CTRL_RUN_ALONE << 16 | CTX_CTRL_RUN_ALONE,
+            );
+        }
         // OACTXCONTROL image value (issue #1821): after the image is
         // built — and after any state restore above, which overwrites
         // the REGS page from the claim's snapshot — program the claim's
@@ -1381,7 +1447,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     image.ggtt_offset(),
                     stamp,
                 )
-            } else if engine.is_copy() {
+            } else if engine.is_copy() || engine.is_gsc() {
+                // ring_ops_gen12_gsc: emit_job_gen12_gsc is
+                // __emit_job_gen12_simple, as for COPY.
                 crate::intel_gpu_engine::copy_ring(
                     (!batch.skip_batch()).then_some(batch.address()),
                     batch.user_fence().filter(|_| width == 1),
@@ -1857,9 +1925,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
                                     now_ns: now,
                                     state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
                                     engines: self.engines,
-                                    process_name: None,
-                                    pid: None,
-                                    snapshot_time: None,
+                                    process: context
+                                        .user
+                                        .as_ref()
+                                        .and_then(crate::intel_gpu_user::UserJob::owner),
+                                    snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
                                 },
                                 contexts,
                                 |offset| {
@@ -2375,9 +2445,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             now_ns: now,
                             state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
                             engines: self.engines,
-                            process_name: None,
-                            pid: None,
-                            snapshot_time: None,
+                            process: c
+                                .user
+                                .as_ref()
+                                .and_then(crate::intel_gpu_user::UserJob::owner),
+                            snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
                         },
                         contexts,
                         |_| None,

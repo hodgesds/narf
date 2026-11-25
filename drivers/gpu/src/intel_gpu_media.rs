@@ -1100,15 +1100,32 @@ pub mod tests {
             let mut pos = head & mask;
             let tail = tail & mask;
             let mut guard = 0u32;
+            let mut stop = None;
             while pos != tail && guard < RING_BYTES {
                 guard += 4;
                 let dw = mem_rd(&ring, pos as u64);
                 match dw >> 23 {
+                    0x1c => {
+                        // MI_SEMAPHORE_WAIT (poll, equal): a paused ring stops
+                        // here and saves its head.
+                        let data = mem_rd(&ring, ((pos + 4) & mask) as u64);
+                        let lo = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
+                        let hi = mem_rd(&ring, ((pos + 12) & mask) as u64) as u64;
+                        if self.read_ggtt(lo | (hi << 32)) != data {
+                            stop = Some(pos);
+                            break;
+                        }
+                        pos = (pos + 16) & mask;
+                    }
                     0x26 => {
                         let lo = mem_rd(&ring, ((pos + 4) & mask) as u64) as u64;
                         let hi = mem_rd(&ring, ((pos + 8) & mask) as u64) as u64;
                         let data = mem_rd(&ring, ((pos + 12) & mask) as u64);
-                        self.write_ggtt((lo & !7) | (hi << 32), data);
+                        // Store-index posts into the context's PPHWSP scratch
+                        // (the Gen9/Gen11 XCS invalidate): no GGTT write.
+                        if dw & (1 << 21) == 0 {
+                            self.write_ggtt((lo & !7) | (hi << 32), data);
+                        }
                         pos = (pos + 16) & mask;
                     }
                     0x31 => {
@@ -1134,7 +1151,7 @@ pub mod tests {
             mem_wr(
                 &image,
                 rs + ((crate::intel_gpu_rcs::CTX_RING_HEAD + 1) as u64) * 4,
-                tail,
+                stop.unwrap_or(tail),
             );
         }
 
@@ -1168,6 +1185,17 @@ pub mod tests {
                 }
             }
             panic!("fake hw: store to unmapped GGTT address");
+        }
+
+        fn read_ggtt(&self, addr: u64) -> u32 {
+            let reg = self.registry.borrow();
+            for (base, mem) in reg.iter() {
+                let size = mem.borrow().len() as u64;
+                if addr >= *base as u64 && addr + 4 <= *base as u64 + size {
+                    return mem_rd(mem, addr - *base as u64);
+                }
+            }
+            panic!("fake hw: load from unmapped GGTT address");
         }
 
         fn push_csb(&mut self, entry: crate::intel_gpu_rcs::CsbEntry) {

@@ -33,10 +33,10 @@
 //! The level-0 and SAGV auto minimum allocation and `PLANE_MIN_BUF_CFG`
 //! are register-image deltas ([`crate::intel_gpu_xe3lpd`]).
 //!
-//! Display 35 (Xe3P_LPD) stays outside operational `DisplayIp` dispatch.
-//! Its disconnected calculation forces latency level 0 through
-//! WaWmMemoryReadLatency and selects method 2 for every linear plane, matching
-//! Linux's `DISPLAY_VER >= 35` branches.
+//! Display 35 (Xe3P_LPD) takes the display-30 rules plus Linux's
+//! `DISPLAY_VER >= 35` branches: [`Latency::read_ip`] ignores the reported
+//! level-0 latency (WaWmMemoryReadLatency always supplies it) and every
+//! linear plane selects method 2.
 //!
 //! Gen12 keeps its own transcription in [`crate::intel_gpu_wm`]; nothing
 //! here changes Gen12 results.
@@ -108,7 +108,39 @@ impl Latency {
         Self::adjust(raw, sagv_block_us)
     }
 
+    /// [`Latency::read`] under `ip`'s sanitizer: display 35 drops the
+    /// reported level-0 latency first ([`Latency::adjust_display35`]).
+    pub(crate) fn read_ip(
+        io: &(impl MmioWindow + ?Sized),
+        ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    ) -> Result<Self, FsError> {
+        let (raw, block, qgv) = Self::read_raw(io, ip)?;
+        Ok(Self {
+            qgv,
+            ..if ip.is_display35() {
+                Self::adjust_display35(raw, block)
+            } else {
+                Self::adjust(raw, block)
+            }
+        })
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn read(io: &(impl MmioWindow + ?Sized)) -> Result<Self, FsError> {
+        let (raw, block, qgv) = Self::read_raw(io, crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp)?;
+        Ok(Self {
+            qgv,
+            ..Self::adjust(raw, block)
+        })
+    }
+
+    /// `mtl_read_wm_latency` and the SAGV block time `intel_sagv_init`
+    /// keeps (zero without SAGV control).
+    #[allow(clippy::type_complexity)]
+    fn read_raw(
+        io: &(impl MmioWindow + ?Sized),
+        ip: crate::intel_gpu_xe2lpd::DisplayIp,
+    ) -> Result<([u16; LEVELS], u16, Option<crate::intel_gpu_xelpg_bw::Qgv>), FsError> {
         let mut raw = [0u16; LEVELS];
         for (i, r) in LATENCY_REGS.into_iter().enumerate() {
             let v = io.read32(r);
@@ -124,16 +156,13 @@ impl Latency {
         }
         // intel_sagv_init: without SAGV control the block time is zero, so
         // no SAGV watermark is computed or programmed.
-        let qgv = crate::intel_gpu_xelpg_bw::Qgv::read(io)?;
+        let qgv = crate::intel_gpu_xelpg_bw::Qgv::read_ip(io, ip)?;
         let block = if qgv.is_some() {
             (sagv & LEVEL_MASK) as u16
         } else {
             0
         };
-        Ok(Self {
-            qgv,
-            ..Self::adjust(raw, block)
-        })
+        Ok((raw, block, qgv))
     }
 }
 
@@ -265,13 +294,15 @@ impl Rules {
         match ip {
             crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd
             | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => Self::Display30 { panned: false },
-            _ => Self::Display14,
+            crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS => Self::Display35 { panned: false },
+            crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp
+            | crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd => Self::Display14,
         }
     }
 }
 
 /// [`params`] for `ip`: display 30 also scans out up to twice its
-/// 691.2 MHz CDCLK.
+/// 691.2 MHz CDCLK, display 35 up to twice its 787.2 MHz one.
 fn params_ip(
     ip: crate::intel_gpu_xe2lpd::DisplayIp,
     timing: Timing,
@@ -391,29 +422,18 @@ fn level_rules(
     })
 }
 
-/// Disconnected display-35 plane calculation. It uses Nova Lake's 787.2 MHz
-/// ceiling and never constructs an operational [`crate::intel_gpu_xe2lpd::DisplayIp`].
+/// [`plane_ip`] on display 35 (Nova Lake's 787.2 MHz ceiling).
 pub(crate) fn plane_display35(
     timing: Timing,
     surface: Surface,
     latency: &Latency,
 ) -> Result<PlaneWm, WmError> {
-    let wp = params_display35(timing, surface)?;
-    plane_with(timing, &wp, latency, Rules::Display35 { panned: false })
-}
-
-fn params_display35(timing: Timing, surface: Surface) -> Result<Params, WmError> {
-    if !matches!(surface.cpp, 1 | 2 | 4 | 8)
-        || surface.width == 0
-        || surface.width > 8192
-        || timing.htotal == 0
-        || timing.htotal > 16384
-        || !(1..=2 * crate::intel_gpu_xelpg_cdclk::NOVA_LAKE_MAX_CDCLK_KHZ)
-            .contains(&timing.pixel_rate_khz)
-    {
-        return Err(WmError::Unsupported);
-    }
-    params_rules(timing, surface, Rules::Display35 { panned: false })
+    plane_ip(
+        crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS,
+        timing,
+        surface,
+        latency,
+    )
 }
 
 /// `skl_compute_transition_wm` (display >= 11, IPC enabled). A disabled
@@ -587,18 +607,17 @@ fn cursor_allocation_with(
     Ok(min_ddb_alloc.max(if num_active == 1 { 32 } else { 8 }))
 }
 
+/// [`cursor_allocation_ip`] on display 35.
 pub(crate) fn cursor_allocation_display35(
     timing: Timing,
     latency: &Latency,
     num_active: u32,
 ) -> Result<u16, WmError> {
-    let wp = params_display35(timing, CURSOR_RESERVATION)?;
-    cursor_allocation_with(
+    cursor_allocation_ip(
+        crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS,
         timing,
-        &wp,
         latency,
         num_active,
-        Rules::Display35 { panned: false },
     )
 }
 
@@ -807,12 +826,13 @@ pub(crate) fn check_vblank_display35(
     latency: &Latency,
     planes: &mut [&mut PlaneWm],
 ) -> Result<bool, WmError> {
-    use crate::intel_gpu_xelpg_cdclk::{calc_nova_lake_cdclk, pixel_rate_to_cdclk};
-    let wm0 = planes.iter().map(|p| p.levels[0].lines).max().unwrap_or(0);
-    let clock = calc_nova_lake_cdclk(pixel_rate_to_cdclk(timing.pixel_rate_khz))
-        .ok_or(WmError::Unsupported)?;
-    let prefill = Prefill::with_clock(timing, u64::from(wm0) << 16, clock)?;
-    limit_vblank(prefill, latency, planes)
+    check_vblank_dsc_ip(
+        crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS,
+        timing,
+        latency,
+        planes,
+        false,
+    )
 }
 
 fn limit_vblank(

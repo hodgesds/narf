@@ -3278,6 +3278,13 @@ const COLOR_FORMAT_ENUMS: [(u64, &[u8]); 5] = [
     (4, b"YUV 4:2:0"),
 ];
 const MAX_BPC_RANGE: [u64; 2] = [8, 16];
+/// drm_connector_attach_content_protection_property: "Content Protection"
+/// (drm_cp_enum_list) and, with HDCP 2.2, "HDCP Content Type"
+/// (drm_hdcp_content_type_enum_list).
+const CONTENT_PROTECTION_PROP_ID: u32 = 0x84;
+const HDCP_CONTENT_TYPE_PROP_ID: u32 = 0x85;
+const CONTENT_PROTECTION_ENUMS: EnumEntries = [(0, b"Undesired"), (1, b"Desired"), (2, b"Enabled")];
+const HDCP_CONTENT_TYPE_ENUMS: [(u64, &[u8]); 2] = [(0, b"HDCP Type0"), (1, b"HDCP Type1")];
 /// `sizeof(struct hdr_output_metadata)`, the size
 /// drm_atomic_connector_set_property requires of an HDR_OUTPUT_METADATA blob.
 const HDR_OUTPUT_METADATA_SIZE: usize = 32;
@@ -3694,6 +3701,16 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         BROADCAST_RGB_PROP_ID => (b"Broadcast RGB", DRM_MODE_PROP_ENUM, &BROADCAST_RGB_ENUMS),
         COLORSPACE_PROP_ID => (b"Colorspace", DRM_MODE_PROP_ENUM, &COLORSPACE_ENUMS),
         COLOR_FORMAT_PROP_ID => (b"color format", DRM_MODE_PROP_ENUM, &COLOR_FORMAT_ENUMS),
+        CONTENT_PROTECTION_PROP_ID => (
+            b"Content Protection",
+            DRM_MODE_PROP_ENUM,
+            &CONTENT_PROTECTION_ENUMS,
+        ),
+        HDCP_CONTENT_TYPE_PROP_ID => (
+            b"HDCP Content Type",
+            DRM_MODE_PROP_ENUM,
+            &HDCP_CONTENT_TYPE_ENUMS,
+        ),
         #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::BLEND_PROP_ID => (
             b"pixel blend mode",
@@ -3821,7 +3838,79 @@ fn connector_properties(
         props.push(VRR_CAPABLE_PROP_ID);
         values.push(u64::from(capable));
     }
+    if let Some(cp) = card.content_protection(connector_id) {
+        props.push(CONTENT_PROTECTION_PROP_ID);
+        values.push(u64::from(cp.value));
+        if let Some(content_type) = cp.content_type {
+            props.push(HDCP_CONTENT_TYPE_PROP_ID);
+            values.push(u64::from(content_type));
+        }
+    }
     (props, values)
+}
+
+/// One connector's "Content Protection" / "HDCP Content Type" change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ContentProtectionChange {
+    value: Option<u8>,
+    content_type: Option<u8>,
+}
+
+/// Validate a "Content Protection" / "HDCP Content Type" value for
+/// `connector` into `change`: EINVAL for a connector without the property,
+/// a value outside its enum, or ENABLED, which only drivers set
+/// (drm_atomic_connector_set_property). `Ok(false)` for any other property.
+fn content_protection_property(
+    card: &crate::drm::card::Card,
+    connector: u32,
+    prop: u32,
+    value: u64,
+    change: &mut ContentProtectionChange,
+) -> Result<bool, FsError> {
+    let cp = card.content_protection(connector);
+    match prop {
+        CONTENT_PROTECTION_PROP_ID => {
+            if cp.is_none() || value > 1 {
+                return Err(invalid_at(line!()));
+            }
+            change.value = Some(value as u8);
+        }
+        HDCP_CONTENT_TYPE_PROP_ID => {
+            if cp.and_then(|c| c.content_type).is_none() || value > 1 {
+                return Err(invalid_at(line!()));
+            }
+            change.content_type = Some(value as u8);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Commit a validated content protection change into the connector state;
+/// returns the driver request `(connector, value, content type)`, made
+/// once the card lock is released (intel_hdcp_atomic_check then
+/// intel_hdcp_update_pipe on the native driver).
+fn apply_content_protection(
+    card_index: u32,
+    card: &mut crate::drm::card::Card,
+    connector: u32,
+    change: ContentProtectionChange,
+) -> Option<(u32, u8, u8)> {
+    let cp = card
+        .content_protection
+        .iter_mut()
+        .find(|c| c.connector == connector)?;
+    if let Some(value) = change.value {
+        cp.value = value;
+    }
+    if let Some(content_type) = change.content_type {
+        cp.content_type = Some(content_type);
+    }
+    (crate::drm_registry::driver_name(card_index) == Some("intel-gpu")).then_some((
+        connector,
+        cp.value,
+        cp.content_type.unwrap_or(0),
+    ))
 }
 
 /// A CRTC color or connector HDR blob property value, validated as
@@ -4609,6 +4698,16 @@ fn handle_set_property(
                 crate::intel_gpu_hdr::request_connector_color(request);
             }
             _ => {}
+        }
+        return Ok(0);
+    }
+    let mut protection = ContentProtectionChange::default();
+    if content_protection_property(&card, obj_id, prop_id, value, &mut protection)? {
+        let _request = apply_content_protection(card_index, &mut card, obj_id, protection);
+        drop(card);
+        #[cfg(feature = "intel")]
+        if let Some((connector, value, content_type)) = _request {
+            crate::intel_hdcp_live::request(card_index, connector, value, content_type);
         }
         return Ok(0);
     }
@@ -5974,6 +6073,8 @@ fn atomic_commit(
     let cursor_requests: Vec<CursorRequest> = Vec::new();
     // Native connector "max bpc" changes, likewise.
     let mut max_bpc_requests: Vec<(u32, u8)> = Vec::new();
+    // Native connector content protection changes, likewise.
+    let mut protection_requests: Vec<(u32, u8, u8)> = Vec::new();
     let presentation = {
         let mut card = mode_state.lock();
         if let Some(a) = admission {
@@ -6001,6 +6102,8 @@ fn atomic_commit(
         // values, likewise.
         let mut crtc_colors: Vec<(u32, CrtcColorChange)> = Vec::new();
         let mut connector_colors: Vec<(u32, ConnectorColorChange)> = Vec::new();
+        // Connector "Content Protection" / "HDCP Content Type", likewise.
+        let mut protections: Vec<(u32, ContentProtectionChange)> = Vec::new();
         for (object_index, object_id) in objects.iter().copied().enumerate() {
             let object_prop_count = prop_counts[object_index] as usize;
             let end = prop_index
@@ -6294,9 +6397,17 @@ fn atomic_commit(
                     }
                 }
                 let mut color = ConnectorColorChange::default();
+                let mut protection = ContentProtectionChange::default();
                 for (&prop, &value) in object_props.iter().zip(object_values) {
                     match prop {
                         p if connector_color_property(&card, object_id, p, value, &mut color)? => {}
+                        p if content_protection_property(
+                            &card,
+                            object_id,
+                            p,
+                            value,
+                            &mut protection,
+                        )? => {}
                         CONNECTOR_CRTC_ID_PROP_ID => {
                             connector_state.crtc_id = (value != 0).then_some(value as u32)
                         }
@@ -6337,6 +6448,15 @@ fn atomic_commit(
                     }
                     connector_colors.retain(|(id, _)| *id != object_id);
                     connector_colors.push((object_id, color));
+                }
+                if protection != ContentProtectionChange::default() {
+                    match protections.iter_mut().find(|(id, _)| *id == object_id) {
+                        Some((_, merged)) => {
+                            merged.value = protection.value.or(merged.value);
+                            merged.content_type = protection.content_type.or(merged.content_type);
+                        }
+                        None => protections.push((object_id, protection)),
+                    }
                 }
                 if let (Some(crtc_ids), Some(crtc_id)) =
                     (event_crtc_ids.as_mut(), connector_state.crtc_id)
@@ -6701,6 +6821,13 @@ fn atomic_commit(
             for &(connector, value) in &broadcast_rgb {
                 apply_broadcast_rgb(card_index, &mut card, connector, value);
             }
+            for &(connector, change) in &protections {
+                if let Some(request) =
+                    apply_content_protection(card_index, &mut card, connector, change)
+                {
+                    protection_requests.push(request);
+                }
+            }
             for &(connector, bpc) in &max_bpcs {
                 if let Some(request) = apply_max_bpc(card_index, &mut card, connector, bpc) {
                     max_bpc_requests.push(request);
@@ -6944,6 +7071,12 @@ fn atomic_commit(
     for (connector, bpc) in max_bpc_requests {
         crate::amdgpu_native_kms::request_connector_max_bpc(connector, bpc);
     }
+    #[cfg(feature = "intel")]
+    for (connector, value, content_type) in protection_requests {
+        crate::intel_hdcp_live::request(card_index, connector, value, content_type);
+    }
+    #[cfg(not(feature = "intel"))]
+    drop(protection_requests);
 
     // Accepted requests, TEST_ONLY probes included; `commits` counts the
     // ones that were not probes, and `present` says whether this one handed

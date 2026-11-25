@@ -673,10 +673,32 @@ fn smoke_bmg_smallbar_cpu_export_alias_and_profile_refusals() -> TestResult {
     assert_eq!(object.write(0, &[1]), Err(FsError::Unsupported));
     assert_eq!(object.backing(0, 4096).err(), Some(FsError::Unsupported));
     assert_eq!(file.gem.mmap_offset(handle), Err(FsError::Unsupported));
-    assert_eq!(
-        file.gem.export_object(handle).err(),
-        Some(FsError::NotImplemented)
-    );
+    // xe_gem_prime_export admits a VRAM object; attachments decide
+    // peer-to-peer or migration (intel_gpu_prime).
+    assert!(Arc::ptr_eq(&file.gem.export_object(handle).unwrap(), &object));
+    {
+        use crate::intel_gpu_prime::fixture::{Fabric, DISTANT, EXPORTER, PEER};
+        use crate::intel_gpu_prime::{attach, Exporter};
+        let exporter = || Exporter {
+            platform: GtPlatform::Battlemage,
+            backend: rig.backend.clone(),
+        };
+        // xe_dma_buf_attach: this nonvisible object's placement is VRAM
+        // only, so an importer without a peer path is -EOPNOTSUPP.
+        assert_eq!(
+            attach(object.clone(), exporter(), &Fabric, Some(EXPORTER), Some(DISTANT), true).err(),
+            Some(FsError::Unsupported)
+        );
+        // A peer attaches, but xe_ttm_vram_mgr_alloc_sgt refuses VRAM that is
+        // not wholly CPU-visible (-EOPNOTSUPP) and the pin-on-map is undone.
+        let peer =
+            attach(object.clone(), exporter(), &Fabric, Some(EXPORTER), Some(PEER), true).unwrap();
+        assert_eq!(
+            narf_scheduler::block_on_spin(peer.map()).err(),
+            Some(FsError::Unsupported)
+        );
+        assert!(!peer.pinned() && !object.externally_pinned());
+    }
     let mut wire = [0; 40];
     put32(&mut wire, 8, handle);
     user.wire.store(64, &wire);

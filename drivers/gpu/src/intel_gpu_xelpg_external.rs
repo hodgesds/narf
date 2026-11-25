@@ -100,6 +100,14 @@
 //! [`ExternalDisplayProfile`] so broad `Generation::PantherLake` can never
 //! widen it to TC3/TC4 or Pipe D. The production hotplug entry receives that
 //! profile from the exact KMS owner; native fixtures also select it directly.
+//! Nova Lake-S display 35 admits LT port B (DP, HDMI TMDS) and TC1/TC2
+//! (DP-alt, declared legacy) through the display-35 view
+//! ([`crate::intel_gpu_xe3plpd::View`]): the port PLL, its disable and the
+//! signal levels take the LT PHY (`intel_lt_phy_pll_enable`,
+//! `intel_lt_phy_pll_disable`, `intel_lt_phy_set_signal_levels` over
+//! `xe3plpd_lt_trans_dp14`), and a profile whose PHY family the view does not
+//! report is refused before MMIO ([`ExternalDisplayProfile::admits_view`]).
+//! Thunderbolt alt mode on an LT port is refused ([`ExternalError::LtTbtAlt`]).
 //!
 //! ## DSC with FEC
 //!
@@ -206,7 +214,11 @@ impl ExternalDisplayProfile {
         let generation = match display_ip {
             DisplayIp::Xelpdp => Generation::MeteorLake,
             DisplayIp::Xe2Lpd => Generation::LunarLake,
-            DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => Generation::PantherLake,
+            // Nova Lake-S has no generation of its own; its profile admits
+            // no external port (see `admits_port`).
+            DisplayIp::Xe3Lpd | DisplayIp::WildcatLake | DisplayIp::NovaLakeS => {
+                Generation::PantherLake
+            }
         };
         Self {
             display_ip,
@@ -230,6 +242,7 @@ impl ExternalDisplayProfile {
             DisplayIp::Xe2Lpd => TcDisplayProfile::Xe2Lpd,
             DisplayIp::Xe3Lpd => TcDisplayProfile::Xe3Lpd,
             DisplayIp::WildcatLake => TcDisplayProfile::WildcatLake,
+            DisplayIp::NovaLakeS => TcDisplayProfile::NovaLakeS,
         }
     }
 
@@ -253,7 +266,20 @@ impl ExternalDisplayProfile {
             DisplayIp::WildcatLake => {
                 matches!(port, XeLpgPort::Tc1 | XeLpgPort::Tc2)
             }
+            // Display 35: LT port B and TC1/TC2 (`HAS_LT_PHY`); every PHY
+            // step of the route takes the LT PHY through the display-35 view
+            // ([`crate::intel_gpu_xe3plpd::View`]), never a Cx0 sequence.
+            DisplayIp::NovaLakeS => {
+                matches!(port, XeLpgPort::B | XeLpgPort::Tc1 | XeLpgPort::Tc2)
+            }
         }
+    }
+
+    /// Whether `io` is this profile's PHY family: the LT PHY exactly on
+    /// display 35 (`HAS_LT_PHY` is `platform.novalake`), Cx0 elsewhere.
+    pub(crate) fn admits_view<M: MmioWindow + ?Sized>(self, io: &M) -> bool {
+        io.has_lt_phy() == matches!(self.display_ip, DisplayIp::NovaLakeS)
+            && !(io.has_lt_phy() && io.cx0_xe3())
     }
 }
 
@@ -383,6 +409,9 @@ pub enum ExternalError {
     /// The stream needs a DSC configuration Linux would not choose or this
     /// driver does not qualify (nothing was programmed).
     Dsc(DscRefusal),
+    /// A Thunderbolt-alt connection on an LT-PHY port: its TBT clock
+    /// (`intel_mtl_tbt_pll_enable_clock`) is not owned on display 35.
+    LtTbtAlt,
 }
 
 impl From<TcError> for ExternalError {
@@ -690,6 +719,90 @@ fn d2d_err(_: crate::intel_gpu_xe2lpd::IpError) -> ExternalError {
     phy_err(Cx0Error::Timeout)
 }
 
+// ── The port's PHY: LT on display 35, Cx0 elsewhere ─────────────
+
+/// The LT PHY behind the probe's port on a display-35 view (`HAS_LT_PHY`),
+/// owning the probe's lanes (DP-alt, the connection's lane limit, the VBT
+/// reversal); `None` on every Cx0 view.
+pub(crate) fn lt_phy<'a, M: MmioWindow + ?Sized>(
+    io: &'a M,
+    port: XeLpgPort,
+    dp_alt: bool,
+    max_lanes: u8,
+    reversed: bool,
+) -> Result<Option<crate::intel_gpu_lt_phy::LtPhy<'a, M>>, ExternalError> {
+    if !io.has_lt_phy() {
+        return Ok(None);
+    }
+    let port =
+        crate::intel_gpu_lt_phy::LtPort::from_xelpg(port).ok_or(ExternalError::UnsupportedPort)?;
+    crate::intel_gpu_lt_phy::LtPhy::new(io, port, dp_alt, max_lanes, reversed)
+        .map(Some)
+        .map_err(phy_err)
+}
+
+fn probe_lt_phy<'a, M: MmioWindow + ?Sized>(
+    io: &'a M,
+    probe: &MtlSinkProbe,
+) -> Result<Option<crate::intel_gpu_lt_phy::LtPhy<'a, M>>, ExternalError> {
+    lt_phy(
+        io,
+        probe.port,
+        probe.dp_alt(),
+        probe.tc.map_or(4, |tc| tc.max_lanes),
+        probe.lane_reversal,
+    )
+}
+
+/// `encoder->set_signal_levels` on `lanes` at `levels`:
+/// `intel_lt_phy_set_signal_levels` over the DP 1.4 table
+/// (`xe3plpd_lt_trans_dp14`; UHBR is not advertised) at each lane's
+/// `intel_ddi_dp_level`, or `intel_cx0_phy_set_signal_levels`.
+fn port_levels<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: &MtlSinkProbe,
+    rate: crate::intel_gpu_pll::LinkRate,
+    lanes: u8,
+    levels: &[(u8, u8); 4],
+) -> Result<(), ExternalError> {
+    match probe_lt_phy(io, probe)? {
+        Some(lt) => {
+            let lanes = usize::from(lanes);
+            if !(1..=levels.len()).contains(&lanes) {
+                return Err(phy_err(Cx0Error::ProtocolMismatch));
+            }
+            let mut index = [0u8; 4];
+            for (slot, &(swing, pre_emph)) in index.iter_mut().zip(levels) {
+                *slot = crate::intel_gpu_xelpg::preset_index(swing, pre_emph) as u8;
+            }
+            lt.program_signal_levels(
+                crate::intel_gpu_lt_phy::LtSignalProtocol::Dp14,
+                &index[..lanes],
+            )
+            .map_err(phy_err)
+        }
+        None => set_signal_levels(
+            &Cx0Phy::with_lanes(io, probe.port, probe.phy_lanes()?),
+            rate,
+            lanes,
+            levels,
+        )
+        .map_err(phy_err),
+    }
+}
+
+/// `intel_ddi_disable_clock` for a non-TBT route: `intel_lt_phy_pll_disable`
+/// or `intel_cx0pll_disable` of the probe's lanes.
+fn port_pll_disable<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: &MtlSinkProbe,
+) -> Result<(), ExternalError> {
+    match probe_lt_phy(io, probe)? {
+        Some(lt) => lt.disable().map_err(phy_err),
+        None => disable_port_pll_lanes(io, probe.port, probe.phy_lanes()?).map_err(phy_err),
+    }
+}
+
 /// Everything [`activate`] needs, owning the Type-C connection and the
 /// AUX power request from probe until [`release_probe`] or a route
 /// release.
@@ -748,8 +861,21 @@ impl MtlSinkProbe {
     fn clock_mask(&self) -> Result<u32, ExternalError> {
         Ok(if self.tbt() {
             crate::intel_gpu_xelpg::TBT_CLOCK_REQUEST | crate::intel_gpu_xelpg::TBT_CLOCK_ACK
+        } else if self.display_ip == DisplayIp::NovaLakeS {
+            // The LT PHY requests MacCLK on lane 0 whichever lanes it owns
+            // (`intel_lt_phy_pll_enable`).
+            crate::intel_gpu_xelpg::lane_pclk_pll_request(0)
+                | crate::intel_gpu_xelpg::lane_pclk_pll_ack(0)
         } else {
             pll_clock_mask(self.phy_lanes()?)
+        })
+    }
+    /// `INTEL_TC_PIN_ASSIGNMENT_D`: the LT transmitter layout of a two-lane
+    /// DP-alt connection that keeps USB.
+    fn pin_assignment_d(&self) -> bool {
+        self.tc.is_some_and(|tc| {
+            tc.mode == TcMode::DpAlt
+                && tc.pin_assignment == crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D
         })
     }
     fn phy_lanes(&self) -> Result<PhyLaneConfig, ExternalError> {
@@ -812,6 +938,9 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
     if !profile.admits_port(port) {
         return Err(ExternalError::UnsupportedPort);
     }
+    if !profile.admits_view(io) {
+        return Err(ExternalError::UnsupportedGeneration);
+    }
     // Do not acquire/release Type-C ownership behind an inherited live DDI.
     if read(io, port.ddi_buf_ctl())? & DDI_BUF_CTL_ENABLE != 0 {
         return Err(ExternalError::PortBusy);
@@ -833,6 +962,14 @@ fn probe_link_profile<M: MmioWindow + ?Sized>(
         }
         e
     };
+    // No Thunderbolt clock owner is modelled for the LT PHY: a TBT-alt
+    // connection on display 35 is released before any AUX traffic.
+    if io.has_lt_phy() && tc.is_some_and(|conn| conn.mode == TcMode::TbtAlt) {
+        if let Some(conn) = tc {
+            let _ = tc_disconnect(io, &conn);
+        }
+        return Err(ExternalError::LtTbtAlt);
+    }
     if let Err(e) = aux_power_enable(io, port) {
         if let Some(conn) = tc {
             let _ = tc_disconnect(io, &conn);
@@ -884,6 +1021,19 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
     legacy_port: bool,
 ) -> Result<MtlSinkProbe, ExternalError> {
     let link = probe_link(io, generation, port, legacy_port)?;
+    probe_sink_link(io, link)
+}
+
+/// [`probe_sink`] for an exact source profile (Nova Lake-S has no
+/// generation of its own).
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn probe_sink_profile<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    port: XeLpgPort,
+    legacy_port: bool,
+) -> Result<MtlSinkProbe, ExternalError> {
+    let link = probe_link_profile(io, profile, port, legacy_port)?;
     probe_sink_link(io, link)
 }
 
@@ -1347,14 +1497,13 @@ fn enable_port<M: MmioWindow + ?Sized>(
             },
     )?;
     enable_d2d(io, route.probe.display_ip, port).map_err(d2d_err)?;
-    let phy = Cx0Phy::with_lanes(io, port, route.probe.phy_lanes()?);
     if !route.probe.tbt()
         && route
             .probe
             .mst
             .is_none_or(|mst| mst.master == route.pipe.transcoder())
     {
-        set_signal_levels(&phy, pll_rate, lanes, &[(0, 0); 4]).map_err(phy_err)?;
+        port_levels(io, &route.probe, pll_rate, lanes, &[(0, 0); 4])?;
     }
     program_port_buf_ctl(io, port, lanes);
     write(
@@ -1409,6 +1558,18 @@ fn enable_clock<M: MmioWindow + ?Sized>(
     )?;
     if probe.tbt() {
         enable_tbt_clock(io, port, rate).map_err(phy_err)?;
+    } else if let Some(lt) = probe_lt_phy(io, probe)? {
+        // intel_lt_phy_pll_enable over xe3plpd_lt_dp_tables (DP 1.4 rates).
+        let rate = crate::intel_gpu_lt_phy::LtDpRate::from_clock_khz(rate.megabits_per_sec() * 100)
+            .filter(|rate| !rate.is_uhbr())
+            .ok_or(phy_err(Cx0Error::UnsupportedRate))?;
+        lt.enable_dp(crate::intel_gpu_lt_phy::LtDpEnable {
+            rate,
+            lane_count: lanes,
+            pin_assignment_d: probe.pin_assignment_d(),
+            ssc_enabled: probe.ssc,
+        })
+        .map_err(phy_err)?;
     } else {
         let mut request = dp_pll_request(
             crate::intel_gpu_xelpg::phy_kind(io, port),
@@ -1438,13 +1599,9 @@ fn training_update<M: MmioWindow + ?Sized>(
     let trans = route_pipe(route)?.transcoder();
     match change {
         Change::Configure => Ok(()),
-        Change::Levels if !state.dirty && !probe.tbt() => set_signal_levels(
-            &Cx0Phy::with_lanes(io, port, probe.phy_lanes()?),
-            state.rate,
-            state.lanes,
-            &state.levels,
-        )
-        .map_err(phy_err),
+        Change::Levels if !state.dirty && !probe.tbt() => {
+            port_levels(io, probe, state.rate, state.lanes, &state.levels)
+        }
         Change::Levels => Ok(()),
         Change::Pattern => {
             if state.pattern == 1 && state.dirty {
@@ -1458,17 +1615,11 @@ fn training_update<M: MmioWindow + ?Sized>(
                 if probe.tbt() {
                     disable_tbt_clock(io, port).map_err(phy_err)?;
                 } else {
-                    disable_port_pll_lanes(io, port, probe.phy_lanes()?).map_err(phy_err)?;
+                    port_pll_disable(io, probe)?;
                 }
                 enable_clock(io, probe, state.rate, state.lanes)?;
                 if !probe.tbt() {
-                    set_signal_levels(
-                        &Cx0Phy::with_lanes(io, port, probe.phy_lanes()?),
-                        state.rate,
-                        state.lanes,
-                        &state.levels,
-                    )
-                    .map_err(phy_err)?;
+                    port_levels(io, probe, state.rate, state.lanes, &state.levels)?;
                 }
                 enable_d2d(io, probe.display_ip, port).map_err(d2d_err)?;
                 program_port_buf_ctl(io, port, state.lanes);
@@ -1593,7 +1744,6 @@ fn finish<M: MmioWindow + ?Sized>(
     trained: &TrainedLink,
     payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
 ) -> Result<(), ExternalError> {
-    let port = route.probe.port;
     let mode = route.probe.mode;
     let pll_rate = crate::intel_gpu_modeset::to_pll_rate(trained.rate);
     let lanes = trained.lanes;
@@ -1607,13 +1757,7 @@ fn finish<M: MmioWindow + ?Sized>(
             .mst
             .is_none_or(|mst| mst.master == route.pipe.transcoder())
     {
-        set_signal_levels(
-            &Cx0Phy::with_lanes(io, port, route.probe.phy_lanes()?),
-            pll_rate,
-            lanes,
-            &levels,
-        )
-        .map_err(phy_err)?;
+        port_levels(io, &route.probe, pll_rate, lanes, &levels)?;
     }
     let rp = route
         .reservation
@@ -1839,7 +1983,7 @@ fn finish_port_stop<M: MmioWindow + ?Sized>(
     if route.probe.tbt() {
         disable_tbt_clock(io, port).map_err(|_| stop_failed)?;
     } else {
-        disable_port_pll_lanes(io, port, route.probe.phy_lanes()?).map_err(|_| stop_failed)?;
+        port_pll_disable(io, &route.probe).map_err(|_| stop_failed)?;
     }
     let buf = read(io, port.buf_ctl1())?;
     write(io, port.buf_ctl1(), buf & !PORT_BUF_IO_SELECT_TBT)?;
@@ -2279,6 +2423,12 @@ impl MtlRoute {
     }
 
     fn stop<M: MmioWindow + ?Sized>(&mut self, io: &M) -> Result<(), RouteError> {
+        // HDCP off before the transcoder goes down (`intel_hdcp_disable`);
+        // inert without `narf.intel.hdcp=1`.
+        crate::intel_hdcp_live::route_stopping(
+            io,
+            crate::intel_hdcp_live::xelpg_key(self.port() as u8, self.pipe().transcoder() as u8),
+        );
         match self {
             MtlRoute::Dp(r) => r.stop(io).map_err(RouteError::Dp),
             MtlRoute::Hdmi(r) => r.stop(io).map_err(RouteError::Hdmi),
@@ -3051,6 +3201,34 @@ pub fn routes_stopped() -> bool {
 /// [`external_route_blocks_dc`], which also refuses while a pass runs.
 pub fn route_live() -> bool {
     PRESENCE.live()
+}
+
+/// HDCP (`crate::intel_hdcp_live`): the live SST DP or HDMI route, unless
+/// a pass holds the service. MST is not reported.
+pub(crate) fn hdcp_route() -> Option<crate::intel_hdcp_live::XelpgRoute> {
+    use crate::intel_hdcp_live::{RouteLink, XelpgRoute};
+    let service = SERVICE.try_lock()?;
+    let route = service.route.as_ref().filter(|r| r.live())?;
+    let (protocol, link) = match route {
+        MtlRoute::Dp(r) => (
+            crate::intel_hdcp::Protocol::Dp,
+            RouteLink::Dp(crate::intel_hdcp_shim::AuxPort::XeLpdp {
+                base: r.probe.port.aux_base(),
+                tbt_io: r.probe.tbt(),
+            }),
+        ),
+        MtlRoute::Hdmi(r) => (
+            crate::intel_hdcp::Protocol::Hdmi,
+            RouteLink::Hdmi(r.probe.ddc),
+        ),
+        MtlRoute::Mst(_) => return None,
+    };
+    Some(XelpgRoute {
+        port: route.port() as u8,
+        transcoder: route.pipe().transcoder() as u8,
+        protocol,
+        link,
+    })
 }
 
 /// Process-wide reset/suspend teardown: stop/release the route, then

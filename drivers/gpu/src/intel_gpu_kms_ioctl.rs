@@ -1907,7 +1907,12 @@ async fn admit_with_gem(
             return Err(FsError::InvalidData.into());
         }
         if w[0] & 1 != 0 && w[6] != 0 {
-            *object = Some(gem.object(w[6])?);
+            let cursor = gem.object(w[6])?;
+            // No scanout from a foreign dma-buf import, as ADDFB refuses.
+            if cursor.is_imported() {
+                return Err(FsError::InvalidData.into());
+            }
+            *object = Some(cursor);
         }
         *hardware = true;
     }

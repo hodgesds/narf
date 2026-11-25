@@ -190,17 +190,20 @@ impl Profile {
             .lines
             .max(alloc.cursor_wm.levels[0].lines);
         let wm_level_disabled = match state.ip {
-            // The VRR guardband is display 30's vblank prefill budget.
-            DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => wm::wm_level_disabled_dsc_ip(
-                state.ip,
-                wm::Timing {
-                    vblank_start: u32::from(state.vblank_start[0].unwrap_or(mode.v_active)),
-                    ..timing
-                },
-                latency,
-                wm0,
-                dsc.is_some(),
-            ),
+            // The VRR guardband is display 30's (and 35's) vblank prefill
+            // budget.
+            DisplayIp::Xe3Lpd | DisplayIp::WildcatLake | DisplayIp::NovaLakeS => {
+                wm::wm_level_disabled_dsc_ip(
+                    state.ip,
+                    wm::Timing {
+                        vblank_start: u32::from(state.vblank_start[0].unwrap_or(mode.v_active)),
+                        ..timing
+                    },
+                    latency,
+                    wm0,
+                    dsc.is_some(),
+                )
+            }
             DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => {
                 wm::wm_level_disabled_dsc(timing, latency, wm0, dsc.is_some())
             }
@@ -253,12 +256,12 @@ impl Profile {
         dsc: Option<DscTerm>,
     ) -> Result<(Self, Box<res::State>), FsError> {
         Self::valid_mode(mode)?;
-        let latency = Latency::read(io)?;
+        let latency = Latency::read_ip(io, ip)?;
         // Display 30 always scans out through the VRR timing generator:
         // the vblank prefill budget is its guardband.
         let mut vblank_start = [None; res::PIPES];
         if ip.is_display30() {
-            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
+            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, ip, mode, dsc, &latency)
                 .map_err(|_| FsError::Unsupported)?;
             vblank_start[0] = Some(mode.v_total - guardband);
         }
@@ -324,7 +327,7 @@ impl Profile {
         match layout {
             None => Ok(Self::compute_state(io, ip, mode, tiling, 0, dsc)?.0),
             Some(layout) => {
-                let latency = Latency::read(io)?;
+                let latency = Latency::read_ip(io, ip)?;
                 let state = Self::multi_state(mode, tiling, layout, &latency, dsc)?;
                 Self::share(mode, &latency, &state, dsc)
             }
@@ -575,7 +578,7 @@ impl Profile {
         layout: &Layout,
         dsc: Option<DscTerm>,
     ) -> Result<Self, FsError> {
-        let latency = Latency::read(io)?;
+        let latency = Latency::read_ip(io, layout.state.ip)?;
         let state = Self::multi_state(mode, Tiling::Linear, layout, &latency, dsc)?;
         let profile = Self::share(mode, &latency, &state, dsc)?;
         for pipe in 1..state.ip.pipe_count() {

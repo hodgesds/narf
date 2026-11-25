@@ -488,10 +488,22 @@ fn smoke_xe2lpd_mdclk_ratio_dbuf_mbus_and_dbox() -> TestResult {
     // DBUF_CTL: request per slice, tracker state service (23:19) kept,
     // POWER_STATE never written back.
     assert_eq!(
-        dbuf_ctl(0, 0x00f8_0000 | (1 << 30), 1, 2, true),
+        dbuf_ctl(DisplayIp::Xe2Lpd, 0, 0x00f8_0000 | (1 << 30), 1, 2, true),
         0x80fb_0000
     );
-    assert_eq!(dbuf_ctl(1, 0x8007_0000, 1, 4, false), 0x0003_0000);
+    assert_eq!(
+        dbuf_ctl(DisplayIp::Xe2Lpd, 1, 0x8007_0000, 1, 4, false),
+        0x0003_0000
+    );
+    // Display 35 widens the tracker to 20:16 and the throttle to 16:13: a
+    // joined ratio of 24 fits there and is truncated on display 20.
+    assert_eq!(
+        dbuf_ctl(DisplayIp::NovaLakeS, 0, 0, 1, 12, true),
+        0x8017_0000
+    );
+    assert_eq!(dbuf_ctl(DisplayIp::Xe2Lpd, 0, 0, 1, 12, true), 0x8007_0000);
+    assert_eq!(mbus_throttle_ip(DisplayIp::NovaLakeS, 12), 11 << 13);
+    assert_eq!(mbus_throttle_ip(DisplayIp::Xe2Lpd, 12), 3 << 13);
     // pipe_mbus_dbox_ctl without the 14.00 BW credits (15:14).
     assert_eq!(dbox(true), 0x0103_0a4c);
     assert_eq!(dbox(false), 0x0103_0a48);
@@ -778,8 +790,30 @@ impl Lnl {
     }
 }
 
+/// DDI A's PHY/AUX registers in the display-20 PICA block, as
+/// [`PicaFlushed`] relocates them, mapped back to the display-14 offsets the
+/// modeset model keeps them at.
+fn from_pica(r: u64) -> Option<u64> {
+    match r {
+        0x16fa00..=0x16fa08 => Some(r - 0x16fa00 + 0x64004),
+        0x16fa10..=0x16fa24 | 0x16fa40..=0x16fa4c => Some(r - 0x16fa00 + 0x64000),
+        0x16fa58 | 0x16fa5c => Some(r - 0x16fa58 + 0x640d8),
+        0x16fa60 => Some(0x640e0),
+        _ => None,
+    }
+}
+
+/// DDI A's display-14 PHY/AUX offsets, which the display-20 panel window
+/// must never touch.
+fn display14_phy(r: u64) -> bool {
+    matches!(r, 0x64004..=0x64024 | 0x64040..=0x6404c | 0x640d8 | 0x640dc | 0x640e0)
+}
+
 impl MmioWindow for Lnl {
     fn read32(&self, r: u64) -> u32 {
+        if let Some(r) = from_pica(r) {
+            return self.mode.read32(r);
+        }
         if Self::resource(r) {
             *self.values.borrow().get(&r).unwrap_or(&0)
         } else if r == 0x46070 {
@@ -798,6 +832,9 @@ impl MmioWindow for Lnl {
         self.writes.borrow_mut().push((r, v));
         if self.drop_write.get() == r {
             return;
+        }
+        if let Some(r) = from_pica(r) {
+            return self.mode.write32(r, v);
         }
         if Self::resource(r) {
             let mut value = v;
@@ -1043,6 +1080,14 @@ fn smoke_xe2lpd_probe_window_flushes_every_read() -> TestResult {
         for r in [0xc7200, 0x510a0, 0x70008] {
             assert!(events.contains(&(false, r)), "{r:#x}");
         }
+        // __xe2lpd_port_idx / __xe2lpd_aux_ch_idx: the panel's PHY message
+        // bus, port clock and AUX run in the PICA block, never at DDI A's
+        // display-14 offsets; DDI_BUF_CTL stays _MMIO_PORT.
+        for r in [0x16fa40, 0x16fa60, 0x16fa10] {
+            assert!(events.contains(&(true, r)), "{r:#x}");
+        }
+        assert!(events.iter().all(|&(_, r)| !display14_phy(r)));
+        assert!(events.contains(&(true, 0x64000)));
         // The backlight gate (PP_CONTROL) is the window's last write.
         assert_eq!(events.last(), Some(&(true, 0xc7204)));
     }

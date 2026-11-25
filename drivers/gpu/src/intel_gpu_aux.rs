@@ -134,6 +134,13 @@ pub const XELPDP_AUX_CH_CTL_POWER_REQUEST: u32 = 1 << 19;
 pub const XELPDP_AUX_CH_CTL_POWER_STATUS: u32 = 1 << 18;
 /// `DP_AUX_CH_CTL_TBT_IO` (bit 11, ICL+).
 pub const AUX_CTL_TBT_IO: u32 = 1 << 11;
+/// `DP_AUX_CH_CTL_AUX_AKSV_SELECT` (bit 15): the controller sends the
+/// hardware HDCP Aksv after the request header in place of the data
+/// registers (`intel_dp_aux_xfer_flags`).
+pub const AUX_CTL_AKSV_SELECT: u32 = 1 << 15;
+/// `DP_AUX_HDCP_AKSV`, the DPCD address whose native writes carry
+/// [`AUX_CTL_AKSV_SELECT`].
+pub const DP_AUX_HDCP_AKSV: u32 = 0x68007;
 /// `DP_AUX_CH_CTL_FW_SYNC_PULSE_SKL(c)` field (bits 9:5) holds c - 1.
 const fn aux_fw_sync_pulse_skl(count: u32) -> u32 {
     ((count - 1) & 0x1F) << 5
@@ -181,6 +188,17 @@ pub struct IntelAux<'a, M: MmioWindow + ?Sized> {
     base: u64,
     /// Control-word encoding (Gen12 unless built by [`IntelAux::xelpdp`]).
     profile: AuxCtlProfile,
+    /// The Gen9 `DC_off` well every transfer holds (`intel_dp_aux_xfer`'s
+    /// AUX power domain; AUX_A-D are Gen9 `dc_off` domains): the production
+    /// service, inert unless `narf.intel.gen9_dc=1` installed it on a Gen9
+    /// display, or a fixture's own ([`IntelAux::with_gen9_dc`]).
+    gen9_dc: &'a dyn crate::intel_gpu_gen9_dc_states::Gen9DcOff,
+    /// The display-35 `DC_off` well every transfer on an LT-PHY window
+    /// holds: `xe3plpd_pwdoms_dc_off` lists every AUX channel, and
+    /// `intel_dp_aux_xfer` holds the channel's AUX domain across the
+    /// transfer. The production service, inert unless the Nova Lake-S
+    /// route installed it, or a fixture's own ([`IntelAux::with_dc_off`]).
+    dc_off: &'a dyn crate::intel_gpu_dc_states::DcOff,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
@@ -319,7 +337,23 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
             mmio,
             ddi,
             profile: AuxCtlProfile::Gen12,
+            gen9_dc: &crate::intel_gpu_gen9_dc_states::ServiceDcOff,
+            dc_off: &crate::intel_gpu_dc_states::Xe3pLpdDcOff,
         }
+    }
+
+    /// Hold `dc` as the display-35 `DC_off` well across each transfer on
+    /// an LT-PHY window instead of the production service.
+    pub fn with_dc_off(mut self, dc: &'a dyn crate::intel_gpu_dc_states::DcOff) -> Self {
+        self.dc_off = dc;
+        self
+    }
+
+    /// Hold `dc` as the Gen9 `DC_off` well across each transfer instead of
+    /// the production service.
+    pub fn with_gen9_dc(mut self, dc: &'a dyn crate::intel_gpu_gen9_dc_states::Gen9DcOff) -> Self {
+        self.gen9_dc = dc;
+        self
     }
 
     /// Create a display-14 (Xe-LPG/MTL) transport over an explicit AUX
@@ -349,6 +383,8 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
             ddi: Ddi::A,
             base,
             profile: AuxCtlProfile::XeLpdp { tbt_io },
+            gen9_dc: &crate::intel_gpu_gen9_dc_states::ServiceDcOff,
+            dc_off: &crate::intel_gpu_dc_states::Xe3pLpdDcOff,
         }
     }
 
@@ -441,7 +477,8 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
     }
 
     /// Issue one request and return the byte count in the reply registers.
-    fn xfer_once(&self, wire: &[u8]) -> Result<usize, AuxError> {
+    /// `flags` joins the send control word (`aux_send_ctl_flags`).
+    fn xfer_once(&self, wire: &[u8], flags: u32) -> Result<usize, AuxError> {
         if wire.len() > 20 {
             return Err(AuxError::TooLong);
         }
@@ -464,7 +501,7 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
         let ctl = match self.profile {
             AuxCtlProfile::Gen12 => native_aux_send_ctl(wire.len() as u32),
             AuxCtlProfile::XeLpdp { tbt_io } => xelpdp_aux_send_ctl(wire.len() as u32, tbt_io),
-        };
+        } | flags;
         self.mmio.write32(self.aux_ctl_off(), ctl);
 
         // Poll for completion.
@@ -500,6 +537,30 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         reply_buf: &'b mut [u8],
     ) -> Result<AuxResponse<'b>, AuxError> {
         let mut wire = AUX_TRANSACTION.try_lock().ok_or(AuxError::Deferred)?;
+        // Gen9: exit DC5/DC6 before the first AUX register access and hold
+        // DC_off to the end of the transfer; re-entry is deferred after it.
+        // A refused exit touches nothing. Inert on every other display.
+        let _dc = crate::intel_gpu_gen9_dc_states::hold(
+            self.gen9_dc,
+            self.mmio,
+            crate::intel_gpu_gen9_dc_states::Gen9DcUser::Aux,
+        )
+        .map_err(|_| AuxError::Deferred)?;
+        // Display 35 (the LT-PHY windows): every AUX channel is a DC_off
+        // domain. Exit DC6 before the first AUX register access and defer
+        // re-entry after the transfer; a refused exit touches nothing.
+        let _dc35 = if self.mmio.has_lt_phy() {
+            Some(
+                crate::intel_gpu_dc_states::hold(
+                    self.dc_off,
+                    self.mmio,
+                    crate::intel_gpu_dc_states::DcUser::Aux,
+                )
+                .map_err(|_| AuxError::Deferred)?,
+            )
+        } else {
+            None
+        };
         let inherited = self.mmio.read32(self.aux_ctl_off());
         if inherited == u32::MAX {
             return Err(AuxError::ShortReply);
@@ -522,6 +583,15 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
                 | crate::dp_aux::AuxCommand::I2cReadMot
         );
         let expected_payload = if is_read { req.data.len() } else { 0 };
+        // intel_dp_aux_xfer_flags: a native write of the HDCP Aksv lets
+        // the hardware supply its bytes.
+        let flags = if req.cmd == crate::dp_aux::AuxCommand::NativeWrite
+            && req.address == DP_AUX_HDCP_AKSV
+        {
+            AUX_CTL_AKSV_SELECT
+        } else {
+            0
+        };
 
         // Hardware retry on protocol error (TIMEOUT / RECEIVE).
         // The dp_aux layer above handles DEFER-status retries —
@@ -529,7 +599,7 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         // backoff requests carried in the status nibble.
         let mut attempt = 1;
         let raw_len = loop {
-            match self.xfer_once(&wire[..n]) {
+            match self.xfer_once(&wire[..n], flags) {
                 Ok(got) => break got,
                 Err(err) if attempt == HW_RETRIES => return Err(err),
                 Err(_) => attempt += 1,

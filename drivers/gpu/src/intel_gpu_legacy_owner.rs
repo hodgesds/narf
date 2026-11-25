@@ -35,6 +35,10 @@ use crate::intel_gpu_legacy_gt::{
     rcs_whitelist, rcs_workarounds, whitelist_writes, LegacyGt, Steering, WaList, WaPlatform,
     MCR_SELECTOR,
 };
+use crate::intel_gpu_legacy_power::{
+    rc6_disable, rc6_enable, rc6_park, rc6_supported, rc6_unpark, rps_enable, rps_request, Caps,
+    Governor, Step,
+};
 use crate::intel_gpu_rcs::{BarWindow, ContextId, RcsEngine, SharedArena, SubmitError};
 use crate::intel_gpu_user::{UserBackend, UserBatch, UserContext, UserJob, UserStatus};
 
@@ -51,6 +55,73 @@ const READY_TO_RESET: u32 = 1 << 1;
 /// `GEN6_GDRST`; `GEN6_GRDOM_FULL` / `GEN11_GRDOM_FULL` is bit 0 on both.
 const GDRST: u64 = 0x941c;
 const GRDOM_FULL: u32 = 1;
+/// `GEN6_GRDOM_RENDER` / `GEN11_GRDOM_RENDER`.
+const GRDOM_RENDER: u32 = 1 << 1;
+
+/// The `GDRST` domain resetting `which` alone (`gen6_hw_engine_mask`,
+/// `get_reset_domain`'s Gen11 table). A Gen11 video or enhancement engine's
+/// reset also locks the SFC it may be using ([`sfc_lock`]).
+pub(crate) const fn engine_reset_domain(gt: LegacyGt, which: HwEngine) -> Option<u32> {
+    match (gt, which) {
+        (_, HwEngine::Rcs0) => Some(GRDOM_RENDER),
+        (LegacyGt::Gen9 | LegacyGt::Gen9Lp, HwEngine::Bcs0) => Some(1 << 3),
+        (LegacyGt::Gen9 | LegacyGt::Gen9Lp, HwEngine::Vcs0) => Some(1 << 2),
+        (LegacyGt::Gen9 | LegacyGt::Gen9Lp, HwEngine::Vecs0) => Some(1 << 4),
+        (LegacyGt::Gen11, HwEngine::Bcs0) => Some(1 << 2),
+        // GEN11_GRDOM_MEDIA, GEN11_GRDOM_VECS.
+        (LegacyGt::Gen11, HwEngine::Vcs0) => Some(1 << 5),
+        (LegacyGt::Gen11, HwEngine::Vecs0) => Some(1 << 13),
+        _ => None,
+    }
+}
+
+/// `GEN11_GRDOM_SFC0`: VCS0's (`GEN11_VCS_SFC_RESET_BIT(0)`) and VECS0's
+/// (`GEN11_VECS_SFC_RESET_BIT(0)`) scaler and format converter.
+const GRDOM_SFC0: u32 = 1 << 17;
+
+/// `get_sfc_forced_lock_data`: an engine's SFC forced-lock request, its
+/// acknowledgement, the engine's SFC usage flag and the `GDRST` bit that
+/// resets the SFC with the engine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SfcLock {
+    lock: u64,
+    lock_bit: u32,
+    ack: u64,
+    ack_bit: u32,
+    usage: u64,
+    usage_bit: u32,
+    reset_bit: u32,
+}
+
+/// The SFC lock of the engine at `base`: Gen11 VCS0 (logical VDBox 0, which
+/// Gen11 always hooks to an SFC, `gen11_vdbox_has_sfc`) and VECS0, both on
+/// SFC 0. `None` for any engine without an SFC to lock.
+pub(crate) const fn sfc_lock(gt: LegacyGt, which: HwEngine, base: u64) -> Option<SfcLock> {
+    match (gt, which) {
+        // GEN11_VCS_SFC_FORCED_LOCK, GEN11_VCS_SFC_LOCK_STATUS (usage [0],
+        // ack [1]).
+        (LegacyGt::Gen11, HwEngine::Vcs0) => Some(SfcLock {
+            lock: base + 0x88c,
+            lock_bit: 1,
+            ack: base + 0x890,
+            ack_bit: 1 << 1,
+            usage: base + 0x890,
+            usage_bit: 1,
+            reset_bit: GRDOM_SFC0,
+        }),
+        // GEN11_VECS_SFC_FORCED_LOCK, _LOCK_ACK, _USAGE.
+        (LegacyGt::Gen11, HwEngine::Vecs0) => Some(SfcLock {
+            lock: base + 0x201c,
+            lock_bit: 1,
+            ack: base + 0x2018,
+            ack_bit: 1,
+            usage: base + 0x2014,
+            usage_bit: 1,
+            reset_bit: GRDOM_SFC0,
+        }),
+        _ => None,
+    }
+}
 
 const fn masked_enable(bits: u32) -> u32 {
     bits << 16 | bits
@@ -76,6 +147,7 @@ enum ResetPhase {
     Start,
     Stopping,
     Preparing,
+    Locking,
     Resetting,
 }
 
@@ -88,59 +160,133 @@ enum ResetPhase {
 pub(crate) struct Reset {
     phase: ResetPhase,
     deadline: u64,
+    /// The engine whose CS is stopped and whose reset handshake is asked.
+    base: u64,
+    /// The `GDRST` domain pulsed: the full GT, or one engine (and its SFC
+    /// once locked to it).
+    domain: u32,
+    /// The engine's SFC lock ([`sfc_lock`]), and whether it was requested.
+    sfc: Option<SfcLock>,
+    sfc_requested: bool,
 }
 
 impl Reset {
     pub(crate) const fn new() -> Self {
+        Self::engine(RCS, GRDOM_FULL)
+    }
+
+    /// `intel_engine_reset` of the engine at `base`: stop its CS, ask its
+    /// reset handshake, pulse its `GDRST` `domain` ([`engine_reset_domain`]).
+    pub(crate) const fn engine(base: u64, domain: u32) -> Self {
         Self {
             phase: ResetPhase::Start,
             deadline: 0,
+            base,
+            domain,
+            sfc: None,
+            sfc_requested: false,
         }
+    }
+
+    /// `__gen11_reset_engines`' SFC handling: when the engine is using its
+    /// SFC, force-lock it (1 ms for the ack) and reset it with the engine;
+    /// an SFC released meanwhile is left alone; an unacknowledged lock fails
+    /// the engine reset. The lock is released after the pulse either way.
+    pub(crate) const fn with_sfc(mut self, sfc: Option<SfcLock>) -> Self {
+        self.sfc = sfc;
+        self
+    }
+
+    /// `gen6_hw_domain_reset`: pulse the domain and wait up to 500 ms.
+    fn pulse(&mut self, mmio: &impl MmioWindow, now: u64) -> Poll<Result<(), InitError>> {
+        mmio.write32(GDRST, self.domain);
+        self.phase = ResetPhase::Resetting;
+        self.deadline = now + 500_000_000;
+        Poll::Pending
+    }
+
+    /// `gen11_unlock_sfc` for a requested lock, then
+    /// `gen8_engine_reset_cancel`.
+    fn finish(&mut self, mmio: &impl MmioWindow) {
+        if let Some(sfc) = self.sfc.filter(|_| self.sfc_requested) {
+            let lock = mmio.read32(sfc.lock);
+            mmio.write32(sfc.lock, lock & !sfc.lock_bit);
+        }
+        mmio.write32(self.base + (RESET_CTL - RCS), masked_disable(REQUEST_RESET));
     }
 
     pub(crate) fn poll(&mut self, mmio: &impl MmioWindow, now: u64) -> Poll<Result<(), InitError>> {
         match self.phase {
             ResetPhase::Start => {
-                if mmio.read32(MI_MODE) == u32::MAX {
+                if mmio.read32(self.base + (MI_MODE - RCS)) == u32::MAX {
                     return Poll::Ready(Err(InitError::Unavailable));
                 }
-                mmio.write32(MI_MODE, masked_enable(STOP_RING));
+                mmio.write32(self.base + (MI_MODE - RCS), masked_enable(STOP_RING));
                 self.phase = ResetPhase::Stopping;
                 self.deadline = now + 1_000_000;
                 Poll::Pending
             }
             ResetPhase::Stopping => {
                 // A CS that will not idle is reset anyway, as Linux does.
-                if mmio.read32(MI_MODE) & MODE_IDLE == 0 && now < self.deadline {
+                if mmio.read32(self.base + (MI_MODE - RCS)) & MODE_IDLE == 0 && now < self.deadline
+                {
                     return Poll::Pending;
                 }
-                mmio.write32(RESET_CTL, masked_enable(REQUEST_RESET));
+                mmio.write32(self.base + (RESET_CTL - RCS), masked_enable(REQUEST_RESET));
                 self.phase = ResetPhase::Preparing;
                 self.deadline = now + 700_000;
                 Poll::Pending
             }
             ResetPhase::Preparing => {
-                if mmio.read32(RESET_CTL) & READY_TO_RESET == 0 && now < self.deadline {
+                if mmio.read32(self.base + (RESET_CTL - RCS)) & READY_TO_RESET == 0
+                    && now < self.deadline
+                {
                     return Poll::Pending;
                 }
-                mmio.write32(GDRST, GRDOM_FULL);
-                self.phase = ResetPhase::Resetting;
-                self.deadline = now + 500_000_000;
-                Poll::Pending
+                match self.sfc {
+                    Some(sfc) if mmio.read32(sfc.usage) & sfc.usage_bit != 0 => {
+                        let lock = mmio.read32(sfc.lock);
+                        mmio.write32(sfc.lock, lock | sfc.lock_bit);
+                        self.sfc_requested = true;
+                        self.phase = ResetPhase::Locking;
+                        self.deadline = now + 1_000_000;
+                        Poll::Pending
+                    }
+                    _ => self.pulse(mmio, now),
+                }
+            }
+            ResetPhase::Locking => {
+                let Some(sfc) = self.sfc else {
+                    return self.pulse(mmio, now);
+                };
+                let acked = mmio.read32(sfc.ack) & sfc.ack_bit != 0;
+                if !acked && now < self.deadline {
+                    return Poll::Pending;
+                }
+                // Released while locking: the engine resets alone.
+                if mmio.read32(sfc.usage) & sfc.usage_bit == 0 {
+                    return self.pulse(mmio, now);
+                }
+                if !acked {
+                    self.finish(mmio);
+                    return Poll::Ready(Err(InitError::ResetTimeout));
+                }
+                self.domain |= sfc.reset_bit;
+                self.pulse(mmio, now)
             }
             ResetPhase::Resetting => {
                 let status = mmio.read32(GDRST);
                 if status == u32::MAX {
                     return Poll::Ready(Err(InitError::Unavailable));
                 }
-                if status & GRDOM_FULL != 0 {
+                if status & self.domain != 0 {
                     if now < self.deadline {
                         return Poll::Pending;
                     }
-                    mmio.write32(RESET_CTL, masked_disable(REQUEST_RESET));
+                    self.finish(mmio);
                     return Poll::Ready(Err(InitError::ResetTimeout));
                 }
-                mmio.write32(RESET_CTL, masked_disable(REQUEST_RESET));
+                self.finish(mmio);
                 Poll::Ready(Ok(()))
             }
         }
@@ -208,6 +354,21 @@ pub(crate) fn program(
     for (reg, value) in l3cc_writes(gt) {
         mmio.write32(reg, value);
     }
+    resume_rcs(mmio, platform, steering, &mut report);
+    report
+}
+
+/// RCS0's engine state, which an engine reset clears as well as a full one
+/// (`execlists_resume`): its workarounds, whitelist, MOCS bank and
+/// `enable_execlists`. The caller then points `RING_HWS_PGA` at the status
+/// page.
+pub(crate) fn resume_rcs(
+    mmio: &impl MmioWindow,
+    platform: WaPlatform,
+    steering: Steering,
+    report: &mut Programmed,
+) {
+    let gt = platform.gt();
     apply(&rcs_workarounds(platform), mmio, steering, &mut report.lost);
     for (reg, value) in whitelist_writes(RCS, &rcs_whitelist(platform)) {
         mmio.write32(reg, value);
@@ -226,7 +387,7 @@ pub(crate) fn program(
         RCS + 0x29c,
         match gt {
             LegacyGt::Gen11 => masked_enable(1 << 3),
-            LegacyGt::Gen9 => masked_enable(1 << 15),
+            LegacyGt::Gen9 | LegacyGt::Gen9Lp => masked_enable(1 << 15),
         },
     );
     mmio.write32(MI_MODE, masked_disable(STOP_RING));
@@ -236,7 +397,6 @@ pub(crate) fn program(
     mmio.write32(RCS + 0xb0, u32::MAX);
     report.error_status = mmio.read32(RCS + 0xb8);
     mmio.write32(RCS + 0xb4, !1);
-    report
 }
 
 /// `read_clock_frequency` for graphics 9 (big core) and 11: the command
@@ -251,6 +411,8 @@ pub(crate) fn timestamp_frequency(gt: LegacyGt, mut read: impl FnMut(u64) -> u32
     }
     match gt {
         LegacyGt::Gen9 => 24_000_000 >> (3 - ((ctc >> 1) & 3)),
+        // Gen9 LP's crystal is 19.2 MHz (`gen9_read_clock_frequency`).
+        LegacyGt::Gen9Lp => 19_200_000 >> (3 - ((ctc >> 1) & 3)),
         LegacyGt::Gen11 => {
             let config = read(0xd00);
             let crystal = match (config >> 3) & 7 {
@@ -268,12 +430,126 @@ pub(crate) fn timestamp_frequency(gt: LegacyGt, mut read: impl FnMut(u64) -> u32
 // ── Runtime ─────────────────────────────────────────────────────────
 
 type Engine = RcsEngine<BarWindow, SharedArena>;
+use crate::intel_gpu_engine::Engine as HwEngine;
+use crate::intel_gpu_media::{MediaForcewake, MediaFwDomain};
+use crate::intel_gpu_rcs::{EngineClass, EngineSpec};
+
+/// Gen9/Gen11 BCS0 (`BLT_RING_BASE`): a copy engine with the two-page
+/// non-render context image.
+const BCS0: EngineSpec = EngineSpec {
+    name: "bcs0",
+    class: EngineClass::Copy,
+    instance: 0,
+    base: 0x22000,
+    image_pages: crate::intel_gpu_media::MEDIA_IMAGE_PAGES,
+};
+
+/// `GEN11_GT_VEBOX_VDBOX_DISABLE`: VDBox disables [7:0], VEBox [23:16].
+const GEN11_VDBOX_VEBOX_DISABLE: u64 = 0x9140;
+
+/// The copy and media engines run beside RCS0 (`intel_engines_init_mmio`):
+/// BCS0, VCS0 and VECS0, present on every Gen9 and Gen11 part this owner
+/// admits, except a Gen11 VDBox or VEBox its fuse register disables.
+fn xcs_engines(gt: LegacyGt, mut read: impl FnMut(u64) -> u32) -> Vec<(HwEngine, EngineSpec)> {
+    use crate::intel_gpu_media as media;
+    match gt {
+        // GEN9_LP_FEATURES' engine mask is the same RCS0, BCS0, VCS0, VECS0.
+        LegacyGt::Gen9 | LegacyGt::Gen9Lp => alloc::vec![
+            (HwEngine::Bcs0, BCS0),
+            (HwEngine::Vcs0, media::GEN9_VCS0_SPEC),
+            (HwEngine::Vecs0, media::GEN9_VECS0_SPEC),
+        ],
+        LegacyGt::Gen11 => {
+            let fuse = read(GEN11_VDBOX_VEBOX_DISABLE);
+            let fuse = if fuse == u32::MAX { 0xff_00ff } else { fuse };
+            let mut engines = alloc::vec![(HwEngine::Bcs0, BCS0)];
+            if fuse & 1 == 0 {
+                engines.push((HwEngine::Vcs0, media::VCS0_SPEC));
+            }
+            if fuse & (1 << 16) == 0 {
+                engines.push((HwEngine::Vecs0, media::VECS0_SPEC));
+            }
+            engines
+        }
+    }
+}
+
+/// `enable_execlists` and the engine MOCS bank for a copy or media engine
+/// (`execlists_resume`): every HWSP write unmasked, execlists mode, the ring
+/// running, error interrupts cleared with only instruction errors unmasked.
+fn resume_xcs(mmio: &impl MmioWindow, gt: LegacyGt, which: HwEngine, base: u64) {
+    for (reg, value) in engine_mocs_writes(gt, which).into_iter().flatten() {
+        mmio.write32(reg, value);
+    }
+    mmio.write32(base + 0x98, u32::MAX);
+    mmio.write32(
+        base + 0x29c,
+        match gt {
+            LegacyGt::Gen11 => masked_enable(1 << 3),
+            LegacyGt::Gen9 | LegacyGt::Gen9Lp => masked_enable(1 << 15),
+        },
+    );
+    mmio.write32(base + 0x9c, masked_disable(STOP_RING));
+    mmio.write32(base + 0xb4, u32::MAX);
+    mmio.write32(base + 0xb0, u32::MAX);
+    mmio.write32(base + 0xb4, !1);
+}
+
+/// The media forcewake domain gating `which`: Gen9's aggregate media well,
+/// Gen11's per-VDBox / per-VEBox wells. `None` for the copy engine, which
+/// the blitter domain covers.
+fn media_domain(gt: LegacyGt, which: HwEngine) -> Option<MediaFwDomain> {
+    match (gt, which) {
+        (_, HwEngine::Bcs0 | HwEngine::Rcs0) => None,
+        (LegacyGt::Gen9 | LegacyGt::Gen9Lp, _) => Some(MediaFwDomain::Aggregate),
+        (LegacyGt::Gen11, HwEngine::Vcs0) => Some(MediaFwDomain::VdBox(0)),
+        (LegacyGt::Gen11, HwEngine::Vecs0) => Some(MediaFwDomain::VeBox(0)),
+        _ => None,
+    }
+}
+
+/// One copy or media engine beside RCS0.
+struct Lane {
+    which: HwEngine,
+    engine: Engine,
+    contexts: Vec<Context>,
+}
+
+/// The hardware context of `user` on `engine`, created on first use with
+/// `setup` (the render context workarounds; nothing on other engines).
+fn context_on(
+    engine: &mut Engine,
+    contexts: &mut Vec<Context>,
+    setup: &[u32],
+    user: &Arc<UserContext>,
+) -> Result<ContextId, SubmitError> {
+    if let Some(context) = contexts
+        .iter()
+        .find(|c| core::ptr::eq(c.user.as_ptr(), Arc::as_ptr(user)))
+    {
+        return Ok(context.id);
+    }
+    let id = engine.create_context()?;
+    if !setup.is_empty() {
+        if let Err(error) = engine.emit_context_setup(id, setup) {
+            let _ = engine.destroy_context(id);
+            return Err(error);
+        }
+    }
+    contexts.push(Context {
+        user: Arc::downgrade(user),
+        id,
+    });
+    Ok(id)
+}
 
 /// A job is declared hung after this long without retiring (Linux's
 /// heartbeat declares a hang after a few 2.5 s pulses).
 const JOB_TIMEOUT_NS: u64 = 10_000_000_000;
 
 struct Job {
+    /// The engine running the request; request ids are per engine.
+    which: HwEngine,
     request: u64,
     job: UserJob,
     deadline: u64,
@@ -284,52 +560,218 @@ struct Context {
     id: ContextId,
 }
 
+/// What a service pass found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Service {
+    Ok,
+    /// A job (this request) overran its deadline on this engine, which
+    /// resets alone where it can, else through the full GT reset.
+    Hung(HwEngine, u64),
+    /// Completion tracking is lost: only a full GT reset recovers.
+    Lost,
+}
+
 struct Runtime {
     engine: Engine,
+    /// The copy and media engines ([`xcs_engines`]) that came up.
+    xcs: Vec<Lane>,
+    gt: LegacyGt,
     fw: Forcewake,
+    /// The media wells the media lanes need (Gen9 aggregate, Gen11
+    /// VDBox/VEBox), held whenever render forcewake is.
+    media_fw: MediaForcewake,
     window: BarWindow,
     epoch: u64,
     /// The context workaround LRI each new hardware context starts with.
     ctx_wa: Vec<u32>,
     contexts: Vec<Context>,
     jobs: Vec<Job>,
+    /// Frequency and park policy ([`crate::intel_gpu_legacy_power`]).
+    governor: Governor,
+    /// MCR steering for re-applying RCS0's workarounds after an engine reset.
+    steering: Steering,
+    /// `RC_CONTROL` while unparked (`rc6->ctl_enable`); `None` when RC6 is
+    /// not supported, which leaves every RC6 control untouched.
+    rc6: Option<u32>,
+    /// The function's BAR, for the display's Gen9 `DC_off` service.
+    bar: narf_bus::bar::MmioRegion,
+    /// `gt->awake`: the Gen9 `GT_IRQ` reference held while unparked
+    /// (`__gt_unpark`), inert without the Gen9 DC service (Gen11, or the
+    /// option clear) and `None` when its DC exit was refused.
+    gt_irq: Option<crate::intel_gpu_gen9_dc_states::Gen9DcRef>,
 }
 
 impl Runtime {
-    fn context_for(&mut self, user: &Arc<UserContext>) -> Result<ContextId, SubmitError> {
-        if let Some(context) = self
-            .contexts
+    /// `intel_rc6_unpark` + `intel_rps_unpark`: take forcewake back, leave
+    /// RC6 and request the efficient frequency before touching the engine.
+    /// Forcewake is acquired first, so a refused wake leaves the GT parked.
+    fn unpark(&mut self) -> Result<(), FsError> {
+        if !self.governor.parked() {
+            return Ok(());
+        }
+        // __gt_unpark takes POWER_DOMAIN_GT_IRQ first: DC states stay off
+        // while the GT is awake (a latency workaround; best effort).
+        if self.gt_irq.is_none() {
+            self.gt_irq = crate::intel_gpu_gen9_dc_states::gt_unparked(&self.bar);
+        }
+        self.fw
+            .acquire(&self.window, FwDomain::Render)
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
+        if self.fw.acquire(&self.window, FwDomain::Blitter).is_err() {
+            let _ = self.fw.release(&self.window, FwDomain::Render);
+            return Err(crate::intel_gpu_user::io_error());
+        }
+        if !self.acquire_media() {
+            let _ = self.fw.release(&self.window, FwDomain::Blitter);
+            let _ = self.fw.release(&self.window, FwDomain::Render);
+            return Err(crate::intel_gpu_user::io_error());
+        }
+        let window = &self.window;
+        if let Some(ctl) = self.rc6 {
+            rc6_unpark(ctl, |r, v| window.write32(r, v));
+        }
+        if let Some(Some(freq)) = self.governor.unpark() {
+            rps_request(freq, |r, v| window.write32(r, v));
+        }
+        Ok(())
+    }
+
+    /// `intel_rps_park` + `intel_rc6_park`: the idle frequency (with the
+    /// render well still awake, so the PCU commits it), the software RC6
+    /// request, then forcewake released so the GT may enter RC6.
+    fn park(&mut self, idle: u32) {
+        let window = &self.window;
+        if idle != 0 {
+            rps_request(idle, |r, v| window.write32(r, v));
+        }
+        if self.rc6.is_some() {
+            rc6_park(|r, v| window.write32(r, v));
+        }
+        self.release_media();
+        let _ = self.fw.release(&self.window, FwDomain::Blitter);
+        let _ = self.fw.release(&self.window, FwDomain::Render);
+        // __gt_park: GT_IRQ released last, with its 100 ms async put.
+        self.gt_irq = None;
+    }
+
+    /// Every media well a media lane needs; on failure nothing extra is held.
+    fn acquire_media(&mut self) -> bool {
+        let domains: Vec<_> = self
+            .xcs
             .iter()
-            .find(|c| core::ptr::eq(c.user.as_ptr(), Arc::as_ptr(user)))
-        {
-            return Ok(context.id);
+            .filter_map(|lane| media_domain(self.gt, lane.which))
+            .collect();
+        let mut held = Vec::new();
+        for domain in domains {
+            if held.contains(&domain) {
+                continue;
+            }
+            if self.media_fw.acquire(&self.window, domain).is_err() {
+                for domain in held {
+                    let _ = self.media_fw.release(&self.window, domain);
+                }
+                return false;
+            }
+            held.push(domain);
         }
-        let id = self.engine.create_context()?;
-        if let Err(error) = self.engine.emit_context_setup(id, &self.ctx_wa) {
-            let _ = self.engine.destroy_context(id);
-            return Err(error);
+        true
+    }
+
+    fn release_media(&mut self) {
+        let mut released = Vec::new();
+        for lane in &self.xcs {
+            if let Some(domain) = media_domain(self.gt, lane.which) {
+                if !released.contains(&domain) {
+                    let _ = self.media_fw.release(&self.window, domain);
+                    released.push(domain);
+                }
+            }
         }
-        self.contexts.push(Context {
-            user: Arc::downgrade(user),
-            id,
-        });
-        Ok(id)
+    }
+
+    /// The hardware engine and context for `user`'s engine.
+    fn context_for(
+        &mut self,
+        user: &Arc<UserContext>,
+    ) -> Result<(&mut Engine, ContextId), SubmitError> {
+        let which = user.engine();
+        if which == HwEngine::Rcs0 {
+            let id = context_on(&mut self.engine, &mut self.contexts, &self.ctx_wa, user)?;
+            return Ok((&mut self.engine, id));
+        }
+        let lane = self
+            .xcs
+            .iter_mut()
+            .find(|lane| lane.which == which)
+            .ok_or(SubmitError::NoEngine)?;
+        let id = context_on(&mut lane.engine, &mut lane.contexts, &[], user)?;
+        Ok((&mut lane.engine, id))
     }
 
     /// Retire landed jobs and drop hardware contexts whose user context is
-    /// gone. `true` when the GT must be reset: a completion could not be
-    /// proven, or a job outlived its deadline.
-    fn service(&mut self, now: u64) -> bool {
-        for done in self.engine.poll_completions() {
-            if let Some(i) = self.jobs.iter().position(|j| j.request == done.request) {
+    /// gone. [`Service::Lost`] when a completion could not be proven (only a
+    /// GT reset recovers), [`Service::Hung`] when a job outlived its deadline.
+    fn service(&mut self, now: u64) -> Service {
+        let mut done: Vec<_> = self
+            .engine
+            .poll_completions()
+            .into_iter()
+            .map(|done| (HwEngine::Rcs0, done.request))
+            .collect();
+        for lane in &mut self.xcs {
+            let which = lane.which;
+            done.extend(
+                lane.engine
+                    .poll_completions()
+                    .into_iter()
+                    .map(|d| (which, d.request)),
+            );
+        }
+        for (which, request) in done {
+            if let Some(i) = self
+                .jobs
+                .iter()
+                .position(|j| j.which == which && j.request == request)
+            {
                 self.jobs.swap_remove(i).job.finish(false);
             }
+        }
+        // Rotate an engine whose ELSP[0] has used its slice while another
+        // context waits (Linux's execlists timeslice timer).
+        self.engine.timeslice(now);
+        for lane in &mut self.xcs {
+            lane.engine.timeslice(now);
         }
         let engine = &mut self.engine;
         self.contexts.retain(|context| {
             context.user.strong_count() != 0 || engine.destroy_context(context.id).is_err()
         });
-        self.engine.completion_lost() || self.jobs.iter().any(|job| now >= job.deadline)
+        for lane in &mut self.xcs {
+            let engine = &mut lane.engine;
+            lane.contexts.retain(|context| {
+                context.user.strong_count() != 0 || engine.destroy_context(context.id).is_err()
+            });
+        }
+        if self.engine.completion_lost() || self.xcs.iter().any(|l| l.engine.completion_lost()) {
+            return Service::Lost;
+        }
+        if let Some(job) = self.jobs.iter().find(|job| now >= job.deadline) {
+            return Service::Hung(job.which, job.request);
+        }
+        {
+            let busy = !self.jobs.is_empty()
+                || !self.engine.is_idle()
+                || self.xcs.iter().any(|l| !l.engine.is_idle());
+            match self.governor.tick(now, busy) {
+                Some(Step::Request(freq)) => {
+                    let window = &self.window;
+                    rps_request(freq, |r, v| window.write32(r, v));
+                }
+                Some(Step::Park(idle)) => self.park(idle),
+                None => {}
+            }
+        }
+        Service::Ok
     }
 }
 
@@ -338,11 +780,18 @@ pub(crate) struct Owner {
     platform: GtPlatform,
     wa: WaPlatform,
     revision: u8,
+    /// PCI device ID (`WaRsDisableCoarsePowerGating`'s Skylake GT3/GT4).
+    device: u16,
+    /// The data stolen memory from PCI config, which Gen9 LP's BIOS RC6
+    /// check places the RC6 context in.
+    dsm: Option<(u64, u64)>,
     bar: narf_bus::bar::MmioRegion,
     card: Arc<crate::drm_devfs_bridge::IntelGpuCard>,
     state: Mutex<Option<Runtime>>,
     epoch: AtomicU64,
     clock: AtomicU64,
+    /// The published engine set's bits (RCS0 plus the lanes that came up).
+    engines: core::sync::atomic::AtomicU32,
     topology: narf_lib::sync::IrqSafeSpinLock<Option<crate::intel_gpu_legacy_gt::LegacyTopology>>,
 }
 
@@ -426,8 +875,10 @@ impl Owner {
             u64::from(timestamp_frequency(self.wa.gt(), |reg| window.read32(reg))),
             Ordering::Release,
         );
+        // The engine's execlists layout: Gen9 LP shares big-core Gen9's
+        // context image, CSB and indirect-context batch.
         let generation = match self.wa.gt() {
-            LegacyGt::Gen9 => crate::intel_gpu::Generation::Skylake,
+            LegacyGt::Gen9 | LegacyGt::Gen9Lp => crate::intel_gpu::Generation::Skylake,
             LegacyGt::Gen11 => crate::intel_gpu::Generation::IceLake,
         };
         let mut engine = RcsEngine::new_for_generation(
@@ -436,6 +887,7 @@ impl Owner {
             crate::intel_gpu_rcs::production_arena(self.bar),
         )
         .map_err(InitError::Engine)?;
+        engine.set_pooled_eu(self.topology.lock().is_some_and(|t| t.pooled_eu()));
         let ready = engine
             .install_gen9_wa_bb()
             .and_then(|()| engine.reset_csb_pointers());
@@ -465,15 +917,100 @@ impl Owner {
             }
             return Err(InitError::Engine(error));
         }
+        // intel_rps_enable / intel_rc6_enable, then unparked: hardware RC6
+        // timers (Gen11) and RPS stay programmed across park/unpark.
+        let gt = self.wa.gt();
+        let caps = Caps::read(gt, |r| window.read32(r));
+        if let Some(caps) = caps {
+            rps_enable(gt, caps, self.clock.load(Ordering::Acquire), |r, v| {
+                window.write32(r, v)
+            });
+        } else {
+            log(self.index, "no RP_STATE_CAP; GPU frequency left to the PCU");
+        }
+        // BCS0, VCS0 and VECS0, with their media wells held from here:
+        // intel_rc6_enable (and Gen9 LP's BIOS check) reach every engine's
+        // idle count under FORCEWAKE_ALL. A lane whose well is refused is
+        // left out.
+        let mut media_fw = MediaForcewake::new();
+        let lanes: Vec<_> = xcs_engines(gt, |r| window.read32(r))
+            .into_iter()
+            .filter(|&(which, _)| match media_domain(gt, which) {
+                Some(domain) if media_fw.acquire(&window, domain).is_err() => {
+                    log(self.index, "media forcewake refused; engine left out");
+                    false
+                }
+                _ => true,
+            })
+            .collect();
+        let bases: Vec<u64> = core::iter::once(RCS)
+            .chain(lanes.iter().map(|(_, spec)| spec.base))
+            .collect();
+        let rc6 = rc6_supported(gt, self.dsm, |r| window.read32(r))
+            .then(|| rc6_enable(gt, self.device, &bases, |r, v| window.write32(r, v)));
+        match rc6 {
+            Some(ctl) => rc6_unpark(ctl, |r, v| window.write32(r, v)),
+            None => log(self.index, "RC6 and powersaving disabled by BIOS"),
+        }
+        // Each lane is its own execlists engine on the shared arena. An
+        // engine that does not come up is left out of the published set;
+        // RCS0 still runs.
+        let mut xcs = Vec::new();
+        for (which, spec) in lanes {
+            resume_xcs(&window, gt, which, spec.base);
+            let lane = RcsEngine::with_spec_for_generation(
+                spec,
+                generation,
+                BarWindow::new(self.bar),
+                crate::intel_gpu_rcs::production_arena(self.bar),
+            )
+            .and_then(|mut engine| match engine.reset_csb_pointers() {
+                Ok(()) => Ok(engine),
+                Err(error) => {
+                    // SAFETY: nothing was submitted on this engine.
+                    unsafe { engine.release_after_reset() };
+                    Err(error)
+                }
+            });
+            match lane {
+                Ok(engine) => xcs.push(Lane {
+                    which,
+                    engine,
+                    contexts: Vec::new(),
+                }),
+                Err(_) => {
+                    if let Some(domain) = media_domain(gt, which) {
+                        let _ = media_fw.release(&window, domain);
+                    }
+                    log(self.index, "copy/media engine did not come up; left out");
+                }
+            }
+        }
+        let engines = core::iter::once(HwEngine::Rcs0)
+            .chain(xcs.iter().map(|lane| lane.which))
+            .collect::<Vec<_>>();
+        self.engines.store(
+            crate::intel_gpu_engine::EngineSet::of(&engines).bits(),
+            Ordering::Release,
+        );
         let epoch = crate::intel_gpu_user::next_epoch();
         *self.state.lock().await = Some(Runtime {
             engine,
+            xcs,
+            gt,
             fw,
+            media_fw,
             window,
             epoch,
             ctx_wa,
             contexts: Vec::new(),
             jobs: Vec::new(),
+            governor: Governor::new(caps),
+            steering,
+            rc6,
+            bar: self.bar,
+            // Bring-up leaves the GT awake: __gt_unpark's GT_IRQ is held.
+            gt_irq: crate::intel_gpu_gen9_dc_states::gt_unparked(&self.bar),
         });
         self.epoch.store(epoch, Ordering::Release);
         Ok(())
@@ -487,6 +1024,9 @@ impl Owner {
         let Some(mut runtime) = self.state.lock().await.take() else {
             return;
         };
+        // The reset sequence needs the render well awake; a refused wake
+        // still attempts it.
+        let _ = runtime.unpark();
         let mut reset = Reset::new();
         let result = loop {
             match reset.poll(&runtime.window, narf_time::monotonic_ns()) {
@@ -494,6 +1034,10 @@ impl Owner {
                 Poll::Ready(result) => break result,
             }
         };
+        if runtime.rc6.is_some() {
+            rc6_disable(|r, v| runtime.window.write32(r, v));
+        }
+        runtime.release_media();
         let _ = runtime.fw.release(&runtime.window, FwDomain::Blitter);
         let _ = runtime.fw.release(&runtime.window, FwDomain::Render);
         if result.is_err() {
@@ -505,9 +1049,13 @@ impl Owner {
         for job in runtime.jobs.drain(..) {
             job.job.finish(true);
         }
-        // SAFETY: the full-domain reset above completed, so the engine no
-        // longer reads or writes any context, ring or batch memory.
+        // SAFETY: the full-domain reset above completed, so no engine reads
+        // or writes any context, ring or batch memory any more.
         unsafe { runtime.engine.release_after_reset() };
+        for lane in runtime.xcs.drain(..) {
+            // SAFETY: as above; the full-domain reset covers every engine.
+            unsafe { lane.engine.release_after_reset() };
+        }
     }
 
     async fn run(self: Arc<Self>) {
@@ -530,26 +1078,111 @@ impl Owner {
                     log(self.index, "render backend already installed");
                     return;
                 }
-                log(self.index, "RCS0 published");
+                log(self.index, "engines published");
             }
             attempts = 0;
             loop {
-                let (reset, busy) = {
+                let (service, busy) = {
                     let mut state = self.state.lock().await;
                     let Some(runtime) = state.as_mut() else {
                         break;
                     };
-                    let reset = runtime.service(narf_time::monotonic_ns());
-                    (reset, !runtime.jobs.is_empty())
+                    let service = runtime.service(narf_time::monotonic_ns());
+                    (service, !runtime.jobs.is_empty())
                 };
-                if reset {
-                    log(self.index, "job hung or completion lost; resetting the GT");
+                let full_reset = match service {
+                    Service::Ok => false,
+                    Service::Lost => {
+                        log(self.index, "completion lost; resetting the GT");
+                        true
+                    }
+                    Service::Hung(engine, request) => {
+                        match self.reset_engine(engine, request).await {
+                            Ok(()) => false,
+                            Err(_) => {
+                                log(
+                                    self.index,
+                                    "engine reset unavailable or failed; resetting the GT",
+                                );
+                                true
+                            }
+                        }
+                    }
+                };
+                if full_reset {
                     self.tear_down().await;
                     break;
                 }
                 sleep_us(if busy { 50 } else { 1000 }).await;
             }
         }
+    }
+
+    /// `intel_engine_reset` for a hung job on `which`: stop and reset that
+    /// engine alone, restore its engine state, fail and ban only the hung
+    /// context and put every other request back on it
+    /// (`__intel_engine_reset_bh`). Every surviving job gets a fresh
+    /// deadline. An error, or an engine with no reset domain of its own,
+    /// leaves the full GT reset to the caller.
+    async fn reset_engine(&self, which: HwEngine, request: u64) -> Result<(), InitError> {
+        let mut state = self.state.lock().await;
+        let runtime = state.as_mut().ok_or(InitError::Unavailable)?;
+        let domain = engine_reset_domain(runtime.gt, which).ok_or(InitError::Unavailable)?;
+        let lane = if which == HwEngine::Rcs0 {
+            None
+        } else {
+            Some(
+                runtime
+                    .xcs
+                    .iter()
+                    .position(|lane| lane.which == which)
+                    .ok_or(InitError::Unavailable)?,
+            )
+        };
+        let base = lane.map_or(RCS, |i| runtime.xcs[i].engine.spec().base);
+        runtime.unpark().map_err(|_| InitError::Forcewake)?;
+        let mut reset = Reset::engine(base, domain).with_sfc(sfc_lock(runtime.gt, which, base));
+        loop {
+            match reset.poll(&runtime.window, narf_time::monotonic_ns()) {
+                Poll::Pending => sleep_us(20).await,
+                Poll::Ready(result) => break result?,
+            }
+        }
+        let (engine, contexts) = match lane {
+            None => {
+                let mut report = Programmed::default();
+                resume_rcs(&runtime.window, self.wa, runtime.steering, &mut report);
+                (&mut runtime.engine, &mut runtime.contexts)
+            }
+            Some(i) => {
+                resume_xcs(&runtime.window, runtime.gt, which, base);
+                let lane = &mut runtime.xcs[i];
+                (&mut lane.engine, &mut lane.contexts)
+            }
+        };
+        // SAFETY: the engine-domain reset above completed, so this engine no
+        // longer reads or writes any of its batch, ring or context memory.
+        let (guilty, failed) =
+            unsafe { engine.reset_rewind_blaming(Some(request)) }.map_err(InitError::Engine)?;
+        if let Some(guilty) = guilty {
+            contexts
+                .retain(|context| context.id != guilty || engine.destroy_context(guilty).is_err());
+        }
+        let now = narf_time::monotonic_ns();
+        for request in failed {
+            if let Some(i) = runtime
+                .jobs
+                .iter()
+                .position(|j| j.which == which && j.request == request)
+            {
+                runtime.jobs.swap_remove(i).job.finish_hung();
+            }
+        }
+        for job in &mut runtime.jobs {
+            job.deadline = now.saturating_add(JOB_TIMEOUT_NS);
+        }
+        log(self.index, "engine reset; the hung context is banned");
+        Ok(())
     }
 
     async fn submit(
@@ -561,8 +1194,10 @@ impl Owner {
         if epoch == 0 {
             return Err(FsError::NoDevice);
         }
+        let published =
+            crate::intel_gpu_engine::EngineSet::from_bits(self.engines.load(Ordering::Acquire));
         if batch.0.platform() != Some(self.platform)
-            || context.engine() != crate::intel_gpu_engine::Engine::Rcs0
+            || !published.contains(context.engine())
             || context.parallel().is_some()
             || context.placements() != crate::intel_gpu_engine::EngineSet::of(&[context.engine()])
         {
@@ -573,14 +1208,14 @@ impl Owner {
             .as_mut()
             .filter(|r| r.epoch == epoch)
             .ok_or(FsError::NoDevice)?;
+        runtime.unpark()?;
         let claim = context.claim_resident(epoch)?;
-        let id = runtime.context_for(&context).map_err(submit_error)?;
-        let submission = runtime
-            .engine
-            .submit_resident(id, batch.0)
-            .map_err(submit_error)?;
+        let (engine, id) = runtime.context_for(&context).map_err(submit_error)?;
+        engine.set_band(id, claim.band()).map_err(submit_error)?;
+        let submission = engine.submit_resident(id, batch.0).map_err(submit_error)?;
         let fence = submission.fence.clone();
         runtime.jobs.push(Job {
+            which: context.engine(),
             request: submission.request,
             job: claim.publish(fence.clone()),
             deadline: narf_time::monotonic_ns().saturating_add(JOB_TIMEOUT_NS),
@@ -609,9 +1244,9 @@ impl UserBackend for Backend {
             epoch,
             platform: self.0.platform,
             submission_version: (0, 0, 0),
-            engines: crate::intel_gpu_engine::EngineSet::of(&[
-                crate::intel_gpu_engine::Engine::Rcs0,
-            ]),
+            engines: crate::intel_gpu_engine::EngineSet::from_bits(
+                self.0.engines.load(Ordering::Acquire),
+            ),
         })
     }
 
@@ -620,7 +1255,7 @@ impl UserBackend for Backend {
         (clock != 0).then(|| crate::intel_gpu_user::DeviceFacts {
             revision: self.0.revision,
             graphics_version: match self.0.wa.gt() {
-                LegacyGt::Gen9 => 900,
+                LegacyGt::Gen9 | LegacyGt::Gen9Lp => 900,
                 LegacyGt::Gen11 => 1100,
             },
             graphics_step: 0,
@@ -654,6 +1289,7 @@ pub(crate) fn install(
     card: Arc<crate::drm_devfs_bridge::IntelGpuCard>,
     device: &narf_bus::BusDevice,
     revision: u8,
+    dsm: Option<(u64, u64)>,
     bar: narf_bus::bar::MmioRegion,
 ) -> bool {
     let Some(platform) = GtPlatform::from_pci(device.id.vendor, device.id.device) else {
@@ -672,11 +1308,14 @@ pub(crate) fn install(
         platform,
         wa,
         revision,
+        device: device.id.device,
+        dsm,
         bar,
         card,
         state: Mutex::new(None),
         epoch: AtomicU64::new(0),
         clock: AtomicU64::new(0),
+        engines: core::sync::atomic::AtomicU32::new(0),
         topology: narf_lib::sync::IrqSafeSpinLock::new(None),
     }));
     true
@@ -868,6 +1507,9 @@ pub mod tests {
         // CTC shift 2: 24 MHz >> 1 = Skylake's 12 MHz.
         if timestamp_frequency(LegacyGt::Gen9, regs(2 << 1, 0, 0)) != 12_000_000
             || timestamp_frequency(LegacyGt::Gen9, regs(3 << 1, 0, 0)) != 24_000_000
+            // Gen9 LP: the 19.2 MHz crystal.
+            || timestamp_frequency(LegacyGt::Gen9Lp, regs(3 << 1, 0, 0)) != 19_200_000
+            || timestamp_frequency(LegacyGt::Gen9Lp, regs(2 << 1, 0, 0)) != 9_600_000
             // Ice Lake: 19.2 MHz crystal, shift 3 → full rate.
             || timestamp_frequency(LegacyGt::Gen11, regs(0, 1 << 3 | 3 << 1, 0)) != 19_200_000
             || timestamp_frequency(LegacyGt::Gen11, regs(0, 2 << 3 | 2 << 1, 0)) != 19_200_000
@@ -917,5 +1559,164 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_legacy_owner",
         smoke_legacy_owner_claim_resident
+    );
+
+    /// BCS0, VCS0 and VECS0 beside RCS0 at their Gen9 and Gen11 bases; a
+    /// Gen11 VDBox or VEBox fused off is left out (an unreadable fuse
+    /// register keeps only the copy engine); each media engine names its
+    /// forcewake well.
+    fn smoke_legacy_owner_copy_and_media_engines() -> TestResult {
+        let bases = |gt, fuse| {
+            xcs_engines(gt, |_| fuse)
+                .into_iter()
+                .map(|(which, spec)| (which, spec.base))
+                .collect::<Vec<_>>()
+        };
+        if bases(LegacyGt::Gen9, 0xffff_ffff)
+            != alloc::vec![
+                (HwEngine::Bcs0, 0x22000),
+                (HwEngine::Vcs0, 0x12000),
+                (HwEngine::Vecs0, 0x1a000),
+            ]
+        {
+            return TestResult::Fail("Gen9 copy and media engines");
+        }
+        if bases(LegacyGt::Gen11, 0)
+            != alloc::vec![
+                (HwEngine::Bcs0, 0x22000),
+                (HwEngine::Vcs0, 0x1c0000),
+                (HwEngine::Vecs0, 0x1c8000),
+            ]
+            || bases(LegacyGt::Gen11, 1)
+                != alloc::vec![(HwEngine::Bcs0, 0x22000), (HwEngine::Vecs0, 0x1c8000)]
+            || bases(LegacyGt::Gen11, u32::MAX) != alloc::vec![(HwEngine::Bcs0, 0x22000)]
+        {
+            return TestResult::Fail("Gen11 engines follow GEN11_GT_VEBOX_VDBOX_DISABLE");
+        }
+        if media_domain(LegacyGt::Gen9, HwEngine::Vecs0) != Some(MediaFwDomain::Aggregate)
+            || media_domain(LegacyGt::Gen11, HwEngine::Vcs0) != Some(MediaFwDomain::VdBox(0))
+            || media_domain(LegacyGt::Gen11, HwEngine::Vecs0) != Some(MediaFwDomain::VeBox(0))
+            || media_domain(LegacyGt::Gen11, HwEngine::Bcs0).is_some()
+        {
+            return TestResult::Fail("media engines name their forcewake wells");
+        }
+        let regs = Regs::default();
+        resume_xcs(&regs, LegacyGt::Gen9, HwEngine::Vcs0, 0x12000);
+        let writes = regs.writes.borrow();
+        if !writes.contains(&(0x1229c, 1 << 31 | 1 << 15))
+            || !writes.contains(&(0x1209c, 1 << 24))
+            || writes.first().map(|w| w.0) != Some(0xc900)
+        {
+            return TestResult::Fail("VCS0 resume: MOCS bank, execlists mode, ring running");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_owner",
+        smoke_legacy_owner_copy_and_media_engines
+    );
+
+    /// Per-engine reset domains (`gen6_hw_engine_mask`,
+    /// `gen11_hw_engine_mask`), and an engine reset that stops and
+    /// handshakes the hung engine's own CS before pulsing only its domain.
+    fn smoke_legacy_owner_engine_reset_domains() -> TestResult {
+        let expect = [
+            (LegacyGt::Gen9, HwEngine::Rcs0, Some(1 << 1)),
+            (LegacyGt::Gen9, HwEngine::Bcs0, Some(1 << 3)),
+            (LegacyGt::Gen9, HwEngine::Vcs0, Some(1 << 2)),
+            (LegacyGt::Gen9, HwEngine::Vecs0, Some(1 << 4)),
+            (LegacyGt::Gen11, HwEngine::Rcs0, Some(1 << 1)),
+            (LegacyGt::Gen11, HwEngine::Bcs0, Some(1 << 2)),
+            (LegacyGt::Gen11, HwEngine::Vcs0, Some(1 << 5)),
+            (LegacyGt::Gen11, HwEngine::Vecs0, Some(1 << 13)),
+        ];
+        if expect
+            .iter()
+            .any(|&(gt, which, domain)| engine_reset_domain(gt, which) != domain)
+        {
+            return TestResult::Fail("engine reset domains follow Linux's masks");
+        }
+        let regs = Regs::default();
+        let mut reset = Reset::engine(0x22000, 1 << 3);
+        let mut now = 0;
+        let done = loop {
+            if let Poll::Ready(result) = reset.poll(&regs, now) {
+                break result;
+            }
+            // The domain bit self-clears once the engine reset completes.
+            regs.values.borrow_mut().insert(GDRST, 0);
+            now += 1000;
+        };
+        let writes = regs.writes.borrow();
+        if done != Ok(())
+            || writes.first() != Some(&(0x2209c, masked_enable(STOP_RING)))
+            || !writes.contains(&(0x220d0, masked_enable(REQUEST_RESET)))
+            || !writes.contains(&(GDRST, 1 << 3))
+            || writes.iter().any(|&(r, _)| r == MI_MODE || r == RESET_CTL)
+        {
+            return TestResult::Fail("BCS0 reset uses BCS0's CS and only the blitter domain");
+        }
+        // Gen11 VCS0 at 0x1c0000 using its SFC: force-lock, reset the SFC
+        // with the engine once acknowledged, then unlock.
+        let run = |usage: u32, ack: bool| {
+            let regs = Regs::default();
+            regs.values.borrow_mut().insert(0x1c0890, usage);
+            let sfc = sfc_lock(LegacyGt::Gen11, HwEngine::Vcs0, 0x1c0000);
+            let mut reset = Reset::engine(0x1c0000, 1 << 5).with_sfc(sfc);
+            let mut now = 0;
+            let done = loop {
+                if let Poll::Ready(result) = reset.poll(&regs, now) {
+                    break result;
+                }
+                let locked = regs.writes.borrow().contains(&(0x1c088c, 1));
+                if locked && ack {
+                    regs.values.borrow_mut().insert(0x1c0890, usage | 1 << 1);
+                }
+                regs.values.borrow_mut().insert(GDRST, 0);
+                now += 100_000;
+            };
+            let writes = regs.writes.borrow().clone();
+            (done, writes)
+        };
+        let at = |writes: &[(u64, u32)], write| writes.iter().position(|w| *w == write);
+        let (done, writes) = run(1, true);
+        let (lock, pulse, unlock) = (
+            at(&writes, (0x1c088c, 1)),
+            at(&writes, (GDRST, 1 << 5 | 1 << 17)),
+            at(&writes, (0x1c088c, 0)),
+        );
+        if done != Ok(())
+            || !(lock < pulse && pulse < unlock && lock.is_some())
+            || at(&writes, (0x1c00d0, masked_disable(REQUEST_RESET))) < unlock
+        {
+            return TestResult::Fail("a used SFC is locked, reset with VCS0 and unlocked");
+        }
+        let (done, writes) = run(0, true);
+        if done != Ok(())
+            || writes.iter().any(|&(r, _)| r == 0x1c088c)
+            || at(&writes, (GDRST, 1 << 5)).is_none()
+        {
+            return TestResult::Fail("an idle SFC is left alone");
+        }
+        let (done, writes) = run(1, false);
+        if done != Err(InitError::ResetTimeout)
+            || writes.iter().any(|&(r, _)| r == GDRST)
+            || at(&writes, (0x1c088c, 0)).is_none()
+        {
+            return TestResult::Fail("an unacknowledged SFC lock fails the engine reset");
+        }
+        let vecs = sfc_lock(LegacyGt::Gen11, HwEngine::Vecs0, 0x1c8000).unwrap();
+        if (vecs.lock, vecs.ack, vecs.usage, vecs.reset_bit)
+            != (0x1ca01c, 0x1ca018, 0x1ca014, 1 << 17)
+            || sfc_lock(LegacyGt::Gen9, HwEngine::Vcs0, 0x12000).is_some()
+            || sfc_lock(LegacyGt::Gen11, HwEngine::Bcs0, 0x22000).is_some()
+        {
+            return TestResult::Fail("SFC lock registers follow get_sfc_forced_lock_data");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_owner",
+        smoke_legacy_owner_engine_reset_domains
     );
 }

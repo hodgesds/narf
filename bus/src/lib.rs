@@ -50,6 +50,7 @@ pub mod module_usb;
 pub mod module_wireless;
 pub mod msi;
 pub mod msix;
+pub mod p2pdma;
 pub mod pci;
 pub mod pci_cap;
 pub mod pci_cap_ext;

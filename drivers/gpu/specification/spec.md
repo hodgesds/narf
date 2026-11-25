@@ -1175,9 +1175,12 @@ HAS_VRAM, and GT_LIST reports near VRAM/far system memory. WC mmap uses retained
 BAR frames. DG2 PPGTT uses sixteen contiguous DM|PS64 leaves per 64 KiB group,
 including valid device address zero; bind, split, replace and unmap preserve
 64 KiB boundaries. Translation rejects partial/corrupt groups and retains
-read-only/PAT checks. VRAM PRIME, i915 residency, eviction/migration and dGPU
-scanout remain unsupported. GPU-only storage has the bounded opt-in exception
-below; other nonvisible/unmapped allocation remains unavailable.
+read-only/PAT checks. VRAM objects export over PRIME; another native Xe
+card attaches peer-to-peer (opt-in `narf.intel.prime_p2p=1`) or after
+migration to system memory (`intel_gpu.md` §19, cross-device PRIME). i915
+residency, eviction/migration and dGPU scanout remain unsupported. GPU-only
+storage has the bounded opt-in exception below; other nonvisible/unmapped
+allocation remains unavailable.
 
 #### Opt-in BMG GPU-only small-BAR local memory
 
@@ -1561,7 +1564,10 @@ sync-file descriptor and atomically publishes its READ/WRITE leaf batch through
 the same reservation admission gate as kernel CPU copies and native jobs.
 Invalid flags precede fd lookup; bad/non-sync descriptors and copy faults
 publish nothing, and an empty signalled-stub batch changes no reservation.
-Foreign attachments remain unavailable.
+Another Intel card's dma-buf imports as a static attachment
+(`intel_gpu_prime`): a system-placed object sharing the exporter's
+reservation, mapped at its first native VM_BIND, with no CPU, mmap, i915
+compatibility or scanout use.
 
 Compatibility-profile GuC and legacy Gen12 resident submissions check every
 synchronous leaf's reservation, rejecting conflicting work without partial

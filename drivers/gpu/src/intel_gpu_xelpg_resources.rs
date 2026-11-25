@@ -198,12 +198,13 @@ fn timing(p: &PipeRequest, vblank_start: Option<u16>) -> wm::Timing {
 }
 
 /// The IP whose CDCLK table the vblank prefill adjustment reads. Display
-/// 20 keeps the display-14 table it has always used here; display 30 takes
-/// its own.
+/// 20 keeps the display-14 table it has always used here; display 30 and 35
+/// take their own.
 const fn prefill_ip(ip: DisplayIp) -> DisplayIp {
     match ip {
         DisplayIp::Xe3Lpd => DisplayIp::Xe3Lpd,
         DisplayIp::WildcatLake => DisplayIp::WildcatLake,
+        DisplayIp::NovaLakeS => DisplayIp::NovaLakeS,
         DisplayIp::Xelpdp | DisplayIp::Xe2Lpd => DisplayIp::Xelpdp,
     }
 }
@@ -618,15 +619,17 @@ impl State {
     pub(crate) fn dbuf_ctl(&self, slice: usize, old: u32, enabled: u8) -> u32 {
         match self.ip {
             DisplayIp::Xelpdp => self.dbuf.dbuf_ctl(slice, old, enabled),
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
-                crate::intel_gpu_xe2lpd::dbuf_ctl(
-                    slice,
-                    old,
-                    enabled,
-                    crate::intel_gpu_xe2lpd::mdclk_cdclk_ratio(self.cdclk),
-                    self.dbuf.joined,
-                )
-            }
+            DisplayIp::Xe2Lpd
+            | DisplayIp::Xe3Lpd
+            | DisplayIp::WildcatLake
+            | DisplayIp::NovaLakeS => crate::intel_gpu_xe2lpd::dbuf_ctl(
+                self.ip,
+                slice,
+                old,
+                enabled,
+                crate::intel_gpu_xe2lpd::mdclk_cdclk_ratio(self.cdclk),
+                self.dbuf.joined,
+            ),
         }
     }
 
@@ -635,8 +638,11 @@ impl State {
     pub(crate) fn dbuf_ctl_mask(&self) -> u32 {
         match self.ip {
             DisplayIp::Xelpdp => 0xc0ff_0000,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
-                0xc000_0000 | crate::intel_gpu_xe2lpd::DBUF_MIN_TRACKER_MASK
+            DisplayIp::Xe2Lpd
+            | DisplayIp::Xe3Lpd
+            | DisplayIp::WildcatLake
+            | DisplayIp::NovaLakeS => {
+                0xc000_0000 | crate::intel_gpu_xe2lpd::dbuf_min_tracker_mask(self.ip)
             }
         }
     }
@@ -645,9 +651,10 @@ impl State {
     pub(crate) fn dbox(&self, pipe: usize) -> u32 {
         match self.ip {
             DisplayIp::Xelpdp => self.dbuf.dbox(pipe),
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
-                crate::intel_gpu_xe2lpd::dbox(self.dbuf.joined)
-            }
+            DisplayIp::Xe2Lpd
+            | DisplayIp::Xe3Lpd
+            | DisplayIp::WildcatLake
+            | DisplayIp::NovaLakeS => crate::intel_gpu_xe2lpd::dbox(self.dbuf.joined),
         }
     }
 
@@ -657,8 +664,12 @@ impl State {
         let join = self.dbuf.mbus_ctl_select(pipe);
         match self.ip {
             DisplayIp::Xelpdp => join,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
-                join | crate::intel_gpu_xe2lpd::mbus_throttle(
+            DisplayIp::Xe2Lpd
+            | DisplayIp::Xe3Lpd
+            | DisplayIp::WildcatLake
+            | DisplayIp::NovaLakeS => {
+                join | crate::intel_gpu_xe2lpd::mbus_throttle_ip(
+                    self.ip,
                     crate::intel_gpu_xe2lpd::mdclk_cdclk_ratio(self.cdclk),
                 )
             }
@@ -669,8 +680,11 @@ impl State {
     pub(crate) fn mbus_ctl_mask(&self) -> u32 {
         match self.ip {
             DisplayIp::Xelpdp => dbuf::MBUS_CTL_MASK,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
-                dbuf::MBUS_CTL_MASK | crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK
+            DisplayIp::Xe2Lpd
+            | DisplayIp::Xe3Lpd
+            | DisplayIp::WildcatLake
+            | DisplayIp::NovaLakeS => {
+                dbuf::MBUS_CTL_MASK | crate::intel_gpu_xe2lpd::mbus_throttle_mask(self.ip)
             }
         }
     }
@@ -887,31 +901,34 @@ fn program_slices(
 
 pub(crate) fn program_ratio(
     io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
     target: Rung,
     joined: bool,
 ) -> Result<(), ResourceError> {
-    crate::intel_gpu_xe2lpd::program_mdclk_ratio(io, target, joined)
+    crate::intel_gpu_xe2lpd::program_mdclk_ratio_ip(io, ip, target, joined)
         .map_err(|_| ResourceError::Readback)
 }
 
 /// Display 20: put the captured MBUS throttle and DBUF minimum trackers
-/// back (the ratio fields of the original clock).
+/// back (the ratio fields of the original clock), in `ip`'s fields.
 pub(crate) fn restore_ratio(
     io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
     snap: &Snapshot,
 ) -> Result<(), ResourceError> {
-    use crate::intel_gpu_xe2lpd::{DBUF_MIN_TRACKER_MASK, MBUS_THROTTLE_MASK};
+    let throttle_mask = crate::intel_gpu_xe2lpd::mbus_throttle_mask(ip);
+    let tracker_mask = crate::intel_gpu_xe2lpd::dbuf_min_tracker_mask(ip);
     let mbus = read(io, dbuf::MBUS_CTL)?;
     checked(
         io,
         dbuf::MBUS_CTL,
-        (mbus & !MBUS_THROTTLE_MASK) | (snap.mbus_ctl & MBUS_THROTTLE_MASK),
+        (mbus & !throttle_mask) | (snap.mbus_ctl & throttle_mask),
     )?;
     for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
-        let value = (read(io, r)? & !(DBUF_MIN_TRACKER_MASK | dbuf::DBUF_POWER_STATE))
-            | (snap.dbuf_ctl[slice] & DBUF_MIN_TRACKER_MASK);
+        let value = (read(io, r)? & !(tracker_mask | dbuf::DBUF_POWER_STATE))
+            | (snap.dbuf_ctl[slice] & tracker_mask);
         io.write32(r, value);
-        if read(io, r)? & DBUF_MIN_TRACKER_MASK != value & DBUF_MIN_TRACKER_MASK {
+        if read(io, r)? & tracker_mask != value & tracker_mask {
             return Err(ResourceError::Readback);
         }
     }
@@ -932,7 +949,7 @@ fn apply(
     *stage = Stage::Cdclk;
     match state.ip {
         DisplayIp::Xelpdp => cdclk::program(io, &snap.cdclk, state.cdclk)?,
-        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
+        DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake | DisplayIp::NovaLakeS => {
             // bxt_set_cdclk, display >= 20: the MDCLK/CDCLK ratio goes in
             // before a lowering and after a raising (an unknown clock is
             // sanitized to 0, so it is raised), with the new MBUS join.
@@ -943,11 +960,11 @@ fn apply(
                 .known
                 .is_none_or(|_| state.cdclk.cdclk_khz > snap.cdclk.actual_khz);
             if lowering {
-                program_ratio(io, state.cdclk, state.dbuf.joined)?;
+                program_ratio(io, state.ip, state.cdclk, state.dbuf.joined)?;
             }
             cdclk::program_ip(io, state.ip, &snap.cdclk, state.cdclk)?;
             if raising {
-                program_ratio(io, state.cdclk, state.dbuf.joined)?;
+                program_ratio(io, state.ip, state.cdclk, state.dbuf.joined)?;
             }
         }
     }
@@ -1025,7 +1042,7 @@ fn restore(
         }
     };
     if stage >= Stage::Mbus {
-        let mask = ratio_mask(crate::intel_gpu_xe2lpd::MBUS_THROTTLE_MASK);
+        let mask = ratio_mask(crate::intel_gpu_xe2lpd::mbus_throttle_mask(state.ip));
         let kept = ratio_fields(dbuf::MBUS_CTL, mask)?;
         checked(io, dbuf::MBUS_CTL, (snap.mbus_ctl & !mask) | kept)?;
         for (pipe, v) in snap.dbox.iter().enumerate().take(state.ip.pipe_count()) {
@@ -1033,7 +1050,7 @@ fn restore(
         }
     }
     if stage >= Stage::Dbuf {
-        let mask = ratio_mask(crate::intel_gpu_xe2lpd::DBUF_MIN_TRACKER_MASK);
+        let mask = ratio_mask(crate::intel_gpu_xe2lpd::dbuf_min_tracker_mask(state.ip));
         for (slice, r) in dbuf::DBUF_CTL.into_iter().enumerate() {
             let original = snap.dbuf_ctl[slice];
             let kept = ratio_fields(r, mask)?;
@@ -1049,15 +1066,18 @@ fn restore(
     if stage >= Stage::Cdclk {
         match state.ip {
             DisplayIp::Xelpdp => cdclk::restore(io, &snap.cdclk)?,
-            DisplayIp::Xe2Lpd | DisplayIp::Xe3Lpd | DisplayIp::WildcatLake => {
+            DisplayIp::Xe2Lpd
+            | DisplayIp::Xe3Lpd
+            | DisplayIp::WildcatLake
+            | DisplayIp::NovaLakeS => {
                 let now = cdclk::Current::read_ip(io, state.ip)?;
                 let lowering = snap.cdclk.actual_khz < now.actual_khz;
                 if lowering {
-                    restore_ratio(io, snap)?;
+                    restore_ratio(io, state.ip, snap)?;
                 }
                 cdclk::restore_ip(io, state.ip, &snap.cdclk)?;
                 if !lowering {
-                    restore_ratio(io, snap)?;
+                    restore_ratio(io, state.ip, snap)?;
                 }
             }
         }
@@ -1126,6 +1146,7 @@ pub(crate) fn all_off_pmdemand_ip(ip: DisplayIp, latency: &Latency, cdclk: Rung)
 /// pipe, plane, cursor, DSB and FBC is off. A failure after the first write
 /// re-requests the original PM demand once the clock it may have left is
 /// covered by it, so the demand never under-covers the hardware.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn settle_all_off(
     io: &(impl MmioWindow + ?Sized),
     latency: &Latency,
@@ -1191,11 +1212,11 @@ pub(crate) fn settle_all_off_ip(
         }
         if clock.known != Some(target) {
             if ip.xe2_plus() && target.cdclk_khz < clock.actual_khz {
-                program_ratio(io, target, joined)?;
+                program_ratio(io, ip, target, joined)?;
             }
             cdclk::program_ip(io, ip, &clock, target)?;
             if ip.xe2_plus() && target.cdclk_khz >= clock.actual_khz {
-                program_ratio(io, target, joined)?;
+                program_ratio(io, ip, target, joined)?;
             }
         }
         pmdemand::program_for(io, layout, &new, None)?;

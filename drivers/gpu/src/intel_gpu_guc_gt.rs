@@ -406,9 +406,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 now_ns,
                 state: self.state,
                 engines: self.engines().unwrap_or_default(),
-                process_name: None,
-                pid: None,
-                snapshot_time: None,
+                process: None,
+                snapshot_time: Some(crate::intel_gpu_error::wall_snapshot()),
             },
             self.parts.scheduler.as_ref().map_or_else(
                 || crate::intel_gpu_error::Contexts::new(0),
@@ -2950,6 +2949,44 @@ impl<W: MmioWindow, A: BootAllocator> GuCGt<crate::intel_gpu_gt::media::MediaGsi
             .as_mut()
             .ok_or(GtError::State)?
             .submit_gsc(now, commands)
+            .map_err(GtError::Scheduling)
+    }
+
+    /// One PXP GSC job on GSCCS0 (`GuCScheduler::submit_pxp_gsc`) under the
+    /// same wake, region and register-policy proof as every submission.
+    ///
+    /// # Safety
+    /// The trusted resident-batch contract of `submit_kernel_batch`.
+    pub(crate) unsafe fn submit_pxp_gsc(
+        &mut self,
+        now: u64,
+        batch: crate::intel_gpu_exec::ResidentBatch,
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        self.admit_scheduling()?;
+        // SAFETY: forwarded caller contract; the exclusive GT owns CT/reset.
+        unsafe {
+            self.parts
+                .scheduler
+                .as_mut()
+                .ok_or(GtError::State)?
+                .submit_pxp_gsc(now, batch)
+                .map_err(GtError::Scheduling)
+        }
+    }
+
+    /// One PXP VCS termination (`GuCScheduler::submit_pxp_termination`).
+    pub(crate) fn submit_pxp_termination(
+        &mut self,
+        now: u64,
+        engine: crate::intel_gpu_engine::Engine,
+        words: &[u32],
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        self.admit_scheduling()?;
+        self.parts
+            .scheduler
+            .as_mut()
+            .ok_or(GtError::State)?
+            .submit_pxp_termination(now, engine, words)
             .map_err(GtError::Scheduling)
     }
 

@@ -51,8 +51,8 @@
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_dmc::{
-    load_program, parse_dmc_firmware_gen9, verify_loaded, DmcError, DmcId, DmcVerifyError,
-    KBL_DMC_FIRMWARE, SKL_DMC_FIRMWARE,
+    load_program, verify_loaded, DmcError, DmcId, DmcVerifyError, KBL_DMC_FIRMWARE,
+    SKL_DMC_FIRMWARE,
 };
 use crate::intel_gpu_gt::Gen9Platform;
 use crate::intel_gpu_pm::{register_dmc_firmware, PmError};
@@ -66,6 +66,18 @@ use narf_capabilities::{Cap, Read};
 /// modeset while this is clear. Probe-only state: a failed
 /// load never sets it, and nothing clears it once set.
 static GEN9_DMC_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// The resident copy of the loaded container and its per-program payload
+/// ceiling, for the Gen9 `DC_off` service's re-verification before every
+/// DC re-entry (`assert_main_dmc_loaded`). Set once, by a completed load.
+static GEN9_DMC_RESIDENT: narf_lib::sync::IrqSafeSpinLock<Option<(&'static [u8], usize)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The resident container [`load_for_display`] loaded and verified, with
+/// its payload ceiling; `None` before (or without) a completed load.
+pub(crate) fn resident_program() -> Option<(&'static [u8], usize)> {
+    *GEN9_DMC_RESIDENT.lock()
+}
 
 /// Record a completed Gen9 DMC load (probe-time; also the
 /// seam the modeset tests drive the gate through).
@@ -95,6 +107,10 @@ pub fn dmc_firmware_name(family: Gen9Platform) -> &'static str {
     match family {
         Gen9Platform::Skylake => SKL_DMC_FIRMWARE,
         Gen9Platform::KabyLake | Gen9Platform::CometLake => KBL_DMC_FIRMWARE,
+        // `dmc_firmware_default`'s Gen9-LP arms. No Gen9-LP display path
+        // loads it today (the DPIO PHY display is not programmed).
+        Gen9Platform::Broxton => crate::intel_gpu_dmc::BXT_DMC_FIRMWARE,
+        Gen9Platform::GeminiLake => crate::intel_gpu_dmc::GLK_DMC_FIRMWARE,
     }
 }
 
@@ -179,22 +195,35 @@ fn log_load_outcome(outcome: &Result<Gen9DmcLoaded, Gen9DmcLoadError>, family: G
 /// `assert_dmc_loaded` readback. Returns the CSS version and
 /// the program bitmask. No registry, no PM-core registration:
 /// the seam the fixture tests drive.
+#[cfg(any(test, feature = "kernel-test"))]
 pub fn load_from_bytes<M: MmioWindow + ?Sized>(
     mmio: &M,
     bytes: &[u8],
 ) -> Result<(u32, u8), Gen9DmcLoadError> {
-    let fw = parse_dmc_firmware_gen9(bytes, b'*', b'*').map_err(|error| match error {
-        // `parse_for` reports a main-less container as
-        // `NoMainProgram`; surface it as the load error of the
-        // same name instead of burying it under `Parse` —
-        // otherwise the `has_main()` gate below is unreachable
-        // (a successful parse always carries a main program)
-        // and callers cannot tell "no main program" from a
-        // malformed container. All other parse refusals stay
-        // `Parse`.
-        DmcError::NoMainProgram => Gen9DmcLoadError::NoMainProgram,
-        error => Gen9DmcLoadError::Parse(error),
-    })?;
+    load_from_bytes_max(mmio, bytes, crate::intel_gpu_dmc::SKL_DMC_MAX_FW_SIZE)
+}
+
+/// [`load_from_bytes`] under the platform's payload ceiling (Gemini Lake's
+/// is larger).
+pub fn load_from_bytes_max<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    bytes: &[u8],
+    max: usize,
+) -> Result<(u32, u8), Gen9DmcLoadError> {
+    let fw = crate::intel_gpu_dmc::parse_dmc_firmware_gen9_max(bytes, b'*', b'*', max).map_err(
+        |error| match error {
+            // `parse_for` reports a main-less container as
+            // `NoMainProgram`; surface it as the load error of the
+            // same name instead of burying it under `Parse` —
+            // otherwise the `has_main()` gate below is unreachable
+            // (a successful parse always carries a main program)
+            // and callers cannot tell "no main program" from a
+            // malformed container. All other parse refusals stay
+            // `Parse`.
+            DmcError::NoMainProgram => Gen9DmcLoadError::NoMainProgram,
+            error => Gen9DmcLoadError::Parse(error),
+        },
+    )?;
     if !fw.has_main() {
         return Err(Gen9DmcLoadError::NoMainProgram);
     }
@@ -249,7 +278,12 @@ fn load_for_display_inner<M: MmioWindow + ?Sized>(
         narf_firmware::FirmwareError::AuthorityRevoked => Gen9DmcLoadError::Revoked,
         error => Gen9DmcLoadError::Registry(error),
     })?;
-    let (version, programs) = load_from_bytes(mmio, view.bytes)?;
+    let max = if family == Gen9Platform::GeminiLake {
+        crate::intel_gpu_dmc::GLK_DMC_MAX_FW_SIZE
+    } else {
+        crate::intel_gpu_dmc::SKL_DMC_MAX_FW_SIZE
+    };
+    let (version, programs) = load_from_bytes_max(mmio, view.bytes, max)?;
     // The PM core reloads from the registered bytes at resume,
     // so the copy must outlive this call — the same shape as
     // i915 keeping the firmware in memory after init. Leaked
@@ -262,6 +296,7 @@ fn load_for_display_inner<M: MmioWindow + ?Sized>(
     let resident: &'static [u8] = alloc::boxed::Box::leak(owned.into_boxed_slice());
     let registered = register_dmc_firmware(resident).map_err(Gen9DmcLoadError::Register)?;
     debug_assert_eq!(registered, programs);
+    *GEN9_DMC_RESIDENT.lock() = Some((resident, max));
     Ok(Gen9DmcLoaded {
         name,
         version,
@@ -270,7 +305,7 @@ fn load_for_display_inner<M: MmioWindow + ?Sized>(
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::intel_gpu_dmc::{
         CSS_HEADER_BYTES, CSS_HEADER_VER, CSS_MODULE_TYPE_DMC, CSS_VERSION_OFFSET, DC_STATE_DEBUG,
@@ -340,8 +375,8 @@ mod tests {
     /// EVT_CTL/HTP pair first: on Gen12 that pair would be
     /// rewritten to VBLANK_DELAYED_A by the TGL fixup and then
     /// disabled at load; on Gen9 both must pass through
-    /// verbatim.
-    fn fixture_dmc_blob() -> Vec<u8> {
+    /// verbatim. (Also the program the Gen9 `DC_off` fixtures load.)
+    pub(crate) fn fixture_dmc_blob() -> Vec<u8> {
         let package_size = PACKAGE_HEADER_BYTES + PACKAGE_V1_MAX_ENTRIES * FW_INFO_BYTES;
         let mut blob = alloc::vec![0u8; CSS_HEADER_BYTES + package_size];
         put32(&mut blob, 0, CSS_MODULE_TYPE_DMC);

@@ -80,7 +80,17 @@ const FILTER: u64 = 0xc4038;
 enum HpdBank {
     Icp,
     Spt,
+    /// Gen9 LP, which has no PCH: `PCH_PORT_HOTPLUG` at the same 0xC4030
+    /// with the SPT layout, but the hotplug interrupts are the display
+    /// engine's `GEN8_DE_PORT_*` bits 3-5 (`hpd_bxt`, `bxt_hpd_irq_handler`).
+    Bxt,
 }
+
+/// `GEN8_DE_PORT_ISR` / `_IMR` / `_IIR` / `_IER`.
+const DE_PORT_ISR: u64 = 0x44440;
+const DE_PORT_IMR: u64 = 0x44444;
+const DE_PORT_IIR: u64 = 0x44448;
+const DE_PORT_IER: u64 = 0x4444c;
 
 /// `SHOTPLUG_CTL_TC` (ICP class): the Type-C hotplug pins' nibbles.
 const SHOTPLUG_TC: u64 = 0xc4034;
@@ -96,6 +106,9 @@ struct HpdPort {
     enable: u32,
     status: u32,
     long: u32,
+    /// The port's sense-inversion bit in `ctl` (Gen9 LP's
+    /// `BXT_DDI*_HPD_INVERT`; 0 elsewhere).
+    invert: u32,
 }
 
 /// ICP class, combo B: `SDE_DDI_HOTPLUG_ICP(HPD_PORT_B)`, `SHOTPLUG_CTL_DDI`
@@ -107,6 +120,7 @@ const ICP_B: HpdPort = HpdPort {
     enable: 0x80,
     status: 0x30,
     long: 0x20,
+    invert: 0,
 };
 /// ICP class, Rocket Lake TC1 (DDI D) with TGP (`tgl_hpd_pin`):
 /// `SDE_TC_HOTPLUG_ICP(HPD_PORT_TC1)`, `SHOTPLUG_CTL_TC` bits 3:0.
@@ -117,6 +131,7 @@ const ICP_TC1: HpdPort = HpdPort {
     enable: 0x8,
     status: 0x3,
     long: 0x2,
+    invert: 0,
 };
 /// ICP class, Rocket Lake TC2 (DDI E): `SHOTPLUG_CTL_TC` bits 7:4.
 const ICP_TC2: HpdPort = HpdPort {
@@ -126,6 +141,7 @@ const ICP_TC2: HpdPort = HpdPort {
     enable: 0x80,
     status: 0x30,
     long: 0x20,
+    invert: 0,
 };
 /// SPT class, port B: `SDE_PORTB_HOTPLUG_CPT`, `PCH_PORT_HOTPLUG` bits 4
 /// and 1:0.
@@ -136,6 +152,7 @@ const SPT_B: HpdPort = HpdPort {
     enable: 1 << 4,
     status: 0x3,
     long: 0x2,
+    invert: 0,
 };
 /// SPT class, Rocket Lake TC1 (DDI D) with CMP (`rkl_hpd_pin`:
 /// `HPD_PORT_C`): `SDE_PORTC_HOTPLUG_CPT`, bits 12 and 9:8.
@@ -146,6 +163,7 @@ const SPT_C: HpdPort = HpdPort {
     enable: 1 << 12,
     status: 0x300,
     long: 0x200,
+    invert: 0,
 };
 /// SPT class, Rocket Lake TC2 (DDI E) with CMP (`HPD_PORT_D`):
 /// `SDE_PORTD_HOTPLUG_CPT`, bits 20 and 17:16.
@@ -156,6 +174,29 @@ const SPT_D: HpdPort = HpdPort {
     enable: 1 << 20,
     status: 0x3_0000,
     long: 0x2_0000,
+    invert: 0,
+};
+
+/// Gen9 LP, port B: `GEN8_DE_PORT_HOTPLUG(HPD_PORT_B)` (bit 4),
+/// `PCH_PORT_HOTPLUG` bits 4 and 1:0.
+const BXT_B: HpdPort = HpdPort {
+    ddi: Ddi::B,
+    owned: 1 << 4,
+    ctl: SHOTPLUG,
+    enable: 1 << 4,
+    status: 0x3,
+    long: 0x2,
+    invert: 1 << 3,
+};
+/// Gen9 LP, port C: DE port bit 5, `PCH_PORT_HOTPLUG` bits 12 and 9:8.
+const BXT_C: HpdPort = HpdPort {
+    ddi: Ddi::C,
+    owned: 1 << 5,
+    ctl: SHOTPLUG,
+    enable: 1 << 12,
+    status: 0x300,
+    long: 0x200,
+    invert: 1 << 11,
 };
 
 impl HpdBank {
@@ -167,7 +208,15 @@ impl HpdBank {
             (Self::Icp, SHOTPLUG_TC) => 0x0033_3333,
             (Self::Icp, _) => 0x3333,
             // PORTB 1:0, PORTC 9:8, PORTD 17:16, PORTA 25:24.
-            (Self::Spt, _) => 0x0303_0303,
+            (Self::Spt | Self::Bxt, _) => 0x0303_0303,
+        }
+    }
+
+    /// The interrupt registers carrying the owned bits: (ISR, IMR, IIR, IER).
+    const fn irq(self) -> (u64, u64, u64, u64) {
+        match self {
+            Self::Icp | Self::Spt => (SDE_ISR, SDE_IMR, SDE_IIR, SDE_IER),
+            Self::Bxt => (DE_PORT_ISR, DE_PORT_IMR, DE_PORT_IIR, DE_PORT_IER),
         }
     }
 }
@@ -262,6 +311,9 @@ impl HpdProfile {
         if !matches!(self.family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. }) {
             return None;
         }
+        if self.bank() == HpdBank::Bxt {
+            return Some(GmbusPinTable::Bxt);
+        }
         match self.device & 0xff80 {
             0xa100 | 0x9d00 | 0xa280 | 0xa380 => Some(GmbusPinTable::Spt),
             0xa300 | 0x9d80 | 0x0280 | 0x0680 => Some(GmbusPinTable::Cnp),
@@ -282,13 +334,18 @@ impl HpdProfile {
         }
         Some(match self.bank() {
             HpdBank::Icp => GmbusPinTable::Icp,
-            HpdBank::Spt => GmbusPinTable::Cnp,
+            HpdBank::Spt | HpdBank::Bxt => GmbusPinTable::Cnp,
         })
     }
     /// The bank this profile's south display uses: the SPT layout for an
     /// SPT-class PCH (every Gen9 pairing, and Rocket Lake on CMP), the ICP
     /// layout otherwise.
     const fn bank(&self) -> HpdBank {
+        if let crate::intel_gpu_aux::SourceFamily::Gen9 { platform, .. } = self.family {
+            if platform.is_lp() {
+                return HpdBank::Bxt;
+            }
+        }
         match self.device & 0xff80 {
             0xa100 | 0x9d00 | 0xa280 | 0xa300 | 0x9d80 | 0x0280 | 0x0680 | 0xa380 => HpdBank::Spt,
             _ => HpdBank::Icp,
@@ -308,6 +365,8 @@ impl HpdProfile {
             (HpdBank::Icp, true) => &[ICP_B, ICP_TC1, ICP_TC2],
             (HpdBank::Spt, false) => &[SPT_B],
             (HpdBank::Spt, true) => &[SPT_B, SPT_C, SPT_D],
+            // Both of Gen9 LP's external DDIs.
+            (HpdBank::Bxt, _) => &[BXT_B, BXT_C],
         }
     }
     /// [`Self::from_observed`] for any source family ([`Self::for_source`]).
@@ -317,6 +376,19 @@ impl HpdProfile {
         devices: &[narf_bus::BusDevice],
     ) -> Option<Self> {
         use narf_bus::{BusAddr, BusKind};
+        // Gen9 LP has no PCH: the display engine is the hotplug source.
+        if matches!(
+            family,
+            crate::intel_gpu_aux::SourceFamily::Gen9 { platform, .. } if platform.is_lp()
+        ) {
+            return Some(Self {
+                family,
+                device: 0,
+                address: 0,
+                config: 0,
+                subsystem: (0, 0),
+            });
+        }
         let mut found = None;
         for pch in devices {
             let BusAddr::Pcie(addr) = pch.addr else {
@@ -435,6 +507,25 @@ impl HpdMonitor {
         }
         (sde, regs)
     }
+    /// The owned ports' invert bits in `reg` and the VBT's choice of them
+    /// (`bxt_hotplug_enables`), as (mask, value). Only Gen9 LP has any.
+    fn invert(&self, reg: u64) -> (u32, u32) {
+        let vbt = crate::intel_gpu_vbt::gen9_lp();
+        let mut mask = 0;
+        let mut value = 0;
+        for port in self.ports().iter().filter(|p| p.ctl == reg) {
+            mask |= port.invert;
+            let set = match port.ddi {
+                Ddi::B => vbt.hpd_invert_b,
+                Ddi::C => vbt.hpd_invert_c,
+                _ => false,
+            };
+            if set {
+                value |= port.invert;
+            }
+        }
+        (mask, value)
+    }
     fn qualify<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
         let Some(profile) = io.gen12_hpd_profile() else {
             if self.profile.is_some() {
@@ -460,27 +551,28 @@ impl HpdMonitor {
             return;
         }
         let bank = self.bank();
+        let (_, sde_imr, sde_iir, sde_ier) = bank.irq();
         let (owned, regs) = self.owned();
-        let ier = io.read32(SDE_IER);
-        let imr = io.read32(SDE_IMR);
+        let ier = io.read32(sde_ier);
+        let imr = io.read32(sde_imr);
         if !io.display_access_ok() {
             self.uncertain = true;
             return;
         }
         // Mask/readback first: inherited IMR may have this source unmasked
         // while its IER latch was disabled. Never transiently enable an IRQ.
-        io.write32(SDE_IMR, imr | owned);
-        let masked = io.read32(SDE_IMR);
+        io.write32(sde_imr, imr | owned);
+        let masked = io.read32(sde_imr);
         if !io.display_access_ok() || masked & owned != owned {
             self.uncertain = true;
             return;
         }
-        io.write32(SDE_IER, ier | owned);
+        io.write32(sde_ier, ier | owned);
         // Establish the first owned status incarnation. A stale orphan LONG
         // without IIR must not contaminate the first later SHORT. The source
         // setup RMW clears observed owned W1C status while enabling detection.
         // Preserve raw captured IIR before ACK so any partial setup is uncertain.
-        let inherited = io.read32(SDE_IIR);
+        let inherited = io.read32(sde_iir);
         if inherited == u32::MAX || !io.display_access_ok() {
             self.uncertain = true;
             return;
@@ -488,7 +580,7 @@ impl HpdMonitor {
         let captured = inherited & owned;
         self.pending |= captured;
         if captured != 0 {
-            io.write32(SDE_IIR, captured);
+            io.write32(sde_iir, captured);
         }
         for (reg, enable, status) in regs {
             if enable == 0 {
@@ -499,10 +591,16 @@ impl HpdMonitor {
                 self.uncertain = true;
                 return;
             }
-            io.write32(reg, (ctl & !bank.all_status(reg)) | (ctl & status) | enable);
+            // bxt_hpd_detection_setup: each owned port's invert bit is the
+            // VBT's (`intel_hpd_hotplug_mask` clears it with the enable).
+            let (invert_mask, invert) = self.invert(reg);
+            io.write32(
+                reg,
+                (ctl & !bank.all_status(reg) & !invert_mask) | (ctl & status) | enable | invert,
+            );
         }
-        let observed_ier = io.read32(SDE_IER);
-        let observed_imr = io.read32(SDE_IMR);
+        let observed_ier = io.read32(sde_ier);
+        let observed_imr = io.read32(sde_imr);
         let mut ok = io.display_access_ok()
             && observed_ier & owned == owned
             && observed_imr & owned == owned;
@@ -511,8 +609,10 @@ impl HpdMonitor {
                 continue;
             }
             let observed_ctl = io.read32(reg);
+            let (invert_mask, invert) = self.invert(reg);
             ok &= observed_ctl != u32::MAX
                 && observed_ctl & enable == enable
+                && observed_ctl & invert_mask == invert
                 && observed_ctl & status == 0;
         }
         if !ok || !io.display_access_ok() {
@@ -528,6 +628,7 @@ impl HpdMonitor {
             return None;
         }
         let bank = self.bank();
+        let (sde_isr, _, sde_iir, _) = bank.irq();
         let ports = self.ports();
         let (owned, _) = self.owned();
         if !self.initialized {
@@ -536,8 +637,8 @@ impl HpdMonitor {
                 return None;
             }
         }
-        let levels = io.read32(SDE_ISR);
-        let edges = io.read32(SDE_IIR);
+        let levels = io.read32(sde_isr);
+        let edges = io.read32(sde_iir);
         if levels == u32::MAX || edges == u32::MAX || !io.display_access_ok() {
             self.uncertain = true;
             return None;
@@ -545,7 +646,7 @@ impl HpdMonitor {
         let captured = edges & owned;
         self.pending |= captured; // retain before the first owned W1C
         if captured != 0 {
-            io.write32(SDE_IIR, captured); // source ACK order: south IIR before SHOTPLUG
+            io.write32(sde_iir, captured); // source ACK order: IIR before SHOTPLUG
             for reg in CTL_REGS {
                 let in_reg = || {
                     ports
@@ -609,7 +710,15 @@ static HPD_MONITOR: IrqSafeSpinLock<HpdMonitor> = IrqSafeSpinLock::new(HpdMonito
 /// Poll the shared HPD monitor once (production entry point;
 /// see `intel_gpu::poll_dp_hpd_events`).
 pub fn poll_hpd_event<M: MmioWindow + ?Sized>(mmio: &M) -> Option<HpdEvent> {
-    HPD_MONITOR.lock().poll(mmio)
+    // Gen9: the hotplug poll runs with DC states exited (stricter than
+    // Linux, whose hotplug handler takes no power domain); a refused exit
+    // reports no event. Inert elsewhere.
+    let dc =
+        crate::intel_gpu_gen9_dc_states::acquire(crate::intel_gpu_gen9_dc_states::Gen9DcUser::Hpd)
+            .ok()?;
+    let event = HPD_MONITOR.lock().poll(mmio);
+    drop(dc);
+    event
 }
 pub(crate) fn hpd_uncertain() -> bool {
     HPD_MONITOR.lock().uncertain()
@@ -618,7 +727,14 @@ pub(crate) fn hpd_uncertain() -> bool {
 /// Enable the shared monitor's source latches while keeping its owned SDE
 /// sources masked. This poll-only owner does not claim an IRQ consumer.
 pub fn enable_hpd_interrupts<M: MmioWindow + ?Sized>(mmio: &M) {
-    HPD_MONITOR.lock().enable_interrupts(mmio)
+    // Gen9: as `poll_hpd_event`; a refused DC exit enables nothing.
+    let Ok(dc) =
+        crate::intel_gpu_gen9_dc_states::acquire(crate::intel_gpu_gen9_dc_states::Gen9DcUser::Hpd)
+    else {
+        return;
+    };
+    HPD_MONITOR.lock().enable_interrupts(mmio);
+    drop(dc);
 }
 
 /// The Intel Gen12 source envelope negotiation runs against:
@@ -2632,6 +2748,156 @@ pub mod tests {
         "drivers/gpu/intel_gpu_dp",
         smoke_hpd_rkl_owns_tc1_tc2_on_either_pch
     );
+
+    /// Gen9 LP hotplug in the display engine: `GEN8_DE_PORT_*` bits 4/5,
+    /// `PCH_PORT_HOTPLUG`'s SPT fields for ports B and C, no south display
+    /// registers touched.
+    struct DePortHpd {
+        profile: HpdProfile,
+        level: core::cell::Cell<u32>,
+        iir: core::cell::Cell<u32>,
+        regs: core::cell::RefCell<alloc::collections::BTreeMap<u64, u32>>,
+        writes: core::cell::RefCell<Vec<(u64, u32)>>,
+    }
+    impl MmioWindow for DePortHpd {
+        fn gen12_hpd_profile(&self) -> Option<HpdProfile> {
+            Some(self.profile)
+        }
+        fn read32(&self, off: u64) -> u32 {
+            match off {
+                super::DE_PORT_ISR => self.level.get(),
+                super::DE_PORT_IIR => self.iir.get(),
+                _ => *self.regs.borrow().get(&off).unwrap_or(&0),
+            }
+        }
+        fn write32(&self, off: u64, val: u32) {
+            self.writes.borrow_mut().push((off, val));
+            match off {
+                super::DE_PORT_IIR => self.iir.set(self.iir.get() & !val),
+                super::SHOTPLUG => {
+                    let w1c = HpdBank::Bxt.all_status(off);
+                    let old = *self.regs.borrow().get(&off).unwrap_or(&0);
+                    self.regs
+                        .borrow_mut()
+                        .insert(off, (val & !w1c) | (old & w1c & !val));
+                }
+                _ => {
+                    self.regs.borrow_mut().insert(off, val);
+                }
+            }
+        }
+    }
+
+    fn smoke_hpd_gen9_lp_de_port_bank() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gmbus::{gen9_ddc_pin, GmbusPinTable, PinPair};
+        use crate::intel_gpu_gt::Gen9Platform;
+        let family = SourceFamily::Gen9 {
+            platform: Gen9Platform::Broxton,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        let Some(profile) = HpdProfile::observed_for_source(family, 0, &[]) else {
+            return TestResult::Fail("Gen9 LP needs no PCH for its hotplug profile");
+        };
+        if profile.bank() != HpdBank::Bxt
+            || profile.gen9_gmbus_table() != Some(GmbusPinTable::Bxt)
+            || gen9_ddc_pin(GmbusPinTable::Bxt, Ddi::B) != Some(PinPair::Pin1Bxt)
+            || gen9_ddc_pin(GmbusPinTable::Bxt, Ddi::C) != Some(PinPair::Pin2Bxt)
+            || gen9_ddc_pin(GmbusPinTable::Bxt, Ddi::A).is_some()
+        {
+            return TestResult::Fail("Gen9 LP bank and bxt_port_to_ddc_pin");
+        }
+        let io = DePortHpd {
+            profile,
+            level: Default::default(),
+            iir: Default::default(),
+            regs: Default::default(),
+            writes: Default::default(),
+        };
+        let mut monitor = HpdMonitor::new();
+        let enables = 1 << 4 | 1 << 12;
+        if monitor.poll(&io).is_some()
+            || io.read32(super::DE_PORT_IMR) & 0x30 != 0x30
+            || io.read32(super::DE_PORT_IER) & 0x30 != 0x30
+            || io.read32(super::SHOTPLUG) & enables != enables
+            || io
+                .writes
+                .borrow()
+                .iter()
+                .any(|(o, _)| (SDE_ISR..=SDE_IER).contains(o))
+        {
+            return TestResult::Fail("Gen9 LP arms DE port bits 4/5 and ports B/C");
+        }
+        io.level.set(1 << 5);
+        if monitor.poll(&io) != Some(HpdEvent::Connected(Ddi::C)) {
+            return TestResult::Fail("DE port bit 5 connects DDI C");
+        }
+        // Unplug C (long pulse) beside a foreign short pulse on B.
+        io.level.set(0);
+        io.iir.set(1 << 5);
+        io.regs
+            .borrow_mut()
+            .insert(super::SHOTPLUG, enables | 0x200 | 0x1);
+        io.writes.borrow_mut().clear();
+        if monitor.poll(&io) != Some(HpdEvent::Disconnected(Ddi::C)) {
+            return TestResult::Fail("port C's long pulse disconnects DDI C");
+        }
+        let acks: Vec<u32> = io
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(o, _)| *o == super::SHOTPLUG)
+            .map(|(_, v)| *v)
+            .collect();
+        if acks != [enables | 0x200]
+            || io.read32(super::SHOTPLUG) != enables | 0x1
+            || io.iir.get() != 0
+        {
+            return TestResult::Fail("the ACK clears C's status and keeps B's");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_gen9_lp_de_port_bank);
+
+    /// `bxt_hpd_detection_setup`: the VBT's invert bits replace firmware's.
+    /// Firmware left DDI B inverted; the VBT inverts only DDI C.
+    fn smoke_hpd_gen9_lp_vbt_invert() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gt::Gen9Platform;
+        use crate::intel_gpu_vbt::{install_gen9_lp_for_test, Gen9LpVbt};
+        let family = SourceFamily::Gen9 {
+            platform: Gen9Platform::GeminiLake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        let Some(profile) = HpdProfile::observed_for_source(family, 0, &[]) else {
+            return TestResult::Fail("Gemini Lake hotplug profile");
+        };
+        let io = DePortHpd {
+            profile,
+            level: Default::default(),
+            iir: Default::default(),
+            regs: Default::default(),
+            writes: Default::default(),
+        };
+        io.regs.borrow_mut().insert(super::SHOTPLUG, 1 << 3);
+        install_gen9_lp_for_test(Gen9LpVbt {
+            hpd_invert_b: false,
+            hpd_invert_c: true,
+            backlight_controller: 0,
+        });
+        let mut monitor = HpdMonitor::new();
+        let _ = monitor.poll(&io);
+        install_gen9_lp_for_test(Gen9LpVbt::default());
+        let ctl = io.read32(super::SHOTPLUG);
+        if monitor.uncertain()
+            || ctl & ((1 << 3) | (1 << 11)) != 1 << 11
+            || ctl & ((1 << 4) | (1 << 12)) != (1 << 4) | (1 << 12)
+        {
+            return TestResult::Fail("VBT invert bits replace firmware's");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_gen9_lp_vbt_invert);
 
     /// A power-well block whose STATE bits follow REQUEST in the driver
     /// AUX and DDI request registers.

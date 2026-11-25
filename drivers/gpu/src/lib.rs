@@ -791,6 +791,14 @@ pub mod intel_gpu_audio;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_bxt_cdclk;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_bxt_display;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_bxt_dpll;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_bxt_phy;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ccs_control;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_color;
@@ -927,6 +935,8 @@ pub(crate) mod intel_gpu_legacy_gt;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_legacy_owner;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_legacy_power;
+#[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_lt_phy;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_media;
@@ -962,6 +972,8 @@ pub(crate) mod intel_gpu_pmdemand;
 pub mod intel_gpu_power_controls;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ppgtt;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_prime;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_psr;
 #[cfg(feature = "intel")]
@@ -1044,6 +1056,15 @@ pub mod intel_gpu_xelpg_scaler;
 pub mod intel_gpu_xelpg_tc;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_xelpg_wm;
+/// Intel HDCP 1.4 / 2.2 content protection (`narf.intel.hdcp=1`).
+#[cfg(feature = "intel")]
+pub mod intel_hdcp;
+#[cfg(feature = "intel")]
+pub mod intel_hdcp_live;
+#[cfg(feature = "intel")]
+pub mod intel_hdcp_msg;
+#[cfg(feature = "intel")]
+pub mod intel_hdcp_shim;
 pub mod qxl;
 pub mod scanout_access;
 pub mod vmware_svga;

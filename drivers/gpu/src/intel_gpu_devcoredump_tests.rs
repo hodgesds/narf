@@ -62,8 +62,7 @@ fn report() -> Report {
             now_ns: 90,
             state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
             engines: EngineSet::of(&[Engine::Rcs0, Engine::Bcs8]),
-            process_name: None,
-            pid: None,
+            process: None,
             snapshot_time: None,
         },
         super::super::Contexts::new(0),
@@ -812,8 +811,7 @@ fn smoke_coredump_xe_text_section_queue_job_engine_and_bounds() -> TestResult {
         batches,
         batch_count: 1,
         wq: None,
-        comm: None,
-        pid: None,
+        process: None,
         snapshot_time: None,
     };
     let index = free_slot();
@@ -968,8 +966,7 @@ fn smoke_coredump_process_and_snapshot_time_formatting() -> TestResult {
         batches: [0; capture::QUEUE_LANES],
         batch_count: 0,
         wq: None,
-        comm: None,
-        pid: None,
+        process: None,
         snapshot_time: None,
     }
     .with_process("render_app", 4321)
@@ -1005,8 +1002,7 @@ fn smoke_coredump_process_and_snapshot_time_formatting() -> TestResult {
         batches: [0; capture::QUEUE_LANES],
         batch_count: 0,
         wq: None,
-        comm: None,
-        pid: None,
+        process: None,
         snapshot_time: None,
     };
 

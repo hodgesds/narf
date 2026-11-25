@@ -1255,6 +1255,21 @@ pub struct Card {
     /// Each dumb BO's GEM_METADATA tiling flags and GFX12_DCC creation flag
     /// (amdgpu_bo_get_tiling_flags), by handle; a BO not listed has none.
     pub bo_tiling: Vec<(u32, u64, bool)>,
+    /// Connectors carrying "Content Protection" (and "HDCP Content Type")
+    /// (`drm_connector_attach_content_protection_property`). Empty unless
+    /// a driver attached them.
+    pub content_protection: Vec<ContentProtection>,
+}
+
+/// A connector's "Content Protection" uAPI value
+/// (`DRM_MODE_CONTENT_PROTECTION_*`: 0 Undesired, 1 Desired, 2 Enabled)
+/// and its "HDCP Content Type" (0 Type0, 1 Type1) when that property is
+/// attached too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentProtection {
+    pub connector: u32,
+    pub value: u8,
+    pub content_type: Option<u8>,
 }
 
 /// drm_plane_state's blending and orientation as amdgpu_dm attaches them:
@@ -1517,6 +1532,7 @@ impl Card {
             overlay_formats: None,
             gfx12_modifiers: false,
             bo_tiling: Vec::new(),
+            content_protection: Vec::new(),
         }
     }
     /// The rectangles the last atomic commit of CRTC `crtc`'s synthesized
@@ -1597,6 +1613,13 @@ impl Card {
     /// The native sink data of a connector, if a driver published it.
     pub fn native_output(&self, connector: u32) -> Option<&NativeOutput> {
         self.native.iter().find(|n| n.connector == connector)
+    }
+
+    /// The connector's content protection properties, when attached.
+    pub fn content_protection(&self, connector: u32) -> Option<&ContentProtection> {
+        self.content_protection
+            .iter()
+            .find(|c| c.connector == connector)
     }
 
     // ── DRM master arbitration ────────────────────────────────────────
@@ -2838,7 +2861,9 @@ impl Card {
         }
         // On integrated GPUs VRAM pages have no display-DMA backing here;
         // discrete Arc display (`intel_vram_scanout`) scans directly from VRAM.
-        if object.is_vram() && !self.intel_vram_scanout {
+        // A foreign dma-buf import (another card's memory or BAR) is not
+        // scanned out here.
+        if (object.is_vram() && !self.intel_vram_scanout) || object.is_imported() {
             return Err(CardError::InvalidDimensions);
         }
         if xe && !xr30 && !object.scanout() {
@@ -2882,6 +2907,13 @@ impl Card {
             cmd.height
         };
         if u64::from(pitch) * u64::from(height) > object.size() {
+            return Err(CardError::InvalidDimensions);
+        }
+        // A PXP-protected object (xe_bo_is_protected; only with
+        // narf.intel.pxp=1): NARF programs no plane decryption, so it never
+        // becomes a framebuffer. Linux decrypts it, or shows black once its
+        // key is stale.
+        if object.pxp_key() != 0 {
             return Err(CardError::InvalidDimensions);
         }
         if self.framebuffers.len() >= 4096 {

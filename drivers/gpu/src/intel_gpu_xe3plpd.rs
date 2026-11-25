@@ -10,9 +10,35 @@
 //! linear horizontal reflection is allowed while Tile4 reflection is not,
 //! semiplanar YUV restores vertical 2x subsampling, and the four Display-35
 //! underrun latches have exact decode/write-one-to-clear images.
+//!
+//! ## Owned modeset
+//!
+//! [`modeset`] and [`takeover`] run the display-14 orchestrator
+//! (`intel_gpu_modeset_xelpg`) dispatched on
+//! [`crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS`] over [`View`]: the
+//! Pipe-A eDP on port A, with its port PLL, transmitters and signal levels on
+//! the LT PHY (`intel_lt_phy_pll_enable`, `intel_lt_phy_set_signal_levels`)
+//! and the display-35 CDCLK, DBUF and watermark owners (Linux 7.4-rc4). A
+//! CMTG left armed by firmware is refused, as is a primary the modeset cannot
+//! scan out unchanged. Nothing here has run on silicon.
+//!
+//! After a successful [`probe_takeover`] the probe moves the console to an
+//! owned surface and installs the KMS owner over [`View`]. System suspend
+//! then turns the panel's crtc off through [`panel_orchestrator`]
+//! (`drm_atomic_helper_suspend`, `intel_lt_phy_pll_disable`), and resume runs
+//! [`relight`]: the sequencer delays [`record_panel_delays`] kept, then the
+//! cold panel-on through the LT PHY (`xe_display_pm_resume`).
+//!
+//! The KMS install also creates the display-35 DC service
+//! (`intel_gpu_dc_states`, `DmcPlatform::Xe3pLpd`): `xe3p_lpd_dmc.bin`
+//! loaded after the GT publication and reloaded after resume, DC6 between
+//! display conversations, and a `DC_off` reference around every AUX
+//! transfer and LT PHY transaction on [`View`].
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
+use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::{intel_gpu_pipes::Pipe, intel_gpu_xelpg_wm::Tiling};
 
 /// Firmware's origin-aligned, opaque linear primary, observed before GT reset.
@@ -445,6 +471,262 @@ pub(crate) const fn bandwidth_profile(raw: u32) -> Result<BandwidthProfile, Band
     })
 }
 
+// ── Owned modeset ────────────────────────────────────────────────
+
+/// `TRANS_CMTG_CTL(TRANSCODER_A)` and its `CMTG_ENABLE`.
+const TRANS_CMTG_CTL_A: u64 = 0x6fa88;
+const CMTG_ENABLE: u32 = 1 << 31;
+/// `TRANS_DDI_FUNC_CTL2(TRANSCODER_A)` and its `CMTG_SECONDARY_MODE`.
+const TRANS_DDI_FUNC_CTL2_A: u64 = 0x60404;
+const CMTG_SECONDARY_MODE: u32 = 1 << 3;
+
+/// The display-35 register view of the owned modeset. DDI A and B's PHY and
+/// AUX registers move into the PICA block as on display 20 and 30
+/// (`__xe2lpd_port_idx`, [`crate::intel_gpu_xe3lpd::pica_port_reg`]), and the
+/// platform's LT PHY (`HAS_LT_PHY`) is behind every port, so no Cx0
+/// sequence takes it. Wa_15015404425's read flush is Lunar Lake's and early
+/// Panther Lake's only. Construct it only for the exact Nova Lake-S route.
+pub(crate) struct View<'a, M: MmioWindow + ?Sized>(pub(crate) &'a M);
+
+impl<M: MmioWindow + ?Sized> MmioWindow for View<'_, M> {
+    fn display_access_ok(&self) -> bool {
+        self.0.display_access_ok()
+    }
+    fn has_lt_phy(&self) -> bool {
+        true
+    }
+    fn read32(&self, off: u64) -> u32 {
+        self.0
+            .read32(crate::intel_gpu_xe3lpd::pica_port_reg(off).unwrap_or(off))
+    }
+    fn write32(&self, off: u64, val: u32) {
+        self.0.write32(
+            crate::intel_gpu_xe3lpd::pica_port_reg(off).unwrap_or(off),
+            val,
+        )
+    }
+}
+
+/// The owned modeset's read-only admission: an LT-PHY view, display 35.00,
+/// and no CMTG on transcoder A. `intel_cmtg_sanitize` retires a firmware
+/// CMTG, and needs a modeset when the transcoder is its secondary; this
+/// route refuses an armed one and leaves the firmware display as it is.
+fn admit(mmio: &(impl MmioWindow + ?Sized)) -> Result<(), ModesetError> {
+    use crate::intel_gpu_xe2lpd::DisplayIp;
+    if !mmio.has_lt_phy() || mmio.cx0_xe3() {
+        return Err(ModesetError::UnsupportedGeneration);
+    }
+    if DisplayIp::read_all(mmio) != Ok(DisplayIp::NovaLakeS) {
+        return Err(ModesetError::UnsupportedGeneration);
+    }
+    let cmtg = mmio.read32(TRANS_CMTG_CTL_A);
+    let ctl2 = mmio.read32(TRANS_DDI_FUNC_CTL2_A);
+    if cmtg == u32::MAX || ctl2 == u32::MAX || !mmio.display_access_ok() {
+        return Err(ModesetError::PipelineStopUnavailable);
+    }
+    if cmtg & CMTG_ENABLE != 0 || ctl2 & CMTG_SECONDARY_MODE != 0 {
+        return Err(ModesetError::DisplayResourceUnavailable);
+    }
+    Ok(())
+}
+
+fn orchestrator<M: MmioWindow + ?Sized>(
+    mmio: &M,
+) -> crate::intel_gpu_modeset_xelpg::XeLpgModeset<'_, M> {
+    crate::intel_gpu_modeset_xelpg::XeLpgModeset::new(mmio, crate::intel_gpu_xelpg::XeLpgPort::A)
+        .with_display_ip(crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS)
+}
+
+/// The display-35 owned Pipe-A eDP modeset at `mode`, or at the panel's
+/// EDID preferred mode without one. `mmio` must be a [`View`].
+pub(crate) fn modeset<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    fb: &Framebuffer,
+    mode: Option<&Mode>,
+) -> Result<Mode, ModesetError> {
+    admit(mmio)?;
+    let mut ms = orchestrator(mmio);
+    match mode {
+        Some(mode) => ms.modeset_fixed(fb, mode),
+        None => ms.modeset(fb, None),
+    }
+}
+
+/// The boot option requesting the owned display-35 modeset on top of the
+/// firmware route ([`crate::intel_gpu_lt_phy::OPT_IN`]).
+pub(crate) const MODESET_OPT_IN: &str = "narf.intel.nvl_modeset";
+
+/// `narf.intel.nvl_modeset=1`, with the strict grammar of Intel's other
+/// destructive route gates.
+pub(crate) fn modeset_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, MODESET_OPT_IN)
+}
+
+/// Why the probe kept the firmware display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakeoverRefusal {
+    /// No VBT in the ACPI OpRegion: port A's output type is unknown.
+    NoVbt,
+    /// The VBT gives port A no eDP output (a desktop board may route a DP
+    /// connector there); the orchestrator drives only an eDP panel.
+    PortANotEdp,
+    /// [`takeover`] refused or failed.
+    Modeset(ModesetError),
+    /// Memory decode with bus mastering, or the BAR0 mapping, was refused.
+    PciAccess,
+}
+
+/// The probe's owned route on the Nova Lake-S function the firmware route
+/// proved lit: BAR0 decoded with bus mastering, [`take_over_for_probe`] over
+/// the function's window with the ACPI OpRegion's VBT, then the panel's
+/// sequencer delays kept for the resume relight ([`record_panel_delays`]).
+pub(crate) fn probe_takeover(
+    device: &narf_bus::BusDevice,
+    cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    primary: &FirmwarePrimary,
+) -> Result<Mode, TakeoverRefusal> {
+    use narf_bus::pci::{self, cmd};
+    pci::set_command(
+        cap,
+        device,
+        cmd::MEM_SPACE | cmd::BUS_MASTER | cmd::INTX_DISABLE,
+    )
+    .map_err(|_| TakeoverRefusal::PciAccess)?;
+    // SAFETY: the PCI probe grants exclusive ownership of this function's
+    // BAR0; an identical later mapping reuses the same typed VA.
+    let bar =
+        unsafe { narf_bus::bar::map_bar(device, 0) }.map_err(|_| TakeoverRefusal::PciAccess)?;
+    let asls = pci::read_config32(cap, device, crate::intel_gpu_vbt::ASLS).ok();
+    let window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, *cap);
+    let mode = take_over_for_probe(&window, primary, asls)?;
+    record_panel_delays(&window);
+    Ok(mode)
+}
+
+/// The probe's owned-modeset step. Port A must be the VBT's eDP output
+/// (`intel_dp_is_port_edp`): the orchestrator sequences the panel's PPS,
+/// takes the eDP link rates and the LT PHY's eDP signal table. Then
+/// [`takeover`] over `io`, the function's BAR window.
+pub(crate) fn take_over_for_probe(
+    io: &(impl MmioWindow + ?Sized),
+    primary: &FirmwarePrimary,
+    asls: Option<u32>,
+) -> Result<Mode, TakeoverRefusal> {
+    use crate::intel_gpu_vbt::{discover, port, VbtPlatform};
+    let (vbt, _) = asls.and_then(discover).ok_or(TakeoverRefusal::NoVbt)?;
+    // Display 35 takes `xelpd_port_mapping`, as Meteor Lake does.
+    if !vbt
+        .encoder(VbtPlatform::MeteorLake, port::A)
+        .is_some_and(|encoder| encoder.edp)
+    {
+        return Err(TakeoverRefusal::PortANotEdp);
+    }
+    takeover(&View(io), primary).map_err(TakeoverRefusal::Modeset)
+}
+
+/// Take over the firmware primary in place: the owned modeset at the panel's
+/// EDID preferred mode, scanning out the firmware surface unchanged. A
+/// preferred mode of another size, or a primary the owned plane cannot
+/// describe (only XR24 is), is refused after the AUX read and before any
+/// other write; the fixed-mode route then keeps the firmware display.
+pub(crate) fn takeover<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    primary: &FirmwarePrimary,
+) -> Result<Mode, ModesetError> {
+    admit(mmio)?;
+    if primary.format != crate::drm::card::PixelFormat::Xrgb8888 {
+        return Err(ModesetError::InvalidFramebuffer);
+    }
+    let fb = Framebuffer {
+        phys_addr: u64::from(primary.gtt_offset),
+        stride_bytes: primary.geometry.pitch,
+        format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+    };
+    let mut ms = orchestrator(mmio);
+    let mode = ms.preferred_mode()?;
+    if (u32::from(mode.h_active), u32::from(mode.v_active))
+        != (primary.geometry.width, primary.geometry.height)
+    {
+        return Err(ModesetError::InvalidFramebuffer);
+    }
+    ms.modeset_fixed(&fb, &mode)
+}
+
+// ── System suspend and resume of the owned panel ─────────────────
+
+/// The panel's power-sequencer delays as the owned route found them at
+/// probe. `pps_init_delays` reads the firmware-programmed `PP_ON_DELAYS`,
+/// `PP_OFF_DELAYS` and the `PP_CONTROL` cycle field once and keeps them for
+/// every later `pps_init_registers`, the resume one included.
+static PANEL_DELAYS: narf_lib::sync::IrqSafeSpinLock<Option<crate::intel_gpu_edp::PanelDelays>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Read and keep the lit panel's sequencer delays (read-only). The owned
+/// route's probe calls this after a successful [`takeover`].
+pub(crate) fn record_panel_delays(
+    io: &(impl MmioWindow + ?Sized),
+) -> crate::intel_gpu_edp::PanelDelays {
+    let delays = crate::intel_gpu_edp::PanelPowerSequencer::new(&View(io)).delays();
+    *PANEL_DELAYS.lock() = Some(delays);
+    delays
+}
+
+/// The delays [`record_panel_delays`] kept; `None` before the owned route ran.
+pub(crate) fn panel_delays() -> Option<crate::intel_gpu_edp::PanelDelays> {
+    *PANEL_DELAYS.lock()
+}
+
+/// The orchestrator the KMS owner turns the panel off and on with, over
+/// `mmio` (a [`View`]): the Pipe-A eDP on port A, dispatched on display 35.
+pub(crate) fn panel_orchestrator<M: MmioWindow + ?Sized>(
+    mmio: &M,
+) -> crate::intel_gpu_modeset_xelpg::XeLpgModeset<'_, M> {
+    orchestrator(mmio)
+}
+
+/// Why the resume relight of the owned panel refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelightRefusal {
+    /// No panel-off record names port A: this driver did not turn the
+    /// panel's crtc off before suspend (`drm_atomic_helper_suspend`), so the
+    /// only modeset left would be the warm one, which needs the DDI that
+    /// system suspend powered down. Nothing was written.
+    PanelNotOff,
+    /// The admission or the panel-on modeset refused or failed.
+    Modeset(ModesetError),
+}
+
+/// The system-resume relight of the owned panel at `mode`, scanning out
+/// `fb`. `xe_display_pm_resume` runs `drm_mode_config_reset`, whose
+/// `intel_ddi_encoder_reset` reprograms the power sequencer
+/// (`intel_pps_encoder_reset`: `pps_init_registers` with the delays kept at
+/// probe), and `__intel_display_driver_resume` then commits the crtc state
+/// saved at suspend: here the panel-on modeset of a panel this driver turned
+/// off, through the LT PHY (`intel_lt_phy_pll_enable`). Admitted read-only
+/// as [`modeset`] is, and refused before any write unless the panel-off
+/// record of port A exists. `mmio` must be a [`View`].
+pub(crate) fn relight<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    fb: &Framebuffer,
+    mode: &Mode,
+    delays: crate::intel_gpu_edp::PanelDelays,
+) -> Result<Mode, RelightRefusal> {
+    admit(mmio).map_err(RelightRefusal::Modeset)?;
+    if crate::intel_gpu_modeset_xelpg::panel_off_record()
+        .is_none_or(|off| off.port != crate::intel_gpu_xelpg::XeLpgPort::A)
+    {
+        return Err(RelightRefusal::PanelNotOff);
+    }
+    crate::intel_gpu_edp::PanelPowerSequencer::with_delays(mmio, delays).init_registers();
+    orchestrator(mmio)
+        .modeset_fixed(fb, mode)
+        .map_err(RelightRefusal::Modeset)
+}
+
+#[cfg(feature = "kernel-test")]
+#[path = "intel_gpu_xe3plpd_modeset_tests.rs"]
+mod modeset_tests;
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
@@ -637,5 +919,233 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xe3plpd",
         smoke_nvl_display35_core_and_color_capabilities
+    );
+
+    use crate::intel_gpu_xe2lpd::DisplayIp;
+    use crate::intel_gpu_xelpg_cdclk::{self as cdclk, Current, Step};
+    use crate::intel_gpu_xelpg_resources as res;
+    use crate::intel_gpu_xelpg_wm::{self as wm, Latency};
+
+    /// A register file that only answers reads.
+    struct Regs(alloc::collections::BTreeMap<u64, u32>);
+    impl crate::intel_gpu_aux::MmioWindow for Regs {
+        fn read32(&self, off: u64) -> u32 {
+            self.0.get(&off).copied().unwrap_or(0)
+        }
+        fn write32(&self, _: u64, _: u32) {}
+    }
+
+    /// 35.00 is admitted only by the widened decoder; it shares every
+    /// display-30 branch and takes the `xe3p_lpd_cdclk_table`.
+    fn smoke_nvl_display35_ip_dispatch() -> TestResult {
+        let gmd = 35 << 22;
+        assert_eq!(DisplayIp::decode_all(gmd), Ok(DisplayIp::NovaLakeS));
+        assert!(DisplayIp::decode(gmd).is_err());
+        let ip = DisplayIp::NovaLakeS;
+        assert_eq!(ip.ver(), 35);
+        assert!(ip.is_display30() && ip.is_display35() && ip.xe2_plus());
+        assert!(!DisplayIp::Xe3Lpd.is_display35());
+        assert_eq!(ip.pipe_count(), 4);
+        assert_eq!(cdclk::max_cdclk_khz(ip), 787_200);
+        assert_eq!(cdclk::voltage_level_ip(ip, 787_200), 0);
+        for khz in [0, 151_200, 300_000, 787_200] {
+            assert_eq!(
+                cdclk::calc_cdclk_ip(ip, khz),
+                cdclk::calc_nova_lake_cdclk(khz)
+            );
+        }
+        assert_eq!(cdclk::calc_cdclk_ip(ip, 787_201), None);
+        let low = cdclk::calc_cdclk_ip(ip, 0).unwrap();
+        assert_eq!(
+            (low.cdclk_khz, low.ratio, low.waveform),
+            (151_200, 21, 0xa4a4)
+        );
+        assert_eq!(
+            cdclk::ctl_value_ip(ip, low),
+            crate::intel_gpu_xe2lpd::MDCLK_SOURCE_SEL_CDCLK_PLL
+        );
+        // Wa_13012396614 covers 35.00: CD2XCLK before the PLL disable.
+        let unknown = Current {
+            known: None,
+            pll: 0x8000_0022,
+            squash: 0,
+            ctl: 0x0200_0517,
+            actual_khz: 652_800,
+        };
+        assert_eq!(
+            cdclk::plan_ip(ip, &unknown, low),
+            alloc::vec![
+                Step::MdclkCd2x,
+                Step::PllDisable,
+                Step::PllEnable { ratio: 21 },
+                Step::Squash { waveform: 0xa4a4 },
+                Step::Ctl { value: 1 << 25 },
+            ]
+        );
+        assert_eq!(
+            crate::intel_gpu_pmdemand::Layout::for_ip(ip),
+            crate::intel_gpu_pmdemand::Layout::Xe3
+        );
+        assert_eq!(
+            crate::intel_gpu_xe3lpd::parent(ip, crate::intel_gpu_xe3lpd::Well::PwB),
+            Some(crate::intel_gpu_xe3lpd::Well::Pw1)
+        );
+        assert!(crate::intel_gpu_xe3lpd::dc_off_domains(ip)
+            .contains(&crate::intel_gpu_xe3lpd::Domain::Aux));
+        // External routes take LT port B and TC1/TC2; port A is the panel's
+        // and Nova Lake-S has no TC3/TC4.
+        use crate::intel_gpu_xelpg::XeLpgPort;
+        let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_ip(ip);
+        for (port, admitted) in [
+            (XeLpgPort::A, false),
+            (XeLpgPort::B, true),
+            (XeLpgPort::Tc1, true),
+            (XeLpgPort::Tc2, true),
+            (XeLpgPort::Tc3, false),
+            (XeLpgPort::Tc4, false),
+        ] {
+            assert_eq!(profile.admits_port(port), admitted, "{port:?}");
+        }
+        assert!(!profile.c20_port_b());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_ip_dispatch
+    );
+
+    /// `narf.intel.nvl_modeset=1` is its own strict option: the firmware
+    /// route's option does not request it.
+    fn smoke_nvl_modeset_opt_in_grammar() -> TestResult {
+        use narf_boot::args::KernelCmdline;
+        assert!(modeset_requested(KernelCmdline::new(
+            "quiet narf.intel.nvl_display=1 narf.intel.nvl_modeset=1"
+        )));
+        for line in [
+            "",
+            "narf.intel.nvl_display=1",
+            "narf.intel.nvl_modeset",
+            "narf.intel.nvl_modeset=0",
+            "narf.intel.nvl_modeset=01",
+            "-- narf.intel.nvl_modeset=1",
+            "narf.intel.nvl_modeset=1 narf.intel.nvl_modeset=1",
+        ] {
+            assert!(!modeset_requested(KernelCmdline::new(line)), "{line}");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_modeset_opt_in_grammar
+    );
+
+    /// Display 35 reads its latencies without the reported level 0, and its
+    /// QGV decode takes Wa_16030862157 and refuses ECC that costs display
+    /// bandwidth; display 30 keeps the raw level 0 and the 8-channel cap.
+    fn smoke_nvl_display35_latency_and_qgv() -> TestResult {
+        let lpddr5_16ch = (2 << 8) | (0xf << 4) | 2;
+        let regs = Regs(
+            [
+                (wm::LATENCY_REGS[0], (4 << 16) | 9),
+                (wm::LATENCY_REGS[1], (12 << 16) | 8),
+                (wm::LATENCY_REGS[2], (30 << 16) | 20),
+                (wm::LATENCY_SAGV, 11),
+                (crate::intel_gpu_xelpg_bw::MEM_SS_INFO_GLOBAL, lpddr5_16ch),
+                (crate::intel_gpu_xelpg_bw::QGV_POINT_BASE, 0x0a0a_0060),
+                (crate::intel_gpu_xelpg_bw::QGV_POINT_BASE + 4, 0x0000_2010),
+                (crate::intel_gpu_xelpg_bw::QGV_POINT_BASE + 8, 0x0a0a_0080),
+                (crate::intel_gpu_xelpg_bw::QGV_POINT_BASE + 12, 0x0000_2010),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let nova = Latency::read_ip(&regs, DisplayIp::NovaLakeS).unwrap();
+        let ptl = Latency::read_ip(&regs, DisplayIp::Xe3Lpd).unwrap();
+        // Level 0 dropped: WaWmMemoryReadLatency adds 6 us to every level.
+        assert_eq!(nova.levels, [6, 10, 14, 18, 26, 36]);
+        assert_eq!(ptl.levels, [9, 9, 9, 12, 20, 30]);
+        assert_eq!(nova.sagv_block_us, 11);
+        let (n, p) = (nova.qgv.unwrap(), ptl.qgv.unwrap());
+        assert_eq!((n.num_channels, n.max_numchannels), (16, 16));
+        assert_eq!((p.num_channels, p.max_numchannels), (15, 8));
+        let mut ecc = regs;
+        ecc.0.insert(
+            crate::intel_gpu_xelpg_bw::MEM_SS_INFO_GLOBAL,
+            lpddr5_16ch | ECC_IMPACTING_DE,
+        );
+        assert_eq!(
+            Latency::read_ip(&ecc, DisplayIp::NovaLakeS),
+            Err(narf_filesystem::FsError::Unsupported)
+        );
+        assert!(Latency::read_ip(&ecc, DisplayIp::Xe3Lpd).is_ok());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_latency_and_qgv
+    );
+
+    /// The operational resource computation on display 35 agrees with the
+    /// display-35 buffer plan for one unscaled XR24 primary: CDCLK, every
+    /// plane/cursor WM and DDB image, the DBUF trackers and the DBOX.
+    fn smoke_nvl_display35_resource_state_matches_dbuf_plan() -> TestResult {
+        use crate::intel_gpu_modeset::Mode;
+        use crate::intel_gpu_nvl_dbuf::{NovaDbufPlan, NovaScanout};
+        let mode = Mode::VESA_1024X768_60;
+        let guardband = 38;
+        let raw = [99, 0, 0, 0, 0, 0];
+        let plan = NovaDbufPlan::compute(
+            &[
+                Some(NovaScanout {
+                    mode,
+                    tiling: Tiling::Linear,
+                    guardband,
+                    cursor_visible: false,
+                }),
+                None,
+                None,
+                None,
+            ],
+            0xf,
+            raw,
+            20,
+            0,
+        )
+        .unwrap();
+        let latency = Latency::adjust_display35(raw, 20);
+        let mut request = crate::intel_gpu_display_resources::request(&mode, Tiling::Linear, 0);
+        if let Some(pipe) = request.pipes[0].as_mut() {
+            pipe.combo_phy = None;
+        }
+        let state = res::compute_ip_vblank(
+            DisplayIp::NovaLakeS,
+            &request,
+            &latency,
+            [Some(mode.v_total - guardband), None, None, None],
+        )
+        .unwrap();
+        assert_eq!(state.cdclk, plan.clock);
+        assert_eq!(state.ip, DisplayIp::NovaLakeS);
+        let registers = state.plane_registers().unwrap();
+        assert_eq!(registers.len(), plan.plane_registers.len());
+        for (reg, value) in &plan.plane_registers {
+            assert_eq!(
+                registers.iter().find(|(r, _)| r == reg).map(|(_, v)| *v),
+                Some(*value),
+                "{reg:#x}"
+            );
+        }
+        for slice in 0..4 {
+            assert_eq!(
+                Some(state.dbuf_ctl(slice, 0x407f_0010, state.dbuf.enabled_slices)),
+                plan.dbuf_ctl(slice, 0x407f_0010)
+            );
+        }
+        assert_eq!(Some(state.dbox(0)), plan.dbox(Pipe::A));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xe3plpd",
+        smoke_nvl_display35_resource_state_matches_dbuf_plan
     );
 }

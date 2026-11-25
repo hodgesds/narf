@@ -173,6 +173,8 @@ struct Behaviour {
     huc_status: u32,
     huc_no_bit: bool,
     proxy_no_init: bool,
+    /// The queue's owner holds XE_FW_GSC (the media GuC).
+    holds_wake: bool,
 }
 
 /// GSC firmware behind GSCCS0: GSC_FW_LOAD sets INIT_COMPLETE; MKHI, PXP
@@ -291,6 +293,17 @@ impl Gsc {
                     reply
                 }
             }
+            18 => {
+                // HECI_MEADDRESS_HDCP: a status-only wired reply that echoes
+                // the command id and port.
+                let mut out = vec![0u8; 20];
+                out[..8].copy_from_slice(&input[36..44]);
+                put32(&mut out, 12, 4);
+                out[16..20].copy_from_slice(&input[52..56]);
+                let mut reply = reply_header(18, 20, 0, 0, 0);
+                reply.extend(out);
+                reply
+            }
             client => panic!("unexpected HECI client {client}"),
         };
         output.write(output_offset, &reply);
@@ -334,6 +347,9 @@ impl Gsccs for Gsc {
             self.outstanding = false;
         }
         done
+    }
+    fn holds_wake(&self) -> bool {
+        self.b.holds_wake
     }
 }
 
@@ -1148,4 +1164,52 @@ fn smoke_media_gsc_proxy_registered_mei_binding() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gsc_proxy_registered_mei_binding
+);
+
+/// HDCP through the GSC worker (`intel_hdcp_live`'s mailbox): a running GSC
+/// whose proxy is up, under a queue owner that holds XE_FW_GSC, submits the
+/// framed command from the packet object's input half with the output
+/// sized to the reply, and hands the output half back; without the wake
+/// reference nothing is taken.
+fn smoke_media_gsc_hdcp_mailbox() -> TestResult {
+    crate::intel_hdcp_live::__reset_for_test();
+    let (mut f, mut owner) = fixture(Behaviour::default());
+    // A loaded GSC whose proxy is in its normal state: Running.
+    f.regs.set(FWSTS1_REG, 1 << 9 | 5);
+    kt_assert_eq!(owner.load_start(&MediaWindow::new(&*f.regs)), Ok(()));
+    kt_assert_eq!(owner.status(), Status::Running);
+    let port = crate::intel_hdcp_msg::HdcpPortData::gen12(crate::intel_hdcp_msg::HDCP_PROTOCOL_DP);
+    let command = crate::intel_hdcp_msg::wired::close_session(&port);
+    let framed = crate::intel_hdcp_msg::frame_gsc_command(&command, 20, 0x77).unwrap();
+    let ticket = crate::intel_hdcp_live::__gsc_post_for_test(framed.clone(), 36 + 20);
+    // No wake reference: the request stays queued.
+    drive(&mut owner, &mut f, 1_000 * MS, no_csme());
+    kt_assert!(f.gsc.jobs.is_empty());
+    kt_assert!(crate::intel_hdcp_live::__gsc_result_for_test(ticket).is_none());
+    f.gsc.b.holds_wake = true;
+    drive(&mut owner, &mut f, 2_000 * MS, no_csme());
+    // GSC_HECI_CMD_PKT: input at the packet object, its size; output at
+    // the second 4 KiB half, 36 + 20 bytes.
+    kt_assert_eq!(f.gsc.jobs.len(), 1);
+    let job = &f.gsc.jobs[0];
+    kt_assert_eq!(job[0], 0x4000_0006);
+    kt_assert_eq!(job[1], PACKET_AT);
+    kt_assert_eq!(job[3], framed.len() as u32);
+    kt_assert_eq!(job[4], PACKET_AT + 4096);
+    kt_assert_eq!(job[6], 56);
+    kt_assert_eq!(f.gsc.inputs[0], framed);
+    let Some(Ok(out)) = crate::intel_hdcp_live::__gsc_result_for_test(ticket) else {
+        return TestResult::Fail("HDCP mailbox not completed");
+    };
+    kt_assert_eq!(out.len(), 56);
+    kt_assert_eq!(at32(&out, 0), MARKER);
+    kt_assert_eq!(out[4], 18);
+    kt_assert_eq!(&out[36..44], &command[..8]);
+    kt_assert!(owner.idle());
+    crate::intel_hdcp_live::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gsc_hdcp_mailbox
 );

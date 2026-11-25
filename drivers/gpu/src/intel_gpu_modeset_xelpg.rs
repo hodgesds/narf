@@ -133,6 +133,9 @@ impl<M: MmioWindow + ?Sized> MmioWindow for CheckedWindow<'_, M> {
     fn cx0_c20_port_b(&self) -> bool {
         self.raw.cx0_c20_port_b()
     }
+    fn has_lt_phy(&self) -> bool {
+        self.raw.has_lt_phy()
+    }
     fn display_access_ok(&self) -> bool {
         if self.failed.get() || !self.raw.display_access_ok() {
             self.failed.set(true);
@@ -554,6 +557,12 @@ pub type LaneLevels = [(u8, u8); 4];
 /// bus-level failures (PHY error bit, wrong-generation ACK) are
 /// `PhyBusFailure`; timeouts and missing tables mean the PLL
 /// never locked.
+/// The eDP PLL image for `link_khz` (`xe3plpd_lt_edp_tables`); a rate the
+/// tables do not carry is refused before the PLL is touched.
+fn lt_edp_rate(link_khz: u32) -> Result<crate::intel_gpu_lt_phy::LtEdpRate, ModesetError> {
+    crate::intel_gpu_lt_phy::LtEdpRate::from_clock_khz(link_khz).ok_or(ModesetError::PllLockTimeout)
+}
+
 fn map_cx0_err(e: Cx0Error) -> ModesetError {
     match e {
         Cx0Error::PhyError | Cx0Error::ProtocolMismatch => ModesetError::PhyBusFailure,
@@ -607,6 +616,89 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         self
     }
 
+    /// Display 35's LT PHY behind this run's port (`HAS_LT_PHY`), driven
+    /// natively on four unreversed lanes as the eDP route admits; `None` on
+    /// every Cx0 IP.
+    fn lt_phy(&self) -> Result<Option<crate::intel_gpu_lt_phy::LtPhy<'a, M>>, ModesetError> {
+        if !self.ip.is_display35() {
+            return Ok(None);
+        }
+        let port = crate::intel_gpu_lt_phy::LtPort::from_xelpg(self.port)
+            .ok_or(ModesetError::UnsupportedGeneration)?;
+        crate::intel_gpu_lt_phy::LtPhy::new(self.mmio, port, false, 4, false)
+            .map(Some)
+            .map_err(map_cx0_err)
+    }
+
+    /// `intel_mtl_pll_enable_clock`: the port PLL at `link_khz` on `lanes`
+    /// (`intel_cx0pll_enable`, or `intel_lt_phy_pll_enable` over the eDP
+    /// tables on display 35).
+    fn port_pll_enable(&self, link_khz: u32, lanes: u8) -> Result<(), ModesetError> {
+        match self.lt_phy()? {
+            Some(lt) => lt
+                .enable_edp(lt_edp_rate(link_khz)?, lanes)
+                .map_err(map_cx0_err),
+            None => enable_port_pll_khz(self.mmio, self.port, link_khz, lanes, false)
+                .map_err(map_cx0_err),
+        }
+    }
+
+    /// Move a running port PLL to `link_khz` for a training fallback. The LT
+    /// PHY has no in-place rate change: its PLL is disabled and enabled
+    /// again on `lanes`, as Linux's retried modeset does.
+    fn port_pll_retarget(&self, link_khz: u32, lanes: u8) -> Result<(), ModesetError> {
+        match self.lt_phy()? {
+            Some(lt) => {
+                let rate = lt_edp_rate(link_khz)?;
+                lt.disable().map_err(map_cx0_err)?;
+                lt.enable_edp(rate, lanes).map_err(map_cx0_err)
+            }
+            None => reprogram_pll_khz(self.mmio, self.port, link_khz).map_err(map_cx0_err),
+        }
+    }
+
+    /// The running PHY's transmitters for `lanes` (the per-TX enables of
+    /// `intel_cx0pll_enable`, `intel_lt_phy_enable_disable_tx`).
+    fn port_lanes(&self, lanes: u8) -> Result<(), ModesetError> {
+        match self.lt_phy()? {
+            Some(lt) => lt.program_transmitters(lanes, false).map_err(map_cx0_err),
+            None => crate::intel_gpu_xelpg::reprogram_phy_lanes(self.mmio, self.port, lanes, false)
+                .map_err(map_cx0_err),
+        }
+    }
+
+    /// `encoder->set_signal_levels`: `intel_cx0_phy_set_signal_levels`, or
+    /// `intel_lt_phy_set_signal_levels` over `xe3plpd_lt_trans_edp` (an eDP
+    /// link never runs UHBR) with each lane's `intel_ddi_dp_level` index.
+    fn port_levels(
+        &self,
+        link_khz: u32,
+        lanes: u8,
+        levels: &LaneLevels,
+    ) -> Result<(), ModesetError> {
+        match self.lt_phy()? {
+            Some(lt) => {
+                let lanes = usize::from(lanes);
+                if lanes > levels.len() {
+                    return Err(ModesetError::PhyBusFailure);
+                }
+                let mut index = [0u8; 4];
+                for (slot, &(swing, pre_emph)) in index.iter_mut().zip(levels) {
+                    *slot = crate::intel_gpu_xelpg::preset_index(swing, pre_emph) as u8;
+                }
+                lt.program_signal_levels(
+                    crate::intel_gpu_lt_phy::LtSignalProtocol::Edp,
+                    &index[..lanes],
+                )
+                .map_err(map_cx0_err)
+            }
+            None => {
+                set_signal_levels_khz(&Cx0Phy::new(self.mmio, self.port), link_khz, lanes, levels)
+                    .map_err(map_cx0_err)
+            }
+        }
+    }
+
     /// Run the MTL modeset. Step order mirrors the Gen12
     /// orchestrator's shape with the Xe-LPG sequences substituted
     /// (see the module header for the delta list).
@@ -641,6 +733,19 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         };
 
         self.modeset_fixed(primary_fb, &mode)
+    }
+
+    /// The panel's EDID preferred mode, read over this port's AUX channel
+    /// with DC_off and the port's AUX power request held, as [`Self::modeset`]
+    /// reads it. Nothing outside the AUX channel is written.
+    pub(crate) fn preferred_mode(&mut self) -> Result<Mode, ModesetError> {
+        inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?;
+        let _power =
+            crate::intel_gpu_dc_states::acquire(crate::intel_gpu_dc_states::DcUser::Modeset)
+                .map_err(|_| ModesetError::PowerWellTimeout)?;
+        crate::intel_gpu_xelpg_tc::aux_power_enable(self.mmio, self.port)
+            .map_err(|_| ModesetError::PowerWellTimeout)?;
+        self.read_preferred_mode_via_edid()
     }
 
     /// Restore exactly the caller's timing without an EDID mode substitution.
@@ -779,11 +884,12 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // (intel_vrr_compute_guardband) is known before the first
         // destructive write, and a mode it cannot describe is refused.
         let guardband = if self.ip.is_display30() {
-            let latency = crate::intel_gpu_xelpg_wm::Latency::read(self.mmio)
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read_ip(self.mmio, self.ip)
                 .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
             Some(
                 crate::intel_gpu_xe3lpd::vrr_guardband_for(
                     self.mmio,
+                    self.ip,
                     &mode,
                     dsc.map(|plan| plan.term(&mode)),
                     &latency,
@@ -865,7 +971,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 (dsc_link_rate(&plan)?.megabits_per_sec() * 100, plan.lanes)
             }
         };
-        enable_port_pll_khz(self.mmio, self.port, link_khz, lanes, false).map_err(map_cx0_err)?;
+        self.port_pll_enable(link_khz, lanes)?;
 
         // Step 6: route the port clock to transcoder A.
         self.mmio
@@ -917,8 +1023,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             enable_d2d(self.mmio, self.port).map_err(map_cx0_err)?;
         }
         program_port_buf_ctl(self.mmio, self.port, lanes);
-        let phy = Cx0Phy::new(self.mmio, self.port);
-        set_signal_levels_khz(&phy, link_khz, lanes, &[(0, 0); 4]).map_err(map_cx0_err)?;
+        self.port_levels(link_khz, lanes, &[(0, 0); 4])?;
 
         // mtl_ddi_pre_enable_dp: intel_dp_set_power(D0), then
         // intel_dp_sink_enable_decompression, before training.
@@ -933,9 +1038,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // intel_ddi_init_dp_buf_reg's value, then the buffer active
         // (PORT_BUF_CTL1 PHY_IDLE clear), before the DPCD training.
         if let Some(off) = cold {
+            // Display >= 20 carries the D2D link enable of step 6.f in this
+            // write (`XE2LPD_DDI_BUF_D2D_LINK_ENABLE` in `intel_dp->DP`).
+            let d2d = if xe2 {
+                crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+            } else {
+                0
+            };
             self.mmio.write32(
                 inherited_ddi_ctl(self.port).ok_or(ModesetError::UnsupportedGeneration)?,
-                off.buf_ctl | ddi_port_width(lanes) | DDI_BUF_CTL_ENABLE,
+                off.buf_ctl | ddi_port_width(lanes) | d2d | DDI_BUF_CTL_ENABLE,
             );
             compiler_fence(Ordering::SeqCst);
             crate::intel_gpu_xelpg::wait_port_buf_active(self.mmio, self.port)
@@ -988,7 +1100,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // rate (or on fewer lanes), re-target the PLL and the
         // width programming, then apply the trained levels.
         if trained_khz != link_khz {
-            reprogram_pll_khz(self.mmio, self.port, trained_khz).map_err(map_cx0_err)?;
+            self.port_pll_retarget(trained_khz, trained_lanes)?;
             link_khz = trained_khz;
         }
         if trained_lanes != lanes {
@@ -999,8 +1111,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 self.program_trans_ddi_func_ctl(trained_lanes, pipe_bpp);
             }
         }
-        set_signal_levels_khz(&phy, link_khz, trained_lanes, &trained_levels)
-            .map_err(map_cx0_err)?;
+        self.port_levels(link_khz, trained_lanes, &trained_levels)?;
         // intel_ddi_set_dp_msa, at the end of intel_ddi_pre_enable_dp.
         if program_msa {
             self.program_msa(pipe_bpp);
@@ -1071,7 +1182,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 vtotal: u32::from(mode.v_total),
                 vblank_start: u32::from(mode.v_active),
             };
-            let latency = crate::intel_gpu_xelpg_wm::Latency::read(self.mmio)
+            let latency = crate::intel_gpu_xelpg_wm::Latency::read_ip(self.mmio, self.ip)
                 .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
             let linetime = crate::intel_gpu_xelpg_wm::linetime(timing)
                 .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
@@ -1248,24 +1359,16 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 return Err(ModesetError::Dsc(DscRefusal::TrainingFallback));
             }
             if retry.link_rate != *pll_khz {
-                reprogram_pll_khz(self.mmio, self.port, retry.link_rate).map_err(map_cx0_err)?;
+                self.port_pll_retarget(retry.link_rate, retry.lanes)?;
                 *pll_khz = retry.link_rate;
             }
             if retry.lanes != *pll_lanes {
-                crate::intel_gpu_xelpg::reprogram_phy_lanes(
-                    self.mmio,
-                    self.port,
-                    retry.lanes,
-                    false,
-                )
-                .map_err(map_cx0_err)?;
+                self.port_lanes(retry.lanes)?;
                 program_port_buf_ctl(self.mmio, self.port, retry.lanes);
                 self.program_trans_ddi_func_ctl(retry.lanes, retry.pipe_bpp);
                 *pll_lanes = retry.lanes;
             }
-            let phy = Cx0Phy::new(self.mmio, self.port);
-            set_signal_levels_khz(&phy, retry.link_rate, retry.lanes, &[(0, 0); 4])
-                .map_err(map_cx0_err)?;
+            self.port_levels(retry.link_rate, retry.lanes, &[(0, 0); 4])?;
             current = retry;
             current_select = retry_select;
         }
@@ -1656,7 +1759,7 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         self.mmio.write32(ddi_reg, ddi & !DDI_BUF_CTL_ENABLE);
         compiler_fence(Ordering::SeqCst);
         crate::intel_gpu_xelpg::wait_port_buf_idle(self.mmio, self.port).map_err(|_| stop)?;
-        crate::intel_gpu_xelpg::disable_d2d(self.mmio, self.port).map_err(|_| stop)?;
+        crate::intel_gpu_xe2lpd::disable_d2d(self.mmio, self.ip, self.port).map_err(|_| stop)?;
         let tp_reg = Transcoder::A.base() + DP_TP_CTL_OFFSET;
         let tp = self.mmio.read32(tp_reg);
         self.mmio.write32(tp_reg, tp & !DP_TP_CTL_ENABLE);
@@ -1666,10 +1769,14 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // intel_pps_vdd_on + intel_pps_off.
         pps.vdd_on_then_off()
             .map_err(|_| ModesetError::PanelPowerTimeout)?;
-        // intel_ddi_disable_clock (intel_cx0pll_disable), then the
-        // Thunderbolt IO deselect.
-        crate::intel_gpu_xelpg::disable_port_pll_complete(self.mmio, self.port)
-            .map_err(map_cx0_err)?;
+        // intel_ddi_disable_clock (intel_cx0pll_disable, or
+        // intel_lt_phy_pll_disable on display 35), then the Thunderbolt IO
+        // deselect.
+        match self.lt_phy()? {
+            Some(lt) => lt.disable().map_err(map_cx0_err)?,
+            None => crate::intel_gpu_xelpg::disable_port_pll_complete(self.mmio, self.port)
+                .map_err(map_cx0_err)?,
+        }
         let buf = self.mmio.read32(self.port.buf_ctl1());
         self.mmio.write32(
             self.port.buf_ctl1(),
@@ -1694,9 +1801,14 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
             .iter()
             .any(|reg| self.mmio.read32(*reg) & (PIPECONF_ENABLE | PIPECONF_STATE) != 0);
         let settled = !others_lit
-            && crate::intel_gpu_xelpg_wm::Latency::read(self.mmio).is_ok_and(|latency| {
-                crate::intel_gpu_xelpg_resources::settle_all_off(self.mmio, &latency).is_ok()
-            });
+            && crate::intel_gpu_xelpg_wm::Latency::read_ip(self.mmio, self.ip).is_ok_and(
+                |latency| {
+                    crate::intel_gpu_xelpg_resources::settle_all_off_ip(
+                        self.mmio, self.ip, &latency,
+                    )
+                    .is_ok()
+                },
+            );
         let record = PanelOff {
             port: self.port,
             mode,
@@ -1771,6 +1883,10 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         self.disable_scaler();
         if let Some(slave) = self.bigjoiner_slave {
             self.program_bigjoiner(PipeIdx::A, slave, false);
+        }
+        if let Some(lt) = self.lt_phy()? {
+            // intel_lt_phy_pll_disable: lane reset, MacCLK off and gated.
+            return lt.disable().map_err(map_cx0_err);
         }
         disable_port_pll(self.mmio, self.port).map_err(map_cx0_err)?;
         // The old helper polls ACK0 only. A refused write must not leave a
@@ -2068,33 +2184,23 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     ) -> Result<(), ModesetError> {
         use crate::intel_gpu_modeset::training::Change;
         let khz = fixed_khz.unwrap_or(state.rate.megabits_per_sec() * 100);
-        let phy = Cx0Phy::new(self.mmio, self.port);
         match change {
             Change::Configure => Ok(()),
-            Change::Levels if !state.dirty => {
-                set_signal_levels_khz(&phy, khz, state.lanes, &state.levels).map_err(map_cx0_err)
-            }
+            Change::Levels if !state.dirty => self.port_levels(khz, state.lanes, &state.levels),
             // The sink is about to be reconfigured; its levels follow.
             Change::Levels => Ok(()),
             Change::Pattern => {
                 if state.pattern == 1 && state.dirty {
                     let (cur_khz, cur_lanes) = pll.get();
                     if khz != cur_khz {
-                        reprogram_pll_khz(self.mmio, self.port, khz).map_err(map_cx0_err)?;
+                        self.port_pll_retarget(khz, state.lanes)?;
                     }
                     if state.lanes != cur_lanes {
-                        crate::intel_gpu_xelpg::reprogram_phy_lanes(
-                            self.mmio,
-                            self.port,
-                            state.lanes,
-                            false,
-                        )
-                        .map_err(map_cx0_err)?;
+                        self.port_lanes(state.lanes)?;
                         program_port_buf_ctl(self.mmio, self.port, state.lanes);
                     }
                     pll.set((khz, state.lanes));
-                    set_signal_levels_khz(&phy, khz, state.lanes, &state.levels)
-                        .map_err(map_cx0_err)?;
+                    self.port_levels(khz, state.lanes, &state.levels)?;
                 }
                 let bits = state
                     .pattern_bits()
@@ -2128,8 +2234,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     }
 
     /// The VRR IP for this run's display IP (MTL/ARL 14.00, LNL
-    /// 20.00). Display 30 (PTL) is `None`: its always-on VRR timing
-    /// generator is owned by `intel_gpu_xe3lpd`, not the generic VRR
+    /// 20.00). Display 30 (PTL) and 35 (NVL-S) are `None`: their always-on
+    /// VRR timing generator is owned by `intel_gpu_xe3lpd`, not the generic VRR
     /// path — the generic hooks below must never run on it.
     fn vrr_ip(&self) -> Option<crate::intel_gpu_vrr::DisplayVrrIp> {
         match self.ip {
@@ -2140,7 +2246,8 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
                 Some(crate::intel_gpu_vrr::DisplayVrrIp::Display20)
             }
             crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd
-            | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake => None,
+            | crate::intel_gpu_xe2lpd::DisplayIp::WildcatLake
+            | crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS => None,
         }
     }
 

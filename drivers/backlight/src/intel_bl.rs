@@ -64,6 +64,10 @@ pub enum PwmLayout {
 
 // ── Intel Backlight Device ─────────────────────────────────────────
 
+/// `_BXT_BLC_PWM_CTL2` - `_BXT_BLC_PWM_CTL1`: the second BXT controller's
+/// block (`BXT_BLC_PWM_CTL(controller)`, `_MMIO_PIPE`).
+pub const BXT_CONTROLLER_STRIDE: u64 = 0x100;
+
 /// Intel backlight device.
 #[derive(Debug)]
 pub struct IntelBacklightDevice {
@@ -71,6 +75,8 @@ pub struct IntelBacklightDevice {
     mmio: MmioRegion,
     max: u32,
     layout: PwmLayout,
+    /// The BXT controller's offset from controller 0's block.
+    offset: u64,
 }
 
 impl IntelBacklightDevice {
@@ -89,12 +95,32 @@ impl IntelBacklightDevice {
     /// # Safety
     /// `mmio` must be a valid mapping of the iGPU's BAR0 registers.
     pub unsafe fn new_with_layout(name: &str, mmio: MmioRegion, layout: PwmLayout) -> Self {
-        // BXT: the whole FREQ1 register is the period. SPT:
+        // SAFETY: forwarded from the caller.
+        unsafe { Self::new_at(name, mmio, layout, 0) }
+    }
+
+    /// The BXT layout on `controller` (0 or 1; any other value is
+    /// controller 0).
+    ///
+    /// # Safety
+    /// `mmio` must be a valid mapping of the iGPU's BAR0 registers.
+    pub unsafe fn new_bxt_controller(name: &str, mmio: MmioRegion, controller: u8) -> Self {
+        let offset = if controller == 1 {
+            BXT_CONTROLLER_STRIDE
+        } else {
+            0
+        };
+        // SAFETY: forwarded from the caller.
+        unsafe { Self::new_at(name, mmio, PwmLayout::Bxt, offset) }
+    }
+
+    unsafe fn new_at(name: &str, mmio: MmioRegion, layout: PwmLayout, offset: u64) -> Self {
+        // BXT: the whole FREQ register is the period. SPT:
         // the period is CTL2's high 16 bits (`lpt_get_backlight`
         // reads `BLC_PWM_PCH_CTL2 >> 16`).
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let max = match layout {
-            PwmLayout::Bxt => unsafe { mmio.read32(BXT_BLC_PWM_FREQ1) },
+            PwmLayout::Bxt => unsafe { mmio.read32(BXT_BLC_PWM_FREQ1 + offset) },
             PwmLayout::Spt => (unsafe { mmio.read32(BLC_PWM_PCH_CTL2) }) >> 16,
         };
         Self {
@@ -102,7 +128,13 @@ impl IntelBacklightDevice {
             mmio,
             max,
             layout,
+            offset,
         }
+    }
+
+    /// The BXT controller block in use (0: `BXT_BLC_PWM_*1`).
+    pub fn bxt_offset(&self) -> u64 {
+        self.offset
     }
 
     /// Convert 0..100 percentage to duty count.
@@ -140,7 +172,7 @@ impl BacklightDevice for IntelBacklightDevice {
         // bits (`lpt_get_backlight`).
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let duty = match self.layout {
-            PwmLayout::Bxt => unsafe { self.mmio.read32(BXT_BLC_PWM_DUTY1) },
+            PwmLayout::Bxt => unsafe { self.mmio.read32(BXT_BLC_PWM_DUTY1 + self.offset) },
             PwmLayout::Spt => (unsafe { self.mmio.read32(BLC_PWM_PCH_CTL2) }) & 0xFFFF,
         };
         self.duty_to_pct(duty)
@@ -156,7 +188,7 @@ impl BacklightDevice for IntelBacklightDevice {
         // high 16 bits (`lpt_set_backlight`).
         // SAFETY: Valid MMIO bounds or trusted driver environment
         match self.layout {
-            PwmLayout::Bxt => unsafe { self.mmio.write32(BXT_BLC_PWM_DUTY1, duty) },
+            PwmLayout::Bxt => unsafe { self.mmio.write32(BXT_BLC_PWM_DUTY1 + self.offset, duty) },
             PwmLayout::Spt => unsafe {
                 let cur = self.mmio.read32(BLC_PWM_PCH_CTL2);
                 self.mmio.write32(BLC_PWM_PCH_CTL2, (cur & !0xFFFF) | duty);
@@ -192,6 +224,22 @@ pub fn install(mmio: MmioRegion) {
     let _ = writeln!(
         narf_console::Writer,
         "  intel-backlight: registered, max_duty={}",
+        dev.max
+    );
+    crate::register_backlight(Arc::new(dev));
+}
+
+/// Install the Broxton / Gemini Lake backlight on the VBT's `controller`
+/// (`bxt_setup_backlight`: `BXT_BLC_PWM_FREQ/DUTY(controller)`). Gen9 LP
+/// has no PCH, so `SOUTH_CHICKEN1`'s PWM select is not touched.
+pub fn install_bxt(mmio: MmioRegion, controller: u8) {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let dev =
+        unsafe { IntelBacklightDevice::new_bxt_controller("intel_backlight", mmio, controller) };
+    let _ = writeln!(
+        narf_console::Writer,
+        "  intel-backlight: registered (BXT controller {}), max_duty={}",
+        dev.offset / BXT_CONTROLLER_STRIDE,
         dev.max
     );
     crate::register_backlight(Arc::new(dev));

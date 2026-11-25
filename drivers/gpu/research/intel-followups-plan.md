@@ -98,8 +98,9 @@ did.
     - Local memory: nonvisible allocation beyond BMG headless,
       eviction/migration, alias revocation, VRAM PRIME/P2P.
     - Engine scheduling: further queue protocols. Protected queues
-      need PXP and so the MEI proxy.
-    - Media GT: the MEI GSC proxy client.
+      run with `narf.intel.pxp=1`.
+    - Media GT: PXP silicon acceptance (PXP itself is behind
+      `narf.intel.pxp=1`).
     - Diagnostics: steered manual capture, coredump process/time facts.
     - Atomic display: what lane 7 leaves, plus tiling/compression beyond
       X/Tile4 and additional planes.
@@ -115,6 +116,73 @@ did.
 
     HDCP needs the same MEI/CSME client as PXP. The PUNIT blob stays
     excluded: it is firmware NARF does not load.
+
+## Status after #2489 (`feat/intel-gpu-remaining`)
+
+#2489 landed lanes 0-8 and most of 9 and 10. Several §20 capability rows
+still read Open for work the code now has (LNL/PTL FBC, i915
+`GEM_USERPTR`). This branch then landed:
+
+- the Lunar Lake panel's PHY/AUX in the PICA block (and PTL's PSR AUX);
+- Gen9/Gen11 RPS and RC6 under a busy/idle governor, per-engine reset with
+  innocent replay, the golden render state (#2489) and BCS0/VCS0/VECS0
+  beside RCS0;
+- fixed-mode KMS beside a running GT on Meteor/Arrow Lake desktops and on
+  Nova Lake-S (`narf.intel.nvl_display=1`, display-preserving GT start);
+- the Nova Lake-S owned eDP route (`narf.intel.nvl_modeset=1`): an owned
+  console with the display-35 KMS owner, the panel off before system
+  suspend and its LT-PHY relight on resume; DP and HDMI TMDS on LT port B
+  and DP-alt on TC1/TC2 beside it;
+- the devcoredump wall-clock snapshot time, and the guilty context's
+  process (`narf_filesystem::caller`, installed by userspace);
+- fixed-mode KMS on Gen9 and Gen11 desktops;
+- Broxton and Gemini Lake: identity, the Gen9-LP GT profile on the
+  execlists owner (CHV PPAT, Broxton MOCS, LP workarounds, pooled EUs,
+  BXT RPS, RC6 behind the BIOS check), and the display: the DPIO PHY,
+  port PLLs and CDCLK, the eDP modeset, and DP/HDMI on DDI B and C with
+  the display-engine hotplug bank (fixed-mode KMS when no modeset runs);
+- Gen11 VCS0/VECS0 engine reset with the SFC lock;
+- Gen9/Gen11 timeslicing and priority-band preemption (Linux's execlists
+  preempt-to-busy model).
+
+Still open, each needing its own grounding first:
+
+- Gen9 DC states on hardware (Skylake and Gen9 LP): the `DC_off` service
+  and its holders are wired behind `narf.intel.gen9_dc=1` (default off),
+  fixture-validated only, with the GT's `GT_IRQ` hold while unparked
+  (`__gt_unpark`), Gen9 LP DC9 across system suspend (`bxt_enable_dc9` /
+  `bxt_disable_dc9` with the PPS reset, entered only with the display
+  dark) and the post-S3 display-core init and DMC reload. Left: a silicon
+  run on each family; a Gen9 display suspend owner that turns the panel
+  off and relights it (none exists, so a lit panel keeps DC9 refused);
+  `intel_cdclk_init_hw` and the PCH reset handshake on resume (the next
+  modeset owns CDCLK); BXT DSI transcoders in the dark-display check; and
+  `assert_can_enable_dc9`'s interrupts-off check.
+- Nova Lake-S beyond the owned eDP route, its suspend relight, the LT
+  external outputs and the display-35 DMC/DC6 service
+  (`narf.intel.nvl_modeset=1`): UHBR and Thunderbolt alt mode on the LT PHY,
+  Nova fixtures for MST and DSC over LT ports (they run the same
+  LT-dispatched route), DC3CO (it needs the CMTG and a LOBF, panel-replay or
+  PSR2 trigger), the DMC wakelock (`intel_dmc_wl`), and a silicon run of the
+  DC service.
+- PXP silicon acceptance. Xe PXP on MTL/Arrow runs behind
+  `narf.intel.pxp=1` (spec "MTL/Arrow PXP behind narf.intel.pxp=1") with
+  native fixtures only; protected-plane decryption is refused, and the
+  RUN_ALONE LRC bit and the runtime wiring have no native model.
+- HDCP beyond the landed SST DP/HDMI path (`narf.intel.hdcp=1`: HDCP 1.4,
+  HDCP 2.2 through the MEI HDCP client on display 12/13 and the GSC on
+  14+, the Content Protection properties): DP MST stream encryption,
+  `CP_IRQ` delivery, KMS-owner cards' property path, and a silicon run
+  (the NUC12's GOP-lit route is the first target).
+- D3cold through `_PR3` power resources (NARF evaluates no AML).
+- VRAM PRIME/P2P beyond the static attachments in `intel_gpu_prime`
+  (peer-to-peer LMEM BAR mapping behind `narf.intel.prime_p2p=1`,
+  migration fallback, pinned, VRAM-only and nonvisible refusals, foreign
+  import binding): dynamic importers with move notification
+  (`xe_dma_buf_move_notify`), system suspend with a pinned VRAM export
+  (Linux evicts and restores it in place), CPU mmap and scanout of a
+  foreign import, AMD exporters and importers, and validation of the P2P
+  path on hardware.
 
 ## Shared files
 

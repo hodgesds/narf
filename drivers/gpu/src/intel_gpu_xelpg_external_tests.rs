@@ -445,11 +445,18 @@ impl ExtFake {
         self.phy
             .write32(0x5_10A0, (u32::from(ip.ver()) << 22) | (release << 14));
         self.phy.write32(0x4_5004, 1 << 3);
-        let latency = crate::intel_gpu_xelpg_wm::Latency::read(self).ok()?;
+        // Display 35 reads its latencies without the reported level 0, as
+        // the Pipe B-D owner's panel adoption does.
+        let latency = if ip == DisplayIp::NovaLakeS {
+            crate::intel_gpu_xelpg_wm::Latency::read_ip(self, ip)
+        } else {
+            crate::intel_gpu_xelpg_wm::Latency::read(self)
+        }
+        .ok()?;
         let mut vblank_start = [None; 4];
         if ip.is_display30() {
             let guardband =
-                crate::intel_gpu_xe3lpd::vrr_guardband_for(self, &mode, None, &latency).ok()?;
+                crate::intel_gpu_xe3lpd::vrr_guardband_for(self, ip, &mode, None, &latency).ok()?;
             vblank_start[0] = Some(mode.v_total - guardband);
         }
         let state = crate::intel_gpu_xelpg_resources::compute_ip_vblank(
@@ -4090,3 +4097,418 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_panel_profile_proves_its_share_beside_external
 );
+
+// ── Nova Lake-S display 35: the routes through the LT PHY ───────────
+
+#[cfg(feature = "kernel-test")]
+mod nova {
+    use super::*;
+
+    /// Display 35 around [`ExtFake`], behind which the route runs through the
+    /// display-35 view ([`crate::intel_gpu_xe3plpd::View`]): the LT PHY model
+    /// (`intel_gpu_lt_phy::tests::FakeLtMmio`) answers the port's LT-only
+    /// registers at their PICA offsets (`PORT_BUF_CTL2`, `PORT_BUF_CTL5`, the
+    /// lane-0/1 message bus, `PORT_CLOCK_CTL`, the P2P status), DDI B's other
+    /// relocated PHY/AUX registers map back to the display-14 offsets the model
+    /// answers at, and an access to DDI B's display-14 PHY offsets is a stray.
+    /// AUX power status follows its request (the LT handshake).
+    struct NovaExt {
+        ext: ExtFake,
+        lt: crate::intel_gpu_lt_phy::tests::FakeLtMmio,
+        strays: RefCell<Vec<u64>>,
+    }
+
+    impl NovaExt {
+        fn new(ext: ExtFake) -> Self {
+            Self {
+                ext,
+                lt: crate::intel_gpu_lt_phy::tests::FakeLtMmio::default(),
+                strays: RefCell::new(Vec::new()),
+            }
+        }
+        /// The port's PHY block at its PICA (TC1-layout) offset.
+        fn pica_base(&self) -> u64 {
+            match self.ext.port {
+                XeLpgPort::B => 0x16_fc00,
+                XeLpgPort::Tc1 => 0x16_f200,
+                XeLpgPort::Tc2 => 0x16_f400,
+                _ => 0,
+            }
+        }
+        fn lt_reg(&self, r: u64) -> bool {
+            let base = self.pica_base();
+            base != 0
+                && [0x04, 0x34, 0x40, 0x44, 0x48, 0x4c, 0x60, 0xa0, 0xa4]
+                    .contains(&(r.wrapping_sub(base)))
+        }
+        /// DDI B's relocated `PORT_BUF_CTL1/3`, AUX and message-bus timer.
+        fn from_pica(&self, r: u64) -> Option<u64> {
+            if self.ext.port != XeLpgPort::B {
+                return None;
+            }
+            match r {
+                0x16_fc00 | 0x16_fc08 => Some(r - 0x16_fc00 + 0x6_4104),
+                0x16_fc10..=0x16_fc24 => Some(r - 0x16_fc00 + 0x6_4100),
+                0x16_fc58 | 0x16_fc5c => Some(r - 0x16_fc00 + 0x6_4180),
+                _ => None,
+            }
+        }
+        fn display14_phy(&self, r: u64) -> bool {
+            self.ext.port == XeLpgPort::B
+                && matches!(r, 0x6_4104..=0x6_4124 | 0x6_4140..=0x6_414c | 0x6_41d8 | 0x6_41dc | 0x6_41e0)
+        }
+        fn aux_ctl(&self) -> u64 {
+            match self.ext.port {
+                XeLpgPort::B => 0x16_fc10,
+                port => port.aux_ctl(),
+            }
+        }
+    }
+
+    impl MmioWindow for NovaExt {
+        fn display_access_ok(&self) -> bool {
+            self.ext.display_access_ok()
+        }
+        fn has_lt_phy(&self) -> bool {
+            true
+        }
+        fn read32(&self, r: u64) -> u32 {
+            if self.display14_phy(r) {
+                self.strays.borrow_mut().push(r);
+                return u32::MAX;
+            }
+            if self.lt_reg(r) {
+                return self.lt.read32(r);
+            }
+            let value = self.ext.read32(self.from_pica(r).unwrap_or(r));
+            if r == self.aux_ctl() && value & XELPDP_AUX_CH_CTL_POWER_REQUEST != 0 {
+                value | crate::intel_gpu_aux::XELPDP_AUX_CH_CTL_POWER_STATUS
+            } else {
+                value
+            }
+        }
+        fn write32(&self, r: u64, v: u32) {
+            if self.display14_phy(r) {
+                self.strays.borrow_mut().push(r);
+                return;
+            }
+            if self.lt_reg(r) {
+                self.ext.writes.borrow_mut().push((r, v));
+                return self.lt.write32(r, v);
+            }
+            self.ext.write32(self.from_pica(r).unwrap_or(r), v)
+        }
+    }
+
+    /// What the LT PHY of DDI B must hold after a lit external route: the
+    /// PLL image `image` (`VDR0..2_CONFIG` on lane 0), MacCLK requested and
+    /// acknowledged on lane 0 (`intel_lt_phy_pll_enable`), and each link lane's
+    /// main cursor from its `levels` entry; no display-14 PHY access
+    /// and no Cx0 message-bus transaction on the display-14 model.
+    fn nova_lt_lit(
+        io: &NovaExt,
+        image: &crate::intel_gpu_lt_phy::LtPllState,
+        levels: &[crate::intel_gpu_lt_phy::LtTxLevel],
+    ) -> Result<(), &'static str> {
+        use crate::intel_gpu_lt_phy::{
+            txy_ctl, LT_PHY_VDR_0_CONFIG, LT_PHY_VDR_1_CONFIG, LT_PHY_VDR_2_CONFIG,
+        };
+        let vdr = |lane: u8, address: u16| io.lt.vdr.borrow().get(&(lane, address)).copied();
+        for (n, address) in [
+            LT_PHY_VDR_0_CONFIG,
+            LT_PHY_VDR_1_CONFIG,
+            LT_PHY_VDR_2_CONFIG,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if vdr(0, address) != Some(image.config[n]) {
+                return Err("the LT PLL must hold the route's image");
+            }
+        }
+        if io.lt.read32(io.pica_base() + 0x60) & (3 << 30) != 3 << 30 {
+            return Err("MacCLK must be requested and acknowledged on lane 0");
+        }
+        for (link_lane, level) in (0u8..).zip(levels) {
+            let main = vdr(link_lane / 2, txy_ctl(link_lane % 2, 3).unwrap());
+            if main.map(|v| v & 0x3f) != Some(level.main_cursor) {
+                return Err("every link lane must carry the LT DP 1.4 level");
+            }
+        }
+        if !io.strays.borrow().is_empty() || !io.ext.phy.msgbus_txns(0).is_empty() {
+            return Err("display 35 must never reach a Cx0 or display-14 PHY register");
+        }
+        Ok(())
+    }
+
+    /// Nova Lake-S native DP on LT port B (Pipe B beside the lit panel): the
+    /// display-35 view, `intel_lt_phy_pll_enable` with the DP 1.4 image of the
+    /// link's rate (`xe3plpd_lt_dp_tables`, no eDP mark), the trained level from
+    /// `xe3plpd_lt_trans_dp14` (`intel_lt_phy_set_signal_levels`), the display
+    /// 20+ D2D link in `DDI_BUF_CTL`; the stop releases MacCLK
+    /// (`intel_lt_phy_pll_disable`) and the DDI.
+    fn smoke_nvl_external_dp_on_lt_port_b() -> TestResult {
+        use crate::intel_gpu_lt_phy::{dp_pll_state, signal_level, LtDpRate, LtSignalProtocol};
+        let port = XeLpgPort::B;
+        let io = NovaExt::new(ExtFake::new(port, Sink::new(0x14, edid_1024())));
+        let Some(panel) = io.ext.light_panel_ip(DisplayIp::NovaLakeS) else {
+            return TestResult::Fail("the fixture must light the display-35 panel");
+        };
+        let view = crate::intel_gpu_xe3plpd::View(&io);
+        let profile = ExternalDisplayProfile::for_ip(DisplayIp::NovaLakeS);
+        let probe = match probe_sink_profile(&view, profile, port, false) {
+            Ok(probe) => probe,
+            Err(_) => return TestResult::Fail("Nova DDI B probe must read the sink over PICA AUX"),
+        };
+        if probe.tc.is_some() || probe.display_version() != 35 {
+            return TestResult::Fail("Nova DDI B owns no Type-C PHY and keeps display 35");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        let mut route = match activate(&view, probe, fb, &display) {
+            Ok(route) if route.state() == RouteState::Live && route.pipe == Pipe::B => route,
+            _ => return TestResult::Fail("Nova DDI B DP must light Pipe B beside the panel"),
+        };
+        let clock = io.read32(port.clk_valfreq().unwrap());
+        let Some(rate) = LtDpRate::from_clock_khz(clock).filter(|rate| !rate.is_uhbr()) else {
+            return TestResult::Fail("DDI_CLK_VALFREQ must name a DP 1.4 link rate");
+        };
+        let image = dp_pll_state(rate);
+        if image.config[2] != 0 {
+            return TestResult::Fail("an external DP image carries no eDP mark");
+        }
+        // Each trained lane's intel_ddi_dp_level in xe3plpd_lt_trans_dp14.
+        let levels: Vec<_> = route.trained.vswing_pe.lanes[..usize::from(route.trained.lanes)]
+            .iter()
+            .map(|lane| {
+                signal_level(
+                    LtSignalProtocol::Dp14,
+                    crate::intel_gpu_xelpg::preset_index(lane.swing, lane.pre_emph),
+                )
+                .unwrap()
+            })
+            .collect();
+        if let Err(e) = nova_lt_lit(&io, image, &levels) {
+            return TestResult::Fail(e);
+        }
+        if io.read32(port.ddi_buf_ctl())
+            & (DDI_BUF_CTL_ENABLE | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE)
+            != DDI_BUF_CTL_ENABLE | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+        {
+            return TestResult::Fail("DDI_CTL_DE must carry the display-20+ D2D enable");
+        }
+        if route.stop(&view).is_err() || route.state() != RouteState::Stopped {
+            return TestResult::Fail("Nova DDI B DP must stop");
+        }
+        if io.lt.read32(0x16_fc60) & (3 << 30) != 0
+            || io.read32(port.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
+            || !io.strays.borrow().is_empty()
+        {
+            return TestResult::Fail("the stop must release MacCLK and the DDI through the LT PHY");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_external",
+        smoke_nvl_external_dp_on_lt_port_b
+    );
+
+    /// Nova Lake-S USB-C DP-alt on LT TC1: the Type-C connect under the exact
+    /// display-35 profile (PICA power and TCSS, no Wa_14020908590 mailbox),
+    /// then the LT PHY in DP-alt mode (`intel_lt_phy_pll_enable` with the
+    /// connection's lanes) at the link's DP 1.4 image, never a C20 transaction;
+    /// stop and release return the PHY and the Type-C ownership.
+    fn smoke_nvl_external_tc_dp_alt_on_lt_tc1() -> TestResult {
+        use crate::intel_gpu_lt_phy::{dp_pll_state, signal_level, LtDpRate, LtSignalProtocol};
+        let port = XeLpgPort::Tc1;
+        let io = NovaExt::new(ExtFake::new(port, Sink::new(0x14, edid_1024())));
+        let Some(panel) = io.ext.light_panel_ip(DisplayIp::NovaLakeS) else {
+            return TestResult::Fail("the fixture must light the display-35 panel");
+        };
+        let view = crate::intel_gpu_xe3plpd::View(&io);
+        let profile = ExternalDisplayProfile::for_ip(DisplayIp::NovaLakeS);
+        let probe = match probe_sink_profile(&view, profile, port, false) {
+            Ok(probe) => probe,
+            Err(_) => return TestResult::Fail("Nova TC1 probe must own PICA/TCSS/AUX"),
+        };
+        if probe
+            .tc
+            .is_none_or(|tc| tc.profile != TcDisplayProfile::NovaLakeS || tc.mode != TcMode::DpAlt)
+            || !io
+                .ext
+                .writes_to(crate::intel_gpu_xelpg_tc::TCSS_DISP_MAILBOX_IN_CMD)
+                .is_empty()
+        {
+            return TestResult::Fail("the DP-alt connect must keep the display-35 Type-C profile");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        let mut route = match activate(&view, probe, fb, &display) {
+            Ok(route) if route.state() == RouteState::Live => route,
+            _ => return TestResult::Fail("Nova USB-C DP must activate beside Pipe A"),
+        };
+        let clock = io.read32(port.clk_valfreq().unwrap());
+        let Some(rate) = LtDpRate::from_clock_khz(clock).filter(|rate| !rate.is_uhbr()) else {
+            return TestResult::Fail("DDI_CLK_VALFREQ must name a DP 1.4 link rate");
+        };
+        let levels: Vec<_> = route.trained.vswing_pe.lanes[..usize::from(route.trained.lanes)]
+            .iter()
+            .map(|lane| {
+                signal_level(
+                    LtSignalProtocol::Dp14,
+                    crate::intel_gpu_xelpg::preset_index(lane.swing, lane.pre_emph),
+                )
+                .unwrap()
+            })
+            .collect();
+        if let Err(e) = nova_lt_lit(&io, dp_pll_state(rate), &levels) {
+            return TestResult::Fail(e);
+        }
+        if io
+            .ext
+            .phy
+            .writes
+            .borrow()
+            .iter()
+            .any(|(off, _)| (port.msgbus_ctl_ln0()..port.msgbus_ctl_ln0() + 0x10).contains(off))
+            || !io.ext.phy.sram_values().is_empty()
+        {
+            return TestResult::Fail("the TC1 PHY must take only LT transactions");
+        }
+        if route.stop(&view).is_err() || route.release(&view).is_err() {
+            return TestResult::Fail("Nova USB-C DP must stop and release");
+        }
+        if io.lt.read32(0x16_f260) & (3 << 30) != 0
+            || io.read32(port.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
+        {
+            return TestResult::Fail("the release must drop MacCLK and the Type-C ownership");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_external",
+        smoke_nvl_external_tc_dp_alt_on_lt_tc1
+    );
+
+    /// Nova Lake-S HDMI TMDS on LT port B: 1080p60's 148.5 MHz TMDS clock takes
+    /// the LT HDMI image (`xe3plpd_lt_hdmi_148_5`, `intel_lt_phy_pll_enable`),
+    /// and `intel_lt_phy_set_signal_levels` the DP 1.4 table's default HDMI
+    /// level on all four transmitters (`intel_ddi_hdmi_level`, no VBT level).
+    /// No C10/C20 state is programmed; the stop releases the LT PLL.
+    fn smoke_nvl_external_hdmi_tmds_on_lt_port_b() -> TestResult {
+        use crate::intel_gpu_lt_phy::{hdmi_pll_state, hdmi_signal_level};
+        use crate::intel_gpu_xelpg_hdmi::{
+            activate_hdmi, ddc_pin, probe_hdmi_profile, HdmiRouteState,
+        };
+        let port = XeLpgPort::B;
+        let io = NovaExt::new(hdmi_on_ddi_b(edid_1080()));
+        let Some(panel) = io.ext.light_panel_ip(DisplayIp::NovaLakeS) else {
+            return TestResult::Fail("the fixture must light the display-35 panel");
+        };
+        let view = crate::intel_gpu_xe3plpd::View(&io);
+        let profile = ExternalDisplayProfile::for_ip(DisplayIp::NovaLakeS);
+        let probe = match probe_hdmi_profile(&view, profile, port, false, ddc_pin(port)) {
+            Ok(probe) => probe,
+            Err(_) => return TestResult::Fail("Nova DDI B HDMI probe must read the EDID over DDC"),
+        };
+        if probe.pll.port_clock_khz != 148_500 {
+            return TestResult::Fail("1080p60 RGB runs at a 148.5 MHz TMDS clock");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let display = MtlDisplay {
+            panel: Some(panel),
+            pipe_dmc: &NoPipeDmc,
+        };
+        let mut route = match activate_hdmi(&view, probe, fb, &display) {
+            Ok(route) if route.state() == HdmiRouteState::Live && route.pipe() == Pipe::B => route,
+            _ => return TestResult::Fail("Nova DDI B HDMI must light Pipe B beside the panel"),
+        };
+        let image = hdmi_pll_state(148_500).unwrap();
+        if io.read32(port.clk_valfreq().unwrap()) != 148_500 {
+            return TestResult::Fail("DDI_CLK_VALFREQ must carry the TMDS clock");
+        }
+        if let Err(e) = nova_lt_lit(&io, &image, &[hdmi_signal_level(None).1; 4]) {
+            return TestResult::Fail(e);
+        }
+        if !io.ext.phy.sram_values().is_empty() {
+            return TestResult::Fail("no C20 SRAM state may be staged on display 35");
+        }
+        if route.stop(&view).is_err()
+            || io.lt.read32(0x16_fc60) & (3 << 30) != 0
+            || io.read32(port.ddi_buf_ctl()) & DDI_BUF_CTL_ENABLE != 0
+        {
+            return TestResult::Fail("Nova DDI B HDMI must stop through the LT PHY");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_external",
+        smoke_nvl_external_hdmi_tmds_on_lt_port_b
+    );
+
+    /// The display-35 profile's refusals, each before any register access:
+    /// port A (the panel's) and TC3/TC4 (absent on Nova Lake-S), a Cx0 view
+    /// behind the Nova profile, and an LT view behind a Cx0 profile, for DP and
+    /// HDMI alike.
+    fn smoke_nvl_external_refusals_precede_mmio() -> TestResult {
+        use crate::intel_gpu_xelpg_hdmi::{probe_hdmi_profile, HdmiError};
+        struct LtNoAccess;
+        impl MmioWindow for LtNoAccess {
+            fn has_lt_phy(&self) -> bool {
+                true
+            }
+            fn read32(&self, _: u64) -> u32 {
+                panic!("refused route read a register");
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("refused route wrote a register");
+            }
+        }
+        let nova = ExternalDisplayProfile::for_ip(DisplayIp::NovaLakeS);
+        let ptl = ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd);
+        for port in [XeLpgPort::A, XeLpgPort::Tc3, XeLpgPort::Tc4] {
+            if probe_sink_profile(&LtNoAccess, nova, port, false).err()
+                != Some(ExternalError::UnsupportedPort)
+            {
+                return TestResult::Fail("Nova must refuse ports outside B/TC1/TC2 before MMIO");
+            }
+        }
+        for (view_lt, profile) in [(false, nova), (true, ptl)] {
+            let refused = if view_lt {
+                probe_sink_profile(&LtNoAccess, profile, XeLpgPort::B, false).err()
+            } else {
+                probe_sink_profile(&NoAccess, profile, XeLpgPort::B, false).err()
+            };
+            if refused != Some(ExternalError::UnsupportedGeneration) {
+                return TestResult::Fail("the PHY family must match the profile before MMIO");
+            }
+        }
+        let pin = crate::intel_gpu_xelpg_hdmi::ddc_pin(XeLpgPort::B);
+        if !matches!(
+            probe_hdmi_profile(&NoAccess, nova, XeLpgPort::B, false, pin),
+            Err(HdmiError::Route(ExternalError::UnsupportedGeneration))
+        ) || !matches!(
+            probe_hdmi_profile(&LtNoAccess, ptl, XeLpgPort::B, false, pin),
+            Err(HdmiError::Route(ExternalError::UnsupportedGeneration))
+        ) {
+            return TestResult::Fail("HDMI must refuse a mismatched PHY family before MMIO");
+        }
+        if !nova.admits_view(&LtNoAccess)
+            || nova.admits_view(&NoAccess)
+            || ptl.admits_view(&LtNoAccess)
+        {
+            return TestResult::Fail("only the LT view admits the display-35 profile");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_external",
+        smoke_nvl_external_refusals_precede_mmio
+    );
+}

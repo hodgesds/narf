@@ -1084,8 +1084,9 @@ fn dma_buf_inode() -> narf_filesystem::inode_id::InodeId {
     }
 }
 
-/// Intel same-card PRIME export. This owns CPU-mappable system pages only;
-/// foreign-device attachment stays refused. Sync-file imports join the shared
+/// Intel PRIME export of system or VRAM storage. The same card imports the
+/// object itself; another Intel card attaches through `intel_gpu_prime`
+/// (peer-to-peer or migration). Sync-file imports join the shared
 /// reservation independently of current backend readiness.
 #[cfg(feature = "intel")]
 #[derive(Debug)]
@@ -1095,11 +1096,15 @@ struct IntelPrimeDmaBufFile {
     inode: narf_filesystem::inode_id::InodeId,
 }
 
+/// A dma-buf of `object` on `card`. Re-exporting a foreign import names the
+/// original buffer and card (`drm_gem_prime_handle_to_dmabuf` returns
+/// `import_attach->dmabuf`).
 #[cfg(feature = "intel")]
 pub(crate) fn intel_dma_buf_file(
     card: u32,
     object: Arc<crate::intel_gpu_gem::GemObject>,
 ) -> Arc<dyn FileOps> {
+    let (card, object) = object.prime_origin().unwrap_or((card, object));
     Arc::new(IntelPrimeDmaBufFile {
         card,
         object,
@@ -1118,7 +1123,7 @@ pub(crate) fn intel_prime_import(
         .and_then(|any| any.downcast_ref::<IntelPrimeDmaBufFile>())
         .ok_or(FsError::InvalidData)?;
     if prime.card != card {
-        return Err(FsError::InvalidData);
+        return crate::intel_gpu_prime::import_foreign(card, gem, prime.card, &prime.object);
     }
     gem.import(&prime.object)
 }

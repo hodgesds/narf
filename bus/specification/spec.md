@@ -691,6 +691,21 @@ non-coherent backing. A DTB-less aarch64 boot (QEMU `virt` fallback) stays
 coherent; aarch64 boots carry no ACPI, so `_CCA` has no source. Non-PCI
 devices on a Devicetree boot return `NotMapped` (no node association yet).
 
+### 3.14 P2P DMA topology
+
+```rust
+/// The registry tree for `narf_io::p2pdma`: `pci_upstream_bridge`, ACS
+/// Control redirect bits, the root bus as host bridge and its first
+/// function (00.0 or a Root Port), and the AMD Zen CPU rule.
+pub struct p2pdma::LiveTopology;
+/// Linux `pci_p2pdma_distance`: `None` is -1.
+pub fn p2pdma::distance(provider: &BusDevice, client: Option<&BusDevice>) -> Option<u32>;
+pub fn p2pdma::map_type(provider: &BusDevice, client: &BusDevice) -> narf_io::p2pdma::P2pMapType;
+```
+
+These reads are passive fabric metadata taken without the peers' device
+capabilities, like `pci::upstream_bridge_commands`; nothing changes ACS.
+
 ## 4. Invariants & safety properties
 
 - The device registry is read-mostly and uses RCU for lookups.

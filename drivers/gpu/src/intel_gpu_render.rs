@@ -147,7 +147,7 @@ impl SubmissionProfile {
             // the execlists lane (Gen9 Lane 3) models it the same
             // way (GuC submission is optional on Gen9 — execlists
             // works without it).
-            Generation::Skylake => Self::Unsupported,
+            Generation::Skylake | Generation::Broxton => Self::Unsupported,
             Generation::LunarLake | Generation::PantherLake => Self::Unsupported,
         }
     }
@@ -573,7 +573,9 @@ impl Namespaces {
             return Err(FsError::InvalidData);
         }
         let media = if matches!(legacy, abi::EXEC_BSD | abi::EXEC_VEBOX) {
-            if !info.platform.is_gen12() {
+            // Gen12 media runs on GuC, Gen9/Gen11 on the execlists owner;
+            // either way only a published engine is selectable below.
+            if !(info.platform.is_gen12() || info.platform.is_gen11() || info.platform.is_gen9()) {
                 return Err(FsError::InvalidData);
             }
             let present = info.user_status().ok_or(FsError::NoDevice)?.engines;
@@ -1009,6 +1011,7 @@ impl RenderFile {
                 cmd,
                 crate::intel_gpu_xe_uapi::DEVICE_QUERY
                     | crate::intel_gpu_xe_uapi::GEM_CREATE
+                    | crate::intel_gpu_xe_uapi::EXEC_QUEUE_CREATE
                     | crate::intel_gpu_xe_uapi::VM_BIND
                     | crate::intel_gpu_xe_uapi::EXEC
                     | crate::intel_gpu_xe_uapi::WAIT_USER_FENCE
@@ -2129,6 +2132,11 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
                 0 => Err(FsError::NoDevice),
                 v => i32::try_from(v).map_err(|_| FsError::NoDevice),
             };
+        } // HAS_POOLED_EU and MIN_EU_IN_POOL report plain values, zero included.
+        match param {
+            38 => return Ok(i32::from(topology.pooled_eu())),
+            39 => return i32::try_from(topology.min_eu_in_pool()).map_err(|_| FsError::NoDevice),
+            _ => {}
         }
     }
     Ok(match param {
@@ -3704,6 +3712,7 @@ pub(crate) mod tests {
                     Generation::MeteorLake => SubmissionProfile::XeLpgGuC,
                     Generation::IceLake
                     | Generation::Skylake
+                    | Generation::Broxton
                     | Generation::LunarLake
                     | Generation::PantherLake => SubmissionProfile::Unsupported,
                 };
@@ -4145,8 +4154,10 @@ pub(crate) mod tests {
             {
                 return Err("PRIME import replaced another handle or copied identity");
             }
+            // Another card attaches only as a registered native Xe card
+            // (intel_gpu_prime::import_foreign); an unregistered one refuses.
             if crate::drm_devfs_bridge::intel_prime_import(3, &importer, &prime) != Ok(imported)
-                || crate::drm_devfs_bridge::intel_prime_import(4, &importer, &prime)
+                || crate::drm_devfs_bridge::intel_prime_import(u32::MAX, &importer, &prime)
                     != Err(FsError::InvalidData)
             {
                 return Err("PRIME reimport identity or cross-card admission");

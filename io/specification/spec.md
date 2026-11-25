@@ -113,6 +113,23 @@ impl DmaPool {
 pub fn map_p2p(src: &BusDevice, dst: &BusDevice, buf: &DmaBuffer<T>)
     -> Result<P2pBinding, IoError>;
 
+/// Implemented: the topology oracle `map_p2p` consults (Linux
+/// `drivers/pci/p2pdma.c` `calc_map_type_and_dist`, the host-bridge
+/// whitelist and `cpu_supports_p2pdma`), pure over a `P2pTopology` the
+/// caller supplies (`narf_bus::p2pdma::LiveTopology` for the registry).
+/// `None` is Linux's -1: no client, a non-PCI client, or no peer path.
+pub mod p2pdma {
+    pub enum P2pMapType { NotSupported, BusAddr, ThruHostBridge }
+    pub trait P2pTopology { type Node: Copy; /* upstream_bridge, acs_redirect,
+        host_bridge, host_bridge_dev, cpu_supports_p2pdma */ }
+    pub fn map_type_and_distance<T: P2pTopology>(t: &T, provider: T::Node,
+        client: T::Node) -> (P2pMapType, u32);
+    pub fn distance_many<T: P2pTopology>(t: &T, provider: T::Node,
+        clients: &[Option<T::Node>]) -> Option<u32>;
+    pub fn distance<T: P2pTopology>(t: &T, provider: T::Node,
+        client: Option<T::Node>) -> Option<u32>;
+}
+
 /// Tear down a P2P binding. Quiescence protocol (binding):
 /// 1. Notify both drivers' domains of pending teardown via `tracing/` event.
 /// 2. Invalidate both sides' IOMMU TLB entries for the binding's IOVA range.

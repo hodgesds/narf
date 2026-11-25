@@ -230,9 +230,15 @@ pub fn dbuf_shares(active: &[Pipe]) -> Vec<(Pipe, u16, u16)> {
 /// 892 (`skl_display`: `.dbuf.size = 896 - 4`).
 pub fn dbuf_pool_blocks<M: MmioWindow + ?Sized>(mmio: &M) -> u16 {
     match crate::intel_gpu_aux::SourceFamily::of(mmio) {
-        Some(crate::intel_gpu_aux::SourceFamily::Gen9 { .. }) => {
-            crate::intel_gpu_gen9_wm::DBUF_TOTAL_BLOCKS
-        }
+        Some(crate::intel_gpu_aux::SourceFamily::Gen9 { platform, .. }) => match platform {
+            crate::intel_gpu_gt::Gen9Platform::Broxton => {
+                crate::intel_gpu_gen9_wm::BXT_DBUF_TOTAL_BLOCKS
+            }
+            crate::intel_gpu_gt::Gen9Platform::GeminiLake => {
+                crate::intel_gpu_gen9_wm::GLK_DBUF_TOTAL_BLOCKS
+            }
+            _ => crate::intel_gpu_gen9_wm::DBUF_TOTAL_BLOCKS,
+        },
         _ => DBUF_TOTAL_BLOCKS,
     }
 }

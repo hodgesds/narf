@@ -45,6 +45,7 @@ extern crate alloc;
 pub mod bound;
 pub mod domain_alloc;
 pub mod gsc_proxy;
+pub mod hdcp_component;
 pub mod params;
 
 mod tests;

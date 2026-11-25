@@ -852,3 +852,103 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_media_gsc_owner_proxy_resume_reload_and_interrupted_load
 );
+
+/// `narf.intel.pxp=1`'s kernel queues on the media GuC model (MIT Linux
+/// 7.4-rc4 xe_pxp_submit.c): the GSC client's batch on GSCCS0 from its own
+/// private PPGTT through ring_ops_gen12_gsc's __emit_job_gen12_simple, and
+/// xe_pxp_submit_session_termination's stream on GT1's first VCS, each one
+/// job at a time; nothing else is admitted, and a stopped GT1 takes none.
+fn smoke_media_gt_pxp_jobs_run_on_gsccs_ppgtt_and_the_first_vcs() -> TestResult {
+    use crate::intel_gpu_gt::media::pxp::{self, Client, PxpError};
+    use crate::intel_gpu_gt::media::PxpQueue;
+    use pxp::Port;
+    let (w, arena) = media_model();
+    let mut guc = start_media(&w, &arena);
+    guc.schedule_gsccs().unwrap();
+    let mut hw = Hw::default();
+    let (now, polled) = media_until(&mut guc, &w, &mut hw, 1, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Running)));
+    // xe_gt_hw_engine(gt, VIDEO_DECODE, 0, true): VCS0 of the fused set.
+    assert_eq!(guc.pxp_vcs(), Some(Engine::Vcs0));
+    let client = pxp::GemClient::new(MTL).unwrap();
+    let batch = pxp::heci_batch(pxp::CLIENT_VA, 112, 84);
+    let bytes: Vec<u8> = batch.iter().flat_map(|word| word.to_le_bytes()).collect();
+    client.write(0, &bytes).unwrap();
+    let live = arena.live_allocations();
+    // A stream other than the exact termination allocates nothing.
+    assert_eq!(
+        PxpQueue::new(&mut guc, now).submit_termination(&[0x0500_0000, 0]),
+        Err(PxpError::Io)
+    );
+    assert_eq!(arena.live_allocations(), live);
+    {
+        let mut queue = PxpQueue::new(&mut guc, now + 1);
+        queue.submit_gsc(&client).unwrap();
+        // One PXP job at a time.
+        assert_eq!(queue.submit_gsc(&client), Err(PxpError::Io));
+        assert_eq!(queue.finished(), None);
+    }
+    let mut finished = None;
+    let mut tick = now + 2;
+    for _ in 0..2000 {
+        let polled = media_tick(&mut guc, &w, &mut hw, tick);
+        assert!(!matches!(polled, Poll::Ready(Err(_))), "{polled:?}");
+        finished = PxpQueue::new(&mut guc, tick).finished();
+        if finished.is_some() {
+            break;
+        }
+        tick += 1_000_000;
+    }
+    assert_eq!(finished, Some(Ok(())));
+    // The ring: start stamp with TLB invalidation, then BB_START (PPGTT) of
+    // the client's batch at CLIENT_VA, in a context with its own PPGTT.
+    let job = hw.gsc_jobs.last().unwrap();
+    assert_eq!(&job[..2], &[0x02800101, 0x13044002]);
+    assert_eq!(job[5], 0x02800100);
+    assert_eq!(
+        &job[6..10],
+        &[0x18800101, pxp::CLIENT_VA as u32, 0, 0x0400_0000]
+    );
+    assert_ne!(*hw.gsc_roots.last().unwrap(), 0);
+
+    // The termination runs inline on VCS0 (base 0x1c0000).
+    PxpQueue::new(&mut guc, tick)
+        .submit_termination(&pxp::termination(pxp::ARB_SESSION))
+        .unwrap();
+    let mut finished = None;
+    for _ in 0..2000 {
+        tick += 1_000_000;
+        let polled = media_tick(&mut guc, &w, &mut hw, tick);
+        assert!(!matches!(polled, Poll::Ready(Err(_))), "{polled:?}");
+        finished = PxpQueue::new(&mut guc, tick).finished();
+        if finished.is_some() {
+            break;
+        }
+    }
+    assert_eq!(finished, Some(Ok(())));
+    assert_eq!(
+        hw.media_prefix.last(),
+        Some(&(0x1c0000, pxp::termination(pxp::ARB_SESSION).to_vec()))
+    );
+
+    // A stopping GT1 takes no PXP job.
+    guc.begin_stop(tick + 1);
+    assert_eq!(
+        PxpQueue::new(&mut guc, tick + 1).submit_gsc(&client),
+        Err(PxpError::NoDevice)
+    );
+    assert_eq!(
+        PxpQueue::new(&mut guc, tick + 1).submit_termination(&pxp::termination(pxp::ARB_SESSION)),
+        Err(PxpError::NoDevice)
+    );
+    let (_, polled) = media_until(&mut guc, &w, &mut hw, tick + 2, |p| p.is_ready());
+    assert_eq!(polled, Poll::Ready(Ok(MediaGucState::Stopped)));
+    drop(guc);
+    drop(client);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_media_gt_pxp_jobs_run_on_gsccs_ppgtt_and_the_first_vcs
+);

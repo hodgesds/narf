@@ -99,6 +99,17 @@ pub const CML_9BCC: u16 = 0x9BCC;
 pub const CML_9BE6: u16 = 0x9BE6;
 pub const CML_9BF6: u16 = 0x9BF6;
 
+// Broxton / Apollo Lake (Gen9 LP). Linux INTEL_BXT_IDS (5).
+pub const BXT_0A84: u16 = 0x0A84;
+pub const BXT_1A84: u16 = 0x1A84;
+pub const BXT_1A85: u16 = 0x1A85;
+pub const BXT_5A84: u16 = 0x5A84;
+pub const BXT_5A85: u16 = 0x5A85;
+
+// Gemini Lake (Gen9 LP). Linux INTEL_GLK_IDS (2).
+pub const GLK_3184: u16 = 0x3184;
+pub const GLK_3185: u16 = 0x3185;
+
 // Ice Lake (Gen11). Linux `include/drm/intel/pciids.h`
 // INTEL_ICL_IDS (15): PORT_F 8A50/8A52–8A54/8A56–8A5C/8A70/8A71
 // plus 8A51 and 8A5D.
@@ -324,6 +335,15 @@ pub enum Generation {
     /// all CML takes the KBL blob until a revision input lands
     /// (Gen9 Lane 7 remainder).
     Skylake,
+    /// Broxton (Apollo Lake) / Gemini Lake — Gen9 LP (`IS_GEN9_LP`).
+    /// The GT is graphics 9 without an LLC: the execlists owner runs it
+    /// with the Gen9-LP cache, workaround and power profile. The display
+    /// (display 9 on Broxton, 10 on Gemini Lake) drives its ports through
+    /// the DPIO PHY, which this driver does not program, so no display
+    /// path is admitted: a GOP framebuffer is kept as fixed-mode KMS only.
+    /// `asic` is "broxton" or "geminilake"; their GuC/HuC blobs differ
+    /// (`intel_gpu_gt::Gen9Platform`).
+    Broxton,
     /// Ice Lake / Elkhart Lake / Jasper Lake — Gen11. One
     /// variant for the whole Gen11 family, following the
     /// Raptor-Lake-under-AlderLake pattern: the GT/register
@@ -919,6 +939,49 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
         did: CML_9BF6,
         generation: Generation::Skylake,
         asic: "cometlake",
+    },
+    // Broxton and Gemini Lake (Gen9 LP). Linux INTEL_BXT_IDS, INTEL_GLK_IDS.
+    DeviceEntry {
+        name: "intel-gpu-bxt-0A84",
+        did: BXT_0A84,
+        generation: Generation::Broxton,
+        asic: "broxton",
+    },
+    DeviceEntry {
+        name: "intel-gpu-bxt-1A84",
+        did: BXT_1A84,
+        generation: Generation::Broxton,
+        asic: "broxton",
+    },
+    DeviceEntry {
+        name: "intel-gpu-bxt-1A85",
+        did: BXT_1A85,
+        generation: Generation::Broxton,
+        asic: "broxton",
+    },
+    DeviceEntry {
+        name: "intel-gpu-bxt-5A84",
+        did: BXT_5A84,
+        generation: Generation::Broxton,
+        asic: "broxton",
+    },
+    DeviceEntry {
+        name: "intel-gpu-bxt-5A85",
+        did: BXT_5A85,
+        generation: Generation::Broxton,
+        asic: "broxton",
+    },
+    DeviceEntry {
+        name: "intel-gpu-glk-3184",
+        did: GLK_3184,
+        generation: Generation::Broxton,
+        asic: "geminilake",
+    },
+    DeviceEntry {
+        name: "intel-gpu-glk-3185",
+        did: GLK_3185,
+        generation: Generation::Broxton,
+        asic: "geminilake",
     },
     // Ice Lake (Gen11). Linux INTEL_ICL_IDS, in macro order.
     DeviceEntry {

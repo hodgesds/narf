@@ -480,6 +480,11 @@ fn idle_companions(io: &impl MmioWindow, c: &DpConnection) -> Result<(), FsError
     let planes = match c.family {
         SourceFamily::Gen12(family) => crate::intel_gpu_pipes::gen12_plane_count(family),
         SourceFamily::Gen11(_) => 7,
+        // Display 10 (Gemini Lake): four on every pipe.
+        SourceFamily::Gen9 {
+            platform: crate::intel_gpu_gt::Gen9Platform::GeminiLake,
+            ..
+        } => 4,
         SourceFamily::Gen9 { .. } if c.pipe == Pipe::C => 2,
         SourceFamily::Gen9 { .. } => 3,
     };

@@ -208,6 +208,13 @@ pub const GMBUS0_HOLD_EXT: u32 = 1 << 7;
 /// burst-read sequence; the transport's transfers are ≤ 511
 /// bytes and never set it.
 pub const GMBUS0_BYTE_CNT_OVERRIDE: u32 = 1 << 6;
+/// `GMBUS_AKSV_SELECT` (bit 11): the controller sources the write data of
+/// the transfer from the hardware HDCP Aksv instead of `GMBUS3`
+/// (`intel_gmbus_output_aksv`).
+pub const GMBUS0_AKSV_SELECT: u32 = 1 << 11;
+/// `GEN9_GMBUS_BYTE_COUNT_MAX`: one data phase's limit; longer messages
+/// run as several phases (`gmbus_xfer_read` / `gmbus_xfer_write`).
+pub const GMBUS_CHUNK_MAX: usize = 511;
 
 /// A GMBUS pin number, the value `intel_gmbus.c` writes into `GMBUS0`
 /// with the rate (`bus->reg0 = pin | GMBUS_RATE_100KHZ`). Names and
@@ -321,6 +328,10 @@ pub enum GmbusPinTable {
     /// callers that know the PCH pass this table to
     /// [`gen9_ddc_pin`] directly.
     Cnp,
+    /// `gmbus_pins_bxt` (Broxton and Gemini Lake, which have no PCH):
+    /// pins 1-3, "dpb" / "dpc" / "misc". No Gen9-LP display path runs; the
+    /// arm keeps the table selection honest.
+    Bxt,
 }
 
 impl GmbusPinTable {
@@ -346,6 +357,7 @@ impl GmbusPinTable {
             // this arm only keeps the table selection honest now
             // that the generation exists.
             Generation::Skylake => GmbusPinTable::Spt,
+            Generation::Broxton => GmbusPinTable::Bxt,
             Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => {
                 GmbusPinTable::Mtp
             }
@@ -355,15 +367,16 @@ impl GmbusPinTable {
     /// `gmbus_pins_*[pin].name`, or `None` when the table has no such
     /// pin (`intel_gmbus_is_valid_pin` false).
     pub const fn name(self, pin: PinPair) -> Option<&'static str> {
-        use GmbusPinTable::{Cnp, Dg1, Dg2, Icp, Mtp, Spt};
+        use GmbusPinTable::{Bxt, Cnp, Dg1, Dg2, Icp, Mtp, Spt};
         Some(match (self, pin) {
             // SPT has no pins 1-3 — the wildcard arms below
             // would wrongly admit them.
             (Spt, PinPair::Pin1Bxt | PinPair::Pin2Bxt | PinPair::Pin3Bxt) => return None,
             // CNP renames pins 1-3: "dpb" / "dpc" / "misc".
-            (Cnp, PinPair::Pin1Bxt) => "dpb",
-            (Cnp, PinPair::Pin2Bxt) => "dpc",
-            (Cnp, PinPair::Pin3Bxt) => "misc",
+            (Cnp | Bxt, PinPair::Pin1Bxt) => "dpb",
+            (Cnp | Bxt, PinPair::Pin2Bxt) => "dpc",
+            (Cnp | Bxt, PinPair::Pin3Bxt) => "misc",
+            (Bxt, _) => return None,
             (Cnp, PinPair::Pin4Cnp) => "dpd",
             // SPT old numbering: 4 "dpc", 5 "dpb", 6 "dpd".
             (Spt, PinPair::Pin4Cnp) => "dpc",
@@ -474,6 +487,12 @@ pub const fn gen9_ddc_pin(table: GmbusPinTable, ddi: Ddi) -> Option<PinPair> {
             Ddi::A | Ddi::B => Some(PinPair::Pin1Bxt),
             Ddi::C => Some(PinPair::Pin2Bxt),
             Ddi::D => Some(PinPair::Pin4Cnp),
+            _ => None,
+        },
+        // `bxt_port_to_ddc_pin`: port B pin 1, port C pin 2.
+        GmbusPinTable::Bxt => match ddi {
+            Ddi::B => Some(PinPair::Pin1Bxt),
+            Ddi::C => Some(PinPair::Pin2Bxt),
             _ => None,
         },
         _ => None,
@@ -607,8 +626,8 @@ pub const DDC_SLAVE_SEGMENT: u8 = 0x30;
 pub enum GmbusError {
     /// The pin pair is reserved or not present on this generation.
     InvalidPinPair,
-    /// Transfer length is zero or exceeds the 511-byte
-    /// per-transfer hardware limit.
+    /// A message is empty or longer than an `i2c_msg` (64 KiB); messages
+    /// above the 511-byte data-phase limit run as several phases.
     TooManyBytes,
     /// The addressed slave did not ACK (`GMBUS2_SATOER`) — no
     /// sink at that address, or not that slave.
@@ -826,16 +845,18 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
     }
 
     fn check_len(len: usize) -> Result<(), GmbusError> {
-        if len == 0 || len > 0x1FF {
+        if len == 0 || len > 0xFFFF {
             return Err(GmbusError::TooManyBytes);
         }
         Ok(())
     }
 
     /// Step 1 of every transfer: select this bus's pin pair +
-    /// rate.
-    fn select_bus(&self) {
-        self.mmio.write32(GMBUS0, self.rate | self.pin.encode());
+    /// rate, with the data `source` (`gmbus0_source`: 0, or
+    /// [`GMBUS0_AKSV_SELECT`]).
+    fn select_bus(&self, source: u32) {
+        self.mmio
+            .write32(GMBUS0, source | self.rate | self.pin.encode());
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -919,17 +940,24 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
         idle
     }
 
-    /// One message's data phase (`gmbus_xfer_read`/`gmbus_xfer_write`)
-    /// with an optional `GMBUS1` index field.
+    /// One message's data phases (`gmbus_xfer_read`/`gmbus_xfer_write`):
+    /// one per [`GMBUS_CHUNK_MAX`] bytes, each with the optional `GMBUS1`
+    /// index field.
     fn message(&self, msg: &mut I2cMsg<'_>, gmbus1_index: u32) -> Result<(), GmbusError> {
         match msg {
             I2cMsg::Read { addr, buf } => {
-                let gmbus1 = self.program(*addr, buf.len(), true, gmbus1_index);
-                self.read_data_phase(gmbus1, buf)
+                for chunk in buf.chunks_mut(GMBUS_CHUNK_MAX) {
+                    let gmbus1 = self.program(*addr, chunk.len(), true, gmbus1_index);
+                    self.read_data_phase(gmbus1, chunk)?;
+                }
+                Ok(())
             }
             I2cMsg::Write { addr, data } => {
-                let gmbus1 = self.program(*addr, data.len(), false, gmbus1_index);
-                self.write_data_phase(gmbus1, data)
+                for chunk in data.chunks(GMBUS_CHUNK_MAX) {
+                    let gmbus1 = self.program(*addr, chunk.len(), false, gmbus1_index);
+                    self.write_data_phase(gmbus1, chunk)?;
+                }
+                Ok(())
             }
         }
     }
@@ -965,6 +993,12 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
     /// Messages must be 1..=511 bytes and the pin a real pin; both are
     /// checked before any register access.
     pub fn xfer(&self, msgs: &mut [I2cMsg<'_>]) -> Result<(), GmbusError> {
+        self.xfer_with_source(msgs, 0)
+    }
+
+    /// [`GmbusBus::xfer`] with `GMBUS0`'s data source (`do_gmbus_xfer`'s
+    /// `gmbus0_source`).
+    pub fn xfer_with_source(&self, msgs: &mut [I2cMsg<'_>], source: u32) -> Result<(), GmbusError> {
         if self.pin == PinPair::Disabled {
             return Err(GmbusError::InvalidPinPair);
         }
@@ -974,9 +1008,17 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
         if msgs.is_empty() {
             return Ok(());
         }
+        // Gen9 LP: GMBUS is a DC_off domain (`bxt_pwdoms_dc_off`,
+        // `glk_pwdoms_dc_off`); exit DC5 before the bus select and hold it
+        // off across the transfer. Inert on display 9 and every other
+        // display.
+        let _dc = crate::intel_gpu_gen9_dc_states::acquire(
+            crate::intel_gpu_gen9_dc_states::Gen9DcUser::Gmbus,
+        )
+        .map_err(|_| GmbusError::Timeout)?;
         let mut retried = false;
         'retry: loop {
-            self.select_bus();
+            self.select_bus(source);
             let mut i = 0;
             while i < msgs.len() {
                 let (result, inc) = if is_index_xfer(msgs, i) {
@@ -1115,6 +1157,26 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
     /// Write `data` to `slave`.
     pub fn write(&self, slave: u8, data: &[u8]) -> Result<(), GmbusError> {
         self.xfer(&mut [I2cMsg::Write { addr: slave, data }])
+    }
+
+    /// `intel_gmbus_output_aksv`: an index write of `DRM_HDCP_DDC_AKSV`
+    /// (0x10) to the HDCP slave 0x3A whose five data bytes the controller
+    /// takes from the hardware Aksv ([`GMBUS0_AKSV_SELECT`]); software
+    /// never sees them.
+    pub fn output_aksv(&self) -> Result<(), GmbusError> {
+        self.xfer_with_source(
+            &mut [
+                I2cMsg::Write {
+                    addr: 0x3A,
+                    data: &[0x10],
+                },
+                I2cMsg::Write {
+                    addr: 0x3A,
+                    data: &[0; 5],
+                },
+            ],
+            GMBUS0_AKSV_SELECT,
+        )
     }
 
     /// Write `data` to `slave` at byte `index` (an index transfer
