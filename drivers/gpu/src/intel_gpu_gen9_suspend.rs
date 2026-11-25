@@ -43,8 +43,11 @@
 //! DMC program that does not reload after resume leaves the panel dark (the
 //! Gen9 modeset requires a loaded DMC); the relight is the probe's full
 //! panel modeset at the probe mode, not a restore of the last atomic state.
-//! Not done, unlike Linux: the master interrupt is not re-enabled after
-//! resume (no Gen9 interrupt handler is installed in this driver).
+//! The master interrupt comes back after resume only with the Gen9
+//! interrupt owner (`narf.intel.gen9_irq=1`), whose own system-sleep hooks
+//! run `intel_irq_suspend` before this preparation and `intel_irq_resume`
+//! after the relight; without it no Gen9 interrupt handler is installed and
+//! the master stays off.
 //! `PP_DIVISOR` on pre-CNP south displays is reprogrammed by the relight
 //! only when probe programmed it (`narf.intel.pp_divisor=1`).
 

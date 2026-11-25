@@ -974,7 +974,7 @@ where
 }
 
 impl PciMsi {
-    fn new(
+    pub(crate) fn new(
         cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
         device: narf_bus::BusDevice,
     ) -> Result<Self, IrqError> {

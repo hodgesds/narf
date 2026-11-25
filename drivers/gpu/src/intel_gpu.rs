@@ -1800,6 +1800,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             panel_mode,
         );
     }
+    // Gen9 interrupts (`narf.intel.gen9_irq=1`, default off): the hard
+    // handler and service pass for the hotplug, display and GT interrupts,
+    // installed after the hotplug monitor and the display suspend owner (its
+    // system-sleep preparation runs before theirs). Without the option nothing
+    // is installed or written.
+    if let Some(platform) =
+        with_controller(|gpu| crate::intel_gpu_modeset::gen9_family_for_chip(gpu.chip)).flatten()
+    {
+        crate::intel_gpu_gen9_irq::install(
+            crate::intel_gpu_gen9_irq::requested(narf_boot::args()),
+            platform,
+            gt_bar,
+            device,
+            cap,
+        );
+    }
 
     // Power management (Q9, #1015): retain the PCI authority,
     // note the takeover mode for resume re-light, and register

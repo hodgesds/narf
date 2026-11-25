@@ -1157,8 +1157,23 @@ impl Owner {
                     self.tear_down().await;
                     break;
                 }
-                sleep_us(if busy { 50 } else { 1000 }).await;
+                self.pause(if busy { 50 } else { 1000 }).await;
             }
+        }
+    }
+
+    /// The run loop's pause between service passes. With the Gen9 interrupt
+    /// owner installed (`narf.intel.gen9_irq=1`) an interrupt on its vector
+    /// ends it early; completions are still proven by the CSB, never by the
+    /// interrupt.
+    async fn pause(&self, us: u64) {
+        match crate::intel_gpu_gen9_irq::vector_for_bar(&self.bar) {
+            Some(vector) => {
+                let _ =
+                    narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_us(us))
+                        .await;
+            }
+            None => sleep_us(us).await,
         }
     }
 

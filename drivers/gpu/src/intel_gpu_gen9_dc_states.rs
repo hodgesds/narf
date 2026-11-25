@@ -958,10 +958,11 @@ impl Gen9DcCore {
 
     /// `assert_can_enable_dc9`'s register checks, in its order: DC9 or DC5
     /// already programmed, the driver's power well 2 request, then the
-    /// device's interrupts (`intel_parent_irq_enabled`). This driver installs
-    /// no Gen9 interrupt handler, so "disabled" is the device's own gate:
-    /// `GEN8_MASTER_IRQ_CONTROL` clear, which `gen8_master_intr_disable` (in
-    /// `intel_irq_suspend`'s reset) leaves.
+    /// device's interrupts (`intel_parent_irq_enabled`). "Disabled" is the
+    /// device's own gate: `GEN8_MASTER_IRQ_CONTROL` clear, which
+    /// `gen8_master_intr_disable` (in `intel_irq_suspend`'s reset) leaves.
+    /// With the Gen9 interrupt owner (`narf.intel.gen9_irq=1`) the
+    /// production hooks also refuse while its software flag is set.
     fn dc9_gates<M: MmioWindow + ?Sized>(&self, regs: &M) -> Result<(), Dc9Block> {
         use crate::intel_gpu_gen9_irq::{GEN8_MASTER_IRQ, GEN8_MASTER_IRQ_CONTROL};
         let state = regs.read32(DC_STATE_EN);
@@ -1933,6 +1934,13 @@ impl Gen9DcSuspend for ServiceDcSuspend {
         let Some(service) = service_for(&self.bar) else {
             return Err(Dc9Block::NotSuspending);
         };
+        // assert_can_enable_dc9's intel_parent_irq_enabled: the Gen9
+        // interrupt owner's software flag, beside the master gate below.
+        if crate::intel_gpu_gen9_irq::irqs_enabled_for_bar(&self.bar) {
+            return Err(Dc9Block::InterruptsLive(
+                crate::intel_gpu_gen9_irq::GEN8_MASTER_IRQ_CONTROL,
+            ));
+        }
         let mut core = service.core.lock();
         core.dc9_admit(&service.window)
     }
@@ -2145,12 +2153,19 @@ fn suspend_late() {
     // Gen9 LP: bxt_display_core_uninit, then bxt_enable_dc9
     // (intel_display_power_suspend_late). A refusal leaves DC0 and the
     // suspend proceeds.
+    let irqs_live = crate::intel_gpu_gen9_irq::irqs_enabled_for_bar(&service.bar);
     let admitted = {
         let mut core = service.core.lock();
         if !core.lp() || core.refs(Gen9DcUser::Suspend) == 0 {
             return;
         }
-        core.dc9_admit(&service.window).map(|()| core.glk())
+        if irqs_live {
+            Err(Dc9Block::InterruptsLive(
+                crate::intel_gpu_gen9_irq::GEN8_MASTER_IRQ_CONTROL,
+            ))
+        } else {
+            core.dc9_admit(&service.window).map(|()| core.glk())
+        }
     };
     let outcome = match admitted {
         Ok(glk) => match display_core_uninit_lp(&service.window, glk) {
