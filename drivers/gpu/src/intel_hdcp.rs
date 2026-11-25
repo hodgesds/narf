@@ -149,10 +149,12 @@ pub const fn mtl_chicken_trans(t: u8) -> u64 {
     0x604e0 + t as u64 * 0x1000
 }
 pub const HDCP_LINE_REKEY_DISABLE: u32 = 1 << 0;
-/// `HSW_PWR_WELL_CTL2`: the driver's power-well request register; PW_1
-/// is index 0 (`ICL_PW_CTL_IDX_PW_1`).
+/// `HSW_PWR_WELL_CTL1` (BIOS) and `HSW_PWR_WELL_CTL2` (driver) power-well
+/// request registers; PW_1 is index 0 (`ICL_PW_CTL_IDX_PW_1`), its state
+/// bit 0.
+pub const HSW_PWR_WELL_CTL1: u64 = 0x45400;
 pub const HSW_PWR_WELL_CTL2: u64 = 0x45404;
-const PW1_REQ_STATE: u32 = 0b11;
+const PW1_STATE: u32 = 0b01;
 
 /// `HDCP_ENCRYPT_STATUS_CHANGE_TIMEOUT_MS`.
 pub const ENCRYPT_STATUS_CHANGE_TIMEOUT_MS: u64 = 50;
@@ -376,8 +378,7 @@ pub trait HdcpShim: Send {
         buf: &mut [u8],
     ) -> Result<usize, HdcpError>;
     /// `config_stream_type` (DP errata); HDMI has none.
-    fn config_stream_type(&mut self, is_repeater: bool, content_type: u8)
-        -> Result<(), HdcpError>;
+    fn config_stream_type(&mut self, is_repeater: bool, content_type: u8) -> Result<(), HdcpError>;
     /// `check_2_2_link`.
     fn check_2_2_link(&mut self) -> Result<LinkCheck, HdcpError>;
 }
@@ -692,9 +693,13 @@ impl HdcpLink {
         (1 << (31 - transcoder as u32)) | ((transcoder as u32 + 1) << 20)
     }
 
-    /// `hdcp_key_loadable`: PW_1 requested and on.
+    /// `hdcp_key_loadable`: PW_1 on. Linux checks its own driver request
+    /// and the state bit; a display NARF inherited from the firmware has
+    /// PW_1 on by the BIOS request, so the state bit of either request
+    /// register is taken.
     fn key_loadable<M: MmioWindow + ?Sized>(io: &M) -> bool {
-        io.read32(HSW_PWR_WELL_CTL2) & PW1_REQ_STATE == PW1_REQ_STATE
+        let (bios, driver) = (io.read32(HSW_PWR_WELL_CTL1), io.read32(HSW_PWR_WELL_CTL2));
+        bios != u32::MAX && driver != u32::MAX && (bios | driver) & PW1_STATE != 0
     }
 
     /// `intel_hdcp_clear_keys`.
@@ -750,7 +755,9 @@ impl HdcpLink {
         }
         let (reg, bit) = match self.rekey {
             LineRekey::None => return,
-            LineRekey::ChickenTrans => (mtl_chicken_trans(self.transcoder), HDCP_LINE_REKEY_DISABLE),
+            LineRekey::ChickenTrans => {
+                (mtl_chicken_trans(self.transcoder), HDCP_LINE_REKEY_DISABLE)
+            }
             LineRekey::TransDdi => (
                 trans_ddi_func_ctl(self.transcoder),
                 TRANS_DDI_HDCP_LINE_REKEY_DISABLE,
@@ -944,7 +951,10 @@ impl HdcpLink {
     }
 
     /// `intel_hdcp_auth_downstream`: part 2, the repeater.
-    async fn auth_downstream<M, S, T, E>(&self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    async fn auth_downstream<M, S, T, E>(
+        &self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1079,7 +1089,10 @@ impl HdcpLink {
     }
 
     /// `intel_hdcp1_enable`.
-    async fn hdcp1_enable<M, S, T, E>(&mut self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    async fn hdcp1_enable<M, S, T, E>(
+        &mut self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1302,7 +1315,10 @@ impl HdcpLink {
     }
 
     /// `hdcp2_locality_check`: three tries.
-    async fn locality_check<M, S, T, E>(&self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    async fn locality_check<M, S, T, E>(
+        &self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1423,7 +1439,10 @@ impl HdcpLink {
     }
 
     /// `_hdcp2_propagate_stream_management_info`.
-    async fn propagate_once<M, S, T, E>(&mut self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    async fn propagate_once<M, S, T, E>(
+        &mut self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1485,7 +1504,10 @@ impl HdcpLink {
     }
 
     /// `hdcp2_deauthenticate_port` (`close_hdcp_session`).
-    async fn deauthenticate<M, S, T, E>(&self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    async fn deauthenticate<M, S, T, E>(
+        &self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1499,7 +1521,10 @@ impl HdcpLink {
     }
 
     /// `hdcp2_enable_encryption`.
-    fn enable_encryption<M, S, T, E>(&mut self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    fn enable_encryption<M, S, T, E>(
+        &mut self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1508,11 +1533,7 @@ impl HdcpLink {
     {
         self.toggle_signalling(cx, true);
         if cx.read(self.hdcp2_status()) & LINK_AUTH_STATUS != 0 {
-            cx.rmw(
-                trans_hdcp2_ctl(self.transcoder),
-                0,
-                CTL_LINK_ENCRYPTION_REQ,
-            );
+            cx.rmw(trans_hdcp2_ctl(self.transcoder), 0, CTL_LINK_ENCRYPTION_REQ);
         }
         let ret = cx
             .wait(
@@ -1535,11 +1556,7 @@ impl HdcpLink {
         T: HdcpTransport + ?Sized,
         E: HdcpEnv,
     {
-        cx.rmw(
-            trans_hdcp2_ctl(self.transcoder),
-            CTL_LINK_ENCRYPTION_REQ,
-            0,
-        );
+        cx.rmw(trans_hdcp2_ctl(self.transcoder), CTL_LINK_ENCRYPTION_REQ, 0);
         let _ = cx.wait(
             self.hdcp2_status(),
             LINK_ENCRYPTION_STATUS,
@@ -1623,7 +1640,10 @@ impl HdcpLink {
     }
 
     /// `_intel_hdcp2_enable`.
-    async fn hdcp2_enable<M, S, T, E>(&mut self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    async fn hdcp2_enable<M, S, T, E>(
+        &mut self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1638,7 +1658,10 @@ impl HdcpLink {
     }
 
     /// `_intel_hdcp2_disable`.
-    async fn hdcp2_disable<M, S, T, E>(&mut self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    async fn hdcp2_disable<M, S, T, E>(
+        &mut self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1709,10 +1732,7 @@ impl HdcpLink {
         if !self.force_hdcp14 && self.hdcp2_capable(cx) {
             ret = self.hdcp2_enable(cx).await;
         }
-        if ret.is_err()
-            && self.content_type != msg::STREAM_TYPE1
-            && Self::hdcp1_capable(cx.shim)
-        {
+        if ret.is_err() && self.content_type != msg::STREAM_TYPE1 && Self::hdcp1_capable(cx.shim) {
             ret = self.hdcp1_enable(cx).await;
         }
         if ret.is_ok() {
@@ -1723,7 +1743,10 @@ impl HdcpLink {
 
     /// `intel_hdcp_disable`: UNDESIRED, then whichever version is
     /// encrypted goes down.
-    pub async fn disable<M, S, T, E>(&mut self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    pub async fn disable<M, S, T, E>(
+        &mut self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1746,7 +1769,10 @@ impl HdcpLink {
     /// `intel_hdcp_check_work`'s check: the HDCP 2.2 link check when HDCP
     /// 2.2 is encrypted, else the HDCP 1.4 one. `Ok` keeps the check
     /// scheduled at [`HdcpLink::check_period_ms`].
-    pub async fn check_link<M, S, T, E>(&mut self, cx: &mut Ctx<'_, M, S, T, E>) -> Result<(), HdcpError>
+    pub async fn check_link<M, S, T, E>(
+        &mut self,
+        cx: &mut Ctx<'_, M, S, T, E>,
+    ) -> Result<(), HdcpError>
     where
         M: MmioWindow + Sync + ?Sized,
         S: HdcpShim,
@@ -1848,8 +1874,7 @@ pub fn update_pipe(link: &HdcpLink, uapi: Uapi) -> Commit {
 /// `intel_hdcp_enable`'s condition at encoder enable: DESIRED, or ENABLED
 /// that the driver has not (yet) enabled.
 pub fn enable_on_route(link: &HdcpLink, uapi: Uapi) -> bool {
-    uapi.cp == CpValue::Desired
-        || (uapi.cp == CpValue::Enabled && link.value == CpValue::Undesired)
+    uapi.cp == CpValue::Desired || (uapi.cp == CpValue::Enabled && link.value == CpValue::Undesired)
 }
 
 /// `intel_hdcp_atomic_check`'s rule for a connector losing its CRTC (its

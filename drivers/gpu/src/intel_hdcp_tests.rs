@@ -670,8 +670,7 @@ fn smoke_intel_hdcp_register_and_message_layouts() -> TestResult {
         (mtl_chicken_trans(1), 0x614e0),
         (trans_ddi_func_ctl(2), 0x62400),
     ];
-    if regs.iter().any(|(a, b)| a != b) || HDCP_SHA_TEXT != 0x66d18 || HDCP_REP_CTL != 0x66d00
-    {
+    if regs.iter().any(|(a, b)| a != b) || HDCP_SHA_TEXT != 0x66d18 || HDCP_REP_CTL != 0x66d00 {
         return TestResult::Fail("HDCP register offsets differ from intel_hdcp_regs.h");
     }
     // HDCP_TRANS{A..D}_REP_PRESENT | HDCP_TRANS{A..D}_SHA1_M0.
@@ -866,7 +865,9 @@ fn hdcp14_dp_sink() -> TestResult {
     if drive(link.check_link(&mut cx)) != Some(Ok(())) {
         return TestResult::Fail("clean link check failed");
     }
-    cx.shim.dpcd.put(shim::DP_AUX_HDCP_BSTATUS, &[shim::DP_BSTATUS_LINK_FAILURE]);
+    cx.shim
+        .dpcd
+        .put(shim::DP_AUX_HDCP_BSTATUS, &[shim::DP_BSTATUS_LINK_FAILURE]);
     if drive(link.check_link(&mut cx)) != Some(Ok(())) || link.value != CpValue::Enabled {
         return TestResult::Fail("link failure did not re-authenticate");
     }
@@ -1047,8 +1048,7 @@ fn smoke_intel_hdcp14_hdmi() -> TestResult {
     // A wrong Ri' after encryption stopped: re-authentication fails, DESIRED.
     cx.shim.ddc.regs.insert(shim::DDC_RI_PRIME, vec![0, 0]);
     regs.clear_bits(trans_hdcp_status(2), HDCP_STATUS_RI_MATCH);
-    if drive(link.check_link(&mut cx)).is_none_or(|r| r.is_ok()) || link.value != CpValue::Desired
-    {
+    if drive(link.check_link(&mut cx)).is_none_or(|r| r.is_ok()) || link.value != CpValue::Desired {
         return TestResult::Fail("Ri' mismatch not DESIRED");
     }
     drop(cx);
@@ -1088,6 +1088,26 @@ fn smoke_intel_hdcp14_hdmi() -> TestResult {
             != 5
     {
         return TestResult::Fail("failed key load not retried and cleared");
+    }
+    // PW_1 off in both request registers: hdcp_key_loadable refuses before
+    // any key register is written; the BIOS request alone suffices.
+    let regs = Regs::new(2);
+    regs.0.lock().regs.insert(HSW_PWR_WELL_CTL2, 0);
+    let mut link = HdcpLink::new(Protocol::Hdmi, 2, LineRekey::None, true);
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: None::<&mut FwModel>,
+        env: &mut env,
+    };
+    if drive(link.enable(&mut cx, 0)) != Some(Err(HdcpError::KeyNotLoadable))
+        || !regs.wrote(HDCP_KEY_CONF).is_empty()
+    {
+        return TestResult::Fail("key load with PW_1 off");
+    }
+    regs.0.lock().regs.insert(HSW_PWR_WELL_CTL1, 0b11);
+    if drive(link.enable(&mut cx, 0)) != Some(Ok(())) {
+        return TestResult::Fail("BIOS-requested PW_1 not accepted");
     }
     TestResult::Pass
 }
@@ -1190,7 +1210,8 @@ kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp22_dp_mei);
 /// The HDMI sink script for an HDCP 2.2 repeater with one device.
 fn hdmi_repeater(d: &Hdcp2Data) -> HdmiSink {
     let mut s = HdmiSink::default();
-    s.regs.insert(shim::HDCP_2_2_HDMI_REG_VER_OFFSET, vec![1 << 2]);
+    s.regs
+        .insert(shim::HDCP_2_2_HDMI_REG_VER_OFFSET, vec![1 << 2]);
     let with_id = |id: u8, body: &[&[u8]]| {
         let mut m = vec![id];
         for b in body {
@@ -1210,7 +1231,10 @@ fn hdmi_repeater(d: &Hdcp2Data) -> HdmiSink {
                 with_id(msg::AKE_SEND_PAIRING_INFO, &[&d.pairing]),
             ],
         ),
-        (msg::LC_INIT, vec![with_id(msg::LC_SEND_LPRIME, &[&d.lprime])]),
+        (
+            msg::LC_INIT,
+            vec![with_id(msg::LC_SEND_LPRIME, &[&d.lprime])],
+        ),
         (msg::SKE_SEND_EKS, vec![recvid]),
         (
             msg::REP_STREAM_MANAGE,
@@ -1301,7 +1325,10 @@ fn hdcp22_hdmi_gsc() -> TestResult {
 fn smoke_intel_hdcp22_hdmi_repeater_gsc() -> TestResult {
     hdcp22_hdmi_gsc()
 }
-kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp22_hdmi_repeater_gsc);
+kernel_test_in!(
+    "drivers/gpu/intel_hdcp",
+    smoke_intel_hdcp22_hdmi_repeater_gsc
+);
 
 fn hdcp22_fallback() -> TestResult {
     // No firmware: type 0 falls back to HDCP 1.4, type 1 is refused.
@@ -1362,7 +1389,10 @@ fn hdcp22_fallback() -> TestResult {
 fn smoke_intel_hdcp22_fallback_and_type1() -> TestResult {
     hdcp22_fallback()
 }
-kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp22_fallback_and_type1);
+kernel_test_in!(
+    "drivers/gpu/intel_hdcp",
+    smoke_intel_hdcp22_fallback_and_type1
+);
 
 // ── The property state machine ───────────────────────────────────────
 
@@ -1471,7 +1501,9 @@ fn smoke_intel_hdcp_srm() -> TestResult {
         return TestResult::Fail("invalid VRLs not discarded");
     }
     // HDCP 2.x SRM: id 0x91, one receiver ID (count 10 bits split 8 + 2).
-    let mut v2 = vec![0x91, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01, 0x8c, 0x00, 0x40, 0, 0];
+    let mut v2 = vec![
+        0x91, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01, 0x8c, 0x00, 0x40, 0, 0,
+    ];
     v2.extend(KSV0);
     v2.extend([0; 384]);
     if Srm::parse(&v2).map(|s| s.revoked) != Some(vec![KSV0]) {
@@ -1559,13 +1591,12 @@ fn smoke_intel_hdcp_aksv_transports() -> TestResult {
     if bus.read_indexed(0x3A, 0x80, &mut cert).is_err() {
         return TestResult::Fail("long DDC read failed against the mock");
     }
-    let counts: Vec<u32> = gm
-        .0
-        .lock()
-        .iter()
-        .filter(|x| x.0 == GMBUS1 && x.1 & GMBUS1_SW_RDY != 0 && x.1 & GMBUS1_DIR_READ != 0)
-        .map(|x| (x.1 >> 16) & 0x1ff)
-        .collect();
+    let counts: Vec<u32> =
+        gm.0.lock()
+            .iter()
+            .filter(|x| x.0 == GMBUS1 && x.1 & GMBUS1_SW_RDY != 0 && x.1 & GMBUS1_DIR_READ != 0)
+            .map(|x| (x.1 >> 16) & 0x1ff)
+            .collect();
     if counts != [511, 23] {
         return TestResult::Fail("long GMBUS read not split at 511 bytes");
     }
