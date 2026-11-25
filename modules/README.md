@@ -128,12 +128,17 @@ cargo xtask build-module --package <crate> \
 This compiles the crate, takes its own object members out of the
 `staticlib` archive, and `ld -r`s them into the single relocatable object
 the loader wants — merging the per-static `.modinfo` sections in the
-process. `cargo xtask test` stages the reference object in the initramfs and
-loads, executes, and unloads it on both architecture paths when QEMU is
-available.
+process, and folding rustc's per-function and per-object sections into one
+`.text` / `.rodata` / `.data` / `.bss` (plus `.rodata.str`, `.rodata.cst`
+and `.data.rel.ro`) so the object carries a handful of section headers
+rather than one per function. `cargo xtask test` stages the reference
+object in the initramfs and loads, executes, and unloads it on both
+architecture paths when QEMU is available; the whole-driver fixtures ride
+as `lib/modules/test-fixtures/*.ko.lz4`.
 
 Add `--compress` to wrap the ABI-stamped ELF in a versioned `.ko.lz4`
-envelope. The loader caps both compressed and decompressed lengths at 32 MiB.
+envelope (standard LZ4 block format from a hash-chain match finder). The
+loader caps both compressed and decompressed lengths at 32 MiB.
 
 Production kernels read trusted raw Ed25519 public keys from the absolute
 path in `NARF_MODULE_TRUSTED_KEYS` at build time. Build the final raw or

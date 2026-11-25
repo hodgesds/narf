@@ -2247,6 +2247,153 @@ fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_execve_with_envp_pack_accepts);
 
+/// execve of a minimal staged ELF with `args` as argv and an empty envp, as
+/// [`smoke_userspace_execve_with_envp_pack_accepts`] runs it: the kernel-test
+/// stub has no user ctx, so an execve whose arguments copied and whose image
+/// (stack included) loaded ends at the -ENOSYS bail. A stack the argument
+/// block does not fit fails the load as -ENOEXEC; a list past the
+/// `bprm_stack_limits` budget is -E2BIG before anything loads.
+#[cfg(target_arch = "x86_64")]
+fn execve_with_args(mount: &str, args: &[alloc::vec::Vec<u8>]) -> Option<SyscallReturn> {
+    crate::syscall::__test_clear_global();
+    crate::user_task::clear_current();
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let elf = build_minimal_elf_for_execve();
+    let handle = {
+        use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+        let auth = bootstrap_mount_authority();
+        registry()
+            .mount(
+                &auth,
+                mount,
+                MemFs::with_seeds("execve-args", &[("init", elf.as_slice())]),
+            )
+            .ok()
+    };
+    let path = alloc::format!("{mount}/init\0");
+    let mut argv: alloc::vec::Vec<u64> = args.iter().map(|a| a.as_ptr() as u64).collect();
+    argv.push(0);
+    let envp: [u64; 1] = [0];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
+    if let Some(h) = &handle {
+        let _ = narf_filesystem::registry().unmount(h, mount);
+    }
+    crate::syscall::__test_clear_global();
+    ctx.ret
+}
+
+/// One NUL-terminated argument: `len` bytes of `b'a'` and the NUL.
+#[cfg(target_arch = "x86_64")]
+fn exec_arg(len: usize) -> alloc::vec::Vec<u8> {
+    let mut arg = alloc::vec![b'a'; len];
+    arg.push(0);
+    arg
+}
+
+/// Linux bounds argv by the stack rlimit (`bprm_stack_limits`), not by an
+/// entry count: 2000 one-byte arguments load. NARF used to walk at most 1024
+/// argv slots and return EFAULT for a longer list.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_accepts_argv_past_1024_entries() -> TestResult {
+    let args: alloc::vec::Vec<_> = (0..2000).map(|_| exec_arg(1)).collect();
+    match execve_with_args("/execve-argc", &args) {
+        Some(r) if r == errno_ret(ENOSYS) => TestResult::Pass,
+        Some(r) if r == errno_ret(EFAULT) => TestResult::Fail("2000 argv entries returned EFAULT"),
+        _ => TestResult::Fail("execve with 2000 argv entries didn't reach the no-user-ctx bail"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_accepts_argv_past_1024_entries
+);
+
+/// One argument may be up to `MAX_ARG_STRLEN` (128 KiB with its NUL). NARF
+/// used to copy at most 4096 bytes of each and return EFAULT past that.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_accepts_100k_argument() -> TestResult {
+    match execve_with_args("/execve-arglen", &[exec_arg(100 * 1024)]) {
+        Some(r) if r == errno_ret(ENOSYS) => TestResult::Pass,
+        Some(r) if r == errno_ret(EFAULT) => TestResult::Fail("a 100 KiB argument returned EFAULT"),
+        _ => TestResult::Fail("execve with a 100 KiB argument didn't reach the no-user-ctx bail"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_execve_accepts_100k_argument);
+
+/// A 1 MiB argument block is inside the default budget (a quarter of the
+/// 8 MiB stack rlimit), so the loader must commit enough stack to lay it out:
+/// it writes the block through the direct map, and only the top 128 KiB of
+/// the stack used to be committed (ENOEXEC from the stack overflow).
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_lays_out_1mib_argument_block() -> TestResult {
+    let args: alloc::vec::Vec<_> = (0..8).map(|_| exec_arg(128 * 1024 - 1)).collect();
+    match execve_with_args("/execve-argblock", &args) {
+        Some(r) if r == errno_ret(ENOSYS) => TestResult::Pass,
+        Some(r) if r == errno_ret(ENOEXEC) => {
+            TestResult::Fail("a 1 MiB argument block overflowed the committed stack")
+        }
+        _ => {
+            TestResult::Fail("execve with a 1 MiB argument block didn't reach the no-user-ctx bail")
+        }
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_lays_out_1mib_argument_block
+);
+
+/// `copy_strings`: an argument longer than `MAX_ARG_STRLEN` is E2BIG, not a
+/// bad address.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_overlong_argument_is_e2big() -> TestResult {
+    match execve_with_args("/execve-argmax", &[exec_arg(128 * 1024)]) {
+        Some(r) if r == errno_ret(E2BIG) => TestResult::Pass,
+        Some(r) if r == errno_ret(EFAULT) => {
+            TestResult::Fail("an argument past MAX_ARG_STRLEN returned EFAULT, not E2BIG")
+        }
+        _ => TestResult::Fail("an argument past MAX_ARG_STRLEN was not refused with E2BIG"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_overlong_argument_is_e2big
+);
+
+/// `bprm_stack_limits` caps the argument block at three quarters of
+/// `_STK_LIM` (6 MiB) whatever the rlimit: 50 near-maximal arguments
+/// (6.4 MiB) are E2BIG.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_execve_argument_block_past_budget_is_e2big() -> TestResult {
+    let args: alloc::vec::Vec<_> = (0..50).map(|_| exec_arg(128 * 1024 - 1)).collect();
+    match execve_with_args("/execve-argbudget", &args) {
+        Some(r) if r == errno_ret(E2BIG) => TestResult::Pass,
+        _ => TestResult::Fail("a 6.4 MiB argument block was not refused with E2BIG"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_argument_block_past_budget_is_e2big
+);
+
 // ── userspace/init ─────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]

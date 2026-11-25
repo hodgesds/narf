@@ -46,6 +46,7 @@ pub(crate) mod ffi {
         ) -> i32;
         pub fn narf_firmware_signed(handle: u64) -> i32;
         pub fn narf_firmware_close(handle: u64) -> i32;
+        pub fn narf_wireless_regdomain(buf: *mut u8, len: usize, out_len: *mut usize) -> i32;
     }
 }
 
@@ -475,5 +476,62 @@ pub mod firmware {
         // SAFETY: closing our own open handle once.
         let _ = unsafe { ffi::narf_firmware_close(handle) };
         result
+    }
+}
+
+/// The kernel's regulatory domain: the one the built-in driver reads.
+///
+/// Built in, `narf_wireless::reg::db` holds it: a signed deployment policy
+/// (`wireless-regulatory.bin`) when one is staged, else world `00` from the
+/// Linux database authenticated at image build, with the user's and the
+/// Country IE's changes on top. The module reads that same installed domain
+/// through `narf_wireless_regdomain` (one NRGD v1 record, decoded by
+/// `narf_wireless::reg::parse_domain_record`, which accepts world `00`),
+/// again on every read, as built in each check reads the live database. An
+/// unchanged record keeps the previous snapshot's `Arc`, so the station's
+/// identity check still sees an unchanged domain as unchanged.
+///
+/// No domain (`-ENODATA`: nothing installed and nothing to bootstrap) or a
+/// record that does not decode is `None`: the caller fails closed, as built
+/// in on an empty database.
+pub mod reg {
+    use super::*;
+    use alloc::sync::Arc;
+    use narf_wireless::reg::RegulatoryDomain;
+
+    /// Largest NRGD v1 record: 12-byte header, at most 64 16-byte rules
+    /// (the export refuses a larger domain).
+    const MAX_RECORD: usize = 12 + 64 * 16;
+
+    /// The last record and its decoded domain.
+    static CACHE: IrqSafeSpinLock<Option<(Vec<u8>, Arc<RegulatoryDomain>)>> =
+        IrqSafeSpinLock::new(None);
+
+    /// The kernel's installed domain, or `None` (fail closed).
+    pub fn snapshot() -> Option<Arc<RegulatoryDomain>> {
+        let mut record = [0u8; MAX_RECORD];
+        let mut len = 0usize;
+        // SAFETY: `record` names `MAX_RECORD` writable bytes; `len` is a
+        // live local.
+        let rc =
+            unsafe { ffi::narf_wireless_regdomain(record.as_mut_ptr(), record.len(), &mut len) };
+        let mut cache = CACHE.lock();
+        if rc != 0 || len > record.len() {
+            *cache = None;
+            return None;
+        }
+        let record = &record[..len];
+        if let Some((cached, domain)) = cache.as_ref() {
+            if cached.as_slice() == record {
+                return Some(domain.clone());
+            }
+        }
+        let Ok(domain) = narf_wireless::reg::parse_domain_record(record) else {
+            *cache = None;
+            return None;
+        };
+        let domain = Arc::new(domain);
+        *cache = Some((record.to_vec(), domain.clone()));
+        Some(domain)
     }
 }

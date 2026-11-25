@@ -1546,13 +1546,24 @@ fn e2e_driver_module_unload_and_reload() -> TestResult {
 }
 kernel_test_in!("modules/e2e", e2e_driver_module_unload_and_reload);
 
+/// Copy a staged fixture with `abi` written over its `kernel_abi=` placeholder.
+///
+/// The large driver fixtures are staged as `NRFCMOD` LZ4 envelopes
+/// (`*.ko.lz4`) to keep the resident initramfs small; those are decoded first
+/// and the raw ELF is stamped, since the placeholder lives inside the
+/// compressed bytes. `None` when an envelope does not decode or the image has
+/// no placeholder.
 fn stamp_fixture_abi(staged: &[u8], abi: u32) -> Option<Vec<u8>> {
     const PLACEHOLDER: &[u8] = b"kernel_abi=0x00000000";
-    let start = staged
+    let mut image = if crate::compression::is_compressed(staged) {
+        crate::compression::decompress(staged).ok()?
+    } else {
+        staged.to_vec()
+    };
+    let start = image
         .windows(PLACEHOLDER.len())
         .position(|w| w == PLACEHOLDER)?
         + b"kernel_abi=0x".len();
-    let mut image = staged.to_vec();
     image[start..start + 8].copy_from_slice(format!("{abi:08x}").as_bytes());
     Some(image)
 }
@@ -1575,7 +1586,7 @@ fn e2e_intel_gpu_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/intel_gpu.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/intel_gpu.ko.lz4")
     else {
         return TestResult::Fail("Intel GPU module fixture absent from staged initramfs");
     };
@@ -1714,7 +1725,7 @@ fn e2e_ath11k_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath11k.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath11k.ko.lz4")
     else {
         return TestResult::Fail("ath11k module fixture absent from staged initramfs");
     };
@@ -1795,7 +1806,7 @@ fn e2e_mt76_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/mt76.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/mt76.ko.lz4")
     else {
         return TestResult::Fail("mt76 module fixture absent from staged initramfs");
     };
@@ -1876,7 +1887,7 @@ fn e2e_ath10k_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath10k.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath10k.ko.lz4")
     else {
         return TestResult::Fail("ath10k module fixture absent from staged initramfs");
     };
@@ -1955,7 +1966,7 @@ fn e2e_ath9k_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath9k.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath9k.ko.lz4")
     else {
         return TestResult::Fail("ath9k module fixture absent from staged initramfs");
     };
@@ -2018,13 +2029,16 @@ kernel_test_in!("modules/e2e/ath9k", e2e_ath9k_module_registration);
 /// The real brcmfmac `.ko` (`narf-drivers-wireless-brcm --features module`,
 /// module name `brcm`: the brcmfmac chip discovery, CR4/CA7 firmware
 /// download, msgbuf common rings and the shared FullMAC station over
-/// `narf-module-rt` and the KABI, including `narf_pci_config_write32`).
-/// The relocations resolve and init runs; the module declares the
-/// autoconnect parameters and takes a load argument; it claims every
-/// Broadcom FullMAC PCIe id of the built-in table under its own match name
-/// (so the built-in entries survive), refuses a probe with no device
-/// context before any device access, and unloads leaving no match behind.
-/// QEMU has no Broadcom Wi-Fi, so bring-up itself is proven on hardware.
+/// `narf-module-rt` and the KABI, including `narf_pci_config_write32` and
+/// `narf_wireless_regdomain`). The relocations resolve and init runs; the
+/// module declares the autoconnect parameters and takes a load argument; it
+/// takes its regulatory domain from the kernel (it imports
+/// `narf_wireless_regdomain` and names no `wireless-regulatory.bin` of its
+/// own); it claims every Broadcom FullMAC PCIe id of the built-in table
+/// under its own match name (so the built-in entries survive), refuses a
+/// probe with no device context before any device access, and unloads
+/// leaving no match behind. QEMU has no Broadcom Wi-Fi, so bring-up itself
+/// is proven on hardware.
 fn e2e_brcmfmac_module_registration() -> TestResult {
     use narf_bus::driver_match::{__module_thunk_for_test, count};
     const BROADCOM: u16 = 0x14e4;
@@ -2040,7 +2054,7 @@ fn e2e_brcmfmac_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/brcmfmac.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/brcmfmac.ko.lz4")
     else {
         return TestResult::Fail("brcmfmac module fixture absent from staged initramfs");
     };
@@ -2050,6 +2064,16 @@ fn e2e_brcmfmac_module_registration() -> TestResult {
     let Some(image) = stamp_fixture_abi(staged, abi) else {
         return TestResult::Fail("brcmfmac module has no ABI placeholder");
     };
+    // The regulatory domain is the kernel's: the import is in the symbol
+    // table (and must resolve for init to run), the signed policy file is
+    // not opened by name. Searched in the decompressed image: the staged
+    // fixture is LZ4.
+    let names = |needle: &[u8]| image.windows(needle.len()).any(|w| w == needle);
+    if !names(b"narf_wireless_regdomain\0") || names(b"wireless-regulatory.bin") {
+        return TestResult::Fail(
+            "brcmfmac.ko does not take its regulatory domain from narf_wireless_regdomain",
+        );
+    }
     let before = count();
     let module = match sys_init_module_with_params(&image, "ssid=narf-e2e") {
         Ok(module) => module,
@@ -2132,7 +2156,7 @@ fn e2e_rtw88_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/rtw88.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/rtw88.ko.lz4")
     else {
         return TestResult::Fail("rtw88 module fixture absent from staged initramfs");
     };
@@ -2255,7 +2279,7 @@ fn e2e_rtl_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/rtl.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/rtl.ko.lz4")
     else {
         return TestResult::Fail("rtl module fixture absent from staged initramfs");
     };
@@ -2371,7 +2395,7 @@ fn e2e_iwlwifi_module_registration() -> TestResult {
     };
     let Some((_, staged)) = initramfs
         .iter_files()
-        .find(|(name, _)| *name == "lib/modules/test-fixtures/iwlwifi.ko")
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/iwlwifi.ko.lz4")
     else {
         return TestResult::Fail("iwlwifi module fixture absent from staged initramfs");
     };

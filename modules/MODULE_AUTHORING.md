@@ -17,6 +17,13 @@ architecture-comparison overview, see the workspace-root
 > which compiles the crate, takes its own object members out of the
 > `staticlib` archive, and `ld -r`s them into a single relocatable
 > object — merging the per-static `.modinfo` sections in the process.
+> The link also folds rustc's per-function and per-object sections
+> (`.text.*`, `.rodata.*`, `.data.*`, `.bss.*`) into one section per kind,
+> so a driver `.ko` carries under twenty section headers instead of one
+> per function. A section you name yourself keeps its own name unless it
+> falls in one of those families: `.modinfo`, `.narf_kparams` and any
+> other `#[link_section]` outside them stay distinct, but a
+> `#[link_section = ".rodata.table"]` is merged into `.rodata`.
 > Works for `aarch64` too; it links with `rust-lld` rather than the host
 > `ld`, which refuses foreign-architecture objects.
 >

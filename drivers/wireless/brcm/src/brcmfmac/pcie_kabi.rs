@@ -20,9 +20,9 @@
 //!    PCIe core's mailbox interrupts.
 //! 5. A device the built-in would only park is left parked (bound, no
 //!    netdev). Otherwise the provisioning task runs on the module's
-//!    executor: signed NBSP board selection, the signed regulatory policy,
-//!    CR4/CA7 boot, ring attach, the station transport and the station
-//!    itself, then the netdev/wiphy
+//!    executor: signed NBSP board selection, the kernel's regulatory domain
+//!    (`narf_wireless_regdomain`), CR4/CA7 boot, ring attach, the station
+//!    transport and the station itself, then the netdev/wiphy
 //!    ([`crate::cyw43439::interface_module`]).
 //!
 //! The 1 ms device poller and the MSI upcall drive the executor.
@@ -695,8 +695,9 @@ fn probe_device(dev: u64) -> i32 {
 }
 
 /// The built-in `drive_scheduled(120, ...)` retry: signed provisioning
-/// staged late (a firmware pack loaded after the module) is retried every
-/// 500 ms for a minute, only while no hardware attempt has started.
+/// staged late (a firmware pack loaded after the module) or a regulatory
+/// country set late is retried every 500 ms for a minute, only while no
+/// hardware attempt has started.
 async fn provision_task(bus: KabiBackplane, chip: Chip, id: Identity) {
     let mut parked = Some(bus);
     let mut last = "signed board selection unavailable or mismatched";
@@ -729,22 +730,29 @@ enum Refusal {
     Started(&'static str),
 }
 
-/// The signed regulatory deployment policy (`narf_wireless::reg::policy`'s
-/// `wireless-regulatory.bin`, NRGD v1), which must carry a signer.
-const REGULATORY_POLICY: &str = "wireless-regulatory.bin";
-
-fn regulatory_domain() -> Result<narf_wireless::reg::RegulatoryDomain, &'static str> {
-    let blob = platform::firmware::load(REGULATORY_POLICY, 64 * 1024)
-        .map_err(|_| "signed regulatory policy unavailable")?;
-    if !blob.signed {
-        return Err("regulatory policy must be signed");
+/// The built-in provisioning gate (`narf_wireless::reg::db::ensure_domain`)
+/// over the KABI: the kernel's installed domain ([`platform::reg`]) must
+/// exist before any hardware attempt; none parks the bus for a retry.
+///
+/// It must also name a country. The shared station refuses any other
+/// (`Station::initialize_inner` requires an uppercase alpha2 for the
+/// firmware `country` iovar), so world `00` never brings brcmfmac up, built
+/// in or module. Built in that refusal comes after the CR4 boot and is
+/// final; here it comes before the firmware runs, so a country set within
+/// the retry window (`iw reg set`, a staged signed policy) still provisions
+/// the device.
+fn regulatory_policy() -> Result<(), &'static str> {
+    let domain = platform::reg::snapshot().ok_or("kernel regulatory domain unavailable")?;
+    if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+        return Err("kernel regulatory domain names no country (world 00)");
     }
-    narf_wireless::reg::parse_policy(&blob.bytes)
+    Ok(())
 }
 
 /// The built-in `provision_checked` + `attach_runtime` for the module:
-/// select and load the signed assets, require the signed regulatory
-/// policy, then boot, attach the rings, build the station and publish it.
+/// select and load the signed assets, require the kernel's regulatory
+/// domain, then boot, attach the rings, build the station on that live
+/// domain and publish it.
 async fn provision(bus: KabiBackplane, chip: &Chip, id: Identity) -> Result<(), Refusal> {
     let reprovision = Reprovision {
         id,
@@ -755,10 +763,9 @@ async fn provision(bus: KabiBackplane, chip: &Chip, id: Identity) -> Result<(), 
         Ok(loaded) => loaded,
         Err(why) => return Err(Refusal::Parked(bus, why)),
     };
-    let domain = match regulatory_domain() {
-        Ok(domain) => domain,
-        Err(why) => return Err(Refusal::Parked(bus, why)),
-    };
+    if let Err(why) = regulatory_policy() {
+        return Err(Refusal::Parked(bus, why));
+    }
     if assets.proof.validate().is_err() {
         return Err(Refusal::Parked(bus, "provisioning replaced before boot"));
     }
@@ -781,7 +788,7 @@ async fn provision(bus: KabiBackplane, chip: &Chip, id: Identity) -> Result<(), 
         assets.firmware.len(),
         selection.board()
     ));
-    crate::cyw43439::interface_module::attach(adapter, Arc::new(domain))
+    crate::cyw43439::interface_module::attach(adapter)
         .await
         .map_err(Refusal::Started)
 }

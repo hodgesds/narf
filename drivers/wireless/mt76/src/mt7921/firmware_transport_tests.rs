@@ -93,6 +93,8 @@ fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestR
     // The exact queued-start constructor used by public provisioning must not
     // begin a session for missing or malformed firmware. A later valid pair
     // can enter the same queue without a reset or an earlier owner to recover.
+    // Boxed like Transport's session: a Session<Model> by value put this
+    // KeyWork::prepare instance over the kernel frame budget.
     for missing in [true, false] {
         let attempt = KeyWork::prepare(
             || {
@@ -102,7 +104,7 @@ fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestR
                     Firmware::prepare(&[], &[])
                 }?;
                 allocations.set(allocations.get() + 1);
-                Ok(Session::new(Model::new(), image))
+                Ok(Session::new_boxed(Model::new(), image))
             },
             |session| alloc::boxed::Box::pin(async move { (session, Ok(())) }),
         );
@@ -114,7 +116,7 @@ fn mt76_late_preflight_retry_and_owned_start_survive_cancelled_waiter() -> TestR
         || {
             let image = firmware(32);
             allocations.set(allocations.get() + 1);
-            Ok(Session::new(Model::new(), image))
+            Ok(Session::new_boxed(Model::new(), image))
         },
         |mut session| {
             alloc::boxed::Box::pin(async move {
