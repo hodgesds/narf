@@ -916,6 +916,16 @@ pub async fn try_attach_via_hub(
 /// `uac::register_initcalls`) runs via `dispatch_unbind` in step 1
 /// above, dropping the slot's UAC devices and unregistering their
 /// sound cards (#1318).
+/// `hdev->maxchild` of the hub in `slot_id` of `controller`: the port count
+/// its hub descriptor gave, `None` when that slot is not a bound hub.
+pub(crate) fn hub_num_ports(controller: u8, slot_id: u8) -> Option<u8> {
+    HUBS.of(controller)
+        .lock()
+        .iter()
+        .find(|h| h.hub.slot_id == slot_id)
+        .map(|h| h.hub.descriptor.num_ports)
+}
+
 pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     let controller = xhci_dev.id();
     // 1. Class bindings.
@@ -1266,6 +1276,34 @@ pub fn choose_configuration(dev: &crate::usbdev::UsbDev) -> Option<u8> {
 /// returning `outcome`. HID-class binders hold the one HID interface they
 /// drive; other binders hold every non-HID interface, leaving any HID
 /// interfaces of a composite device to raw HID.
+/// The Linux driver that binds the interfaces a class binder claimed, as
+/// usbfs `GETDRIVER` and sysfs report it. NARF binders with no Linux
+/// counterpart (fingerprint, CCID: Linux leaves those to libusb) keep a
+/// `narf_` name so no tool mistakes them for an in-tree Linux driver.
+pub(crate) fn driver_name(outcome: &AttachOutcome) -> &'static str {
+    match outcome {
+        AttachOutcome::Keyboard
+        | AttachOutcome::Mouse
+        | AttachOutcome::Touchpad
+        | AttachOutcome::RmiElanTouchpad
+        | AttachOutcome::GenericHid
+        | AttachOutcome::ConsumerControl
+        | AttachOutcome::RawHid => "usbhid",
+        AttachOutcome::SerialAcm => "cdc_acm",
+        AttachOutcome::SerialVendor => "usbserial_generic",
+        AttachOutcome::MassStorage => "usb-storage",
+        AttachOutcome::AudioClass => "snd-usb-audio",
+        AttachOutcome::VideoClass => "uvcvideo",
+        AttachOutcome::NetworkClass => "cdc_ether",
+        AttachOutcome::Bluetooth => "btusb",
+        AttachOutcome::Hub => "hub",
+        AttachOutcome::WbdiFingerprint | AttachOutcome::Fingerprint => "narf_fingerprint",
+        AttachOutcome::CcidReader => "narf_ccid",
+        AttachOutcome::UsbClassDriver => "narf_module",
+        AttachOutcome::Unbound | AttachOutcome::UnknownClass => "",
+    }
+}
+
 fn claims_for(outcome: &AttachOutcome, cfg: &[u8]) -> alloc::vec::Vec<u8> {
     let hid_iface = match outcome {
         AttachOutcome::Keyboard => hid::find_boot_keyboard(cfg).ok().map(|(i, _)| i),
@@ -1315,7 +1353,7 @@ async fn settle_outcome(
             if let Some(&value) = cfg.get(5) {
                 usb.set_config_value(value);
             }
-            let owner = crate::usbdev::Owner::Driver("kernel");
+            let owner = crate::usbdev::Owner::Driver(driver_name(&outcome));
             for iface in claims_for(&outcome, cfg) {
                 let _ = usb.claim(iface, owner.clone());
             }

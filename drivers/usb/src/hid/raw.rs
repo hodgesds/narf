@@ -563,6 +563,31 @@ pub fn detach(controller: u8, slot: u8) {
     }
 }
 
+/// Unbind the raw binding of interface `iface` alone (usbfs DISCONNECT,
+/// `usb_driver_release_interface`), releasing its claim. Returns whether
+/// one was bound. Its armed interrupt TRB stays posted until the caller
+/// reprograms the endpoints.
+pub fn unbind_interface(controller: u8, slot: u8, iface: u8) -> bool {
+    let gone: Vec<RawBinding> = {
+        let mut g = RAW.lock();
+        let (gone, keep) = core::mem::take(&mut *g)
+            .into_iter()
+            .partition(|b| b.controller == controller && b.slot == slot && b.iface == iface);
+        *g = keep;
+        gone
+    };
+    let any = !gone.is_empty();
+    for b in gone {
+        hid_device::unregister(&b.dev);
+    }
+    if any {
+        if let Some(usb) = crate::usbdev::find(controller, slot) {
+            usb.release(iface, &Owner::Driver("usbhid"));
+        }
+    }
+    any
+}
+
 /// Unbind every raw interface on `controller` (controller recovery).
 pub fn detach_all(controller: u8) {
     let gone: Vec<RawBinding> = {
