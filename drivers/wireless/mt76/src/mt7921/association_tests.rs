@@ -492,8 +492,14 @@ fn mt76_uni_station_records_per_link() -> TestResult {
     plan.start_authentication().unwrap();
     plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
         .unwrap();
-    if plan.association_response(&reply(0x10, &[1, 0, 0, 0, 42, 0xc0, 1, 2, 0x96, 0x8c]))
-        != Ok(Some(42))
+    // The response's Supported Rates must repeat the BSS's basic set
+    // (`bss(false)` advertises 1/2/5.5/11): `negotiate_response`
+    // refuses any basic rate missing from the negotiated intersection,
+    // so the rates-test reply bytes (11/6 Mbps) do not work here.
+    if plan.association_response(&reply(
+        0x10,
+        &[1, 0, 0, 0, 42, 0xc0, 1, 4, 0x82, 0x84, 0x8b, 0x96],
+    )) != Ok(Some(42))
     {
         return TestResult::Fail("UNI test association response rejected");
     }

@@ -39,15 +39,22 @@ impl Hif {
             holds: Vec::new(),
         }
     }
-    /// The reset register's L1 window on this fixture's chip: the
-    /// CONNAC2 window (`0x40000 + 0x140`, page `0x1800` in the low
-    /// selector half) or the MT7925 one (`0x130000 + 0x140`, page
-    /// `0x7c00` in the high half).
+    /// The reset register's BAR0 window on this fixture's chip. On
+    /// CONNAC2 the reset register (`0x18000140`) is reached through
+    /// L1, so the window follows the programmed selector page
+    /// (`0x40000 + 0x140` for page `0x1800`). On MT7925 the reset
+    /// register (`0x7c000140`) sits inside the fixed CONN_INFRA
+    /// window (upstream `default_fixed_map`: `0x7c000000 -> 0x0f0000`,
+    /// torvalds/linux 8d7fe9885c62), so it is reached at BAR0
+    /// `0x0f0140` without programming the L1 selector at all — the
+    /// selector stays at its initial value on the correct path, and
+    /// a write to the L1 window `0x130140` is the signature of the
+    /// CONNAC2 address being used on a 7925.
     fn reset_window(&self) -> Option<u32> {
-        if self.selector & 0xffff == 0x1800 {
+        if is_mt7925_did(self.did) {
+            Some(0x0f0000 + 0x140)
+        } else if self.selector & 0xffff == 0x1800 {
             Some(MT_HIF_REMAP_BASE_L1 + 0x140)
-        } else if self.selector >> 16 == 0x7c00 {
-            Some(MT7925_HIF_REMAP_BASE_L1 + 0x140)
         } else {
             None
         }
@@ -212,9 +219,13 @@ kernel_test_in!(
 );
 
 /// The MT7925 probe power sequence resets WFSYS at the CONNAC3
-/// address (`0x7c000140`, L1 window `0x130140`), never the CONNAC2
-/// address (`0x18000140`, window `0x40140`). Upstream
-/// `mt7925/regs.h:92` at torvalds/linux 8d7fe9885c62.
+/// address (`0x7c000140`), reached through the fixed CONN_INFRA
+/// window at BAR0 `0x0f0140` — never through L1, and never the
+/// CONNAC2 address (`0x18000140`, whose L1 window on a 7925 would
+/// be `0x130140`) or the CONNAC2 L1 window (`0x40140`). Upstream
+/// `mt7925/regs.h:92` for the address and `mt7925/pci.c`
+/// `default_fixed_map` (`0x7c000000 -> 0x0f0000`) for the window,
+/// both at torvalds/linux 8d7fe9885c62.
 fn mt76_probe_power_mt7925_reset_uses_connac3_address() -> TestResult {
     let mut hif = Hif::new();
     hif.did = MTK_DEV_MT7925;
@@ -222,7 +233,8 @@ fn mt76_probe_power_mt7925_reset_uses_connac3_address() -> TestResult {
         || hif.resets != 1
         || hif.holds != vec![50]
         || hif.selector != 0xa5a51234
-        || !hif.writes.iter().any(|(offset, _)| *offset == 0x130140)
+        || !hif.writes.iter().any(|(offset, _)| *offset == 0x0f0140)
+        || hif.writes.iter().any(|(offset, _)| *offset == 0x130140)
         || hif.writes.iter().any(|(offset, _)| *offset == 0x40140)
     {
         return TestResult::Fail("MT7925 probe reset used the CONNAC2 address or window");
