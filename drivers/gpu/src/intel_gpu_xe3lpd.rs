@@ -656,12 +656,33 @@ fn adjust(value: u64, factor: u64) -> u64 {
 /// 1`), capped by `intel_vrr_max_guardband` (`vtotal - vdisplay`, the
 /// guardband field's 0xffff). `None` for a mode the computation cannot
 /// describe.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(crate) fn vrr_guardband(
     mode: &Mode,
     latency: &Latency,
     dsc: bool,
     num_scalers: u8,
 ) -> Option<u16> {
+    vrr_guardband_ip(DisplayIp::Xe3Lpd, mode, latency, dsc, num_scalers)
+}
+
+/// [`vrr_guardband`] on `ip`. Display 35 takes its own CDCLK ceiling
+/// (`intel_compute_max_dotclk`) and table (the CDCLK prefill adjustment);
+/// both display-30 releases keep the 30.00 values. The worst-case level-0
+/// watermark is a panned Tile4 surface, which display 35 computes exactly
+/// as display 30 does.
+pub(crate) fn vrr_guardband_ip(
+    ip: DisplayIp,
+    mode: &Mode,
+    latency: &Latency,
+    dsc: bool,
+    num_scalers: u8,
+) -> Option<u16> {
+    let (max_cdclk_khz, table_ip) = if ip.is_display35() {
+        (crate::intel_gpu_xelpg_cdclk::max_cdclk_khz(ip), ip)
+    } else {
+        (MAX_CDCLK_KHZ, DisplayIp::Xe3Lpd)
+    };
     let clock = u64::from(mode.pixel_clock_khz);
     let htotal = u64::from(mode.h_total);
     if clock == 0
@@ -673,7 +694,7 @@ pub(crate) fn vrr_guardband(
         return None;
     }
     // intel_compute_max_dotclk: ppc 2, guardband 100.
-    let max_dotclk = 2 * u64::from(MAX_CDCLK_KHZ);
+    let max_dotclk = 2 * u64::from(max_cdclk_khz);
     // _skl_scaler_max_scale.
     let cap = |max: u64| max.min((max_dotclk << 16).div_ceil(clock));
     let (total_scale, hscale, scale) = if num_scalers == 0 {
@@ -705,7 +726,7 @@ pub(crate) fn vrr_guardband(
     // minimum (ppc 2, guardband 100), clamped to 1.
     let cdclk = u64::from(
         crate::intel_gpu_xelpg_cdclk::calc_cdclk_ip(
-            DisplayIp::Xe3Lpd,
+            table_ip,
             u32::try_from(clock.div_ceil(2)).ok()?,
         )?
         .cdclk_khz,
@@ -748,14 +769,15 @@ pub(crate) fn num_scalers(io: &(impl MmioWindow + ?Sized)) -> Result<u8, IpError
     Ok(if cap.single_scaler { 1 } else { 2 })
 }
 
-/// [`vrr_guardband`] for `mode` with the scaler count read from `io`.
+/// [`vrr_guardband_ip`] for `mode` with the scaler count read from `io`.
 pub(crate) fn vrr_guardband_for(
     io: &(impl MmioWindow + ?Sized),
+    ip: DisplayIp,
     mode: &Mode,
     dsc: Option<crate::intel_gpu_xelpg_dsc::DscTerm>,
     latency: &Latency,
 ) -> Result<u16, IpError> {
-    vrr_guardband(mode, latency, dsc.is_some(), num_scalers(io)?).ok_or(IpError::NoDevice)
+    vrr_guardband_ip(ip, mode, latency, dsc.is_some(), num_scalers(io)?).ok_or(IpError::NoDevice)
 }
 
 /// `intel_vrr_transcoder_disable` → `intel_vrr_tg_disable` for `trans`'s

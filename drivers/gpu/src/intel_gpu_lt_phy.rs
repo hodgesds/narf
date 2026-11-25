@@ -1260,7 +1260,7 @@ pub(crate) const fn hdmi_signal_level(vbt_level: Option<u8>) -> (u8, LtTxLevel) 
     (index, DP14_LEVELS[index as usize])
 }
 
-const fn txy_ctl(tx: u8, register: u16) -> Option<u16> {
+pub(crate) const fn txy_ctl(tx: u8, register: u16) -> Option<u16> {
     if tx < 2 {
         Some(0x0400 + tx as u16 * 0x0200 + register)
     } else {
@@ -1731,6 +1731,28 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         })
     }
 
+    /// The DP PLL enable on an eDP output: `intel_lt_phy_pll_calc_state`
+    /// takes `xe3plpd_lt_edp_tables` and sets `config[2] = 1` on every eDP
+    /// image, including the four rates shared with DP. SSC is not requested
+    /// (Linux enables it only for a VBT panel-SSC sink advertising 0.5%
+    /// downspread).
+    pub(crate) fn enable_edp(&self, rate: LtEdpRate, lane_count: u8) -> Result<(), Cx0Error> {
+        if self.dp_alt || !matches!(lane_count, 1 | 2 | 4) || lane_count > self.max_lanes {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        let mut state = *edp_pll_state(rate);
+        state.config[2] = 1;
+        self.enable_pll_state(LtEnablePlan {
+            state: &state,
+            clock_khz: rate.clock_khz(),
+            lane_count,
+            pin_assignment_d: false,
+            plla_ssc: false,
+            pllb_ssc: false,
+            hdmi_frl: false,
+        })
+    }
+
     /// Run the source LT-PHY PLL/transmitter enable order for HDMI TMDS. This
     /// remains disconnected from the display route and deliberately refuses
     /// HDMI 2.1 FRL clocks, whose packet/training owner is not implemented.
@@ -1856,24 +1878,26 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
 }
 
 #[cfg(feature = "kernel-test")]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloc::{collections::BTreeMap, vec::Vec};
     use core::cell::{Cell, RefCell};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct Transaction {
-        lane: u8,
-        address: u16,
-        data: u8,
+    pub(crate) struct Transaction {
+        pub(crate) lane: u8,
+        pub(crate) address: u16,
+        pub(crate) data: u8,
     }
 
+    /// The LT PHY's message bus, P2P status, lane reset/pulse status and
+    /// MacCLK request/ACK at the PICA offsets of ports A, B, TC1 and TC2.
     #[derive(Debug)]
-    struct FakeLtMmio {
-        regs: RefCell<BTreeMap<u64, u32>>,
-        vdr: RefCell<BTreeMap<(u8, u16), u8>>,
-        transactions: RefCell<Vec<Transaction>>,
+    pub(crate) struct FakeLtMmio {
+        pub(crate) regs: RefCell<BTreeMap<u64, u32>>,
+        pub(crate) vdr: RefCell<BTreeMap<(u8, u16), u8>>,
+        pub(crate) transactions: RefCell<Vec<Transaction>>,
         resets: Cell<u32>,
         bad_ack: Cell<bool>,
         lt_phy: bool,

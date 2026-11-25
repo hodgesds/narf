@@ -369,7 +369,7 @@ impl Pipes {
         if ip.is_display30() {
             let latency = crate::intel_gpu_xelpg_wm::Latency::read_ip(io, ip)
                 .map_err(|_| PipeEnableError::NoDevice)?;
-            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
+            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, ip, mode, dsc, &latency)
                 .map_err(|_| PipeEnableError::Unsupported)?;
             vblank_start[0] = Some(mode.v_total - guardband);
         }
@@ -527,9 +527,10 @@ impl Pipes {
         if fresh.ip.is_display30() {
             let latency = crate::intel_gpu_xelpg_wm::Latency::read_ip(io, fresh.ip)
                 .map_err(|_| PipeEnableError::NoDevice)?;
-            let guardband =
-                crate::intel_gpu_xe3lpd::vrr_guardband_for(io, &ext.mode, ext.dsc, &latency)
-                    .map_err(|_| PipeEnableError::Unsupported)?;
+            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(
+                io, fresh.ip, &ext.mode, ext.dsc, &latency,
+            )
+            .map_err(|_| PipeEnableError::Unsupported)?;
             vblank_start[p] = Some(ext.mode.v_total - guardband);
         }
         Self::compute(

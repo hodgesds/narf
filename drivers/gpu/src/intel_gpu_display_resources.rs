@@ -261,7 +261,7 @@ impl Profile {
         // the vblank prefill budget is its guardband.
         let mut vblank_start = [None; res::PIPES];
         if ip.is_display30() {
-            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, mode, dsc, &latency)
+            let guardband = crate::intel_gpu_xe3lpd::vrr_guardband_for(io, ip, mode, dsc, &latency)
                 .map_err(|_| FsError::Unsupported)?;
             vblank_start[0] = Some(mode.v_total - guardband);
         }

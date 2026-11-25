@@ -449,7 +449,7 @@ impl ExtFake {
         let mut vblank_start = [None; 4];
         if ip.is_display30() {
             let guardband =
-                crate::intel_gpu_xe3lpd::vrr_guardband_for(self, &mode, None, &latency).ok()?;
+                crate::intel_gpu_xe3lpd::vrr_guardband_for(self, ip, &mode, None, &latency).ok()?;
             vblank_start[0] = Some(mode.v_total - guardband);
         }
         let state = crate::intel_gpu_xelpg_resources::compute_ip_vblank(

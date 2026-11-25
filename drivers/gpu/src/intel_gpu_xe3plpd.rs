@@ -10,9 +10,22 @@
 //! linear horizontal reflection is allowed while Tile4 reflection is not,
 //! semiplanar YUV restores vertical 2x subsampling, and the four Display-35
 //! underrun latches have exact decode/write-one-to-clear images.
+//!
+//! ## Owned modeset
+//!
+//! [`modeset`] and [`takeover`] run the display-14 orchestrator
+//! (`intel_gpu_modeset_xelpg`) dispatched on
+//! [`crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS`] over [`View`]: the
+//! Pipe-A eDP on port A, with its port PLL, transmitters and signal levels on
+//! the LT PHY (`intel_lt_phy_pll_enable`, `intel_lt_phy_set_signal_levels`)
+//! and the display-35 CDCLK, DBUF and watermark owners (Linux 7.4-rc4). A
+//! CMTG left armed by firmware is refused, as is a primary the modeset cannot
+//! scan out unchanged. Nothing here has run on silicon.
 
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
+use crate::intel_gpu_aux::MmioWindow;
+use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::{intel_gpu_pipes::Pipe, intel_gpu_xelpg_wm::Tiling};
 
 /// Firmware's origin-aligned, opaque linear primary, observed before GT reset.
@@ -444,6 +457,119 @@ pub(crate) const fn bandwidth_profile(raw: u32) -> Result<BandwidthProfile, Band
         deprogbwlimit_gbps: DEPROGBWLIMIT_GBPS,
     })
 }
+
+// ── Owned modeset ────────────────────────────────────────────────
+
+/// `TRANS_CMTG_CTL(TRANSCODER_A)` and its `CMTG_ENABLE`.
+const TRANS_CMTG_CTL_A: u64 = 0x6fa88;
+const CMTG_ENABLE: u32 = 1 << 31;
+/// `TRANS_DDI_FUNC_CTL2(TRANSCODER_A)` and its `CMTG_SECONDARY_MODE`.
+const TRANS_DDI_FUNC_CTL2_A: u64 = 0x60404;
+const CMTG_SECONDARY_MODE: u32 = 1 << 3;
+
+/// The display-35 register view of the owned modeset. DDI A and B's PHY and
+/// AUX registers move into the PICA block as on display 20 and 30
+/// (`__xe2lpd_port_idx`, [`crate::intel_gpu_xe3lpd::pica_port_reg`]), and the
+/// platform's LT PHY (`HAS_LT_PHY`) is behind every port, so no Cx0
+/// sequence takes it. Wa_15015404425's read flush is Lunar Lake's and early
+/// Panther Lake's only. Construct it only for the exact Nova Lake-S route.
+pub(crate) struct View<'a, M: MmioWindow + ?Sized>(pub(crate) &'a M);
+
+impl<M: MmioWindow + ?Sized> MmioWindow for View<'_, M> {
+    fn display_access_ok(&self) -> bool {
+        self.0.display_access_ok()
+    }
+    fn has_lt_phy(&self) -> bool {
+        true
+    }
+    fn read32(&self, off: u64) -> u32 {
+        self.0
+            .read32(crate::intel_gpu_xe3lpd::pica_port_reg(off).unwrap_or(off))
+    }
+    fn write32(&self, off: u64, val: u32) {
+        self.0.write32(
+            crate::intel_gpu_xe3lpd::pica_port_reg(off).unwrap_or(off),
+            val,
+        )
+    }
+}
+
+/// The owned modeset's read-only admission: an LT-PHY view, display 35.00,
+/// and no CMTG on transcoder A. `intel_cmtg_sanitize` retires a firmware
+/// CMTG, and needs a modeset when the transcoder is its secondary; this
+/// route refuses an armed one and leaves the firmware display as it is.
+fn admit(mmio: &(impl MmioWindow + ?Sized)) -> Result<(), ModesetError> {
+    use crate::intel_gpu_xe2lpd::DisplayIp;
+    if !mmio.has_lt_phy() || mmio.cx0_xe3() {
+        return Err(ModesetError::UnsupportedGeneration);
+    }
+    if DisplayIp::read_all(mmio) != Ok(DisplayIp::NovaLakeS) {
+        return Err(ModesetError::UnsupportedGeneration);
+    }
+    let cmtg = mmio.read32(TRANS_CMTG_CTL_A);
+    let ctl2 = mmio.read32(TRANS_DDI_FUNC_CTL2_A);
+    if cmtg == u32::MAX || ctl2 == u32::MAX || !mmio.display_access_ok() {
+        return Err(ModesetError::PipelineStopUnavailable);
+    }
+    if cmtg & CMTG_ENABLE != 0 || ctl2 & CMTG_SECONDARY_MODE != 0 {
+        return Err(ModesetError::DisplayResourceUnavailable);
+    }
+    Ok(())
+}
+
+fn orchestrator<M: MmioWindow + ?Sized>(
+    mmio: &M,
+) -> crate::intel_gpu_modeset_xelpg::XeLpgModeset<'_, M> {
+    crate::intel_gpu_modeset_xelpg::XeLpgModeset::new(mmio, crate::intel_gpu_xelpg::XeLpgPort::A)
+        .with_display_ip(crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS)
+}
+
+/// The display-35 owned Pipe-A eDP modeset at `mode`, or at the panel's
+/// EDID preferred mode without one. `mmio` must be a [`View`].
+pub(crate) fn modeset<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    fb: &Framebuffer,
+    mode: Option<&Mode>,
+) -> Result<Mode, ModesetError> {
+    admit(mmio)?;
+    let mut ms = orchestrator(mmio);
+    match mode {
+        Some(mode) => ms.modeset_fixed(fb, mode),
+        None => ms.modeset(fb, None),
+    }
+}
+
+/// Take over the firmware primary in place: the owned modeset at the panel's
+/// EDID preferred mode, scanning out the firmware surface unchanged. A
+/// preferred mode of another size, or a primary the owned plane cannot
+/// describe (only XR24 is), is refused after the AUX read and before any
+/// other write; the fixed-mode route then keeps the firmware display.
+pub(crate) fn takeover<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    primary: &FirmwarePrimary,
+) -> Result<Mode, ModesetError> {
+    admit(mmio)?;
+    if primary.format != crate::drm::card::PixelFormat::Xrgb8888 {
+        return Err(ModesetError::InvalidFramebuffer);
+    }
+    let fb = Framebuffer {
+        phys_addr: u64::from(primary.gtt_offset),
+        stride_bytes: primary.geometry.pitch,
+        format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+    };
+    let mut ms = orchestrator(mmio);
+    let mode = ms.preferred_mode()?;
+    if (u32::from(mode.h_active), u32::from(mode.v_active))
+        != (primary.geometry.width, primary.geometry.height)
+    {
+        return Err(ModesetError::InvalidFramebuffer);
+    }
+    ms.modeset_fixed(&fb, &mode)
+}
+
+#[cfg(feature = "kernel-test")]
+#[path = "intel_gpu_xe3plpd_modeset_tests.rs"]
+mod modeset_tests;
 
 #[cfg(feature = "kernel-test")]
 mod tests {
