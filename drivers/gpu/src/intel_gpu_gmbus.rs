@@ -986,6 +986,14 @@ impl<'a, M: MmioWindow + ?Sized> GmbusBus<'a, M> {
         if msgs.is_empty() {
             return Ok(());
         }
+        // Gen9 LP: GMBUS is a DC_off domain (`bxt_pwdoms_dc_off`,
+        // `glk_pwdoms_dc_off`); exit DC5 before the bus select and hold it
+        // off across the transfer. Inert on display 9 and every other
+        // display.
+        let _dc = crate::intel_gpu_gen9_dc_states::acquire(
+            crate::intel_gpu_gen9_dc_states::Gen9DcUser::Gmbus,
+        )
+        .map_err(|_| GmbusError::Timeout)?;
         let mut retried = false;
         'retry: loop {
             self.select_bus();

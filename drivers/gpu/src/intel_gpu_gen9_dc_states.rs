@@ -108,19 +108,26 @@
 //! the option clear no service exists, every hook is inert and nothing new
 //! is written): probe installs the service before the Gen9 DMC load and
 //! holds the Init reference (DC states disabled); the end of probe releases
-//! it only with a loaded DMC and an owned internal panel on Pipe A. The Gen9
-//! modeset, every AUX transfer, GMBUS on Gen9 LP, the hotplug poll, the
-//! external-output pass, the panel power sequencer and KMS sessions take a
-//! reference for their hardware conversation; system suspend takes one
+//! it only with a loaded DMC and an owned internal panel on Pipe A (the
+//! probe-time takeover, PPS power-on, DPIO PHY power and hotplug pass all
+//! run under Init). After that, these take a reference for their hardware
+//! conversation: the Gen9 modeset and pipeline teardown
+//! (`intel_gpu_modeset::Modeset`), every AUX transfer (`IntelAux`), GMBUS
+//! on Gen9 LP, the hotplug poll and enable (`intel_gpu_dp`), the
+//! external-output pass (`intel_gpu::poll_dp_hpd_events`), the runtime
+//! panel power-off (`intel_gpu_edp::panel_power_off`), and KMS sessions and
+//! legacy guards (through the display-14 `DcRef`). System suspend takes one
 //! first and keeps it unless the resident DMC program still verifies at
-//! resume.
+//! resume. Panel brightness (the backlight crate's PWM writes) takes none,
+//! as in Linux.
 //!
 //! Stricter than Linux, and why: every last release defers re-entry by 17
 //! ms (Linux releases GMBUS and INIT synchronously and AUX after 100 ms);
 //! DC6 also requires power well 2 off (Linux checks it only on the DC5
 //! path) and any requester's PW_2 bit refuses, not only the driver's; the
-//! hotplug poll and the panel power sequencer, which Linux runs without
-//! `DC_off`, take a reference; a lost program is never re-entered and not
+//! hotplug poll and the panel power-off, which Linux runs without
+//! `DC_off`, take a reference; a live external route refuses re-entry even
+//! with power well 2 off; a lost program is never re-entered and not
 //! reloaded; DC5/DC6 are disarmed for every system sleep target (Linux
 //! leaves display 9 in DC6 across s2idle) and DC9 is never entered. The GT
 //! does not hold `GT_IRQ` while unparked (Linux's `__gt_unpark` does, as a
@@ -1240,8 +1247,8 @@ async fn arm_task(service: Arc<Gen9Service>) {
 
 /// Probe, before the Gen9 DMC load: with `narf.intel.gen9_dc=1`, create
 /// the service for this display, disable DC states and hold the Init
-/// reference, and register the system-suspend hook. Without the option
-/// nothing is created and nothing is written.
+/// reference until [`probe_complete`], and register the system-suspend
+/// hook. Without the option nothing is created and nothing is written.
 pub(crate) fn install(
     platform: Gen9Platform,
     bar: narf_bus::MmioRegion,
@@ -1267,6 +1274,40 @@ pub(crate) fn install(
     }));
     drop(slot);
     narf_power::system_pm::register_async_system_pm(PM_NAME, Arc::new(SystemPm));
+}
+
+/// End of probe (`intel_display_power_enable` dropping the init
+/// wakeref): hand the service the probe-time DMC program and release the
+/// Init reference, but only when that program loaded and the internal
+/// panel on Pipe A is owned. Otherwise DC states stay disabled.
+pub(crate) fn probe_complete(bar: &narf_bus::MmioRegion, panel_owned: bool) {
+    let Some(service) = service_for(bar) else {
+        return;
+    };
+    let resident = crate::intel_gpu_gen9_dmc::resident_program()
+        .filter(|_| crate::intel_gpu_gen9_dmc::gen9_dmc_loaded());
+    let (due, target) = {
+        let mut core = service.core.lock();
+        if let Some((blob, max)) = resident {
+            core.provide_program(blob, max);
+        }
+        let due = if panel_owned {
+            core.release_init(narf_time::monotonic_ns())
+        } else {
+            None
+        };
+        (due, core.target())
+    };
+    log(match (due.is_some(), resident.is_some(), panel_owned) {
+        (true, _, _) if target == DC_STATE_EN_UPTO_DC6 => "Gen9 DC states enabled (DC6 when idle)",
+        (true, _, _) => "Gen9 DC states enabled (DC5 when idle)",
+        (false, false, _) => "Gen9 DC states held off: no verified DMC program",
+        (false, true, false) => "Gen9 DC states held off: no owned internal panel",
+        (false, true, true) => "Gen9 DC states held off: DC_STATE_EN did not take DC0",
+    });
+    if due.is_some() {
+        schedule_arm(&service);
+    }
 }
 
 const PM_NAME: &str = "intel-gen9-dc";

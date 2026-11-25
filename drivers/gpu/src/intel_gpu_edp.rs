@@ -1444,6 +1444,13 @@ pub fn enable_psr_for_panel(gpu: &crate::intel_gpu::IntelGpu, mode: &Mode) {
 /// composition), then the PPS backlight gate and power target.
 /// For suspend/remove paths; probe never calls it.
 pub fn panel_power_off(gpu: &crate::intel_gpu::IntelGpu) -> Result<(), PpsError> {
+    // Gen9: the whole power-off (PSR's AUX, the PPS) runs with DC states
+    // exited; if they cannot be, nothing is touched. Inert elsewhere.
+    let _dc = crate::intel_gpu_gen9_dc_states::acquire_for_bar(
+        &gpu.gtt_mmadr,
+        crate::intel_gpu_gen9_dc_states::Gen9DcUser::Pps,
+    )
+    .map_err(|_| PpsError::PowerOffTimeout { status: u32::MAX })?;
     // AUX disable parks the desired level instead of replacing it with zero;
     // the post-S3 live-panel path replays the latest retained request. A failed
     // AUX disable still closes the independent PPS gate before dropping power.

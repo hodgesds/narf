@@ -710,7 +710,15 @@ static HPD_MONITOR: IrqSafeSpinLock<HpdMonitor> = IrqSafeSpinLock::new(HpdMonito
 /// Poll the shared HPD monitor once (production entry point;
 /// see `intel_gpu::poll_dp_hpd_events`).
 pub fn poll_hpd_event<M: MmioWindow + ?Sized>(mmio: &M) -> Option<HpdEvent> {
-    HPD_MONITOR.lock().poll(mmio)
+    // Gen9: the hotplug poll runs with DC states exited (stricter than
+    // Linux, whose hotplug handler takes no power domain); a refused exit
+    // reports no event. Inert elsewhere.
+    let dc =
+        crate::intel_gpu_gen9_dc_states::acquire(crate::intel_gpu_gen9_dc_states::Gen9DcUser::Hpd)
+            .ok()?;
+    let event = HPD_MONITOR.lock().poll(mmio);
+    drop(dc);
+    event
 }
 pub(crate) fn hpd_uncertain() -> bool {
     HPD_MONITOR.lock().uncertain()
@@ -719,7 +727,14 @@ pub(crate) fn hpd_uncertain() -> bool {
 /// Enable the shared monitor's source latches while keeping its owned SDE
 /// sources masked. This poll-only owner does not claim an IRQ consumer.
 pub fn enable_hpd_interrupts<M: MmioWindow + ?Sized>(mmio: &M) {
-    HPD_MONITOR.lock().enable_interrupts(mmio)
+    // Gen9: as `poll_hpd_event`; a refused DC exit enables nothing.
+    let Ok(dc) =
+        crate::intel_gpu_gen9_dc_states::acquire(crate::intel_gpu_gen9_dc_states::Gen9DcUser::Hpd)
+    else {
+        return;
+    };
+    HPD_MONITOR.lock().enable_interrupts(mmio);
+    drop(dc);
 }
 
 /// The Intel Gen12 source envelope negotiation runs against:

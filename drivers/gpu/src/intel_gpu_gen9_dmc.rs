@@ -67,6 +67,18 @@ use narf_capabilities::{Cap, Read};
 /// load never sets it, and nothing clears it once set.
 static GEN9_DMC_LOADED: AtomicBool = AtomicBool::new(false);
 
+/// The resident copy of the loaded container and its per-program payload
+/// ceiling, for the Gen9 `DC_off` service's re-verification before every
+/// DC re-entry (`assert_main_dmc_loaded`). Set once, by a completed load.
+static GEN9_DMC_RESIDENT: narf_lib::sync::IrqSafeSpinLock<Option<(&'static [u8], usize)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The resident container [`load_for_display`] loaded and verified, with
+/// its payload ceiling; `None` before (or without) a completed load.
+pub(crate) fn resident_program() -> Option<(&'static [u8], usize)> {
+    *GEN9_DMC_RESIDENT.lock()
+}
+
 /// Record a completed Gen9 DMC load (probe-time; also the
 /// seam the modeset tests drive the gate through).
 pub fn install_gen9_dmc_loaded() {
@@ -284,6 +296,7 @@ fn load_for_display_inner<M: MmioWindow + ?Sized>(
     let resident: &'static [u8] = alloc::boxed::Box::leak(owned.into_boxed_slice());
     let registered = register_dmc_firmware(resident).map_err(Gen9DmcLoadError::Register)?;
     debug_assert_eq!(registered, programs);
+    *GEN9_DMC_RESIDENT.lock() = Some((resident, max));
     Ok(Gen9DmcLoaded {
         name,
         version,

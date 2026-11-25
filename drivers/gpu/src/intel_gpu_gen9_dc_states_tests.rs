@@ -614,3 +614,168 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_gen9_dc_states",
     smoke_gen9_dc_refuses_without_the_option
 );
+
+/// A hook whose DC exit always fails (`DC_STATE_EN` unavailable).
+struct Refuse;
+
+impl Gen9DcOff for Refuse {
+    fn get(&self, _regs: &dyn MmioWindow, _user: Gen9DcUser) -> Result<bool, DcError> {
+        Err(DcError::Unavailable)
+    }
+    fn put(&self, _user: Gen9DcUser) {}
+}
+
+/// A Skylake sink window armed in DC6: the fixture DMC loaded, the core
+/// booted, Init released and DC6 re-entered, all through `sink`.
+fn armed_sink(
+    sink: &crate::intel_gpu_modeset::tests::ScriptedSinkMmio,
+) -> Result<LocalDc, &'static str> {
+    let blob = resident();
+    load(sink, blob);
+    let mut core = Gen9DcCore::new(Gen9Platform::Skylake);
+    let _ = core.boot(sink);
+    core.provide_program(blob, SKL_DMC_MAX_FW_SIZE);
+    let due = core.release_init(0).ok_or("Init must be released with a program")?;
+    if core.arm_if_due(sink, due, Gen9ArmGates::default()) != Ok(DC6) {
+        return Err("the sink fixture must start in DC6");
+    }
+    Ok(LocalDc::new(core))
+}
+
+/// The Gen9 modeset holds DC_off for its whole run
+/// (`intel_atomic_commit_tail`'s `POWER_DOMAIN_DC_OFF`): `DC_STATE_EN` is
+/// written to `DC_STATE_DISABLE` before any other display register, is not
+/// re-armed while the run lasts, and re-entry is deferred 17 ms after it.
+/// A refused DC exit runs nothing.
+fn smoke_gen9_dc_brackets_the_modeset() -> TestResult {
+    use crate::intel_gpu_ddi::Ddi;
+    use crate::intel_gpu_modeset::tests::ScriptedSinkMmio;
+    use crate::intel_gpu_modeset::{Framebuffer, Modeset, ModesetError, PixelFormat};
+    crate::intel_gpu_gen9_dmc::set_gen9_dmc_loaded_for_test(true);
+    let fb = Framebuffer {
+        phys_addr: 0x100_0000,
+        stride_bytes: 1920 * 4,
+        format: PixelFormat::Xrgb8888,
+    };
+    let sku = crate::intel_gpu_gen9_ddi::sku_family_for_did(0x1912);
+    let sink = ScriptedSinkMmio::new(1 << 29);
+    let local = match armed_sink(&sink) {
+        Ok(local) => local,
+        Err(why) => return TestResult::Fail(why),
+    };
+    local.now.store(100 * MS, Ordering::Relaxed);
+    sink.writes.borrow_mut().clear();
+    let mut ms = Modeset::new(&sink, Ddi::A);
+    ms.set_gen9_platform(Gen9Platform::Skylake);
+    ms.set_gen9_sku_family(sku);
+    ms.set_gen9_dc(&local);
+    if ms.modeset(&fb, None).is_err() {
+        return TestResult::Fail("the Skylake panel modeset must succeed");
+    }
+    let writes = sink.writes.borrow().clone();
+    if writes.first() != Some(&(DC_STATE_EN, 0)) || writes.len() < 2 {
+        return TestResult::Fail("DC_STATE_DISABLE must precede every modeset register write");
+    }
+    if sink.writes_to(DC_STATE_EN) != [0] {
+        return TestResult::Fail("DC states must stay off for the whole modeset");
+    }
+    if local.core.lock().total() != 0
+        || local.deadline.load(Ordering::Relaxed) != 100 * MS + DC_REENABLE_DELAY_NS
+    {
+        return TestResult::Fail("the modeset's release must defer re-entry 17 ms");
+    }
+    // The lit eDP panel holds only DDI IO A (PW_1 domains): DC6 is legal.
+    let due = local.deadline.load(Ordering::Relaxed);
+    if local
+        .core
+        .lock()
+        .arm_if_due(&sink, due, Gen9ArmGates::default())
+        != Ok(DC6)
+    {
+        return TestResult::Fail("DC6 must be re-entered after the modeset");
+    }
+    // A refused DC exit: the modeset refuses before any register write.
+    let sink = ScriptedSinkMmio::new(1 << 29);
+    let mut ms = Modeset::new(&sink, Ddi::A);
+    ms.set_gen9_platform(Gen9Platform::Skylake);
+    ms.set_gen9_sku_family(sku);
+    ms.set_gen9_dc(&Refuse);
+    if ms.modeset(&fb, None) != Err(ModesetError::PowerWellTimeout) {
+        return TestResult::Fail("a refused DC exit must refuse the modeset");
+    }
+    if !sink.writes.borrow().is_empty() {
+        return TestResult::Fail("a refused DC exit must write nothing");
+    }
+    // Teardown holds DC_off too.
+    let sink = ScriptedSinkMmio::new(1 << 29);
+    let local = match armed_sink(&sink) {
+        Ok(local) => local,
+        Err(why) => return TestResult::Fail(why),
+    };
+    sink.writes.borrow_mut().clear();
+    let mut ms = Modeset::new(&sink, Ddi::A);
+    ms.set_gen9_platform(Gen9Platform::Skylake);
+    ms.set_gen9_sku_family(sku);
+    ms.set_gen9_dc(&local);
+    ms.teardown();
+    if sink.writes.borrow().first() != Some(&(DC_STATE_EN, 0)) {
+        return TestResult::Fail("the pipeline teardown must exit DC states first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_dc_brackets_the_modeset
+);
+
+/// Every AUX transfer holds DC_off (`intel_dp_aux_xfer`'s AUX_A domain, a
+/// Gen9 `dc_off` domain): the exit is written before the first AUX
+/// register write, and re-entry is deferred after the transfer. A refused
+/// exit touches no AUX register.
+fn smoke_gen9_dc_brackets_an_aux_transfer() -> TestResult {
+    use crate::dp_aux::{AuxChannel as _, AuxError};
+    use crate::intel_gpu_aux::IntelAux;
+    use crate::intel_gpu_ddi::Ddi;
+    use crate::intel_gpu_modeset::tests::ScriptedSinkMmio;
+    let sink = ScriptedSinkMmio::new(1 << 29);
+    let local = match armed_sink(&sink) {
+        Ok(local) => local,
+        Err(why) => return TestResult::Fail(why),
+    };
+    local.now.store(7 * MS, Ordering::Relaxed);
+    sink.writes.borrow_mut().clear();
+    let mut buf = [0u8; 1];
+    let mut aux = IntelAux::new(&sink, Ddi::A).with_gen9_dc(&local);
+    if aux.dpcd_read(0x000, &mut buf).is_err() {
+        return TestResult::Fail("the DPCD read must complete");
+    }
+    let writes = sink.writes.borrow().clone();
+    let ctl = Ddi::A.base() + crate::intel_gpu_aux::DDI_AUX_CTL_OFFSET;
+    let exit = writes.iter().position(|w| *w == (DC_STATE_EN, 0));
+    let first_aux = writes.iter().position(|(o, _)| *o == ctl);
+    match (exit, first_aux) {
+        (Some(0), Some(aux_at)) if aux_at > 0 => {}
+        _ => return TestResult::Fail("DC exit must precede the transfer's first AUX write"),
+    }
+    if sink.writes_to(DC_STATE_EN) != [0] {
+        return TestResult::Fail("DC states must stay off for the whole transfer");
+    }
+    if local.core.lock().total() != 0
+        || local.deadline.load(Ordering::Relaxed) != 7 * MS + DC_REENABLE_DELAY_NS
+    {
+        return TestResult::Fail("the transfer's release must defer re-entry 17 ms");
+    }
+    let sink = ScriptedSinkMmio::new(1 << 29);
+    let mut aux = IntelAux::new(&sink, Ddi::A).with_gen9_dc(&Refuse);
+    if !matches!(aux.dpcd_read(0x000, &mut buf), Err(AuxError::Deferred)) {
+        return TestResult::Fail("a refused DC exit must refuse the transfer");
+    }
+    if !sink.writes.borrow().is_empty() {
+        return TestResult::Fail("a refused DC exit must touch no AUX register");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_dc_brackets_an_aux_transfer
+);

@@ -565,6 +565,11 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// Another pipe is live beside this run's, so the CDCLK it runs on
     /// cannot be reprogrammed here.
     shared_cdclk: bool,
+    /// The Gen9 `DC_off` well a Gen9 run holds for its hardware
+    /// conversation (`intel_atomic_commit_tail`'s `POWER_DOMAIN_DC_OFF`):
+    /// the production service (inert without `narf.intel.gen9_dc=1`) unless
+    /// a fixture set its own with [`Self::set_gen9_dc`].
+    gen9_dc: &'a dyn crate::intel_gpu_gen9_dc_states::Gen9DcOff,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -608,7 +613,33 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             hdmi_bpc: 8,
             hdmi_ycbcr420: false,
             shared_cdclk: false,
+            gen9_dc: &crate::intel_gpu_gen9_dc_states::ServiceDcOff,
         }
+    }
+
+    /// Hold `dc` as this run's Gen9 `DC_off` well instead of the production
+    /// service.
+    pub fn set_gen9_dc(&mut self, dc: &'a dyn crate::intel_gpu_gen9_dc_states::Gen9DcOff) {
+        self.gen9_dc = dc;
+    }
+
+    /// A Gen9 run's `DC_off` reference, taken before its first register
+    /// access: DC5/DC6 are exited and stay off until the guard drops, and
+    /// re-entry is deferred after it. `None` on every other display. A DC
+    /// exit that fails runs nothing.
+    fn gen9_dc_off(
+        &self,
+    ) -> Result<Option<crate::intel_gpu_gen9_dc_states::Gen9DcGuard<'a>>, ModesetError> {
+        if self.gen9_platform.is_none() {
+            return Ok(None);
+        }
+        crate::intel_gpu_gen9_dc_states::hold(
+            self.gen9_dc,
+            self.mmio,
+            crate::intel_gpu_gen9_dc_states::Gen9DcUser::Modeset,
+        )
+        .map(Some)
+        .map_err(|_| ModesetError::PowerWellTimeout)
     }
 
     /// Another pipe scans out beside this run's (the multi-pipe
@@ -1046,17 +1077,26 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// (#1092); the disable sequence itself is step 3 of every
     /// modeset.
     pub fn teardown(&mut self) {
+        // Best effort, like the disable itself: a refused Gen9 DC exit
+        // still stops the pipeline.
+        let _dc = self.gen9_dc_off();
         self.disable_pipeline();
     }
     /// Fallible migration for retained legacy sessions. Success is a local
     /// stop proof, never inferred from a write or a GT-reset completion.
     pub fn try_teardown(&mut self) -> Result<(), ModesetError> {
         self.check_stop_source()?;
+        let _dc = self
+            .gen9_dc_off()
+            .map_err(|_| ModesetError::PipelineStopUnavailable)?;
         self.try_disable_pipe_pipeline()?;
         self.try_disable_ddi_buffer()
     }
     pub fn try_teardown_stream(&mut self) -> Result<(), ModesetError> {
         self.check_stop_source()?;
+        let _dc = self
+            .gen9_dc_off()
+            .map_err(|_| ModesetError::PipelineStopUnavailable)?;
         self.try_disable_pipe_pipeline()
     }
     fn check_stop_source(&self) -> Result<(), ModesetError> {
@@ -1177,6 +1217,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         };
         let port_clock =
             crate::intel_gpu_hdmi::tmds_clock_for(mode.pixel_clock_khz, self.hdmi_bpc, format);
+        // Gen9: DC_off before the first register access (DDI B-D lanes and
+        // pipes B/C are PW_2 domains). Inert elsewhere.
+        let _dc = self.gen9_dc_off()?;
         self.enable_pg1()?;
         self.disable_pipeline();
         // Gen9: the SKL WRPLL row (`program_dpll_gen9_hdmi`),
@@ -1302,6 +1345,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// (#1017): the surviving streams keep scanning out of the
     /// same DDI.
     pub fn teardown_stream(&mut self) {
+        let _dc = self.gen9_dc_off();
         self.disable_pipe_pipeline();
     }
 
@@ -1325,6 +1369,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         }
         // Step 0: validate inputs that don't require touching HW.
         validate_framebuffer(primary_fb)?;
+        // Gen9: DC_off for the whole run, from the EDID AUX read on (AUX_A
+        // and every PW_2 domain are DC_off domains). Inert elsewhere.
+        let _dc = self.gen9_dc_off()?;
 
         // The plan, where the run carries one (the legacy shape
         // derives its link parameters at the steps that consume

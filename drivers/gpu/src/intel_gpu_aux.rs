@@ -181,6 +181,11 @@ pub struct IntelAux<'a, M: MmioWindow + ?Sized> {
     base: u64,
     /// Control-word encoding (Gen12 unless built by [`IntelAux::xelpdp`]).
     profile: AuxCtlProfile,
+    /// The Gen9 `DC_off` well every transfer holds (`intel_dp_aux_xfer`'s
+    /// AUX power domain; AUX_A-D are Gen9 `dc_off` domains): the production
+    /// service, inert unless `narf.intel.gen9_dc=1` installed it on a Gen9
+    /// display, or a fixture's own ([`IntelAux::with_gen9_dc`]).
+    gen9_dc: &'a dyn crate::intel_gpu_gen9_dc_states::Gen9DcOff,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
@@ -319,7 +324,18 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
             mmio,
             ddi,
             profile: AuxCtlProfile::Gen12,
+            gen9_dc: &crate::intel_gpu_gen9_dc_states::ServiceDcOff,
         }
+    }
+
+    /// Hold `dc` as the Gen9 `DC_off` well across each transfer instead of
+    /// the production service.
+    pub fn with_gen9_dc(
+        mut self,
+        dc: &'a dyn crate::intel_gpu_gen9_dc_states::Gen9DcOff,
+    ) -> Self {
+        self.gen9_dc = dc;
+        self
     }
 
     /// Create a display-14 (Xe-LPG/MTL) transport over an explicit AUX
@@ -349,6 +365,7 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
             ddi: Ddi::A,
             base,
             profile: AuxCtlProfile::XeLpdp { tbt_io },
+            gen9_dc: &crate::intel_gpu_gen9_dc_states::ServiceDcOff,
         }
     }
 
@@ -500,6 +517,15 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         reply_buf: &'b mut [u8],
     ) -> Result<AuxResponse<'b>, AuxError> {
         let mut wire = AUX_TRANSACTION.try_lock().ok_or(AuxError::Deferred)?;
+        // Gen9: exit DC5/DC6 before the first AUX register access and hold
+        // DC_off to the end of the transfer; re-entry is deferred after it.
+        // A refused exit touches nothing. Inert on every other display.
+        let _dc = crate::intel_gpu_gen9_dc_states::hold(
+            self.gen9_dc,
+            self.mmio,
+            crate::intel_gpu_gen9_dc_states::Gen9DcUser::Aux,
+        )
+        .map_err(|_| AuxError::Deferred)?;
         let inherited = self.mmio.read32(self.aux_ctl_off());
         if inherited == u32::MAX {
             return Err(AuxError::ShortReply);

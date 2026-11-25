@@ -1079,9 +1079,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // own outcome.
     if let Some(platform) = crate::intel_gpu_modeset::gen9_family_for_chip(dev.chip) {
         // Gen9 DC states (`narf.intel.gen9_dc=1`, default off): the
-        // `DC_off` service disables DC states and holds them off
-        // (`skl_display_core_init`'s DC_STATE_DISABLE, `POWER_DOMAIN_INIT`).
-        // Without the option nothing is written.
+        // `DC_off` service disables DC states and holds them off from here
+        // to the end of probe (`skl_display_core_init`'s DC_STATE_DISABLE,
+        // `POWER_DOMAIN_INIT`). Without the option nothing is written.
         crate::intel_gpu_gen9_dc_states::install(platform, dev.gtt_mmadr, cap);
         let window = dev.mode_window();
         let authority: Option<Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>> =
@@ -1757,6 +1757,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
     poll_dp_hpd_events();
 
+    // Gen9 DC states: hardware readout is done. The Init reference drops
+    // (DC5/DC6 may be entered once idle) only with the DMC loaded and the
+    // internal panel owned on Pipe A; inert without the Gen9 service.
+    crate::intel_gpu_gen9_dc_states::probe_complete(
+        &gt_bar,
+        owns_scanout && panel_mode.is_some(),
+    );
+
     // Power management (Q9, #1015): retain the PCI authority,
     // note the takeover mode for resume re-light, and register
     // the device-PM + suspend-hook pair. Last, so a failed
@@ -2232,6 +2240,15 @@ pub fn poll_dp_hpd_events() {
     let Some(bar) =
         with_controller(|gpu| (!gpu.firmware_display).then_some(gpu.gtt_mmadr)).flatten()
     else {
+        return;
+    };
+    // Gen9: the whole external-output pass (hotplug, probe, connect,
+    // disconnect) runs with DC states exited; if they cannot be, nothing
+    // runs. Inert on every other display.
+    let Ok(_dc) = crate::intel_gpu_gen9_dc_states::acquire_for_bar(
+        &bar,
+        crate::intel_gpu_gen9_dc_states::Gen9DcUser::External,
+    ) else {
         return;
     };
     let display = crate::intel_gpu_kms::display_for_bar(&bar);
