@@ -73,11 +73,15 @@ work had.
   FRL stays refused: Linux 7.4 has no source FRL link training (its rate
   and PHY facts are carried).
 - DP 2.0 UHBR beyond the 128b/132b SST route behind `narf.intel.uhbr=1`
-  (UHBR10/20 on C20 and LT ports, native fixtures only): 128b/132b MST, DSC
-  over UHBR, UHBR over Thunderbolt alt mode (TBT 312.5/625 MHz clocks, DP
-  tunnel BW allocation), LTTPR non-transparent mode, the reduced-parameter
-  retry after a failed 128b/132b training, HDCP on 128b/132b, VBT C20
-  vswing overrides, and a silicon run.
+  (UHBR10/20 on C20 and LT ports, over display-30 Thunderbolt with DP
+  tunnel BW allocation, through non-transparent LTTPRs, with the
+  reduced-parameter retry, HDCP as DP SST and the VBT C20 UHBR override;
+  native fixtures only): 128b/132b MST (MTP slots from 0 with the 128b/132b
+  PBN divider, per-stream `TRANS_DP2_CTL`/VFREQ and the 128b/132b MST
+  transport), DSC over UHBR (`intel_dp_mtp_tu_compute_config` with DSC
+  slices, implicit FEC, the display-14 DPT limit), per-hop 8b/10b LTTPR
+  training (`intel_dp_link_train_all_phys`), the VBT DP 1.4 C20 and C10
+  overrides, and a silicon run.
 - Older display: the Gen9 interrupt owner (`narf.intel.gen9_irq=1`), the
   execlists GT across system sleep (`narf.intel.execlists_suspend=1`),
   `PP_DIVISOR` on pre-CNP south displays (`narf.intel.pp_divisor=1`), Gen9

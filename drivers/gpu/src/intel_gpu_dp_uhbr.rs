@@ -1331,10 +1331,18 @@ pub fn poll_act_handled<A: AuxChannel + ?Sized, C: Clock>(aux: &mut A, clock: &m
 pub enum UhbrRefusal {
     /// The link is MST and its hub supports a common UHBR rate: Linux runs
     /// 128b/132b MST (`intel_dp_mst_compute_link_config` takes the
-    /// highest-bandwidth link), which is not implemented.
+    /// highest-bandwidth link), which is not implemented: MTP slots from 0
+    /// of 64 (`drm_dp_mst_update_slots`) with `drm_dp_get_vc_payload_bw`'s
+    /// 128b/132b PBN divider, the primary's 128b/132b training without the
+    /// SST payload, and each stream's `TRANS_DP2_CTL`, VFREQ and
+    /// 128b/132b function on the master's MST transport.
     Mst,
     /// The stream needs DSC and the common rates include UHBR: Linux's DSC
-    /// search would consider them; DSC over 128b/132b is not implemented.
+    /// search would consider them (`dsc_compute_link_config` with
+    /// `intel_dp_mtp_tu_compute_config(dsc)`: slice-aware 32-bit symbol
+    /// overhead, implicit FEC, the display-14 DPT bpp limit). The
+    /// display-14 DSC search predates Linux 7.4's slice-aware one, so DSC
+    /// over 128b/132b is not implemented.
     Dsc,
     /// The stream needs UHBR over Thunderbolt alt mode on display 14 or 20:
     /// `intel_mtl_tbt_clock_select` has no UHBR10/20 select below display
