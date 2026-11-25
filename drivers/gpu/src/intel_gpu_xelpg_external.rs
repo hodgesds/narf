@@ -134,9 +134,13 @@
 //! `DDI_CTL_DE`, the 128b/132b training with TX FFE presets
 //! ([`uhbr::train`]), the sink's VC payload and its ACT, the MTP M/N, the
 //! `TRANS_DP2_VFREQ` pair and, on display 30+, `DP_MIN_HBLANK_CTL`. The stop
-//! reverses it and hands the sink back to 8b/10b channel coding. 128b/132b
-//! MST, DSC on a UHBR link, Thunderbolt alt mode, LTTPRs, a failed
-//! training's reduced retry and HDCP are refused typed
+//! reverses it and hands the sink back to 8b/10b channel coding. On
+//! display 30+ Thunderbolt alt mode the link runs through the DP tunnel's BW
+//! allocation ([`tunnel`]): the tunnel supplies the DPRX's 128b/132b rates
+//! and caps the link, the stream's bandwidth is requested before the port
+//! and freed after it, and the port clock is the fabric's UHBR select.
+//! 128b/132b MST, DSC on a UHBR link, Thunderbolt UHBR on display 14/20,
+//! LTTPRs, a failed training's reduced retry and HDCP are refused typed
 //! ([`ExternalError::Uhbr`]) or not offered. Without the option no
 //! 128b/132b register is touched.
 //!
@@ -189,6 +193,8 @@ pub mod color;
 
 #[path = "intel_gpu_xelpg_audio.rs"]
 pub mod audio;
+#[path = "intel_gpu_dp_tunnel.rs"]
+pub(crate) mod tunnel;
 
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
@@ -1027,6 +1033,9 @@ pub struct UhbrPlan {
     /// `intel_dp_use_post_lt_adj_req` (the sink's
     /// `DP_POST_LT_ADJ_REQ_SUPPORTED`).
     pub post_lt_adj_req: bool,
+    /// The DP tunnel with BW allocation enabled that the 128b/132b link
+    /// runs through (Thunderbolt alt mode, display 30+); `None` without one.
+    pub tunnel: Option<tunnel::Tunnel>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1094,6 +1103,8 @@ pub fn release_probe<M: MmioWindow + ?Sized>(
     io: &M,
     probe: &MtlSinkProbe,
 ) -> Result<(), ExternalError> {
+    let mut probe_tunnel = probe.uhbr.and_then(|plan| plan.tunnel);
+    tunnel_off(io, probe, &mut probe_tunnel);
     let aux = aux_power_disable(io, probe.port);
     let tc = match probe.tc {
         Some(conn) => tc_disconnect(io, &conn),
@@ -1262,6 +1273,18 @@ fn c10_phy<M: MmioWindow + ?Sized>(io: &M, port: XeLpgPort) -> bool {
 /// stream at its bpp, `Ok(None)` when the 8b/10b negotiation stands (an
 /// 8b/10b link carries it, no UHBR rate is common, or nothing fits a sink
 /// without DSC), a typed refusal for what is not implemented.
+///
+/// On Thunderbolt alt mode at display 30+ the link first reads
+/// `DP_128B132B_SUPPORTED_LINK_RATES` (unconditionally, which the DP IN
+/// adapter's 128b/132b detection needs, DP 2.1 5.14.3), then detects the DP
+/// tunnel and enables its BW allocation (`intel_dp_tunnel_detect`,
+/// `detect_new_tunnel`); with it the sink's 128b/132b rates, its maximum
+/// rate and lane count come from the tunnel and every configuration is
+/// capped at the tunnel's available bandwidth. A tunnel whose BW allocation
+/// does not enable is kept without it, as Linux does. A probe that does not
+/// take a 128b/132b link through the tunnel hands the tunnel back to its
+/// legacy allocation ([`tunnel::disable_bw_alloc`]; Linux would allocate the
+/// 8b/10b stream's bandwidth instead, which the 8b/10b route does not do).
 fn plan_uhbr<A: crate::dp_aux::AuxChannel + ?Sized>(
     aux: &mut A,
     link: &LinkProbe,
@@ -1275,15 +1298,61 @@ fn plan_uhbr<A: crate::dp_aux::AuxChannel + ?Sized>(
     if source == 0 {
         return Ok(None);
     }
-    let sink = uhbr::read_sink(aux, &link.raw)
+    let mut found = None;
+    if link.tbt() && link.display_ip.is_display30() {
+        let mut rates = [0u8];
+        aux.dpcd_read(uhbr::DP_128B132B_SUPPORTED_LINK_RATES, &mut rates)
+            .map_err(|e| ExternalError::Link(LinkError::AuxFailure(e)))?;
+        if let Ok(mut t) = tunnel::detect(aux) {
+            if tunnel::enable_bw_alloc(aux, &mut t).is_ok() {
+                found = Some(t);
+            }
+        }
+    }
+    let plan = plan_uhbr_link(aux, link, limits, mode, max_bpp, sink_dsc, source, found);
+    if let Some(mut t) = found {
+        if !matches!(plan, Ok(Some(UhbrPlan { tunnel: Some(_), .. }))) {
+            let _ = tunnel::disable_bw_alloc(aux, &mut t);
+        }
+    }
+    plan
+}
+
+/// [`plan_uhbr`] once the tunnel (if any) is known.
+#[allow(clippy::too_many_arguments)]
+fn plan_uhbr_link<A: crate::dp_aux::AuxChannel + ?Sized>(
+    aux: &mut A,
+    link: &LinkProbe,
+    limits: &dsc::LinkLimits,
+    mode: &Mode,
+    max_bpp: u32,
+    sink_dsc: bool,
+    source: u8,
+    tunnel: Option<tunnel::Tunnel>,
+) -> Result<Option<UhbrPlan>, ExternalError> {
+    let sink = uhbr::read_sink_rates(aux, &link.raw, tunnel.map(|t| t.dprx_128b132b_rates))
         .map_err(|e| ExternalError::Link(LinkError::AuxFailure(e)))?;
     let common = sink.rates & source;
     if common == 0 {
         return Ok(None);
     }
-    match uhbr::wide_link(limits, common, mode, max_bpp) {
+    // With BW allocation, max_dprx_rate / max_dprx_lane_count are the
+    // tunnel's and intel_dp_max_link_data_rate caps at its available BW;
+    // intel_dp_tunnel_uhbr_lanes_wa_apply drops the narrow UHBR configs.
+    let (limits, cap, lane_mask) = match tunnel {
+        Some(t) => (
+            dsc::LinkLimits::standard(
+                t.max_dprx_rate.min(810_000),
+                link.tc.map_or(4, |tc| tc.max_lanes).min(t.max_dprx_lanes),
+            ),
+            t.available_bw.map(u64::from),
+            t.uhbr_lane_mask(),
+        ),
+        None => (*limits, None, 0),
+    };
+    match uhbr::wide_link_capped(&limits, common, mode, max_bpp, cap, lane_mask) {
         uhbr::WideLink::Uhbr(chosen) => {
-            if link.tbt() {
+            if link.tbt() && !link.display_ip.is_display30() {
                 return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt));
             }
             if sink.lttpr {
@@ -1295,11 +1364,66 @@ fn plan_uhbr<A: crate::dp_aux::AuxChannel + ?Sized>(
                 link: chosen,
                 stream,
                 post_lt_adj_req: sink.post_lt_adj_req,
+                tunnel,
             }))
         }
         uhbr::WideLink::None if sink_dsc => Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Dsc)),
         uhbr::WideLink::EightTenB | uhbr::WideLink::None => Ok(None),
     }
+}
+
+/// `intel_dp_tunnel_atomic_alloc_bw` before the 128b/132b port is
+/// programmed: the stream's `intel_dp_config_required_rate`. Linux only
+/// queues a re-detect after a failed request and enables the stream
+/// anyway; this route refuses it ([`uhbr::UhbrRefusal::Tunnel`]) rather
+/// than run a stream the tunnel may not carry.
+fn tunnel_alloc<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &mut MtlExternalRoute,
+) -> Result<(), ExternalError> {
+    let Some(mut plan) = route.probe.uhbr else {
+        return Ok(());
+    };
+    let Some(mut t) = plan.tunnel else {
+        return Ok(());
+    };
+    let mode = route.probe.mode;
+    let required = uhbr::link_required(
+        u32::from(plan.link.lanes),
+        mode.pixel_clock_khz,
+        u32::from(mode.h_active),
+        plan.link.pipe_bpp * 16,
+    );
+    let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
+    let result = tunnel::alloc_bw(
+        &mut aux,
+        &mut uhbr::SystemClock,
+        &mut t,
+        u32::try_from(required).unwrap_or(u32::MAX),
+    );
+    plan.tunnel = Some(t);
+    route.probe.uhbr = Some(plan);
+    result.map_err(|e| ExternalError::Uhbr(uhbr::UhbrRefusal::Tunnel(e)))
+}
+
+/// The tunnel's teardown with the port off: the stream's bandwidth freed
+/// (`atomic_decrease_bw` with no stream: 0) and BW allocation disabled
+/// (`drm_dp_tunnel_disable_bw_alloc`, which Linux runs when the tunnel goes:
+/// the 8b/10b route that may follow does not speak BW allocation). Best
+/// effort, as the sink may be gone.
+fn tunnel_off<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: &MtlSinkProbe,
+    found: &mut Option<tunnel::Tunnel>,
+) {
+    let Some(t) = found.as_mut().filter(|t| t.bw_alloc_enabled) else {
+        return;
+    };
+    let mut aux = IntelAux::xelpdp(io, probe.port.aux_base(), probe.tbt());
+    if t.allocated_bw.is_some_and(|bw| bw != 0) {
+        let _ = tunnel::alloc_bw(&mut aux, &mut uhbr::SystemClock, t, 0);
+    }
+    let _ = tunnel::disable_bw_alloc(&mut aux, t);
 }
 
 fn probe_sink_link<M: MmioWindow + ?Sized>(
@@ -1788,6 +1912,9 @@ fn program<M: MmioWindow + ?Sized>(
     )?);
     let (rate, lanes) = (route.probe.negotiated.rate, route.probe.negotiated.lanes);
     if let Some(plan) = route.probe.uhbr {
+        // The DP tunnel's bandwidth first (intel_dp_tunnel_atomic_alloc_bw
+        // precedes the modeset enables).
+        tunnel_alloc(io, route)?;
         // A 128b/132b link trains once at the planned rate and lanes; a
         // failure stops the route (Linux's reduced-parameter retry is not
         // run).
@@ -1972,6 +2099,11 @@ fn uhbr_levels<M: MmioWindow + ?Sized>(
     lanes: u8,
     presets: &[u8; 4],
 ) -> Result<(), ExternalError> {
+    // intel_cx0_phy_set_signal_levels / intel_lt_phy_set_signal_levels
+    // return in Thunderbolt alt mode: the fabric owns the PHY.
+    if probe.tbt() {
+        return Ok(());
+    }
     match probe_lt_phy(io, probe)? {
         Some(lt) => {
             let lanes = usize::from(lanes);
@@ -1999,8 +2131,10 @@ fn uhbr_levels<M: MmioWindow + ?Sized>(
 
 /// `intel_ddi_enable_clock` at a UHBR rate: `intel_lt_phy_pll_enable` over
 /// `xe3plpd_lt_dp_uhbr*` or `intel_cx0pll_enable` over the C20 DP 2.0 image
-/// ([`dp_uhbr_pll_request`]), after `mtl_port_buf_ctl_io_selection` (never
-/// Thunderbolt: that refuses at probe).
+/// ([`dp_uhbr_pll_request`]), after `mtl_port_buf_ctl_io_selection`. In
+/// Thunderbolt alt mode (display 30+; display 14/20 refuse at probe) the
+/// TBT IO select and `intel_mtl_tbt_pll_enable_clock` at the UHBR port clock
+/// (`XELPDP_DDI_CLOCK_SELECT_TBT_312_5` / `_625`), no PHY PLL.
 fn enable_clock_uhbr<M: MmioWindow + ?Sized>(
     io: &M,
     probe: &MtlSinkProbe,
@@ -2008,10 +2142,12 @@ fn enable_clock_uhbr<M: MmioWindow + ?Sized>(
     lanes: u8,
 ) -> Result<(), ExternalError> {
     let port = probe.port;
-    if probe.tbt() {
-        return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt));
-    }
     let buf = read(io, port.buf_ctl1())?;
+    if probe.tbt() {
+        write(io, port.buf_ctl1(), buf | PORT_BUF_IO_SELECT_TBT)?;
+        return crate::intel_gpu_xelpg::enable_tbt_clock_khz(io, port, rate.link_rate())
+            .map_err(phy_err);
+    }
     write(io, port.buf_ctl1(), buf & !PORT_BUF_IO_SELECT_TBT)?;
     match probe_lt_phy(io, probe)? {
         Some(lt) => {
@@ -2812,6 +2948,10 @@ fn stop_local<M: MmioWindow + ?Sized>(
         disable_port(io, route)?;
     }
     finish_port_stop(io, route)?;
+    if let Some(mut plan) = route.probe.uhbr {
+        tunnel_off(io, &route.probe, &mut plan.tunnel);
+        route.probe.uhbr = Some(plan);
+    }
     let rp = route
         .reservation
         .as_mut()

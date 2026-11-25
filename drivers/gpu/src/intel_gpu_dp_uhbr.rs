@@ -27,11 +27,17 @@
 //!   VC payload (VCPID 1, slot 0, `tu` slots) of `mtl_ddi_pre_enable_dp` /
 //!   `intel_ddi_enable` and its clear in `intel_ddi_post_disable_hdmi_or_sst`.
 //!
+//! - **Thunderbolt alt mode** (display 30+): the DP tunnel's BW allocation
+//!   ([`super::tunnel`]) supplies the tunnelled DPRX's 128b/132b rates
+//!   ([`read_sink_rates`]) and caps every configuration
+//!   ([`wide_link_capped`]); the port clock is the fabric's UHBR select
+//!   (`crate::intel_gpu_xelpg::enable_tbt_clock_khz`).
+//!
 //! Not implemented, refused typed ([`UhbrRefusal`]) instead of running a
 //! link Linux would not: 128b/132b MST, DSC on a link whose common rates
-//! include UHBR, Thunderbolt-alt UHBR (the TBT 312.5/625 MHz clock select and
-//! DP tunnel BW allocation), an LTTPR in the path (Linux trains through it
-//! in non-transparent mode), and the reduced-parameter retry after a failed
+//! include UHBR, Thunderbolt-alt UHBR on display 14/20 (no TBT UHBR clock
+//! select), an LTTPR in the path (Linux trains through it in
+//! non-transparent mode), and the reduced-parameter retry after a failed
 //! 128b/132b training.
 
 use crate::dp_aux::{AuxChannel, AuxError};
@@ -231,20 +237,45 @@ pub fn read_sink<A: AuxChannel + ?Sized>(
     aux: &mut A,
     raw: &[u8; 16],
 ) -> Result<UhbrSink, AuxError> {
+    read_sink_rates(aux, raw, None)
+}
+
+/// [`read_sink`] behind a DP tunnel with BW allocation enabled
+/// ([`super::tunnel`]): `dprx_supports_128b132b` and
+/// `dprx_128b132b_link_rates` take the tunnel's 128b/132b rates
+/// (`drm_dp_tunnel_128b132b_dprx_rates`, zero without 128b/132b support)
+/// instead of `DP_CAP_ANSI_128B132B` and `DP_128B132B_SUPPORTED_LINK_RATES`
+/// (which a tunnelled DPRX reports empty, DP 2.1 5.14.3); the LTTPR masking
+/// is unchanged. `None` is [`read_sink`].
+pub fn read_sink_rates<A: AuxChannel + ?Sized>(
+    aux: &mut A,
+    raw: &[u8; 16],
+    tunnel_rates: Option<u8>,
+) -> Result<UhbrSink, AuxError> {
     let post_lt_adj_req = raw[DP_MAX_LANE_COUNT] & DP_POST_LT_ADJ_REQ_SUPPORTED != 0;
-    if raw[DP_MAIN_LINK_CHANNEL_CODING] & DP_CAP_ANSI_128B132B == 0 {
+    let supported = match tunnel_rates {
+        Some(rates) => rates != 0,
+        None => raw[DP_MAIN_LINK_CHANNEL_CODING] & DP_CAP_ANSI_128B132B != 0,
+    };
+    if !supported {
         return Ok(UhbrSink {
             post_lt_adj_req,
             ..UhbrSink::default()
         });
     }
-    let mut rates = [0u8];
-    aux.dpcd_read(DP_128B132B_SUPPORTED_LINK_RATES, &mut rates)?;
+    let rates = match tunnel_rates {
+        Some(rates) => rates,
+        None => {
+            let mut rates = [0u8];
+            aux.dpcd_read(DP_128B132B_SUPPORTED_LINK_RATES, &mut rates)?;
+            rates[0]
+        }
+    };
     let mut lttpr = [0u8; 8];
     if aux.dpcd_read(DP_LTTPR_COMMON_CAPS, &mut lttpr).is_err() {
         lttpr = [0; 8];
     }
-    let mut rates = rates[0] & (DP_UHBR10 | DP_UHBR13_5 | DP_UHBR20);
+    let mut rates = rates & (DP_UHBR10 | DP_UHBR13_5 | DP_UHBR20);
     let present = lttpr_count(&lttpr) != Some(0);
     if present {
         if lttpr[0] >= 0x20
@@ -330,7 +361,25 @@ pub enum WideLink {
 /// lowest (the 8b/10b rates of `limits`, then the UHBR rates in
 /// `uhbr_rates`) and every lane count from 1 to `limits.max_lanes`; the
 /// first that carries the mode wins.
+#[cfg(any(test, feature = "kernel-test"))]
 pub fn wide_link(limits: &dsc::LinkLimits, uhbr_rates: u8, mode: &Mode, max_bpp: u32) -> WideLink {
+    wide_link_capped(limits, uhbr_rates, mode, max_bpp, None, 0)
+}
+
+/// [`wide_link`] with `intel_dp_max_link_data_rate`'s DP tunnel cap
+/// (`cap`, kBps: the tunnel's available bandwidth while BW allocation is
+/// enabled) on every configuration, and the UHBR lane counts the tunnel's
+/// `intel_dp_tunnel_uhbr_lanes_wa_apply` disabled (`uhbr_lane_mask`, bit
+/// `ilog2(lanes)`).
+pub fn wide_link_capped(
+    limits: &dsc::LinkLimits,
+    uhbr_rates: u8,
+    mode: &Mode,
+    max_bpp: u32,
+    cap: Option<u64>,
+    uhbr_lane_mask: u8,
+) -> WideLink {
+    let capped = |rate: u64| cap.map_or(rate, |cap| rate.min(cap));
     let max_bpp = max_bpp.min(dsc::PIPE_BPP);
     let lanes = [1u8, 2, 4].into_iter().filter(|&l| l <= limits.max_lanes);
     let (clock, hdisplay) = (mode.pixel_clock_khz, u32::from(mode.h_active));
@@ -341,7 +390,7 @@ pub fn wide_link(limits: &dsc::LinkLimits, uhbr_rates: u8, mode: &Mode, max_bpp:
             for l in lanes.clone() {
                 let l = u32::from(l);
                 if dsc::link_required(l, clock, hdisplay, bpp_x16, false)
-                    <= dsc::max_link_data_rate(rate, l)
+                    <= capped(dsc::max_link_data_rate(rate, l))
                 {
                     return WideLink::EightTenB;
                 }
@@ -351,9 +400,12 @@ pub fn wide_link(limits: &dsc::LinkLimits, uhbr_rates: u8, mode: &Mode, max_bpp:
             .into_iter()
             .filter(|r| uhbr_rates & r.rate_bit() != 0)
         {
-            for l in lanes.clone() {
+            for l in lanes
+                .clone()
+                .filter(|l| uhbr_lane_mask & (1 << l.trailing_zeros()) == 0)
+            {
                 if link_required(u32::from(l), clock, hdisplay, bpp_x16)
-                    <= max_link_data_rate(rate, u32::from(l))
+                    <= capped(max_link_data_rate(rate, u32::from(l)))
                 {
                     return WideLink::Uhbr(UhbrLink {
                         rate,
@@ -883,9 +935,13 @@ pub enum UhbrRefusal {
     /// The stream needs DSC and the common rates include UHBR: Linux's DSC
     /// search would consider them; DSC over 128b/132b is not implemented.
     Dsc,
-    /// The stream needs UHBR over Thunderbolt alt mode (TBT UHBR clocks and
-    /// DP tunnel BW allocation are not owned).
+    /// The stream needs UHBR over Thunderbolt alt mode on display 14 or 20:
+    /// `intel_mtl_tbt_clock_select` has no UHBR10/20 select below display
+    /// 30 (Linux WARNs and programs the 162 MHz one).
     Tbt,
+    /// The DP tunnel's bandwidth request for the 128b/132b stream failed
+    /// (`drm_dp_tunnel_alloc_bw`; nothing past the tunnel was programmed).
+    Tunnel(super::tunnel::TunnelError),
     /// The stream needs UHBR through an LTTPR (non-transparent mode is not
     /// owned).
     Lttpr,

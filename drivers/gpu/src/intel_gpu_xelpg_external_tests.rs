@@ -70,6 +70,12 @@ pub struct Sink {
     pub extra: Vec<(u32, u8)>,
     /// Native writes to `DP_PROTOCOL_CONVERTER_CONTROL_0..=2`, in order.
     pub pcon_log: Vec<(u32, u8)>,
+    /// A USB4 DP IN adapter's tunnel DPCD (0xe0000..=0xe0031) in front of
+    /// the sink: its connection manager grants every `DP_REQUEST_BW` at once
+    /// (`DP_ALLOCATED_BW` takes the request, `DP_BW_REQUEST_SUCCEEDED`).
+    pub tunnel: Option<[u8; 0x32]>,
+    /// Native writes to the tunnel registers, in order.
+    pub tunnel_log: Vec<(u32, u8)>,
 }
 
 impl Sink {
@@ -108,6 +114,8 @@ impl Sink {
             uhbr_reads: Vec::new(),
             extra: Vec::new(),
             pcon_log: Vec::new(),
+            tunnel: None,
+            tunnel_log: Vec::new(),
         }
     }
     /// A DP 2.0 sink: `DP_CAP_ANSI_128B132B` with `uhbr_rates`.
@@ -190,6 +198,11 @@ impl Sink {
                 _ => {}
             }
         }
+        if let Some(t) = &self.tunnel {
+            if (0xe_0000..=0xe_0031).contains(&addr) {
+                return t[(addr - 0xe_0000) as usize];
+            }
+        }
         match addr {
             0x000..=0x00F => self.caps[addr as usize],
             uhbr::DP_128B132B_SUPPORTED_LINK_RATES => {
@@ -226,6 +239,21 @@ impl Sink {
         }
     }
     fn write_byte(&mut self, addr: u32, value: u8) {
+        if let Some(t) = self.tunnel.as_mut() {
+            if (0xe_0000..=0xe_0031).contains(&addr) {
+                self.tunnel_log.push((addr, value));
+                match addr {
+                    tunnel::DP_TUNNELING_STATUS => t[0x25] &= !value,
+                    tunnel::DP_REQUEST_BW => {
+                        t[0x31] = value;
+                        t[0x24] = value;
+                        t[0x25] |= tunnel::DP_BW_REQUEST_SUCCEEDED;
+                    }
+                    _ => t[(addr - 0xe_0000) as usize] = value,
+                }
+                return;
+            }
+        }
         match addr {
             0x101 => {
                 self.training_writes.push((addr, value));
@@ -4649,6 +4677,247 @@ fn smoke_mtl_external_uhbr_mst_hub_refused() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_uhbr_mst_hub_refused
+);
+
+/// The tunnel DPCD of a USB4 DP IN adapter with BW allocation: tunneling and
+/// BW allocation support, USB4 driver 1 (with its BW allocation support),
+/// group 1, 0.25 Gbps granularity, 72 units (2250000 kBps) estimated,
+/// nothing allocated, and a DPRX of HBR3 x2 with UHBR10 and the 128b/132b
+/// lane 0 mapping.
+fn usb4_adapter() -> [u8; 0x32] {
+    let mut t = [0u8; 0x32];
+    t[0x0d] = tunnel::DP_TUNNELING_SUPPORT | tunnel::DP_IN_BW_ALLOCATION_MODE_SUPPORT;
+    t[0x0f] = 1;
+    t[0x20] = tunnel::DP_USB4_DRIVER_BW_ALLOCATION_MODE_SUPPORT;
+    t[0x21] = 1;
+    t[0x23] = 72;
+    t[0x28] = 0x1e;
+    t[0x29] = 2;
+    t[0x2b] = tunnel::DP_128B132B_DP_SUPPORTED;
+    t[0x2c] = 0x01 | tunnel::DP_TUNNELING_128B132B_LL_LANE0_MAPPING_SUPPORT;
+    t
+}
+
+/// `narf.intel.uhbr=1` on Panther Lake TC2 in Thunderbolt alt mode: the
+/// tunnelled 4K60 DPRX reports HBR2 and no 128b/132b rate in its own DPCD
+/// (DP 2.1 5.14.3); after the unconditional
+/// `DP_128B132B_SUPPORTED_LINK_RATES` read, `drm_dp_tunnel_detect` and
+/// `drm_dp_tunnel_enable_bw_alloc` (`DP_DPTX_BW_ALLOCATION_MODE_CONTROL`
+/// 0xc0) the tunnel's UHBR10, HBR3 x2 and 2250000 kBps make
+/// `intel_dp_compute_link_config_wide` pick UHBR10 x2 at 24 bpp (HBR3 x2
+/// carries 1296000 kBps, the mode needs 1782000; UHBR10 x2's 2417750 is
+/// capped at 2250000). Before the port, `drm_dp_tunnel_alloc_bw` asks for
+/// `DIV_ROUND_UP(1782000, 31250)` = 58 units; the port clock is the
+/// fabric's `XELPDP_DDI_CLOCK_SELECT_TBT_312_5` (0x18 in the five-bit field)
+/// with `DDI_CLK_VALFREQ` 312500 and the TBT IO select, and no PHY PLL,
+/// message-bus or level transaction. The stop frees the 58 units and
+/// disables BW allocation.
+fn smoke_ptl_external_uhbr_over_tbt_tunnel() -> TestResult {
+    let port = XeLpgPort::Tc2;
+    let mut sink = Sink::new(0x14, edid_uhd(594_000));
+    sink.caps[2] = 2 | 0x40 | 0x80;
+    sink.tunnel = Some(usb4_adapter());
+    let io = ExtFake::new(port, sink);
+    let Some(panel) = io.light_panel_ip(DisplayIp::Xe3Lpd) else {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    };
+    io.pica_isr.set(pica_tbt_hotplug(1));
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd);
+    let probe = match probe_sink_profile_uhbr(&io, profile, port, false, true) {
+        Ok(probe) => probe,
+        Err(e) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "TBT UHBR probe: {e:?}");
+            return TestResult::Fail("the tunnelled DP 2.0 sink must probe with UHBR on");
+        }
+    };
+    let Some(plan) = probe.uhbr else {
+        return TestResult::Fail("only the tunnel's UHBR10 carries 4K60 on two lanes");
+    };
+    let mn = [(47 << 25) | 0x5e_579e, 0x80_0000, 0xf_34d6, 0x8_0000];
+    let Some(t) = plan.tunnel else {
+        return TestResult::Fail("the plan must keep the BW-allocation tunnel");
+    };
+    if !probe.tbt()
+        || plan.link
+            != (uhbr::UhbrLink {
+                rate: uhbr::UhbrRate::Uhbr10,
+                lanes: 2,
+                pipe_bpp: 24,
+            })
+        || plan.stream.tu != 48
+        || plan.stream.m_n != mn
+        || !t.bw_alloc_enabled
+        || t.available_bw != Some(2_250_000)
+        || t.allocated_bw.is_some()
+    {
+        return TestResult::Fail("the tunnel's caps must give Linux's UHBR10 x2 link");
+    }
+    {
+        let sink = io.sink.borrow();
+        if sink.uhbr_reads.first() != Some(&uhbr::DP_128B132B_SUPPORTED_LINK_RATES)
+            || sink.tunnel_log != [(tunnel::DP_DPTX_BW_ALLOCATION_MODE_CONTROL, 0xc0)]
+        {
+            return TestResult::Fail("probe: the 128b/132b rates read, then BWA enabled");
+        }
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let display = MtlDisplay {
+        panel: Some(panel),
+        pipe_dmc: &NoPipeDmc,
+    };
+    io.phy.writes.borrow_mut().clear();
+    let mut route = match activate(&io, probe, fb, &display) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        Ok(_) => return TestResult::Fail("the TBT 128b/132b route must be live"),
+        Err(ActivateError::Refused(_, e)) | Err(ActivateError::Failed(_, e)) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "TBT UHBR activate: {e:?}");
+            return TestResult::Fail("the TBT 128b/132b route must light");
+        }
+    };
+    let req = tunnel::DP_BW_REQUEST_SUCCEEDED | tunnel::DP_BW_REQUEST_FAILED;
+    {
+        let sink = io.sink.borrow();
+        if sink.tunnel_log[1..]
+            != [
+                (tunnel::DP_TUNNELING_STATUS, req),
+                (tunnel::DP_REQUEST_BW, 58),
+                (tunnel::DP_TUNNELING_STATUS, req),
+            ]
+        {
+            return TestResult::Fail("the stream's 58 units must be requested and acknowledged");
+        }
+    }
+    if route
+        .probe
+        .uhbr
+        .and_then(|p| p.tunnel)
+        .and_then(|t| t.allocated_bw)
+        != Some(58 * 31_250)
+    {
+        return TestResult::Fail("the route must record the granted allocation");
+    }
+    let clock = io.read32(port.port_clock_ctl());
+    if clock & crate::intel_gpu_xelpg::XE3_DDI_CLOCK_SELECT_MASK
+        != crate::intel_gpu_xelpg::DDI_CLOCK_SELECT_TBT_312_5 << 12
+        || clock & crate::intel_gpu_xelpg::TBT_CLOCK_REQUEST == 0
+        || io.read32(port.clk_valfreq().unwrap()) != 312_500
+        || io.read32(port.buf_ctl1()) & PORT_BUF_IO_SELECT_TBT == 0
+        || io.read32(port.buf_ctl1()) & (3 << 18) != 2 << 18
+    {
+        return TestResult::Fail("UHBR10 over TBT runs the fabric's 312.5 MHz select, 40-bit");
+    }
+    if io.phy.writes.borrow().iter().any(|(off, _)| {
+        (*off >= port.msgbus_ctl_ln0() && *off < port.msgbus_ctl_ln0() + 0x20)
+            || *off == port.buf_ctl2()
+    }) || io.read32(port.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
+    {
+        return TestResult::Fail("TBT UHBR must leave the C20 PHY to the fabric");
+    }
+    if io.writes_to(0x6_10a0) != [1 << 31]
+        || io.writes_to(TRANS_DDI_FUNC_CTL_B).last().map(|v| v & (7 << 24)) != Some(4 << 24)
+    {
+        return TestResult::Fail("the transcoder must run 128b/132b");
+    }
+    if route.stop(&io).is_err() || route.state() != RouteState::Stopped {
+        return TestResult::Fail("the TBT 128b/132b route must stop");
+    }
+    {
+        let sink = io.sink.borrow();
+        let log = &sink.tunnel_log;
+        let free = log.iter().rposition(|&w| w == (tunnel::DP_REQUEST_BW, 0));
+        let off = log.iter().rposition(|&w| {
+            w == (tunnel::DP_DPTX_BW_ALLOCATION_MODE_CONTROL, 0x00)
+        });
+        if !matches!((free, off), (Some(f), Some(o)) if f < o)
+            || sink.tunnel.map(|t| t[0x24]) != Some(0)
+        {
+            return TestResult::Fail("stop: the allocation freed, then BWA disabled");
+        }
+    }
+    if io.read32(port.port_clock_ctl())
+        & (crate::intel_gpu_xelpg::TBT_CLOCK_REQUEST | crate::intel_gpu_xelpg::XE3_DDI_CLOCK_SELECT_MASK)
+        != 0
+    {
+        return TestResult::Fail("stop: the TBT clock must be off");
+    }
+    let before = io.sink.borrow().tunnel_log.len();
+    if route.release(&io).is_err() || io.sink.borrow().tunnel_log.len() != before {
+        return TestResult::Fail("release must not touch the already handed-back tunnel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ptl_external_uhbr_over_tbt_tunnel
+);
+
+/// What keeps the tunnel out of a route: an 8b/10b stream through a
+/// BW-allocation tunnel hands the tunnel back at probe
+/// (`DP_DPTX_BW_ALLOCATION_MODE_CONTROL` 0xc0, then 0x00); a tunnel
+/// without the 128b/132b lane 0 mapping drops the two-lane UHBR
+/// configurations (`intel_dp_tunnel_uhbr_lanes_wa_apply`), so nothing
+/// carries 4K60 and the DSC-less sink stays over budget; display 14 never
+/// reads the tunnel and a UHBR rate there is the typed `Tbt` refusal.
+fn smoke_external_uhbr_tbt_tunnel_refusals() -> TestResult {
+    let port = XeLpgPort::Tc2;
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd);
+    // 1080p60 fits HBR3 x2: 8b/10b, the tunnel handed back.
+    let mut sink = Sink::new(0x14, edid_1080());
+    sink.caps[2] = 2 | 0x40 | 0x80;
+    sink.tunnel = Some(usb4_adapter());
+    let io = ExtFake::new(port, sink);
+    if io.light_panel_ip(DisplayIp::Xe3Lpd).is_none() {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    }
+    io.pica_isr.set(pica_tbt_hotplug(1));
+    match probe_sink_profile_uhbr(&io, profile, port, false, true) {
+        Ok(probe) if probe.uhbr.is_none() => {
+            let _ = release_probe(&io, &probe);
+        }
+        _ => return TestResult::Fail("an 8b/10b stream must keep the 8b/10b route"),
+    }
+    let ctl = tunnel::DP_DPTX_BW_ALLOCATION_MODE_CONTROL;
+    if io.sink.borrow().tunnel_log != [(ctl, 0xc0), (ctl, 0x00)] {
+        return TestResult::Fail("an 8b/10b probe must hand the tunnel back");
+    }
+    // No lane 0 mapping: UHBR10 x2 is disabled, 4K60 fits nothing.
+    let mut adapter = usb4_adapter();
+    adapter[0x2c] = 0x01;
+    let mut sink = Sink::new(0x14, edid_uhd(594_000));
+    sink.caps[2] = 2 | 0x40 | 0x80;
+    sink.tunnel = Some(adapter);
+    let io = ExtFake::new(port, sink);
+    if io.light_panel_ip(DisplayIp::Xe3Lpd).is_none() {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    }
+    io.pica_isr.set(pica_tbt_hotplug(1));
+    if !matches!(
+        probe_sink_profile_uhbr(&io, profile, port, false, true),
+        Err(ExternalError::OverBudget { .. })
+    ) || io.sink.borrow().tunnel_log != [(ctl, 0xc0), (ctl, 0x00)]
+    {
+        return TestResult::Fail("without the lane 0 mapping two-lane UHBR must be dropped");
+    }
+    // Display 14 over TBT: no tunnel read; a UHBR rate refuses typed.
+    let mut sink = Sink::dp20(0x14, edid_uhd(594_000), uhbr::DP_UHBR10);
+    sink.caps[2] = 2 | 0x40 | 0x80;
+    sink.tunnel = Some(usb4_adapter());
+    let io = ExtFake::new(port, sink);
+    io.pica_isr.set(pica_tbt_hotplug(1));
+    let mtl = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    if probe_sink_profile_uhbr(&io, mtl, port, false, true).err()
+        != Some(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt))
+        || !io.sink.borrow().tunnel_log.is_empty()
+    {
+        return TestResult::Fail("display 14 has no TBT UHBR clock: typed Tbt, no tunnel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_external_uhbr_tbt_tunnel_refusals
 );
 
 // ── Nova Lake-S display 35: the routes through the LT PHY ───────────
