@@ -644,6 +644,51 @@ pub fn is_ati_hdmi(c: &Codec) -> bool {
 pub fn ati_hdmi_rev3(c: &Codec) -> bool {
     is_ati_hdmi(c) && c.revision & 0xff00 >= 0x0300
 }
+
+/// The codec models of Linux `sound/hda/codecs/hdmi/intelhdmi.c`
+/// (`snd_hda_id_intelhdmi`): what each Intel HDMI/DP codec id probes as.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IntelHdmiModel {
+    /// `probe_i915_hsw_hdmi`: Haswell to Kaby Lake, Broxton.
+    Hsw,
+    /// `probe_i915_glk_hdmi`: Gemini Lake, Cannon Lake.
+    Glk,
+    /// `probe_i915_icl_hdmi`: Ice Lake, Jasper and Elkhart Lake.
+    Icl,
+    /// `probe_i915_tgl_hdmi`: Tiger, Rocket, Alder (S) and Raptor Lake,
+    /// DG1, DG2.
+    Tgl,
+    /// `probe_i915_adlp_hdmi`: Alder Lake-P, Meteor Lake, Battlemage,
+    /// Raptor Lake-P, Lunar, Panther, Wildcat and Nova Lake.
+    Adlp,
+    /// `probe_i915_byt_hdmi`: Valleyview2, Braswell.
+    Byt,
+    /// `probe_i915_cpt_hdmi`: Ibex Peak, Cougar and Panther Point.
+    Cpt,
+}
+
+/// `snd_hda_id_intelhdmi[]`: the model of Intel HDMI codec `vendor:device`.
+pub const fn intel_hdmi_model_for(vendor: u16, device: u16) -> Option<IntelHdmiModel> {
+    use IntelHdmiModel::*;
+    if vendor != 0x8086 {
+        return None;
+    }
+    Some(match device {
+        0x0054 | 0x2804 | 0x2805 | 0x2806 => Cpt,
+        0x2807 | 0x2808 | 0x2809 | 0x280a | 0x280b => Hsw,
+        0x2800 | 0x280c | 0x280d => Glk,
+        0x280f | 0x281a | 0x281b => Icl,
+        0x2812 | 0x2814 | 0x2815 | 0x2816 | 0x2818 | 0x2819 => Tgl,
+        0x281c | 0x281d | 0x281e | 0x281f | 0x2820 | 0x2822 | 0x2823 | 0x2824 => Adlp,
+        0x2882 | 0x2883 => Byt,
+        _ => return None,
+    })
+}
+
+/// [`intel_hdmi_model_for`] of a decoded codec.
+pub fn intel_hdmi_model(c: &Codec) -> Option<IntelHdmiModel> {
+    intel_hdmi_model_for(c.vendor_id, c.device_id)
+}
 /// Every digital output pin (HDMI/DP port) with a physical connection and a
 /// route to an Audio Output converter. On ATI codecs each port pin has its
 /// own converter (pins 3, 5, 7..., converters 2, 4, 6...).
