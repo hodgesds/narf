@@ -7372,9 +7372,9 @@ drivers/misc/mei/gsc_proxy/mei_gsc_proxy.c, `i915_gsc_proxy_component_ops`):
   control (mei_cldev_enable).
 - Provide a blocking `send(buf, len)` (mei_cldev_send) and a
   `recv(buf, 32 KiB)` (mei_cldev_recv) that return bytes or a negative errno.
-`drivers/platform/src/mei.rs` stops at link bring-up, HOST_START and the client
-enumeration bitmap. The worker's `CsmeProxy` trait is exactly that send/recv
-pair.
+That client now exists (`drivers/platform/src/mei_gsc_proxy.rs` over
+`mei.rs`'s client message layer) and registers with `narf_drivers::gsc_proxy`,
+which the worker's `CsmeProxy` binds; PXP above it remains refused.
 
 Threat assumptions. While PXP is refused, NARF writes no KCR register, starts
 no session, creates no protected object or queue and offers no key to
@@ -7517,8 +7517,8 @@ Fixtures, all under `drivers/gpu/intel_gpu_media_gt`:
   reset, D3hot re-classification, D3cold reload with a model CSME component,
   and an interrupted load.
 These fixtures are native models only: none has been run on physical Intel
-hardware. Still open are the MEI GSC proxy client, PXP, GSC ER-timeout
-recovery beyond wedging, and silicon acceptance.
+hardware. Still open are PXP, GSC ER-timeout recovery beyond wedging, and
+silicon acceptance.
 
 Integration: S2 was written before the media-GT power unit and was never run
 before integration. Its targeted run found two production bugs and one

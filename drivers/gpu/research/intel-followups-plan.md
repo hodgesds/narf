@@ -99,7 +99,7 @@ did.
       eviction/migration, alias revocation, VRAM PRIME/P2P.
     - Engine scheduling: further queue protocols. Protected queues
       need PXP and so the MEI proxy.
-    - Media GT: the MEI GSC proxy client.
+    - Media GT: PXP behind the (landed) MEI GSC proxy client.
     - Diagnostics: steered manual capture, coredump process/time facts.
     - Atomic display: what lane 7 leaves, plus tiling/compression beyond
       X/Tile4 and additional planes.
@@ -147,7 +147,9 @@ Still open, each needing its own grounding first:
 - Nova Lake-S beyond the opted-in eDP takeover (`narf.intel.nvl_modeset=1`):
   external DP/HDMI and Type-C on the LT PHY, a display-35 relight owner for
   system suspend, and the DMC/DC states.
-- The MEI/CSME GSC proxy, and PXP and HDCP behind it.
+- PXP and HDCP. The MEI GSC proxy client they sit behind is in
+  `drivers/platform/src/mei_gsc_proxy.rs` and joins the media GT's GSC
+  worker through `narf_drivers::gsc_proxy`.
 - D3cold through `_PR3` power resources (NARF evaluates no AML), and
   VRAM PRIME/P2P.
 
