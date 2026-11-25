@@ -4607,28 +4607,277 @@ kernel_test_in!(
     smoke_ext2_htree_lookup_chooses_correct_bucket
 );
 
-fn smoke_ext2_htree_tea_hash_deterministic() -> TestResult {
-    use crate::htree::{hash_version, name_hash};
-    let seed = [0u32; 4];
-    let h1 = name_hash(b"hello", hash_version::TEA, &seed);
-    let h2 = name_hash(b"hello", hash_version::TEA, &seed);
-    if h1 != h2 {
-        return TestResult::Fail("TEA hash not deterministic");
+fn smoke_ext4_dirhash_matches_e2fsprogs() -> TestResult {
+    // Every hash family, signed and unsigned, against e2fsprogs: name
+    // lengths around the 16-byte (TEA) and 32-byte (half-MD4) chunk
+    // edges, a 255-byte name, bytes >= 0x80 (where signedness matters),
+    // the default seed (`-s` with the nil UUID: an all-zero `s_hash_seed`
+    // selects the built-in seed) and an explicit one.
+    use crate::htree::{ext4fs_dirhash, hash_version as V};
+    let long: alloc::vec::Vec<u8> = b"long_name_".iter().cycle().take(255).copied().collect();
+    // Names: each is `debugfs dx_hash`'s input; see the table below.
+    let names: [&[u8]; 11] = [
+        b"a",
+        b"hello",
+        b"fifteen_chars__",
+        b"sixteen_chars___",
+        b"seventeen_chars__",
+        b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        b"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+        b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        &long,
+        b"\x63\x61\x66\xe9",
+        b"\xff\x80\x78",
+    ];
+    // (seed, version, name, hash, minor) from e2fsprogs 1.47.4:
+    // `debugfs -R "dx_hash -h <0-5> -s <seed> <name>" <img>`. The version is
+    // given by number: debugfs maps an unknown name (`tea_unsigned`) to 0.
+    let table: [(usize, u8, usize, u32, u32); 132] = [
+        (0, V::LEGACY, 0, 0xe74b53e2, 0x0),
+        (0, V::LEGACY, 1, 0x32252546, 0x0),
+        (0, V::LEGACY, 2, 0x8d4eb054, 0x0),
+        (0, V::LEGACY, 3, 0x89fab9c2, 0x0),
+        (0, V::LEGACY, 4, 0xa8c2175e, 0x0),
+        (0, V::LEGACY, 5, 0xa365191c, 0x0),
+        (0, V::LEGACY, 6, 0x71586034, 0x0),
+        (0, V::LEGACY, 7, 0x7851e27c, 0x0),
+        (0, V::LEGACY, 8, 0xef6de4fa, 0x0),
+        (0, V::LEGACY, 9, 0x65f23bce, 0x0),
+        (0, V::LEGACY, 10, 0xb0b9e266, 0x0),
+        (0, V::HALF_MD4, 0, 0xd5fa7d7a, 0xacb48187),
+        (0, V::HALF_MD4, 1, 0x1746da32, 0x420013b5),
+        (0, V::HALF_MD4, 2, 0x22f941fc, 0xafe5ffd1),
+        (0, V::HALF_MD4, 3, 0xef105ba4, 0xffc12b8a),
+        (0, V::HALF_MD4, 4, 0xd8960ae, 0x41e48908),
+        (0, V::HALF_MD4, 5, 0x415798c2, 0xe25911d8),
+        (0, V::HALF_MD4, 6, 0x8036bd46, 0x9d765e5a),
+        (0, V::HALF_MD4, 7, 0xb8a27f84, 0x11ec56cf),
+        (0, V::HALF_MD4, 8, 0xb647b390, 0xe1d34df9),
+        (0, V::HALF_MD4, 9, 0x9be4a372, 0xc33d4f19),
+        (0, V::HALF_MD4, 10, 0x4261bd34, 0x4d364f39),
+        (0, V::TEA, 0, 0x6d0ea4c0, 0xc18922df),
+        (0, V::TEA, 1, 0x6f5bb1a8, 0x231917c2),
+        (0, V::TEA, 2, 0xb808ecc6, 0xc30dc579),
+        (0, V::TEA, 3, 0xd8f8040, 0x72379af6),
+        (0, V::TEA, 4, 0x3f9d267c, 0x205d372b),
+        (0, V::TEA, 5, 0x85384aa4, 0x3bd016f2),
+        (0, V::TEA, 6, 0xc4e94f42, 0x7d25c4a8),
+        (0, V::TEA, 7, 0x54d31c78, 0x5c5b1ba2),
+        (0, V::TEA, 8, 0xf9482fec, 0x968f8d66),
+        (0, V::TEA, 9, 0x84b3a194, 0x1cf71779),
+        (0, V::TEA, 10, 0xb5b9326c, 0xd92ce391),
+        (0, V::LEGACY_UNSIGNED, 0, 0xe74b53e2, 0x0),
+        (0, V::LEGACY_UNSIGNED, 1, 0x32252546, 0x0),
+        (0, V::LEGACY_UNSIGNED, 2, 0x8d4eb054, 0x0),
+        (0, V::LEGACY_UNSIGNED, 3, 0x89fab9c2, 0x0),
+        (0, V::LEGACY_UNSIGNED, 4, 0xa8c2175e, 0x0),
+        (0, V::LEGACY_UNSIGNED, 5, 0xa365191c, 0x0),
+        (0, V::LEGACY_UNSIGNED, 6, 0x71586034, 0x0),
+        (0, V::LEGACY_UNSIGNED, 7, 0x7851e27c, 0x0),
+        (0, V::LEGACY_UNSIGNED, 8, 0xef6de4fa, 0x0),
+        (0, V::LEGACY_UNSIGNED, 9, 0x7c3849d0, 0x0),
+        (0, V::LEGACY_UNSIGNED, 10, 0xb942486a, 0x0),
+        (0, V::HALF_MD4_UNSIGNED, 0, 0xd5fa7d7a, 0xacb48187),
+        (0, V::HALF_MD4_UNSIGNED, 1, 0x1746da32, 0x420013b5),
+        (0, V::HALF_MD4_UNSIGNED, 2, 0x22f941fc, 0xafe5ffd1),
+        (0, V::HALF_MD4_UNSIGNED, 3, 0xef105ba4, 0xffc12b8a),
+        (0, V::HALF_MD4_UNSIGNED, 4, 0xd8960ae, 0x41e48908),
+        (0, V::HALF_MD4_UNSIGNED, 5, 0x415798c2, 0xe25911d8),
+        (0, V::HALF_MD4_UNSIGNED, 6, 0x8036bd46, 0x9d765e5a),
+        (0, V::HALF_MD4_UNSIGNED, 7, 0xb8a27f84, 0x11ec56cf),
+        (0, V::HALF_MD4_UNSIGNED, 8, 0xb647b390, 0xe1d34df9),
+        (0, V::HALF_MD4_UNSIGNED, 9, 0xab408964, 0x7893b5c),
+        (0, V::HALF_MD4_UNSIGNED, 10, 0xcfdb2d3c, 0x8f4961fa),
+        (0, V::TEA_UNSIGNED, 0, 0x6d0ea4c0, 0xc18922df),
+        (0, V::TEA_UNSIGNED, 1, 0x6f5bb1a8, 0x231917c2),
+        (0, V::TEA_UNSIGNED, 2, 0xb808ecc6, 0xc30dc579),
+        (0, V::TEA_UNSIGNED, 3, 0xd8f8040, 0x72379af6),
+        (0, V::TEA_UNSIGNED, 4, 0x3f9d267c, 0x205d372b),
+        (0, V::TEA_UNSIGNED, 5, 0x85384aa4, 0x3bd016f2),
+        (0, V::TEA_UNSIGNED, 6, 0xc4e94f42, 0x7d25c4a8),
+        (0, V::TEA_UNSIGNED, 7, 0x54d31c78, 0x5c5b1ba2),
+        (0, V::TEA_UNSIGNED, 8, 0xf9482fec, 0x968f8d66),
+        (0, V::TEA_UNSIGNED, 9, 0xe665cc26, 0x417d943d),
+        (0, V::TEA_UNSIGNED, 10, 0x9df2c526, 0xceda22fd),
+        (1, V::LEGACY, 0, 0xe74b53e2, 0x0),
+        (1, V::LEGACY, 1, 0x32252546, 0x0),
+        (1, V::LEGACY, 2, 0x8d4eb054, 0x0),
+        (1, V::LEGACY, 3, 0x89fab9c2, 0x0),
+        (1, V::LEGACY, 4, 0xa8c2175e, 0x0),
+        (1, V::LEGACY, 5, 0xa365191c, 0x0),
+        (1, V::LEGACY, 6, 0x71586034, 0x0),
+        (1, V::LEGACY, 7, 0x7851e27c, 0x0),
+        (1, V::LEGACY, 8, 0xef6de4fa, 0x0),
+        (1, V::LEGACY, 9, 0x65f23bce, 0x0),
+        (1, V::LEGACY, 10, 0xb0b9e266, 0x0),
+        (1, V::HALF_MD4, 0, 0x73bfb0a, 0x7446406e),
+        (1, V::HALF_MD4, 1, 0xb230da8a, 0xd96b22d0),
+        (1, V::HALF_MD4, 2, 0x1c64957e, 0x251e9b3b),
+        (1, V::HALF_MD4, 3, 0xb2588710, 0x8cdaabf4),
+        (1, V::HALF_MD4, 4, 0x44008922, 0xc05a1fca),
+        (1, V::HALF_MD4, 5, 0xf492e7a, 0xcfda0b72),
+        (1, V::HALF_MD4, 6, 0x9060aea8, 0x34b4f35d),
+        (1, V::HALF_MD4, 7, 0x7acfd538, 0x4af46b50),
+        (1, V::HALF_MD4, 8, 0x25de8128, 0x9f0c555d),
+        (1, V::HALF_MD4, 9, 0xd731c0e4, 0x95aa1aeb),
+        (1, V::HALF_MD4, 10, 0x30d1d43e, 0xc7933a62),
+        (1, V::TEA, 0, 0xc3d656bc, 0x334f477f),
+        (1, V::TEA, 1, 0xbdcaa196, 0xf19746ea),
+        (1, V::TEA, 2, 0xa9bfe0a4, 0xd283e4bb),
+        (1, V::TEA, 3, 0x18b2f18c, 0x84219cd5),
+        (1, V::TEA, 4, 0xee1a1130, 0x6bc74a61),
+        (1, V::TEA, 5, 0x65c8e67e, 0x16490c6),
+        (1, V::TEA, 6, 0x211c9a8c, 0xda6664de),
+        (1, V::TEA, 7, 0xc2a7f142, 0x1a6c8154),
+        (1, V::TEA, 8, 0xe6c70bf6, 0x31e23d52),
+        (1, V::TEA, 9, 0xa784043e, 0x1a8157dc),
+        (1, V::TEA, 10, 0x5028644e, 0xd8e56ce2),
+        (1, V::LEGACY_UNSIGNED, 0, 0xe74b53e2, 0x0),
+        (1, V::LEGACY_UNSIGNED, 1, 0x32252546, 0x0),
+        (1, V::LEGACY_UNSIGNED, 2, 0x8d4eb054, 0x0),
+        (1, V::LEGACY_UNSIGNED, 3, 0x89fab9c2, 0x0),
+        (1, V::LEGACY_UNSIGNED, 4, 0xa8c2175e, 0x0),
+        (1, V::LEGACY_UNSIGNED, 5, 0xa365191c, 0x0),
+        (1, V::LEGACY_UNSIGNED, 6, 0x71586034, 0x0),
+        (1, V::LEGACY_UNSIGNED, 7, 0x7851e27c, 0x0),
+        (1, V::LEGACY_UNSIGNED, 8, 0xef6de4fa, 0x0),
+        (1, V::LEGACY_UNSIGNED, 9, 0x7c3849d0, 0x0),
+        (1, V::LEGACY_UNSIGNED, 10, 0xb942486a, 0x0),
+        (1, V::HALF_MD4_UNSIGNED, 0, 0x73bfb0a, 0x7446406e),
+        (1, V::HALF_MD4_UNSIGNED, 1, 0xb230da8a, 0xd96b22d0),
+        (1, V::HALF_MD4_UNSIGNED, 2, 0x1c64957e, 0x251e9b3b),
+        (1, V::HALF_MD4_UNSIGNED, 3, 0xb2588710, 0x8cdaabf4),
+        (1, V::HALF_MD4_UNSIGNED, 4, 0x44008922, 0xc05a1fca),
+        (1, V::HALF_MD4_UNSIGNED, 5, 0xf492e7a, 0xcfda0b72),
+        (1, V::HALF_MD4_UNSIGNED, 6, 0x9060aea8, 0x34b4f35d),
+        (1, V::HALF_MD4_UNSIGNED, 7, 0x7acfd538, 0x4af46b50),
+        (1, V::HALF_MD4_UNSIGNED, 8, 0x25de8128, 0x9f0c555d),
+        (1, V::HALF_MD4_UNSIGNED, 9, 0xc9eec110, 0x1143e9d9),
+        (1, V::HALF_MD4_UNSIGNED, 10, 0xf06f1324, 0x332596c9),
+        (1, V::TEA_UNSIGNED, 0, 0xc3d656bc, 0x334f477f),
+        (1, V::TEA_UNSIGNED, 1, 0xbdcaa196, 0xf19746ea),
+        (1, V::TEA_UNSIGNED, 2, 0xa9bfe0a4, 0xd283e4bb),
+        (1, V::TEA_UNSIGNED, 3, 0x18b2f18c, 0x84219cd5),
+        (1, V::TEA_UNSIGNED, 4, 0xee1a1130, 0x6bc74a61),
+        (1, V::TEA_UNSIGNED, 5, 0x65c8e67e, 0x16490c6),
+        (1, V::TEA_UNSIGNED, 6, 0x211c9a8c, 0xda6664de),
+        (1, V::TEA_UNSIGNED, 7, 0xc2a7f142, 0x1a6c8154),
+        (1, V::TEA_UNSIGNED, 8, 0xe6c70bf6, 0x31e23d52),
+        (1, V::TEA_UNSIGNED, 9, 0x96265bd4, 0xa2850e92),
+        (1, V::TEA_UNSIGNED, 10, 0xfff21ac, 0xb4d9d7f4),
+    ];
+    // `-s a1b2c3d4-e5f6-0718-293a-4b5c6d7e8f90`: the UUID's bytes read as
+    // little-endian words, as `s_hash_seed` is.
+    let seeds = [
+        [0u32; 4],
+        [0xd4c3_b2a1, 0x1807_f6e5, 0x5c4b_3a29, 0x908f_7e6d],
+    ];
+    for &(seed, version, name, hash, minor) in &table {
+        match ext4fs_dirhash(names[name], version, &seeds[seed]) {
+            Some(got) if got.hash == hash && got.minor == minor => {}
+            _ => return TestResult::Fail("directory hash differs from e2fsprogs dx_hash"),
+        }
     }
-    // Different name should yield (with overwhelming probability) a
-    // different hash. If this ever flakes the hash is broken.
-    let h3 = name_hash(b"world", hash_version::TEA, &seed);
-    if h1 == h3 {
-        return TestResult::Fail("TEA hash collision on tiny inputs");
-    }
-    // Legacy hash differs from TEA for the same input.
-    let h_legacy = name_hash(b"hello", hash_version::LEGACY, &seed);
-    if h1 == h_legacy {
-        return TestResult::Fail("LEGACY and TEA must differ for non-empty input");
+    // SipHash (6) and unknown versions are refused, as Linux's -EINVAL.
+    if ext4fs_dirhash(b"a", 6, &seeds[0]).is_some() || ext4fs_dirhash(b"a", 7, &seeds[0]).is_some()
+    {
+        return TestResult::Fail("an unsupported hash version must be refused");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_tea_hash_deterministic);
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_dirhash_matches_e2fsprogs);
+
+fn smoke_ext4_dirhash_never_returns_the_eof_cookie() -> TestResult {
+    // The hash readdir reserves (EXT4_HTREE_EOF_32BIT << 1) is folded to
+    // the one below it, and the low bit is always clear.
+    use crate::htree::{ext4fs_dirhash, hash_version as V, HTREE_EOF_32BIT};
+    let mut name = [0u8; 4];
+    for i in 0..20_000u32 {
+        name.copy_from_slice(&i.to_le_bytes());
+        for v in [V::LEGACY, V::HALF_MD4, V::TEA] {
+            let h = match ext4fs_dirhash(&name, v, &[0; 4]) {
+                Some(h) => h.hash,
+                None => return TestResult::Fail("base hash versions must hash"),
+            };
+            if h & 1 != 0 || h == HTREE_EOF_32BIT << 1 {
+                return TestResult::Fail("a name hashed to the EOF cookie or an odd value");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_dirhash_never_returns_the_eof_cookie
+);
+
+fn smoke_ext4_hash_signedness_follows_s_flags() -> TestResult {
+    use crate::htree::{hash_version as V, lookup_hash_version};
+    use crate::superblock::{Superblock, EXT2_FLAGS_SIGNED_HASH, EXT2_FLAGS_UNSIGNED_HASH};
+    let mut buf = alloc::vec![0u8; 1024];
+    buf[56..58].copy_from_slice(&crate::EXT2_SUPER_MAGIC.to_le_bytes());
+    let parse_with = |buf: &mut alloc::vec::Vec<u8>, flags: u32| {
+        buf[352..356].copy_from_slice(&flags.to_le_bytes());
+        Superblock::parse(buf).map(|sb| sb.hash_unsigned())
+    };
+    if parse_with(&mut buf, EXT2_FLAGS_UNSIGNED_HASH) != Some(3)
+        || parse_with(&mut buf, EXT2_FLAGS_SIGNED_HASH) != Some(0)
+    {
+        return TestResult::Fail("s_flags signedness must select the hash variant");
+    }
+    // Neither bit: the platform's char signedness (signed on x86_64).
+    let platform = if core::ffi::c_char::MIN == 0 { 3 } else { 0 };
+    if parse_with(&mut buf, 0) != Some(platform) {
+        return TestResult::Fail("no s_flags bit must fall back to the platform char");
+    }
+    if lookup_hash_version(V::HALF_MD4, 3) != V::HALF_MD4_UNSIGNED
+        || lookup_hash_version(V::TEA, 0) != V::TEA
+        || lookup_hash_version(V::LEGACY, 3) != V::LEGACY_UNSIGNED
+    {
+        return TestResult::Fail("dx_probe adds s_hash_unsigned to the base versions");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_hash_signedness_follows_s_flags
+);
+
+fn smoke_ext4_dx_root_refuses_what_dx_probe_refuses() -> TestResult {
+    use crate::htree::{hash_version as V, DxRoot, DX_ROOT_HEAD_OFF, DX_ROOT_INFO_OFF};
+    let root = |version: u8, levels: u8, flags: u8| {
+        let mut b = alloc::vec![0u8; 1024];
+        b[DX_ROOT_INFO_OFF + 4] = version;
+        b[DX_ROOT_INFO_OFF + 5] = 8;
+        b[DX_ROOT_INFO_OFF + 6] = levels;
+        b[DX_ROOT_INFO_OFF + 7] = flags;
+        b[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2].copy_from_slice(&123u16.to_le_bytes());
+        b[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4].copy_from_slice(&1u16.to_le_bytes());
+        DxRoot::parse(&b).is_some()
+    };
+    for v in [V::LEGACY, V::HALF_MD4, V::TEA] {
+        if !root(v, 0, 0) || !root(v, 1, 0) {
+            return TestResult::Fail("a base-version root with 0 or 1 levels must parse");
+        }
+    }
+    // The _UNSIGNED variants are never stored; SipHash needs casefold.
+    for v in [V::LEGACY_UNSIGNED, V::HALF_MD4_UNSIGNED, V::TEA_UNSIGNED, 6] {
+        if root(v, 0, 0) {
+            return TestResult::Fail("dx_probe refuses this on-disk hash version");
+        }
+    }
+    if root(V::TEA, 2, 0) {
+        return TestResult::Fail("two dx-node levels need largedir");
+    }
+    if root(V::TEA, 0, 1) {
+        return TestResult::Fail("unused_flags bit 0 is unimplemented in Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_dx_root_refuses_what_dx_probe_refuses
+);
 
 fn smoke_ext2_dir_splice_insert_and_delete() -> TestResult {
     use crate::dir::{ftype, rec_len_for, splice};

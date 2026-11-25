@@ -73,6 +73,11 @@ pub const DX_ROOT_ENTRIES_OFF: usize = 32;
 pub const DX_NODE_HEAD_OFF: usize = 8;
 pub const DX_NODE_ENTRIES_OFF: usize = 8;
 
+/// The deepest dx-node level a directory may have without `largedir`:
+/// `ext4_dir_htree_level()` is 2 (root plus one node level), and
+/// `dx_probe` requires `indirect_levels < 2`.
+pub const MAX_INDIRECT_LEVELS: u8 = 1;
+
 /// Decoded HTREE root metadata.
 #[derive(Debug, Clone, Copy)]
 pub struct DxRoot {
@@ -91,8 +96,14 @@ pub struct DxEntry {
 
 impl DxRoot {
     /// Parse the HTREE root metadata from a directory's first data
-    /// block. Returns `None` if the block is too small or the header
-    /// is obviously bogus (`info_length != 8`, `hash_version > 5`).
+    /// block, refusing what Linux `dx_probe` refuses: an on-disk hash
+    /// version other than legacy, half-MD4 or TEA (the `_UNSIGNED`
+    /// variants are never stored; a lookup derives them from `s_flags`,
+    /// and SipHash needs casefold + encryption, which NARF never mounts),
+    /// the unimplemented `unused_flags` bit 0, and a tree deeper than
+    /// `ext4_dir_htree_level` allows without `largedir` (which NARF
+    /// refuses at mount): at most one level of dx nodes. `None` also for
+    /// a block too small or an `info_length` other than 8.
     pub fn parse(block: &[u8]) -> Option<Self> {
         if block.len() < DX_ROOT_ENTRIES_OFF {
             return None;
@@ -102,13 +113,14 @@ impl DxRoot {
         let hash_version = block[info_off + 4];
         let info_length = block[info_off + 5];
         let indirect_levels = block[info_off + 6];
+        let unused_flags = block[info_off + 7];
         if info_length != 8 {
             return None;
         }
-        if hash_version > hash_version::TEA_UNSIGNED {
+        if hash_version > hash_version::TEA || unused_flags & 1 != 0 {
             return None;
         }
-        if indirect_levels > 2 {
+        if indirect_levels > MAX_INDIRECT_LEVELS {
             return None;
         }
         let limit = u16::from_le_bytes([block[DX_ROOT_HEAD_OFF], block[DX_ROOT_HEAD_OFF + 1]]);
@@ -234,42 +246,109 @@ fn tea_transform(buf: &mut [u32; 4], inp: &[u32; 4]) {
     buf[1] = buf[1].wrapping_add(b1);
 }
 
-/// Pack `len` bytes of `msg` into `num` u32 words. Trailing bytes are
-/// padded with `(len | (len << 8) | (len << 16) | (len << 24))`.
-/// `signed` selects whether bytes are treated as `i8` (legacy) or
-/// `u8` (the _UNSIGNED variants). Mirrors
-/// `fs/ext4/hash.c::str2hashbuf_{signed,unsigned}`.
-fn str2hashbuf(msg: &[u8], buf: &mut [u32; 4], num: usize, signed: bool) {
-    let pad = (msg.len() as u32) | ((msg.len() as u32) << 8);
-    let pad = pad | (pad << 16);
+/// Basic cut-down MD4 transform (`fs/ext4/hash.c::half_md4_transform`):
+/// three rounds over eight input words, folding into `buf`. Linux returns
+/// `buf[1]`; callers read the words they need from `buf`.
+fn half_md4_transform(buf: &mut [u32; 4], inp: &[u32; 8]) {
+    const K1: u32 = 0;
+    const K2: u32 = 0o13240474631;
+    const K3: u32 = 0o15666365641;
+    fn f(x: u32, y: u32, z: u32) -> u32 {
+        z ^ (x & (y ^ z))
+    }
+    fn g(x: u32, y: u32, z: u32) -> u32 {
+        (x & y).wrapping_add((x ^ y) & z)
+    }
+    fn h(x: u32, y: u32, z: u32) -> u32 {
+        x ^ y ^ z
+    }
+    let (mut a, mut b, mut c, mut d) = (buf[0], buf[1], buf[2], buf[3]);
+    // ROUND(f, a, b, c, d, x, s): a += f(b, c, d) + x; a = rol(a, s).
+    macro_rules! round {
+        ($f:ident, $a:ident, $b:ident, $c:ident, $d:ident, $x:expr, $s:expr) => {
+            $a = $a
+                .wrapping_add($f($b, $c, $d))
+                .wrapping_add($x)
+                .rotate_left($s)
+        };
+    }
+    round!(f, a, b, c, d, inp[0].wrapping_add(K1), 3);
+    round!(f, d, a, b, c, inp[1].wrapping_add(K1), 7);
+    round!(f, c, d, a, b, inp[2].wrapping_add(K1), 11);
+    round!(f, b, c, d, a, inp[3].wrapping_add(K1), 19);
+    round!(f, a, b, c, d, inp[4].wrapping_add(K1), 3);
+    round!(f, d, a, b, c, inp[5].wrapping_add(K1), 7);
+    round!(f, c, d, a, b, inp[6].wrapping_add(K1), 11);
+    round!(f, b, c, d, a, inp[7].wrapping_add(K1), 19);
+
+    round!(g, a, b, c, d, inp[1].wrapping_add(K2), 3);
+    round!(g, d, a, b, c, inp[3].wrapping_add(K2), 5);
+    round!(g, c, d, a, b, inp[5].wrapping_add(K2), 9);
+    round!(g, b, c, d, a, inp[7].wrapping_add(K2), 13);
+    round!(g, a, b, c, d, inp[0].wrapping_add(K2), 3);
+    round!(g, d, a, b, c, inp[2].wrapping_add(K2), 5);
+    round!(g, c, d, a, b, inp[4].wrapping_add(K2), 9);
+    round!(g, b, c, d, a, inp[6].wrapping_add(K2), 13);
+
+    round!(h, a, b, c, d, inp[3].wrapping_add(K3), 3);
+    round!(h, d, a, b, c, inp[7].wrapping_add(K3), 9);
+    round!(h, c, d, a, b, inp[2].wrapping_add(K3), 11);
+    round!(h, b, c, d, a, inp[6].wrapping_add(K3), 15);
+    round!(h, a, b, c, d, inp[1].wrapping_add(K3), 3);
+    round!(h, d, a, b, c, inp[5].wrapping_add(K3), 9);
+    round!(h, c, d, a, b, inp[0].wrapping_add(K3), 11);
+    round!(h, b, c, d, a, inp[4].wrapping_add(K3), 15);
+
+    buf[0] = buf[0].wrapping_add(a);
+    buf[1] = buf[1].wrapping_add(b);
+    buf[2] = buf[2].wrapping_add(c);
+    buf[3] = buf[3].wrapping_add(d);
+}
+
+/// `str2hashbuf_{signed,unsigned}`: pack the start of `msg` into
+/// `out.len()` words. `msg` is the whole REMAINING name, not just this
+/// chunk: Linux passes the remaining length, and the padding word encodes
+/// it (`len | len << 8 | len << 16 | len << 24`) even when only the first
+/// `4 * out.len()` bytes are packed.
+fn str2hashbuf(msg: &[u8], out: &mut [u32], signed: bool) {
+    let len = msg.len() as u32;
+    let mut pad = len | (len << 8);
+    pad |= pad << 16;
+    let num = out.len();
     let mut val = pad;
-    let bytes = if msg.len() > num * 4 {
-        num * 4
-    } else {
-        msg.len()
-    };
-    let mut out_i = 0usize;
-    let mut left = num;
-    for (i, &b) in msg.iter().enumerate().take(bytes) {
+    let mut w = 0usize;
+    for (i, &b) in msg.iter().take(num * 4).enumerate() {
         let ch = if signed { b as i8 as i32 } else { b as i32 };
         val = (ch as u32).wrapping_add(val << 8);
-        if (i & 3) == 3 {
-            buf[out_i] = val;
-            out_i += 1;
+        if i % 4 == 3 {
+            out[w] = val;
+            w += 1;
             val = pad;
-            left -= 1;
         }
     }
-    if left > 0 {
-        buf[out_i] = val;
-        out_i += 1;
-        left -= 1;
+    if w < num {
+        out[w] = val;
+        w += 1;
     }
-    while left > 0 {
-        buf[out_i] = pad;
-        out_i += 1;
-        left -= 1;
+    for word in out.iter_mut().skip(w) {
+        *word = pad;
     }
+}
+
+/// `dx_hack_hash_{signed,unsigned}`, the legacy hash.
+fn dx_hack_hash(name: &[u8], signed: bool) -> u32 {
+    let mut hash0: u32 = 0x12a3_fe2d;
+    let mut hash1: u32 = 0x37ab_e8f9;
+    for &b in name {
+        let ch = if signed { b as i8 as i32 } else { b as i32 };
+        let mut hash = hash1.wrapping_add(hash0 ^ (ch.wrapping_mul(7_152_373) as u32));
+        if hash & 0x8000_0000 != 0 {
+            hash = hash.wrapping_sub(0x7fff_ffff);
+        }
+        hash1 = hash0;
+        hash0 = hash;
+    }
+    hash0 << 1
 }
 
 /// Result of a directory-name hash — `(hash, minor_hash)`.
@@ -279,64 +358,60 @@ pub struct DirHash {
     pub minor: u32,
 }
 
-/// Hash the bytes `name` per the directory's `hash_version`. The
-/// `seed` is the 4 × u32 secret from the superblock (`s_hash_seed`,
-/// zero in practice for our generated images).
-pub fn name_hash(name: &[u8], hash_version: u8, seed: &[u32; 4]) -> DirHash {
-    // Default Linux seed when s_hash_seed is all zeros.
-    let default_seed: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    let mut buf = if seed.iter().any(|&v| v != 0) {
+/// `EXT4_HTREE_EOF_32BIT`: the hash readdir uses as its end-of-directory
+/// cookie, so no name may hash to it (`EOF << 1` after the low-bit clear).
+pub const HTREE_EOF_32BIT: u32 = (1 << 31) - 1;
+
+/// `__ext4fs_dirhash`: hash `name` with `hash_version` (already adjusted
+/// for the filesystem's signedness, see [`lookup_hash_version`]) and the
+/// superblock's `s_hash_seed`. `None` for a version Linux rejects with
+/// `-EINVAL` (SipHash needs an encryption key NARF never has).
+pub fn ext4fs_dirhash(name: &[u8], hash_version: u8, seed: &[u32; 4]) -> Option<DirHash> {
+    // The default seed when `s_hash_seed` is all zero.
+    let mut buf: [u32; 4] = if seed.iter().any(|&w| w != 0) {
         *seed
     } else {
-        default_seed
+        [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476]
     };
-
-    match hash_version {
+    let (hash, minor) = match hash_version {
         hash_version::LEGACY | hash_version::LEGACY_UNSIGNED => {
-            let signed = hash_version == hash_version::LEGACY;
-            let mut hash0: u32 = 0x12a3_fe2d;
-            let mut hash1: u32 = 0x37ab_e8f9;
-            for &b in name {
-                let ch = if signed { b as i8 as i32 } else { b as i32 };
-                let mut hash = hash1.wrapping_add(hash0 ^ ((ch as u32).wrapping_mul(7152373)));
-                if hash & 0x8000_0000 != 0 {
-                    hash = hash.wrapping_sub(0x7fff_ffff);
-                }
-                hash1 = hash0;
-                hash0 = hash;
+            (dx_hack_hash(name, hash_version == hash_version::LEGACY), 0)
+        }
+        hash_version::HALF_MD4 | hash_version::HALF_MD4_UNSIGNED => {
+            let signed = hash_version == hash_version::HALF_MD4;
+            let mut inp = [0u32; 8];
+            for start in (0..name.len()).step_by(32) {
+                str2hashbuf(&name[start..], &mut inp, signed);
+                half_md4_transform(&mut buf, &inp);
             }
-            DirHash {
-                hash: hash0 << 1,
-                minor: 0,
-            }
+            (buf[1], buf[2])
         }
         hash_version::TEA | hash_version::TEA_UNSIGNED => {
             let signed = hash_version == hash_version::TEA;
-            let mut p = 0usize;
-            let mut remaining = name.len();
-            while remaining > 0 {
-                let mut inp: [u32; 4] = [0; 4];
-                let chunk_len = remaining.min(16);
-                let chunk = &name[p..p + chunk_len];
-                str2hashbuf(chunk, &mut inp, 4, signed);
+            let mut inp = [0u32; 4];
+            for start in (0..name.len()).step_by(16) {
+                str2hashbuf(&name[start..], &mut inp, signed);
                 tea_transform(&mut buf, &inp);
-                p += chunk_len;
-                if remaining >= 16 {
-                    remaining -= 16;
-                } else {
-                    remaining = 0;
-                }
             }
-            DirHash {
-                hash: buf[0],
-                minor: buf[1],
-            }
+            (buf[0], buf[1])
         }
-        _ => {
-            // HALF_MD4 path is rarely used; we stub it as zero so an
-            // unsupported HTREE volume falls back to the linear walker.
-            DirHash { hash: 0, minor: 0 }
-        }
+        _ => return None,
+    };
+    let mut hash = hash & !1;
+    if hash == HTREE_EOF_32BIT << 1 {
+        hash = (HTREE_EOF_32BIT - 1) << 1;
+    }
+    Some(DirHash { hash, minor })
+}
+
+/// The hash version a lookup uses for a directory whose dx_root names
+/// `root_version`: `dx_probe` adds `s_hash_unsigned` (3 when the
+/// filesystem hashes names as unsigned bytes) to the three base versions.
+pub fn lookup_hash_version(root_version: u8, hash_unsigned: u8) -> u8 {
+    if root_version <= hash_version::TEA {
+        root_version + hash_unsigned
+    } else {
+        root_version
     }
 }
 
@@ -412,7 +487,7 @@ pub fn collect_sorted_leaf_entries(
         }
         if inode != 0 && name_len > 0 {
             let name = &block[off + 8..off + 8 + name_len];
-            let h = name_hash(name, hash_version, seed);
+            let h = ext4fs_dirhash(name, hash_version, seed).ok_or(SplitError::Corrupt)?;
             let bytes = pack_dirent(inode, name, file_type);
             out.push(LeafEntry {
                 hash: h.hash,

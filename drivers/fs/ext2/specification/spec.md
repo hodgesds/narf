@@ -134,6 +134,17 @@ A device without `BlockFeature::Discard` fails the ioctl with
   keep the volume read-only. One-level HTREE insertion into an existing leaf
   and deletion from existing one-level HTREE leaves are supported; a full
   leaf or multi-level mutation is rejected before mutation.
+- **Directory names hash as Linux hashes them** (`htree::ext4fs_dirhash`,
+  `fs/ext4/hash.c::__ext4fs_dirhash`): legacy, half-MD4 and TEA, each
+  signed or unsigned, checked against e2fsprogs' `dx_hash`. The low bit is
+  cleared and the readdir EOF cookie (`EXT4_HTREE_EOF_32BIT << 1`) is never
+  returned. A lookup adds `s_hash_unsigned` to the root's base version as
+  `dx_probe` does: 3 when `s_flags` says unsigned, 0 when it says signed,
+  and the platform's `char` signedness when it says neither (signed on
+  x86_64, unsigned on aarch64). `DxRoot::parse` refuses what `dx_probe`
+  refuses: an on-disk version other than 0-2, `unused_flags` bit 0, and
+  more than one dx-node level (two need `largedir`, which is refused at
+  mount).
 - **Allocation metadata is serialized and quarantined by group.** Bitmap,
   group-descriptor, and superblock-counter updates cannot interleave. A block
   group whose bitmap checksum fails is skipped without mutation, allowing a

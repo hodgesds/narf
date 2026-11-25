@@ -185,7 +185,18 @@ pub struct Superblock {
     /// `s_orphan_file_inum` (offset 640), when `COMPAT_ORPHAN_FILE`
     /// is enabled.
     pub orphan_file_inum: u32,
+    /// `s_def_hash_version` (offset 252): the hash a newly indexed
+    /// directory gets (`make_indexed_dir`).
+    pub def_hash_version: u8,
+    /// `s_flags` (offset 352): `EXT2_FLAGS_{SIGNED,UNSIGNED}_HASH` and
+    /// `EXT2_FLAGS_TEST_FILESYS`.
+    pub flags: u32,
 }
+
+/// `s_flags` bit: directory names hash as signed chars.
+pub const EXT2_FLAGS_SIGNED_HASH: u32 = 0x0001;
+/// `s_flags` bit: directory names hash as unsigned chars.
+pub const EXT2_FLAGS_UNSIGNED_HASH: u32 = 0x0002;
 
 /// `s_state` value meaning "filesystem was unmounted cleanly".
 /// Linux `include/uapi/linux/ext2_fs.h::EXT2_VALID_FS`.
@@ -292,6 +303,12 @@ impl Superblock {
         } else {
             0
         };
+        let def_hash_version = if buf.len() > 252 { buf[252] } else { 0 };
+        let flags = if buf.len() >= 356 {
+            u32::from_le_bytes([buf[352], buf[353], buf[354], buf[355]])
+        } else {
+            0
+        };
 
         Some(Self {
             inodes_count,
@@ -315,7 +332,26 @@ impl Superblock {
             hash_seed,
             want_extra_isize,
             orphan_file_inum,
+            def_hash_version,
+            flags,
         })
+    }
+
+    /// `s_hash_unsigned` (`ext4_hash_info_init`): 3 when directory names
+    /// hash as unsigned bytes, else 0. With neither `s_flags` bit set,
+    /// Linux uses the platform's `char` signedness: signed on x86_64,
+    /// unsigned on aarch64 (and records that choice on a read-write
+    /// mount).
+    pub fn hash_unsigned(&self) -> u8 {
+        if self.flags & EXT2_FLAGS_UNSIGNED_HASH != 0 {
+            3
+        } else if self.flags & EXT2_FLAGS_SIGNED_HASH != 0 {
+            0
+        } else if core::ffi::c_char::MIN == 0 {
+            3
+        } else {
+            0
+        }
     }
 
     /// True iff `s_state` indicates a clean unmount (== EXT2_VALID_FS).

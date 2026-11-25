@@ -34,7 +34,7 @@ use super::extent::{
     empty_iblock_leaf, find_physical_for_logical, insert_into_leaf, lookup_in_node, ExtentHeader,
     ExtentIndex, ExtentLeaf, InsertOutcome, LookupOutcome, EXT4_EXTENT_MAGIC,
 };
-use super::htree::{hash_version, name_hash, DxRoot, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF};
+use super::htree::{ext4fs_dirhash, hash_version, DxRoot, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF};
 use super::inode::{Ext4Inode, EXT4_EXTENTS_FL, EXT4_INDEX_FL};
 use super::journal::{
     block_type as jbt, build_one_txn_image, encode_commit, encode_descriptor, encode_superblock,
@@ -448,10 +448,10 @@ fn smoke_ext4_htree_root_decode_same_format() -> TestResult {
 
     // Verify hash function determinism so the index keys are stable.
     let seed = [0u32; 4];
-    let h1 = name_hash(b"hello", hash_version::TEA_UNSIGNED, &seed);
-    let h2 = name_hash(b"hello", hash_version::TEA_UNSIGNED, &seed);
-    if h1 != h2 {
-        return TestResult::Fail("name_hash must be deterministic");
+    let h1 = ext4fs_dirhash(b"hello", hash_version::TEA_UNSIGNED, &seed);
+    let h2 = ext4fs_dirhash(b"hello", hash_version::TEA_UNSIGNED, &seed);
+    if h1.is_none() || h1 != h2 {
+        return TestResult::Fail("ext4fs_dirhash must be deterministic");
     }
     TestResult::Pass
 }

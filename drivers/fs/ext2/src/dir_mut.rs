@@ -206,7 +206,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if dx_root.indirect_levels != 0 {
             return Err(FsError::Unsupported);
         }
-        let hash = htree::name_hash(name, dx_root.hash_version, &self.superblock.hash_seed);
+        let version =
+            htree::lookup_hash_version(dx_root.hash_version, self.superblock.hash_unsigned());
+        let hash = htree::ext4fs_dirhash(name, version, &self.superblock.hash_seed)
+            .ok_or(FsError::InvalidData)?;
         let leaf = htree::dx_find_entry_root(&root, hash.hash).ok_or(FsError::InvalidData)?;
         let blocks = (parent_inode.size as usize).div_ceil(bs);
         if leaf.block == 0 || leaf.block as usize >= blocks {
