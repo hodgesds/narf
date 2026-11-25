@@ -653,6 +653,8 @@ pub(crate) async fn release_slot(
     xhci_dev: &Xhci,
     slot_id: u8,
 ) -> Result<(), crate::xhci::XhciError> {
+    // The slot's device record goes with it (`usb_disconnect`).
+    crate::usbdev::remove(xhci_dev.id(), slot_id);
     xhci_dev.disable_slot(slot_id).await?;
     xhci_dev.reclaim_slot(slot_id)
 }
@@ -990,6 +992,7 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// the same BOT device (queue 16, Concern C); the fingerprint clear serves the
 /// same purpose for re-enumerated readers.
 pub fn detach_all_bindings(controller: u8) {
+    crate::usbdev::remove_controller(controller);
     hid::clear_boot_keyboards(controller);
     hid::keyboard::unregister_all_keyboards(controller);
     mouse::clear_mice(controller);
@@ -1037,7 +1040,7 @@ async fn dispatch_after_address(
     // Also capture idVendor (+8) and idProduct (+10) for explicit
     // VID/PID matches (fingerprint readers with vendor class 0xFF
     // that don't advertise MS OS 2.0 WBDI descriptors).
-    let (dev_class, dev_protocol, dev_vid, dev_pid) =
+    let (dev_class, dev_protocol, dev_vid, dev_pid, descriptor) =
         match xhci_dev.get_device_descriptor(slot_id).await {
             Ok(d) => {
                 let vid = u16::from_le_bytes([d[8], d[9]]);
@@ -1049,7 +1052,7 @@ async fn dispatch_after_address(
                     "addressed",
                     &(slot_id, speed, vid, pid, d[4], d[7]),
                 );
-                (d[4], d[6], vid, pid)
+                (d[4], d[6], vid, pid, d)
             }
             Err(e) => {
                 note_attach_failure(
@@ -1063,6 +1066,22 @@ async fn dispatch_after_address(
                 return AttachOutcome::UnknownClass;
             }
         };
+
+    // The device's registry record: bus/device numbers, devpath, every
+    // configuration descriptor and the strings (usb_new_device). Class
+    // binders below run against the live slot either way.
+    let _ = crate::usbdev::register(
+        xhci_dev,
+        slot_id,
+        descriptor,
+        crate::usbdev::Placement {
+            root_port,
+            route: this_route,
+            speed,
+            parent_slot: parent_hub_slot,
+        },
+    )
+    .await;
 
     if dev_class == DEV_CLASS_HUB {
         // Pull the configuration descriptor to find the hub
