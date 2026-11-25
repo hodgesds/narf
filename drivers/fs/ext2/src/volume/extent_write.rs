@@ -41,7 +41,7 @@ use narf_filesystem::FsError;
 
 use super::super::extent::{ExtentHeader, ExtentIndex, ExtentLeaf, EXT4_EXTENT_MAGIC};
 use super::super::inode::Inode;
-use super::{metadata_csum, BitmapKind, Ext2Volume};
+use super::{metadata_csum, Ext2Volume};
 
 /// `EXT_INIT_MAX_LEN`.
 const EXT_INIT_MAX_LEN: u16 = 32768;
@@ -167,25 +167,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Allocate a block at or after `goal` in `goal`'s group, falling back
     /// to the first free block anywhere (`ext4_ext_find_goal` + allocator).
     pub(super) async fn alloc_block_near(&self, goal: u64) -> Result<u64, FsError> {
-        let bpg = self.superblock.blocks_per_group as u64;
-        let first = self.superblock.first_data_block as u64;
-        if goal >= first && goal < self.superblock.total_blocks() {
-            let _allocation = self.allocation_lock.lock().await;
-            let group = ((goal - first) / bpg) as usize;
-            if let Some(gd) = self.group_descs.get(group) {
-                let group_first = first + group as u64 * bpg;
-                let group_last = (group_first + bpg).min(self.superblock.total_blocks());
-                let bits = (group_last - group_first) as u32;
-                let start = (goal - group_first) as u32;
-                if let Some(bit) = self
-                    .alloc_in_bitmap_block(group, BitmapKind::Block, gd.block_bitmap, bits, start)
-                    .await?
-                {
-                    return Ok(group_first + bit as u64);
-                }
-            }
-        }
-        self.alloc_block().await
+        let _allocation = self.allocation_lock.lock().await;
+        self.alloc_block_locked(Some(goal)).await
     }
 
     async fn zero_block(&self, block: u64) -> Result<(), FsError> {

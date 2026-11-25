@@ -199,6 +199,28 @@ A device without `BlockFeature::Discard` fails the ioctl with
   allocation also monotonically advances ext4's `bg_itable_unused` boundary
   before the updated group-descriptor checksum is persisted, so Linux does not
   classify newly initialized inode slots as deleted.
+- **Allocation starts at its goal** (`ext4_mb_new_blocks` with a goal):
+  - Order: the goal's group from the goal block, then every later group,
+    wrapping around.
+  - A group whose descriptor counts nothing free is skipped without reading
+    its bitmap.
+  - Inodes are taken from groups in order, after `EXT4_FIRST_INO`
+    (`s_first_ino`). LINUX-GAP: no Orlov spreading of directories.
+- **Lazily initialized groups** (`BLOCK_UNINIT`, `INODE_UNINIT`, with a
+  descriptor checksum) are used only after every initialized group.
+  - Their bitmap is never read: it is computed as `ext4_init_block_bitmap`
+    computes it. That covers the superblock copy (`ext4_bg_has_super`,
+    `sparse_super` / `sparse_super2`), the descriptor table and reserved GDT
+    blocks, the group's own bitmaps and inode table when they lie inside it,
+    and the padding past a short last group.
+  - The computed bitmap must agree with the descriptor's free count; if it
+    does not, the group is skipped.
+  - The first allocation writes the bitmap and clears the flag.
+  - An inode allocated in a group whose block bitmap is uninitialized
+    initializes it first (`__ext4_new_inode`).
+  - Freeing anything in such a group is `Corrupted`.
+- **Group count** is `DIV_ROUND_UP(blocks_count - first_data_block,
+  blocks_per_group)`, as `ext4_fill_super` computes it.
 
 ## 5. Architecture notes
 

@@ -51,3 +51,20 @@ pub fn superblock(image: &Path) -> std::collections::BTreeMap<String, String> {
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect()
 }
+
+/// Groups whose descriptor still says `BLOCK_UNINIT` and `INODE_UNINIT`
+/// (`dumpe2fs` prints `[INODE_UNINIT, BLOCK_UNINIT, ...]` per group).
+pub fn uninit_groups(image: &Path) -> (usize, usize) {
+    let out = Command::new("dumpe2fs")
+        .arg(image)
+        .output()
+        .expect("run dumpe2fs");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let groups = text.lines().filter(|l| l.starts_with("Group "));
+    let (mut block, mut inode) = (0, 0);
+    for line in groups {
+        block += usize::from(line.contains("BLOCK_UNINIT"));
+        inode += usize::from(line.contains("INODE_UNINIT"));
+    }
+    (block, inode)
+}

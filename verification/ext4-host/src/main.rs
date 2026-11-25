@@ -31,7 +31,7 @@ USAGE: narf-ext4-host [OPTIONS]
   --seed N          first workload seed (default 1)
   --seeds N         seeds per scenario (default 2)
   --ops N           operations per run (default 1500)
-  --scenario LIST   comma-separated subset of: baseline,lifecycle,gate
+  --scenario LIST   comma-separated subset of: baseline,lifecycle,gate,uninit
                     (default all)
   --workdir DIR     scratch directory (default target/ext4-host)
   --keep            keep the images of passing runs
@@ -257,15 +257,97 @@ fn gate(o: &Opts, seed: u64) -> Result<String, String> {
     Ok("3 refusals".into())
 }
 
+/// Lazily initialized groups (`BLOCK_UNINIT` / `INODE_UNINIT`): a 4 GiB
+/// image whose small tree leaves most groups uninitialized, then enough
+/// data to fill the initialized groups and enough files to use up group 0's
+/// inodes. e2fsck then checks every bitmap, flag and count NARF wrote.
+fn uninit(o: &Opts, seed: u64) -> Result<String, String> {
+    let name = format!("uninit-{seed}");
+    let spec = fixture::Spec {
+        size_mib: 4096,
+        lib_files: 50,
+        packages: 10,
+        ..fixture::Spec::root()
+    };
+    let fx = fixture::build(&o.workdir, &name, &spec, seed);
+    let uninit_before = check::uninit_groups(&fx.image);
+    if uninit_before.0 == 0 || uninit_before.1 == 0 {
+        return Err(format!(
+            "mkfs left no uninitialized groups: {uninit_before:?}"
+        ));
+    }
+    let mut model = Model::load_host(&fx.tree);
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+    let fs = narf::mount(dev)?;
+    let root = fs.root();
+    let mut rng = rng::Rng::new(seed);
+    let chunk = rng.bytes(1 << 20);
+    host::block_on(async {
+        let work = narf::dir_at(&root, "/work").await?;
+        // Data past the initialized groups' free space.
+        for i in 0..24 {
+            let f = work.create(&format!("big{i}")).await?;
+            for c in 0..64u64 {
+                let mut off = c << 20;
+                let mut rest = &chunk[..];
+                while !rest.is_empty() {
+                    let n = f.write(off, rest).await?;
+                    off += n as u64;
+                    rest = &rest[n..];
+                }
+            }
+        }
+        // Inodes past group 0's.
+        let many = work.mkdir("many").await?;
+        for i in 0..9000 {
+            many.create(&format!("e{i}")).await?;
+        }
+        root.syncfs().await
+    })
+    .map_err(|e| format!("uninit workload: {e:?}"))?;
+    for i in 0..24 {
+        let mut data = Vec::with_capacity(64 << 20);
+        for _ in 0..64 {
+            data.extend_from_slice(&chunk);
+        }
+        model
+            .nodes
+            .insert(format!("/work/big{i}"), model::Node::File(data));
+    }
+    model.nodes.insert("/work/many".into(), model::Node::Dir);
+    for i in 0..9000 {
+        model
+            .nodes
+            .insert(format!("/work/many/e{i}"), model::Node::File(Vec::new()));
+    }
+    drop(root);
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    let uninit_after = check::uninit_groups(&fx.image);
+    if uninit_after.0 >= uninit_before.0 || uninit_after.1 >= uninit_before.1 {
+        return Err(format!(
+            "the workload never initialized a group: block/inode uninit {uninit_before:?} -> {uninit_after:?}"
+        ));
+    }
+    verdict(&fx.image, &model, &o.workdir.join(format!("{name}/rdump")))?;
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+    }
+    Ok(format!(
+        "uninit groups (block, inode) {uninit_before:?} -> {uninit_after:?}"
+    ))
+}
+
 fn main() {
     let o = parse_args();
     host::init();
     std::fs::create_dir_all(&o.workdir).unwrap();
     type Scenario = fn(&Opts, u64) -> Result<String, String>;
-    let all: [(&str, Scenario); 3] = [
+    let all: [(&str, Scenario); 4] = [
         ("baseline", baseline),
         ("lifecycle", lifecycle),
         ("gate", gate),
+        ("uninit", uninit),
     ];
     let mut failed = 0;
     for (name, run) in all {

@@ -36,3 +36,7 @@ Scenarios:
 - `gate`: root-rw must refuse, with EROFS and without changing a byte, an
   unclean filesystem (`ssv state 0`), one with recorded errors
   (`ssv state 3`), and one with an orphan list (`ssv last_orphan 12`).
+- `uninit`: a 4 GiB image whose small tree leaves most groups lazily
+  initialized (`BLOCK_UNINIT`, `INODE_UNINIT`), then 1.5 GiB of data and
+  9000 files: allocation must move into those groups (dumpe2fs counts fewer
+  uninit groups afterwards) with every bitmap, flag and count e2fsck-clean.

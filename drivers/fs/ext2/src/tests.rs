@@ -510,6 +510,27 @@ fn put_u16(buf: &mut [u8], off: usize, v: u16) {
 ///
 /// Inode 2 = root directory (mode S_IFDIR, points to block 9).
 /// Inode 12 = `data` file (mode S_IFREG, points to block 10).
+/// The free counts mke2fs records, derived from the bitmaps of a
+/// one-group, 1 KiB-block fixture (group from block 1, so `total - 1`
+/// block bits): the group descriptor's and the superblock's. Linux sums the
+/// descriptors into its free-cluster counter at mount, so a fixture that
+/// leaves them 0 is a full filesystem to it (ENOSPC), and to NARF's
+/// allocator, which skips a group whose descriptor says it has nothing free.
+fn set_free_counts(img: &mut [u8], total_blocks: u32, inodes: u32) {
+    const BS: usize = 1024;
+    let clear = |base: usize, bits: u32| {
+        (0..bits as usize)
+            .filter(|&b| img[base + b / 8] & (1 << (b % 8)) == 0)
+            .count() as u32
+    };
+    let free_blocks = clear(3 * BS, total_blocks - 1);
+    let free_inodes = clear(4 * BS, inodes);
+    put_u32(img, BS + 12, free_blocks);
+    put_u32(img, BS + 16, free_inodes);
+    put_u16(img, 2 * BS + 12, free_blocks as u16);
+    put_u16(img, 2 * BS + 14, free_inodes as u16);
+}
+
 fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
     const BS: usize = 1024;
     const TOTAL_BLOCKS: u32 = 64;
@@ -624,6 +645,7 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
         img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
     }
 
+    set_free_counts(&mut img, TOTAL_BLOCKS, INODES_PER_GROUP);
     img
 }
 
@@ -1551,6 +1573,7 @@ fn build_ext4_extent_image_sized(file_data: &[u8], inode_size: u16) -> Vec<u8> {
         img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
     }
 
+    set_free_counts(&mut img, TOTAL_BLOCKS, INODES_PER_GROUP);
     img
 }
 
@@ -1956,6 +1979,7 @@ fn build_ext4_metadata_csum_htree_fixture() -> Result<Vec<u8>, &'static str> {
     image[10 * BS..11 * BS].fill(0);
     put_u32(&mut image, FILE_INODE + 60, 11);
     image[3 * BS + 1] |= 1 << 3; // block 11 is allocated
+    set_free_counts(&mut image, 64, 32);
 
     put_u32(&mut image, ROOT_INODE + 4, (2 * BS) as u32);
     put_u32(&mut image, ROOT_INODE + 28, (2 * BS / 512) as u32);
@@ -2320,7 +2344,8 @@ fn smoke_ext4_extent_write_converts_unwritten() -> TestResult {
     put_u16(&mut image, file_ib + 16, 3 + 0x8000);
     put_u32(&mut image, 5 * 1024 + 11 * 128 + 4, 3 * 1024); // i_size
     image[3 * 1024 + 1] = 0x1F; // blocks 8..=12 in use
-                                // Garbage on disk under the unwritten extent must never surface.
+    set_free_counts(&mut image, 64, 32);
+    // Garbage on disk under the unwritten extent must never surface.
     for b in &mut image[10 * 1024..13 * 1024] {
         *b = 0xAA;
     }
@@ -7989,4 +8014,120 @@ fn smoke_ext4_refused_rw_mount_writes_nothing() -> TestResult {
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext4_refused_rw_mount_writes_nothing
+);
+
+// ── Lazily initialized groups (`volume::uninit`) ─────────────────────
+
+fn smoke_ext4_uninit_group_layout_follows_linux() -> TestResult {
+    use crate::group_desc::GroupDesc;
+    use crate::superblock::{compat, ro_compat};
+    use crate::volume::uninit::{
+        base_meta_blocks, blocks_in_group, free_bits, gdt_blocks, has_super, init_block_bitmap,
+        init_inode_bitmap,
+    };
+    // 4 KiB blocks, 32768 blocks and 8192 inodes per group, 100 groups plus a
+    // short last one, 64-byte descriptors, 256-byte inodes, 63 reserved GDT
+    // blocks, sparse_super: mke2fs's defaults for a 13 GiB filesystem.
+    let sb = match sb_bytes_with(|b| {
+        put_u32(b, 4, 100 * 32768 + 1000); // s_blocks_count
+        put_u32(b, 24, 2); // s_log_block_size → 4096
+        put_u32(b, 32, 32768);
+        put_u32(b, 40, 8192);
+        put_u32(b, 76, 1);
+        put_u16(b, 88, 256);
+        put_u32(b, 96, super::superblock::incompat::SIXTYFOURBIT);
+        put_u32(b, 100, ro_compat::SPARSE_SUPER | ro_compat::METADATA_CSUM);
+        put_u16(b, 0xce, 63);
+        put_u16(b, 254, 64);
+    }) {
+        Some(sb) => sb,
+        None => return TestResult::Fail("superblock fixture"),
+    };
+    // ext4_bg_has_super: 0, 1, and powers of 3, 5 and 7.
+    let with_super: alloc::vec::Vec<u32> = (0..100).filter(|&g| has_super(&sb, g)).collect();
+    if with_super != [0, 1, 3, 5, 7, 9, 25, 27, 49, 81] {
+        return TestResult::Fail("sparse_super backups are 0, 1 and powers of 3, 5, 7");
+    }
+    // 101 groups of 64-byte descriptors fill two 4 KiB blocks.
+    if gdt_blocks(&sb) != 2
+        || base_meta_blocks(&sb, 3) != 1 + 2 + 63
+        || base_meta_blocks(&sb, 2) != 0
+    {
+        return TestResult::Fail(
+            "base metadata is superblock + GDT + reserved GDT, in backup groups",
+        );
+    }
+    if blocks_in_group(&sb, 100) != 1000 || blocks_in_group(&sb, 99) != 32768 {
+        return TestResult::Fail("the last group is short");
+    }
+    // sparse_super2 names its two backups.
+    let sb2 = sb_bytes_with(|b| {
+        put_u32(b, 4, 100 * 32768 + 1000);
+        put_u32(b, 24, 2);
+        put_u32(b, 32, 32768);
+        put_u32(b, 40, 8192);
+        put_u32(b, 76, 1);
+        put_u32(b, 92, compat::SPARSE_SUPER2);
+        put_u32(b, 0x24c, 1);
+        put_u32(b, 0x250, 99);
+    });
+    let Some(sb2) = sb2 else {
+        return TestResult::Fail("sparse_super2 fixture");
+    };
+    if (0..101)
+        .filter(|&g| has_super(&sb2, g))
+        .collect::<alloc::vec::Vec<_>>()
+        != [0, 1, 99]
+    {
+        return TestResult::Fail("sparse_super2 backups are the groups s_backup_bgs names");
+    }
+    // A flex_bg group whose bitmaps and inode table live in group 0: only
+    // the superblock copy and descriptor tables are used, plus nothing past
+    // the end; a short last group marks its tail used.
+    let elsewhere = GroupDesc {
+        block_bitmap: 1000,
+        inode_bitmap: 1100,
+        inode_table: 1200,
+        free_blocks_count: 0,
+        free_inodes_count: 0,
+        used_dirs_count: 0,
+        flags: 0,
+        itable_unused: 0,
+    };
+    let Some(g3) = init_block_bitmap(&sb, 3, &elsewhere) else {
+        return TestResult::Fail("init_block_bitmap refused a valid group");
+    };
+    if free_bits(&g3, 32768) != 32768 - 66 || g3[0] != 0xff || g3[66 / 8] & (1 << (66 % 8)) != 0 {
+        return TestResult::Fail("a backup group's base metadata, and nothing else, is in use");
+    }
+    let Some(last) = init_block_bitmap(&sb, 100, &elsewhere) else {
+        return TestResult::Fail("init_block_bitmap refused the last group");
+    };
+    if free_bits(&last, 32768) != 1000 {
+        return TestResult::Fail("the bits past a short group's end are in use");
+    }
+    // Its own bitmaps and inode table, when inside the group, are in use.
+    let first = 2 * 32768u64;
+    let own = GroupDesc {
+        block_bitmap: first,
+        inode_bitmap: first + 1,
+        inode_table: first + 2,
+        ..elsewhere
+    };
+    let Some(g2) = init_block_bitmap(&sb, 2, &own) else {
+        return TestResult::Fail("init_block_bitmap refused an own-metadata group");
+    };
+    // 8192 inodes of 256 bytes are 512 table blocks.
+    if free_bits(&g2, 32768) != 32768 - 2 - 512 {
+        return TestResult::Fail("a group's own bitmaps and inode table are in use");
+    }
+    let inodes = init_inode_bitmap(&sb);
+    if free_bits(&inodes, 8192) != 8192 || free_bits(&inodes, 4096 * 8) != 8192 {
+        return TestResult::Fail("an INODE_UNINIT bitmap is all free, padding set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_uninit_group_layout_follows_linux
 );

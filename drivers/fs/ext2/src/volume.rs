@@ -40,6 +40,7 @@ use super::superblock::{ExtFlavour, Superblock};
 mod extent_write;
 mod file_data;
 pub mod sb_state;
+pub(crate) mod uninit;
 pub(crate) mod xattr;
 
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
@@ -1556,6 +1557,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_group_desc(
         &self,
         group: usize,
@@ -1564,8 +1566,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         dirs: i64,
         bitmap: Option<(BitmapKind, &[u8])>,
         allocated_inode_index: Option<u32>,
+        clear_flags: u16,
     ) -> Result<(), FsError> {
         let (offset, mut desc) = self.group_desc_bytes(group).await?;
+        if clear_flags != 0 {
+            use super::group_desc::BG_FLAGS_OFFSET as F;
+            let flags = u16::from_le_bytes([desc[F], desc[F + 1]]) & !clear_flags;
+            desc[F..F + 2].copy_from_slice(&flags.to_le_bytes());
+        }
         for (lo_off, hi_off, delta) in
             [(12usize, 44usize, blocks), (14, 46, inodes), (16, 48, dirs)]
         {
@@ -1709,50 +1717,176 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.write_byte_range(1024, &bytes).await
     }
 
-    async fn alloc_in_bitmap_block(
+    /// The group's descriptor as it is on the device now (the mount-time
+    /// `group_descs` snapshot does not follow free counts or flags).
+    async fn current_group_desc(&self, group: usize) -> Result<GroupDesc, FsError> {
+        let (_, bytes) = self.group_desc_bytes(group).await?;
+        GroupDesc::parse_sized(&bytes, bytes.len()).ok_or(FsError::Corrupted)
+    }
+
+    /// `ext4_read_block_bitmap` of a `BLOCK_UNINIT` group: compute the
+    /// bitmap (`ext4_init_block_bitmap`), check it against the free count
+    /// the descriptor promises, write it, and clear the flag.
+    async fn init_block_bitmap_on_disk(&self, group: usize, gd: &GroupDesc) -> Result<(), FsError> {
+        let bitmap = uninit::init_block_bitmap(&self.superblock, group as u32, gd)
+            .ok_or(FsError::Corrupted)?;
+        let bits = uninit::blocks_in_group(&self.superblock, group as u32);
+        if uninit::free_bits(&bitmap, bits) != gd.free_blocks_count {
+            return Err(FsError::Corrupted);
+        }
+        self.write_block(gd.block_bitmap, &bitmap).await?;
+        self.update_group_desc(
+            group,
+            0,
+            0,
+            0,
+            Some((BitmapKind::Block, &bitmap)),
+            None,
+            super::group_desc::BG_BLOCK_UNINIT,
+        )
+        .await
+    }
+
+    /// Allocate one bit of `kind` in `group`, scanning from `start` and
+    /// wrapping. The caller holds `allocation_lock`.
+    ///
+    /// - A group whose descriptor counts nothing free is skipped without
+    ///   reading its bitmap (`ext4_mb_good_group`).
+    /// - A lazily initialized group (`BLOCK_UNINIT` / `INODE_UNINIT`) is
+    ///   used only when `allow_uninit`, the allocator's last pass: its
+    ///   bitmap is computed ([`uninit`]), and the allocation writes it out
+    ///   with the flag cleared. An inode allocated in a group whose block
+    ///   bitmap is still uninitialized initializes that first, as
+    ///   `__ext4_new_inode` does.
+    /// - A bitmap whose checksum fails, or a computed one that disagrees
+    ///   with the descriptor, quarantines the group: it is skipped.
+    ///
+    /// Writes go bitmap, then descriptor (with the bitmap's checksum), then
+    /// superblock counters.
+    async fn alloc_in_group(
         &self,
         group: usize,
         kind: BitmapKind,
-        bm_block: u64,
-        max_bits: u32,
-        skip_first: u32,
+        start: u32,
+        allow_uninit: bool,
     ) -> Result<Option<u32>, FsError> {
-        let bs = self.block_size();
-        let mut buf = vec![0u8; bs];
-        self.read_block(bm_block, &mut buf).await?;
-        match self.verify_bitmap(group, kind, &buf).await {
-            Ok(()) => {}
-            // A large ext4 volume can still allocate safely from its other
-            // groups. Quarantine this group rather than mutating metadata
-            // whose checksum does not validate or failing the whole volume.
-            Err(FsError::InvalidData) => return Ok(None),
-            Err(error) => return Err(error),
+        use super::group_desc::{BG_BLOCK_UNINIT, BG_INODE_UNINIT};
+        let gd = self.current_group_desc(group).await?;
+        let flags_valid = uninit::has_group_desc_csum(&self.superblock);
+        let (uninit_flag, free, bits, bm_block) = match kind {
+            BitmapKind::Block => (
+                BG_BLOCK_UNINIT,
+                gd.free_blocks_count,
+                uninit::blocks_in_group(&self.superblock, group as u32),
+                gd.block_bitmap,
+            ),
+            BitmapKind::Inode => (
+                BG_INODE_UNINIT,
+                gd.free_inodes_count,
+                self.superblock.inodes_per_group,
+                gd.inode_bitmap,
+            ),
+        };
+        if free == 0 {
+            return Ok(None);
         }
-        let max = (max_bits as usize).min(bs * 8);
-        for bit in (skip_first as usize)..max {
-            let byte = bit / 8;
-            let bit_in_byte = bit % 8;
-            if (buf[byte] >> bit_in_byte) & 1 == 0 {
-                buf[byte] |= 1 << bit_in_byte;
-                self.write_block(bm_block, &buf).await?;
-                let (blocks, inodes) = match kind {
-                    BitmapKind::Block => (-1, 0),
-                    BitmapKind::Inode => (0, -1),
-                };
-                self.update_group_desc(
-                    group,
-                    blocks,
-                    inodes,
-                    0,
-                    Some((kind, &buf)),
-                    matches!(kind, BitmapKind::Inode).then_some(bit as u32),
-                )
-                .await?;
-                self.update_superblock_counters(blocks, inodes).await?;
-                return Ok(Some(bit as u32));
+        let lazy = flags_valid && gd.flags & uninit_flag != 0;
+        if lazy && !allow_uninit {
+            return Ok(None);
+        }
+        let mut buf = if lazy {
+            match kind {
+                BitmapKind::Block => {
+                    let Some(bitmap) =
+                        uninit::init_block_bitmap(&self.superblock, group as u32, &gd)
+                    else {
+                        return Ok(None);
+                    };
+                    if uninit::free_bits(&bitmap, bits) != free {
+                        return Ok(None);
+                    }
+                    bitmap
+                }
+                BitmapKind::Inode => uninit::init_inode_bitmap(&self.superblock),
+            }
+        } else {
+            let mut buf = vec![0u8; self.block_size()];
+            self.read_block(bm_block, &mut buf).await?;
+            match self.verify_bitmap(group, kind, &buf).await {
+                Ok(()) => {}
+                // A large ext4 volume can still allocate safely from its other
+                // groups. Quarantine this group rather than mutating metadata
+                // whose checksum does not validate or failing the whole volume.
+                Err(FsError::InvalidData) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            buf
+        };
+        let max = bits.min(buf.len() as u32 * 8);
+        let start = start.min(max);
+        let Some(bit) = (start..max)
+            .chain(0..start)
+            .find(|&bit| buf[bit as usize / 8] & (1 << (bit % 8)) == 0)
+        else {
+            return Ok(None);
+        };
+        if matches!(kind, BitmapKind::Inode) && flags_valid && gd.flags & BG_BLOCK_UNINIT != 0 {
+            self.init_block_bitmap_on_disk(group, &gd).await?;
+        }
+        buf[bit as usize / 8] |= 1 << (bit % 8);
+        self.write_block(bm_block, &buf).await?;
+        let (blocks, inodes) = match kind {
+            BitmapKind::Block => (-1, 0),
+            BitmapKind::Inode => (0, -1),
+        };
+        self.update_group_desc(
+            group,
+            blocks,
+            inodes,
+            0,
+            Some((kind, &buf)),
+            matches!(kind, BitmapKind::Inode).then_some(bit),
+            if lazy { uninit_flag } else { 0 },
+        )
+        .await?;
+        self.update_superblock_counters(blocks, inodes).await?;
+        Ok(Some(bit))
+    }
+
+    /// Allocate one block, starting at `goal`'s group (`ext4_mb_new_blocks`
+    /// with a goal): the goal group from the goal block, then every later
+    /// group wrapping around; groups still lazily initialized only in a
+    /// second pass, so initialized space is used first. The caller holds
+    /// `allocation_lock`.
+    async fn alloc_block_locked(&self, goal: Option<u64>) -> Result<u64, FsError> {
+        if self.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let groups = self.group_descs.len();
+        let first = u64::from(self.superblock.first_data_block);
+        let bpg = u64::from(self.superblock.blocks_per_group);
+        let (goal_group, goal_bit) = match goal {
+            Some(goal) if goal >= first && goal < self.superblock.total_blocks() => (
+                ((goal - first) / bpg) as usize,
+                ((goal - first) % bpg) as u32,
+            ),
+            _ => (0, 0),
+        };
+        for allow_uninit in [false, true] {
+            for step in 0..groups {
+                let group = (goal_group + step) % groups;
+                let start = if step == 0 { goal_bit } else { 0 };
+                if let Some(bit) = self
+                    .alloc_in_group(group, BitmapKind::Block, start, allow_uninit)
+                    .await?
+                {
+                    return Ok(
+                        uninit::group_first_block(&self.superblock, group as u32) + u64::from(bit)
+                    );
+                }
             }
         }
-        Ok(None)
+        Err(FsError::NoSpace)
     }
 
     /// Clear bit `bit_index` in bitmap block `bm_block`.
@@ -1763,6 +1897,18 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         bm_block: u64,
         bit_index: u32,
     ) -> Result<(), FsError> {
+        // Nothing was ever allocated in a lazily initialized group: freeing
+        // there is Linux's "bit already cleared" (EFSCORRUPTED), and its
+        // on-disk bitmap is not to be read.
+        if uninit::has_group_desc_csum(&self.superblock) {
+            let flag = match kind {
+                BitmapKind::Block => super::group_desc::BG_BLOCK_UNINIT,
+                BitmapKind::Inode => super::group_desc::BG_INODE_UNINIT,
+            };
+            if self.current_group_desc(group).await?.flags & flag != 0 {
+                return Err(FsError::Corrupted);
+            }
+        }
         let bs = self.block_size();
         let mut buf = vec![0u8; bs];
         self.read_block(bm_block, &mut buf).await?;
@@ -1776,42 +1922,18 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 BitmapKind::Block => (1, 0),
                 BitmapKind::Inode => (0, 1),
             };
-            self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)), None)
+            self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)), None, 0)
                 .await?;
             self.update_superblock_counters(blocks, inodes).await?;
         }
         Ok(())
     }
 
-    /// Allocate a free block from the volume. Walks block groups in
-    /// order, scanning each group's block bitmap. Returns the
-    /// absolute (1-based) block number of the allocated block.
-    ///
-    /// The on-disk `bg_free_blocks_count` is treated as a hint only
-    /// — we still scan the bitmap when the count is zero, because
-    /// the in-memory snapshot reflects mount-time state and we
-    /// don't update the descriptor cache on every alloc. Linux does
-    /// the same (`ext2_new_blocks` re-scans rather than trusting
-    /// the descriptor) for robustness against unclean mounts.
+    /// Allocate a free block anywhere ([`Self::alloc_block_locked`] with no
+    /// goal). Returns the absolute block number.
     pub async fn alloc_block(&self) -> Result<u64, FsError> {
         let _allocation = self.allocation_lock.lock().await;
-        let bpg = self.superblock.blocks_per_group;
-        let first_block = self.superblock.first_data_block;
-        for (gi, gd) in self.group_descs.iter().enumerate() {
-            // ext2 block numbers are 1-based starting from
-            // first_data_block. Bit 0 of group `g`'s bitmap maps
-            // to absolute block `first_data_block + g*blocks_per_group`.
-            let group_first = first_block as u64 + gi as u64 * bpg as u64;
-            let group_last = (group_first + bpg as u64).min(self.superblock.total_blocks());
-            let bits_in_group = (group_last - group_first) as u32;
-            if let Some(bit) = self
-                .alloc_in_bitmap_block(gi, BitmapKind::Block, gd.block_bitmap, bits_in_group, 0)
-                .await?
-            {
-                return Ok(group_first + bit as u64);
-            }
-        }
-        Err(FsError::NoSpace)
+        self.alloc_block_locked(None).await
     }
 
     /// Free block `block_no` (absolute 1-based).
@@ -1945,26 +2067,38 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         run_len * bs
     }
 
-    /// Allocate a free inode. Returns the 1-based inode number.
-    /// Treats `bg_free_inodes_count` as a hint (see `alloc_block`).
+    /// Allocate a free inode. Returns the 1-based inode number. Groups in
+    /// order, skipping the reserved inodes of group 0 (`EXT4_FIRST_INO`);
+    /// lazily initialized groups only in a second pass.
+    ///
+    /// LINUX-GAP: no Orlov spreading of new directories across groups
+    /// (`find_group_orlov`).
     pub async fn alloc_inode(&self) -> Result<u32, FsError> {
+        // EROFS before ENOSPC, as the VFS refuses a read-only mount before
+        // the filesystem looks for space.
+        if self.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
         let _allocation = self.allocation_lock.lock().await;
         let ipg = self.superblock.inodes_per_group;
         let first_reserved = self.superblock.first_ino();
-        for (gi, gd) in self.group_descs.iter().enumerate() {
-            // Reserve first_reserved-1 bits of group 0 (matches
-            // mkfs.ext2's behaviour — bit 0 = inode 1, bit 1 = inode 2,
-            // ...). Higher groups have no reserved range.
-            let skip = if gi == 0 {
-                first_reserved.saturating_sub(1)
-            } else {
-                0
-            };
-            if let Some(bit) = self
-                .alloc_in_bitmap_block(gi, BitmapKind::Inode, gd.inode_bitmap, ipg, skip)
-                .await?
-            {
-                return Ok((gi as u32) * ipg + bit + 1);
+        for allow_uninit in [false, true] {
+            for group in 0..self.group_descs.len() {
+                let skip = if group == 0 {
+                    first_reserved.saturating_sub(1)
+                } else {
+                    0
+                };
+                if let Some(bit) = self
+                    .alloc_in_group(group, BitmapKind::Inode, skip, allow_uninit)
+                    .await?
+                {
+                    // The wrap-around scan must not hand out a reserved inode.
+                    if group == 0 && bit < skip {
+                        return Err(FsError::Corrupted);
+                    }
+                    return Ok((group as u32) * ipg + bit + 1);
+                }
             }
         }
         Err(FsError::NoSpace)
@@ -2025,7 +2159,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let (group, _) = self
             .inode_group_and_index(inode_no)
             .ok_or(FsError::NotFound)?;
-        self.update_group_desc(group as usize, 0, 0, delta, None, None)
+        self.update_group_desc(group as usize, 0, 0, delta, None, None, 0)
             .await
     }
 
