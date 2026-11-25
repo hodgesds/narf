@@ -876,6 +876,15 @@ pub enum FsError {
     /// The device gave up on the work after its timeout: a GPU job that
     /// hung (Linux sets the job fence's error to `-ETIME`). Maps to `ETIME`.
     TimedOut,
+    /// A bus transaction timed out before the device answered — an SMBus
+    /// host whose busy bit never cleared, a USB control transfer past its
+    /// timeout (Linux drivers return `-ETIMEDOUT`). Distinct from
+    /// [`FsError::TimedOut`], which is the GPU-job `ETIME`. Maps to
+    /// `ETIMEDOUT`.
+    TransferTimedOut,
+    /// A numeric value does not fit the type it is parsed into — a sysfs
+    /// store whose `kstrtol` overflowed `long`. Maps to `ERANGE`.
+    OutOfRange,
     /// The work was abandoned without running to completion — a GPU job
     /// queued behind one that hung, or any job of a context that caused a
     /// hang (`-ECANCELED`). Maps to `ECANCELED`.

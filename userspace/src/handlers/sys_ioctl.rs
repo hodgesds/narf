@@ -2218,6 +2218,8 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::StreamSuspended) => ctx.set_return(errno_ret(86)),
         Err(narf_filesystem::FsError::NoSpace) => ctx.set_return(errno_ret(28)),
         Err(narf_filesystem::FsError::NoDeviceAddress) => ctx.set_return(errno_ret(6)),
+        Err(narf_filesystem::FsError::TransferTimedOut) => ctx.set_return(errno_ret(110)),
+        Err(narf_filesystem::FsError::OutOfRange) => ctx.set_return(errno_ret(34)),
         Err(narf_filesystem::FsError::OutOfMemory) => {
             ctx.set_return(errno_ret(ENOMEM));
         }
