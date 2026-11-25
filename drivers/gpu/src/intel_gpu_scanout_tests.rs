@@ -883,9 +883,9 @@ kernel_test_in!(
 /// out with `PLANE_SURF_DECRYPT`; after the PXP termination the next
 /// commit scans it out without decryption through an all-zero plane CSC
 /// (`PLANE_COLOR_PLANE_CSC_ENABLE`); an unprotected surface takes the CSC
-/// off again. Without a published PXP a protected object is black, and
-/// the DSB arm, which carries neither, refuses it. ADDFB takes a protected
-/// object only on a card with PXP planes, and linear XR24 only.
+/// off again. Without a published PXP a protected object is black. ADDFB
+/// takes a protected object only on a card with PXP planes, in any layout
+/// the card takes (Linux places no layout or format bound on one).
 fn scanout_pxp_protected_plane_decrypts_then_goes_black() -> TestResult {
     use crate::intel_gpu_gt::media::pxp::{self, PlaneProtection, Pxp};
     const SURF: u64 = 0x7019c;
@@ -985,11 +985,6 @@ fn scanout_pxp_protected_plane_decrypts_then_goes_black() -> TestResult {
     }
     model.land(plain_surf, 43);
     owner.poll(21).expect("plain poll").expect("plain latch");
-    // The DSB arm refuses a protected surface before any change.
-    if owner.stage_dsb(id, 4, 30) != Err(ScanoutError::Unsupported) || owner.pending() {
-        pxp::set_display_pxp(None);
-        return TestResult::Fail("DSB arm took a protected surface");
-    }
     // No PXP for the display: xe_pxp_obj_key_check fails, black.
     pxp::set_display_pxp(None);
     if pxp::plane_protection(pxp.key_assign())
@@ -1001,40 +996,184 @@ fn scanout_pxp_protected_plane_decrypts_then_goes_black() -> TestResult {
         return TestResult::Fail("protected object decrypted without a PXP");
     }
     shutdown(&mut owner);
-    // ADDFB: refused without PXP planes, and for a tiled surface.
+    // ADDFB: refused without PXP planes in every layout and format; with
+    // them, linear and X/Tile4 XR24 and linear XR30 are all taken.
     let mut card = crate::drm::card::Card::new("intel-gpu", "PXP planes", (1, 0, 0));
     card.intel_x_tiled = true;
-    let cmd = |modifier: u64| crate::drm::fb_cmd::FbCmd {
+    card.intel_tile4 = true;
+    card.intel_xr30 = true;
+    let cmd = |modifier: u64, format: u32| crate::drm::fb_cmd::FbCmd {
         width: 64,
         height: 32,
-        pixel_format: 0x3432_5258,
+        pixel_format: format,
         handles: [1, 0, 0, 0],
         pitches: [if modifier == 0 { 256 } else { 512 }, 0, 0, 0],
         flags: 2,
         modifier: [modifier, 0, 0, 0],
         ..Default::default()
     };
+    const XR24: u32 = 0x3432_5258;
+    const XR30: u32 = 0x3033_5258;
     let fb_object = object(16384);
     fb_object.set_pxp_key(7);
-    if card
-        .addfb2_intel(&cmd(0), fb_object.clone(), 7, true)
-        .is_ok()
-    {
-        return TestResult::Fail("protected framebuffer without PXP planes");
+    let wc = {
+        let gem = crate::intel_gpu_gem::GemState::new();
+        match gem.create_placed(
+            16384,
+            None,
+            crate::intel_gpu_gem::Placement::SystemWc,
+            |_, _| Ok(()),
+        ) {
+            Ok(handle) => gem.object(handle).ok(),
+            // No WC page attributes on this architecture.
+            Err(narf_filesystem::FsError::NotImplemented) => None,
+            Err(_) => return TestResult::Fail("WC object for XR30"),
+        }
+    };
+    if let Some(wc) = &wc {
+        wc.set_pxp_key(7);
+    }
+    for (modifier, format) in [(0, XR24), (X_TILED_MODIFIER, XR24), (TILE4_MODIFIER, XR24)] {
+        if card
+            .addfb2_intel(&cmd(modifier, format), fb_object.clone(), 7, true)
+            .is_ok()
+        {
+            return TestResult::Fail("protected framebuffer without PXP planes");
+        }
+    }
+    if wc.as_ref().is_some_and(|wc| {
+        card.addfb2_intel(&cmd(0, XR30), wc.clone(), 7, true)
+            .is_ok()
+    }) {
+        return TestResult::Fail("protected XR30 framebuffer without PXP planes");
     }
     card.intel_pxp_planes = true;
-    if card
-        .addfb2_intel(&cmd(X_TILED_MODIFIER), fb_object.clone(), 7, true)
-        .is_ok()
-        || card.addfb2_intel(&cmd(0), fb_object, 7, true).is_err()
-    {
-        return TestResult::Fail("protected framebuffer admission");
+    for (modifier, format) in [(X_TILED_MODIFIER, XR24), (TILE4_MODIFIER, XR24), (0, XR24)] {
+        if card
+            .addfb2_intel(&cmd(modifier, format), fb_object.clone(), 7, true)
+            .is_err()
+        {
+            return TestResult::Fail("protected framebuffer admission");
+        }
+    }
+    if wc.as_ref().is_some_and(|wc| {
+        card.addfb2_intel(&cmd(0, XR30), wc.clone(), 7, true)
+            .is_err()
+    }) {
+        return TestResult::Fail("protected XR30 framebuffer admission");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_scanout",
     scanout_pxp_protected_plane_decrypts_then_goes_black
+);
+
+/// The DSB arm of a protected surface (the KMS owner's path for tiled and
+/// XR30 frames) runs `check_protection` too: a current key stages
+/// `PLANE_SURF | PLANE_SURF_DECRYPT` after PLANE_OFFSET; a stale key stages
+/// `icl_plane_csc_load_black`'s twelve zero writes (`PLANE_CSC_COEFF(0..5)`,
+/// `PLANE_CSC_PREOFF(0..2)`, `PLANE_CSC_POSTOFF(0..2)` at 0x70210..0x7023c)
+/// and PLANE_COLOR_CTL with `PLANE_COLOR_PLANE_CSC_ENABLE` (bit 21) ahead of
+/// a SURF without the decrypt bit (bit 2). A staged arm cancelled unarmed
+/// leaves the plane's black state as it was; an unprotected surface after a
+/// black one stages the CSC enable off first. The color owner admits the
+/// plane CSC enable exactly while the plane is black.
+fn scanout_pxp_protected_dsb_arm_decrypts_or_loads_the_black_csc() -> TestResult {
+    use crate::intel_gpu_gt::media::pxp::{self, Pxp};
+    const OFFSET: u64 = 0x701a4;
+    const SURF: u64 = 0x7019c;
+    const COLOR_CTL: u64 = 0x701cc;
+    let pxp = Pxp::new();
+    pxp.activate_for_test();
+    pxp::set_display_pxp(Some(&pxp));
+    let model = Model::new();
+    model.set(COLOR_CTL, 1 << 13);
+    let mut owner = presenter(&model);
+    let protected = object(8192);
+    protected.set_pxp_key(pxp.key_assign());
+    let id = owner
+        .prepare_object(protected.clone(), geometry())
+        .expect("protected map");
+    let staged = owner.stage_dsb(id, 1, 0);
+    let Ok(regs) = staged else {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("DSB arm refused a decryptable surface");
+    };
+    let address = regs.last().map_or(0, |&(_, v)| v) & !0xfff;
+    if regs.len() != 2
+        || regs[0].0 != OFFSET
+        || regs[1] != (SURF, address | PLANE_SURF_DECRYPT)
+        || owner.forced_black()
+    {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("current key not staged as PLANE_SURF_DECRYPT alone");
+    }
+    // Hardware runs the DSB, then the flip lands.
+    for &(reg, value) in &regs {
+        model.set(reg, value);
+    }
+    model.land(address, 41);
+    if owner.poll(1).map(|c| c.map(|c| c.ticket)) != Ok(Some(1)) {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("decrypted DSB surface did not latch");
+    }
+
+    // The session terminates: the next DSB arm of the same surface is black.
+    pxp.terminate_for_test();
+    let Ok(regs) = owner.stage_dsb(id, 2, 10) else {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("DSB arm refused a stale protected surface");
+    };
+    let mut expected = alloc::vec![(OFFSET, 0)];
+    expected.extend((0x70210..0x70240).step_by(4).map(|reg| (reg, 0)));
+    expected.push((COLOR_CTL, 1 << 13 | 1 << 21));
+    expected.push((SURF, address));
+    if regs != expected || !owner.forced_black() {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("stale key not staged through the black plane CSC");
+    }
+    // Cancelled before the DSB ran: the plane was not black and is not.
+    // SAFETY: the fixture never exposed this staged stream to hardware.
+    if unsafe { owner.cancel_staged_dsb() }.is_err() || owner.forced_black() || owner.pending()
+    {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("cancelled black arm kept the black state");
+    }
+    let regs = owner.stage_dsb(id, 3, 20).expect("stale arm again");
+    for &(reg, value) in &regs {
+        model.set(reg, value);
+    }
+    model.land(address, 42);
+    if owner.poll(21).map(|c| c.map(|c| c.ticket)) != Ok(Some(3)) || !owner.forced_black() {
+        pxp::set_display_pxp(None);
+        return TestResult::Fail("black DSB surface did not latch");
+    }
+    pxp::set_display_pxp(None);
+
+    // An unprotected surface: the CSC enable goes off first, no decryption.
+    let plain = owner
+        .prepare_object(object(8192), geometry())
+        .expect("plain map");
+    let regs = owner.stage_dsb(plain, 4, 30).expect("plain arm");
+    let plain_surf = regs.last().map_or(0, |&(_, v)| v);
+    if regs.first() != Some(&(COLOR_CTL, 1 << 13))
+        || plain_surf & PLANE_SURF_DECRYPT != 0
+        || owner.forced_black()
+    {
+        return TestResult::Fail("unprotected DSB arm left the plane black");
+    }
+    for &(reg, value) in &regs {
+        model.set(reg, value);
+    }
+    model.land(plain_surf, 43);
+    owner.poll(31).expect("plain poll").expect("plain latch");
+    shutdown(&mut owner);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout",
+    scanout_pxp_protected_dsb_arm_decrypts_or_loads_the_black_csc
 );
 
 // ADDFB and scanout of a foreign dma-buf import on an integrated display:

@@ -494,6 +494,9 @@ struct Pending {
     frame: u32,
     deadline: u64,
     deferred: bool,
+    /// Whether the plane CSC was black before this arm: a staged DSB arm
+    /// that is cancelled unarmed leaves it so.
+    black_before: bool,
 }
 #[derive(Clone, Copy)]
 struct Target {
@@ -1238,6 +1241,12 @@ impl<M: ScanoutIo> Presenter<M> {
     /// Retain a pending target and fresh primary completion status without
     /// writing SURF. The exclusive KMS owner emits the returned arm in its
     /// source-qualified DSB safe window, after color arm registers.
+    ///
+    /// `check_protection` runs here too, at each commit: a protected
+    /// surface whose key is current is armed with `PLANE_SURF_DECRYPT`, and
+    /// one whose key is stale (or that has no PXP) scans out black, with
+    /// `icl_plane_csc_load_black`'s twelve zeroes and the plane CSC enable
+    /// of `glk_plane_color_ctl` ahead of the SURF write that latches them.
     pub(crate) fn stage_dsb(
         &mut self,
         id: SurfaceId,
@@ -1246,10 +1255,6 @@ impl<M: ScanoutIo> Presenter<M> {
     ) -> Result<Vec<(u64, u32)>, ScanoutError> {
         self.ready()?;
         let surface = self.surfaces.get(&id).ok_or(ScanoutError::UnknownSurface)?;
-        // The DSB arm carries neither the decrypt bit nor the black CSC.
-        if surface.object.pxp_key() != 0 {
-            return Err(ScanoutError::Unsupported);
-        }
         if !surface.object.idle(false) {
             return Err(ScanoutError::Busy);
         }
@@ -1266,6 +1271,8 @@ impl<M: ScanoutIo> Presenter<M> {
         };
         let view = surface.view;
         let (offset, geometry) = (surface.offset + base, surface.geometry);
+        let protection =
+            crate::intel_gpu_gt::media::pxp::plane_protection(surface.object.pxp_key());
         self.arm_target(
             id,
             Target {
@@ -1273,19 +1280,40 @@ impl<M: ScanoutIo> Presenter<M> {
                 geometry,
                 view,
                 plane_offset,
-                protection: Default::default(),
+                protection,
             },
             ticket,
             now,
             true,
         )?;
+        let surf = if protection.decrypt {
+            offset | PLANE_SURF_DECRYPT
+        } else {
+            offset
+        };
         let mut registers = alloc::vec![
             (self.plane() + PLANE_OFFSET_OFFSET, plane_offset),
-            (self.plane() + PLANE_SURF_OFFSET, offset),
+            (self.plane() + PLANE_SURF_OFFSET, surf),
         ];
-        // A plane left black by a stale protected surface gets its CSC
-        // back with this arm.
-        if self.black {
+        if protection.force_black {
+            // A stale protected surface: the all-zero plane CSC, enabled.
+            let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
+            let mut black: Vec<(u64, u32)> = PLANE_CSC_BLACK
+                .iter()
+                .map(|reg| (self.plane() + reg, 0))
+                .collect();
+            black.push((
+                self.plane() + COLOR_CTL_OFFSET,
+                color | PLANE_COLOR_CSC_ENABLE,
+            ));
+            // After PLANE_OFFSET, before the SURF write that latches them.
+            let tail = registers.split_off(1);
+            registers.extend(black);
+            registers.extend(tail);
+            self.black = true;
+        } else if self.black {
+            // A plane left black by a stale protected surface gets its CSC
+            // back with this arm.
             let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
             registers.insert(
                 0,
@@ -1328,7 +1356,10 @@ impl<M: ScanoutIo> Presenter<M> {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }
-        self.pending = None;
+        // The black CSC (or its removal) was never armed either.
+        if let Some(pending) = self.pending.take() {
+            self.black = pending.black_before;
+        }
         self.retain_controls(None)?;
         Ok(())
     }
@@ -1435,6 +1466,7 @@ impl<M: ScanoutIo> Presenter<M> {
             frame,
             deadline: now.saturating_add(FLIP_TIMEOUT_NS),
             deferred,
+            black_before: self.black,
         });
         if deferred {
             return Ok(());
@@ -1510,8 +1542,7 @@ impl<M: ScanoutIo> Presenter<M> {
     }
 
     /// Whether the plane CSC was last programmed black (a stale protected
-    /// surface, `force_black`).
-    #[cfg(any(test, feature = "kernel-test"))]
+    /// surface, `force_black`), or is staged so in a DSB arm.
     pub(crate) fn forced_black(&self) -> bool {
         self.black
     }

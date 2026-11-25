@@ -2924,9 +2924,9 @@ impl Card {
         // A PXP-protected object (xe_bo_is_protected; only with
         // narf.intel.pxp=1) becomes a framebuffer only where PXP published
         // plane decryption for this card: its planes decrypt it, or scan it
-        // out black once its key is stale (check_protection). Tiled
-        // protected surfaces take the DSB arm, which carries neither.
-        if object.pxp_key() != 0 && (!self.intel_pxp_planes || tiled || xr30) {
+        // out black once its key is stale (check_protection), in any layout
+        // and format the plane takes, as Linux allows.
+        if object.pxp_key() != 0 && !self.intel_pxp_planes {
             return Err(CardError::InvalidDimensions);
         }
         if self.framebuffers.len() >= 4096 {

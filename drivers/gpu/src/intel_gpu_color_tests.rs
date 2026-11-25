@@ -494,3 +494,45 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_color",
     smoke_color_gen12_arb_slots_capture_retention_and_profile_refusal
 );
+
+/// A stale PXP-protected primary (`check_protection`'s `force_black`) owns
+/// the plane CSC: `glk_plane_color_ctl` sets `PLANE_COLOR_PLANE_CSC_ENABLE`
+/// (bit 21) over `icl_plane_csc_load_black`'s zeroes. The color owner admits
+/// that bit exactly while the scanout owner reports the plane black, and
+/// still fails closed on it otherwise or on its absence while black.
+fn smoke_intel_ctm_admits_the_plane_csc_only_while_the_plane_is_black() -> TestResult {
+    let io = registers();
+    let mut owner = Owner::capture(&io, Generation::MeteorLake).unwrap();
+    // The scanout owner armed the stale surface black.
+    io.write32(0x701cc, (1 << 13) | (1 << 21));
+    owner.set_plane_black(true);
+    assert!(owner.plane_black());
+    owner.arm(&io, Some(identity()), 100).unwrap();
+    io.write32(FRAME, 11);
+    assert!(owner.poll(&io, 101).unwrap().is_some());
+    // The plane went back to an unprotected surface, CSC off.
+    io.write32(0x701cc, 1 << 13);
+    owner.set_plane_black(false);
+    owner.arm(&io, None, 102).unwrap();
+    io.write32(FRAME, 12);
+    assert!(owner.poll(&io, 103).unwrap().is_some());
+    // Bit 21 the scanout owner never armed: unsupported plane state.
+    io.write32(0x701cc, (1 << 13) | (1 << 21));
+    assert_eq!(
+        owner.arm(&io, Some(identity()), 104),
+        Err(FsError::NoDevice)
+    );
+    // A black plane whose CSC enable is gone fails closed too.
+    let io = registers();
+    let mut owner = Owner::capture(&io, Generation::MeteorLake).unwrap();
+    owner.set_plane_black(true);
+    assert_eq!(
+        owner.arm(&io, Some(identity()), 105),
+        Err(FsError::NoDevice)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_color",
+    smoke_intel_ctm_admits_the_plane_csc_only_while_the_plane_is_black
+);

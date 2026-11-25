@@ -2931,6 +2931,19 @@ impl<M: Platform> Guard<'_, M> {
         }
         Ok(())
     }
+    /// A CPU-armed primary may have changed the plane CSC's black state
+    /// (a stale PXP-protected surface, `force_black`): the color owner
+    /// admits the plane as the scanout owner armed it.
+    fn sync_plane_black(&mut self) {
+        let black = self
+            .state
+            .presenter
+            .as_ref()
+            .is_some_and(|p| p.forced_black());
+        if let Some(color) = self.state.color.as_mut() {
+            color.set_plane_black(black);
+        }
+    }
     pub(crate) async fn present(
         &mut self,
         object: Arc<GemObject>,
@@ -2994,6 +3007,7 @@ impl<M: Platform> Guard<'_, M> {
             self.state.failed = true;
             return Err(scanout_error(error));
         }
+        self.sync_plane_black();
         // The cursor's arm follows the primary's in the same commit.
         if let (Some(sf), Some(psr)) = (&selective, self.state.psr.as_mut()) {
             psr.program_sel_fetch_cursor(&self.device.platform, sf);
@@ -3602,6 +3616,7 @@ impl<M: Platform> Guard<'_, M> {
                     .arm_console(ticket, self.device.platform.now())
                     .map_err(scanout_error)
                     .inspect_err(|_| self.state.failed = true)?;
+                self.sync_plane_black();
                 self.state.pending = None;
                 self.finish_pending().await?;
             }
@@ -4526,6 +4541,20 @@ impl<M: Platform> Guard<'_, M> {
                             .expect("color owner")
                             .target_input(&mut update, target.view.input)?;
                     }
+                }
+                // The staged primary arm decided the plane CSC's black
+                // state (check_protection); the update latches it.
+                if primary.is_some() {
+                    let black = self
+                        .state
+                        .presenter
+                        .as_ref()
+                        .is_some_and(|p| p.forced_black());
+                    self.state
+                        .color
+                        .as_ref()
+                        .expect("color owner")
+                        .target_black(&mut update, black);
                 }
                 if let Some(surface) = surface {
                     update.registers.extend(surface);
