@@ -1819,14 +1819,15 @@ mod i2c_hid_smokes {
             if writes.len() != 3 {
                 return TestResult::Fail("expected desc-pointer + 2 report writes");
             }
-            // SET_REPORT framing (Microsoft HID-over-I2C §7.2):
-            // [cmd reg 0x0005 LE][(type<<4)|report id][opcode 0x03]
-            // [data reg 0x0006 LE][total len = 2+1+1 = 4 LE]
-            // [report id][payload]. Output type = 0x02, Feature = 0x03.
+            // SET_REPORT framing (i2c_hid_set_or_send_report +
+            // i2c_hid_format_report): [cmd reg 0x0005 LE][(type<<4)|
+            // report id][opcode 0x03][data reg 0x0006 LE][total len LE]
+            // [report id, only when non-zero][payload]. Report ID 0:
+            // len = 2 + 1 = 3, no ID byte. Output = 0x02, Feature = 0x03.
             let expect_output: Vec<u8> =
-                alloc::vec![0x05, 0x00, 0x20, 0x03, 0x06, 0x00, 0x04, 0x00, 0x00, 0x05];
+                alloc::vec![0x05, 0x00, 0x20, 0x03, 0x06, 0x00, 0x03, 0x00, 0x05];
             let expect_feature: Vec<u8> =
-                alloc::vec![0x05, 0x00, 0x30, 0x03, 0x06, 0x00, 0x04, 0x00, 0x00, 0x05];
+                alloc::vec![0x05, 0x00, 0x30, 0x03, 0x06, 0x00, 0x03, 0x00, 0x05];
             if writes[1] != expect_output {
                 return TestResult::Fail("SET_REPORT (Output) frame bytes wrong");
             }
@@ -3282,15 +3283,17 @@ mod i2c_hid_touch_smokes {
                                       // (1) HID descriptor. (2) RESET sentinel.
         bus.stage_read(hid_desc);
         bus.stage_read(alloc::vec![0u8; 2]);
-        // (3)-(5) Parameter GET responses: [len=7][5-byte report].
-        // MAX_X = 0x1234, MAX_Y = 0x0500, RES x/y = 0x10/0x10.
+        // (3)-(5) Parameter GET responses, each the one read of its
+        // GET_REPORT transaction (i2c_hid_get_report): [len=7][5-byte
+        // report]. MAX_X = 0x1234, MAX_Y = 0x0500, RES x/y = 0x10/0x10.
         for resp in [
             [0x0D, 0x05, 0x03, 0x34, 0x12],
             [0x0D, 0x05, 0x03, 0x00, 0x05],
             [0x0D, 0x05, 0x03, 0x10, 0x10],
         ] {
-            bus.stage_read(alloc::vec![0x07, 0x00]);
-            bus.stage_read(resp.to_vec());
+            let mut framed = alloc::vec![0x07, 0x00];
+            framed.extend_from_slice(&resp);
+            bus.stage_read(framed);
         }
         // (6) One 0x5D i2c-HID report: finger 0 present, no click.
         // Finger record mirrors the ElanFinger unit fixture:
@@ -3423,15 +3426,17 @@ mod i2c_hid_touch_smokes {
         // (1) HID descriptor. (2) RESET sentinel.
         bus.stage_read(hid_desc);
         bus.stage_read(alloc::vec![0u8; 2]);
-        // (3)-(5) Parameter GET responses: [len=7][5-byte report].
-        // MAX_X = 0x1234, MAX_Y = 0x0500, RES x/y = 0x10/0x10.
+        // (3)-(5) Parameter GET responses, each the one read of its
+        // GET_REPORT transaction (i2c_hid_get_report): [len=7][5-byte
+        // report]. MAX_X = 0x1234, MAX_Y = 0x0500, RES x/y = 0x10/0x10.
         for resp in [
             [0x0D, 0x05, 0x03, 0x34, 0x12],
             [0x0D, 0x05, 0x03, 0x00, 0x05],
             [0x0D, 0x05, 0x03, 0x10, 0x10],
         ] {
-            bus.stage_read(alloc::vec![0x07, 0x00]);
-            bus.stage_read(resp.to_vec());
+            let mut framed = alloc::vec![0x07, 0x00];
+            framed.extend_from_slice(&resp);
+            bus.stage_read(framed);
         }
 
         let bus_dyn: Arc<dyn I2cBus> = bus.clone();
@@ -3474,21 +3479,23 @@ mod i2c_hid_touch_smokes {
                 ROUTER.unregister_device(id);
                 TestResult::Fail(msg)
             };
-            // Mute-LED SET_FEATURE frames on the wire: 16-byte
-            // writes whose byte 8 echoes report id 0xBC.
+            // Mute-LED SET_FEATURE frames on the wire: 17-byte
+            // writes whose byte 9 echoes report id 0xBC.
             let mute_frames = || {
                 bus_for_check
                     .writes()
                     .into_iter()
-                    .filter(|w| w.len() == 16 && w[8] == ELAN_MUTE_LED_REPORT)
+                    .filter(|w| w.len() == 17 && w[9] == ELAN_MUTE_LED_REPORT)
                     .collect::<alloc::vec::Vec<alloc::vec::Vec<u8>>>()
             };
-            // Expected frame (Microsoft HID-over-I2C §7.2):
-            // [cmd reg 0x0005 LE][(Feature 0x03 << 4) | (0xBC & 0x0f)
-            //  = 0x3C][opcode 0x03][data reg 0x0006 LE][total len
-            //  2+1+7 = 10 LE][report id 0xBC][0x02][on][0 × 5].
+            // Expected frame (i2c_hid_set_or_send_report): [cmd reg
+            // 0x0005 LE][(Feature 0x03 << 4) | 0x0F sentinel = 0x3F]
+            // [opcode 0x03][report id 0xBC — i2c_hid_encode_command's
+            // third byte for an ID >= 15][data reg 0x0006 LE][total len
+            // 2+1+7 = 10 LE][report id 0xBC][0x02][on][0 × 5].
             let expect_frame = |on: bool| {
-                let mut v = alloc::vec![0x05, 0x00, 0x3C, 0x03, 0x06, 0x00, 0x0A, 0x00, 0xBC, 0x02];
+                let mut v =
+                    alloc::vec![0x05, 0x00, 0x3F, 0x03, 0xBC, 0x06, 0x00, 0x0A, 0x00, 0xBC, 0x02];
                 v.push(if on { 1 } else { 0 });
                 v.extend_from_slice(&[0u8; 5]);
                 v

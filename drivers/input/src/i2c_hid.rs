@@ -26,8 +26,11 @@
 //!   pump task calls in a loop. The first two bytes of any read
 //!   from the Input register carry the length; length=0 means no
 //!   report ready.
-//! - GET_REPORT / SET_REPORT round-trip helpers for FEATURE reports
-//!   (used for things like setting precision-touchpad mode).
+//! - GET_REPORT / SET_REPORT and plain output reports with Linux's
+//!   framing (`drivers/hid/i2c-hid/i2c-hid-core.c`: one write+read
+//!   transaction per GET, the 0x0F sentinel for report IDs >= 15, no ID
+//!   byte for report 0), used for precision-touchpad mode, LEDs, and the
+//!   raw requests of `crate::i2c_hid_transport`.
 //!
 //! Discovery vs. binding:
 //! - The `register_initcalls` Stage::Device pass below logs every
@@ -72,6 +75,11 @@ const REPORT_TYPE_FEATURE: u8 = 0x03;
 // SET_POWER values.
 pub const POWER_ON: u8 = 0x00;
 pub const POWER_SLEEP: u8 = 0x01;
+
+/// `HID_MIN_BUFFER_SIZE` (`include/linux/hid.h:589`): the transfer buffer
+/// i2c-hid starts with, before `i2c_hid_start` grows it to the largest
+/// report the descriptor declares.
+pub const HID_MIN_BUFFER_SIZE: usize = 64;
 
 /// Decoded HID descriptor. Field names mirror the Microsoft spec so
 /// cross-referencing the document is friction-free.
@@ -148,6 +156,15 @@ pub enum I2cHidError {
     BufferTooSmall,
     /// SET_POWER value out of spec (must be 0 or 1).
     BadPowerState,
+    /// A report request i2c-hid refuses with `-EINVAL`: data longer than
+    /// the transfer buffer, GET of an Output or SET of an Input report, a
+    /// SET whose `buf[0]` is not the report ID, or a GET answered with
+    /// another report's ID.
+    InvalidRequest,
+    /// A plain output report to a device with no output register
+    /// (`wMaxOutputLength == 0`): `-ENOSYS`, which makes hidraw fall back
+    /// to SET_REPORT.
+    NoOutputRegister,
 }
 
 impl From<I2cError> for I2cHidError {
@@ -211,6 +228,8 @@ pub struct I2cHidDriver {
     /// `Some` after `start()` succeeds — the descriptor is the
     /// driver's source of truth for the four operating registers.
     descriptor: Option<HidDescriptor>,
+    /// `ihid->bufsize`: the largest report a GET/SET_REPORT moves.
+    bufsize: usize,
 }
 
 impl I2cHidDriver {
@@ -220,7 +239,19 @@ impl I2cHidDriver {
             addr,
             hid_desc_register,
             descriptor: None,
+            bufsize: HID_MIN_BUFFER_SIZE,
         }
+    }
+
+    /// Size the transfer buffer for the descriptor's largest report, as
+    /// `i2c_hid_start` does (never below [`HID_MIN_BUFFER_SIZE`]).
+    pub fn set_bufsize(&mut self, bufsize: usize) {
+        self.bufsize = bufsize.max(HID_MIN_BUFFER_SIZE);
+    }
+
+    /// `ihid->bufsize`.
+    pub fn bufsize(&self) -> usize {
+        self.bufsize
     }
 
     /// Read + decode the HID descriptor. Idempotent — repeated calls
@@ -375,42 +406,98 @@ impl I2cHidDriver {
         .await
     }
 
-    /// Issue a GET_REPORT for a FEATURE report by ID. Reads the
-    /// payload bytes (length-prefixed) into a fresh Vec.
-    pub async fn get_feature_report(&self, report_id: u8) -> Result<Vec<u8>, I2cHidError> {
+    /// `i2c_hid_get_report` (`drivers/hid/i2c-hid/i2c-hid-core.c:257`):
+    /// GET_REPORT of `report_type` (1 Input, 3 Feature) for `report_id`
+    /// as ONE transaction — [command register][encoded command][data
+    /// register], then a repeated-START read of the 2-byte length and the
+    /// report from the data register. Fills `recv` with the report as the
+    /// device sends it (report ID first for numbered reports), cut to
+    /// `bufsize - 2`, and returns its length; an empty response is 0.
+    pub async fn get_report(
+        &self,
+        report_type: u8,
+        report_id: u8,
+        recv: &mut [u8],
+    ) -> Result<usize, I2cHidError> {
         let desc = self.descriptor.ok_or(I2cHidError::NotInitialised)?;
-        // GET_REPORT command: opcode in low byte, report-type +
-        // report-id in next byte, then the Data Register (LE u16),
-        // then read length-prefixed payload from Data Register.
-        let cmd_addr = desc.w_command_register.to_le_bytes();
-        let data_addr = desc.w_data_register.to_le_bytes();
-        let cmd = [
-            cmd_addr[0],
-            cmd_addr[1],
-            (REPORT_TYPE_FEATURE << 4) | (report_id & 0x0f),
-            CMD_OP_GET_REPORT,
-            data_addr[0],
-            data_addr[1],
-        ];
-        let mut len_buf = [0u8; 2];
-        // Phase 1: write the command. STOP, then a fresh START with
-        // the Data Register address + read of length prefix.
-        let mut ops1 = [I2cOp::Write(&cmd)];
-        self.bus.transfer(self.addr, &mut ops1).await?;
-        let mut ops2 = [I2cOp::Write(&data_addr), I2cOp::Read(&mut len_buf)];
-        self.bus.transfer(self.addr, &mut ops2).await?;
-        let len = u16::from_le_bytes(len_buf) as usize;
-        if len < 2 {
-            return Err(I2cHidError::ShortReport);
+        let mut cmd = Vec::with_capacity(7);
+        cmd.extend_from_slice(&desc.w_command_register.to_le_bytes());
+        encode_command(&mut cmd, CMD_OP_GET_REPORT, report_type, report_id);
+        // "Because command can be either 2 or 3 bytes destination for the
+        // data register may be not aligned."
+        cmd.extend_from_slice(&desc.w_data_register.to_le_bytes());
+        // "In addition to report data device will supply data length in
+        // the first 2 bytes of the response, so adjust."
+        let recv_len = recv.len().min(self.bufsize - 2);
+        let mut raw = alloc::vec![0u8; recv_len + 2];
+        let mut ops = [I2cOp::Write(&cmd), I2cOp::Read(&mut raw)];
+        self.bus.transfer(self.addr, &mut ops).await?;
+        let ret_count = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+        // "Check for empty report response"
+        if ret_count <= 2 {
+            return Ok(0);
         }
-        let payload_len = len - 2;
-        let mut payload = alloc::vec![0; payload_len];
-        // Phase 2 continued: read the rest of the report. The Data
-        // Register stays at the next byte after the length prefix
-        // for a continuation read against the same slave address.
-        let mut ops3 = [I2cOp::Read(&mut payload)];
-        self.bus.transfer(self.addr, &mut ops3).await?;
-        Ok(payload)
+        let n = recv_len.min(ret_count - 2);
+        recv[..n].copy_from_slice(&raw[2..2 + n]);
+        // "device returned incorrect report"
+        if report_id != 0 && n != 0 && recv[0] != report_id {
+            return Err(I2cHidError::InvalidRequest);
+        }
+        Ok(n)
+    }
+
+    /// `i2c_hid_set_or_send_report` (`i2c-hid-core.c:344`): `data` (no
+    /// report ID) as report `report_id` of `report_type` (2 Output,
+    /// 3 Feature) — through SET_REPORT on the command and data registers
+    /// when `do_set`, else as a plain output report written to
+    /// `wOutputRegister`. Framing is `i2c_hid_format_report`'s: a 2-byte
+    /// length, the report ID only when it is non-zero, the data. Returns
+    /// `data.len()`.
+    pub async fn set_or_send_report(
+        &self,
+        report_type: u8,
+        report_id: u8,
+        data: &[u8],
+        do_set: bool,
+    ) -> Result<usize, I2cHidError> {
+        let desc = self.descriptor.ok_or(I2cHidError::NotInitialised)?;
+        if data.len() > self.bufsize {
+            return Err(I2cHidError::InvalidRequest);
+        }
+        if !do_set && desc.w_max_output_length == 0 {
+            return Err(I2cHidError::NoOutputRegister);
+        }
+        let mut buf = Vec::<u8>::with_capacity(12 + data.len());
+        if do_set {
+            buf.extend_from_slice(&desc.w_command_register.to_le_bytes());
+            encode_command(&mut buf, CMD_OP_SET_REPORT, report_type, report_id);
+            buf.extend_from_slice(&desc.w_data_register.to_le_bytes());
+        } else {
+            // "With simple "send report" all data goes into the output
+            // register."
+            buf.extend_from_slice(&desc.w_output_register.to_le_bytes());
+        }
+        let length = 2 + usize::from(report_id != 0) + data.len();
+        buf.extend_from_slice(&(length as u16).to_le_bytes());
+        if report_id != 0 {
+            buf.push(report_id);
+        }
+        buf.extend_from_slice(data);
+        let mut ops = [I2cOp::Write(&buf)];
+        self.bus.transfer(self.addr, &mut ops).await?;
+        Ok(data.len())
+    }
+
+    /// Issue a GET_REPORT for a FEATURE report by ID. Returns the report
+    /// as the device sent it (report ID first for a numbered report), at
+    /// most `bufsize - 2` bytes.
+    pub async fn get_feature_report(&self, report_id: u8) -> Result<Vec<u8>, I2cHidError> {
+        let mut out = alloc::vec![0u8; self.bufsize - 2];
+        let n = self
+            .get_report(REPORT_TYPE_FEATURE, report_id, &mut out)
+            .await?;
+        out.truncate(n);
+        Ok(out)
     }
 
     /// SET_REPORT for a FEATURE report by ID + payload. The device
@@ -421,8 +508,9 @@ impl I2cHidDriver {
         report_id: u8,
         payload: &[u8],
     ) -> Result<(), I2cHidError> {
-        self.set_report(REPORT_TYPE_FEATURE, report_id, payload)
+        self.set_or_send_report(REPORT_TYPE_FEATURE, report_id, payload, true)
             .await
+            .map(|_| ())
     }
 
     /// SET_REPORT for an OUTPUT report by ID + payload — the
@@ -435,38 +523,59 @@ impl I2cHidDriver {
         report_id: u8,
         payload: &[u8],
     ) -> Result<(), I2cHidError> {
-        self.set_report(REPORT_TYPE_OUTPUT, report_id, payload)
+        self.set_or_send_report(REPORT_TYPE_OUTPUT, report_id, payload, true)
             .await
+            .map(|_| ())
     }
 
-    /// Shared SET_REPORT framing for `set_feature_report` /
-    /// `set_output_report`: one write of [command register][(type
-    /// nibble | report ID nibble), SET_REPORT opcode][data
-    /// register][total length LE][report ID][payload].
-    async fn set_report(
+    /// `i2c_hid_get_raw_report` (`i2c-hid-core.c:658`), the GET half of
+    /// `hid_hw_raw_request`: `buf[0]` receives the report ID — stashed by
+    /// hand for an unnumbered report, whose response carries none — and
+    /// the result counts it.
+    pub async fn get_raw_report(
         &self,
-        report_type: u8,
+        report_type: narf_input::hid_device::ReportType,
         report_id: u8,
-        payload: &[u8],
-    ) -> Result<(), I2cHidError> {
-        let desc = self.descriptor.ok_or(I2cHidError::NotInitialised)?;
-        let cmd_addr = desc.w_command_register.to_le_bytes();
-        let data_addr = desc.w_data_register.to_le_bytes();
-        // Total length includes the 2-byte length prefix + the
-        // 1-byte report ID echo + the payload.
-        let total_len = 2u16 + 1 + payload.len() as u16;
-        let total_le = total_len.to_le_bytes();
-        let mut buf = Vec::<u8>::with_capacity(8 + payload.len());
-        buf.extend_from_slice(&cmd_addr);
-        buf.push((report_type << 4) | (report_id & 0x0f));
-        buf.push(CMD_OP_SET_REPORT);
-        buf.extend_from_slice(&data_addr);
-        buf.extend_from_slice(&total_le);
-        buf.push(report_id);
-        buf.extend_from_slice(payload);
-        let mut ops = [I2cOp::Write(&buf)];
-        self.bus.transfer(self.addr, &mut ops).await?;
-        Ok(())
+        buf: &mut [u8],
+    ) -> Result<usize, I2cHidError> {
+        use narf_input::hid_device::ReportType;
+        let wire = match report_type {
+            ReportType::Output => return Err(I2cHidError::InvalidRequest),
+            ReportType::Feature => REPORT_TYPE_FEATURE,
+            ReportType::Input => REPORT_TYPE_INPUT,
+        };
+        if report_id != 0 {
+            return self.get_report(wire, report_id, buf).await;
+        }
+        let Some((first, rest)) = buf.split_first_mut() else {
+            return Err(I2cHidError::InvalidRequest);
+        };
+        *first = 0;
+        let n = self.get_report(wire, 0, rest).await?;
+        Ok(if n > 0 { n + 1 } else { 0 })
+    }
+
+    /// `i2c_hid_output_raw_report` (`i2c-hid-core.c:690`): `buf[0]` is
+    /// the report ID, stripped before framing; the result counts it.
+    /// `do_set` picks SET_REPORT over the output register.
+    pub async fn output_raw_report(
+        &self,
+        report_type: narf_input::hid_device::ReportType,
+        buf: &[u8],
+        do_set: bool,
+    ) -> Result<usize, I2cHidError> {
+        use narf_input::hid_device::ReportType;
+        let wire = match report_type {
+            ReportType::Input => return Err(I2cHidError::InvalidRequest),
+            ReportType::Feature => REPORT_TYPE_FEATURE,
+            ReportType::Output => REPORT_TYPE_OUTPUT,
+        };
+        let Some((&report_id, data)) = buf.split_first() else {
+            return Err(I2cHidError::InvalidRequest);
+        };
+        self.set_or_send_report(wire, report_id, data, do_set)
+            .await
+            .map(|n| n + 1)
     }
 
     /// Cached descriptor — `None` before `read_descriptor()` succeeds.
@@ -511,6 +620,7 @@ impl I2cHidDriver {
             addr,
             hid_desc_register,
             descriptor: Some(descriptor),
+            bufsize: HID_MIN_BUFFER_SIZE,
         }
     }
 
@@ -522,6 +632,21 @@ impl I2cHidDriver {
         self.descriptor
             .map(|d| d.w_max_input_length as usize)
             .unwrap_or(64)
+    }
+}
+
+/// `i2c_hid_encode_command` (`i2c-hid-core.c:240`): the report type in the
+/// high nibble and the report ID in the low one, then the opcode — except
+/// that an ID of 15 or more takes the 0x0F sentinel nibble and follows the
+/// opcode as a third byte.
+fn encode_command(buf: &mut Vec<u8>, opcode: u8, report_type: u8, report_id: u8) {
+    if report_id < 0x0F {
+        buf.push((report_type << 4) | report_id);
+        buf.push(opcode);
+    } else {
+        buf.push((report_type << 4) | 0x0F);
+        buf.push(opcode);
+        buf.push(report_id);
     }
 }
 
@@ -733,10 +858,3 @@ fn report_crs(path: &str) {
         }
     }
 }
-
-// REPORT_TYPE_INPUT is kept in case future code (e.g. a debug
-// shell that issues GET_REPORT against an Input report directly)
-// needs it; suppress the unused warning until then.
-// (REPORT_TYPE_OUTPUT is live: `set_output_report`.)
-#[allow(dead_code)]
-const _ENSURE_REPORT_TYPES_LIVE: u8 = REPORT_TYPE_INPUT;

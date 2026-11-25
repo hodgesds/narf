@@ -25,6 +25,7 @@ pub mod i2c_hid_bind;
 pub mod i2c_hid_keyboard;
 pub mod i2c_hid_pm;
 pub mod i2c_hid_touch;
+pub mod i2c_hid_transport;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042;
 #[cfg(target_arch = "x86_64")]
