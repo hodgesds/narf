@@ -185,7 +185,9 @@ pub fn register_initcalls() {
         }
     });
     narf_init::register(Stage::Subsys, "ath10k", || {
+        #[cfg(not(feature = "ath10k-module-only"))]
         ath10k::register();
+        // ath10k.ko owns every ath10k PCI id (AR9462 is ath9k's either way).
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "ath9k", || {

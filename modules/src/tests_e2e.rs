@@ -1763,6 +1763,86 @@ fn e2e_ath11k_module_registration() -> TestResult {
 }
 kernel_test_in!("modules/e2e/ath11k", e2e_ath11k_module_registration);
 
+/// The real ath10k `.ko` (`narf-drivers-wireless-ath10k --features module`:
+/// the whole PCIe driver — BMI, firmware/board/OTP download, CE, HTC, WMI,
+/// HTT and the station radio with its in-driver supplicant — over
+/// `narf-module-rt` and the shared KABI, including `narf_pci_command`,
+/// `narf_pcie_state` and `narf_wireless_regdomain`). Its relocations
+/// resolve and init runs; it claims
+/// every ath10k PCIe id the built-in driver binds and not AR9462 (ath9k's),
+/// refuses a probe with no device context before any device access, and
+/// unloads leaving no match behind. QEMU has no Atheros Wi-Fi, so bring-up
+/// itself is proven on hardware.
+fn e2e_ath10k_module_registration() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    const ATHEROS: u16 = 0x168c;
+    const CLAIMED: [(u16, u16); 9] = [
+        (ATHEROS, 0x003c), // QCA988X
+        (0x0777, 0x11ac),  // QCA988X (Ubiquiti)
+        (ATHEROS, 0x0050), // QCA9887
+        (ATHEROS, 0x003e), // QCA6174
+        (ATHEROS, 0x0041), // QCA6164
+        (ATHEROS, 0x0040), // QCA99X0
+        (ATHEROS, 0x0056), // QCA9888
+        (ATHEROS, 0x0046), // QCA9984
+        (ATHEROS, 0x0042), // QCA9377
+    ];
+    const AR9462: u16 = 0x0034;
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("kernel booted without a test initramfs");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/test-fixtures/ath10k.ko")
+    else {
+        return TestResult::Fail("ath10k module fixture absent from staged initramfs");
+    };
+    fresh_state(0);
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    let Some(image) = stamp_fixture_abi(staged, abi) else {
+        return TestResult::Fail("ath10k module has no ABI placeholder");
+    };
+    let before = count();
+    let module = match sys_init_module(&image) {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("ath10k.ko failed to load or run init"),
+    };
+    let live = *module.state.lock() == crate::lifecycle::ModuleState::Live;
+    let claims = module.name() == "ath10k"
+        && count() == before + CLAIMED.len()
+        && CLAIMED
+            .iter()
+            .all(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
+        && __module_thunk_for_test(ATHEROS, AR9462).is_none();
+    // A bogus token (no device context): the identity read fails first.
+    let (vendor, device) = CLAIMED[0];
+    let refused = __module_thunk_for_test(vendor, device).is_some_and(|thunk| thunk(0, 0) != 0);
+    drop(module);
+    if sys_delete_module("ath10k").is_err() {
+        return TestResult::Fail("could not unload ath10k.ko");
+    }
+    if !live {
+        return TestResult::Fail("ath10k.ko did not reach Live");
+    }
+    if !claims {
+        return TestResult::Fail("ath10k.ko did not claim exactly the ath10k PCIe ids");
+    }
+    if !refused {
+        return TestResult::Fail("ath10k.ko probe accepted a token with no device context");
+    }
+    if count() != before
+        || CLAIMED
+            .iter()
+            .any(|&(vendor, device)| __module_thunk_for_test(vendor, device).is_some())
+    {
+        return TestResult::Fail("ath10k.ko unload left a PCI match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/ath10k", e2e_ath10k_module_registration);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]

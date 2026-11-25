@@ -41,8 +41,8 @@
 //! needs a fresh generation.
 //!
 //! Not carried (built-in only): AP/P2P/ROC, WoW and system PM, power-save
-//! control (the awake default is still submitted), the userspace SME, and
-//! the kernel's live regulatory database (see `platform::reg`).
+//! control (the awake default is still submitted) and the userspace SME.
+//! The regulatory domain is the kernel's live one (`platform::reg`).
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;

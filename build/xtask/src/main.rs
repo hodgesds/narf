@@ -5745,6 +5745,11 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath11k.ko".into(), bytes)),
             Err(e) => println!("xtask: ath11k driver module unavailable ({e})"),
         }
+        // The whole ath10k driver as a `.ko` (QCA988X..QCA9377 over the KABI).
+        match build_module_fixture("narf-drivers-wireless-ath10k", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/test-fixtures/ath10k.ko".into(), bytes)),
+            Err(e) => println!("xtask: ath10k driver module unavailable ({e})"),
+        }
     }
 
     if !fixtures.is_empty() {
