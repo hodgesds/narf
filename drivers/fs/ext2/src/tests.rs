@@ -7665,3 +7665,328 @@ fn smoke_ext2_fitrim_ioctl_paths() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_fitrim_ioctl_paths);
+
+// ── Superblock lifecycle and the write gate (`volume::sb_state`) ─────
+
+fn sb_bytes_with(f: impl FnOnce(&mut [u8])) -> Option<super::superblock::Superblock> {
+    let mut b = alloc::vec![0u8; 1024];
+    b[56..58].copy_from_slice(&crate::EXT2_SUPER_MAGIC.to_le_bytes());
+    put_u16(&mut b, 0x3a, super::superblock::EXT2_VALID_FS);
+    f(&mut b);
+    super::superblock::Superblock::parse(&b)
+}
+
+fn smoke_ext4_rw_gate_rules() -> TestResult {
+    use crate::superblock::{compat, incompat, ro_compat, EXT2_ERROR_FS};
+    use crate::volume::sb_state::{rw_refusal, GateProfile as P};
+    let gate = |f: &dyn Fn(&mut [u8]), j: bool, o: bool, p: P| {
+        sb_bytes_with(|b| f(b)).map(|sb| rw_refusal(&sb, j, o, p).is_some())
+    };
+    let none = |_: &mut [u8]| {};
+    // (superblock edit, journal clean, orphans empty, profile, refused, rule)
+    type Case<'a> = (&'a dyn Fn(&mut [u8]), bool, bool, P, bool, &'static str);
+    let cases: [Case<'_>; 12] = [
+        (
+            &none,
+            false,
+            false,
+            P::RootRw,
+            false,
+            "a clean filesystem is writable",
+        ),
+        (
+            &|b| put_u32(b, 100, 0x8000_0000),
+            true,
+            true,
+            P::Default,
+            true,
+            "unknown ro_compat",
+        ),
+        (
+            &|b| put_u32(b, 100, ro_compat::GDT_CSUM),
+            true,
+            true,
+            P::Default,
+            true,
+            "legacy gdt_csum",
+        ),
+        (
+            &|b| put_u32(b, 96, incompat::RECOVER),
+            false,
+            true,
+            P::Default,
+            true,
+            "dirty journal",
+        ),
+        (
+            &|b| put_u32(b, 96, incompat::RECOVER),
+            true,
+            true,
+            P::Default,
+            false,
+            "stale RECOVER",
+        ),
+        (
+            &|b| put_u32(b, 100, ro_compat::ORPHAN_PRESENT),
+            true,
+            false,
+            P::Default,
+            true,
+            "orphans",
+        ),
+        (
+            &|b| put_u32(b, 100, ro_compat::ORPHAN_PRESENT),
+            true,
+            true,
+            P::Default,
+            false,
+            "stale ORPHAN_PRESENT",
+        ),
+        (
+            &|b| put_u32(b, 0xe8, 12),
+            true,
+            true,
+            P::Default,
+            true,
+            "s_last_orphan",
+        ),
+        (
+            &|b| {
+                put_u32(b, 92, compat::DIR_INDEX);
+                b[0xfc] = 3;
+            },
+            true,
+            true,
+            P::Default,
+            true,
+            "an unknown default hash",
+        ),
+        (
+            &|b| put_u16(b, 0x3a, 1 | EXT2_ERROR_FS),
+            true,
+            true,
+            P::Default,
+            false,
+            "errors, Linux rules",
+        ),
+        (
+            &|b| put_u16(b, 0x3a, 1 | EXT2_ERROR_FS),
+            true,
+            true,
+            P::RootRw,
+            true,
+            "errors under root-rw",
+        ),
+        (
+            &|b| put_u16(b, 0x3a, 0),
+            true,
+            true,
+            P::RootRw,
+            true,
+            "unclean under root-rw",
+        ),
+    ];
+    for (f, j, o, p, refused, _why) in cases {
+        if gate(f, j, o, p) != Some(refused) {
+            return TestResult::Fail("the write gate disagrees with its rule");
+        }
+    }
+    // Without root-rw an unclean filesystem mounts as Linux mounts it.
+    if gate(&|b| put_u16(b, 0x3a, 0), true, true, P::Default) != Some(false) {
+        return TestResult::Fail("Linux mounts an unchecked filesystem read-write");
+    }
+    // What the refusal means for a read-write request, as Linux decides it.
+    use crate::volume::sb_state::Refusal;
+    let kind = |ro_bits: u32| {
+        sb_bytes_with(|b| put_u32(b, 100, ro_bits))
+            .and_then(|sb| rw_refusal(&sb, true, true, P::Default))
+    };
+    if kind(ro_compat::READONLY | 0x8000_0000) != Some(Refusal::ReadOnlyFeature) {
+        return TestResult::Fail("READONLY mounts read-only before anything else is checked");
+    }
+    if !matches!(kind(0x8000_0000), Some(Refusal::Unsupported(_))) {
+        return TestResult::Fail("a feature Linux does not know is EINVAL for read-write");
+    }
+    if !matches!(kind(ro_compat::QUOTA), Some(Refusal::Gate(_))) {
+        return TestResult::Fail("quota is a feature Linux writes and NARF does not: EROFS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_rw_gate_rules);
+
+/// The extent fixture as a filesystem Linux unmounted cleanly
+/// (`s_state = EXT2_VALID_FS`).
+fn clean_ext4_extent_image(data: &[u8]) -> Vec<u8> {
+    let mut img = build_ext4_extent_image(data);
+    put_u16(&mut img, 1024 + 0x3a, super::superblock::EXT2_VALID_FS);
+    img
+}
+
+fn sb_on(device: &narf_block::ram::RamBlockDevice) -> super::superblock::Superblock {
+    let img = device.snapshot();
+    super::superblock::Superblock::parse(&img[1024..2048]).expect("superblock")
+}
+
+fn sb_u16(device: &narf_block::ram::RamBlockDevice, at: usize) -> u16 {
+    let img = device.snapshot();
+    u16::from_le_bytes([img[1024 + at], img[1024 + at + 1]])
+}
+
+fn smoke_ext4_rw_mount_marks_dirty_and_remount_ro_clean() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{sb_flags::RDONLY, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::superblock::{EXT2_FLAGS_SIGNED_HASH, EXT2_FLAGS_UNSIGNED_HASH, EXT2_VALID_FS};
+    use crate::volume::Ext2Volume;
+
+    let device = RamBlockDevice::from_image(512, clean_ext4_extent_image(b"lifecycle"));
+    let before = sb_on(&device);
+    let mounts = sb_u16(&device, 0x34);
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    if !before.is_clean() || volume.is_read_only() {
+        return TestResult::Fail("a clean fixture must mount read-write");
+    }
+    // ext4_setup_super without a journal: not clean, one more mount, a
+    // recorded hash signedness, the default maximal mount count.
+    let dirty = sb_on(&device);
+    if dirty.state & EXT2_VALID_FS != 0 || sb_u16(&device, 0x34) != mounts.wrapping_add(1) {
+        return TestResult::Fail("a read-write mount must clear VALID_FS and count the mount");
+    }
+    if dirty.flags & (EXT2_FLAGS_SIGNED_HASH | EXT2_FLAGS_UNSIGNED_HASH) == 0
+        || sb_u16(&device, 0x36) == 0
+    {
+        return TestResult::Fail("the mount must record hash signedness and a max mount count");
+    }
+    if poll_once(volume.root().syncfs())
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("syncfs failed");
+    }
+    if sb_on(&device).state & EXT2_VALID_FS != 0 {
+        return TestResult::Fail("syncfs must not mark the filesystem clean");
+    }
+    // Remount read-only: clean again, and writes are refused.
+    if !matches!(
+        poll_once(volume.reconfigure_sb_async(RDONLY, RDONLY, "")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("remount read-only failed");
+    }
+    if sb_on(&device).state != before.state || !volume.always_read_only() {
+        return TestResult::Fail("remount read-only must restore s_state and stop writing");
+    }
+    if !matches!(
+        poll_once(volume.root().create("after-ro")),
+        Some(Err(narf_filesystem::FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("a read-only remount must refuse writes with EROFS");
+    }
+    // Back to read-write, then the last reference drops: clean again.
+    if !matches!(
+        poll_once(volume.reconfigure_sb_async(0, RDONLY, "")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("remount read-write failed");
+    }
+    if sb_on(&device).state & EXT2_VALID_FS != 0 {
+        return TestResult::Fail("remount read-write must mark the filesystem dirty again");
+    }
+    drop(volume);
+    if sb_on(&device).state != before.state {
+        return TestResult::Fail("the last unmount must mark the filesystem clean");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_rw_mount_marks_dirty_and_remount_ro_clean
+);
+
+fn smoke_ext4_fs_error_records_and_root_rw_stops_writing() -> TestResult {
+    use narf_block::disk_policy::{self, DiskPolicy};
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::superblock::EXT2_ERROR_FS;
+    use crate::volume::sb_state::ErrorSite;
+    use crate::volume::Ext2Volume;
+
+    let run = |policy| {
+        disk_policy::__set_policy_for_test(Some(policy));
+        let device = RamBlockDevice::from_image(512, clean_ext4_extent_image(b"errors"));
+        let volume = poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0))?.ok()?;
+        poll_once(volume.fs_error(ErrorSite {
+            func: "smoke_test",
+            ino: 12,
+            block: 7,
+            errno: narf_lib::errno::EUCLEAN,
+        }))?;
+        let ro = volume.always_read_only();
+        let img = device.snapshot();
+        let count = u32::from_le_bytes(img[1024 + 0x194..1024 + 0x198].try_into().ok()?);
+        let func = img[1024 + 0x1a8..1024 + 0x1a8 + 10].to_vec();
+        let code = img[1024 + 0x27a];
+        drop(volume);
+        Some((ro, count, func, code, sb_on(&device).state))
+    };
+    let root_rw = run(DiskPolicy::RootRw);
+    let default = run(DiskPolicy::All);
+    disk_policy::__set_policy_for_test(None);
+    let (Some(root_rw), Some(default)) = (root_rw, default) else {
+        return TestResult::Fail("mount or fs_error failed");
+    };
+    if root_rw.1 != 1 || root_rw.2 != b"smoke_test" || root_rw.3 != 5 {
+        return TestResult::Fail(
+            "the error count, function and EXT4_ERR_EFSCORRUPTED must be recorded",
+        );
+    }
+    if !root_rw.0 || default.0 {
+        return TestResult::Fail("root-rw stops writing after an error; errors=continue does not");
+    }
+    if root_rw.4 & EXT2_ERROR_FS == 0 || default.4 & EXT2_ERROR_FS == 0 {
+        return TestResult::Fail("EXT4_ERROR_FS must survive the unmount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_fs_error_records_and_root_rw_stops_writing
+);
+
+fn smoke_ext4_refused_rw_mount_writes_nothing() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    // An orphan list NARF does not walk: read-only, and not one byte of
+    // the image changes, the gate's own repair included.
+    let mut img = clean_ext4_extent_image(b"refused");
+    put_u32(&mut img, 1024 + 0xe8, 12);
+    let device = RamBlockDevice::from_image(512, img);
+    let before = device.snapshot();
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let ro = volume.is_read_only();
+    let refusal = volume.refusal();
+    drop(volume);
+    if !ro || refusal.is_none() {
+        return TestResult::Fail("a non-empty orphan list must refuse read-write, with a reason");
+    }
+    if device.snapshot() != before {
+        return TestResult::Fail("a refused read-write mount must write nothing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_refused_rw_mount_writes_nothing
+);

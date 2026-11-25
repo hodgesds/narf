@@ -1424,6 +1424,7 @@ dependencies = [
  "narf-arch",
  "narf-block",
  "narf-capabilities",
+ "narf-console",
  "narf-driver-runtime",
  "narf-drivers",
  "narf-filesystem",

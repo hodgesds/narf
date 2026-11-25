@@ -87,6 +87,24 @@ pub mod ro_compat {
     /// supersedes it with CRC32C and is checked separately below.
     pub const WRITE_SUPPORTED: u32 =
         SPARSE_SUPER | LARGE_FILE | HUGE_FILE | GDT_CSUM | DIR_NLINK | EXTRA_ISIZE | METADATA_CSUM;
+
+    /// `EXT4_FEATURE_RO_COMPAT_SUPP`: the features Linux knows. A bit
+    /// outside it makes Linux refuse a read-write mount (EINVAL); a bit
+    /// inside it but outside [`WRITE_SUPPORTED`] is one Linux writes and
+    /// NARF does not.
+    pub const LINUX_SUPPORTED: u32 = SPARSE_SUPER
+        | LARGE_FILE
+        | GDT_CSUM
+        | DIR_NLINK
+        | EXTRA_ISIZE
+        | BTREE_DIR
+        | HUGE_FILE
+        | BIGALLOC
+        | METADATA_CSUM
+        | QUOTA
+        | PROJECT
+        | VERITY
+        | ORPHAN_PRESENT;
 }
 
 /// What flavour of the ext family a superblock represents. Driver
@@ -191,7 +209,21 @@ pub struct Superblock {
     /// `s_flags` (offset 352): `EXT2_FLAGS_{SIGNED,UNSIGNED}_HASH` and
     /// `EXT2_FLAGS_TEST_FILESYS`.
     pub flags: u32,
+    /// `s_errors` (offset 0x3c): what to do when an error is detected
+    /// ([`EXT4_ERRORS_CONTINUE`] and friends).
+    pub errors: u16,
+    /// `s_last_orphan` (offset 0xe8): head of the pre-orphan-file list of
+    /// inodes still to be released. Nonzero after a crash on a volume
+    /// without `orphan_file`.
+    pub last_orphan: u32,
 }
+
+/// `s_errors`: keep going after an error.
+pub const EXT4_ERRORS_CONTINUE: u16 = 1;
+/// `s_errors`: remount read-only after an error.
+pub const EXT4_ERRORS_RO: u16 = 2;
+/// `s_errors`: panic after an error.
+pub const EXT4_ERRORS_PANIC: u16 = 3;
 
 /// `s_flags` bit: directory names hash as signed chars.
 pub const EXT2_FLAGS_SIGNED_HASH: u32 = 0x0001;
@@ -304,6 +336,16 @@ impl Superblock {
             0
         };
         let def_hash_version = if buf.len() > 252 { buf[252] } else { 0 };
+        let errors = if buf.len() >= 0x3e {
+            u16::from_le_bytes([buf[0x3c], buf[0x3d]])
+        } else {
+            0
+        };
+        let last_orphan = if buf.len() >= 0xec {
+            u32::from_le_bytes([buf[0xe8], buf[0xe9], buf[0xea], buf[0xeb]])
+        } else {
+            0
+        };
         let flags = if buf.len() >= 356 {
             u32::from_le_bytes([buf[352], buf[353], buf[354], buf[355]])
         } else {
@@ -334,6 +376,8 @@ impl Superblock {
             orphan_file_inum,
             def_hash_version,
             flags,
+            errors,
+            last_orphan,
         })
     }
 

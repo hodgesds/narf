@@ -39,6 +39,7 @@ use super::superblock::{ExtFlavour, Superblock};
 
 mod extent_write;
 mod file_data;
+pub mod sb_state;
 pub(crate) mod xattr;
 
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
@@ -346,11 +347,24 @@ pub struct Ext2Volume<B: BlockDevice + 'static> {
     /// Mount-root metadata must be available to the synchronous `root()`
     /// interface. It is loaded during mount and refreshed by `write_inode`.
     root_inode: IrqSafeSpinLock<Option<Inode>>,
-    /// Set when a feature or dynamic recovery flag lacks a safe write path.
-    /// Clean metadata_csum/csum_seed volumes are writable: inode, directory,
-    /// bitmap, group-descriptor, and primary-superblock writers regenerate
-    /// their dependent checksums before returning.
-    read_only: bool,
+    /// Set when this mount writes nothing: requested read-only, refused by
+    /// the write gate ([`sb_state::rw_refusal`]), a dirty journal replayed
+    /// into memory only, an error under a read-only error policy, or a
+    /// remount read-only. Cleared only by a remount read-write that passes
+    /// the gate again.
+    read_only: core::sync::atomic::AtomicBool,
+    /// The gate rules this mount was made under.
+    profile: sb_state::GateProfile,
+    /// Why the gate refused a read-write mount, if it did.
+    refusal: Option<sb_state::Refusal>,
+    /// `s_state` as the mount found it (Linux `s_mount_state`), restored
+    /// when the filesystem is marked clean again.
+    mount_state: u16,
+    /// An error was recorded during this mount (`EXT4_ERROR_FS` then
+    /// survives the clean unmount).
+    errors_seen: core::sync::atomic::AtomicBool,
+    /// The superblock says "not clean" because this mount wrote it so.
+    dirty_marked: core::sync::atomic::AtomicBool,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
 }
@@ -460,63 +474,6 @@ async fn device_read_into<B: BlockDevice>(
     Ok(())
 }
 
-/// Mount-time byte writer using the already-registered scratch pool. This is
-/// intentionally limited to pre-construction recovery updates, when no other
-/// volume operation can contend for `io.pool[0]`.
-async fn write_byte_range_static<B: BlockDevice>(
-    device: &B,
-    io: &VolumeIo,
-    byte_off: u64,
-    src: &[u8],
-) -> Result<(), FsError> {
-    let lbs = io.lbs;
-    let scratch = io
-        .pool
-        .first()
-        .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
-    let mut cursor = 0usize;
-    while cursor < src.len() {
-        let absolute = byte_off + cursor as u64;
-        let lba = absolute / lbs as u64;
-        let in_lba = (absolute % lbs as u64) as usize;
-        let take = (src.len() - cursor).min(lbs - in_lba);
-        let mut sector = vec![0u8; lbs];
-        if in_lba != 0 || take != lbs {
-            device_read_into(
-                device,
-                lbs,
-                io.scratch_bytes,
-                scratch,
-                lba * lbs as u64,
-                &mut sector,
-            )
-            .await?;
-        }
-        sector[in_lba..in_lba + take].copy_from_slice(&src[cursor..cursor + take]);
-        {
-            let dma = resolve_cap(scratch)
-                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-            // SAFETY: mount owns this scratch entry exclusively and the DMA
-            // allocation is at least one logical sector.
-            let dst = unsafe { core::slice::from_raw_parts_mut(dma.as_mut_ptr(), lbs) };
-            dst.copy_from_slice(&sector);
-        }
-        let request = BlockRequest {
-            op: BlockOp::Write { fua: true },
-            lba,
-            blocks: 1,
-            buffer: scratch
-                .derive::<Read>()
-                .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
-            qos: QosHint::Latency,
-            user_tag: 0,
-        };
-        device.submit(request).await.result.map_err(FsError::Io)?;
-        cursor += take;
-    }
-    Ok(())
-}
-
 /// Free-function variant of `Ext2Volume::read_byte_range_into`
 /// usable from other free helpers.
 async fn read_byte_range_into_static<B: BlockDevice>(
@@ -594,7 +551,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut sb_bytes = vec![0u8; 1024];
         Self::read_byte_range_into(&*device, &io, 1024, &mut sb_bytes).await?;
 
-        let mut superblock = match Superblock::parse(&sb_bytes) {
+        let superblock = match Superblock::parse(&sb_bytes) {
             Some(s) => s,
             None => {
                 // `io` drops here, unregistering every pooled buffer.
@@ -653,6 +610,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // never write to disk; later `read_block` calls consult the
         // override before doing device I/O.
         let mut journal_overrides: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        // Whether the JBD2 log has nothing to replay, and the orphan file
+        // nothing to release: then a stale RECOVER / ORPHAN_PRESENT bit is
+        // repaired by the read-write mount's superblock update below.
+        let mut journal_clean = false;
+        let mut orphans_empty = false;
         if superblock.flavour() != ExtFlavour::Ext2
             && superblock.has_journal()
             && (!superblock.is_clean()
@@ -662,39 +624,30 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // mount (we just fall back to the on-disk state — same
             // as ext2 was before journal support). The override
             // map only narrows reads, never invents data.
-            if let Ok((map, journal_clean)) =
+            if let Ok((map, clean)) =
                 Self::replay_journal_at_mount(&*device, &io, &superblock, &group_descs).await
             {
                 journal_overrides = map;
-                // A clean JBD2 superblock means there is nothing to replay;
-                // a stale main-superblock RECOVER bit can be cleared safely.
-                // Persist that repair now so this and subsequent mounts can
-                // enable checksum-aware direct writes. Dirty journals remain
-                // override-only/read-only until verified persistent replay is
-                // implemented for every JBD2 feature combination.
-                let orphan_clean = if journal_clean
-                    && superblock.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT
-                        != 0
-                {
-                    Self::orphan_file_is_empty_at_mount(&*device, &io, &superblock, &group_descs)
-                        .await
-                        .unwrap_or(false)
-                } else {
-                    true
-                };
-                if journal_clean && orphan_clean && !read_only_requested {
-                    superblock.feature_incompat &= !super::superblock::incompat::RECOVER;
-                    superblock.feature_ro_compat &= !super::superblock::ro_compat::ORPHAN_PRESENT;
-                    sb_bytes[96..100].copy_from_slice(&superblock.feature_incompat.to_le_bytes());
-                    sb_bytes[100..104].copy_from_slice(&superblock.feature_ro_compat.to_le_bytes());
-                    metadata_csum::write_superblock_checksum(&superblock, &mut sb_bytes)
-                        .ok_or(FsError::InvalidData)?;
-                    write_byte_range_static(&*device, &io, 1024, &sb_bytes).await?;
-                }
+                journal_clean = clean;
             }
         }
-
-        let read_only = read_only_requested || !superblock.write_features_supported();
+        if superblock.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT != 0 {
+            orphans_empty =
+                Self::orphan_file_is_empty_at_mount(&*device, &io, &superblock, &group_descs)
+                    .await
+                    .unwrap_or(false);
+        }
+        // The write gate. Nothing has been written yet, whatever it says.
+        let profile = sb_state::GateProfile::current();
+        let refusal = if read_only_requested {
+            None
+        } else {
+            sb_state::rw_refusal(&superblock, journal_clean, orphans_empty, profile)
+        };
+        if let Some(refusal) = refusal {
+            sb_state::report_refusal(&superblock, refusal);
+        }
+        let read_only = read_only_requested || refusal.is_some() || !journal_overrides.is_empty();
 
         let page_cache = Arc::new(PageCache::new());
         let volume = Arc::new_cyclic(|self_weak| Ext2Volume {
@@ -716,11 +669,33 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
-            read_only,
+            read_only: core::sync::atomic::AtomicBool::new(read_only),
+            profile,
+            refusal,
+            mount_state: superblock.state,
+            errors_seen: core::sync::atomic::AtomicBool::new(false),
+            dirty_marked: core::sync::atomic::AtomicBool::new(false),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
         });
         let root_inode = volume.read_inode(super::EXT2_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root_inode);
+        // `ext4_setup_super`: mark the filesystem dirty (and repair a stale
+        // RECOVER / ORPHAN_PRESENT the gate found clean) before anything
+        // else is written. If that cannot be written, `ext4_fill_super`
+        // falls back to read-only, and so does this.
+        if !volume.is_read_only() {
+            if let Err(error) = volume.setup_super().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ext4 {}: superblock update failed ({error:?}); mounting READ-ONLY",
+                    sb_state::uuid_string(&volume.superblock)
+                );
+                volume
+                    .read_only
+                    .store(true, core::sync::atomic::Ordering::Release);
+            }
+        }
         // Register the page cache with the central memory reclaimer so its
         // clean pages can be shed under pressure (shrinker). Done after the
         // owning Arc exists so a Weak can be held without keeping it alive.
@@ -1132,10 +1107,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// byte-granularity write — for sub-LBA spans we read-modify-
     /// write the enclosing sector.
     pub async fn write_byte_range(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
-        if self.read_only {
+        if self.is_read_only() {
             return Err(FsError::ReadOnly);
         }
-        let result = self.write_byte_range_device(byte_off, src).await;
+        let result = self.write_byte_range_device(byte_off, src, false).await;
         // Direct block writes bypass the page cache, so once the device has
         // changed — even partially, on an error — drop the cached device
         // pages they overwrote, and void any fill of exactly those pages that
@@ -1148,7 +1123,30 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         result
     }
 
-    async fn write_byte_range_device(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
+    /// [`Self::write_byte_range`] with Force Unit Access on every sector:
+    /// for the superblock state changes that must be on media before any
+    /// write that depends on them ([`sb_state`]).
+    pub(crate) async fn write_byte_range_fua(
+        &self,
+        byte_off: u64,
+        src: &[u8],
+    ) -> Result<(), FsError> {
+        if self.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let result = self.write_byte_range_device(byte_off, src, true).await;
+        let first_page = byte_off / PAGE_SIZE as u64;
+        let end_page = (byte_off + src.len() as u64).div_ceil(PAGE_SIZE as u64);
+        self.bdev_mapping.invalidate(first_page, end_page);
+        result
+    }
+
+    async fn write_byte_range_device(
+        &self,
+        byte_off: u64,
+        src: &[u8],
+        fua: bool,
+    ) -> Result<(), FsError> {
         let lbs = self.io.lock().lbs;
         let mut cursor = 0usize;
         while cursor < src.len() {
@@ -1186,7 +1184,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     dst.copy_from_slice(&sector);
                 }
                 let req = BlockRequest {
-                    op: BlockOp::Write { fua: false },
+                    op: BlockOp::Write { fua },
                     lba,
                     blocks: 1,
                     buffer: guard
@@ -1408,7 +1406,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Directory metadata is write-through. Complete deferred inode teardown
     /// before flushing the device, and preserve a failed flush as an error.
     pub(crate) async fn sync_metadata(&self) -> Result<(), FsError> {
-        if self.read_only {
+        if self.is_read_only() {
             return Ok(());
         }
         let _update = self.inode_update_lock.lock().await;
@@ -1420,7 +1418,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// just the inode used to obtain the syncfs descriptor. Never keep the
     /// icache spinlock across I/O or nest the inode-update mutex.
     pub(crate) async fn sync_filesystem(&self) -> Result<(), FsError> {
-        if self.read_only {
+        if self.is_read_only() {
             return Ok(());
         }
         let nodes: Vec<_> = self
@@ -2733,5 +2731,70 @@ impl<B: BlockDevice + 'static> FsInstance for Ext2Volume<B> {
     /// [`super::mount_opts::validate_remount`].
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
         super::mount_opts::validate_remount(options)
+    }
+
+    /// Writes are refused at the mount (`mnt_want_write` → EROFS) while
+    /// this mount writes nothing.
+    fn always_read_only(&self) -> bool {
+        self.is_read_only()
+    }
+
+    /// `__ext4_remount`: `SB_RDONLY` turning on writes everything back and
+    /// marks the filesystem clean; turning off runs the write gate again.
+    fn reconfigure_sb_async<'a>(
+        &'a self,
+        sb_flags: u64,
+        sb_mask: u64,
+        options: &'a str,
+    ) -> narf_filesystem::FsFuture<'a, ()> {
+        alloc::boxed::Box::pin(async move {
+            use narf_filesystem::sb_flags::RDONLY;
+            super::mount_opts::validate_remount(options)?;
+            let mut want_ro = (sb_mask & RDONLY != 0).then_some(sb_flags & RDONLY != 0);
+            for option in options.split(',') {
+                match option {
+                    "ro" => want_ro = Some(true),
+                    "rw" => want_ro = Some(false),
+                    _ => {}
+                }
+            }
+            match want_ro {
+                Some(true) => self.remount_read_only().await,
+                Some(false) => self.remount_read_write().await,
+                None => Ok(()),
+            }
+        })
+    }
+}
+
+impl<B: BlockDevice + 'static> Drop for Ext2Volume<B> {
+    /// The last reference went away (umount, which never syncs, or a
+    /// dropped internal mount): `ext4_put_super` marks the filesystem clean
+    /// after everything is on the device. Drop cannot block, so the flush
+    /// and superblock write are polled once in place, which completes on
+    /// NARF's synchronous block devices. If they cannot finish, the
+    /// superblock keeps saying "not clean", and e2fsck checks it, which is
+    /// safe.
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering;
+        if self.read_only.load(Ordering::Acquire) || !self.dirty_marked.load(Ordering::Acquire) {
+            return;
+        }
+        use core::future::Future as _;
+        let this: &Self = self;
+        let mut finish = core::pin::pin!(async move {
+            let _ = this.device.flush_result().await;
+            this.mark_clean().await
+        });
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        if finish.as_mut().poll(&mut cx).is_pending() {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "ext4 {}: last unmount could not mark the filesystem clean; e2fsck will check it",
+                sb_state::uuid_string(&self.superblock)
+            );
+        }
     }
 }

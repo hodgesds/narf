@@ -145,6 +145,34 @@ A device without `BlockFeature::Discard` fails the ioctl with
   refuses: an on-disk version other than 0-2, `unused_flags` bit 0, and
   more than one dx-node level (two need `largedir`, which is refused at
   mount).
+- **A crash is never hidden** (Linux `ext4_setup_super` without a journal).
+  NARF writes metadata in place, never through the journal. So a
+  read-write mount first clears `EXT4_VALID_FS`, bumps `s_mnt_count`, sets
+  `s_mtime`, records the hash signedness, and repairs a stale
+  `RECOVER`/`ORPHAN_PRESENT` the gate found clean. That one superblock write
+  goes out with FUA and a flush before any other write. Remount read-only
+  and the last unmount (`Drop`, polled once in place) restore the mount-time
+  `s_state` after a full write-back, adding `EXT4_ERROR_FS` if an error was
+  recorded. `syncfs` never marks the filesystem clean. After a crash,
+  `e2fsck -p` sees an unclean filesystem and checks it fully.
+- **The write gate** refuses a read-write mount, and writes nothing, for:
+  - an unknown or unwritable read-only-compatible feature;
+  - legacy `gdt_csum`;
+  - a journal that needs recovery;
+  - a non-empty orphan file or `s_last_orphan` list;
+  - a default directory hash other than 0-2.
+
+  Under `narf.disks=root-rw` it also refuses a filesystem with
+  `EXT4_ERROR_FS` or without `EXT4_VALID_FS`. LINUX-GAP: Linux mounts those
+  with a warning; NARF writes a production root only after e2fsck has seen
+  it.
+- **Errors are recorded** (`fs_error`, Linux `__ext4_error`). This sets:
+  - `EXT4_ERROR_FS` and `s_error_count`;
+  - the first and last error's time, inode, block and function;
+  - the `EXT4_ERR_*` code.
+
+  Under `root-rw`, or with `s_errors=remount-ro`, the mount stops writing.
+  `s_errors=panic` panics.
 - **Allocation metadata is serialized and quarantined by group.** Bitmap,
   group-descriptor, and superblock-counter updates cannot interleave. A block
   group whose bitmap checksum fails is skipped without mutation, allowing a
