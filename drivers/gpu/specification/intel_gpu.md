@@ -1502,7 +1502,9 @@ activity (the runtime-PM lane consumes this interface).
 ### 12.1 Display 14 DMC and DC states (`intel_gpu_dc_states`)
 
 Meteor Lake and Arrow Lake (display 14.00) have a production DC-state
-service; the Gen12 rules, tests and the inert §13 seam above are unchanged.
+service; the Gen12 rules, tests and the §13 seam above are unchanged. The
+display-20, -30 and -35 owners create the same service with their own DMC
+identity (§17, §5).
 Sources are the pinned Linux tree b90c984d615e8ce2af96f5b1411a962d83fed2ad:
 `intel_dmc.c`, `intel_dmc_regs.h`, `intel_display_power.c`,
 `intel_display_power_well.c`, `intel_display_power_map.c`, `intel_display.c`,
@@ -1567,7 +1569,7 @@ the following:
 from `DG1_DMC_DEBUG_DC5_COUNT` (0x134154) deltas and a counter for requests the
 DMC ignored.
 
-Production wiring, Meteor/Arrow Lake only. KMS install creates the service and
+Production wiring on Meteor/Arrow Lake: KMS install creates the service and
 holds Init, so DC states are exited. After each GT publication the card worker
 acquires the container through the trusted firmware-registry authority as a
 bounded (1 MiB), parse-validated copy. It then loads and verifies the program
@@ -2334,8 +2336,8 @@ Invariants:
   only, and disconnect always clears the publication before
   the pipeline comes down.
 
-Deliberate remainders: DP MST and multi-pipe (#1017),
-Xe-LPG display (#1016), Type-C HPD via the GEN11 DE HPD block
+Deliberate remainders (MST and multi-pipe are §16, Xe-LPG §17):
+Type-C HPD via the GEN11 DE HPD block
 (the Alt-Mode bridge's DDIs), DSC/FEC, and the HPD IRQ
 handler itself (interrupt enables are programmed; the
 session is poll-driven until an IRQ consumer lands).
@@ -2503,10 +2505,10 @@ pins, and disconnect teardown order.
 
 DVI sinks, deep colour (10/12 bpc) and YCbCr 4:2:0 on display 11/12
 (Y420VDB/Y420CMDB, `intel_hdmi_compute_output_format`, the 1:1 pipe
-scaler, the BT.709 output CSC) are implemented with native fixtures.
-Deliberate remainders: 4:2:0 on display 14 (`intel_gpu_xelpg_hdmi`),
-HDCP (§20, behind `narf.intel.hdcp=1`), native HDMI 2.1 FRL (i915 has none; its FRL
-is the DP PCON's), Type-C HDMI alt mode.
+scaler, the BT.709 output CSC) are implemented with native fixtures;
+display 14 and 20 take 4:2:0 in `intel_gpu_xelpg_hdmi`, and HDMI 2.1
+FRL runs through a DP PCON (i915 has no native FRL). HDCP is §20,
+behind `narf.intel.hdcp=1`. Deliberate remainder: Type-C HDMI alt mode.
 
 ## 16. Multi-pipe display + DP MST (lane Q11 — `intel_gpu_multipipe`, `intel_gpu_mst`, #1017)
 
@@ -2761,14 +2763,15 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
 
 ### 10.4 Gates and named remainders
 
-- `display_supported()`: Gen12 + Meteor Lake. **Lunar Lake and Panther Lake
-  stay off at this generation-level gate** — their display IPs require
-  independently qualified clock-select fields, PLL tables and DDI
-  arrangements; the MTL sequence must not claim them by generation. Lunar
-  Lake's display 20 is reached only through its per-device route (10.5).
-- `backlight_supported()`: Gen12 only. MTL's PWM path belongs
-  to the backlight composition lane (PR #1037); the modeset
-  shipping first must not claim a backlight it cannot drive.
+- `display_supported()`: Gen12, Gen11, Gen9, Gen9 LP and Meteor Lake.
+  **Lunar, Panther and Wildcat Lake and Nova Lake-S stay off at this
+  generation-level gate** — their display IPs require independently
+  qualified clock-select fields, PLL tables and DDI arrangements; the MTL
+  sequence must not claim them by generation. Each is reached only through
+  its per-device route (10.5, §5).
+- `backlight_supported()`: the Gen12, Gen11, Gen9 and Gen9 LP PWM
+  blocks. MTL's panel backlight is the full-AUX DPCD owner
+  (`intel_dpcd_bl::install_mtl`, §20 "Full-AUX panel backlight").
 - Region enumeration: `RegionGeneration::XeLpg` — display at
   0x40000/0x40000 plus the TC block at 0x16F000/0x1000, and
   **no DPLL region** (Xe-LPG has no DPLL block; Gen12's DPLL
@@ -2783,18 +2786,20 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
   Type-C, their HDMI DDC pins and the SSC preference come from the
   board VBT (`intel_gpu_vbt`, §20 "VBT parser") when the OpRegion
   carries one.
-- Lunar Lake reuses that service only for source-qualified TC1–TC4 USB-C
-  DP. It uses PICA power, display-20 TCSS pin assignment, D2D in
-  `DDI_BUF_CTL`, and display-20 live resource transactions. Combo DDI B,
-  HDMI and UHBR remain refused.
+- Lunar Lake reuses that service for source-qualified TC1–TC4 USB-C
+  DP, combo C10 DDI B DP and HDMI on DDI B and declared legacy Type-C
+  ports. It uses PICA power, display-20 TCSS pin assignment, D2D in
+  `DDI_BUF_CTL`, and display-20 live resource transactions. UHBR remains
+  refused.
 - An opted-in, GMD-qualified Panther Lake display-30 owner reuses the same
-  TC1–TC4 route and the display-30 PICA/Cx0 view. Its live transaction uses
+  TC1–TC4 route, combo C20 DDI B DP, HDMI and the display-30 PICA/Cx0
+  view. Its live transaction uses
   Xe3 PM demand and guardband-aware watermarks; every external transcoder
   programs and runs the mandatory fixed-refresh VRR timing generator between
   the DDI-function and transcoder enables. The exact WCL 30.02 model uses the
   same Pipe-A/display-30 core and a distinct TC1/TC2, Pipes B/C C20 profile.
-  Its production entry requires `narf.intel.wcl_display=1`; combo DDI B,
-  HDMI and a headless/unqualified function remain refused.
+  Its production entry requires `narf.intel.wcl_display=1`; on WCL combo
+  DDI B, HDMI and a headless/unqualified function remain refused.
 - Pipe A's DMC is reported dark after this lane's crtc disable and lit
   before its port PLL (`intel_dmc_disable_pipe` / `intel_dmc_enable_pipe`
   call sites); a successful owned modeset records its panel mode
@@ -2805,22 +2810,20 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
   retain firmware's allocation, and an inherited layout cannot be
   adopted by the external route), the owned panel's PM demand at its
   trained eDP rate (it keeps the HBR3 reservation the KMS fixed profile
-  checks), computed (non-table) HDMI
-  PLL states and HDMI 2.1 FRL (TMDS above 340 MHz with
-  scrambling/SCDC is owned by `intel_gpu_xelpg_hdmi`, §20), DP 2.0
-  UHBR rates (the DP stack tops out at HBR3), MST, a second external
-  route at once, linetime/pipe-chicken/frame-start-delay programming
-  of Pipes B–D, TBT-alt tunnels, pin-assignment-D lane ownership,
+  checks), native HDMI 2.1 FRL (TMDS above 340 MHz with
+  scrambling/SCDC and the computed SNPS C10 / C20 HDMI PLL states are
+  owned by `intel_gpu_xelpg_hdmi`, §20), DP 2.0
+  UHBR rates (the DP stack tops out at HBR3), a second external
+  route at once (one `MtlExternalService` route; MST streams aside),
+  linetime/pipe-chicken/frame-start-delay programming
+  of Pipes B–D, and
   CDCLK notifications on the display-14 inherited path (display 14
   has no PCODE CDCLK mailbox; only the owned transaction sends
   PM demand — the Gen12 inherited path does send them, via
-  `intel_gpu_gen12_cdclk`), and
-  per-iteration TX-level updates inside the DPCD training loop
-  (display 14 still stages levels before training and
-  re-applies after; the Gen12 combo path closed this with the
-  `TrainingAux` callback in `intel_gpu_gen12_combo_phy`, which
-  also deleted the preloaded DDI_BUF_TRANS table it used to
-  share the simplification with).
+  `intel_gpu_gen12_cdclk`). Display-14 MST, TBT-alt tunnels and
+  pin-assignment D are §20 "USB-C display transports"; panel training
+  follows each sink level request through `TrainingAux`, as the Gen12
+  combo path does.
 - DSC is owned by `intel_gpu_xelpg_dsc` (§20, "Display-14 DSC"): the
   Pipe A eDP panel compresses when Linux would, and external DP routes
   compress with FEC. The same module picks the pipe bpp (§20, "Display-14
@@ -2828,24 +2831,9 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
   the VBT limit them to it or only 18 bpp fits, and an eDP panel that
   publishes `DP_SUPPORTED_LINK_RATES` trains with `DP_LINK_RATE_SET`.
   Bigjoiner, the uncompressed joiner, more than four slices and UHBR
-  stay refused. The pipe scaler for panel fitting is modeled
-  (`intel_gpu_xelpg_scaler`) but not wired into a modeset.
-- §5's device table is unchanged by this lane: the MTL DIDs
-  were already in the census; only their display gate moved.
-- Gen11 Lane 4 remainders (clocking/watermark prerequisites
-  for modeset, Lane 5): MG PLL divisor search + TC-port
-  programming and the TBT PLL fixed rows were delivered by
-  Lane 8 (§12.3); the VBT AFC-startup `div0` (VBT fields not
-  parsed); the SKL WRPLL search + CFGCR1/2 (delivered by Gen9 Lane 4:
-  `intel_gpu_gen9_dpll.rs`, with the DP `DPLL_CTRL1` state shared
-  from this module's SKL section); ICL PHY
-  register programming of the selected DDI entries (Lane 5
-  wiring); `display_supported()` stays unflipped for Gen11
-  (Lane 5 flips it); the SAGV *control* pcode command and
-  per-level SAGV admission were delivered by the Gen11 power
-  lane (Lane 6: `intel_gpu_gen11_sagv`,
-  `apply_sagv_admission`); the cursor DDB allocation special
-  case belongs to the cursor lane.
+  stay refused. The pipe scaler for panel fitting
+  (`intel_gpu_xelpg_scaler`) is plumbed through
+  `XeLpgModeset::with_panel_fit`; no production caller requests a fit.
 
 ### 10.5 Xe2_LPD — Lunar Lake display 20 (`intel_gpu_xe2lpd`)
 
@@ -2861,15 +2849,16 @@ programmed-bandwidth limit; NVL-S selects
 `xe3p_lpd_dmc.bin`/787.2 MHz and the four-pipe/FBC `xe2_lpd_display` topology.
 The headless post-FLR proof uses those masks, so WCL does not sample a
 nonexistent Pipe D while NVL-S still refuses live Pipe-D state.
-`DisplayIp::{Xelpdp,Xe2Lpd,Xe3Lpd,WildcatLake}` grants programming authority
-only through its qualified route: 14.00 and 20.00 normally, plus 30.00/30.02
-through the display-30 decoder. `display_route` binds 30.00 to exact Panther
-Lake with `narf.intel.ptl_display=1`, and 30.02 to exact Wildcat Lake with
-`narf.intel.wcl_display=1`; crossed identities refuse before any write. The
+`DisplayIp::{Xelpdp,Xe2Lpd,Xe3Lpd,WildcatLake,NovaLakeS}` grants programming
+authority only through its qualified route: 14.00 and 20.00 normally, plus
+30.00/30.02/35.00 through the display-30 decoder. `display_route` binds 30.00
+to exact Panther Lake with `narf.intel.ptl_display=1`, and 30.02 to exact
+Wildcat Lake with `narf.intel.wcl_display=1`; 35.00 takes Nova Lake-S's own
+route (§5). Crossed identities refuse before any write. The
 production probe selects each exact identity only under its own option, and
 the WCL hotplug actor retains 30.02 rather than rebuilding broad Panther Lake.
-An absent display (GMD zero), 14.01 (BMG) and 35.00 (NVL-S) remain
-typed refusals. Display 20/30 runs the display-14 code with version dispatch,
+An absent display (GMD zero) and 14.01 (BMG, driven as
+`DiscreteDisplayIp::Xe2Hpd`) remain typed refusals here. Display 20/30 runs the display-14 code with version dispatch,
 not a copy of it.
 
 Admission and the headless profile. Lunar Lake's existing profile is the
@@ -2911,10 +2900,10 @@ fused in and lit, and no inherited display DMA outside the route's primary
 off, no pipe-DMC flip queue armed, no pipe B–D DMC enabled). Stolen memory
 is not wiped and the GT arena never maps DSM, so the boot framebuffer stays
 valid; neither the headless boot-scanout exclusion nor its client gate
-applies. A BIOS-set `DRIVERINT_FLR_DIS` does not refuse this profile. The profile
-is D0-only: system suspend is refused (`system_suspend_admitted`) because
-display-20 relight after S3 is not owned, and the panel's mode keeps runtime
-autosuspend off.
+applies. A BIOS-set `DRIVERINT_FLR_DIS` does not refuse this profile.
+System suspend is admitted (`display_suspend_admitted`): resume relights the
+panel through the display-20 modeset (`relight_display_locked`). The panel's
+mode keeps runtime autosuspend off.
 
 KMS owner. Probe then moves the console onto an owned surface in the Pipe-A
 console window (the MTL probe pattern, `lnl_console_handoff`). Its GGTT
@@ -2975,8 +2964,8 @@ entries stay zero. Only a source stride no wider than `dst` is owned, so
 table equals Linux's for any framebuffer width up to the pitch. The table
 is a WC system object (xe's `__xe_pin_fb_vma_dpt` system fallback) mapped
 at PAT3 at a 2 MiB-aligned GGTT address (`tgl_plane_min_alignment`, 512 x
-4 KiB), and `PLANE_SURF` names it; panning a tiled display-20 primary is
-refused. Tile4 and X are advertised on display 20 through the display-14
+4 KiB), and `PLANE_SURF` names it; a panned tiled primary starts the table
+at the view's tile origin (`DptLayout::with_origin`). Tile4 and X are advertised on display 20 through the display-14
 qualification without the chicken read (`tiled_profile` returns the proved
 IP, `Primary::capture_ip`), and their watermarks are the display-14 tiled
 images (skl_watermark.c has no DPT term). Compressed modifiers
@@ -3001,17 +2990,15 @@ enables Pipe A's DMC and enters DC6 17 ms after the last DC_off release, with
 Wa_15015404425 on its register view. `get_allowed_dc_mask` caps display 20
 at `max_dc` 2, so DC6 is the target and DC3CO is never allowed.
 
-PSR1 stays refused on display 20: the KMS owner offers PSR only on display
-14. The display >= 20 branches of intel_psr.c that are not implemented are
-`hsw_activate_psr1` (no `EDP_PSR_MAX_SLEEP_TIME`,
+PSR1 runs on display 20 and 30 with the display >= 20 branches of
+intel_psr.c: `hsw_activate_psr1` (no `EDP_PSR_MAX_SLEEP_TIME`,
 `LNL_EDP_PSR_ENTRY_SETUP_FRAMES`), `intel_psr_entry_setup_frames` (a setup
 time longer than vblank takes one entry setup frame instead of refusing,
 and Wa_18037818876 then refuses PSR1 without selective update),
-`_intel_psr_min_set_context_latency` (SRD_STATUS needs
-`TRANS_SET_CONTEXT_LATENCY` > 0, which the display-20 modeset does not
-program) and Wa_16025596647 (with DC5/DC6 blocked by non-PSR pipes the DMC
-starts package-C exit at the undelayed vblank, plus
-`intel_psr_set_non_psr_pipes`).
+`_intel_psr_min_set_context_latency` (the modeset programs
+`TRANS_SET_CONTEXT_LATENCY` >= 1 for SRD_STATUS) and Wa_16025596647 (with
+DC5/DC6 blocked by non-PSR pipes the DMC starts package-C exit at the
+undelayed vblank, plus `intel_psr_set_non_psr_pipes`).
 
 Display-20 deltas, each with its pinned source branch:
 
@@ -3033,11 +3020,11 @@ Display-20 deltas, each with its pinned source branch:
 The shipped `xe2lpd_dmc.bin` (v2.29) loads main and pipes A–C inside the
 display-14 program windows, so the display-14 window checks apply unchanged.
 
-Refused or not wired on display 20: PSR1 (above), PSR2 and panel replay,
-FBC, compressed primaries, panning of a tiled primary, XR30, system suspend
-and relight, combo DDI B, HDMI and backlight PWM. TC1–TC4 USB-C DP,
-PICA/TCSS ownership, external multi-pipe layouts and the VBT port policy are
-wired. The route's probe-time
+Refused or not wired on display 20: PSR2 and panel replay, compressed
+primaries, XR30 and backlight PWM. PSR1, FBC on the HDR planes
+(Wa_18038517565), tiled panning, system suspend and relight, TC1–TC4 USB-C
+DP, combo DDI B DP, HDMI, PICA/TCSS ownership, external multi-pipe layouts
+and the VBT port policy are wired. The route's probe-time
 modeset window (`probe_window`: panel power sequencing, the takeover and the
 PPS backlight gate) applies Wa_15015404425 like the KMS owner and the DC
 service; only the read-only route decision ahead of it does not. Panther
