@@ -688,6 +688,37 @@ impl GemObject {
         }
         Ok(placement)
     }
+    /// `xe_bo_migrate(bo, XE_PL_TT)` for CPU reads of an export
+    /// (`xe_dma_buf_begin_cpu_access`), under the lock every move takes:
+    /// `Ok(true)` once a VRAM object moved to system memory (its dynamic
+    /// importers notified first and its CPU mappings retired, so they fault
+    /// in the new pages), `Ok(false)` when it already is in system memory. A
+    /// pinned object is -EBUSY (`xe_bo_is_pinned`; a VRAM scanout object
+    /// counts as pinned), one without a system placement -EINVAL
+    /// (`xe_bo_can_migrate`), and a move the eviction copy cannot make keeps
+    /// its error. The object stays where it was on any error.
+    pub(crate) async fn migrate_for_cpu_access(
+        self: &Arc<Self>,
+        backend: &dyn crate::intel_gpu_user::UserBackend,
+        epoch: Option<u64>,
+    ) -> Result<bool, FsError> {
+        let _placement = self.migrating.lock().await;
+        if !self.is_vram() {
+            return Ok(false);
+        }
+        if self.externally_pinned() || self.scanout() {
+            return Err(FsError::Busy);
+        }
+        if !self.can_migrate_to_system() {
+            return Err(FsError::InvalidData);
+        }
+        let epoch = epoch.ok_or(FsError::NoDevice)?;
+        // TTM waits for the object's fences before the move; the NARF
+        // eviction copy requires an idle object.
+        self.wait_idle(true, None).await?;
+        self.evict_locked(backend, epoch, false).await?;
+        Ok(true)
+    }
     /// A suspend backup awaits [`Self::restore_pinned`]: until then the VRAM
     /// holds nothing of this object's (S3 lost it), so no CPU access,
     /// mapping, scanout, move or GPU use may reach it first.

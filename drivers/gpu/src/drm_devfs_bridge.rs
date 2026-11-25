@@ -1217,6 +1217,13 @@ impl FileOps for IntelPrimeDmaBufFile {
                 self.object
                     .wait_idle(flags & DMA_BUF_SYNC_WRITE != 0, None)
                     .await?;
+                // The exporter's begin_cpu_access, on the idle buffer (so a
+                // busy one still parks above): xe's migration for reads.
+                if let Some(direction) = DmaDataDirection::from_sync_flags(flags) {
+                    crate::intel_gpu_prime::CpuAccess::new(self.card, &self.object)
+                        .begin_cpu_access(direction)
+                        .await?;
+                }
             }
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             Ok(0)

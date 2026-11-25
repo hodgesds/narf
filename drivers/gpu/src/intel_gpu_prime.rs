@@ -46,10 +46,12 @@
 //! integrated display scans an import out after [`pin_for_scanout`]
 //! (`__xe_pin_fb_vma`, with `dma_buf_pin`).
 //!
-//! LINUX-GAP: `xe_dma_buf_begin_cpu_access` migrates a VRAM export to
-//! system memory for CPU reads when it can. NARF's DMA_BUF_IOCTL_SYNC is
-//! synchronous and has no exporter hook, so CPU access always takes place in
-//! the current placement, which is what Linux falls back to.
+//! `xe_dma_buf_begin_cpu_access` ([`CpuAccess`], the exporter's
+//! `narf_filesystem::dma_buf::DmaBufCpuAccess`): DMA_BUF_IOCTL_SYNC START
+//! for reads migrates a VRAM export to system memory when it can
+//! (`xe_bo_migrate(bo, XE_PL_TT)`, notifying dynamic importers and retiring
+//! CPU mappings first); otherwise CPU access takes place in the current
+//! placement, as Linux falls back to.
 //!
 //! Peer-to-peer into another function's BAR is unvalidated on hardware:
 //! the live importer asks for it only with `narf.intel.prime_p2p=1`, and
@@ -59,7 +61,7 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use narf_filesystem::dma_buf::DmaBufAttachOps;
+use narf_filesystem::dma_buf::{DmaBufAttachOps, DmaBufCpuAccess, DmaDataDirection};
 use narf_filesystem::FsError;
 use narf_io::p2pdma::{P2pMapType, P2pTopology};
 use narf_io::sg::Segment;
@@ -574,6 +576,58 @@ pub(crate) async fn pin_for_scanout(object: &Arc<GemObject>) -> Result<(), FsErr
     import.attachment().restore_export().await?;
     import.attachment().pin().await?;
     ensure_mapped(object).await
+}
+
+/// `xe_dma_buf_begin_cpu_access` of an Intel export of `card`: CPU reads
+/// (DMA_BIDIRECTIONAL, DMA_FROM_DEVICE) migrate a VRAM export to system
+/// memory in the exporter's running epoch, holding its runtime-PM
+/// reference over the copy; writes do nothing. As in Linux, a failed
+/// migration leaves CPU access in the current placement and the hook
+/// succeeds.
+pub(crate) struct CpuAccess<'a> {
+    card: u32,
+    object: &'a Arc<GemObject>,
+}
+
+impl<'a> CpuAccess<'a> {
+    pub(crate) fn new(card: u32, object: &'a Arc<GemObject>) -> Self {
+        Self { card, object }
+    }
+}
+
+impl DmaBufCpuAccess for CpuAccess<'_> {
+    fn begin_cpu_access(&self, direction: DmaDataDirection) -> narf_filesystem::FsFuture<'_, ()> {
+        Box::pin(async move {
+            if !direction.cpu_reads() || !self.object.is_vram() {
+                return Ok(());
+            }
+            let Some(backend) =
+                crate::intel_gpu_render::DeviceInfo::for_card(self.card).and_then(|d| d.backend)
+            else {
+                return Ok(());
+            };
+            // "If we failed, cpu-access takes place in current placement."
+            let _ = migrate_for_cpu_read(self.object, backend.as_ref(), direction).await;
+            Ok(())
+        })
+    }
+}
+
+/// [`CpuAccess`]'s migration over the exporter's `backend`, with its
+/// outcome: `Ok(true)` once moved to system memory, `Ok(false)` for a write
+/// or an object already there, else the refusal of
+/// [`GemObject::migrate_for_cpu_access`] (or of the runtime-PM wake).
+pub(crate) async fn migrate_for_cpu_read(
+    object: &Arc<GemObject>,
+    backend: &dyn UserBackend,
+    direction: DmaDataDirection,
+) -> Result<bool, FsError> {
+    if !direction.cpu_reads() || !object.is_vram() {
+        return Ok(false);
+    }
+    let _wakeref = backend.cpu_vram_wakeref().await?;
+    let epoch = backend.status().map(|s| s.epoch).filter(|&e| e != 0);
+    object.migrate_for_cpu_access(backend, epoch).await
 }
 
 /// Whether any import in `objects` was notified of a move since its pages
