@@ -44,6 +44,7 @@ Boot options, each strict and default off:
 | `narf.intel.rkl_edp=1` | The Rocket Lake internal panel on the owned eDP route |
 | `narf.intel.dg1_kms=1` | The DG1 KMS owner over its firmware-lit Pipe A |
 | `narf.intel.hdmi14_ext=1` | Display 14+ external deep colour, YCbCr 4:4:4 into a DP PCON, and HDMI/DP audio with its component |
+| `narf.intel.svm=1` | Xe CPU-address-mirror VMs on fault-mode VMs of USM devices (LNL, PTL/WCL, NVL-S, BMG) |
 
 ## Still open
 
@@ -113,5 +114,8 @@ work had.
   CPU reads): AMD exporters and importers, migration of an export a
   process has mmapped (a live BAR mapping keeps it in VRAM), and
   validation of the P2P, suspend and migration paths on hardware.
-- CPU-address-mirror VMs.
+- CPU-address-mirror VMs behind `narf.intel.svm=1`: routing hardware GPU
+  faults to the fault service (ASIDs, the GuC G2H 0x6002 path, updating a
+  running job's tables), VRAM migration (`drm_pagemap`) on Battlemage,
+  madvise, and a silicon run.
 - D3cold through `_PR3` power resources (NARF evaluates no AML).
