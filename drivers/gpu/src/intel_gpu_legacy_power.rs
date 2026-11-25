@@ -318,6 +318,12 @@ pub(crate) fn rc6_disable(mut write: impl FnMut(u64, u32)) {
     write(RC_STATE, 0);
 }
 
+/// `intel_rps_disable` → `gen6_rps_disable`: `GEN6_RP_CONTROL` cleared,
+/// before system sleep (`intel_gt_suspend_late`).
+pub(crate) fn rps_disable(mut write: impl FnMut(u64, u32)) {
+    write(RP_CONTROL, 0);
+}
+
 /// Request `freq` (`rps_set`'s `RPNSWREQ` write).
 pub(crate) fn rps_request(freq: u32, mut write: impl FnMut(u64, u32)) {
     write(RPNSWREQ, Caps::request(freq));
