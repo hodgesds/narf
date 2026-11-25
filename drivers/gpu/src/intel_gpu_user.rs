@@ -826,6 +826,11 @@ impl UserContext {
     pub(crate) fn busy(&self) -> bool {
         self.state.lock().busy
     }
+    /// [`Self::configure_run_alone`] ran: every claim's LRC runs alone.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn run_alone_requested(&self) -> bool {
+        self.state.lock().run_alone
+    }
     /// One word of the context's saved register image, as `restore` copies
     /// it into a fresh LRC image at 4096 + index * 4: index 3 is the
     /// RING_CONTEXT_CONTROL value slot (the image's first `reg_offsets`

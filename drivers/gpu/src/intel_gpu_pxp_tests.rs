@@ -848,3 +848,239 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_pxp",
     smoke_pxp_stop_quiesces_or_aborts_hardware_work
 );
+
+/// The GT runtime's PXP wiring (`service_pxp`, `suspend_pxp`) over
+/// [`Runtime`], against the GSC firmware and KCR model. xe_pxp_init runs once
+/// per device and only with its firmware dependencies: a skip touches no
+/// KCR register and allocates nothing, a failed allocation writes KCR_INIT's
+/// masked enable 0x40004000 and then the disable 0x40000000
+/// (out_kcr_disable). A running PXP takes its KCR causes
+/// (xe_pxp_irq_handler, pxp_events_work), and the KCR route is asked for
+/// only once PXP exists. A GT1 stop (xe_pxp_pm_suspend) kills the queues
+/// and moves the key on; causes latched while GT1 was stopped are dropped;
+/// xe_pxp_pm_resume waits for an idle GSC worker, enables KCR and runs the
+/// deferred termination. A stop that cannot wait fails a hung start as its
+/// job would (-EIO).
+fn smoke_pxp_runtime_wiring_inits_once_suspends_and_resumes() -> TestResult {
+    use core::cell::Cell;
+    let full = Gt1View {
+        gsc_loadable: true,
+        huc_staged: true,
+        vcs: true,
+        gsc_idle: true,
+        gsc_error: false,
+        huc_error: false,
+    };
+    let regs = Regs::default();
+    regs.prerequisites();
+    let mut fw = Fw::new(&regs, Behaviour::default());
+    let resources = || Ok((Obj::new(), SESSION));
+
+    // Unsatisfied dependencies: skipped, and never tried again.
+    for missing in [
+        Gt1View {
+            gsc_loadable: false,
+            ..full
+        },
+        Gt1View {
+            huc_staged: false,
+            ..full
+        },
+        Gt1View { vcs: false, ..full },
+    ] {
+        let asked = Cell::new(false);
+        let mut runtime = Runtime::<Obj>::default();
+        let pass = runtime.service(
+            missing,
+            0,
+            &mut fw,
+            &regs,
+            || {
+                asked.set(true);
+                Err(PxpError::NoMemory)
+            },
+            || 0,
+        );
+        kt_assert!(matches!(pass, Pass::Skipped));
+        let again = runtime.service(full, 1, &mut fw, &regs, resources, || 0);
+        kt_assert!(matches!(again, Pass::Disabled));
+        kt_assert!(!asked.get());
+        kt_assert!(runtime.pxp().is_none());
+    }
+    kt_assert!(regs.writes.borrow().is_empty());
+
+    // The GSC client resources fail: KCR enabled, then disabled again.
+    let mut runtime = Runtime::<Obj>::default();
+    let pass = runtime.service(full, 0, &mut fw, &regs, || Err(PxpError::NoMemory), || 0);
+    kt_assert!(matches!(pass, Pass::InitFailed(PxpError::NoMemory)));
+    kt_assert_eq!(
+        &regs.writes.borrow()[..],
+        &[(KCR_INIT, 0x4000_4000), (KCR_INIT, 0x4000_0000)]
+    );
+    kt_assert!(runtime.pxp().is_none());
+    regs.writes.borrow_mut().clear();
+
+    // xe_pxp_init: KCR enabled, NEEDS_TERMINATION with key instance 1, and
+    // the readiness of a GT1 whose GSC proxy and HuC are up.
+    let mut runtime = Runtime::<Obj>::default();
+    let routes = Cell::new(0);
+    let pass = runtime.service(full, 0, &mut fw, &regs, resources, || {
+        routes.set(routes.get() + 1);
+        0
+    });
+    let Pass::Ran {
+        initialized: Some(pxp),
+        resumed: false,
+    } = pass
+    else {
+        return TestResult::Fail("xe_pxp_init did not publish a PXP");
+    };
+    kt_assert_eq!(routes.get(), 1);
+    kt_assert_eq!(&regs.writes.borrow()[..], &[(KCR_INIT, 0x4000_4000)]);
+    kt_assert_eq!(pxp.status(), Status::NeedsTermination);
+    kt_assert_eq!(pxp.key_assign(), 1);
+    kt_assert_eq!(pxp.readiness(), Ok(1));
+    kt_assert!(runtime.pxp().is_some_and(|p| Arc::ptr_eq(p, &pxp)));
+    let later = runtime.service(full, 1, &mut fw, &regs, resources, || 0);
+    kt_assert!(matches!(
+        later,
+        Pass::Ran {
+            initialized: None,
+            resumed: false
+        }
+    ));
+
+    // KCR_PXP_STATE_TERMINATED on an active session: the queue is killed,
+    // the key moves on and the VCS termination runs; RESET_COMPLETE ends it.
+    pxp.activate_for_test();
+    let ctx = context();
+    let mut add = QueueAdd::new(&ctx, Box::new(()));
+    kt_assert_eq!(pxp.add_step(&mut add, 2), Poll::Ready(Ok(())));
+    let key = pxp.key_assign();
+    regs.set(KCR_SIP, SIP);
+    let _ = runtime.service(full, 2, &mut fw, &regs, resources, || {
+        KCR_PXP_STATE_TERMINATED
+    });
+    kt_assert!(ctx.banned());
+    kt_assert_eq!(pxp.key_check(key), Err(KeyError::Stale));
+    kt_assert_eq!(&fw.terminations[..], &[TERMINATION_STREAM.to_vec()]);
+    kt_assert_eq!(pxp.status(), Status::TerminationInProgress);
+    let _ = runtime.service(full, 3, &mut fw, &regs, resources, || {
+        KCR_PXP_STATE_RESET_COMPLETE
+    });
+    kt_assert_eq!(pxp.status(), Status::ReadyToStart);
+
+    // GT1 stops with a session active: xe_pxp_pm_suspend.
+    pxp.activate_for_test();
+    let key = pxp.key_assign();
+    let ctx = context();
+    let mut add = QueueAdd::new(&ctx, Box::new(()));
+    kt_assert_eq!(pxp.add_step(&mut add, 4), Poll::Ready(Ok(())));
+    kt_assert!(runtime.suspend(4, Some(&mut fw), &regs, true));
+    kt_assert!(ctx.banned());
+    kt_assert_eq!(pxp.queues(), 0);
+    kt_assert_eq!(pxp.status(), Status::Suspended);
+    kt_assert_eq!(pxp.key_check(key), Err(KeyError::Stale));
+    kt_assert_eq!(pxp.readiness(), Ok(0));
+
+    // GT1 runs again while the GSC worker is busy: the resume waits, and
+    // the causes latched meanwhile are dropped.
+    regs.writes.borrow_mut().clear();
+    let terminations = fw.terminations.len();
+    let pass = runtime.service(
+        Gt1View {
+            gsc_idle: false,
+            ..full
+        },
+        5,
+        &mut fw,
+        &regs,
+        resources,
+        || KCR_PXP_STATE_TERMINATED,
+    );
+    kt_assert!(matches!(pass, Pass::ResumeDeferred));
+    kt_assert!(regs.writes.borrow().is_empty());
+    kt_assert_eq!(pxp.status(), Status::Suspended);
+
+    // The GSC worker is idle: KCR enabled, and only the deferred
+    // (hardware-only) termination runs, with no new key iteration.
+    regs.set(KCR_SIP, SIP);
+    let pass = runtime.service(full, 6, &mut fw, &regs, resources, || 0);
+    kt_assert!(matches!(
+        pass,
+        Pass::Ran {
+            initialized: None,
+            resumed: true
+        }
+    ));
+    kt_assert_eq!(regs.writes.borrow().first(), Some(&(KCR_INIT, 0x4000_4000)));
+    kt_assert_eq!(fw.terminations.len(), terminations + 1);
+    kt_assert_eq!(pxp.key_assign(), key + 1);
+    kt_assert_eq!(pxp.status(), Status::TerminationInProgress);
+    let _ = runtime.service(full, 7, &mut fw, &regs, resources, || {
+        KCR_PXP_STATE_RESET_COMPLETE
+    });
+    kt_assert_eq!(pxp.status(), Status::ReadyToStart);
+
+    // A start whose GSC job hangs: a stop that waits is refused while the
+    // job runs; one that cannot wait fails it (-EIO) and suspends.
+    regs.set(KCR_SIP, 0);
+    let mut hung = Fw::new(
+        &regs,
+        Behaviour {
+            hang_gsc: true,
+            ..Default::default()
+        },
+    );
+    let ctx = context();
+    let mut add = QueueAdd::new(&ctx, Box::new(()));
+    kt_assert!(pxp.add_step(&mut add, 8).is_pending());
+    let _ = runtime.service(full, 8, &mut hung, &regs, resources, || 0);
+    kt_assert_eq!(hung.packets.len(), 1);
+    kt_assert!(!runtime.suspend(9, Some(&mut hung), &regs, true));
+    kt_assert!(runtime.suspend(10, Some(&mut hung), &regs, false));
+    kt_assert_eq!(pxp.status(), Status::Suspended);
+    kt_assert_eq!(pxp.add_step(&mut add, 11), Poll::Ready(Err(PxpError::Io)));
+
+    // GT1 lost under a resumed PXP: suspended again at once.
+    let _ = runtime.service(full, 12, &mut fw, &regs, resources, || 0);
+    kt_assert_eq!(pxp.status(), Status::NeedsTermination);
+    runtime.lost();
+    kt_assert_eq!(pxp.status(), Status::Suspended);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_pxp",
+    smoke_pxp_runtime_wiring_inits_once_suspends_and_resumes
+);
+
+/// xe_lrc.c XE_LRC_CREATE_RUNALONE: `__xe_exec_queue_init` asks it of a
+/// PXP queue on RCS or CCS below graphics 20, and `xe_lrc_init` ORs
+/// `REG_MASKED_FIELD_ENABLE(CTX_CTRL_RUN_ALONE)` (bit 7: 0x00800080) into
+/// CTX_CONTEXT_CONTROL. The default user value 0x00090008 (inhibit
+/// syncctx-switch and restore-inhibit masks, as the LRC restores it)
+/// becomes 0x00890088 on RCS0 and CCS0 only; VCS, VECS and BCS keep it, as
+/// does any queue that is not PXP. The context carries the request from
+/// `configure_run_alone` to its claim.
+fn smoke_pxp_run_alone_lrc_bit_on_render_and_compute_only() -> TestResult {
+    use crate::intel_gpu_guc_sched::run_alone_control;
+    const CONTROL: u32 = 0x0009_0008;
+    for engine in [Hw::Rcs0, Hw::Ccs0] {
+        kt_assert_eq!(run_alone_control(engine, true, CONTROL), 0x0089_0088);
+        kt_assert_eq!(run_alone_control(engine, false, CONTROL), CONTROL);
+    }
+    for engine in [Hw::Vcs0, Hw::Vecs0, Hw::Bcs0] {
+        kt_assert_eq!(run_alone_control(engine, true, CONTROL), CONTROL);
+    }
+    // Idempotent over an image that already carries it.
+    kt_assert_eq!(run_alone_control(Hw::Rcs0, true, 0x0089_0088), 0x0089_0088);
+    let ctx = UserContext::for_placements(EngineSet::of(&[Hw::Rcs0])).unwrap();
+    kt_assert!(!ctx.run_alone_requested());
+    kt_assert!(ctx.configure_run_alone().is_ok());
+    kt_assert!(ctx.run_alone_requested());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_pxp",
+    smoke_pxp_run_alone_lrc_bit_on_render_and_compute_only
+);
