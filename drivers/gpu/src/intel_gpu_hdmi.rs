@@ -237,6 +237,11 @@ pub const fn source_max_tmds_khz(family: crate::intel_gpu_aux::SourceFamily) -> 
             Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN | Gen12Platform::AlderLakeS,
         ) => 600_000,
         SourceFamily::Gen12(_) | SourceFamily::Gen11(_) => 594_000,
+        // Display 10 (Gemini Lake) reaches 594 MHz; display 9 300 MHz.
+        SourceFamily::Gen9 {
+            platform: crate::intel_gpu_gt::Gen9Platform::GeminiLake,
+            ..
+        } => 594_000,
         SourceFamily::Gen9 { .. } => 300_000,
     }
 }

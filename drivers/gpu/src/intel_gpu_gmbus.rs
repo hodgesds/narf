@@ -482,6 +482,12 @@ pub const fn gen9_ddc_pin(table: GmbusPinTable, ddi: Ddi) -> Option<PinPair> {
             Ddi::D => Some(PinPair::Pin4Cnp),
             _ => None,
         },
+        // `bxt_port_to_ddc_pin`: port B pin 1, port C pin 2.
+        GmbusPinTable::Bxt => match ddi {
+            Ddi::B => Some(PinPair::Pin1Bxt),
+            Ddi::C => Some(PinPair::Pin2Bxt),
+            _ => None,
+        },
         _ => None,
     }
 }

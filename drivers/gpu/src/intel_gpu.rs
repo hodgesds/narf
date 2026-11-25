@@ -178,6 +178,7 @@ impl Generation {
                 | Generation::AlderLake
                 | Generation::IceLake
                 | Generation::Skylake
+                | Generation::Broxton
         )
     }
 
@@ -1081,15 +1082,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // (Linux powers every PHY at display init).
         let lp = dev.chip.generation == Generation::Broxton;
         if lp {
+            use crate::intel_gpu_bxt_phy::Port;
             let glk = dev.chip.asic == "geminilake";
-            if crate::intel_gpu_bxt_display::power_port(
-                &window,
-                glk,
-                crate::intel_gpu_bxt_phy::Port::A,
-            )
-            .is_err()
-            {
-                log_probe("eDP port PHY did not power up", &device);
+            for port in [Port::A, Port::B, Port::C] {
+                if crate::intel_gpu_bxt_display::power_port(&window, glk, port).is_err() {
+                    log_probe("a DDI's PHY did not power up", &device);
+                }
             }
         }
         let pps_window = crate::intel_gpu_bxt_display::PpsWindow::new(&window, lp);
@@ -1997,8 +1995,9 @@ impl crate::intel_gpu_aux::MmioWindow for ModeWindow {
             self.device.id.vendor,
             self.device.id.device,
         ) {
-            // Gen9 LP's display (DPIO PHY) has none of the big-core tables.
-            Some(crate::intel_gpu_gt::GtPlatform::Gen9(platform)) if !platform.is_lp() => Some((
+            // Gen9 LP takes the Gen9 sessions with its own PHY, PLL and
+            // hotplug bank; the SKU family selects nothing for it.
+            Some(crate::intel_gpu_gt::GtPlatform::Gen9(platform)) => Some((
                 platform,
                 crate::intel_gpu_gen9_ddi::sku_family_for_did(self.device.id.device),
             )),
@@ -4034,15 +4033,15 @@ pub mod tests {
         {
             return TestResult::Fail("Gen9 must admit regions + display + external + backlight");
         }
-        // Gen9 LP: the Gen9 register map, pre-GMD, the internal panel and
-        // its BXT-layout backlight; no external outputs yet.
+        // Gen9 LP: the Gen9 register map, pre-GMD, the internal panel with
+        // its BXT-layout backlight, and DP/HDMI on DDI B and C.
         if !Generation::Broxton.display_supported()
-            || Generation::Broxton.external_display_supported()
+            || !Generation::Broxton.external_display_supported()
             || !Generation::Broxton.backlight_supported()
             || Generation::Broxton.region_generation() != Some(RegionGeneration::Gen9)
             || Generation::Broxton.has_gmd_id()
         {
-            return TestResult::Fail("Gen9 LP drives its internal panel only");
+            return TestResult::Fail("Gen9 LP drives its panel and external DDIs");
         }
         // Gen11 (Lanes 5 + 8): identity + probe + internal-panel
         // modeset + external outputs + backlight. The BAR0 region
