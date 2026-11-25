@@ -3229,15 +3229,25 @@ pages or the LMEM BAR, bounded by the buffer); DMA_BUF_IOCTL_SYNC on the
 shared reservation orders CPU access. An integrated display takes it as a
 framebuffer (no FORCE_WC needed, so it may be bound) and pins the export
 (`dma_buf_pin`) for the import's life before the GGTT maps its pages; a
-discrete display refuses it (`__xe_pin_fb_vma` pins to VRAM0). It has no
+discrete display refuses it (`__xe_pin_fb_vma` pins to VRAM0).
+DMA_BUF_IOCTL_SYNC START on an Intel dma-buf runs the exporter's
+`begin_cpu_access` hook (`narf_filesystem::dma_buf::DmaBufCpuAccess`) after
+its fence wait: for CPU reads (SYNC_READ, SYNC_RW) a VRAM|system export
+migrates to system memory (`xe_dma_buf_begin_cpu_access`,
+`xe_bo_migrate(bo, XE_PL_TT)`) under the exporter's runtime-PM reference,
+notifying dynamic importers and retiring CPU mappings first; a pinned
+export (EBUSY), a VRAM-only one (EINVAL), a live CPU mapping of the BAR or
+a failed copy leaves it in place and the SYNC still succeeds, as Linux's
+hook returns 0. Writes never migrate. It has no
 kernel CPU copy, migration, i915 compatibility exec or mmap, CPU-copy
 presentation or cursor use. A reimport returns its handle; a re-export names
 the original buffer. Live imports request peer-to-peer only with
 `narf.intel.prime_p2p=1`. Native fixtures (`drivers/gpu/intel_gpu_prime`,
 the smallbar suite and `io/p2pdma`) cover BAR bus addresses, migration, the
 pinned, VRAM-only and nonvisible refusals, import binding, move
-notification and rebind, suspend of a pinned export, import mmap and
-import scanout.
+notification and rebind, suspend of a pinned export, import mmap, import
+scanout and the `begin_cpu_access` migration
+(`smoke_xe_prime_begin_cpu_access_migrates_vram_for_cpu_reads`).
 
 Native terminal fences now back the shared per-object dma-buf reservation.
 GuC and Gen12 resident admission check synchronous conflicts across the
@@ -4932,7 +4942,7 @@ that state:
 | HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. Gen12 external admission and the bridge take `legacy()`. Joined: every MTL external hardware pass (HPD poll, event handling with Type-C connect/disconnect, probe, activate, stop, and the suspend/GT-reset teardown) runs in `intel_gpu_xelpg_external::with_dc_off`, which takes one `DcUser::External` reference before its first register access and runs nothing if DC states cannot be exited. Probe registers `external_route_blocks_dc` with `register_external_live`, so a live or quarantined route, or a pass in progress, refuses re-entry between passes. |
 | Frame-counter, scanline and pipe-status reads | Under `Guard`, the modeset reference or the format-refresh reference. |
 | Format discovery (GETPLANE, IN_FORMATS) | `publish_console_formats` runs under Init at install, under `LegacyGuard` on console replacement, and under the publication-refresh reference. |
-| debugfs / sysfs readers | No debugfs. Intel sysfs attributes (runtime power, error reports, power controls, hwmon, CCS) read cached state or GT registers only. |
+| debugfs / sysfs readers | The HDCP debugfs files (`narf.intel.hdcp=1` only) touch no register: a sink capability read is answered by the HDCP service pass. Intel sysfs attributes (runtime power, error reports, power controls, hwmon, CCS) read cached state or GT registers only. |
 | Error capture | GT-only register lists (GuC status/DMA, GDRST, GT interrupt, engine ring registers). |
 | Gen12 PM core (`PmBarWindow`) | Unreachable: registered only for Gen12. |
 | DC service itself | Re-entry checks run only from DC0. Loads and suspend steps hold their own references. |
@@ -6847,13 +6857,18 @@ uAPI with `xe->pxp` published:
   (xe_vm_validate_protected), are Linux's ENOEXEC, which FsError cannot
   carry: NARF answers EINVAL. UNMAP and UNMAP_ALL are never checked.
 - A killed queue is ECANCELED on EXEC, as Linux's reset_status reports.
-- A protected linear XR24 object becomes a framebuffer once PXP is up on the
-  card (drm/card.rs, `intel_pxp_planes`). Each primary-plane arm runs
-  `check_protection`: a current key sets `PLANE_SURF_DECRYPT`, a stale one
-  (or no PXP) scans out through an all-zero plane CSC
-  (`icl_plane_csc_load_black`). The DSB arm and the KMS owner's CPU copy
-  refuse protected frames; tiled and XR30 protected framebuffers are
-  refused.
+- A protected object becomes a framebuffer once PXP is up on the card
+  (drm/card.rs, `intel_pxp_planes`), in any layout and format the plane
+  takes (linear, X and Tile4 XR24, linear XR30), as Linux places no bound
+  on one. Each primary-plane arm, CPU or DSB, runs `check_protection`: a
+  current key sets `PLANE_SURF_DECRYPT`, a stale one (or no PXP) scans out
+  through an all-zero plane CSC (`icl_plane_csc_load_black`, with
+  `glk_plane_color_ctl`'s CSC enable), all latched by the same SURF write;
+  a staged DSB arm cancelled unarmed leaves the plane's black state as it
+  was. The color owner admits `PLANE_COLOR_PLANE_CSC_ENABLE` exactly while
+  the scanout owner armed the plane black. The KMS owner's CPU copy still
+  refuses protected frames, and a first color transaction over a plane
+  already black is refused until an unprotected frame is shown.
 
 Threat assumptions with the option:
 - Key material never reaches NARF. The GSC firmware and KCR hold every
@@ -6880,8 +6895,20 @@ Fixtures:
   `smoke_pxp_arb_session_start_sends_the_linux_init_session_packet`,
   `smoke_pxp_terminates_on_suspend_and_resume`,
   `smoke_pxp_key_check_refuses_a_stale_object_after_termination`,
-  `smoke_pxp_start_failures_keep_linux_errnos` and
-  `smoke_pxp_stop_quiesces_or_aborts_hardware_work`.
+  `smoke_pxp_start_failures_keep_linux_errnos`,
+  `smoke_pxp_stop_quiesces_or_aborts_hardware_work`,
+  `smoke_pxp_runtime_wiring_inits_once_suspends_and_resumes` (the GT
+  runtime's `service_pxp` / `suspend_pxp` over `pxp::Runtime`: init once
+  and only with its dependencies, the failed-allocation KCR disable, KCR
+  causes, suspend, the deferred resume and a stop that cannot wait) and
+  `smoke_pxp_run_alone_lrc_bit_on_render_and_compute_only` (the
+  CTX_CONTEXT_CONTROL value the submit path writes: 0x00090008 becomes
+  0x00890088 on RCS0/CCS0 only).
+- `drivers/gpu/intel_gpu_scanout`:
+  `scanout_pxp_protected_plane_decrypts_then_goes_black` and
+  `scanout_pxp_protected_dsb_arm_decrypts_or_loads_the_black_csc`;
+  `drivers/gpu/intel_gpu_color`:
+  `smoke_intel_ctm_admits_the_plane_csc_only_while_the_plane_is_black`.
 - `drivers/gpu/intel_gpu_media_gt`:
   `smoke_mtl_media_gt_kcr_irq_enables_decodes_and_resets` (the IRQ model),
   `smoke_media_gt_pxp_jobs_run_on_gsccs_ppgtt_and_the_first_vcs` (the media
@@ -6889,10 +6916,11 @@ Fixtures:
   (native Xe with a published `xe->pxp`).
 The packet bytes, termination words, register values and errnos are the
 Linux ABI's, never recorded from this implementation. Nothing here has run
-on physical Intel hardware. Not covered natively: the RUN_ALONE bit in a
-submitted LRC, the runtime's init/suspend/resume wiring (no runtime model),
-and the real GSC firmware's acceptance of NARF's PPGTT address and inline
-VCS termination.
+on physical Intel hardware. Not covered natively: a protected queue's LRC
+submitted through the GuC model (the fixture pins the value the submit path
+computes), the runtime's real GSC worker and media GuC behind the
+`pxp::Runtime` model, and the real GSC firmware's acceptance of NARF's PPGTT
+address and inline VCS termination.
 
 ### Xe OA streams on the main-GT OAG unit — native fixtures added
 
@@ -8121,11 +8149,24 @@ firmware command set), `intel_hdcp_shim` (DP and HDMI sinks) and
   connector_property_event`: change, `HOTPLUG=1`, `CONNECTOR`,
   `PROPERTY`, as `drm_sysfs_connector_property_event`).
 - Routes: the connector binds to the function's single live route: a
-  Gen12 HPD DP/HDMI/MST session, a display 14+ DP/HDMI/MST route, or the
-  route a Tiger/Alder Lake-P firmware display lit (`TRANS_DDI_FUNC_CTL`
-  readout; DP on combo DDIs whose sink is not eDP, HDMI with the DDI's
-  default DDC pin). Several routes, older displays and other platforms'
-  firmware routes are refused with typed errors (`HdcpError`).
+  Gen12 HPD DP/HDMI/MST session, a Gen9 or Gen11 one (display 9, 10 on
+  Gemini Lake, 11), a display 14+ DP/HDMI/MST route, or the route a
+  Tiger/Alder Lake-P firmware display lit (`TRANS_DDI_FUNC_CTL` readout; DP
+  on combo DDIs whose sink is not eDP, HDMI with the DDI's default DDC
+  pin). Several routes, a display 9-11 session on DDI E or later
+  (`is_hdcp_supported`) and other platforms' firmware routes are refused
+  with typed errors (`HdcpError`).
+- Display 9-11 (`TRANS_HDCP(display)` false, `HdcpHw`): the DDI port's
+  `PORT_HDCP_*` block (A 0x66800, B 0x66500, C 0x66600, D 0x66700) for
+  HDCP 1.4 and 2.2, `PIPE_HDCP2_STREAM_STATUS(pipe)` and the port's one
+  HDCP 1.4 status for MST streams, the DDI repeater bits
+  (`HDCP_DDIx_REP_PRESENT | HDCP_DDIx_SHA1_M0`), PW_1 at
+  `SKL_PW_CTL_IDX_PW_1` (14) on display 9 and 10, the fuse load through
+  the pcode mailbox (`SKL_PCODE_LOAD_HDCP_KEYS`) on display 9 except
+  Broxton, no line rekeying, and a firmware port ID naming the DDI
+  (`intel_get_hdcp_ddi_index`) with no transcoder. HDCP 2.2 only where
+  `is_hdcp2_supported` admits it (display 10+, Kaby/Coffee/Comet Lake);
+  Skylake and Broxton use HDCP 1.4.
 - DP MST (`intel_hdcp::mst`): the link authenticates on the master
   transcoder and every stream of the route is encrypted by
   `TRANS_DDI_HDCP_SELECT` in its own transcoder, confirmed by
@@ -8144,14 +8185,33 @@ firmware command set), `intel_hdcp_shim` (DP and HDMI sinks) and
   stream management, HDMI line-rekey control by display stepping, link
   check every 500 ms. Firmware: the MEI HDCP client
   (`narf_drivers_platform::mei_hdcp`, joined through
-  `narf_drivers::hdcp_component`) on display 12/13; the media GT's GSC on
+  `narf_drivers::hdcp_component`) below display 14, bound on the TGP, ADP
+  and RPL PCHs and, for Coffee and Comet Lake, on CNP-H and CMP-LP/H (the
+  other display 9-11 PCHs are not claimed by the MEI driver, so they fall
+  back to HDCP 1.4); the media GT's GSC on
   14+ (with `narf.intel.media_gt=1 narf.intel.gsc=1`), whose worker
   submits each framed command from its packet object. Without the firmware
   type-0 content falls back to HDCP 1.4 and type 1 is refused.
 - SRM: `display_hdcp_srm.bin` from the firmware registry; none revokes
   nothing, as in Linux.
-- Not done: the HDCP debugfs files, Gen9/Gen11 port-indexed HDCP
-  registers, and any silicon run.
+- debugfs (`intel_hdcp_debugfs`, `intel_hdcp_connector_debugfs_add`):
+  `/sys/kernel/debug/dri/<minor>/<DP-n|HDMI-A-n|HDMI-B-n>/` holds
+  `i915_hdcp_sink_capability` (0444: "<name>:<id> HDCP version: " then
+  "HDCP1.4 ", "HDCP2.2 " or "None"; the sink is read on the HDCP service
+  pass, ENODEV without a route, ETIMEDOUT after 2 s) and
+  `i915_force_hdcp14` (0644: "yes"/"no", ENODEV without a route; a write
+  takes `kstrtobool` and limits the next enable and link check to HDCP
+  1.4). NARF has no DRM debugfs core: this module owns `dri/` through
+  `narf_filesystem::debugfs::register_dir`, only with the option.
+- Fixtures: `drivers/gpu/intel_hdcp` also runs
+  `smoke_intel_hdcp_gen9_gen11_port_layout`,
+  `smoke_intel_hdcp14_gen9_port_registers_and_pcode_key_load`,
+  `smoke_intel_hdcp_gen11_hdmi14_and_hdcp22_mei_port_data`,
+  `smoke_intel_hdcp_debugfs_names_texts_and_bool_grammar` and
+  `smoke_intel_hdcp_debugfs_capability_and_force_through_the_service`.
+- Not done: Gen9/Gen11 MST HDCP has no fixture of its own (its registers
+  are the layout fixture's), HDCP 2.2 on the Gen9/Gen11 PCHs the MEI driver
+  does not claim, and any silicon run.
 
 ### DP 2.0 UHBR on display 14+ external DP (`narf.intel.uhbr=1`) — native fixtures added
 

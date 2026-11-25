@@ -48,6 +48,16 @@ The read-only scheduler debugfs `sched/quantum_unit` file reports `nanos`,
 unit. Instruction-mode admission and limits are defined in
 `scheduler/specification/spec.md` §3.1.1.
 
+Drivers add top-level debugfs directories with
+`debugfs::register_dir(name: &'static str, dir: Arc<dyn DirOps>)` (Linux
+`debugfs_create_dir(name, NULL)`; a taken name or `sched` is
+`AlreadyExists`) and remove them with `debugfs::unregister_dir(name)`. Their
+entries carry `debugfs::attrs()` (the superblock identity) and inode numbers
+from `debugfs::alloc_ino()` / `alloc_ino_range(count)` (`get_next_ino()`),
+which never collide with the fixed `sched/` tree. The Intel display driver
+registers `dri/` this way for its HDCP connector files, only with
+`narf.intel.hdcp=1`.
+
 Evdev registration publishes a stable `/sys/devices/platform/narf-input/inputN`
 parent and `eventN` child, class links and the `13:(64+N)` device link, with
 `N = DeviceId - 1` matching `/dev/input/eventN`. The input registry observer
@@ -585,6 +595,11 @@ pub mod dma_buf {
     // attach_dynamic(Weak<dyn DmaBufAttachOps>), detach_dynamic(&Weak),
     // dynamic_importers(), invalidate_mappings() -> notified count
     pub trait DmaBufAttachOps: Send + Sync { fn invalidate_mappings(&self); }
+    pub enum DmaDataDirection { Bidirectional, ToDevice, FromDevice }
+    // from_sync_flags(flags) -> Option<Self>, cpu_reads(), cpu_writes()
+    pub trait DmaBufCpuAccess: Send + Sync {
+        fn begin_cpu_access(&self, direction: DmaDataDirection) -> FsFuture<'_, ()>;
+    }
     pub fn dma_buf_ioctl(obj: &DmaBufObject, cmd: u32, arg: u64,
                          ctx: &dyn IoctlContext) -> Result<u64, FsError>;
 }
@@ -1954,6 +1969,15 @@ the backing store (`dma_buf_invalidate_mappings`), and each importer drops
 its mappings and maps again before further DMA. Callbacks run after the
 attachment list lock is released and must not block. Static importers
 register nothing and keep the exporter's pin-on-map.
+An exporter that prepares its buffer for CPU access (Linux
+`dma_buf_ops.begin_cpu_access`) implements `DmaBufCpuAccess`; its file's
+`DMA_BUF_IOCTL_SYNC` START awaits it with the `DmaDataDirection` the SYNC
+flags give (`READ` is `FromDevice`, `WRITE` `ToDevice`, both
+`Bidirectional`), with no dma-buf lock held, and fails with its error. It
+may do GPU work, and a second call on a prepared buffer must be cheap, as a
+parked SYNC re-executes. The Intel exporter migrates a VRAM export to system
+memory for CPU reads (`xe_dma_buf_begin_cpu_access`) after its fence wait.
+Exporters without the hook use `dma_buf_ioctl` unchanged.
 
 sync_file fds belong to the syscall layer: `IoctlContext::sync_file_fences` is `sync_file_get_fence` +
 `dma_fence_unwrap` (`None` for a bad fd or a non-sync_file), and
