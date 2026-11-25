@@ -1062,6 +1062,8 @@ pub(crate) mod intel_gpu_xelpg_wm;
 #[cfg(feature = "intel")]
 pub mod intel_hdcp;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_hdcp_debugfs;
+#[cfg(feature = "intel")]
 pub mod intel_hdcp_live;
 #[cfg(feature = "intel")]
 pub mod intel_hdcp_msg;
