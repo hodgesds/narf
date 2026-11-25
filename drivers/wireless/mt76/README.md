@@ -9,11 +9,14 @@ The real driver is `src/mt7921/` (L1 remap, MCU framing, WFDMA rings,
 firmware download, association and scan), with `src/iface.rs`
 providing the `WirelessNetIface` station interface plus AP, P2P,
 monitor, and WoWLAN variants (`iface_ap.rs`, `iface_p2p*.rs`,
-`iface_monitor.rs`, `iface_wowlan.rs`). The `module` build owns
-probe/service/control handles and a domain-gated poller through the
-versioned copy-mode C ABI in `src/module_protocol.rs` /
-`src/module_host.rs`; native MCU/WFDMA execution remains in the
-permanent host build.
+`iface_monitor.rs`, `iface_wowlan.rs`). The driver reaches the kernel
+only through `src/platform/`: the kernel crates built in, `narf-module-rt`
+plus the KABI in the `module` build. As `mt76.ko` the same driver runs
+inside the module: `src/mt7921/pci_kabi.rs` binds the function and
+`src/iface_module.rs` publishes the station netdev and wiphy through the
+generic `WIFI` family host (wireless spec §4.3). The private copy-mode
+family (`src/module_protocol.rs` / `src/module_host.rs`) stays registered
+in the built-in build for compatibility; no in-tree `.ko` uses it.
 
 Hardware validation is gated by the crate's own documentation: QEMU
 emulates no MediaTek Wi-Fi PCIe device, so chip-id read, firmware

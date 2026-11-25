@@ -1,9 +1,9 @@
 //! Actual source-bound cfg80211 management subscriptions for one WDEV.
 //! Host registration alone creates no native capture/channel/started owner.
+use crate::platform::ap_control::{RadioControlAuthority, RadioEventAuthority};
+use crate::platform::IrqSafeSpinLock;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_wireless::ap_control::{RadioControlAuthority, RadioEventAuthority};
 const MAX_FILTERS: usize = 16;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug)]

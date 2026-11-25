@@ -2,9 +2,9 @@
 //! A completed wdev is independent of IFF_UP and has no Ethernet carrier,
 //! peer controlled port or RF/channel grant. CNM acquisition is separate.
 use super::{station::Command, Backend, Error, RadioInfo, Session, Stage, State};
+use crate::platform::ap_control::{RadioControlAuthority, RadioInterfaceIdentity};
 use alloc::sync::Arc;
 use core::future::Future;
-use narf_wireless::ap_control::{RadioControlAuthority, RadioInterfaceIdentity};
 #[path = "p2p_roc.rs"]
 mod roc;
 pub(super) use roc::JoinRoc;

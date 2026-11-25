@@ -19,7 +19,7 @@ pub(crate) async fn transmit(
         alive: alive.clone(),
         terminal: false,
     };
-    let result = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
+    let result = Arc::new(crate::platform::IrqSafeSpinLock::new(None));
     let target = result.clone();
     let status = retained_owner_work(false, move |mut transport| {
         Box::pin(async move {

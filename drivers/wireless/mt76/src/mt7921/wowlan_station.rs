@@ -6,9 +6,9 @@
 //! host replay/key state from an unspecified firmware wake event.
 
 use super::{station::Command, Backend, Error, Session, Stage, State, WakeAssociation};
+use crate::platform::power::SystemSleepState;
 use alloc::sync::Arc;
 use core::{future::poll_fn, task::Poll};
-use narf_power::system_pm::SystemSleepState;
 use narf_wireless::WowlanConfig;
 use zeroize::Zeroizing;
 
@@ -195,7 +195,7 @@ impl<B: Backend> Session<B> {
         // The DMA/FW-own receipts precede actual PMCSR D3hot. The intent
         // remains retained if the posted write or caller future is lost.
         self.backend.enter_wake_d3hot()?;
-        self.wait(narf_bus::pci::PM_D3HOT_DELAY_MS + 20, |backend| {
+        self.wait(crate::platform::bus::PM_D3HOT_DELAY_MS + 20, |backend| {
             Ok(backend.wake_power_settled().then_some(()))
         })
         .await?;
@@ -256,12 +256,12 @@ impl<B: Backend> Session<B> {
         // The timestamp lives in the retained backend. A cancelled D3
         // entry must finish its original delay before writing D0; a new
         // future cannot shorten that physical transition.
-        self.wait(narf_bus::pci::PM_D3HOT_DELAY_MS + 20, |backend| {
+        self.wait(crate::platform::bus::PM_D3HOT_DELAY_MS + 20, |backend| {
             Ok(backend.wake_power_settled().then_some(()))
         })
         .await?;
         if self.backend.begin_wake_d0()? {
-            self.wait(narf_bus::pci::PM_D3HOT_DELAY_MS + 20, |backend| {
+            self.wait(crate::platform::bus::PM_D3HOT_DELAY_MS + 20, |backend| {
                 Ok(backend.wake_power_settled().then_some(()))
             })
             .await?;

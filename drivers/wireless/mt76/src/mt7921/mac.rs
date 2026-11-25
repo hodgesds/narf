@@ -27,8 +27,8 @@
 
 use core::fmt::Write;
 
-use narf_bus::MmioRegion;
-use narf_time::Deadline;
+use crate::platform::bus::MmioRegion;
+use crate::platform::time::Deadline;
 
 use super::registers;
 use super::regs::*;
@@ -57,7 +57,7 @@ impl super::mac_power::Io for ProbePower<'_> {
     fn stage(&mut self, stage: super::mac_power::Stage) {
         if crate::mt7921::debug::enabled() {
             let _ = writeln!(
-                narf_console::PriorityWriter::<7>,
+                crate::platform::PriorityConsole::<7>,
                 "  mt7921: probe power {stage:?}"
             );
         }
@@ -71,7 +71,7 @@ impl super::mac_power::Io for ProbePower<'_> {
         unsafe { registers::write32(self.0, address, value) }.map_err(|_| PowerError::InvalidWindow)
     }
     fn delay(&mut self, ms: u64) {
-        narf_scheduler::responsive_spin_until(|| false, Deadline::after_ms(ms));
+        crate::platform::responsive_spin_until(|| false, Deadline::after_ms(ms));
     }
     fn poll(
         &mut self,
@@ -81,7 +81,7 @@ impl super::mac_power::Io for ProbePower<'_> {
         ms: u64,
     ) -> Result<bool, PowerError> {
         let mut error = None;
-        let ready = narf_scheduler::responsive_spin_until(
+        let ready = crate::platform::responsive_spin_until(
             || match self.read(address) {
                 Ok(u32::MAX) => {
                     error = Some(PowerError::DeviceGone);
@@ -118,7 +118,7 @@ pub(super) unsafe fn initialize_probe(mmio: &MmioRegion) -> Result<(), PowerErro
             // Only the always-accessible HIF ownership register is safe here.
             // A timeout is not permission to access unowned WFSYS registers.
             let _ = writeln!(
-                narf_console::Writer,
+                crate::platform::Console,
                 "  mt7921: probe power failed {error:?}: lpctl={own:x?}"
             );
         }

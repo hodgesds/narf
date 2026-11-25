@@ -218,5 +218,6 @@ pub(crate) fn rate(mode: u8, idx: u8, nss: u8, bw: u8, gi: u8, dcm: bool) -> Opt
     Some(info)
 }
 
+#[cfg(feature = "builtin")]
 #[path = "link_stats_tests.rs"]
 mod tests;

@@ -1,5 +1,6 @@
 //! Retained AP work and exact concrete-interface publication.
 use super::*;
+use crate::platform::ap_control::ApControlAuthority;
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
@@ -7,7 +8,6 @@ use alloc::{
 use core::future::Future;
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_net::Interface;
-use narf_wireless::ap_control::ApControlAuthority;
 
 pub(crate) enum Request {
     Start(Box<(narf_wireless::ApConfig, narf_wireless::ApStartSettings)>),
@@ -158,7 +158,7 @@ pub(crate) async fn request(
         alive: alive.clone(),
         terminal: false,
     };
-    let result = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
+    let result = Arc::new(crate::platform::IrqSafeSpinLock::new(None));
     // Settle the existing native owner before claiming it. Its previous
     // terminal error does not turn a failed owner into a fresh radio.
     let _ = finish_boot_keys().await;

@@ -422,5 +422,6 @@ fn reports(bytes: &[u8]) -> Result<Vec<Report>, Error> {
     Ok(reports)
 }
 
+#[cfg(feature = "builtin")]
 #[path = "tx_sequence_tests.rs"]
 mod tests;

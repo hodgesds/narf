@@ -17,13 +17,12 @@
 //! raised when `HOST_INT_STA & HOST_INT_ENA` becomes non-zero, so a source
 //! set while the worker serviced the rings raises a fresh message when the
 //! enable is restored: no event waits for a timer.
+use crate::platform::bus::{BusDevice, DeviceCap};
+use crate::platform::IrqSafeSpinLock;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
-use narf_bus::{BusDevice, BusDeviceCap};
-use narf_capabilities::{Cap, Write};
-use narf_lib::sync::IrqSafeSpinLock;
 
 /// `MT_INT_RX_DONE_ALL`: the event (WM), data and WM2 RX rings.
 pub(super) const MT_INT_RX_DONE_ALL: u32 = (1 << 2) | (1 << 0) | (1 << 22);
@@ -151,10 +150,12 @@ pub(crate) fn kick() {
     LINE.raise();
 }
 
+#[cfg(feature = "builtin")]
 const HANDLER: &str = "mt7921e";
 
 /// `mt792x_irq_handler`: hand the interrupt to the worker (the tasklet's
 /// work runs there, under the owner of BAR0).
+#[cfg(feature = "builtin")]
 fn handler(_cookie: u64) -> narf_interrupts::IrqStatus {
     LINE.delivered.fetch_add(1, Ordering::Relaxed);
     LINE.raise();
@@ -162,22 +163,24 @@ fn handler(_cookie: u64) -> narf_interrupts::IrqStatus {
 }
 
 /// MSI delivery bound to the exact owned PCI function.
+#[cfg(feature = "builtin")]
 #[derive(Debug)]
 pub(super) struct Binding {
     vector: u8,
     msi: narf_bus::msi::MsiConfig,
 }
 
+#[cfg(feature = "builtin")]
 impl Binding {
     /// `pci_alloc_irq_vectors(pdev, 1, 1, ...)` + `devm_request_irq`: one
     /// MSI vector to the boot CPU (the default affinity). `None` leaves the
     /// owner polled. Only x86_64 programs MSI here; other architectures
     /// need an interrupt-translation mapping this owner does not make.
-    pub(super) fn bind(device: &BusDevice, authority: &Cap<BusDeviceCap, Write>) -> Option<Self> {
+    pub(super) fn bind(device: &BusDevice, authority: &DeviceCap) -> Option<Self> {
         if !cfg!(target_arch = "x86_64") {
             return None;
         }
-        let mut msi = super::pci::invoke(authority, || {
+        let mut msi = crate::platform::bus::invoke(authority, || {
             narf_bus::msi::enable_msi(authority, device, 1)
         })
         .ok()?
@@ -185,7 +188,7 @@ impl Binding {
         let vector = narf_interrupts::vector::alloc().ok()?;
         narf_interrupts::install_handler_named(vector, HANDLER, 0, handler);
         narf_interrupts::enable_irq(vector);
-        let programmed = super::pci::invoke(authority, || {
+        let programmed = crate::platform::bus::invoke(authority, || {
             // SAFETY: the claimed transport exclusively owns this function's
             // configuration space; the vector and its handler are installed.
             unsafe {
@@ -194,7 +197,7 @@ impl Binding {
             }
         });
         if !matches!(programmed, Ok(Ok(()))) {
-            let disabled = super::pci::invoke(authority, || {
+            let disabled = crate::platform::bus::invoke(authority, || {
                 // SAFETY: same exclusive configuration owner.
                 unsafe { narf_bus::msi::disable(&msi) }
             });
@@ -207,9 +210,9 @@ impl Binding {
 
     /// `devm_free_irq` + `pci_free_irq_vectors`, after the device sources
     /// are masked. A vector the device may still target is quarantined.
-    pub(super) fn release(self, authority: &Cap<BusDeviceCap, Write>) {
+    pub(super) fn release(self, authority: &DeviceCap) {
         LINE.bound.store(false, Ordering::Release);
-        let disabled = super::pci::invoke(authority, || {
+        let disabled = crate::platform::bus::invoke(authority, || {
             // SAFETY: exclusive configuration owner of this function.
             unsafe { narf_bus::msi::disable(&self.msi) }
         });
@@ -219,6 +222,7 @@ impl Binding {
     }
 }
 
+#[cfg(feature = "builtin")]
 fn release_vector(vector: u8, free: bool) {
     narf_interrupts::disable_irq(vector);
     let _ = narf_interrupts::remove_handler(vector, HANDLER, 0);
@@ -228,6 +232,95 @@ fn release_vector(vector: u8, free: bool) {
     }
 }
 
+/// The module build's MSI binding: one plain-MSI vector through the KABI
+/// (`narf_msi_enable`), whose task-context callback ([`module_vector`])
+/// raises the line and then runs the module's executor, so the woken owner
+/// makes progress on this CPU now. The kernel programs the message and
+/// frees the block at device teardown.
+#[cfg(feature = "module")]
+#[derive(Debug)]
+pub(super) struct Binding {
+    vector: u16,
+}
+
+#[cfg(feature = "module")]
+mod module_ffi {
+    unsafe extern "C" {
+        pub fn narf_msi_enable(
+            dev: u64,
+            want: u16,
+            out_count: *mut u16,
+            out_base_vector: *mut u16,
+            out_addr: *mut u64,
+            out_data: *mut u32,
+        ) -> i32;
+        pub fn narf_msi_set_enabled(dev: u64, enabled: u32) -> i32;
+        pub fn narf_irq_set_handler(dev: u64, vector: u16, callback: usize, cookie: u64) -> i32;
+    }
+}
+
+/// The vector's task-context upcall (`mt792x_irq_handler`, then the
+/// tasklet's executor pass).
+#[cfg(feature = "module")]
+extern "C" fn module_vector(_cookie: u64) -> i32 {
+    LINE.delivered.fetch_add(1, Ordering::Relaxed);
+    LINE.raise();
+    let _ = crate::platform::EXEC.run();
+    0
+}
+
+#[cfg(feature = "module")]
+impl Binding {
+    /// `pci_alloc_irq_vectors(pdev, 1, 1, ...)` + `devm_request_irq`, with
+    /// the built-in policy: x86_64 only, otherwise the owner stays polled.
+    pub(super) fn bind(device: &BusDevice, authority: &DeviceCap) -> Option<Self> {
+        if !cfg!(target_arch = "x86_64") || authority.check_live().is_err() {
+            return None;
+        }
+        let (mut count, mut base, mut addr, mut data) = (0u16, 0u16, 0u64, 0u32);
+        // SAFETY: the four outputs are live locals.
+        let rc = unsafe {
+            module_ffi::narf_msi_enable(
+                device.token,
+                1,
+                &mut count,
+                &mut base,
+                &mut addr,
+                &mut data,
+            )
+        };
+        if rc != 0 || count != 1 {
+            return None;
+        }
+        // SAFETY: `module_vector` is a valid `extern "C" fn(u64) -> i32` in
+        // this image; the kernel unbinds it before unmapping the module.
+        let bound = unsafe {
+            module_ffi::narf_irq_set_handler(device.token, base, module_vector as usize, 0) == 0
+                && module_ffi::narf_msi_set_enabled(device.token, 1) == 0
+        };
+        if !bound {
+            // SAFETY: argument-only call on our probe token.
+            let _ = unsafe { module_ffi::narf_msi_set_enabled(device.token, 0) };
+            return None;
+        }
+        LINE.bound.store(true, Ordering::Release);
+        Some(Self { vector: base })
+    }
+
+    /// Delivery off after the device sources are masked; the block and the
+    /// vector stay the device context's until teardown.
+    pub(super) fn release(self, authority: &DeviceCap) {
+        let _ = self.vector;
+        LINE.bound.store(false, Ordering::Release);
+        if authority.check_live().is_ok() {
+            // SAFETY: argument-only call on the bound probe token.
+            let _ = unsafe { module_ffi::narf_msi_set_enabled(crate::platform::device(), 0) };
+        }
+        LINE.raise();
+    }
+}
+
+#[cfg(feature = "builtin")]
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};

@@ -5,11 +5,19 @@
 //! `drivers/net/i40e/` for the reference dual-build shape and `PLAN.md` at the
 //! worktree root for the promotion rationale.
 //!
-//! The real driver in [`mt7921`] (L1 remap, MCU framing, WFDMA rings, firmware
-//! download, the [`iface`] `WirelessNetIface` scaffold) compiles only for the
-//! permanent host build. The `module` build owns probe/service/control
-//! handles and a domain-gated poller through the versioned copy-mode C ABI;
-//! native MCU/WFDMA execution remains in that permanent host.
+//! One source tree, two builds. The driver in [`mt7921`] (L1 remap, WFDMA
+//! rings, MCU framing, firmware download, the station join with its in-driver
+//! WPA2/WPA3 supplicant, the packet path) reaches the kernel only through
+//! [`platform`]: the kernel's crates built in, `narf-module-rt` and the KABI
+//! in the `.ko` (the `drivers/wireless/ath11k` precedent).
+//!
+//! - Built in, [`iface`] is the full `WirelessNetIface` netdev (station, AP,
+//!   P2P, monitor, WoW, system PM), and the private copy-mode family host
+//!   ([`module_protocol`], `module_host`) stays registered for loadable
+//!   frontends built against it.
+//! - As a module, `mt7921::pci_kabi` binds the function over the KABI and
+//!   `iface_module` publishes the station netdev and wiphy through the netif
+//!   bridge and the generic `WIFI` family host (version 2).
 //!
 //! ## Hardware validation is gated
 //!
@@ -21,7 +29,6 @@
 #![no_std]
 #![allow(dead_code)]
 
-#[cfg(feature = "builtin")]
 extern crate alloc;
 
 use narf_driver_macros::narf_driver;
@@ -31,14 +38,21 @@ pub mod module_protocol;
 #[cfg(feature = "builtin")]
 mod module_host;
 
-#[cfg(feature = "builtin")]
+/// Kernel services under one name in both builds.
+pub mod platform;
+
+/// The driver. One source tree in both builds.
 pub mod mt7921;
 
 #[cfg(feature = "builtin")]
 pub mod iface;
 
+/// Station helpers both netdevs share (scan plans, join resolution).
+pub(crate) mod iface_station;
+
+/// The station netdev and wiphy of the module build.
 #[cfg(feature = "module")]
-mod module_probe;
+pub mod iface_module;
 
 // Re-export the key driver surface so the facade (and tests in other crates)
 // can reach it through the crate root, mirroring the pre-promotion module.
@@ -59,7 +73,7 @@ narf_driver! {
         author: "narf",
         description: "MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920)",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write,Firmware:Read",
     },
     register: do_register,
 }
@@ -70,15 +84,31 @@ fn do_register() {
     mt7921::register();
 }
 
+/// The built-in registration without the PCI binding (`mt76-module-only` in
+/// `narf-drivers-wireless`): `mt76.ko` owns the CONNAC2 PCI ids, and only the
+/// private copy-mode family host is registered.
+#[cfg(feature = "builtin")]
+pub fn register_host_only() {
+    module_host::register();
+}
+
+/// `mt76.debug=1` (or the load argument `debug=1`): the routine firmware and
+/// station traces the built-in driver prints under `mt76.dyndbg=+p`
+/// ([`mt7921::debug`]), declared so the loader applies it before init.
+#[cfg(feature = "module")]
+#[used]
+#[link_section = ".narf_kparams"]
+static KPARAMS: [u8; 7] = *b"debug=\n";
+
 #[cfg(feature = "module")]
 #[unsafe(no_mangle)]
 pub extern "C" fn narf_module_exit() {
-    module_probe::exit();
+    mt7921::pci::exit();
 }
 
 #[cfg(feature = "module")]
 fn do_register() {
-    module_probe::register();
+    mt7921::pci::register();
 }
 
 // The `narf_driver!` macro above generates the public `register()` entry point
