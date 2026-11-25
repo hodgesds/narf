@@ -463,7 +463,10 @@ pub enum InitOutcome {
 
 /// `skl_sanitize_cdclk`: `None` when the clock must be programmed from
 /// scratch ("force full PLL disable + enable"), otherwise what was kept.
-fn sanitize(io: &(impl MmioWindow + ?Sized), hw: &Current) -> Result<Option<InitOutcome>, CdclkError> {
+fn sanitize(
+    io: &(impl MmioWindow + ?Sized),
+    hw: &Current,
+) -> Result<Option<InitOutcome>, CdclkError> {
     // "Is PLL enabled and locked?"
     if hw.vco == 0 || hw.cdclk_khz == REFCLK_KHZ {
         return Ok(None);
@@ -519,7 +522,10 @@ pub fn init_hw(
 /// the display-core uninit (`skl_display_core_uninit`): CDCLK to the 24 MHz
 /// bypass with DPLL0 off. Returns the VCO DPLL0 ran at, the preferred VCO
 /// the next [`init_hw`] restores (0 when it was already off).
-pub fn uninit_hw(io: &(impl MmioWindow + ?Sized), platform: Gen9Platform) -> Result<u32, CdclkError> {
+pub fn uninit_hw(
+    io: &(impl MmioWindow + ?Sized),
+    platform: Gen9Platform,
+) -> Result<u32, CdclkError> {
     let hw = Current::read(io)?;
     program(io, &hw, REFCLK_KHZ, 0, platform)?;
     Ok(hw.vco)

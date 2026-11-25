@@ -1760,9 +1760,7 @@ impl<'a, M: MmioWindow + ?Sized> LtPhy<'a, M> {
         // rate, UHBR included. Step 10 writes the link symbol clock.
         self.enable_pll_state(LtEnablePlan {
             state: dp_pll_state(request.rate),
-            valfreq_khz: crate::intel_gpu_xelpg::dp_link_symbol_clock_khz(
-                request.rate.clock_khz(),
-            ),
+            valfreq_khz: crate::intel_gpu_xelpg::dp_link_symbol_clock_khz(request.rate.clock_khz()),
             lane_count: request.lane_count,
             pin_assignment_d: request.pin_assignment_d,
             plla_ssc: request.ssc_enabled,

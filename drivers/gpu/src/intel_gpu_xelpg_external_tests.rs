@@ -4322,7 +4322,11 @@ fn smoke_mtl_external_uhbr_tc_route_lights_and_stops() -> TestResult {
     if io.phy.writes_to(0x6_4430) != [312_500]
         || io.phy.sram_get(0xCCE5) != 0x3104
         || io.phy.sram_get(0xCCE5 - 9) != 0x0001
-        || io.phy.vdr_get(0, crate::intel_gpu_xelpg::C20_VDR_CUSTOM_WIDTH) & 3 != 2
+        || io
+            .phy
+            .vdr_get(0, crate::intel_gpu_xelpg::C20_VDR_CUSTOM_WIDTH)
+            & 3
+            != 2
         || io.read32(XeLpgPort::Tc2.port_clock_ctl())
             & (crate::intel_gpu_xelpg::SSC_ENABLE_PLLA | crate::intel_gpu_xelpg::SSC_ENABLE_PLLB)
             != 0
@@ -4382,7 +4386,10 @@ fn smoke_mtl_external_uhbr_tc_route_lights_and_stops() -> TestResult {
         let at = |w: (u32, u8)| log.iter().position(|&e| e == w);
         let (Some(crc), Some(coding), Some(bw)) = (
             at((uhbr::DP_SDP_ERROR_DETECTION_CONFIGURATION, 1)),
-            at((uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET, uhbr::DP_SET_ANSI_128B132B)),
+            at((
+                uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET,
+                uhbr::DP_SET_ANSI_128B132B,
+            )),
             at((0x100, 0x01)),
         ) else {
             return TestResult::Fail("SDP CRC16, 128b/132b coding and DP_LINK_BW_10 must be set");
@@ -4419,15 +4426,19 @@ fn smoke_mtl_external_uhbr_tc_route_lights_and_stops() -> TestResult {
         let clear = log
             .windows(3)
             .position(|w| w == [(0x1c0, 1), (0x1c1, 0), (0x1c2, 0)]);
-        let back = log
-            .iter()
-            .rposition(|&e| e == (uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET, uhbr::DP_SET_ANSI_8B10B));
+        let back = log.iter().rposition(|&e| {
+            e == (
+                uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET,
+                uhbr::DP_SET_ANSI_8B10B,
+            )
+        });
         if clear.is_none() || back.is_none() || clear > back || sink.power_log.last() != Some(&2) {
             return TestResult::Fail("stop: payload clear, 8b/10b coding back, then D3");
         }
     }
     if io.writes_to(0x6_10a0).last() != Some(&0)
-        || io.read32(XeLpgPort::Tc2.port_clock_ctl()) & crate::intel_gpu_xelpg::lane_pclk_pll_request(0)
+        || io.read32(XeLpgPort::Tc2.port_clock_ctl())
+            & crate::intel_gpu_xelpg::lane_pclk_pll_request(0)
             != 0
     {
         return TestResult::Fail("stop: TRANS_DP2_CTL off and the PLL released");
@@ -4503,16 +4514,37 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
     let dp_alt = link(DisplayIp::Xelpdp, TcMode::DpAlt);
     let refusal = |r| Err::<Option<UhbrPlan>, _>(ExternalError::Uhbr(r));
     // 4K120 fits neither HBR2 x2 nor UHBR10 x2 at 18 bpp: DSC territory.
-    if plan_uhbr(&mut rates(uhbr::DP_UHBR10), &dp_alt, false, &limits, &uhd120, 24, true)
-        != refusal(uhbr::UhbrRefusal::Dsc)
-        || plan_uhbr(&mut rates(uhbr::DP_UHBR10), &dp_alt, false, &limits, &uhd120, 24, false)
-            != Ok(None)
+    if plan_uhbr(
+        &mut rates(uhbr::DP_UHBR10),
+        &dp_alt,
+        false,
+        &limits,
+        &uhd120,
+        24,
+        true,
+    ) != refusal(uhbr::UhbrRefusal::Dsc)
+        || plan_uhbr(
+            &mut rates(uhbr::DP_UHBR10),
+            &dp_alt,
+            false,
+            &limits,
+            &uhd120,
+            24,
+            false,
+        ) != Ok(None)
     {
         return TestResult::Fail("DSC over a UHBR common rate must refuse typed");
     }
     let tbt = link(DisplayIp::Xelpdp, TcMode::TbtAlt);
-    if plan_uhbr(&mut rates(uhbr::DP_UHBR10), &tbt, false, &limits, &uhd60, 24, false)
-        != refusal(uhbr::UhbrRefusal::Tbt)
+    if plan_uhbr(
+        &mut rates(uhbr::DP_UHBR10),
+        &tbt,
+        false,
+        &limits,
+        &uhd60,
+        24,
+        false,
+    ) != refusal(uhbr::UhbrRefusal::Tbt)
     {
         return TestResult::Fail("UHBR over Thunderbolt alt mode must refuse typed");
     }
@@ -4530,16 +4562,45 @@ fn smoke_mtl_external_uhbr_typed_refusals() -> TestResult {
     }
     // What leaves the 8b/10b route alone.
     let wcl = link(DisplayIp::WildcatLake, TcMode::DpAlt);
-    if plan_uhbr(&mut rates(uhbr::DP_UHBR13_5), &dp_alt, false, &limits, &uhd60, 24, false)
-        != Ok(None)
-        || plan_uhbr(&mut rates(uhbr::DP_UHBR10), &dp_alt, true, &limits, &uhd60, 24, false)
-            != Ok(None)
-        || plan_uhbr(&mut rates(uhbr::DP_UHBR10), &wcl, false, &limits, &uhd60, 24, false)
-            != Ok(None)
+    if plan_uhbr(
+        &mut rates(uhbr::DP_UHBR13_5),
+        &dp_alt,
+        false,
+        &limits,
+        &uhd60,
+        24,
+        false,
+    ) != Ok(None)
+        || plan_uhbr(
+            &mut rates(uhbr::DP_UHBR10),
+            &dp_alt,
+            true,
+            &limits,
+            &uhd60,
+            24,
+            false,
+        ) != Ok(None)
+        || plan_uhbr(
+            &mut rates(uhbr::DP_UHBR10),
+            &wcl,
+            false,
+            &limits,
+            &uhd60,
+            24,
+            false,
+        ) != Ok(None)
     {
         return TestResult::Fail("no common UHBR rate, a C10 or WCL source keeps 8b/10b");
     }
-    match plan_uhbr(&mut rates(uhbr::DP_UHBR20), &dp_alt, false, &limits, &uhd60, 24, false) {
+    match plan_uhbr(
+        &mut rates(uhbr::DP_UHBR20),
+        &dp_alt,
+        false,
+        &limits,
+        &uhd60,
+        24,
+        false,
+    ) {
         Ok(Some(plan)) if plan.link.rate == uhbr::UhbrRate::Uhbr20 && plan.link.lanes == 1 => {}
         _ => return TestResult::Fail("a UHBR20-only sink takes UHBR20 x1"),
     }
@@ -4828,7 +4889,9 @@ pub(crate) mod nova {
             Ok(probe) => probe,
             Err(_) => return TestResult::Fail("the Nova DP 2.0 sink must probe with UHBR on"),
         };
-        if probe.uhbr.map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp, p.stream.tu))
+        if probe
+            .uhbr
+            .map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp, p.stream.tu))
             != Some((uhbr::UhbrRate::Uhbr10, 1, 24, 48))
         {
             return TestResult::Fail("4K30 over an RBR ceiling must take UHBR10 x1");
@@ -4857,7 +4920,9 @@ pub(crate) mod nova {
         if io.ext.writes_to(0x6_10a0).first() != Some(&(1 << 31))
             || io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 24) != 4 << 24
             || io.read32(port.ddi_buf_ctl())
-                & (DDI_BUF_CTL_ENABLE | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE | (3 << 18))
+                & (DDI_BUF_CTL_ENABLE
+                    | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE
+                    | (3 << 18))
                 != DDI_BUF_CTL_ENABLE | crate::intel_gpu_xe2lpd::DDI_BUF_D2D_LINK_ENABLE | (2 << 18)
         {
             return TestResult::Fail("TRANS_DP2_CTL, the 128b/132b mode and the 40-bit DDI");
@@ -4974,8 +5039,8 @@ pub(crate) mod nova {
     fn smoke_nvl_external_tbt_alt_on_lt_tc1() -> TestResult {
         use crate::intel_gpu_xe2lpd::{PICA_POWER_REQUEST, PICA_PW_CTL};
         use crate::intel_gpu_xelpg::{
-            lane_pclk_pll_request, FORWARD_CLOCK_UNGATE, PORT_BUF_IO_SELECT_TBT,
-            TBT_CLOCK_ACK, TBT_CLOCK_REQUEST, XE3_DDI_CLOCK_SELECT_MASK,
+            lane_pclk_pll_request, FORWARD_CLOCK_UNGATE, PORT_BUF_IO_SELECT_TBT, TBT_CLOCK_ACK,
+            TBT_CLOCK_REQUEST, XE3_DDI_CLOCK_SELECT_MASK,
         };
         let port = XeLpgPort::Tc1;
         let io = NovaExt::new(ExtFake::new(port, Sink::new(0x14, edid_1024())));
@@ -5020,10 +5085,14 @@ pub(crate) mod nova {
         };
         // intel_mtl_tbt_clock_select for the DP 1.4 rates.
         let khz = link_clock_khz(route.trained.rate);
-        let Some(select) = [(162_000, 0xc), (270_000, 0xd), (540_000, 0xe), (810_000, 0xf)]
-            .into_iter()
-            .find_map(|(rate, select)| (rate == khz).then_some(select))
-        else {
+        let Some(select) = [
+            (162_000, 0xc),
+            (270_000, 0xd),
+            (540_000, 0xe),
+            (810_000, 0xf),
+        ]
+        .into_iter()
+        .find_map(|(rate, select)| (rate == khz).then_some(select)) else {
             return TestResult::Fail("the tunnel trains at a DP 1.4 rate");
         };
         let clock = io.read32(port.port_clock_ctl());
@@ -5121,7 +5190,9 @@ pub(crate) mod nova {
         if (plan.link_rate, plan.lanes) != (270_000, 1)
             || probe.negotiated.rate != TrainRate::Hbr
             || probe.negotiated.lanes != 1
-            || probe.tc.is_none_or(|tc| tc.mode != TcMode::DpAlt || tc.max_lanes != 2)
+            || probe
+                .tc
+                .is_none_or(|tc| tc.mode != TcMode::DpAlt || tc.max_lanes != 2)
         {
             return TestResult::Fail("the plan must keep the sink's one-lane HBR link");
         }
@@ -5181,8 +5252,9 @@ pub(crate) mod nova {
         }
         let writes = io.ext.writes.borrow().clone();
         let pos = |f: &dyn Fn(u64, u32) -> bool| writes.iter().position(|&(o, v)| f(o, v));
-        let fec_off =
-            pos(&|o, v| o == DP_TP_CTL_B && v & (DP_TP_CTL_ENABLE | dsc::DP_TP_CTL_FEC_ENABLE) == 0);
+        let fec_off = pos(&|o, v| {
+            o == DP_TP_CTL_B && v & (DP_TP_CTL_ENABLE | dsc::DP_TP_CTL_FEC_ENABLE) == 0
+        });
         let macclk_off =
             pos(&|o, v| o == port.port_clock_ctl() && v & lane_pclk_pll_request(0) == 0);
         if !matches!((fec_off, macclk_off), (Some(f), Some(m)) if f < m)

@@ -273,12 +273,13 @@ pub fn pwm_enable(regs: &dyn MmioWindow, pwm: &Pwm) {
                 if util & UTIL_PIN_ENABLE != 0 {
                     regs.write32(UTIL_PIN_CTL, util & !UTIL_PIN_ENABLE);
                 }
-                let polarity = if util_active_low { UTIL_PIN_POLARITY } else { 0 };
+                let polarity = if util_active_low {
+                    UTIL_PIN_POLARITY
+                } else {
+                    0
+                };
                 // UTIL_PIN_PIPE(PIPE_A) is 0.
-                regs.write32(
-                    UTIL_PIN_CTL,
-                    polarity | UTIL_PIN_MODE_PWM | UTIL_PIN_ENABLE,
-                );
+                regs.write32(UTIL_PIN_CTL, polarity | UTIL_PIN_MODE_PWM | UTIL_PIN_ENABLE);
             }
             let ctl = regs.read32(bxt_blc_pwm_ctl(controller));
             if ctl & BXT_BLC_PWM_ENABLE != 0 {
@@ -414,7 +415,12 @@ const DDI_BUF_IS_IDLE: u32 = 1 << 7;
 const DP_SET_POWER: u32 = 0x600;
 const DP_SET_POWER_D3: u8 = 0x2;
 
-fn wait_clear(regs: &dyn MmioWindow, reg: u64, bit: u32, us: u64) -> Result<bool, Gen9SuspendError> {
+fn wait_clear(
+    regs: &dyn MmioWindow,
+    reg: u64,
+    bit: u32,
+    us: u64,
+) -> Result<bool, Gen9SuspendError> {
     let mut lost = false;
     let done = narf_scheduler::responsive_spin_until(
         || {
@@ -473,7 +479,10 @@ fn disable_transcoders(regs: &dyn MmioWindow) -> Result<(), Gen9SuspendError> {
 /// `DDI_BUF_IS_IDLE` within 10 ms).
 fn disable_ddi_buffer(regs: &dyn MmioWindow, panel: &Panel) -> Result<(), Gen9SuspendError> {
     let buf = read(regs, DDI_BUF_CTL_A)?;
-    regs.write32(DDI_BUF_CTL_A, buf & !crate::intel_gpu_ddi::DDI_BUF_CTL_ENABLE);
+    regs.write32(
+        DDI_BUF_CTL_A,
+        buf & !crate::intel_gpu_ddi::DDI_BUF_CTL_ENABLE,
+    );
     let tp = read(regs, DP_TP_CTL_A)?;
     regs.write32(DP_TP_CTL_A, tp & !(1 << 31));
     if panel.broxton() {
@@ -945,7 +954,12 @@ async fn prepare_installed(target: SystemSleepState) -> Result<(), Gen9SuspendEr
         return Err(Gen9SuspendError::ExternalRoute);
     }
     let dc_off = dc::ServiceDcSuspend { bar: owner.bar };
-    let saved = match prepare(&owner.window, &owner.panel, &dc_off, narf_time::monotonic_ns()) {
+    let saved = match prepare(
+        &owner.window,
+        &owner.panel,
+        &dc_off,
+        narf_time::monotonic_ns(),
+    ) {
         Ok(saved) => saved,
         Err(refusal) => {
             if !refusal.touched {

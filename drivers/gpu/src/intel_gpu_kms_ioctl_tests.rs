@@ -1201,7 +1201,11 @@ fn intel_kms_content_protection_round_trip() -> TestResult {
     let index = crate::drm_registry::register_drm_card_with_state(Arc::new(HdcpCard), card);
     let mode = crate::drm_registry::mode_state(index).unwrap();
     crate::intel_hdcp_live::__attach_for_test(index);
-    if mode.lock().content_protection(3).map(|c| (c.value, c.content_type)) != Some((0, Some(0)))
+    if mode
+        .lock()
+        .content_protection(3)
+        .map(|c| (c.value, c.content_type))
+        != Some((0, Some(0)))
     {
         return TestResult::Fail("connector without the property pair");
     }
@@ -1279,9 +1283,18 @@ fn intel_kms_content_protection_round_trip() -> TestResult {
     crate::intel_hdcp_live::__publish_for_test(index, 3, CpValue::Enabled);
     let events = reader.drain(8);
     let want = [
-        (alloc::string::String::from("HOTPLUG"), alloc::string::String::from("1")),
-        (alloc::string::String::from("CONNECTOR"), alloc::string::String::from("3")),
-        (alloc::string::String::from("PROPERTY"), alloc::format!("{CP}")),
+        (
+            alloc::string::String::from("HOTPLUG"),
+            alloc::string::String::from("1"),
+        ),
+        (
+            alloc::string::String::from("CONNECTOR"),
+            alloc::string::String::from("3"),
+        ),
+        (
+            alloc::string::String::from("PROPERTY"),
+            alloc::format!("{CP}"),
+        ),
     ];
     if mode.lock().content_protection(3).map(|c| c.value) != Some(2)
         || events.len() != 1

@@ -24,11 +24,11 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 
+use super::mst;
 use super::*;
+use crate::intel_hdcp_live as live;
 use crate::intel_hdcp_msg::{self as msg, GscFraming, GscPacketPort, HdcpPortData};
 use crate::intel_hdcp_shim::{self as shim, Ddc, DpShim, Dpcd, HdmiShim};
-use crate::intel_hdcp_live as live;
-use super::mst;
 
 // ── Driving ──────────────────────────────────────────────────────────
 
@@ -136,8 +136,8 @@ impl MmioWindow for Regs {
                 };
             }
             if off == trans_hdcp_status(x) {
-                let enc = s.regs.get(&trans_hdcp_status(t)).copied().unwrap_or(0) & HDCP_STATUS_ENC
-                    != 0;
+                let enc =
+                    s.regs.get(&trans_hdcp_status(t)).copied().unwrap_or(0) & HDCP_STATUS_ENC != 0;
                 return v | if select && enc {
                     mst::hdcp_status_stream_enc(x)
                 } else {
@@ -1305,7 +1305,11 @@ impl crate::dp_aux::AuxChannel for IrqAux {
             AuxCommand::NativeRead => {
                 let n = req.data.len();
                 for (i, b) in reply[1..=n].iter_mut().enumerate() {
-                    *b = self.mem.get(&(req.address + i as u32)).copied().unwrap_or(0);
+                    *b = self
+                        .mem
+                        .get(&(req.address + i as u32))
+                        .copied()
+                        .unwrap_or(0);
                 }
                 n
             }
@@ -1409,8 +1413,7 @@ fn hdcp22_dp_cp_irq() -> TestResult {
         encoder_id: None,
         modes: Vec::new(),
     });
-    let index =
-        crate::drm_registry::register_drm_card_with_state(Arc::new(LiveCard), card);
+    let index = crate::drm_registry::register_drm_card_with_state(Arc::new(LiveCard), card);
     live::__attach_for_test(index);
     let key = live::xelpg_key(1, 1);
     let route = live::RouteDesc {

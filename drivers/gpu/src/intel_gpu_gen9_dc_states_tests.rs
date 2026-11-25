@@ -1198,7 +1198,14 @@ fn smoke_gen9_resume_cdclk_init_and_pch_handshake() -> TestResult {
     if fake.writes_to(HSW_NDE_RSTWRN_OPT) != [0x11] {
         return TestResult::Fail("RESET_PCH_HANDSHAKE_ENABLE (bit 4) must be set, bit 0 kept");
     }
-    if fake.writes_to(CDCLK) != [0x0800_02A1, 0x0808_02A1, 0x0008_0000, 0x0808_02A1, 0x0800_02A1]
+    if fake.writes_to(CDCLK)
+        != [
+            0x0800_02A1,
+            0x0808_02A1,
+            0x0008_0000,
+            0x0808_02A1,
+            0x0800_02A1,
+        ]
     {
         return TestResult::Fail("CDCLK_CTL must take skl_set_cdclk's 337.5 MHz Wa #1183 dance");
     }
@@ -1384,7 +1391,9 @@ fn smoke_gen9_skl_display_core_uninit() -> TestResult {
     let dbuf = log
         .iter()
         .position(|(o, v)| *o == DBUF_CTL_S1 && v & (1 << 31) == 0);
-    let pll = log.iter().position(|(o, v)| *o == LCPLL1 && v & (1 << 31) == 0);
+    let pll = log
+        .iter()
+        .position(|(o, v)| *o == LCPLL1 && v & (1 << 31) == 0);
     let pw1 = log
         .iter()
         .position(|(o, v)| *o == HSW_PWR_WELL_CTL2 && v & (1 << 29) == 0);

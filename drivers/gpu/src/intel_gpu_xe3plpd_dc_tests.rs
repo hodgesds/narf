@@ -535,7 +535,13 @@ fn smoke_xe3plpd_dc3co_trigger_and_owned_refusal() -> TestResult {
     let cases = [
         (panel, Err(Dc3coRefusal::NoTrigger)),
         (psr2, Ok(1)),
-        (Dc3coState { lobf: true, ..panel }, Ok(2)),
+        (
+            Dc3coState {
+                lobf: true,
+                ..panel
+            },
+            Ok(2),
+        ),
         (
             Dc3coState {
                 panel_replay_as_sdp: true,

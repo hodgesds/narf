@@ -1058,7 +1058,8 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
                     } => Some((OpKind::Retype, r)),
                     Commit::Enable { .. } => Some((OpKind::Enable, r)),
                 }
-            } else if link.value() == CpValue::Enabled && narf_time::monotonic_ns() >= s.next_check_ns
+            } else if link.value() == CpValue::Enabled
+                && narf_time::monotonic_ns() >= s.next_check_ns
             {
                 Some((OpKind::Check, r))
             } else {
@@ -1092,8 +1093,7 @@ fn finish(i: usize, done: OpDone) {
             return;
         };
         let now = narf_time::monotonic_ns();
-        if let (Ok(()), OpKind::Enable | OpKind::Retype | OpKind::Check) =
-            (&done.result, done.kind)
+        if let (Ok(()), OpKind::Enable | OpKind::Retype | OpKind::Check) = (&done.result, done.kind)
         {
             s.next_check_ns = now + done.link.check_period_ms() * 1_000_000;
         }

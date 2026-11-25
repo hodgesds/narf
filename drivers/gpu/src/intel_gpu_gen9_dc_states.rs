@@ -1294,8 +1294,8 @@ pub fn display_core_uninit_skl<M: MmioWindow + ?Sized>(
     platform: Gen9Platform,
 ) -> Result<u32, CoreInitError> {
     dbuf_set(regs, false)?;
-    let vco = crate::intel_gpu_gen9_cdclk::uninit_hw(regs, platform)
-        .map_err(|_| CoreInitError::Cdclk)?;
+    let vco =
+        crate::intel_gpu_gen9_cdclk::uninit_hw(regs, platform).map_err(|_| CoreInitError::Cdclk)?;
     pw1_release(regs)?;
     Ok(vco)
 }
@@ -2192,7 +2192,12 @@ fn resume_after_suspend() {
     let (pending, platform, vco, resident) = {
         let mut core = service.core.lock();
         let pending = core.resume_begin(&service.window);
-        (pending, core.platform(), core.preferred_vco(), core.resident())
+        (
+            pending,
+            core.platform(),
+            core.preferred_vco(),
+            core.resident(),
+        )
     };
     match pending {
         Ok(true) => {}

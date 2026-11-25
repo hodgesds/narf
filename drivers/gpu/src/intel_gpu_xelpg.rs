@@ -2038,12 +2038,11 @@ pub fn dp_uhbr_pll_request(
         return Err(Cx0Error::UnsupportedRate);
     }
     let vdr = C20Vdr::dp(port_clock_khz).ok_or(Cx0Error::UnsupportedRate)?;
-    let state = match c20_uhbr_pll_state(port_clock_khz, display30)
-        .ok_or(Cx0Error::UnsupportedRate)?
-    {
-        C20UhbrPll::Mplla(state) => Cx0PllState::C20Mplla(*state, vdr),
-        C20UhbrPll::Mpllb(state) => Cx0PllState::C20(*state, vdr),
-    };
+    let state =
+        match c20_uhbr_pll_state(port_clock_khz, display30).ok_or(Cx0Error::UnsupportedRate)? {
+            C20UhbrPll::Mplla(state) => Cx0PllState::C20Mplla(*state, vdr),
+            C20UhbrPll::Mpllb(state) => Cx0PllState::C20(*state, vdr),
+        };
     Ok(PllRequest {
         lanes: PhyLaneConfig::NATIVE,
         state,
@@ -3186,7 +3185,9 @@ pub mod tests {
         if u10.tx != [0xBE21, 0xE800, 0x0000]
             || u10.cmn != [0x0700, 0x0005, 0x0000, 0x0000]
             || u10.mplla
-                != [0x3104, 0xD105, 0xC025, 0xC025, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001]
+                != [
+                    0x3104, 0xD105, 0xC025, 0xC025, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001,
+                ]
         {
             return TestResult::Fail("mtl_c20_dp_uhbr10 words differ");
         }
@@ -3196,7 +3197,9 @@ pub mod tests {
         if u20.tx != [0xBE20, 0x4800, 0x0000]
             || u20.cmn != [0x0500, 0x0005, 0x0000, 0x0000]
             || u20.mplla
-                != [0x3104, 0xD105, 0x9217, 0x9217, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001]
+                != [
+                    0x3104, 0xD105, 0x9217, 0x9217, 0x8C00, 0x759A, 0x4000, 0x0003, 0x3555, 0x0001,
+                ]
         {
             return TestResult::Fail("mtl_c20_dp_uhbr20 words differ");
         }
@@ -3209,13 +3212,13 @@ pub mod tests {
         if mtl.tx != [0xBEA0, 0x4800, 0x0000]
             || mtl.mpllb
                 != [
-                    0x015F, 0x2205, 0x1B17, 0xFFC1, 0xE100, 0xBD00, 0x2000, 0x0001, 0x4800,
-                    0x0000, 0x0000,
+                    0x015F, 0x2205, 0x1B17, 0xFFC1, 0xE100, 0xBD00, 0x2000, 0x0001, 0x4800, 0x0000,
+                    0x0000,
                 ]
             || xe3.mpllb
                 != [
-                    0x015F, 0x2205, 0x1B17, 0xFFC1, 0xBD00, 0x9EC3, 0x2000, 0x0001, 0x4800,
-                    0x0000, 0x0000,
+                    0x015F, 0x2205, 0x1B17, 0xFFC1, 0xBD00, 0x9EC3, 0x2000, 0x0001, 0x4800, 0x0000,
+                    0x0000,
                 ]
         {
             return TestResult::Fail("UHBR13.5 MPLLB words differ (mtl vs xe2hpd)");
@@ -3264,8 +3267,7 @@ pub mod tests {
     /// `DDI_CLK_VALFREQ` = the 312.5 MHz symbol clock.
     fn smoke_c20_uhbr10_enable_programs_mplla_context() -> TestResult {
         let fake = FakePhy::new(XeLpgPort::Tc1);
-        let req = match dp_uhbr_pll_request(PhyKind::C20, 1_000_000, 4, false, false, true, false)
-        {
+        let req = match dp_uhbr_pll_request(PhyKind::C20, 1_000_000, 4, false, false, true, false) {
             Ok(req) => req,
             Err(_) => return TestResult::Fail("UHBR10 request must build on C20"),
         };

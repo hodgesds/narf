@@ -224,7 +224,10 @@ fn scanout_object_ok(object: &GemObject, vram_scanout: bool) -> bool {
 /// pins its attachment ([`crate::intel_gpu_prime::pin_for_scanout`]); a
 /// discrete one pins framebuffers to VRAM0, which an sg BO cannot reach
 /// (`xe_bo_migrate` -EINVAL). Anything else: nothing to do.
-async fn pin_import_for_scanout(object: &Arc<GemObject>, vram_scanout: bool) -> Result<(), FsError> {
+async fn pin_import_for_scanout(
+    object: &Arc<GemObject>,
+    vram_scanout: bool,
+) -> Result<(), FsError> {
     if !object.is_imported() {
         return Ok(());
     }

@@ -1383,8 +1383,7 @@ impl<M: ScanoutIo> Presenter<M> {
         {
             return Err(ScanoutError::Unsupported);
         }
-        if !self.latched_expected()
-        {
+        if !self.latched_expected() {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }

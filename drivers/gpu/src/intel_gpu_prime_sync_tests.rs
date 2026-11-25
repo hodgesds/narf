@@ -415,7 +415,8 @@ fn smoke_intel_prime_foreign_import_mmap_maps_exporter_pages_under_cpu_sync() ->
         .object(gem.create(4 * PAGE, |_, _| Ok(())).unwrap())
         .unwrap();
     exporter.write(PAGE, &[0x5a; 16]).unwrap();
-    let (importer, handle, imported) = crate::intel_gpu_prime::fixture::foreign_import(&exporter, 778);
+    let (importer, handle, imported) =
+        crate::intel_gpu_prime::fixture::foreign_import(&exporter, 778);
     let offset = importer.mmap_offset(handle).unwrap();
     let pages: Vec<u64> = exporter.pages().collect();
     let view = importer

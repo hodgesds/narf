@@ -330,12 +330,7 @@ pub enum WideLink {
 /// lowest (the 8b/10b rates of `limits`, then the UHBR rates in
 /// `uhbr_rates`) and every lane count from 1 to `limits.max_lanes`; the
 /// first that carries the mode wins.
-pub fn wide_link(
-    limits: &dsc::LinkLimits,
-    uhbr_rates: u8,
-    mode: &Mode,
-    max_bpp: u32,
-) -> WideLink {
+pub fn wide_link(limits: &dsc::LinkLimits, uhbr_rates: u8, mode: &Mode, max_bpp: u32) -> WideLink {
     let max_bpp = max_bpp.min(dsc::PIPE_BPP);
     let lanes = [1u8, 2, 4].into_iter().filter(|&l| l <= limits.max_lanes);
     let (clock, hdisplay) = (mode.pixel_clock_khz, u32::from(mode.h_active));
@@ -490,10 +485,7 @@ impl Clock for SystemClock {
         narf_time::wall::monotonic_ns() / 1_000
     }
     fn sleep_us(&mut self, us: u64) {
-        let _ = narf_scheduler::responsive_spin_until(
-            || false,
-            narf_time::Deadline::after_us(us),
-        );
+        let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(us));
     }
 }
 
@@ -644,9 +636,7 @@ fn set_link_train<A: AuxChannel + ?Sized, S: UhbrSource>(
     train_set: &[u8; 4],
     lanes: u8,
 ) -> Result<(), TrainError<S::Error>> {
-    source
-        .pattern(source_pattern)
-        .map_err(TrainError::Source)?;
+    source.pattern(source_pattern).map_err(TrainError::Source)?;
     let mut buf = [0u8; 5];
     buf[0] = dpcd_pattern;
     buf[1..5].copy_from_slice(train_set);

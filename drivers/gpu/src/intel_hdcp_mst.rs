@@ -233,7 +233,11 @@ impl MstHdcp {
     /// The route's one connector: ENABLED when every stream is, UNDESIRED
     /// when none wants protection, else DESIRED.
     pub fn value(&self) -> CpValue {
-        if !self.streams.is_empty() && self.streams.iter().all(|s| s.conn.value == CpValue::Enabled)
+        if !self.streams.is_empty()
+            && self
+                .streams
+                .iter()
+                .all(|s| s.conn.value == CpValue::Enabled)
         {
             CpValue::Enabled
         } else if self

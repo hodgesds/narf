@@ -178,7 +178,10 @@ fn first_light(
         PwmLayout::Bxt(c) => {
             m.write32(bxt_blc_pwm_freq(c), PERIOD);
             m.write32(bxt_blc_pwm_duty(c), DUTY);
-            m.write32(bxt_blc_pwm_ctl(c), BXT_BLC_PWM_ENABLE | BXT_BLC_PWM_POLARITY);
+            m.write32(
+                bxt_blc_pwm_ctl(c),
+                BXT_BLC_PWM_ENABLE | BXT_BLC_PWM_POLARITY,
+            );
         }
         PwmLayout::None => {}
     }
@@ -318,9 +321,7 @@ fn big_core_round_trip() -> Result<(), &'static str> {
         return Err("power, modeset, PWM, then the PPS gate");
     }
     let core = local.core.lock();
-    if core.refs(Gen9DcUser::Suspend) != 0
-        || local.deadline.load(Ordering::Relaxed) != 117 * MS
-    {
+    if core.refs(Gen9DcUser::Suspend) != 0 || local.deadline.load(Ordering::Relaxed) != 117 * MS {
         return Err("the Suspend reference must drop with re-entry 17 ms later");
     }
     Ok(())
@@ -533,7 +534,9 @@ fn refusals_on_hardware() -> Result<(), &'static str> {
         if suspend_late(&m, &p, SystemSleepState::S3, true, dc_off) != want {
             return Err("a lit DSI transcoder must refuse the late step");
         }
-        if m.log().iter().any(|(o, _)| *o == DC_STATE_EN || *o == 0x46070 || *o == 0x45008)
+        if m.log()
+            .iter()
+            .any(|(o, _)| *o == DC_STATE_EN || *o == 0x46070 || *o == 0x45008)
         {
             return Err("a refused late step must write nothing to DC, CDCLK or DBUF");
         }
@@ -569,7 +572,10 @@ fn refusals_on_hardware() -> Result<(), &'static str> {
     }
     Ok(())
 }
-kernel_test_in!("drivers/gpu/intel_gpu_gen9_suspend", smoke_gen9_suspend_refusals);
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_suspend",
+    smoke_gen9_suspend_refusals
+);
 
 /// Display 9 proper into suspend-to-idle with a DMC payload keeps its core
 /// (`intel_power_domains_suspend`'s early return): the late step writes
@@ -578,7 +584,15 @@ kernel_test_in!("drivers/gpu/intel_gpu_gen9_suspend", smoke_gen9_suspend_refusal
 fn s2idle_keeps_the_core() -> Result<(), &'static str> {
     let m = Machine::new();
     let p = panel(Gen9Platform::KabyLake);
-    let (_, local) = first_light(&m, &p, ChipInfo { did: 0x5916, asic: "kabylake", ..skl() })?;
+    let (_, local) = first_light(
+        &m,
+        &p,
+        ChipInfo {
+            did: 0x5916,
+            asic: "kabylake",
+            ..skl()
+        },
+    )?;
     let saved = prepare(&m, &p, &local, 0).map_err(|_| "the preparation must succeed")?;
     m.clear_log();
     let late = suspend_late(&m, &p, SystemSleepState::S0Idle, true, &local);
@@ -586,8 +600,7 @@ fn s2idle_keeps_the_core() -> Result<(), &'static str> {
         return Err("s2idle with the DMC must keep the core untouched");
     }
     if resume_early(&m, &p, &saved, Some(late), &local).is_err()
-        || m
-            .log()
+        || m.log()
             .iter()
             .any(|(o, _)| *o == 0x46000 || *o == 0x45404 || (0x80000..0x8F000).contains(o))
     {

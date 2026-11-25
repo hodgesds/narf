@@ -798,8 +798,10 @@ impl Plan {
                             }
                         } else if card.connector(object).is_ok() {
                             let at = p.protection.iter().position(|(c, _)| *c == object);
-                            let mut change = at.map_or_else(Default::default, |i| p.protection[i].1);
-                            if content_protection_property(card, object, prop, value, &mut change)? {
+                            let mut change =
+                                at.map_or_else(Default::default, |i| p.protection[i].1);
+                            if content_protection_property(card, object, prop, value, &mut change)?
+                            {
                                 match at {
                                     Some(i) => p.protection[i].1 = change,
                                     None => p.protection.push((object, change)),
@@ -1795,10 +1797,7 @@ async fn execute_plan<B: Backend>(
             card.collect_blobs();
             for (connector, change) in &plan.protection {
                 hdcp.extend(apply_content_protection(
-                    card_index,
-                    &mut card,
-                    *connector,
-                    *change,
+                    card_index, &mut card, *connector, *change,
                 ));
             }
             if matches!(plan.action, Action::Color { .. }) {
@@ -1840,9 +1839,8 @@ fn protected(fb: &Framebuffer) -> bool {
 
 /// The registry index of the card whose state is `mode`.
 fn card_index_of(mode: &ModeState) -> Option<u32> {
-    (0..crate::drm_registry::count() as u32).find(|&i| {
-        crate::drm_registry::mode_state(i).is_some_and(|m| Arc::ptr_eq(&m, mode))
-    })
+    (0..crate::drm_registry::count() as u32)
+        .find(|&i| crate::drm_registry::mode_state(i).is_some_and(|m| Arc::ptr_eq(&m, mode)))
 }
 
 fn plan_dependencies(

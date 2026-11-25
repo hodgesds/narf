@@ -736,9 +736,7 @@ mod tests {
         if let Err(e) = nova_lt_lit(&io, dp_pll_state(rate), &levels) {
             return TestResult::Fail(e);
         }
-        let second = io
-            .ext
-            .first_write(|r, _| r == trans_clk_sel(Transcoder::C));
+        let second = io.ext.first_write(|r, _| r == trans_clk_sel(Transcoder::C));
         let last_lt = io.ext.last_write(|r, _| io.lt_reg(r));
         if !matches!((last_lt, second), (Some(l), Some(c)) if l < c) {
             return TestResult::Fail("the second stream must not reach the LT PHY");

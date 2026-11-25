@@ -397,9 +397,13 @@ fn smoke_uhbr_training_failures_leave_tps2_and_disable() -> TestResult {
         now: Cell::new(0),
         log: &log,
     };
-    if train(&mut sink, &mut source, &mut clock, 4, 0) != Err(TrainError::Source("source pattern failed"))
+    if train(&mut sink, &mut source, &mut clock, 4, 0)
+        != Err(TrainError::Source("source pattern failed"))
         || log.borrow().last()
-            != Some(&Ev::Write(DP_TRAINING_PATTERN_SET, vec![DP_TRAINING_PATTERN_DISABLE]))
+            != Some(&Ev::Write(
+                DP_TRAINING_PATTERN_SET,
+                vec![DP_TRAINING_PATTERN_DISABLE],
+            ))
     {
         return TestResult::Fail("a source failure must still disable the sink's pattern");
     }
@@ -455,10 +459,12 @@ fn smoke_uhbr_prepare_and_payload_dpcd() -> TestResult {
             if req.cmd == AuxCommand::NativeRead && req.address == DP_PAYLOAD_TABLE_UPDATE_STATUS {
                 self.1 += 1;
                 if self.1 == 3 {
-                    self.0.set(DP_PAYLOAD_TABLE_UPDATE_STATUS, &[DP_PAYLOAD_TABLE_UPDATED]);
+                    self.0
+                        .set(DP_PAYLOAD_TABLE_UPDATE_STATUS, &[DP_PAYLOAD_TABLE_UPDATED]);
                 }
                 if self.1 == 4 {
-                    self.0.set(DP_PAYLOAD_TABLE_UPDATE_STATUS, &[DP_PAYLOAD_ACT_HANDLED]);
+                    self.0
+                        .set(DP_PAYLOAD_TABLE_UPDATE_STATUS, &[DP_PAYLOAD_ACT_HANDLED]);
                 }
             }
             self.0.transact(req, reply)
@@ -521,7 +527,10 @@ fn smoke_uhbr_sink_and_source_rates() -> TestResult {
     raw[0] = 0x14;
     raw[2] = 4 | DP_POST_LT_ADJ_REQ_SUPPORTED;
     let mut sink = Dp20Sink::new(&log, vec![[0; 6]]);
-    sink.set(DP_128B132B_SUPPORTED_LINK_RATES, &[DP_UHBR10 | DP_UHBR20 | DP_UHBR13_5]);
+    sink.set(
+        DP_128B132B_SUPPORTED_LINK_RATES,
+        &[DP_UHBR10 | DP_UHBR20 | DP_UHBR13_5],
+    );
     // Without DP_CAP_ANSI_128B132B nothing past the caps is read.
     match read_sink(&mut sink, &raw) {
         Ok(caps) if caps.rates == 0 && caps.post_lt_adj_req && log.borrow().is_empty() => {}
@@ -533,7 +542,10 @@ fn smoke_uhbr_sink_and_source_rates() -> TestResult {
         _ => return TestResult::Fail("a direct DP 2.0 sink reports its rates"),
     }
     // One LTTPR (count 0x80) at revision 2.0 carrying UHBR10 only.
-    sink.set(DP_LTTPR_COMMON_CAPS, &[0x20, 0x1e, 0x80, 0x55, 4, 0, 1, DP_UHBR10]);
+    sink.set(
+        DP_LTTPR_COMMON_CAPS,
+        &[0x20, 0x1e, 0x80, 0x55, 4, 0, 1, DP_UHBR10],
+    );
     match read_sink(&mut sink, &raw) {
         Ok(caps) if caps.rates == DP_UHBR10 && caps.lttpr => {}
         _ => return TestResult::Fail("a 128b/132b LTTPR must mask the rates"),
@@ -643,7 +655,8 @@ fn smoke_uhbr_link_choice_and_mn() -> TestResult {
         return TestResult::Fail("wrong UHBR link for 4K60 on two lanes");
     }
     match mtp_tu(&link, &uhd) {
-        Some(s) if s.tu == 48 && s.m_n == [(47 << 25) | 0x5e_579e, 0x80_0000, 0xf_34d6, 0x8_0000] => {}
+        Some(s)
+            if s.tu == 48 && s.m_n == [(47 << 25) | 0x5e_579e, 0x80_0000, 0xf_34d6, 0x8_0000] => {}
         _ => return TestResult::Fail("UHBR10 x2 M/N/TU differ from Linux"),
     }
     // Only UHBR20 in common: UHBR20 x1 already carries it.
@@ -660,8 +673,12 @@ fn smoke_uhbr_link_choice_and_mn() -> TestResult {
     // that before any UHBR rate; 4K120 (2673000 kBps at 18 bpp) fits
     // nothing uncompressed on two 8b/10b lanes.
     let uhd120 = mode(1_188_000, 3840, 4400, 2160, 2250);
-    if wide_link(&two, DP_UHBR10 | DP_UHBR20, &mode(148_500, 1920, 2200, 1080, 1125), 24)
-        != WideLink::EightTenB
+    if wide_link(
+        &two,
+        DP_UHBR10 | DP_UHBR20,
+        &mode(148_500, 1920, 2200, 1080, 1125),
+        24,
+    ) != WideLink::EightTenB
         || wide_link(&two, 0, &uhd, 24) != WideLink::EightTenB
         || wide_link(&two, DP_UHBR10, &uhd, 18) != WideLink::EightTenB
         || wide_link(&two, 0, &uhd120, 24) != WideLink::None
@@ -688,4 +705,7 @@ fn smoke_uhbr_link_choice_and_mn() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/intel_gpu_dp_uhbr", smoke_uhbr_link_choice_and_mn);
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_link_choice_and_mn
+);

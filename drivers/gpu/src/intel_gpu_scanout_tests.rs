@@ -958,7 +958,8 @@ fn scanout_pxp_protected_plane_decrypts_then_goes_black() -> TestResult {
     if last(&model, SURF) != Some(address)
         || csc.len() != 12
         || csc.iter().any(|&v| v != 0)
-        || last(&model, COLOR_CTL).map(|v| v & PLANE_COLOR_CSC_ENABLE) != Some(PLANE_COLOR_CSC_ENABLE)
+        || last(&model, COLOR_CTL).map(|v| v & PLANE_COLOR_CSC_ENABLE)
+            != Some(PLANE_COLOR_CSC_ENABLE)
         || !owner.forced_black()
     {
         pxp::set_display_pxp(None);
@@ -1015,7 +1016,10 @@ fn scanout_pxp_protected_plane_decrypts_then_goes_black() -> TestResult {
     };
     let fb_object = object(16384);
     fb_object.set_pxp_key(7);
-    if card.addfb2_intel(&cmd(0), fb_object.clone(), 7, true).is_ok() {
+    if card
+        .addfb2_intel(&cmd(0), fb_object.clone(), 7, true)
+        .is_ok()
+    {
         return TestResult::Fail("protected framebuffer without PXP planes");
     }
     card.intel_pxp_planes = true;

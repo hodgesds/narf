@@ -105,12 +105,7 @@ pub(crate) fn connector_property_event(card: u32, connector: u32, property: u32)
             }
         }
     }
-    narf_filesystem::emit_uevent_extras(
-        UeventAction::Change,
-        devpath,
-        String::from("drm"),
-        extras,
-    );
+    narf_filesystem::emit_uevent_extras(UeventAction::Change, devpath, String::from("drm"), extras);
     true
 }
 

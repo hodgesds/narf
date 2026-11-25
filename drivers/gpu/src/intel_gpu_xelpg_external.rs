@@ -199,9 +199,8 @@ use crate::intel_gpu_xe2lpd::{disable_d2d, enable_d2d, DisplayIp, DDI_BUF_D2D_LI
 use crate::intel_gpu_xelpg::{
     disable_port_pll_lanes, disable_tbt_clock, dp_pll_request, dp_uhbr_pll_request,
     enable_port_pll_state, enable_tbt_clock, program_port_buf_ctl, program_port_buf_ctl_width,
-    set_signal_levels, set_signal_levels_uhbr, wait_port_buf_active, wait_port_buf_idle,
-    Cx0Error, Cx0Phy, PhyKind, PhyLaneConfig, XeLpgPort, PORT_BUF_IO_SELECT_TBT,
-    PORT_BUF_PHY_IDLE,
+    set_signal_levels, set_signal_levels_uhbr, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
+    Cx0Phy, PhyKind, PhyLaneConfig, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
@@ -1183,8 +1182,8 @@ fn plan_uhbr<A: crate::dp_aux::AuxChannel + ?Sized>(
             if sink.lttpr {
                 return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Lttpr));
             }
-            let stream = uhbr::mtp_tu(&chosen, mode)
-                .ok_or(ExternalError::Uhbr(uhbr::UhbrRefusal::Slots))?;
+            let stream =
+                uhbr::mtp_tu(&chosen, mode).ok_or(ExternalError::Uhbr(uhbr::UhbrRefusal::Slots))?;
             Ok(Some(UhbrPlan {
                 link: chosen,
                 stream,
@@ -1971,8 +1970,7 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
     // indication (Linux only logs one that does not clear).
     let _ = uhbr::stop_train(&mut aux, &mut source, &mut clock)?;
     // 7.a 128b/132b SST: VCPID 1, start slot 0, tu slots.
-    let sink_payload =
-        uhbr::write_payload(&mut aux, &mut clock, 1, 0, plan.stream.tu);
+    let sink_payload = uhbr::write_payload(&mut aux, &mut clock, 1, 0, plan.stream.tu);
     route.uhbr = Some(UhbrTrained {
         presets,
         sink_payload,
@@ -2303,9 +2301,7 @@ fn finish<M: MmioWindow + ?Sized>(
             state.vc_payload = true;
         }
         mst::source_payload(io, trans, trans, true).map_err(|e| match e {
-            ExternalError::Mst(MstFailure::Act) => {
-                ExternalError::Uhbr(uhbr::UhbrRefusal::Payload)
-            }
+            ExternalError::Mst(MstFailure::Act) => ExternalError::Uhbr(uhbr::UhbrRefusal::Payload),
             e => e,
         })?;
         func |= TRANS_DDI_DP_VC_PAYLOAD_ALLOC;
@@ -2462,7 +2458,10 @@ fn disable_port<M: MmioWindow + ?Sized>(
     // 128b/132b route hands the sink back with DP_SET_ANSI_8B10B (best
     // effort, while the sink is still in D0).
     if uhbr {
-        let _ = aux.dpcd_write(uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET, &[uhbr::DP_SET_ANSI_8B10B]);
+        let _ = aux.dpcd_write(
+            uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET,
+            &[uhbr::DP_SET_ANSI_8B10B],
+        );
     }
     // Sink to D3 before the port goes down (a NACK never replaces the
     // local idle proof).

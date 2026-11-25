@@ -326,7 +326,8 @@ pub const fn dc3co_trigger(state: &Dc3coState) -> Result<u32, Dc3coRefusal> {
         return Err(Dc3coRefusal::NotEdp);
     }
     let pipe = state.active_pipes.trailing_zeros();
-    if state.joined_pipes != 1 || !((pipe == 0 && state.port == 0) || (pipe == 1 && state.port == 1))
+    if state.joined_pipes != 1
+        || !((pipe == 0 && state.port == 0) || (pipe == 1 && state.port == 1))
     {
         return Err(Dc3coRefusal::PortPipe);
     }
