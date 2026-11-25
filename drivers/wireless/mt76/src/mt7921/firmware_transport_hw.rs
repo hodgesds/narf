@@ -2033,7 +2033,10 @@ impl Transport {
         let mut transport = crate::mt7921::pci::invoke(&authority, || {
             authority.check_live().map_err(|_| Error::Authority)?;
             if !matches!(device.id.vendor, 0x14c3 | 0x0e8d)
-                || !matches!(device.id.device, 0x0616 | 0x0608 | 0x7922 | 0x7961 | 0x7920)
+                || !matches!(
+                    device.id.device,
+                    0x0616 | 0x0608 | 0x7922 | 0x7961 | 0x7920 | 0x7925 | 0x0717
+                )
             {
                 return Err(Error::Bounds);
             }

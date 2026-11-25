@@ -76,6 +76,13 @@ fn smoke_mt7921_name_for_known_ids() -> TestResult {
     if name_for(MTK_DEV_MT7920) != "mt7921-7920" {
         return TestResult::Fail("MT7920 name mismatch");
     }
+    if name_for(MTK_DEV_MT7925) != "mt7921-7925" {
+        return TestResult::Fail("MT7925 name mismatch");
+    }
+    // 0717 is a PCI alias for MT7925, not an MT7921 variant.
+    if name_for(MTK_DEV_MT7925_ALT) != "mt7925-0717" {
+        return TestResult::Fail("MT7925 PCI alias (0717) name mismatch");
+    }
     if name_for(0xFFFF) != "mt7921" {
         return TestResult::Fail("default name mismatch");
     }
@@ -243,6 +250,14 @@ fn smoke_mt7921_firmware_blobs_for_each_chip() -> TestResult {
     let (p, r) = firmware_blobs_for(MTK_DEV_MT7920);
     if p != MT7920_ROM_PATCH || r != MT7920_FIRMWARE_WM {
         return TestResult::Fail("MT7920 firmware blob names drift");
+    }
+    // MT7925 ships its own patch + RAM code (upstream `mt792x.h:51,59`).
+    // Both the 0x7925 DID and the 0717 PCI alias select the same pair.
+    for &did in [MTK_DEV_MT7925, MTK_DEV_MT7925_ALT].iter() {
+        let (p, r) = firmware_blobs_for(did);
+        if p != MT7925_ROM_PATCH || r != MT7925_FIRMWARE_WM {
+            return TestResult::Fail("MT7925 firmware blob names drift");
+        }
     }
     // PCI alias 0616 selects MT7922 firmware, as in the Linux match table.
     if firmware_blobs_for(MTK_DEV_MT7921_ALT) != firmware_blobs_for(MTK_DEV_MT7922) {
