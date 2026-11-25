@@ -405,8 +405,7 @@ fn smoke_usbfs_read_descriptors() -> TestResult {
         if n != 4 || tail[..] != cfg[2..6] {
             return Err("a read at an offset continues inside the configuration");
         }
-        let n = run(fx.file.read(18 + cfg.len() as u64, &mut tail))
-            .map_err(|_| "read")?;
+        let n = run(fx.file.read(18 + cfg.len() as u64, &mut tail)).map_err(|_| "read")?;
         if n != 0 {
             return Err("a read past the last configuration is EOF");
         }
@@ -1018,10 +1017,7 @@ fn smoke_usbfs_device_removal() -> TestResult {
             return Err("REAPURBNDELAY with nothing left on a removed device is ENODEV");
         }
         let mut buf = [0u8; 18];
-        if !matches!(
-            run(fx.file.read(0, &mut buf)),
-            Err(FsError::NoDevice)
-        ) {
+        if !matches!(run(fx.file.read(0, &mut buf)), Err(FsError::NoDevice)) {
             return Err("read of a removed device is ENODEV");
         }
         Ok(())
@@ -1121,8 +1117,7 @@ fn smoke_usbfs_node_names_and_metadata() -> TestResult {
         if again.stat().mode.perms != 0o664 || again.owners() != (0, 85) {
             return Err("udev's chmod/chown survive a new lookup");
         }
-        run(again.set_xattr(ACL_XATTR, &[2, 0, 0, 0], 0))
-            .map_err(|_| "acl")?;
+        run(again.set_xattr(ACL_XATTR, &[2, 0, 0, 0], 0)).map_err(|_| "acl")?;
         if run(lookup_node(3, 5).ok_or("acl node")?.get_xattr(ACL_XATTR)).ok()
             != Some(alloc::vec![2, 0, 0, 0])
         {
@@ -1151,9 +1146,7 @@ fn smoke_usbfs_root_hub() -> TestResult {
     let file = __open_for_test(Target::RootHub(hub), None, true);
     let other = __open_for_test(Target::RootHub(hub), None, true);
     let mem = Mem::new();
-    let io = |f: &Arc<UsbfsFile>, cmd: u32, arg: u64| {
-        run(f.ioctl_user(cmd, arg, &mem))
-    };
+    let io = |f: &Arc<UsbfsFile>, cmd: u32, arg: u64| run(f.ioctl_user(cmd, arg, &mem));
     let r = (|| {
         let mut buf = [0u8; 18];
         run(file.read(0, &mut buf)).map_err(|_| "read")?;
