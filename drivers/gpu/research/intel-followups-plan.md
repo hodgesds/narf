@@ -155,8 +155,15 @@ Still open, each needing its own grounding first:
 - PXP and HDCP. The MEI GSC proxy client they sit behind is in
   `drivers/platform/src/mei_gsc_proxy.rs` and joins the media GT's GSC
   worker through `narf_drivers::gsc_proxy`.
-- D3cold through `_PR3` power resources (NARF evaluates no AML), and
-  VRAM PRIME/P2P.
+- D3cold through `_PR3` power resources (NARF evaluates no AML).
+- VRAM PRIME/P2P beyond the static attachments in `intel_gpu_prime`
+  (peer-to-peer LMEM BAR mapping behind `narf.intel.prime_p2p=1`,
+  migration fallback, pinned, VRAM-only and nonvisible refusals, foreign
+  import binding): dynamic importers with move notification
+  (`xe_dma_buf_move_notify`), system suspend with a pinned VRAM export
+  (Linux evicts and restores it in place), CPU mmap and scanout of a
+  foreign import, AMD exporters and importers, and validation of the P2P
+  path on hardware.
 
 ## Shared files
 

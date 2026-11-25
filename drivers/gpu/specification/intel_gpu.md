@@ -3449,10 +3449,35 @@ admission". The modules are `intel_gpu_uapi` (wire definitions),
 `intel_gpu_gem` (owned system memory), `intel_gpu_render` (per-open dispatcher,
 contexts, VM handles and queries) and `intel_gpu_exec` (softpin admission and
 immutable PPGTT residency). Same-card PRIME shares owned objects and stable,
-globally distinct mmap offsets. Foreign attachments remain unavailable;
-explicit sync-file imports join the same owned reservation. Both primary and
-render nodes route these requests before shared DRM/KMS dispatch and acquire
-mmap backing atomically.
+globally distinct mmap offsets; explicit sync-file imports join the same
+owned reservation. Another native Xe card imports through `intel_gpu_prime`
+(below). Both primary and render nodes route these requests before shared
+DRM/KMS dispatch and acquire mmap backing atomically.
+
+Cross-device PRIME follows Linux `xe_dma_buf.c`. Export admits system and
+VRAM objects (VM-private and USERPTR objects refuse). An importer's
+attachment keeps peer-to-peer only where `narf_io::p2pdma`
+(`pci_p2pdma_distance` over `narf_bus::p2pdma::LiveTopology`) finds a path
+from the exporter's PCI function; otherwise the object must have a system
+placement (`xe_bo_can_migrate(bo, XE_PL_TT)`), so a VRAM-only object
+refuses with EOPNOTSUPP. Pinning (`xe_dma_buf_pin`) keeps VRAM only while
+every attachment is peer-to-peer, else migrates the idle object through the
+eviction copy. An object already pinned in VRAM, or a VRAM scanout object,
+refuses a system pin with EINVAL. Mapping returns the exporter's system
+pages, or for a peer the LMEM BAR bus addresses in segments of at most
+2 GiB; VRAM that is not wholly CPU-visible refuses with EOPNOTSUPP. NARF
+importers are static (no `xe_dma_buf_move_notify`): mapping pins for the
+attachment's life, which excludes eviction, exec re-migration and the
+suspend drain, so a pinned VRAM export refuses system suspend. The
+exporter's runtime-PM reference is held from that pin. The import is a
+system-placed object sharing the exporter's reservation, mapped at its
+first native VM_BIND (XE_COH_NONE and compressed indices refuse). It has no
+CPU copy, mmap, migration, i915 compatibility exec, ADDFB or cursor use. A
+reimport returns its handle; a re-export names the original buffer. Live
+imports request peer-to-peer only with `narf.intel.prime_p2p=1`. Native
+fixtures (`drivers/gpu/intel_gpu_prime`, the smallbar suite and
+`io/p2pdma`) cover BAR bus addresses, migration, the pinned, VRAM-only and
+nonvisible refusals and import binding.
 
 Native terminal fences now back the shared per-object dma-buf reservation.
 GuC and Gen12 resident admission check synchronous conflicts across the
@@ -3919,7 +3944,7 @@ and both btrfs postflights per architecture.
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0, BCS0, BMG BCS8 and selected CCS0–3 state, verified register policy, graphics-GT/engine workarounds on MTL/Arrow, DG2 and BMG | Media engines, remaining out-of-band workarounds and silicon qualification |
 | Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR), width-one GuC placement queues and single-row width-two through width-four COPY/COMPUTE groups, EXEC/user fences/per-engine cycles; explicit i915 compatibility on GuC cards with load-balanced context maps, WB softpin and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier), i915 GEM_USERPTR, fault/long-running VMs, multi-placement parallel submission and GPU user-fence joins, more queue/query families and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0, BMG BCS8 and fuse-derived CCS0–3 scheduling with dense logical instances and client-free reset reconfiguration; separate Gen12 foundations | Media GT and media submission, independently sourced profiles for other IP |
-| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings and explicit fence imports; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); DG2/BMG visible VRAM (64 KiB DG2 pages and trusted data/CCS clear, guarded BMG CPU clear, WC BAR mmap, placement fallback); fixed-mode MTL/Arrow WC GEM KMS flips with console handoff, PM exclusion, queued NONBLOCK return, native error fences and hardware latch events; checked-copy fallback and bounded console/GEM GGTT windows; fresh-console retirement after GT reset | Small-BAR/unmapped VRAM, eviction/migration and general GPU copy jobs, VRAM PRIME/P2P, Gen12 production direct-flip admission, tiled/compressed modifiers and extra planes |
+| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings and explicit fence imports; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); DG2/BMG visible VRAM (64 KiB DG2 pages and trusted data/CCS clear, guarded BMG CPU clear, WC BAR mmap, placement fallback); fixed-mode MTL/Arrow WC GEM KMS flips with console handoff, PM exclusion, queued NONBLOCK return, native error fences and hardware latch events; checked-copy fallback and bounded console/GEM GGTT windows; fresh-console retirement after GT reset; cross-device PRIME of system and VRAM objects (static attachments, peer-to-peer LMEM BAR mapping behind `narf.intel.prime_p2p=1`, migration fallback, pinned/VRAM-only/nonvisible refusals) | Small-BAR/unmapped VRAM, eviction/migration and general GPU copy jobs, dynamic (move-notify) dma-buf importers, suspend of a pinned VRAM export and CPU/scanout use of foreign imports, Gen12 production direct-flip admission, tiled/compressed modifiers and extra planes |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset; fixed-mode MTL/Arrow Pipe-A native CTM/gamma with DSB active replacement and joint primary/color arms; fixed 64x64 hardware cursor with owned PM_DEMAND/DBUF/MBUS/watermarks and separate retirement | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
 | Power and faults | Owned GuC/RCS0/BCS0/BMG-BCS8 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; per-context hang recovery with LRC runtime accounting and engine-progress fallback; bounded first-error reports and protected automatic GuC log/CT failure bundles; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; optional GuC SLPC/RC6 with acknowledged frequency bounds, Base/PowerSaving profiles and userspace policy replay; opt-in MTL/Arrow GT1 SLPC from its media fuses, GuC RC6 and powergating, required before GT1 publication and handed back to the host before every media stop; protected passive and flush-coordinated GuC log descriptors; cached DG2/BMG hwmon, fan/thermal readings, DG2 PL1 and BMG PL1/PL2/interval control | Full devcoredump and broader loss-accounted diagnostics, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, dynamic BMG MERT cap removal/L2-flush frequency coordination, GT1 frequency/idle sysfs and silicon acceptance of GT1 power |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
@@ -3942,7 +3967,7 @@ remeasured and is not a completion percentage.
 
 | Area | Still to write (est.) | Main items |
 | --- | --- | --- |
-| VM and memory | 18–25k | Fault-mode, long-running and CPU-address-mirror VMs; USERPTR invalidation (memory-layer MMU notifier); VRAM eviction and migration through general copy-engine jobs; nonvisible VRAM; VRAM PRIME/P2P |
+| VM and memory | 18–25k | Fault-mode, long-running and CPU-address-mirror VMs; USERPTR invalidation (memory-layer MMU notifier); VRAM eviction and migration through general copy-engine jobs; nonvisible VRAM; dynamic dma-buf importers (move notification) |
 | Engines | 10–15k | MTL media GT (own GuC instance, VCS/VECS, HuC load/auth); parallel queues |
 | Reliability and observability | 8–12k | Full devcoredump beyond bounded first-error reports; lossless GuC log streaming; OA and EU-stall perf streams |
 | Power | 5–8k | D3cold; autosuspend with live VRAM or a lit panel; dynamic MERT caps; remaining hwmon controls |
@@ -4097,7 +4122,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
 | VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20). Swap, lazy-free and compaction now refuse pinned pages, and VRAM CPU mappings are revoked and refaulted across runtime suspend (§20); i915 GEM_USERPTR, fault-mode/CPU-mirror VMs and long-running VMs remain |
-| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations; VRAM PRIME/P2P | Open; bounded BMG allocation does not close migration/alias ownership. CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20), but eviction/migration remains |
+| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations; dynamic dma-buf importers and in-place suspend of pinned VRAM exports | Open; bounded BMG allocation does not close migration/alias ownership. CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20), but eviction/migration remains. VRAM PRIME/P2P landed for static attachments (§19, cross-device PRIME); peer-to-peer is opt-in and unvalidated on hardware |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
