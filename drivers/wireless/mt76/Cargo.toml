@@ -1,4 +1,4 @@
-# mt76 — MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920), dual-build.
+# mt76 — MediaTek CONNAC2/CONNAC3 Wi-Fi (MT7921/MT7922/MT7961/MT7920 + MT7925), dual-build.
 #
 # Promoted from the former `drivers/wireless/src/mt7921/` module into a proper
 # per-driver crate. Builds two ways from one source, selected by cargo feature,
