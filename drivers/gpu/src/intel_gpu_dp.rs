@@ -320,6 +320,16 @@ impl HpdProfile {
             _ => None,
         }
     }
+    /// `intel_pps_get_registers`: whether the panel power sequencer still
+    /// has `PP_DIVISOR` — a display-9 source on a pre-CNP south display
+    /// (SPT, SPT-LP, KBP, and CMP-V, which `intel_pch_type` reports as SPT:
+    /// "CMP-V is based on KBP"). Gen9 LP and every CNP-or-later PCH keep
+    /// the power-cycle delay in `PP_CONTROL`.
+    pub(crate) fn has_pp_divisor(&self) -> bool {
+        matches!(self.family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. })
+            && self.bank() == HpdBank::Spt
+            && matches!(self.device & 0xff80, 0xa100 | 0x9d00 | 0xa280 | 0xa380)
+    }
     /// The GMBUS pin table of a Rocket Lake source's observed PCH:
     /// `gmbus_pins_icp` with TGP, `gmbus_pins_cnp` with CMP/CMP2 (CNP
     /// compatible). `None` for every other family.
@@ -2787,6 +2797,53 @@ pub mod tests {
             }
         }
     }
+
+    /// `intel_pps_get_registers`' `PP_DIVISOR` rule over `intel_pch_type`:
+    /// display 9 on SPT (0xA100), SPT-LP (0x9D00), KBP (0xA280) and CMP-V
+    /// (0xA380, "based on KBP, which is SPT compatible") keeps the divisor;
+    /// CNP, CNP-LP and CMP (CNP compatible), Gen9 LP and Rocket Lake on CMP
+    /// do not.
+    fn smoke_hpd_profile_pp_divisor_pchs() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gt::Gen9Platform;
+        let gen9 = SourceFamily::Gen9 {
+            platform: Gen9Platform::KabyLake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        for (device, want) in [
+            (0xA143u16, true),
+            (0x9D4E, true),
+            (0xA2C8, true),
+            (0xA3C8, true),
+            (0xA305, false),
+            (0x9D84, false),
+            (0x0284, false),
+            (0x0687, false),
+        ] {
+            let Some(profile) = HpdProfile::for_source(gen9, 0x8086, device, 0x060100) else {
+                return TestResult::Fail("every SPT-class PCH pairs with display 9");
+            };
+            if profile.has_pp_divisor() != want {
+                return TestResult::Fail("PP_DIVISOR exists below PCH_CNP only");
+            }
+        }
+        let lp = SourceFamily::Gen9 {
+            platform: Gen9Platform::Broxton,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        let rkl = SourceFamily::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+        if HpdProfile::observed_for_source(lp, 0, &[]).is_none_or(|p| p.has_pp_divisor())
+            || HpdProfile::for_source(rkl, 0x8086, 0x0284, 0x060100)
+                .is_none_or(|p| p.has_pp_divisor())
+        {
+            return TestResult::Fail("Gen9 LP and Rocket Lake have no PP_DIVISOR");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_hpd_profile_pp_divisor_pchs
+    );
 
     fn smoke_hpd_gen9_lp_de_port_bank() -> TestResult {
         use crate::intel_gpu_aux::SourceFamily;

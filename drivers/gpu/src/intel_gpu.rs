@@ -1145,12 +1145,28 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             }
         }
         let pps_window = crate::intel_gpu_bxt_display::PpsWindow::new(&window, lp);
-        let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::new(&pps_window);
+        // intel_pps_get_registers: a display-9 panel on a pre-CNP south
+        // display (SPT/KBP) keeps its power-cycle delay in PP_DIVISOR.
+        // Programmed only with narf.intel.pp_divisor=1.
+        let divisor = crate::intel_gpu_edp::pp_divisor_for(
+            dev.chip.generation == Generation::Skylake
+                && crate::intel_gpu_edp::pp_divisor_requested(narf_boot::args()),
+            {
+                use crate::intel_gpu_aux::MmioWindow as _;
+                dev.mode_window()
+                    .gen12_hpd_profile()
+                    .is_some_and(|profile| profile.has_pp_divisor())
+            },
+            &window,
+        );
+        let mut pps =
+            crate::intel_gpu_edp::PanelPowerSequencer::new_with_divisor(&pps_window, divisor);
         pps.init_registers();
         crate::intel_gpu_edp::runtime_install_panel(
             pps.delays(),
             crate::intel_gpu_edp::PsrLayout::from_generation(dev.chip.generation),
         );
+        crate::intel_gpu_edp::runtime_install_divisor(divisor);
         let panel_on = match pps.power_on() {
             Ok(()) => true,
             Err(e) => {

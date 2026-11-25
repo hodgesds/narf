@@ -44,9 +44,9 @@
 //! Gen9 modeset requires a loaded DMC); the relight is the probe's full
 //! panel modeset at the probe mode, not a restore of the last atomic state.
 //! Not done, unlike Linux: the master interrupt is not re-enabled after
-//! resume (no Gen9 interrupt handler is installed in this driver);
-//! `PP_DIVISOR` on pre-CNP south displays is not programmed (the probe's
-//! sequencer init does not either).
+//! resume (no Gen9 interrupt handler is installed in this driver).
+//! `PP_DIVISOR` on pre-CNP south displays is reprogrammed by the relight
+//! only when probe programmed it (`narf.intel.pp_divisor=1`).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -349,6 +349,10 @@ pub struct Panel {
     pub platform: Gen9Platform,
     /// The sequencer delays decoded at probe (`pps_init_delays`).
     pub delays: PanelDelays,
+    /// The probe's `PP_DIVISOR` layout (`narf.intel.pp_divisor=1` on a
+    /// pre-CNP south display), which the relight's `pps_init_registers`
+    /// reprograms; `None` keeps the `PP_CONTROL` layout.
+    pub divisor: Option<crate::intel_gpu_edp::PpDivisor>,
     pub pwm: PwmLayout,
     /// The probe-time DMC container and its payload ceiling, for the
     /// resume's `intel_dmc_load_program`.
@@ -760,7 +764,8 @@ pub fn relight(
         }
     }
     let pps_window = crate::intel_gpu_bxt_display::PpsWindow::new(regs, panel.lp());
-    let mut pps = PanelPowerSequencer::with_delays(&pps_window, panel.delays);
+    let mut pps =
+        PanelPowerSequencer::with_delays(&pps_window, panel.delays).with_divisor(panel.divisor);
     pps.init_registers();
     pps.power_on().map_err(Gen9SuspendError::Pps)?;
     if !light() {
@@ -873,6 +878,7 @@ pub(crate) fn install(
     let panel = Panel {
         platform,
         delays: crate::intel_gpu_edp::panel_delays(),
+        divisor: crate::intel_gpu_edp::pp_divisor(),
         pwm: pwm_layout(platform),
         dmc: crate::intel_gpu_gen9_dmc::resident_program()
             .filter(|_| crate::intel_gpu_gen9_dmc::gen9_dmc_loaded()),

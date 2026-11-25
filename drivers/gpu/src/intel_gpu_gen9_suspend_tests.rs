@@ -147,6 +147,7 @@ fn panel(platform: Gen9Platform) -> Panel {
             t10: 1,
             t11_t12: 0,
         },
+        divisor: None,
         pwm: if platform.is_lp() {
             PwmLayout::Bxt(0)
         } else {

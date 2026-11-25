@@ -88,6 +88,75 @@ pub const PP_CONTROL: u64 = 0xC_7204;
 pub const PP_ON_DELAYS: u64 = 0xC_7208;
 /// `PP_OFF_DELAYS` — T10 (power-down) and T9 (light-off) delays.
 pub const PP_OFF_DELAYS: u64 = 0xC_720C;
+/// `PP_DIVISOR` (`_PP_DIVISOR` 0x61210 on the PCH instance): the
+/// reference divider and the power-cycle delay, on pre-CNP south
+/// displays only (`intel_pps_get_registers`).
+pub const PP_DIVISOR: u64 = 0xC_7210;
+/// `PP_REFERENCE_DIVIDER_MASK` (31:8).
+const PP_REFERENCE_DIVIDER_SHIFT: u32 = 8;
+/// `PANEL_POWER_CYCLE_DELAY_MASK` (4:0).
+const PANEL_POWER_CYCLE_DELAY_MASK: u32 = 0x1F;
+/// `PCH_RAWCLK_FREQ` and `RAWCLK_FREQ_MASK` (`intel_display_regs.h`):
+/// the raw clock in MHz (`pch_rawclk`).
+pub const PCH_RAWCLK_FREQ: u64 = 0xC_6204;
+const RAWCLK_FREQ_MASK: u32 = 0x3FF;
+
+/// The boot option that programs `PP_DIVISOR` on a pre-CNP south display
+/// (default off: without it the sequencer keeps the CNP layout it always
+/// used, and `PP_DIVISOR` is never written).
+pub const PP_DIVISOR_OPT_IN: &str = "narf.intel.pp_divisor";
+
+/// The pre-CNP sequencer's `PP_DIVISOR`, as `pps_init_registers` programs
+/// it: the reference divider from the raw clock and the power-cycle delay
+/// (which on these south displays is not in `PP_CONTROL[8:4]`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PpDivisor {
+    /// The raw clock in kHz (`DISPLAY_RUNTIME_INFO(display)->rawclk_freq`).
+    rawclk_khz: u32,
+}
+
+impl PpDivisor {
+    /// A divisor for a raw clock of `rawclk_khz`; `None` below 1 MHz,
+    /// where the reference divider would underflow.
+    pub const fn new(rawclk_khz: u32) -> Option<Self> {
+        if rawclk_khz < 1000 {
+            None
+        } else {
+            Some(Self { rawclk_khz })
+        }
+    }
+
+    /// `pch_rawclk`: `PCH_RAWCLK_FREQ & RAWCLK_FREQ_MASK`, in MHz. `None`
+    /// for an all-ones (unavailable) or zero read.
+    pub fn read(io: &(impl MmioWindow + ?Sized)) -> Option<Self> {
+        let raw = io.read32(PCH_RAWCLK_FREQ);
+        if raw == u32::MAX || !io.display_access_ok() {
+            return None;
+        }
+        Self::new((raw & RAWCLK_FREQ_MASK) * 1000)
+    }
+
+    /// The raw clock this divisor was derived from, in kHz.
+    pub const fn rawclk_khz(self) -> u32 {
+        self.rawclk_khz
+    }
+
+    /// `pps_init_registers`' `PP_DIVISOR` value: `(100 * div) / 2 - 1` in
+    /// the reference-divider field (`div` the raw clock in MHz) and
+    /// `DIV_ROUND_UP(power_cycle, 1000) + 1` in the cycle field ("hardware
+    /// wants <delay>+1 in 100ms units").
+    pub const fn value(self, delays: &PanelDelays) -> u32 {
+        let div = self.rawclk_khz / 1000;
+        let reference = (100 * div) / 2 - 1;
+        let cycle = (delays.t11_t12 as u32).div_ceil(1000) + 1;
+        let cycle = if cycle > PANEL_POWER_CYCLE_DELAY_MASK {
+            PANEL_POWER_CYCLE_DELAY_MASK
+        } else {
+            cycle
+        };
+        (reference << PP_REFERENCE_DIVIDER_SHIFT) | cycle
+    }
+}
 
 // PP_STATUS bits.
 const PP_ON: u32 = 1 << 31;
@@ -191,6 +260,19 @@ impl PanelDelays {
         }
     }
 
+    /// [`Self::from_hw`] on a pre-CNP south display: the power-cycle delay
+    /// comes from `PP_DIVISOR[4:0]`, decoded as `pps_readout_hw_state` does
+    /// (`(field - 1) * 1000`, the hardware holding the delay plus one), a
+    /// field of 0 or 1 taking the spec value.
+    pub fn from_hw_divisor(pp_on: u32, pp_off: u32, pp_div: u32) -> PanelDelays {
+        let mut delays = Self::from_hw(pp_on, pp_off, 0);
+        let field = pp_div & PANEL_POWER_CYCLE_DELAY_MASK;
+        if field > 1 {
+            delays.t11_t12 = ((field - 1) * 1000) as u16;
+        }
+        delays
+    }
+
     /// `PP_ON_DELAYS` value to program. The hardware T8 field is
     /// forced to 1 (100 µs): this driver performs the T8 wait in
     /// software, as i915 does ("We override the HW backlight
@@ -256,6 +338,9 @@ pub struct PanelPowerSequencer<'a, M: MmioWindow + ?Sized> {
     /// Poll budget for status waits; a field so fixtures can run
     /// the timeout path without burning the production budget.
     status_poll_budget: u32,
+    /// A pre-CNP south display's `PP_DIVISOR` ([`Self::with_divisor`]);
+    /// `None` keeps the CNP layout (the cycle delay in `PP_CONTROL`).
+    divisor: Option<PpDivisor>,
 }
 
 impl<M: MmioWindow + ?Sized> core::fmt::Debug for PanelPowerSequencer<'_, M> {
@@ -267,6 +352,7 @@ impl<M: MmioWindow + ?Sized> core::fmt::Debug for PanelPowerSequencer<'_, M> {
             .field("last_power_on_cycles", &self.last_power_on_cycles)
             .field("last_power_off_cycles", &self.last_power_off_cycles)
             .field("status_poll_budget", &self.status_poll_budget)
+            .field("divisor", &self.divisor)
             .finish_non_exhaustive()
     }
 }
@@ -287,6 +373,7 @@ impl<'a, M: MmioWindow + ?Sized> PanelPowerSequencer<'a, M> {
             last_power_on_cycles: None,
             last_power_off_cycles: None,
             status_poll_budget: STATUS_POLL_BUDGET,
+            divisor: None,
         };
         seq.powered_on = seq.have_panel_power();
         seq
@@ -303,9 +390,38 @@ impl<'a, M: MmioWindow + ?Sized> PanelPowerSequencer<'a, M> {
             last_power_on_cycles: None,
             last_power_off_cycles: None,
             status_poll_budget: STATUS_POLL_BUDGET,
+            divisor: None,
         };
         seq.powered_on = seq.have_panel_power();
         seq
+    }
+
+    /// [`Self::new`] on a pre-CNP south display (`divisor` set): the
+    /// power-cycle delay is decoded from `PP_DIVISOR`
+    /// ([`PanelDelays::from_hw_divisor`]) and [`Self::init_registers`]
+    /// programs `PP_DIVISOR` instead of `PP_CONTROL[8:4]`. With `None` this
+    /// is [`Self::new`].
+    pub fn new_with_divisor(mmio: &'a M, divisor: Option<PpDivisor>) -> Self {
+        let Some(divisor) = divisor else {
+            return Self::new(mmio);
+        };
+        let pp_on = mmio.read32(PP_ON_DELAYS);
+        let pp_off = mmio.read32(PP_OFF_DELAYS);
+        let pp_div = mmio.read32(PP_DIVISOR);
+        let delays = PanelDelays::from_hw_divisor(pp_on, pp_off, pp_div);
+        Self::with_delays(mmio, delays).with_divisor(Some(divisor))
+    }
+
+    /// Use `divisor`'s `PP_DIVISOR` layout (a pre-CNP south display) for
+    /// [`Self::init_registers`]; `None` keeps the CNP layout.
+    pub fn with_divisor(mut self, divisor: Option<PpDivisor>) -> Self {
+        self.divisor = divisor;
+        self
+    }
+
+    /// The `PP_DIVISOR` layout in force, if any.
+    pub fn divisor(&self) -> Option<PpDivisor> {
+        self.divisor
     }
 
     /// The delays in force for this panel.
@@ -328,10 +444,17 @@ impl<'a, M: MmioWindow + ?Sized> PanelPowerSequencer<'a, M> {
     /// on/off delay registers outright, and the power-cycle field
     /// in `PP_CONTROL` by read-modify-write (CNP+ has no divisor
     /// register). Port-select bits are zero: Haswell-and-later
-    /// sequencers have no port selection.
+    /// sequencers have no port selection. With a
+    /// [`PpDivisor`] (a pre-CNP south display) the cycle delay and the
+    /// reference divider go to `PP_DIVISOR` instead and `PP_CONTROL` is not
+    /// written (`pps_init_registers`).
     pub fn init_registers(&mut self) {
         self.mmio.write32(PP_ON_DELAYS, self.delays.pp_on_value());
         self.mmio.write32(PP_OFF_DELAYS, self.delays.pp_off_value());
+        if let Some(divisor) = self.divisor {
+            self.mmio.write32(PP_DIVISOR, divisor.value(&self.delays));
+            return;
+        }
         self.pp_control_rmw(
             PP_POWER_CYCLE_DELAY_MASK,
             self.delays.cycle_field() << PP_POWER_CYCLE_DELAY_SHIFT,
@@ -1166,6 +1289,9 @@ pub enum DirtyOutcome {
 #[derive(Copy, Clone, Debug)]
 struct EdpRuntime {
     delays: Option<PanelDelays>,
+    /// The probe's `PP_DIVISOR` layout (`narf.intel.pp_divisor=1` on a
+    /// pre-CNP south display); `None` otherwise.
+    divisor: Option<PpDivisor>,
     layout: Option<PsrLayout>,
     caps: Option<PsrCaps>,
     active: Option<PsrMode>,
@@ -1179,6 +1305,7 @@ impl EdpRuntime {
     const fn new() -> Self {
         Self {
             delays: None,
+            divisor: None,
             layout: None,
             caps: None,
             active: None,
@@ -1295,6 +1422,40 @@ pub fn runtime_install_panel(delays: PanelDelays, layout: PsrLayout) {
     let mut rt = EDP_RUNTIME.lock();
     rt.delays = Some(delays);
     rt.layout = Some(layout);
+}
+
+/// Record the probe's `PP_DIVISOR` layout, which every later
+/// reprogramming of the sequencer (the Gen9 resume relight) reuses.
+pub fn runtime_install_divisor(divisor: Option<PpDivisor>) {
+    EDP_RUNTIME.lock().divisor = divisor;
+}
+
+/// The `PP_DIVISOR` layout probe recorded ([`runtime_install_divisor`]).
+pub(crate) fn pp_divisor() -> Option<PpDivisor> {
+    EDP_RUNTIME.lock().divisor
+}
+
+/// The probe's `PP_DIVISOR` decision (`intel_pps_get_registers`): with
+/// `narf.intel.pp_divisor=1` (`opted_in`) and a pre-CNP south display
+/// (`pre_cnp`, [`crate::intel_gpu_dp::HpdProfile::has_pp_divisor`]), the
+/// divisor for the raw clock the PCH reports ([`PpDivisor::read`]).
+/// `None` (the CNP layout, nothing new written) otherwise, including for a
+/// raw clock that does not read back.
+pub fn pp_divisor_for(
+    opted_in: bool,
+    pre_cnp: bool,
+    io: &(impl MmioWindow + ?Sized),
+) -> Option<PpDivisor> {
+    if !opted_in || !pre_cnp {
+        return None;
+    }
+    PpDivisor::read(io)
+}
+
+/// `narf.intel.pp_divisor=1`, with the strict grammar every Intel opt-in
+/// uses ([`crate::intel_gpu_gt::boot_opt_in`]).
+pub fn pp_divisor_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, PP_DIVISOR_OPT_IN)
 }
 
 /// Record a live PSR session at probe time.
@@ -1913,6 +2074,91 @@ pub mod tests {
         "drivers/gpu/intel_gpu_edp",
         smoke_pps_power_cycle_sequence_is_pinned
     );
+
+    /// A pre-CNP south display (`intel_pps_get_registers` leaves
+    /// `PP_DIVISOR` valid below `PCH_CNP`): `pps_init_registers` writes
+    /// `PP_DIVISOR` = `(100 * 24) / 2 - 1` = 1199 (0x4AF) in [31:8] for
+    /// SPT's 24 MHz raw clock and `DIV_ROUND_UP(6100, 1000) + 1` = 8 in
+    /// [4:0], and leaves `PP_CONTROL` alone; the readout decodes the
+    /// field as `(field - 1) * 1000` (`pps_readout_hw_state`).
+    fn smoke_pps_pre_cnp_programs_pp_divisor() -> TestResult {
+        if PP_DIVISOR != 0xC_7210 || PCH_RAWCLK_FREQ != 0xC_6204 {
+            return TestResult::Fail("PP_DIVISOR / PCH_RAWCLK_FREQ addresses");
+        }
+        let mmio = ScriptMmio::default();
+        mmio.set_current(PCH_RAWCLK_FREQ, 24);
+        let Some(divisor) = pp_divisor_for(true, true, &mmio) else {
+            return TestResult::Fail("a 24 MHz raw clock must give a divisor");
+        };
+        if divisor.rawclk_khz() != 24_000 {
+            return TestResult::Fail("pch_rawclk is the MHz field times 1000");
+        }
+        let mut pps = PanelPowerSequencer::with_delays(&mmio, PanelDelays::SPEC_DEFAULTS)
+            .with_divisor(Some(divisor));
+        pps.init_registers();
+        let expected = alloc::vec![
+            (PP_ON_DELAYS, 0x0834_0001),
+            (PP_OFF_DELAYS, 0x1388_0001),
+            (PP_DIVISOR, 0x0004_AF08),
+        ];
+        if mmio.all_writes() != expected {
+            return TestResult::Fail("pre-CNP init must write PP_DIVISOR and not PP_CONTROL");
+        }
+        // Readout: field 8 is 700 ms; 0 and 1 fall back to the spec.
+        for (field, want) in [(8u32, 7000u16), (2, 1000), (1, 6100), (0, 6100)] {
+            let d = PanelDelays::from_hw_divisor(0, 0, (0x4AF << 8) | field);
+            if d.t11_t12 != want {
+                return TestResult::Fail("PP_DIVISOR cycle field decode");
+            }
+        }
+        let mmio = ScriptMmio::default();
+        mmio.set_current(PP_DIVISOR, 0x0004_AF06);
+        mmio.set_current(PP_CONTROL, 0x1F << 4);
+        let pps = PanelPowerSequencer::new_with_divisor(&mmio, Some(divisor));
+        if pps.delays().t11_t12 != 5000 || pps.divisor() != Some(divisor) {
+            return TestResult::Fail("the pre-CNP sequencer decodes PP_DIVISOR, not PP_CONTROL");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_edp",
+        smoke_pps_pre_cnp_programs_pp_divisor
+    );
+
+    /// The `PP_DIVISOR` layout is strictly opt-in: without
+    /// `narf.intel.pp_divisor=1`, on a CNP-or-later PCH, or with a raw
+    /// clock that does not read back, the sequencer keeps the `PP_CONTROL`
+    /// layout and never writes `PP_DIVISOR`.
+    fn smoke_pps_pp_divisor_is_opt_in() -> TestResult {
+        use narf_boot::args::KernelCmdline;
+        let mmio = ScriptMmio::default();
+        mmio.set_current(PCH_RAWCLK_FREQ, 24);
+        if pp_divisor_for(false, true, &mmio).is_some()
+            || pp_divisor_for(true, false, &mmio).is_some()
+        {
+            return TestResult::Fail("no option or a CNP PCH must keep the PP_CONTROL layout");
+        }
+        for raw in [0u32, u32::MAX] {
+            mmio.set_current(PCH_RAWCLK_FREQ, raw);
+            if pp_divisor_for(true, true, &mmio).is_some() {
+                return TestResult::Fail("an unreadable raw clock must refuse the divisor");
+            }
+        }
+        if !pp_divisor_requested(KernelCmdline::new("narf.intel.pp_divisor=1"))
+            || pp_divisor_requested(KernelCmdline::new(""))
+            || pp_divisor_requested(KernelCmdline::new("narf.intel.pp_divisor=0"))
+            || pp_divisor_requested(KernelCmdline::new("-- narf.intel.pp_divisor=1"))
+        {
+            return TestResult::Fail("strict opt-in grammar");
+        }
+        let mut pps = PanelPowerSequencer::with_delays(&mmio, PanelDelays::SPEC_DEFAULTS);
+        pps.init_registers();
+        if !mmio.writes_to(PP_DIVISOR).is_empty() || mmio.writes_to(PP_CONTROL).is_empty() {
+            return TestResult::Fail("the CNP layout must not touch PP_DIVISOR");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_edp", smoke_pps_pp_divisor_is_opt_in);
 
     /// A panel that never asserts the on-idle state: typed
     /// timeout, power target cleared again, backlight never
