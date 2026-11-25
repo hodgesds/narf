@@ -59,7 +59,10 @@ pub(crate) fn register() {
     if REGISTERED.swap(true, Ordering::AcqRel) {
         return;
     }
-    INO_BASE.store(narf_filesystem::debugfs::alloc_ino_range(INO_SPAN), Ordering::Release);
+    INO_BASE.store(
+        narf_filesystem::debugfs::alloc_ino_range(INO_SPAN),
+        Ordering::Release,
+    );
     let _ = narf_filesystem::debugfs::register_dir("dri", Arc::new(DriDir));
 }
 
@@ -143,7 +146,11 @@ impl DirOps for DriDir {
         ino(0)
     }
     fn dcache_identity(&self) -> (usize, u64, u64) {
-        (narf_filesystem::debugfs::attrs().dev as usize, 0, self.ino())
+        (
+            narf_filesystem::debugfs::attrs().dev as usize,
+            0,
+            self.ino(),
+        )
     }
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::debugfs::attrs()
@@ -186,7 +193,11 @@ impl DirOps for MinorDir {
         ino(1 + u64::from(self.card))
     }
     fn dcache_identity(&self) -> (usize, u64, u64) {
-        (narf_filesystem::debugfs::attrs().dev as usize, 0, self.ino())
+        (
+            narf_filesystem::debugfs::attrs().dev as usize,
+            0,
+            self.ino(),
+        )
     }
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::debugfs::attrs()
@@ -227,7 +238,11 @@ impl DirOps for ConnectorDir {
         entry_ino(self.card, self.connector, 0)
     }
     fn dcache_identity(&self) -> (usize, u64, u64) {
-        (narf_filesystem::debugfs::attrs().dev as usize, 0, self.ino())
+        (
+            narf_filesystem::debugfs::attrs().dev as usize,
+            0,
+            self.ino(),
+        )
     }
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         narf_filesystem::debugfs::attrs()
@@ -246,16 +261,22 @@ impl DirOps for ConnectorDir {
         }
     }
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        Box::new([SINK_CAPABILITY, FORCE_HDCP14].into_iter().map(|name| DirEntry {
-            name: name.into(),
-            file_type: FileType::File,
-        }))
+        Box::new(
+            [SINK_CAPABILITY, FORCE_HDCP14]
+                .into_iter()
+                .map(|name| DirEntry {
+                    name: name.into(),
+                    file_type: FileType::File,
+                }),
+        )
     }
 }
 
 /// Copy `text` from `offset` into `buf`.
 fn copy_at(text: &[u8], offset: u64, buf: &mut [u8]) -> usize {
-    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(text.len());
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(text.len());
     let n = buf.len().min(text.len() - start);
     buf[..n].copy_from_slice(&text[start..start + n]);
     n
@@ -288,10 +309,8 @@ impl SinkCapabilityFile {
             if narf_time::monotonic_ns() >= deadline {
                 return Err(FsError::TimedOut);
             }
-            narf_time::SleepUntil::new(
-                narf_time::Deadline::after_us(ANSWER_POLL_US).as_instant(),
-            )
-            .await;
+            narf_time::SleepUntil::new(narf_time::Deadline::after_us(ANSWER_POLL_US).as_instant())
+                .await;
         }
     }
 }

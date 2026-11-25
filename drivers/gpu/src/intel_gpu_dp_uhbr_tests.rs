@@ -964,7 +964,8 @@ fn smoke_uhbr_dsc_mtp_slices_and_dpt_limit() -> TestResult {
     let uhd120 = mode(1_188_000, 3840, 4400, 2160, 2250);
     let r = UhbrRate::Uhbr10;
     match dsc_mtp_tu(r, 1, &uhd60, 259, 2, true) {
-        Some(s) if s.tu == 64 && s.m_n == [(63 << 25) | 0x7f_e2e3, 0x80_0000, 0xf_34d6, 0x8_0000] => {}
+        Some(s)
+            if s.tu == 64 && s.m_n == [(63 << 25) | 0x7f_e2e3, 0x80_0000, 0xf_34d6, 0x8_0000] => {}
         _ => return TestResult::Fail("259/16 bpp on UHBR10 x1 takes the 64 slots"),
     }
     if dsc_mtp_tu(r, 1, &uhd60, 260, 2, true).is_some() {

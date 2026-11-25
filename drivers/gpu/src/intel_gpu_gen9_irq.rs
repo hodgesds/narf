@@ -647,7 +647,12 @@ pub const fn gen8_gt_init(bank: usize) -> (u32, u32) {
 /// is cleared twice and the install carries on, as Linux does after its
 /// warning), then IER, then IMR with a posting read. Returns whether IIR
 /// was clean.
-fn irq_init(io: &(impl MmioWindow + ?Sized), regs: (u64, u64, u64), imr_val: u32, ier_val: u32) -> bool {
+fn irq_init(
+    io: &(impl MmioWindow + ?Sized),
+    regs: (u64, u64, u64),
+    imr_val: u32,
+    ier_val: u32,
+) -> bool {
     let (imr, iir, ier) = regs;
     let clean = io.read32(iir) == 0;
     if !clean {
@@ -1013,9 +1018,7 @@ impl Gen9IrqCore {
             }
         }
         if decoded.pch && !self.lp {
-            let (iir, triggered) = hotplug
-                .ack(io, SDE_IIR)
-                .ok_or(Gen9IrqError::Unavailable)?;
+            let (iir, triggered) = hotplug.ack(io, SDE_IIR).ok_or(Gen9IrqError::Unavailable)?;
             if iir == 0 {
                 events.lied |= GEN8_DE_PCH_IRQ;
             }
@@ -1155,7 +1158,9 @@ pub(crate) fn install(
 /// The Gen9 `DC_off` reference the owner's display register accesses run
 /// under (stricter than Linux, whose interrupt code takes no power domain);
 /// `None` when DC states could not be exited.
-fn display_access(bar: &narf_bus::MmioRegion) -> Option<crate::intel_gpu_gen9_dc_states::Gen9DcRef> {
+fn display_access(
+    bar: &narf_bus::MmioRegion,
+) -> Option<crate::intel_gpu_gen9_dc_states::Gen9DcRef> {
     crate::intel_gpu_gen9_dc_states::acquire_for_bar(
         bar,
         crate::intel_gpu_gen9_dc_states::Gen9DcUser::Hpd,
@@ -1937,7 +1942,11 @@ pub mod tests {
         }
         hw.clear_log();
         if core.hard_irq(&hw)
-            || hw.log() != alloc::vec![(GEN8_MASTER_IRQ, 0), (GEN8_MASTER_IRQ, GEN8_MASTER_IRQ_CONTROL)]
+            || hw.log()
+                != alloc::vec![
+                    (GEN8_MASTER_IRQ, 0),
+                    (GEN8_MASTER_IRQ, GEN8_MASTER_IRQ_CONTROL)
+                ]
         {
             return TestResult::Fail("no source: the master on again, not handled");
         }
@@ -2058,7 +2067,9 @@ pub mod tests {
         }
         if OPT_IN != "narf.intel.gen9_irq"
             || !requested(narf_boot::args::KernelCmdline::new("narf.intel.gen9_irq=1"))
-            || requested(narf_boot::args::KernelCmdline::new("narf.intel.gen9_irq=yes"))
+            || requested(narf_boot::args::KernelCmdline::new(
+                "narf.intel.gen9_irq=yes",
+            ))
         {
             return TestResult::Fail("strict opt-in grammar");
         }

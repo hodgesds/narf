@@ -110,12 +110,8 @@ impl Ccs {
         match modifier {
             I915_FORMAT_MOD_4_TILED_MTL_RC_CCS if display_ver == 14 && !xe => Ok(Self::MtlRc),
             I915_FORMAT_MOD_4_TILED_MTL_MC_CCS if display_ver == 14 && !xe => Ok(Self::MtlMc),
-            I915_FORMAT_MOD_4_TILED_MTL_RC_CCS_CC if display_ver == 14 && !xe => {
-                Ok(Self::MtlRcCc)
-            }
-            I915_FORMAT_MOD_4_TILED_LNL_CCS if (20..35).contains(&display_ver) => {
-                Ok(Self::Xe2)
-            }
+            I915_FORMAT_MOD_4_TILED_MTL_RC_CCS_CC if display_ver == 14 && !xe => Ok(Self::MtlRcCc),
+            I915_FORMAT_MOD_4_TILED_LNL_CCS if (20..35).contains(&display_ver) => Ok(Self::Xe2),
             _ => Err(CcsRefusal::Modifier),
         }
     }

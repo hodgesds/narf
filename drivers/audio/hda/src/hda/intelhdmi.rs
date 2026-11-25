@@ -107,7 +107,9 @@ pub(super) fn intel_pin2port(model: IntelHdmiModel, codec_id: u32, pin: u32) -> 
     let map = port_map(model);
     if map.is_empty() {
         let base = u32::from(intel_base_nid(codec_id));
-        return (base..base + 3).contains(&pin).then(|| (pin - base + 1) as i32);
+        return (base..base + 3)
+            .contains(&pin)
+            .then(|| (pin - base + 1) as i32);
     }
     map.iter()
         .position(|&nid| u32::from(nid) == pin)
@@ -166,7 +168,8 @@ pub(super) fn vendor_verbs(
         return Ok(());
     };
     let get = |verb: &mut dyn FnMut(u32) -> Result<u32, HdaError>| {
-        verb(make_verb(cad, nid, INTEL_GET_VENDOR_VERB << 8)).ok()
+        verb(make_verb(cad, nid, INTEL_GET_VENDOR_VERB << 8))
+            .ok()
             .filter(|&v| v != u32::MAX)
     };
     if let Some(param) = get(&mut verb) {
@@ -208,7 +211,10 @@ pub(super) fn intel_output_paths(c: &Codec) -> Vec<AudioPath> {
             .connections
             .iter()
             .copied()
-            .filter(|nid| c.widget(*nid).is_some_and(|w| w.ty() == WidgetType::AudioOutput))
+            .filter(|nid| {
+                c.widget(*nid)
+                    .is_some_and(|w| w.ty() == WidgetType::AudioOutput)
+            })
             .collect();
         let Some(&first) = converters.first() else {
             continue;
@@ -321,10 +327,11 @@ pub(super) fn register_notifier(dev: &Arc<IntelHda>) {
 }
 
 /// `snd_hdac_display_power`'s bus state (one Intel display per system).
-static DISPLAY_POWER: IrqSafeSpinLock<acomp::DisplayPower> = IrqSafeSpinLock::new(acomp::DisplayPower {
-    status: 0,
-    active: None,
-});
+static DISPLAY_POWER: IrqSafeSpinLock<acomp::DisplayPower> =
+    IrqSafeSpinLock::new(acomp::DisplayPower {
+        status: 0,
+        active: None,
+    });
 
 /// `snd_hdac_display_power(bus, cad, enable)`, with no lock held across the
 /// component's calls.
@@ -344,7 +351,8 @@ impl IntelHda {
         let ports = self.hdmi.lock();
         ports.iter().position(|p| {
             let path = &self.outputs[p.output];
-            path.nodes.pin_nid == pin && hda_codec::intel_hdmi_model(&self.graphs[path.codec]).is_some()
+            path.nodes.pin_nid == pin
+                && hda_codec::intel_hdmi_model(&self.graphs[path.codec]).is_some()
         })
     }
 
@@ -365,9 +373,10 @@ impl IntelHda {
             0,
             &mut buf,
         ) {
-            Ok((present, size)) if size > 0 => {
-                (present, super::hdmi::parse_eld(&buf[..size.min(ELD_MAX_SIZE)]))
-            }
+            Ok((present, size)) if size > 0 => (
+                present,
+                super::hdmi::parse_eld(&buf[..size.min(ELD_MAX_SIZE)]),
+            ),
             Ok((present, _)) => (present, None),
             Err(_) => (false, None),
         }
@@ -558,7 +567,11 @@ impl IntelHda {
             return Ok(());
         };
         vendor_verbs(graph.addr, model, |command| {
-            self.verb((command >> 28) as u8, (command >> 20) as u8, command & 0xf_ffff)
+            self.verb(
+                (command >> 28) as u8,
+                (command >> 20) as u8,
+                command & 0xf_ffff,
+            )
         })
     }
 

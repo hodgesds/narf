@@ -18,8 +18,7 @@ fn smoke_intel_hdcp_debugfs_names_texts_and_bool_grammar() -> TestResult {
         return TestResult::Fail("connector debugfs names");
     }
     if sink_capability_text("DP-1", 42, true, true) != "DP-1:42 HDCP version: HDCP1.4 HDCP2.2 \n"
-        || sink_capability_text("HDMI-A-1", 7, true, false)
-            != "HDMI-A-1:7 HDCP version: HDCP1.4 \n"
+        || sink_capability_text("HDMI-A-1", 7, true, false) != "HDMI-A-1:7 HDCP version: HDCP1.4 \n"
         || sink_capability_text("DP-2", 9, false, true) != "DP-2:9 HDCP version: HDCP2.2 \n"
         || sink_capability_text("DP-1", 42, false, false) != "DP-1:42 HDCP version: None\n"
     {

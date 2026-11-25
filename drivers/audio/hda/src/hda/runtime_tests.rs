@@ -4413,7 +4413,10 @@ impl narf_drivers_sound::display_audio::DisplayAudioComponent for ScriptedDispla
         1
     }
     fn put_power(&self, cookie: u64) {
-        self.state.lock().calls.push(("put_power", 0, 0, cookie as u32));
+        self.state
+            .lock()
+            .calls
+            .push(("put_power", 0, 0, cookie as u32));
     }
     fn codec_wake_override(&self, enable: bool) {
         self.state
@@ -4505,10 +4508,7 @@ fn native_hda_intel_hdmi_unbound_without_component() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "audio/hda",
-    native_hda_intel_hdmi_unbound_without_component
-);
+kernel_test_in!("audio/hda", native_hda_intel_hdmi_unbound_without_component);
 
 /// The Intel HDMI codec end to end against a scripted display: the codec
 /// binds to the component (`snd_hdac_i915_init`), gets
@@ -4603,28 +4603,29 @@ fn intel_end_to_end() -> TestResult {
     let verbs = &fixture.model.verbs[first..];
     let at = |v: u32| verbs.iter().position(|x| *x == v);
     let expected = [
-        make_verb(0, 2, 0xf8100),                    // vendor verbs re-issued
-        make_verb(0, 1, 0x70500),                    // then the AFG to D0
-        make_verb(0, 6, 0x70500),                    // pin 6 out of its D3
-        make_verb(0, 6, 0xf0100),                    // the converter select
-        make_verb(0, 6, 0x73400),                    // slot 0 <- channel 0
-        make_verb(0, 6, 0x73411),                    // slot 1 <- channel 1
-        make_verb(0, 6, 0x734f7),                    // slot 7 empty
-        make_verb(0, 6, 0x73200),                    // InfoFrame transmit off
-        make_verb(0, 6, 0x73184),                    // type 0x84
-        make_verb(0, 6, 0x73170),                    // checksum
-        make_verb(0, 6, 0x732c0),                    // best effort
-        make_verb(0, 2, 0x73e00),                    // ICT (no HBR)
-        make_verb(0, 2, 0x70610),                    // stream tag
+        make_verb(0, 2, 0xf8100), // vendor verbs re-issued
+        make_verb(0, 1, 0x70500), // then the AFG to D0
+        make_verb(0, 6, 0x70500), // pin 6 out of its D3
+        make_verb(0, 6, 0xf0100), // the converter select
+        make_verb(0, 6, 0x73400), // slot 0 <- channel 0
+        make_verb(0, 6, 0x73411), // slot 1 <- channel 1
+        make_verb(0, 6, 0x734f7), // slot 7 empty
+        make_verb(0, 6, 0x73200), // InfoFrame transmit off
+        make_verb(0, 6, 0x73184), // type 0x84
+        make_verb(0, 6, 0x73170), // checksum
+        make_verb(0, 6, 0x732c0), // best effort
+        make_verb(0, 2, 0x73e00), // ICT (no HBR)
+        make_verb(0, 2, 0x70610), // stream tag
     ];
     let positions: Vec<Option<usize>> = expected.iter().map(|v| at(*v)).collect();
-    if positions.iter().any(Option::is_none)
-        || positions.windows(2).any(|w| w[0] > w[1])
-    {
+    if positions.iter().any(Option::is_none) || positions.windows(2).any(|w| w[0] > w[1]) {
         return TestResult::Fail("the Intel HDMI prepare verbs differ from Linux's order");
     }
     // The converter channel count already reads two: no write.
-    if verbs.iter().any(|v| *v >> 20 == 2 && (*v >> 8) & 0xfff == 0x72d) {
+    if verbs
+        .iter()
+        .any(|v| *v >> 20 == 2 && (*v >> 8) & 0xfff == 0x72d)
+    {
         return TestResult::Fail("a matching channel count must not be rewritten");
     }
     // Power once (the bus keeps it), then a rate sync per codec setup: the
@@ -4645,7 +4646,4 @@ fn intel_end_to_end() -> TestResult {
     drop(playback);
     TestResult::Pass
 }
-kernel_test_in!(
-    "audio/hda",
-    native_hda_intel_hdmi_component_end_to_end
-);
+kernel_test_in!("audio/hda", native_hda_intel_hdmi_component_end_to_end);

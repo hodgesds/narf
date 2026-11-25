@@ -160,7 +160,10 @@ pub const fn port_alpm_ctl_max_phy_swing_setup(v: u32) -> u32 {
 const PORT_ALPM_CTL_SILENCE_PERIOD_MASK: u32 = 0xff;
 /// `PORT_ALPM_LFPS_CTL` fields (`LFPS_CYCLE_COUNT` biased by its minimum 7).
 pub const fn port_alpm_lfps_value(cycles: u32, half_cycle: u32) -> u32 {
-    ((cycles - 7) & 0xf) << 24 | (half_cycle & 0x1f) << 16 | (half_cycle & 0x1f) << 8 | (half_cycle & 0x1f)
+    ((cycles - 7) & 0xf) << 24
+        | (half_cycle & 0x1f) << 16
+        | (half_cycle & 0x1f) << 8
+        | (half_cycle & 0x1f)
 }
 const LFPS_HALF_CYCLE_MASK: u32 = 0x1f;
 /// `TGL_PSR_MASK` / `TGL_PSR_ERROR` (`psr_irq_control`).
@@ -267,7 +270,11 @@ pub struct Caps {
 impl Caps {
     /// `_panel_replay_init_dpcd` (and the AUX-less ALPM test of an eDP
     /// sink, `intel_alpm_aux_less_wake_supported`).
-    pub fn read<A: AuxChannel + ?Sized>(aux: &mut A, edp: bool, mst: bool) -> Result<Self, Refusal> {
+    pub fn read<A: AuxChannel + ?Sized>(
+        aux: &mut A,
+        edp: bool,
+        mst: bool,
+    ) -> Result<Self, Refusal> {
         if mst {
             return Err(Refusal::Mst);
         }
@@ -300,7 +307,10 @@ impl Caps {
             (4, 4)
         } else {
             let w = u16::from_le_bytes([dpcd[2], dpcd[3]]);
-            (if w == 0 { 4 } else { w }, if dpcd[4] == 0 { 1 } else { dpcd[4] })
+            (
+                if w == 0 { 4 } else { w },
+                if dpcd[4] == 0 { 1 } else { dpcd[4] },
+            )
         };
         // compute_pr_dsc_support.
         let dsc = match (dpcd[1] & DSC_DECODE_MASK) >> 1 {
@@ -322,7 +332,6 @@ impl Caps {
     pub fn async_video_timing(&self) -> bool {
         self.dpcd[1] & DP_PANEL_REPLAY_ASYNC_VIDEO_TIMING_NOT_SUPPORTED_IN_PR == 0
     }
-
 }
 
 /// `intel_psr_panel_replay_enable_sink` from `intel_ddi_pre_enable_dp`:
@@ -456,7 +465,9 @@ pub fn silence_period_symbols(port_clock: u32) -> u32 {
 
 /// `get_lfps_half_cycle_clocks`.
 pub fn lfps_half_cycle_clocks(port_clock: u32) -> u32 {
-    (u64::from(lfps_cycle_time_ns(port_clock)) * u64::from(port_clock) / 1000 / 1000
+    (u64::from(lfps_cycle_time_ns(port_clock)) * u64::from(port_clock)
+        / 1000
+        / 1000
         / u64::from(2 * LFPS_CYCLE_COUNT)) as u32
 }
 
@@ -885,8 +896,14 @@ impl PanelReplay {
     ) {
         let pipe = 0x1000 * u64::from(self.config.pipe);
         let (y1, y2) = sf.primary.unwrap_or((-1, -1));
-        regs.write32(crate::intel_gpu_psr::SEL_FETCH_PLANE_POS + pipe, (y1 as u32) << 16);
-        regs.write32(crate::intel_gpu_psr::SEL_FETCH_PLANE_OFFSET + pipe, (y1 as u32) << 16);
+        regs.write32(
+            crate::intel_gpu_psr::SEL_FETCH_PLANE_POS + pipe,
+            (y1 as u32) << 16,
+        );
+        regs.write32(
+            crate::intel_gpu_psr::SEL_FETCH_PLANE_OFFSET + pipe,
+            (y1 as u32) << 16,
+        );
         regs.write32(
             crate::intel_gpu_psr::SEL_FETCH_PLANE_SIZE + pipe,
             ((y2.wrapping_sub(y1).wrapping_sub(1) as u32) << 16) | u32::from(width).wrapping_sub(1),
@@ -919,7 +936,11 @@ impl PanelReplay {
     /// `LATENCY_REPORTING_REMOVED`, then on eDP `intel_alpm_disable`. The
     /// sink keeps its replay configuration (Linux clears only PSR's
     /// `DP_PSR_EN_CFG`). Every step runs; the first failure is returned.
-    pub fn disable<M: MmioWindow + ?Sized>(&mut self, regs: &M, timeout_ms: u64) -> Result<(), Refusal> {
+    pub fn disable<M: MmioWindow + ?Sized>(
+        &mut self,
+        regs: &M,
+        timeout_ms: u64,
+    ) -> Result<(), Refusal> {
         let mut first = self.exit(regs).err();
         if let Err(refusal) = self.wait_idle(regs, timeout_ms) {
             first.get_or_insert(refusal);
@@ -935,7 +956,10 @@ impl PanelReplay {
             let t = self.config.pipe;
             let ctl = regs.read32(alpm_ctl(t));
             if ctl != u32::MAX {
-                regs.write32(alpm_ctl(t), ctl & !(ALPM_CTL_ALPM_ENABLE | ALPM_CTL_LOBF_ENABLE));
+                regs.write32(
+                    alpm_ctl(t),
+                    ctl & !(ALPM_CTL_ALPM_ENABLE | ALPM_CTL_LOBF_ENABLE),
+                );
             }
         }
         self.active = false;

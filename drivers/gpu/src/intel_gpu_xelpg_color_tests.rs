@@ -82,14 +82,7 @@ fn smoke_xelpg_deep_colour_display_bpc() -> TestResult {
         }
     }
     // bpc_to_bpp of min(bpc ?: 8, 12).
-    for (display_bpc, bpp) in [
-        (0u8, 24u32),
-        (6, 18),
-        (8, 24),
-        (10, 30),
-        (12, 36),
-        (16, 36),
-    ] {
+    for (display_bpc, bpp) in [(0u8, 24u32), (6, 18), (8, 24), (10, 30), (12, 36), (16, 36)] {
         if max_pipe_bpp(display_bpc) != bpp {
             return TestResult::Fail("compute_sink_pipe_bpp differs from Linux");
         }
@@ -106,7 +99,7 @@ kernel_test_in!(
 /// the HDMI depth and clock admission (`intel_hdmi_sink_bpc_possible`,
 /// `hdmi_port_clock_limit`, `hdmi_port_clock_valid`).
 fn smoke_xelpg_deep_colour_encodings_and_admission() -> TestResult {
-    use crate::intel_gpu_hdmi::{parse_hdmi_vsdb, Ycbcr420Caps, SinkFormat};
+    use crate::intel_gpu_hdmi::{parse_hdmi_vsdb, SinkFormat, Ycbcr420Caps};
     // PIPE_MISC: BPC_10 = 1 << 5, BPC_12_ADLP = 4 << 5, with
     // PIXEL_ROUNDING_TRUNC (bit 8); TRANS_DDI_BPC_10 = 1 << 20, _12 =
     // 3 << 20; DP_MSA_MISC_10_BPC = 2 << 5, _12_BPC = 3 << 5 with

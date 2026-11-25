@@ -426,13 +426,16 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
         let non_transparent = match found {
             Some(_) if transparent => {
                 if aux
-                    .dpcd_write(DP_PHY_REPEATER_MODE, &[DP_PHY_REPEATER_MODE_NON_TRANSPARENT])
+                    .dpcd_write(
+                        DP_PHY_REPEATER_MODE,
+                        &[DP_PHY_REPEATER_MODE_NON_TRANSPARENT],
+                    )
                     .is_ok()
                 {
                     true
                 } else {
-                    let _ = aux
-                        .dpcd_write(DP_PHY_REPEATER_MODE, &[DP_PHY_REPEATER_MODE_TRANSPARENT]);
+                    let _ =
+                        aux.dpcd_write(DP_PHY_REPEATER_MODE, &[DP_PHY_REPEATER_MODE_TRANSPARENT]);
                     false
                 }
             }
@@ -524,8 +527,7 @@ pub fn symbol_cycles(lanes: u32, pixels: u32, dsc_slices: u32, bpp_x16: u32, mst
     let slices = dsc_slices.max(1);
     let slice_pixels = pixels.div_ceil(slices);
     let align = if mst { u64::from(4 / lanes) } else { 1 };
-    let data =
-        (u64::from(slice_pixels) * u64::from(bpp_x16)).div_ceil(16 * 32 * u64::from(lanes));
+    let data = (u64::from(slice_pixels) * u64::from(bpp_x16)).div_ceil(16 * 32 * u64::from(lanes));
     let data = data.div_ceil(align) * align;
     let eoc = if dsc_slices == 0 {
         0
@@ -621,7 +623,8 @@ pub fn wide_link(limits: &dsc::LinkLimits, uhbr_rates: u8, mode: &Mode, max_bpp:
 /// available bandwidth while BW allocation is enabled).
 pub fn wide_link_caps(caps: &LinkCaps, mode: &Mode, max_bpp: u32, cap: Option<u64>) -> WideLink {
     match wide_search(caps, mode, max_bpp, cap) {
-        Some(link) if link.link_rate >= 1_000_000 => match UhbrRate::from_link_rate(link.link_rate) {
+        Some(link) if link.link_rate >= 1_000_000 => match UhbrRate::from_link_rate(link.link_rate)
+        {
             Some(rate) => WideLink::Uhbr(UhbrLink {
                 rate,
                 lanes: link.lanes,
@@ -928,13 +931,26 @@ pub fn dsc_mtp_tu(
 }
 
 /// The MTP time slots and M/N of `intel_dp_mtp_tu_compute_config` for SST.
-fn mtp(rate: UhbrRate, lanes: u8, mode: &Mode, bpp_x16: u32, dsc_slices: u32) -> Option<UhbrStream> {
+fn mtp(
+    rate: UhbrRate,
+    lanes: u8,
+    mode: &Mode,
+    bpp_x16: u32,
+    dsc_slices: u32,
+) -> Option<UhbrStream> {
     let lanes = u32::from(lanes);
     if !matches!(lanes, 1 | 2 | 4) {
         return None;
     }
     let clock = mode.pixel_clock_khz;
-    let overhead = bw_overhead_with(lanes, u32::from(mode.h_active), dsc_slices, bpp_x16, true, false);
+    let overhead = bw_overhead_with(
+        lanes,
+        u32::from(mode.h_active),
+        dsc_slices,
+        bpp_x16,
+        true,
+        false,
+    );
     let data_m = effective_data_rate(clock, bpp_x16, overhead);
     let data_n = max_link_data_rate(rate, lanes);
     if data_n == 0 {
@@ -1056,7 +1072,13 @@ pub fn min_hblank_link(mode: &Mode, link_bpp_x16: u32, dsc_slices: u8) -> u32 {
     if hactive == 0 || link_bpp_x16 == 0 {
         return 0;
     }
-    let active = symbol_cycles(4, mode.h_active.into(), dsc_slices.into(), link_bpp_x16, false);
+    let active = symbol_cycles(
+        4,
+        mode.h_active.into(),
+        dsc_slices.into(),
+        link_bpp_x16,
+        false,
+    );
     let total = htotal * active / hactive;
     let blank = total.saturating_sub(active).max(3) - 2;
     blank.min(3) as u32

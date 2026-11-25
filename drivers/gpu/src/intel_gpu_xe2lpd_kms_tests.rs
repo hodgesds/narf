@@ -994,10 +994,13 @@ fn smoke_discrete_arc_display_identify_and_vram_pte() -> TestResult {
             DiscreteDisplayIp::identify(&dg1, GtPlatform::Gen12(Gen12Platform::TigerLake)),
             Err(IpError::Unqualified { .. })
         ));
-        assert_eq!(crate::intel_gpu_gt_runtime::DG1_KMS_OPT_IN, "narf.intel.dg1_kms");
-        assert!(crate::intel_gpu_gt_runtime::dg1_kms_requested(KernelCmdline::new(
-            "narf.intel.dg1_kms=1"
-        )));
+        assert_eq!(
+            crate::intel_gpu_gt_runtime::DG1_KMS_OPT_IN,
+            "narf.intel.dg1_kms"
+        );
+        assert!(crate::intel_gpu_gt_runtime::dg1_kms_requested(
+            KernelCmdline::new("narf.intel.dg1_kms=1")
+        ));
         assert!(!crate::intel_gpu_gt_runtime::dg1_kms_requested(
             KernelCmdline::new("")
         ));

@@ -2226,7 +2226,9 @@ fn smoke_intel_hdcp14_gen9_port_registers_and_pcode_key_load() -> TestResult {
         || regs.wrote(0x66510) != [0x0f0f_0f0f]
         || regs.wrote(0x66514) != [0x0f]
         || regs.wrote(0x66518) != [0x1234]
-        || (0x66400..0x66420).step_by(4).any(|r| !regs.wrote(r).is_empty())
+        || (0x66400..0x66420)
+            .step_by(4)
+            .any(|r| !regs.wrote(r).is_empty())
     {
         return TestResult::Fail("Gen9 HDCP 1.4 port register sequence");
     }
@@ -2260,10 +2262,10 @@ fn smoke_intel_hdcp14_gen9_port_registers_and_pcode_key_load() -> TestResult {
         return TestResult::Fail("Gen9 key load without PW_1");
     }
     // The BIOS request of PW_1 (index 14) suffices.
-    regs.0
-        .lock()
-        .regs
-        .insert(HSW_PWR_WELL_CTL1, 0b11 << (2 * u32::from(SKL_PW_CTL_IDX_PW_1)));
+    regs.0.lock().regs.insert(
+        HSW_PWR_WELL_CTL1,
+        0b11 << (2 * u32::from(SKL_PW_CTL_IDX_PW_1)),
+    );
     if drive(link.enable(&mut cx, 0)) != Some(Ok(())) {
         return TestResult::Fail("BIOS-requested Gen9 PW_1 not accepted");
     }

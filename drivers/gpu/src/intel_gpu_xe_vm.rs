@@ -478,7 +478,11 @@ impl Bind {
         // which Linux admits.
         let mirror = flags & svm::BIND_FLAG_CPU_ADDR_MIRROR != 0;
         if flags & svm_flags != 0
-            && (!mirror || op != 0 || object != 0 || offset != 0 || flags & svm::BIND_FLAG_NULL != 0)
+            && (!mirror
+                || op != 0
+                || object != 0
+                || offset != 0
+                || flags & svm::BIND_FLAG_NULL != 0)
         {
             return Err(FsError::InvalidData);
         }

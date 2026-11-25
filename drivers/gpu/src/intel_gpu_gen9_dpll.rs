@@ -1206,7 +1206,9 @@ pub mod tests {
             return TestResult::Fail("eDP keeps DPLL0");
         }
         if ARBITRATION_OPT_IN != "narf.intel.gen9_dpll"
-            || !arbitration_requested(narf_boot::args::KernelCmdline::new("narf.intel.gen9_dpll=1"))
+            || !arbitration_requested(narf_boot::args::KernelCmdline::new(
+                "narf.intel.gen9_dpll=1",
+            ))
             || arbitration_requested(narf_boot::args::KernelCmdline::new("narf.intel.gen9_dpll"))
         {
             return TestResult::Fail("strict opt-in grammar");

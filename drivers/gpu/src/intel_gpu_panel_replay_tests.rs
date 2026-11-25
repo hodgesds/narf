@@ -177,16 +177,44 @@ fn smoke_panel_replay_caps_and_compute_follow_linux() -> TestResult {
     // Typed refusals: eDP below display 20, eDP off pipes A/B, HDCP,
     // 128b/132b, no AUX-less ALPM, MST, and the AS SDP need.
     let refused = |stream: Stream, caps: &Caps| compute(caps, &stream, None).err();
-    if refused(Stream { display_ver: 14, ..edp_stream() }, &caps)
-        != Some(Refusal::SourceUnsupported)
-        || refused(Stream { pipe: 2, ..edp_stream() }, &caps) != Some(Refusal::Pipe)
-        || refused(Stream { hdcp: true, ..edp_stream() }, &caps) != Some(Refusal::Hdcp)
-        || refused(Stream { uhbr: true, ..edp_stream() }, &caps) != Some(Refusal::Uhbr)
+    if refused(
+        Stream {
+            display_ver: 14,
+            ..edp_stream()
+        },
+        &caps,
+    ) != Some(Refusal::SourceUnsupported)
+        || refused(
+            Stream {
+                pipe: 2,
+                ..edp_stream()
+            },
+            &caps,
+        ) != Some(Refusal::Pipe)
+        || refused(
+            Stream {
+                hdcp: true,
+                ..edp_stream()
+            },
+            &caps,
+        ) != Some(Refusal::Hdcp)
+        || refused(
+            Stream {
+                uhbr: true,
+                ..edp_stream()
+            },
+            &caps,
+        ) != Some(Refusal::Uhbr)
     {
         return TestResult::Fail("eDP Panel Replay must refuse what Linux refuses");
     }
-    if refused(Stream { as_sdp_v2: true, ..edp_stream() }, &caps)
-        != Some(Refusal::AsSdpUnmodelled)
+    if refused(
+        Stream {
+            as_sdp_v2: true,
+            ..edp_stream()
+        },
+        &caps,
+    ) != Some(Refusal::AsSdpUnmodelled)
     {
         return TestResult::Fail("a sink needing the AS SDP must be refused typed");
     }
@@ -253,7 +281,15 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     // PANEL_REPLAY_CONFIG = ENABLE | VSC_SDP_CRC | UNRECOVERABLE_ERROR |
     // RFB_STORAGE_ERROR | ACTIVE_FRAME_CRC_ERROR | SU_ENABLE (0x7b),
     // CONFIG2 = CRC_VERIFICATION, CONFIG3 = T1, then DP_SET_POWER D0.
-    if sink.writes != [(0x116, 0x07), (0x1b0, 0x7b), (0x1b1, 0x02), (0x11a, 0x00), (0x600, 0x01)] {
+    if sink.writes
+        != [
+            (0x116, 0x07),
+            (0x1b0, 0x7b),
+            (0x1b1, 0x02),
+            (0x11a, 0x00),
+            (0x600, 0x01),
+        ]
+    {
         return TestResult::Fail("the sink conversation must be Linux's");
     }
     // Source: PSR_DEBUG(A) = HPD | MEMUP | LPSP, PSR_IMR all but
@@ -329,12 +365,7 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     regs.writes.borrow_mut().clear();
     regs.set(0x46430, 1 << 23);
     if pr.disable(&regs, 1).is_err()
-        || regs.log()
-            != [
-                (0x600a0, 0),
-                (0x46430, 0),
-                (0x60950, 0x4003_0005),
-            ]
+        || regs.log() != [(0x600a0, 0), (0x46430, 0), (0x60950, 0x4003_0005)]
         || pr.active()
         || sink.writes.len() != 5
     {
@@ -374,7 +405,12 @@ fn smoke_panel_replay_external_dp_on_transcoder_b() -> TestResult {
         Err(_) => return TestResult::Fail("DP Panel Replay must enable on transcoder B"),
     };
     if sink.writes != [(0x1b0, 0x7b), (0x1b1, 0x02), (0x11a, 0x00)]
-        || regs.log() != [(0x61860, 1 << 25), (0x61814, 0xffff_fffb), (0x46430, 1 << 24)]
+        || regs.log()
+            != [
+                (0x61860, 1 << 25),
+                (0x61814, 0xffff_fffb),
+                (0x46430, 1 << 24),
+            ]
     {
         return TestResult::Fail("DP replay takes no ALPM, no SET_POWER and the Pipe-B Wa bit");
     }
@@ -383,9 +419,7 @@ fn smoke_panel_replay_external_dp_on_transcoder_b() -> TestResult {
     }
     regs.set(0x61840, 0);
     regs.writes.borrow_mut().clear();
-    if pr.resume(&regs) != Ok(true)
-        || regs.log() != [(0x61910, 1 << 13), (0x610a0, 1 << 30)]
-    {
+    if pr.resume(&regs) != Ok(true) || regs.log() != [(0x61910, 1 << 13), (0x610a0, 1 << 30)] {
         return TestResult::Fail("DP activation writes MAN_TRK(B) and TRANS_DP2_CTL(B) only");
     }
     regs.writes.borrow_mut().clear();

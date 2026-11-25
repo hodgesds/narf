@@ -37,7 +37,11 @@ const OBJECT_SIZE: u64 = 9 << 20;
 /// 960 * 64 = 0xf000 bytes, ending at 0x807000, where the 64-byte
 /// clear-colour plane starts. The object is 9 MiB.
 fn mtl_planes(ccs: Ccs) -> Result<CcsPlanes, CcsRefusal> {
-    let cc = if ccs == Ccs::MtlRcCc { (1, 0x80_7000) } else { (0, 0) };
+    let cc = if ccs == Ccs::MtlRcCc {
+        (1, 0x80_7000)
+    } else {
+        (0, 0)
+    };
     check_planes(
         ccs,
         XRGB8888,
@@ -76,7 +80,9 @@ fn smoke_ccs_modifiers_and_plane_rules_follow_intel_fb() -> TestResult {
     }
     let rc = match mtl_planes(Ccs::MtlRc) {
         Ok(p) => p,
-        Err(_) => return TestResult::Fail("a Linux-shaped MTL RC CCS framebuffer must be admitted"),
+        Err(_) => {
+            return TestResult::Fail("a Linux-shaped MTL RC CCS framebuffer must be admitted")
+        }
     };
     if rc.aux != Some((0x7f_8000, 960)) || rc.cc.is_some() {
         return TestResult::Fail("the AUX plane is plane 1 at its pitch");
@@ -87,16 +93,36 @@ fn smoke_ccs_modifiers_and_plane_rules_follow_intel_fb() -> TestResult {
     let refuse = |handles, pitches, offsets, size| {
         check_planes(Ccs::MtlRc, XRGB8888, 1080, handles, pitches, offsets, size).err()
     };
-    if refuse([7, 7, 0, 0], [7680, 896, 0, 0], [0, 0x7f_8000, 0, 0], OBJECT_SIZE)
-        != Some(CcsRefusal::Planes)
-        || refuse([7, 8, 0, 0], [7680, 960, 0, 0], [0, 0x7f_8000, 0, 0], OBJECT_SIZE)
-            != Some(CcsRefusal::Planes)
-        || refuse([7, 7, 0, 0], [7680, 960, 0, 0], [0, 0x7f_7000, 0, 0], OBJECT_SIZE)
-            != Some(CcsRefusal::Planes)
-        || refuse([7, 7, 0, 0], [7168 + 128, 960, 0, 0], [0, 0x7f_8000, 0, 0], OBJECT_SIZE)
-            != Some(CcsRefusal::Planes)
-        || refuse([7, 7, 0, 0], [7680, 960, 0, 0], [0, 0x7f_8000, 0, 0], 0x80_6000)
-            != Some(CcsRefusal::Bounds)
+    if refuse(
+        [7, 7, 0, 0],
+        [7680, 896, 0, 0],
+        [0, 0x7f_8000, 0, 0],
+        OBJECT_SIZE,
+    ) != Some(CcsRefusal::Planes)
+        || refuse(
+            [7, 8, 0, 0],
+            [7680, 960, 0, 0],
+            [0, 0x7f_8000, 0, 0],
+            OBJECT_SIZE,
+        ) != Some(CcsRefusal::Planes)
+        || refuse(
+            [7, 7, 0, 0],
+            [7680, 960, 0, 0],
+            [0, 0x7f_7000, 0, 0],
+            OBJECT_SIZE,
+        ) != Some(CcsRefusal::Planes)
+        || refuse(
+            [7, 7, 0, 0],
+            [7168 + 128, 960, 0, 0],
+            [0, 0x7f_8000, 0, 0],
+            OBJECT_SIZE,
+        ) != Some(CcsRefusal::Planes)
+        || refuse(
+            [7, 7, 0, 0],
+            [7680, 960, 0, 0],
+            [0, 0x7f_8000, 0, 0],
+            0x80_6000,
+        ) != Some(CcsRefusal::Bounds)
         || check_planes(
             Ccs::MtlRc,
             ARGB8888,

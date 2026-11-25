@@ -195,7 +195,8 @@ fn smoke_uhbr_tunnel_detect_reads_linux_ranges() -> TestResult {
     over.regs[0x24] = 73;
     let mut gran = adapter();
     gran.regs[0x22] = 3;
-    if detect(&mut over) != Err(TunnelError::Invalid) || detect(&mut gran) != Err(TunnelError::Invalid)
+    if detect(&mut over) != Err(TunnelError::Invalid)
+        || detect(&mut gran) != Err(TunnelError::Invalid)
     {
         return TestResult::Fail("allocated > estimated and granularity 3 are invalid");
     }

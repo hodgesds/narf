@@ -1135,8 +1135,7 @@ fn scanout_pxp_protected_dsb_arm_decrypts_or_loads_the_black_csc() -> TestResult
     }
     // Cancelled before the DSB ran: the plane was not black and is not.
     // SAFETY: the fixture never exposed this staged stream to hardware.
-    if unsafe { owner.cancel_staged_dsb() }.is_err() || owner.forced_black() || owner.pending()
-    {
+    if unsafe { owner.cancel_staged_dsb() }.is_err() || owner.forced_black() || owner.pending() {
         pxp::set_display_pxp(None);
         return TestResult::Fail("cancelled black arm kept the black state");
     }

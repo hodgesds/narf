@@ -327,7 +327,14 @@ impl LegacyDisplay {
     /// The route of a display 9-11 session on `ddi`, CPU transcoder `t`:
     /// the port-indexed registers of DDI A–D (`is_hdcp_supported`), no
     /// line rekeying (display 14+ only); `None` for any other port.
-    pub fn route(self, ddi: Ddi, transcoder: u8, protocol: Protocol, link: RouteLink, mst: MstStreams) -> Option<RouteDesc> {
+    pub fn route(
+        self,
+        ddi: Ddi,
+        transcoder: u8,
+        protocol: Protocol,
+        link: RouteLink,
+        mst: MstStreams,
+    ) -> Option<RouteDesc> {
         let hw = hdcp::HdcpHw::legacy(self.display_ver, self.big_core, ddi as u8)?;
         Some(RouteDesc {
             key: gen12_key(ddi),

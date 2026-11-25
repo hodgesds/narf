@@ -234,7 +234,12 @@ fn smoke_usbc_tbt_uhbr_clock_selects_need_display30() -> TestResult {
         return TestResult::Fail("a refused TBT clock must precede every write");
     }
     // The DP 1.4 selects are unchanged and read back on both layouts.
-    for (khz, select) in [(162_000, 0xC), (270_000, 0xD), (540_000, 0xE), (810_000, 0xF)] {
+    for (khz, select) in [
+        (162_000, 0xC),
+        (270_000, 0xD),
+        (540_000, 0xE),
+        (810_000, 0xF),
+    ] {
         if tbt_clock_select(khz, false) != Some(select)
             || tbt_clock_select(khz, true) != Some(select)
             || tbt_port_clock_khz(select << 12, false) != Some(khz)

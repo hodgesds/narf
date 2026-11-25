@@ -3195,7 +3195,11 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     // a second concurrent route (`narf.intel.ext_routes=2`) with its own
     // retained surface in its own GGTT window.
     let slot = crate::intel_gpu_xelpg_external::event_slot(event.pin.port());
-    let mut next_scanout = if slot == 0 { 0u8 } else { MTL_SECOND_SCANOUT_KEY };
+    let mut next_scanout = if slot == 0 {
+        0u8
+    } else {
+        MTL_SECOND_SCANOUT_KEY
+    };
     let mut stream = 0u8;
     let mut alloc_fb = |mode: &crate::intel_gpu_modeset::Mode| {
         let index = next_scanout;

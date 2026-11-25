@@ -347,13 +347,12 @@ pub fn dp_output(
     } else {
         return Err(ColorRefusal::Ycbcr420Output);
     };
-    let pcon = (branch && dpcd.get(DP_DPCD_REV).is_some_and(|&rev| rev >= 0x13)).then(|| {
-        PconConfig {
+    let pcon =
+        (branch && dpcd.get(DP_DPCD_REV).is_some_and(|&rev| rev >= 0x13)).then(|| PconConfig {
             hdmi_sink: is_hdmi_sink(edid),
             ycbcr444_to_420: sink_420,
             rgb_to_ycbcr: sink_420 && !ycbcr444,
-        }
-    });
+        });
     Ok(DpOutput { ycbcr444, pcon })
 }
 

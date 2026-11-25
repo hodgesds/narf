@@ -122,7 +122,10 @@ fn smoke_xelpg_audio_tables_and_config_update() -> TestResult {
     // unrelated low bits kept; M/CTS programming handed to hardware.
     let io = AudioFake::new();
     let cfg = aud_cfg_off(Transcoder::B);
-    io.set(cfg, AUD_CONFIG_N_VALUE_INDEX | AUD_CONFIG_PIXEL_CLOCK_MASK | 0x3);
+    io.set(
+        cfg,
+        AUD_CONFIG_N_VALUE_INDEX | AUD_CONFIG_PIXEL_CLOCK_MASK | 0x3,
+    );
     io.set(
         aud_m_cts_enable(Transcoder::B),
         AUD_M_CTS_M_PROG_ENABLE | AUD_M_CTS_M_VALUE_INDEX | 0x5,
@@ -144,8 +147,7 @@ fn smoke_xelpg_audio_tables_and_config_update() -> TestResult {
     // No table N (rate 0 before any sync): automatic N, no N_PROG_ENABLE.
     let io = AudioFake::new();
     io.set(cfg, AUD_CONFIG_N_PROG_ENABLE);
-    if hdmi_audio_config_update(&io, &hdmi_stream(), 0).is_err() || io.writes_to(cfg) != [1 << 16]
-    {
+    if hdmi_audio_config_update(&io, &hdmi_stream(), 0).is_err() || io.writes_to(cfg) != [1 << 16] {
         return TestResult::Fail("automatic N must leave N_PROG_ENABLE clear");
     }
     // DP: N_VALUE_INDEX ("enable time stamps").
@@ -155,8 +157,7 @@ fn smoke_xelpg_audio_tables_and_config_update() -> TestResult {
         dp: true,
         ..hdmi_stream()
     };
-    if config_update(&io, &dp, 48_000).is_err() || io.writes_to(cfg) != [AUD_CONFIG_N_VALUE_INDEX]
-    {
+    if config_update(&io, &dp, 48_000).is_err() || io.writes_to(cfg) != [AUD_CONFIG_N_VALUE_INDEX] {
         return TestResult::Fail("hsw_dp_audio_config_update must only set N_VALUE_INDEX");
     }
     TestResult::Pass
@@ -190,7 +191,11 @@ fn smoke_xelpg_audio_codec_enable_disable_dp() -> TestResult {
     if io.writes_to(AUD_CONFIG_BE) != [1 << 25]
         || io.writes_to(AUD_CHICKENBIT_REG3) != [DACBE_DISABLE_MIN_HBLANK_FIX]
         || io.writes_to(aud_dp_2dot0_ctrl(Transcoder::B)) != [0]
-        || pin != [aud_output_enable(Transcoder::B), aud_output_enable(Transcoder::B)]
+        || pin
+            != [
+                aud_output_enable(Transcoder::B),
+                aud_output_enable(Transcoder::B),
+            ]
         || pin.iter().any(|v| v & aud_eld_valid(Transcoder::B) != 0)
         || io.writes_to(aud_cfg_off(Transcoder::B)) != [AUD_CONFIG_N_VALUE_INDEX]
     {
@@ -199,7 +204,11 @@ fn smoke_xelpg_audio_codec_enable_disable_dp() -> TestResult {
     // OUTPUT_ENABLE, a vblank, then the invalidate, before the config.
     let writes = io.writes.borrow().clone();
     let at = |reg: u64| writes.iter().position(|(o, _)| *o == reg);
-    match (at(AUD_CHICKENBIT_REG3), at(HSW_AUD_PIN_ELD_CP_VLD), at(aud_cfg_off(Transcoder::B))) {
+    match (
+        at(AUD_CHICKENBIT_REG3),
+        at(HSW_AUD_PIN_ELD_CP_VLD),
+        at(aud_cfg_off(Transcoder::B)),
+    ) {
         (Some(a), Some(b), Some(c)) if a < b && b < c => {}
         _ => return TestResult::Fail("the WA, presence and timestamps must run in order"),
     }
@@ -285,7 +294,9 @@ pub(crate) fn audio_edid() -> Vec<u8> {
         0,
     ];
     crate::intel_gpu_xelpg_external::color::tests::with_cta(
-        crate::intel_gpu_xelpg_external::tests::edid_for(138_500, 1920, 160, 48, 32, 1080, 31, 3, 5),
+        crate::intel_gpu_xelpg_external::tests::edid_for(
+            138_500, 1920, 160, 48, 32, 1080, 31, 3, 5,
+        ),
         &blocks,
     )
 }
@@ -361,9 +372,9 @@ fn smoke_xelpg_audio_basic_audio_sink_gets_linux_eld() -> TestResult {
     }
     // An HDMI VSDB only (PA 1.0.0.0).
     let vsdb = [(3 << 5) | 5, 0x03, 0x0C, 0x00, 0x10, 0x00];
-    let base = || crate::intel_gpu_xelpg_external::tests::edid_for(
-        138_500, 1920, 160, 48, 32, 1080, 31, 3, 5,
-    );
+    let base = || {
+        crate::intel_gpu_xelpg_external::tests::edid_for(138_500, 1920, 160, 48, 32, 1080, 31, 3, 5)
+    };
     let plain = crate::intel_gpu_xelpg_external::color::tests::with_cta(base(), &vsdb);
     let basic = with_basic_audio(plain.clone());
     if edid_has_audio(&plain) || !edid_has_audio(&basic) {
@@ -464,8 +475,7 @@ fn scripted_hda_sequence() -> TestResult {
     power.set(Some(&component), 0, true);
     if io.writes_to(AUD_FREQ_CNTRL) != [AUD_FREQ_GEN12]
         || io.writes_to(AUD_PIN_BUF_CTL) != [AUD_PIN_BUF_ENABLE]
-        || io.writes_to(HSW_AUD_CHICKENBIT)
-            != [0, SKL_AUD_CODEC_WAKE_SIGNAL, 0]
+        || io.writes_to(HSW_AUD_CHICKENBIT) != [0, SKL_AUD_CODEC_WAKE_SIGNAL, 0]
         || component.get_cdclk_freq() != Ok(307_200)
     {
         return TestResult::Fail("get_power / codec_wake_override differ from Linux");

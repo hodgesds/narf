@@ -4582,9 +4582,7 @@ fn smoke_mtl_external_uhbr_training_fallback_retry() -> TestResult {
         io.read32(base + PIPE_LINK_M1_OFFSET),
         io.read32(base + PIPE_LINK_N1_OFFSET),
     ];
-    if got != mn
-        || io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != dsc::trans_ddi_bpc(18)
-    {
+    if got != mn || io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != dsc::trans_ddi_bpc(18) {
         return TestResult::Fail("the retry's M/N and BPC_6 must be programmed");
     }
     let mut route = route;
@@ -4613,7 +4611,10 @@ fn smoke_mtl_external_uhbr_fallback_to_8b10b_or_none() -> TestResult {
     let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
         return TestResult::Fail("the DP 2.0 sink must probe");
     };
-    if probe.uhbr.as_deref().map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp))
+    if probe
+        .uhbr
+        .as_deref()
+        .map(|p| (p.link.rate, p.link.lanes, p.link.pipe_bpp))
         != Some((uhbr::UhbrRate::Uhbr10, 2, 24))
     {
         return TestResult::Fail("440 MHz on two HBR2 lanes plans UHBR10 x2");
@@ -4702,7 +4703,9 @@ fn smoke_mtl_external_uhbr_dsc_route_without_fec() -> TestResult {
     };
     {
         let sink = io.sink.borrow();
-        if !sink.dsc_log.contains(&(dsc::DP_DSC_ENABLE, dsc::DP_DECOMPRESSION_EN))
+        if !sink
+            .dsc_log
+            .contains(&(dsc::DP_DSC_ENABLE, dsc::DP_DECOMPRESSION_EN))
             || sink
                 .dsc_log
                 .iter()
@@ -4728,8 +4731,7 @@ fn smoke_mtl_external_uhbr_dsc_route_without_fec() -> TestResult {
     if got != mn
         || io.read32(dsc::dss_ctl1(Pipe::B)) != dss.0
         || io.read32(dsc::dss_ctl2(Pipe::B)) != dss.1
-        || dss.1 & (dsc::VDSC0_ENABLE | dsc::VDSC1_ENABLE)
-            != dsc::VDSC0_ENABLE | dsc::VDSC1_ENABLE
+        || dss.1 & (dsc::VDSC0_ENABLE | dsc::VDSC1_ENABLE) != dsc::VDSC0_ENABLE | dsc::VDSC1_ENABLE
     {
         return TestResult::Fail("the compressed MTP M/N and both VDSC engines must be live");
     }
@@ -4777,7 +4779,9 @@ fn smoke_mtl_external_uhbr_lttpr_non_transparent_route() -> TestResult {
     let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
         return TestResult::Fail("the DP 2.0 sink must probe through its LTTPR");
     };
-    if probe.uhbr.as_deref().map(|p| (p.link.rate, p.link.lanes)) != Some((uhbr::UhbrRate::Uhbr10, 2)) {
+    if probe.uhbr.as_deref().map(|p| (p.link.rate, p.link.lanes))
+        != Some((uhbr::UhbrRate::Uhbr10, 2))
+    {
         return TestResult::Fail("the LTTPR keeps Linux's UHBR10 x2 link");
     }
     if !io.sink.borrow().uhbr_log.is_empty() {
@@ -4821,7 +4825,9 @@ fn smoke_mtl_external_uhbr_lttpr_non_transparent_route() -> TestResult {
             ]
             || !matches!((last_mode, coding), (Some(m), Some(c)) if m < c)
         {
-            return TestResult::Fail("the LTTPR must go non-transparent, then the 128b/132b coding");
+            return TestResult::Fail(
+                "the LTTPR must go non-transparent, then the 128b/132b coding",
+            );
         }
     }
     if route.uhbr.map(|u| u.lttpr_count) != Some(1) {
@@ -4891,7 +4897,10 @@ fn smoke_mtl_external_uhbr_vbt_c20_override() -> TestResult {
         .typec()
         .byte(23, 1 << 5);
     let image = VbtImage::new(250)
-        .block(block::GENERAL_DEFINITIONS, general_definitions(44, &[child]))
+        .block(
+            block::GENERAL_DEFINITIONS,
+            general_definitions(44, &[child]),
+        )
         .block(block::VSWING_PREEMPH, vspeo_block(6, 3))
         .build();
     let Ok(vbt) = Vbt::parse(&image) else {
@@ -5365,7 +5374,11 @@ fn smoke_ptl_external_uhbr_over_tbt_tunnel() -> TestResult {
         return TestResult::Fail("TBT UHBR must leave the C20 PHY to the fabric");
     }
     if io.writes_to(0x6_10a0) != [1 << 31]
-        || io.writes_to(TRANS_DDI_FUNC_CTL_B).last().map(|v| v & (7 << 24)) != Some(4 << 24)
+        || io
+            .writes_to(TRANS_DDI_FUNC_CTL_B)
+            .last()
+            .map(|v| v & (7 << 24))
+            != Some(4 << 24)
     {
         return TestResult::Fail("the transcoder must run 128b/132b");
     }
@@ -5376,9 +5389,9 @@ fn smoke_ptl_external_uhbr_over_tbt_tunnel() -> TestResult {
         let sink = io.sink.borrow();
         let log = &sink.tunnel_log;
         let free = log.iter().rposition(|&w| w == (tunnel::DP_REQUEST_BW, 0));
-        let off = log.iter().rposition(|&w| {
-            w == (tunnel::DP_DPTX_BW_ALLOCATION_MODE_CONTROL, 0x00)
-        });
+        let off = log
+            .iter()
+            .rposition(|&w| w == (tunnel::DP_DPTX_BW_ALLOCATION_MODE_CONTROL, 0x00));
         if !matches!((free, off), (Some(f), Some(o)) if f < o)
             || sink.tunnel.map(|t| t[0x24]) != Some(0)
         {
@@ -5386,7 +5399,8 @@ fn smoke_ptl_external_uhbr_over_tbt_tunnel() -> TestResult {
         }
     }
     if io.read32(port.port_clock_ctl())
-        & (crate::intel_gpu_xelpg::TBT_CLOCK_REQUEST | crate::intel_gpu_xelpg::XE3_DDI_CLOCK_SELECT_MASK)
+        & (crate::intel_gpu_xelpg::TBT_CLOCK_REQUEST
+            | crate::intel_gpu_xelpg::XE3_DDI_CLOCK_SELECT_MASK)
         != 0
     {
         return TestResult::Fail("stop: the TBT clock must be off");
@@ -6234,7 +6248,15 @@ fn smoke_mtl_external_dp_deep_colour_10_and_12_bpc() -> TestResult {
     use crate::intel_gpu_xelpg_dsc::link_m_n;
     let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
     for (input, bpp, rate, link_khz, func_bpc, misc, msa) in [
-        (0xB0u8, 30u32, TrainRate::Rbr, 162_000u32, 1u32 << 20, 0x120u32, 0x41u32),
+        (
+            0xB0u8,
+            30u32,
+            TrainRate::Rbr,
+            162_000u32,
+            1u32 << 20,
+            0x120u32,
+            0x41u32,
+        ),
         (0xC0, 36, TrainRate::Hbr, 270_000, 3 << 20, 0x180, 0x61),
     ] {
         let mut edid = edid_1080();
@@ -6263,7 +6285,9 @@ fn smoke_mtl_external_dp_deep_colour_10_and_12_bpc() -> TestResult {
             || io.writes_to(0x6_1030) != [mn[0]]
             || io.writes_to(0x6_1044) != [mn[3]]
         {
-            return TestResult::Fail("Pipe B must carry the depth in FUNC_CTL, PIPE_MISC, MSA, M/N");
+            return TestResult::Fail(
+                "Pipe B must carry the depth in FUNC_CTL, PIPE_MISC, MSA, M/N",
+            );
         }
         if route.stop(&io).is_err() || io.read32(0x6_1410) != 0x21 {
             return TestResult::Fail("the deep route must stop and restore an 8 bpc MSA");

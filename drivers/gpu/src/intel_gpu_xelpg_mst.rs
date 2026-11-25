@@ -966,7 +966,11 @@ mod tests {
             || owner.streams.iter().any(|s| {
                 s.vcpi != s.route.pipe as u8 + 1
                     || s.route.probe.mst.map(|m| m.slots) != Some(2)
-                    || s.route.probe.uhbr.as_deref().map(|p| (p.link, p.stream.tu, p.stream.m_n))
+                    || s.route
+                        .probe
+                        .uhbr
+                        .as_deref()
+                        .map(|p| (p.link, p.stream.tu, p.stream.m_n))
                         != Some((
                             uhbr::UhbrLink {
                                 rate: uhbr::UhbrRate::Uhbr20,
@@ -987,7 +991,8 @@ mod tests {
             return TestResult::Fail("payload part 1 must allocate slots 0..2 and 2..4");
         }
         let at = aux.payload[1].1;
-        let trained = io.first_write(|r, v| r == dp_tp_ctl(Transcoder::B) && v & (7 << 8) == 3 << 8);
+        let trained =
+            io.first_write(|r, v| r == dp_tp_ctl(Transcoder::B) && v & (7 << 8) == 3 << 8);
         let func_on = io.first_write(|r, v| {
             r == trans_ddi_func_ctl(Transcoder::B) && v & TRANS_DDI_FUNC_ENABLE != 0
         });
@@ -1002,7 +1007,8 @@ mod tests {
         ) & !(7 << 24))
             | TRANS_DDI_MODE_128B132B
             | (1 << 10);
-        if io.writes_to(trans_dp2_ctl(Transcoder::B)).first() != Some(&TRANS_DP2_128B132B_CHANNEL_CODING)
+        if io.writes_to(trans_dp2_ctl(Transcoder::B)).first()
+            != Some(&TRANS_DP2_128B132B_CHANNEL_CODING)
             || io.writes_to(trans_dp2_ctl(Transcoder::C)).first()
                 != Some(&TRANS_DP2_128B132B_CHANNEL_CODING)
             || func_c.first() != Some(&(want_c & !TRANS_DDI_FUNC_ENABLE))
@@ -1076,6 +1082,8 @@ mod tests {
         let _ = link.release(&io);
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu_xelpg_mst", smoke_mtl_mst_uhbr_link_choice);
-
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_mtl_mst_uhbr_link_choice
+    );
 }

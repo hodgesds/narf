@@ -380,8 +380,12 @@ pub trait DisplayAudioComponent {
     fn sync_audio_rate(&self, port: i32, pipe: i32, rate: u32) -> Result<(), ComponentError>;
     /// `get_eld`: whether audio is enabled on the stream and the whole
     /// ELD's size; at most `buf.len()` bytes are copied.
-    fn get_eld(&self, port: i32, pipe: i32, buf: &mut [u8])
-        -> Result<(bool, usize), ComponentError>;
+    fn get_eld(
+        &self,
+        port: i32,
+        pipe: i32,
+        buf: &mut [u8],
+    ) -> Result<(bool, usize), ComponentError>;
 }
 
 /// The HDA codec driver's half (`drm_audio_component_audio_ops`).
@@ -784,7 +788,13 @@ pub mod tests {
         {
             return TestResult::Fail("the HDA-core component helpers differ from component.c");
         }
-        if display.calls.borrow()[..] != [("eld", 1, -1, 0), ("rate", 1, 2, 48_000), ("rate", 6, -1, 48_000)][..] {
+        if display.calls.borrow()[..]
+            != [
+                ("eld", 1, -1, 0),
+                ("rate", 1, 2, 48_000),
+                ("rate", 6, -1, 48_000),
+            ][..]
+        {
             return TestResult::Fail("pin2port must map the pin, dev_id must be the pipe");
         }
         display.calls.borrow_mut().clear();

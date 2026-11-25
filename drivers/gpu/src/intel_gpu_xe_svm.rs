@@ -201,12 +201,7 @@ pub(crate) fn carve(
 
 /// Whether `[address, address + size)` is covered by the union of the
 /// mappings and the mirror VMAs (PREFETCH admission).
-pub(crate) fn covered(
-    mappings: &[VmMapping],
-    vmas: &[MirrorVma],
-    address: u64,
-    size: u64,
-) -> bool {
+pub(crate) fn covered(mappings: &[VmMapping], vmas: &[MirrorVma], address: u64, size: u64) -> bool {
     let Some(end) = address.checked_add(size).filter(|_| size != 0) else {
         return false;
     };
@@ -329,7 +324,12 @@ impl Range {
     /// collect the range inside `read_begin`/`read_retry` until no
     /// invalidation raced it; -EFAULT once the range is unmapped, -EBUSY when
     /// every round was raced (`HMM_RANGE_DEFAULT_TIMEOUT`).
-    fn collect(&mut self, vm: &Vm, user: &dyn IoctlContext, vma: &MirrorVma) -> Result<(), FsError> {
+    fn collect(
+        &mut self,
+        vm: &Vm,
+        user: &dyn IoctlContext,
+        vma: &MirrorVma,
+    ) -> Result<(), FsError> {
         self.pages = None;
         self.writable = !vma.read_only;
         self.pat = vma.pat;
@@ -338,7 +338,8 @@ impl Range {
                 return Err(FsError::BadAddress);
             }
             let seq = self.notifier.read_begin();
-            let pins = user.pin_user_pages(self.start, (self.end - self.start) / PAGE, self.writable)?;
+            let pins =
+                user.pin_user_pages(self.start, (self.end - self.start) / PAGE, self.writable)?;
             // drm_gpusvm_get_pages: a range unmapped meanwhile is -EFAULT.
             if self.gone() {
                 return Err(FsError::BadAddress);
@@ -718,7 +719,10 @@ pub(crate) mod guc {
         vm.check()?;
         let address = fault.page_addr;
         let read = fault.access_type == ACCESS_READ;
-        let mirror = vm.svm.as_ref().and_then(|svm| Some((svm, svm.vma_at(address)?)));
+        let mirror = vm
+            .svm
+            .as_ref()
+            .and_then(|svm| Some((svm, svm.vma_at(address)?)));
         if let Some((svm, vma)) = mirror {
             if vma.read_only && !read {
                 return Err(FsError::OperationNotPermitted);

@@ -731,9 +731,7 @@ pub const PIPE_MISC_OFFSET: u64 = 0x30;
 /// DITHER_TYPE_SP`; `PIXEL_ROUNDING_TRUNC` on display 12+.
 pub const fn pipe_misc(pipe_bpp: u32) -> u32 {
     match pipe_bpp {
-        MIN_PIPE_BPP => {
-            PIPE_MISC_BPC_6 | PIPE_MISC_DITHER_ENABLE | PIPE_MISC_PIXEL_ROUNDING_TRUNC
-        }
+        MIN_PIPE_BPP => PIPE_MISC_BPC_6 | PIPE_MISC_DITHER_ENABLE | PIPE_MISC_PIXEL_ROUNDING_TRUNC,
         30 => PIPE_MISC_BPC_10 | PIPE_MISC_PIXEL_ROUNDING_TRUNC,
         36 => PIPE_MISC_BPC_12_ADLP | PIPE_MISC_PIXEL_ROUNDING_TRUNC,
         _ => PIPE_MISC_PIXEL_ROUNDING_TRUNC,
@@ -1301,8 +1299,7 @@ pub fn compute_with(
                     }
                 }
             }
-            if let Some((rate, lanes)) = uhbr.filter(|_| slices != 0).and_then(|f| f(bpp, slices))
-            {
+            if let Some((rate, lanes)) = uhbr.filter(|_| slices != 0).and_then(|f| f(bpp, slices)) {
                 found = Some((rate, lanes, bpp));
                 break;
             }

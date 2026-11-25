@@ -964,7 +964,8 @@ pub struct MtlHdmiProbe {
     /// The sink's ELD (`drm_edid_to_eld`) when the route enables audio
     /// (`narf.intel.hdmi14_ext=1`, `intel_hdmi_has_audio`: an HDMI sink
     /// that declares basic audio or audio descriptors).
-    pub audio: Option<alloc::boxed::Box<[u8; crate::intel_gpu_xelpg_external::audio::MAX_ELD_BYTES]>>,
+    pub audio:
+        Option<alloc::boxed::Box<[u8; crate::intel_gpu_xelpg_external::audio::MAX_ELD_BYTES]>>,
     /// EDID bytes (`edid_len` valid).
     pub edid: alloc::boxed::Box<[u8; crate::intel_gpu_hdmi::EDID_CAPACITY]>,
     /// Valid EDID length.
@@ -1190,9 +1191,7 @@ fn output_for<M: MmioWindow + ?Sized>(
         with_depth(SinkFormat::Ycbcr420)
     } else {
         match with_depth(SinkFormat::Rgb) {
-            Err(e) if allowed && y420.also(vic) => {
-                with_depth(SinkFormat::Ycbcr420).map_err(|_| e)
-            }
+            Err(e) if allowed && y420.also(vic) => with_depth(SinkFormat::Ycbcr420).map_err(|_| e),
             result => result,
         }
     };

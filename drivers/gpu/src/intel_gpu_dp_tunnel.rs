@@ -452,13 +452,10 @@ fn clear_bw_req_state<A: AuxChannel + ?Sized>(aux: &mut A) -> Result<(), AuxErro
 
 /// `bw_req_complete`: `None` while neither result bit is set, else the
 /// result after clearing it; the status-change bits are reported.
-fn bw_req_complete<A: AuxChannel + ?Sized>(
-    aux: &mut A,
-) -> Result<(Option<bool>, bool), AuxError> {
+fn bw_req_complete<A: AuxChannel + ?Sized>(aux: &mut A) -> Result<(Option<bool>, bool), AuxError> {
     let mut status = [0u8];
     aux.dpcd_read(DP_TUNNELING_STATUS, &mut status)?;
-    let changed =
-        status[0] & (DP_BW_ALLOCATION_CAPABILITY_CHANGED | DP_ESTIMATED_BW_CHANGED) != 0;
+    let changed = status[0] & (DP_BW_ALLOCATION_CAPABILITY_CHANGED | DP_ESTIMATED_BW_CHANGED) != 0;
     let result = status[0] & (DP_BW_REQUEST_SUCCEEDED | DP_BW_REQUEST_FAILED);
     if result == 0 {
         return Ok((None, changed));

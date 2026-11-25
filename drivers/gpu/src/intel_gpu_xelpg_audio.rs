@@ -54,9 +54,9 @@ use narf_drivers_sound::display_audio::{
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::intel_gpu_audio::{
-    aud_cfg_off, aud_eld_valid, aud_output_enable, dp_audio_config_update,
-    AUD_CONFIG_LOWER_N_MASK, AUD_CONFIG_N_PROG_ENABLE, AUD_CONFIG_N_VALUE_INDEX,
-    AUD_CONFIG_PIXEL_CLOCK_MASK, AUD_CONFIG_UPPER_N_MASK, HSW_AUD_PIN_ELD_CP_VLD,
+    aud_cfg_off, aud_eld_valid, aud_output_enable, dp_audio_config_update, AUD_CONFIG_LOWER_N_MASK,
+    AUD_CONFIG_N_PROG_ENABLE, AUD_CONFIG_N_VALUE_INDEX, AUD_CONFIG_PIXEL_CLOCK_MASK,
+    AUD_CONFIG_UPPER_N_MASK, HSW_AUD_PIN_ELD_CP_VLD,
 };
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_pipes::{Pipe, Transcoder};
@@ -208,12 +208,7 @@ pub enum AudioError {
     Transcoder,
 }
 
-fn rmw<M: MmioWindow + ?Sized>(
-    io: &M,
-    reg: u64,
-    clear: u32,
-    set: u32,
-) -> Result<(), AudioError> {
+fn rmw<M: MmioWindow + ?Sized>(io: &M, reg: u64, clear: u32, set: u32) -> Result<(), AudioError> {
     let cur = io.read32(reg);
     if cur == u32::MAX || !io.display_access_ok() {
         return Err(AudioError::AccessLost);
@@ -235,10 +230,8 @@ fn wait_for_next_vblank<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe) {
 }
 
 fn sleep_us(us: u64) {
-    let _ = narf_scheduler::responsive_spin_until(
-        || false,
-        narf_time::Deadline::after_ns(us * 1_000),
-    );
+    let _ =
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ns(us * 1_000));
 }
 
 // ── AUD_CONFIG (hsw_*_audio_config_update) ───────────────────────────
@@ -372,7 +365,8 @@ pub fn hdmi_audio_config_update<M: MmioWindow + ?Sized>(
     if cur == u32::MAX || !io.display_access_ok() {
         return Err(AudioError::AccessLost);
     }
-    let mut tmp = cur & !(AUD_CONFIG_N_VALUE_INDEX | AUD_CONFIG_PIXEL_CLOCK_MASK | AUD_CONFIG_N_PROG_ENABLE);
+    let mut tmp =
+        cur & !(AUD_CONFIG_N_VALUE_INDEX | AUD_CONFIG_PIXEL_CLOCK_MASK | AUD_CONFIG_N_PROG_ENABLE);
     tmp |= audio_config_hdmi_pixel_clock(s.crtc_clock_khz);
     let n = audio_config_hdmi_get_n(s.pipe_bpp, s.port_clock_khz, rate);
     if n != 0 {
@@ -438,10 +432,14 @@ pub fn calc_hblank_early_prog(s: &AudioStream, cdclk_khz: u32) -> u32 {
     };
     let tu_data = (pixel_clk * vdsc_bppx16 * 8 * 1_000_000) / (link_clk * lanes * 16 * fec_coeff);
     let tu_line = (h_active * link_clk * fec_coeff) / (64 * pixel_clk * 1_000_000);
-    let link_clks_active = (tu_line.wrapping_sub(1)).wrapping_mul(64).wrapping_add(tu_data);
+    let link_clks_active = (tu_line.wrapping_sub(1))
+        .wrapping_mul(64)
+        .wrapping_add(tu_data);
     let hblank_rise =
         (link_clks_active + 6 * link_clks_active.div_ceil(250) + 4) * pixel_clk / link_clk;
-    (h_active.wrapping_sub(hblank_rise).wrapping_add(hblank_delta)) as u32
+    (h_active
+        .wrapping_sub(hblank_rise)
+        .wrapping_add(hblank_delta)) as u32
 }
 
 /// `calc_samples_room`.
@@ -558,12 +556,7 @@ pub fn codec_disable<M: MmioWindow + ?Sized>(io: &M, s: &AudioStream) -> Result<
             io,
             aud_cfg_off(s.trans),
             AUD_CONFIG_N_VALUE_INDEX | AUD_CONFIG_UPPER_N_MASK | AUD_CONFIG_LOWER_N_MASK,
-            AUD_CONFIG_N_PROG_ENABLE
-                | if s.dp {
-                    AUD_CONFIG_N_VALUE_INDEX
-                } else {
-                    0
-                },
+            AUD_CONFIG_N_PROG_ENABLE | if s.dp { AUD_CONFIG_N_VALUE_INDEX } else { 0 },
         )?;
     }
     rmw(io, HSW_AUD_PIN_ELD_CP_VLD, aud_eld_valid(s.trans), 0)?;
@@ -604,7 +597,8 @@ pub fn hdmi_audio_rate_supported(
     let rate_x4_x1000 = (u64::from(audio_rate) * factor + 12_000) * 1001;
     let packets_line = (rate_x4_x1000 * u64::from(h_total)).div_ceil(4 * 1000 * pixel_clk_max_hz);
     let hblank_audio_min = 32 * packets_line + 74;
-    hblank_audio_min <= u64::from(available_tmds) && packets_line <= HDMI_TMDS_AUDIO_PACKETS_LINE_MAX
+    hblank_audio_min <= u64::from(available_tmds)
+        && packets_line <= HDMI_TMDS_AUDIO_PACKETS_LINE_MAX
 }
 
 /// The HDMI VSDB's progressive (audio, video) latency, if present
@@ -759,11 +753,7 @@ pub fn eld_from_edid(edid: &[u8], dp: bool) -> [u8; MAX_ELD_BYTES] {
 /// `DIV_ROUND_UP(hblank * bpc, 8 * K_420)` TMDS clocks; SADs left with none
 /// are dropped and the count and baseline length recomputed), then
 /// `drm_av_sync_delay / 2` in byte 6.
-pub fn compute_eld(
-    eld: &[u8; MAX_ELD_BYTES],
-    edid: &[u8],
-    s: &AudioStream,
-) -> [u8; MAX_ELD_BYTES] {
+pub fn compute_eld(eld: &[u8; MAX_ELD_BYTES], edid: &[u8], s: &AudioStream) -> [u8; MAX_ELD_BYTES] {
     let mut eld = *eld;
     let mnl = usize::from(eld[4] & 0x1F);
     let mut sad_count = usize::from(eld[5] >> 4);
@@ -898,7 +888,10 @@ pub fn audio_codec_enable<M: MmioWindow + ?Sized>(
 /// `intel_audio_codec_disable`: [`codec_disable`], the state cleared, the
 /// sink publication cleared and the codec notified. The state is cleared
 /// even when a register step failed, so no codec reads a stale ELD.
-pub fn audio_codec_disable<M: MmioWindow + ?Sized>(io: &M, s: &AudioStream) -> Result<(), AudioError> {
+pub fn audio_codec_disable<M: MmioWindow + ?Sized>(
+    io: &M,
+    s: &AudioStream,
+) -> Result<(), AudioError> {
     let result = codec_disable(io, s);
     if let Some(slot) = AUDIO.lock().state.get_mut(s.trans as usize) {
         *slot = None;
@@ -954,7 +947,11 @@ pub fn component_get_power<M: MmioWindow + ?Sized>(io: &M) -> u64 {
     let (first, freq, count) = {
         let mut audio = AUDIO.lock();
         audio.power_refcount += 1;
-        (audio.power_refcount == 1, audio.freq_cntrl, audio.power_refcount)
+        (
+            audio.power_refcount == 1,
+            audio.freq_cntrl,
+            audio.power_refcount,
+        )
     };
     if first {
         io.write32(AUD_FREQ_CNTRL, freq);
@@ -995,7 +992,8 @@ pub fn component_sync_audio_rate<M: MmioWindow + ?Sized>(
     let _cookie = component_get_power(io);
     let result = (|| {
         let mut audio = AUDIO.lock();
-        let state = find_audio_state(&audio, port, cpu_transcoder).ok_or(ComponentError::NoDevice)?;
+        let state =
+            find_audio_state(&audio, port, cpu_transcoder).ok_or(ComponentError::NoDevice)?;
         let slot = usize::try_from(port)
             .ok()
             .and_then(|p| audio.aud_sample_rate.get_mut(p))
@@ -1032,7 +1030,8 @@ pub struct XelpgAudioComponent<'a, M: MmioWindow + ?Sized> {
 
 impl<M: MmioWindow + ?Sized> core::fmt::Debug for XelpgAudioComponent<'_, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("XelpgAudioComponent").finish_non_exhaustive()
+        f.debug_struct("XelpgAudioComponent")
+            .finish_non_exhaustive()
     }
 }
 

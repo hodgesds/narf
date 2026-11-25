@@ -3202,12 +3202,14 @@ impl<M: Platform> Guard<'_, M> {
             .enabled()
             .map_err(|_| Refusal::VbtDisabled)?;
         let timing = platform.psr_timing().ok_or(Refusal::NoTiming)?;
-        if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 || crate::intel_gpu_vrr::vrr_excludes_psr(1) {
+        if timing.flags & DRM_MODE_FLAG_INTERLACE != 0 || crate::intel_gpu_vrr::vrr_excludes_psr(1)
+        {
             return Err(Refusal::NoTiming);
         }
         let mut aux = PsrAux(platform);
         let caps = pr::Caps::read(&mut aux, true, false)?;
-        let port_clock = crate::intel_gpu_psr::sink_link_rate(&mut aux).ok_or(Refusal::Unavailable)?;
+        let port_clock =
+            crate::intel_gpu_psr::sink_link_rate(&mut aux).ok_or(Refusal::Unavailable)?;
         let mut feature = [0u8];
         let as_sdp = crate::intel_gpu_psr::read(&mut aux, 0x2214, &mut feature).is_ok()
             && feature[0] & 1 != 0;

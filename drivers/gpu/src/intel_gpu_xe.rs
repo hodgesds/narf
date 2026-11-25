@@ -1324,12 +1324,10 @@ impl XeFile {
         // xe_svm_garbage_collector: CPU unmaps are processed first, so a
         // range they removed cannot make the VMA change below -EBUSY.
         vm.svm_collect_garbage(&state);
-        let prepared = state.prepare_all(
-            &binds,
-            vm.scratch,
-            &vm.svm_vmas(&state),
-            &|start, end| vm.svm_has_mapping(start, end),
-        )?;
+        let prepared =
+            state.prepare_all(&binds, vm.scratch, &vm.svm_vmas(&state), &|start, end| {
+                vm.svm_has_mapping(start, end)
+            })?;
         state.retire().await?;
         vm.check()?;
         if let Some(queue) = &queue {

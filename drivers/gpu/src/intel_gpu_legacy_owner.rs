@@ -1543,7 +1543,11 @@ impl Owner {
         }
         loop {
             let idle = self.gt_idle().await;
-            match self.sleep.lock().drain_step(idle, narf_time::monotonic_ns()) {
+            match self
+                .sleep
+                .lock()
+                .drain_step(idle, narf_time::monotonic_ns())
+            {
                 DrainStep::Wait => {}
                 DrainStep::Idle => break,
                 DrainStep::Wedged => {

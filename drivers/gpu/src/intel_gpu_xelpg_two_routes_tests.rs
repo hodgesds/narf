@@ -227,7 +227,11 @@ fn smoke_mtl_two_routes_light_and_tear_down_independently() -> TestResult {
     // Independent hotplug: a healthy IRQ_HPD on TC1 changes nothing.
     let quiet = io.tc.writes.borrow().len();
     if !matches!(
-        service.handle(&io, event(XeLpgPort::Tc1, MtlHpdKind::ShortPulse), &mut alloc),
+        service.handle(
+            &io,
+            event(XeLpgPort::Tc1, MtlHpdKind::ShortPulse),
+            &mut alloc
+        ),
         ServiceOutcome::Unchanged
     ) || !never_blanked(&io, PIPECONF_C, quiet, SURFACES[1])
     {
@@ -236,7 +240,11 @@ fn smoke_mtl_two_routes_light_and_tear_down_independently() -> TestResult {
     // A lost link retrains TC1 on Pipe B beside the HDMI route.
     io.tc.sink.borrow_mut().drop_lock();
     let retrain_from = io.tc.writes.borrow().len();
-    match service.handle(&io, event(XeLpgPort::Tc1, MtlHpdKind::ShortPulse), &mut alloc) {
+    match service.handle(
+        &io,
+        event(XeLpgPort::Tc1, MtlHpdKind::ShortPulse),
+        &mut alloc,
+    ) {
         ServiceOutcome::Activated { pipe: Pipe::B, .. } => {}
         _ => return TestResult::Fail("a lost TC1 link must retrain on Pipe B"),
     }
@@ -250,7 +258,11 @@ fn smoke_mtl_two_routes_light_and_tear_down_independently() -> TestResult {
     // Unplug TC1: Pipe B goes, Pipe C stays lit and takes S3|S4 alone.
     let unplug_from = io.tc.writes.borrow().len();
     if !matches!(
-        service.handle(&io, event(XeLpgPort::Tc1, MtlHpdKind::Disconnected), &mut alloc),
+        service.handle(
+            &io,
+            event(XeLpgPort::Tc1, MtlHpdKind::Disconnected),
+            &mut alloc
+        ),
         ServiceOutcome::Withdrawn {
             port: XeLpgPort::Tc1
         }
@@ -269,7 +281,11 @@ fn smoke_mtl_two_routes_light_and_tear_down_independently() -> TestResult {
     }
     // Unplug DDI B: the panel gets its whole single-pipe profile back.
     if !matches!(
-        service.handle(&io, event(XeLpgPort::B, MtlHpdKind::Disconnected), &mut alloc),
+        service.handle(
+            &io,
+            event(XeLpgPort::B, MtlHpdKind::Disconnected),
+            &mut alloc
+        ),
         ServiceOutcome::Withdrawn { port: XeLpgPort::B }
     ) {
         return TestResult::Fail("DDI B's unplug must withdraw the HDMI route");

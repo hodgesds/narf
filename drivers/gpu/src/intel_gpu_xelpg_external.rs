@@ -225,8 +225,8 @@ use crate::intel_gpu_xe2lpd::{disable_d2d, enable_d2d, DisplayIp, DDI_BUF_D2D_LI
 use crate::intel_gpu_xelpg::{
     disable_port_pll_lanes, disable_tbt_clock, dp_pll_request, dp_uhbr_pll_request,
     enable_port_pll_state, enable_tbt_clock, program_port_buf_ctl, program_port_buf_ctl_width,
-    set_signal_levels, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
-    Cx0Phy, PhyKind, PhyLaneConfig, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
+    set_signal_levels, wait_port_buf_active, wait_port_buf_idle, Cx0Error, Cx0Phy, PhyKind,
+    PhyLaneConfig, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
@@ -1398,7 +1398,11 @@ fn plan_uhbr_link<A: crate::dp_aux::AuxChannel + ?Sized>(
     let lttpr_lanes = uhbr::lttpr_max_lanes(&sink.lttpr_caps);
     if lttpr_rate != 0 || lttpr_lanes != 0 {
         limits = limits.capped(
-            if lttpr_rate != 0 { lttpr_rate } else { u32::MAX },
+            if lttpr_rate != 0 {
+                lttpr_rate
+            } else {
+                u32::MAX
+            },
             if lttpr_lanes != 0 { lttpr_lanes } else { 4 },
         );
     }
@@ -1547,7 +1551,11 @@ fn uhbr_mst_link<M: MmioWindow + ?Sized>(
     let lttpr_lanes = uhbr::lttpr_max_lanes(&sink.lttpr_caps);
     if lttpr_rate != 0 || lttpr_lanes != 0 {
         limits = limits.capped(
-            if lttpr_rate != 0 { lttpr_rate } else { u32::MAX },
+            if lttpr_rate != 0 {
+                lttpr_rate
+            } else {
+                u32::MAX
+            },
             if lttpr_lanes != 0 { lttpr_lanes } else { 4 },
         );
     }
@@ -2648,8 +2656,8 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
     let _ = uhbr::stop_train(&mut aux, &mut source, &mut clock)?;
     // 7.a 128b/132b SST: VCPID 1, start slot 0, tu slots (an MST stream's
     // payload is drm_dp_add_payload_part1's, at its activation).
-    let sink_payload = probe.mst.is_none()
-        && uhbr::write_payload(&mut aux, &mut clock, 1, 0, plan.stream.tu);
+    let sink_payload =
+        probe.mst.is_none() && uhbr::write_payload(&mut aux, &mut clock, 1, 0, plan.stream.tu);
     let lttpr_count = route.uhbr.map_or(0, |state| state.lttpr_count);
     route.uhbr = Some(UhbrTrained {
         presets,
@@ -3025,7 +3033,11 @@ fn finish<M: MmioWindow + ?Sized>(
     rp.pipes.arm_primary(io, pipe)?;
     observe_live(io, route, func, start)?;
     // intel_post_plane_update: intel_encoders_audio_enable (SST only).
-    let Some(connector_eld) = route.probe.audio.clone().filter(|_| route.probe.mst.is_none())
+    let Some(connector_eld) = route
+        .probe
+        .audio
+        .clone()
+        .filter(|_| route.probe.mst.is_none())
     else {
         return Ok(());
     };
@@ -4100,7 +4112,10 @@ impl MtlExternalService {
 
     /// The route owning `port`, if any.
     pub fn route_on(&self, port: XeLpgPort) -> Option<&MtlRoute> {
-        self.routes.iter().flatten().find(|route| route.port() == port)
+        self.routes
+            .iter()
+            .flatten()
+            .find(|route| route.port() == port)
     }
 
     /// Every retained route.
@@ -4294,9 +4309,7 @@ impl MtlExternalService {
                     let _ = release_probe(io, &probe);
                     ServiceOutcome::Refused {
                         port,
-                        error: RouteError::Dp(ExternalError::SecondRoute(
-                            SecondRouteRefusal::Uhbr,
-                        )),
+                        error: RouteError::Dp(ExternalError::SecondRoute(SecondRouteRefusal::Uhbr)),
                     }
                 }
                 Ok(mut probe) => {
@@ -4373,22 +4386,16 @@ impl MtlExternalService {
         let profile = self
             .profile
             .expect("HDMI connect follows a source-qualified route plan");
-        let mut probe = match probe_hdmi_profile_ext(
-            io,
-            profile,
-            port,
-            legacy,
-            ddc,
-            color::opted_in(),
-        ) {
-            Ok(probe) => probe,
-            Err(e) => {
-                return ServiceOutcome::Refused {
-                    port,
-                    error: RouteError::Hdmi(e),
+        let mut probe =
+            match probe_hdmi_profile_ext(io, profile, port, legacy, ddc, color::opted_in()) {
+                Ok(probe) => probe,
+                Err(e) => {
+                    return ServiceOutcome::Refused {
+                        port,
+                        error: RouteError::Hdmi(e),
+                    }
                 }
-            }
-        };
+            };
         probe.pll.lanes = PhyLaneConfig::for_route(false, 4, self.policy.decl(port).lane_reversal)
             .expect("native PHY has both lanes");
         let fb = match alloc(&probe.mode) {

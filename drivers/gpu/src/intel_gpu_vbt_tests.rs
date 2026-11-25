@@ -990,7 +990,10 @@ fn vbt_c20_vspeo_tables_follow_intel_bios() -> TestResult {
             .typec()
             .byte(23, if bit { 1 << 5 } else { 0 });
         let image = VbtImage::new(version)
-            .block(block::GENERAL_DEFINITIONS, general_definitions(44, &[child]))
+            .block(
+                block::GENERAL_DEFINITIONS,
+                general_definitions(44, &[child]),
+            )
             .block(block::VSWING_PREEMPH, block_data)
             .build();
         Vbt::parse(&image).ok()

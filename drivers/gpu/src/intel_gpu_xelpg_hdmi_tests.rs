@@ -1236,8 +1236,8 @@ fn probe_deep(io: &ExtFake, ext: bool) -> Result<MtlHdmiProbe, HdmiError> {
 /// sinks stay at 8 bpc and get no GCP.
 fn smoke_xe_hdmi_deep_colour_10_and_12_bpc_routes() -> TestResult {
     use crate::intel_gpu_hdmi::{
-        GCP_COLOR_INDICATION, GCP_DEFAULT_PHASE_ENABLE, VIDEO_DIP_CTL_OFFSET,
-        VIDEO_DIP_ENABLE_GCP, VIDEO_DIP_GCP_OFFSET,
+        GCP_COLOR_INDICATION, GCP_DEFAULT_PHASE_ENABLE, VIDEO_DIP_CTL_OFFSET, VIDEO_DIP_ENABLE_GCP,
+        VIDEO_DIP_GCP_OFFSET,
     };
     let fb = Framebuffer {
         phys_addr: 0x100_0000,
@@ -1352,10 +1352,11 @@ fn smoke_xe_hdmi_audio_route_with_scripted_hda() -> TestResult {
         let pin = io.writes_to(crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD);
         let output = crate::intel_gpu_audio::aud_output_enable(Transcoder::B);
         if pin.first() != Some(&output)
-            || pin.iter().any(|v| v & crate::intel_gpu_audio::aud_eld_valid(Transcoder::B) != 0)
+            || pin
+                .iter()
+                .any(|v| v & crate::intel_gpu_audio::aud_eld_valid(Transcoder::B) != 0)
             || io.writes_to(crate::intel_gpu_audio::aud_cfg_off(Transcoder::B)) != [1 << 16]
-            || io.writes_to(audio::AUD_TS_CDCLK_M).last()
-                != Some(&(60 | audio::AUD_TS_CDCLK_M_EN))
+            || io.writes_to(audio::AUD_TS_CDCLK_M).last() != Some(&(60 | audio::AUD_TS_CDCLK_M_EN))
             || at::NOTIFY_COUNT.load(core::sync::atomic::Ordering::SeqCst) != before + 1
             || at::NOTIFY_PORT.load(core::sync::atomic::Ordering::SeqCst) != 1
             || at::NOTIFY_PIPE.load(core::sync::atomic::Ordering::SeqCst) != -1
@@ -1365,7 +1366,9 @@ fn smoke_xe_hdmi_audio_route_with_scripted_hda() -> TestResult {
         // The audio enable follows the armed primary and its witness.
         match (
             position(&io, |o, _| o == PLANE_SURF_1 + Pipe::B.base()),
-            position(&io, |o, _| o == crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD),
+            position(&io, |o, _| {
+                o == crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD
+            }),
         ) {
             (Some(plane), Some(audio)) if plane < audio => {}
             _ => return TestResult::Fail("audio must start after the plane update"),
@@ -1381,7 +1384,10 @@ fn smoke_xe_hdmi_audio_route_with_scripted_hda() -> TestResult {
             || at::NOTIFY_COUNT.load(core::sync::atomic::Ordering::SeqCst) != before + 2
             || acomp::acomp_get_eld(Some(&component), Some(&at::SCRIPTED_HDA), 0x6, 0, &mut buf)
                 .is_ok()
-            || io.writes_to(crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD).last() != Some(&0)
+            || io
+                .writes_to(crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD)
+                .last()
+                != Some(&0)
         {
             return TestResult::Fail("the stop must disable audio and withdraw the ELD");
         }
