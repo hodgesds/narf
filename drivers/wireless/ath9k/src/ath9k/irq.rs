@@ -22,6 +22,8 @@
 //! wake; this bottom half reads/clears causes and re-enables IER afterwards,
 //! exactly as Linux kills interrupts in `ath_isr` and resumes in the tasklet.
 use super::packet::{Error, Port};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::narf_lib;
 use alloc::sync::Arc;
 use core::{
     future::Future,

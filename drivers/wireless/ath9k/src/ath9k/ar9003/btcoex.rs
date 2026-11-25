@@ -42,6 +42,8 @@ use super::mci::{
 };
 use super::{field, rmw, Chip, HW_CAP_MCI};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_io, narf_lib};
 use alloc::sync::Arc;
 use narf_io::DmaBuffer;
 use narf_lib::sync::IrqSafeSpinLock;

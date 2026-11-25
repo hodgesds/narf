@@ -48,6 +48,8 @@
 use super::btcoex::StompType;
 use super::{field, rmw, Chip};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::narf_io;
 use narf_io::{DmaBuffer, DmaDirection};
 
 /// `reg_mci.h::AR_MCI_COMMAND0`.

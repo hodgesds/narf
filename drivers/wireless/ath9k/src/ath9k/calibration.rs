@@ -21,6 +21,8 @@ use super::{
     identity::{BringUpError, RegisterIo, Registers},
     EEPROM_4K_BYTES,
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::narf_time;
 use narf_wireless::reg::{RegFlags, RegulatoryDomain};
 
 pub(super) trait Io: RegisterIo {

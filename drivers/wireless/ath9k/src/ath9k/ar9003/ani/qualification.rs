@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Distinct full-program N46P/N48P/N65P measurements. No A/S/D upgrade.
 use super::Settings;
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{narf_capabilities, narf_firmware};
 use crate::ath9k::{admission, calibration::Permission, packet::Error};
 use alloc::{format, string::String, sync::Arc};
 use narf_capabilities::{Cap, CapError, CapOp, Read};
@@ -73,7 +75,7 @@ impl Base {
         }
         h.update(&[44, permission.budget(), grant.antenna, grant.ceiling]);
         h.update(&crate::ath9k::ar9003::btcoex::concurrent::plan(plan, true).targets);
-        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+        let domain = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
         h.update(&domain.country_code);
         let frequency = r.frequency_mhz;
         let device = r.device;
@@ -122,7 +124,7 @@ impl Base {
     fn invoke<T>(&self, action: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         self.grant
             .invoke(|| {
-                let domain = narf_wireless::reg::db::snapshot()
+                let domain = crate::ath9k::platform::regdb::snapshot()
                     .ok_or(crate::ath9k::identity::BringUpError::Policy)?;
                 if !self.permission.current_dual_in(&domain) {
                     return Err(crate::ath9k::identity::BringUpError::Policy);
@@ -219,7 +221,7 @@ impl Grant {
             }
         }
         self.base.invoke(|| {
-            let host = narf_wireless::reg::db::snapshot()
+            let host = crate::ath9k::platform::regdb::snapshot()
                 .and_then(|d| Permission::from_domain_dual(&d, self.base.frequency).ok())
                 .ok_or(Error::Access)?;
             if i32::from(self.peak) + i32::from(self.antenna)

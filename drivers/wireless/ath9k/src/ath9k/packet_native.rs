@@ -4,6 +4,10 @@ use super::{
     identity,
     packet::{Error, Port},
 };
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::{
+    narf_bus, narf_capabilities, narf_interrupts, narf_io, narf_lib, narf_scheduler, narf_time,
+};
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
@@ -1001,7 +1005,7 @@ impl Native {
         {
             return Err(Error::Access);
         }
-        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+        let domain = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
         if !self.calibrated.permitted(&domain) {
             return Err(Error::Access);
         }
@@ -1521,7 +1525,7 @@ impl Port for Native {
         Some(retained.get_or_insert(grant).clone())
     }
     fn transmit_allowed(&self) -> Result<(), Error> {
-        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+        let domain = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
         if !self.calibrated.permitted(&domain) {
             return Err(Error::Access);
         }

@@ -5,11 +5,17 @@
 //! lives in `narf-drivers-wireless-ath-core`; see `drivers/wireless/ath10k/`
 //! for the reference single-driver dual-build shape.
 //!
-//! ath9k is PCIe-only (AR5008/AR9001/AR9002/AR9003 families). The real driver
-//! in [`ath9k`] binds the Atheros PCIe ids (vendor `0x168c`); the `module`
-//! build registers that id table through `narf_register_pci_driver` with a
-//! probe thunk that returns `-ENOSYS` (registration-only proof), matching the
-//! net and iwlwifi `.ko`s.
+//! ath9k is PCIe-only (AR5008/AR9001/AR9002/AR9003 families). Built in, the
+//! driver in [`ath9k`] binds every Atheros PCIe id it owns (vendor
+//! `0x168c`). The `module` build is the same driver running inside the
+//! `.ko`, every chip owner (AR5008, AR9280, AR9285/AR2427, AR9287 and the
+//! AR9300 family): it registers the same ids through
+//! `narf_register_pci_driver` and drives the chip through the KABI (BAR
+//! access, the PCI Command register, PCIe state, a read-only config dword,
+//! plain MSI, mapped DMA, signed board/qualification records and the host
+//! regulatory domain), with its netdev and wiphy published through the
+//! netif bridge and the `WIFI` family host. `narf_module_exit` runs the
+//! bound owner's device removal.
 //!
 //! ## Hardware validation is gated
 //!
@@ -20,16 +26,14 @@
 #![no_std]
 #![allow(dead_code)]
 
-#[cfg(feature = "builtin")]
 extern crate alloc;
 
 use narf_driver_macros::narf_driver;
 
-#[cfg(feature = "builtin")]
+/// The driver. One source tree in both builds: kernel services come from
+/// [`ath9k::platform`], which is the kernel's crates built in and
+/// `narf-module-rt` + the KABI in the `.ko`.
 pub mod ath9k;
-
-#[cfg(feature = "module")]
-mod module_probe;
 
 narf_driver! {
     name: "ath9k",
@@ -39,7 +43,7 @@ narf_driver! {
         author: "narf",
         description: "Qualcomm Atheros ath9k (AR5008..AR9003 PCIe)",
         target_domain: "net",
-        required_caps: "BusDevice:Write,NetIface:Write",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write,Firmware:Read",
     },
     register: do_register,
 }
@@ -51,5 +55,13 @@ fn do_register() {
 
 #[cfg(feature = "module")]
 fn do_register() {
-    module_probe::register();
+    ath9k::register_module();
+}
+
+/// Module exit (`rmmod`): remove the bound radio as built-in device removal
+/// does, then stop the module's executor.
+#[cfg(feature = "module")]
+#[unsafe(no_mangle)]
+pub extern "C" fn narf_module_exit() {
+    ath9k::exit_module();
 }

@@ -4,6 +4,8 @@
 //! the normal packet path checks the last completely verified rate table.
 use super::*;
 use crate::ath9k::ar9003::btcoex::concurrent::Raw;
+#[cfg(feature = "module")]
+use crate::ath9k::platform::compat::narf_bus;
 
 struct Registers<'a>(&'a Native, bool);
 impl Registers<'_> {
@@ -15,7 +17,7 @@ impl Registers<'_> {
             {
                 return Err(Error::Access);
             }
-            let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+            let domain = crate::ath9k::platform::regdb::snapshot().ok_or(Error::Access)?;
             if !native.calibrated.permitted(&domain) {
                 return Err(Error::Access);
             }
