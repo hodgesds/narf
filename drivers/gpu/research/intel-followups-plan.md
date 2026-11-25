@@ -48,9 +48,11 @@ work had.
   GT across S3 (the execlists owner has no system-PM hooks, and while it
   holds its `GT_IRQ` reference DC9 is refused) and `PP_DIVISOR` on pre-CNP
   south displays.
-- Nova Lake-S: Thunderbolt alt mode on the LT PHY, Nova fixtures for
-  MST and DSC over LT ports, DC3CO (it needs the CMTG and a LOBF,
-  panel-replay or PSR2 trigger) and the DMC wakelock (`intel_dmc_wl`).
+- Nova Lake-S: DC3CO (a typed refusal until the route has a LOBF,
+  panel-replay or PSR2 trigger and owns the CMTG), and silicon runs of the
+  DC service and of a TBT dock. Thunderbolt alt mode on the LT PHY and the
+  MST and DSC fixtures over LT ports have landed; the DMC wakelock is not
+  used, and an inherited wakelock mode blocks DC6.
 - Display 14 and later: native HDMI FRL, HDMI audio, deep colour and
   YCbCr 4:4:4, a second concurrent external route, panel replay, and
   compressed primary layouts.

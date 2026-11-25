@@ -471,9 +471,12 @@ panel, the display-14 external route drives LT port B (DP 1.4 and HDMI TMDS on
 Pipes B-D) and TC1/TC2 (DP-alt, declared legacy HDMI) over the same view: PLL
 enable/disable and signal levels on the LT PHY (`ExternalDisplayProfile::
 admits_port` opens B/TC1/TC2 for `NovaLakeS`, and `admits_view` refuses a
-profile whose PHY family the view does not report). Thunderbolt alt mode
-(`ExternalError::LtTbtAlt`) and HDMI FRL stay refused; UHBR10/20 SST runs
-only behind `narf.intel.uhbr=1` (§20, "DP 2.0 UHBR").
+profile whose PHY family the view does not report). Thunderbolt alt mode on
+TC1/TC2 takes the fabric's clock (`intel_mtl_tbt_pll_enable_clock` with the
+display-30 five-bit select and `DDI_CLK_VALFREQ`, TBT IO in `PORT_BUF_CTL1`,
+PICA_TC for the tunnel's AUX) and no LT transaction; MST and DSC with FEC
+over LT ports have native fixtures. HDMI FRL stays refused; UHBR10/20 SST
+runs only behind `narf.intel.uhbr=1` (§20, "DP 2.0 UHBR").
 WCL uses its separate C10/C20 route.
 `intel_gpu_nvl_resources` is a separate, pure ownership model; the owned
 route above does not use it. It admits only eDP on LT port A/Pipe A, native DP or HDMI TMDS on LT
@@ -593,8 +596,12 @@ select either container. Nova's owned route (`narf.intel.nvl_display=1` with
 loads `xe3p_lpd_dmc.bin` under the same Pipe C/D rule, writes `DC_COUNT_EN`
 after each load, arms the display-35 pipe-DMC interrupts
 (`PIPEDMC_FLIPQ_PROG_DONE | PIPEDMC_ERROR`), takes Linux 7.4-rc4's
-`gen9_dc_mask` and CMTG read-only mask for `DC_STATE_EN`, and targets DC6
-(DC3CO, which needs the CMTG, is never armed). Every display-35 AUX transfer
+`gen9_dc_mask` and CMTG read-only mask for `DC_STATE_EN`, and targets DC6.
+DC3CO is a typed refusal (`xe3plpd_dc3co_refusal`): the owned route has no
+LOBF, panel-replay or PSR2 trigger (`Dc3coRefusal::NoTrigger`), and a
+triggered state would still need the CMTG (`CmtgUnowned`). The DMC wakelock
+is not used; re-entry refuses a wakelock mode left on in `DMC_WAKELOCK_CFG`
+(`ArmBlock::DmcWakelock`). Every display-35 AUX transfer
 and LT PHY message-bus transaction takes its own DC_off reference
 (`xe3plpd_pwdoms_dc_off`, `intel_lt_phy_transaction_begin`).
 
