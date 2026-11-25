@@ -44,7 +44,8 @@
 //!
 //! ## DP or HDMI
 //!
-//! The service owns one [`MtlRoute`]: this module's DP route or the HDMI
+//! The service owns one [`MtlRoute`] (two under `narf.intel.ext_routes=2`,
+//! see [`MtlExternalService`]): this module's DP route or the HDMI
 //! TMDS route of [`crate::intel_gpu_xelpg_hdmi`]. Which one a port may
 //! carry is a board fact Linux reads from the VBT child device
 //! (`intel_ddi_init`: `init_dp`/`init_hdmi`, Type-C legacy = neither
@@ -204,7 +205,7 @@ use crate::intel_gpu_xelpg::{
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
-    activate_hdmi, probe_hdmi_profile, release_hdmi_probe, HdmiError, HdmiRouteState, MtlHdmiRoute,
+    activate_hdmi_beside, probe_hdmi_profile, release_hdmi_probe, HdmiError, HdmiRouteState, MtlHdmiRoute,
 };
 use crate::intel_gpu_xelpg_hpd::{LiveMode, MtlHpdConfig, MtlHpdEvent, MtlHpdKind, MtlHpdPin};
 use crate::intel_gpu_xelpg_pipes::{ExternalPipe, PipeEnableError, Pipes};
@@ -473,7 +474,41 @@ pub enum ExternalError {
     /// A 128b/132b (UHBR) route `narf.intel.uhbr=1` would run is refused or
     /// failed ([`uhbr::UhbrRefusal`]).
     Uhbr(uhbr::UhbrRefusal),
+    /// A second concurrent route (`narf.intel.ext_routes=2`) is refused
+    /// beside the route already owned ([`SecondRouteRefusal`]).
+    SecondRoute(SecondRouteRefusal),
 }
+
+/// Why a second concurrent external route is refused under
+/// `narf.intel.ext_routes=2`. Nothing was programmed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SecondRouteRefusal {
+    /// The owned route is not live (quarantined, or stopped and retained):
+    /// its reservation is not a proven layout to plan beside.
+    SiblingNotLive,
+    /// The owned route is DP MST, which already shares its pipes among its
+    /// own streams; a second independent route beside it is not qualified.
+    SiblingMst,
+    /// The owned route runs 128b/132b; a second route beside it is not
+    /// qualified.
+    SiblingUhbr,
+    /// The new sink is a DP MST branch.
+    Mst,
+    /// The new sink needs a 128b/132b link.
+    Uhbr,
+}
+
+/// `narf.intel.ext_routes=2`: the strict default-off option for a second
+/// concurrent external route ([`MtlExternalService`]).
+pub const EXT_ROUTES_OPTION: &str = "narf.intel.ext_routes";
+
+/// Whether the boot command line carries exactly `narf.intel.ext_routes=2`.
+pub fn ext_routes_opted_in() -> bool {
+    crate::intel_gpu_gt::boot_opt_is(narf_boot::args(), EXT_ROUTES_OPTION, "2")
+}
+
+/// How many external routes the service owns at once.
+pub const MAX_ROUTES: usize = 2;
 
 impl From<TcError> for ExternalError {
     fn from(e: TcError) -> Self {
@@ -690,16 +725,31 @@ pub(crate) fn preflight_ip<M: MmioWindow + ?Sized>(
     port: XeLpgPort,
     display: &MtlDisplay,
     ip: DisplayIp,
+    beside: Option<Pipes>,
 ) -> Result<PipeChoice, ExternalError> {
-    preflight_clock_ip(io, port, display, pll_clock_mask(PhyLaneConfig::NATIVE), ip)
+    preflight_clock_ip(
+        io,
+        port,
+        display,
+        pll_clock_mask(PhyLaneConfig::NATIVE),
+        ip,
+        beside,
+    )
 }
 
+/// `beside` is the Pipe B–D owner of a live sibling route
+/// ([`MtlExternalService`] under `narf.intel.ext_routes=2`): the new route
+/// joins the layout that owner holds programmed (Pipe A and the sibling's
+/// pipe), as Linux's atomic check plans a second CRTC against the CRTCs
+/// already active (`intel_atomic_check`), instead of adopting the panel
+/// profile alone, which a lit Pipe B–D refuses.
 fn preflight_clock_ip<M: MmioWindow + ?Sized>(
     io: &M,
     port: XeLpgPort,
     display: &MtlDisplay,
     clock_mask: u32,
     ip: DisplayIp,
+    beside: Option<Pipes>,
 ) -> Result<PipeChoice, ExternalError> {
     if !io.display_access_ok() {
         return Err(ExternalError::AccessLost);
@@ -710,6 +760,11 @@ fn preflight_clock_ip<M: MmioWindow + ?Sized>(
         return Err(ExternalError::PortBusy);
     }
     let pipe = free_pipe(io, ExternalDisplayProfile::for_ip(ip))?;
+    if let Some(pipes) = beside {
+        // The owner's own admission re-proves every lit pipe it holds
+        // (`check_pipes`) before the joint transaction's first write.
+        return Ok(PipeChoice { pipe, pipes });
+    }
     let panel = read(io, Pipe::A.base() + CONF)? & (ENABLE | STATE);
     let pipes = match (panel, display.panel) {
         (0, _) => Pipes::adopt_ip(ip, None, 0),
@@ -1394,6 +1449,9 @@ pub struct MtlExternalRoute {
     pipe: Pipe,
     /// The pipe's reservation until its post-plane release is proven.
     reservation: Option<RoutePipe>,
+    /// The Pipe B–D owner as the proven release left it, until a sibling
+    /// route adopts it ([`MtlRoute::take_shared_pipes`]).
+    retired: Option<Pipes>,
     /// Plane, transcoder and port are disabled. Only the source FEC-off
     /// acknowledgement is pending before clock teardown can resume.
     awaiting_fec_stop: bool,
@@ -1493,7 +1551,20 @@ pub fn activate<M: MmioWindow + ?Sized>(
     fb: Framebuffer,
     display: &MtlDisplay,
 ) -> Result<MtlExternalRoute, ActivateError> {
-    activate_with_payload(io, probe, fb, display, &mut |_| Ok(()))
+    activate_with_payload(io, probe, fb, display, None, &mut |_| Ok(()))
+}
+
+/// [`activate`] beside a live sibling route: the new pipe joins the
+/// layout `beside` holds programmed (see [`preflight_clock_ip`]).
+#[allow(clippy::result_large_err)]
+pub(crate) fn activate_beside<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: MtlSinkProbe,
+    fb: Framebuffer,
+    display: &MtlDisplay,
+    beside: Option<Pipes>,
+) -> Result<MtlExternalRoute, ActivateError> {
+    activate_with_payload(io, probe, fb, display, beside, &mut |_| Ok(()))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1502,6 +1573,7 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
     mut probe: MtlSinkProbe,
     fb: Framebuffer,
     display: &MtlDisplay,
+    beside: Option<Pipes>,
     payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
 ) -> Result<MtlExternalRoute, ActivateError> {
     if let Err(e) = probe.phy_lanes() {
@@ -1516,6 +1588,7 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
         display,
         probe.clock_mask().expect("validated above"),
         probe.display_ip,
+        beside,
     ) {
         Ok(choice) => choice,
         Err(e) => return Err(ActivateError::Refused(probe, e)),
@@ -1573,6 +1646,7 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
         state: RouteState::Stopped,
         pipe: choice.pipe,
         reservation: None,
+        retired: None,
         awaiting_fec_stop: false,
         uhbr: route_uhbr,
     };
@@ -2575,7 +2649,7 @@ fn stop_local<M: MmioWindow + ?Sized>(
         .as_mut()
         .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
     rp.pipes.release(io, rp.pipe, rp.dmc)?;
-    route.reservation = None;
+    route.retired = route.reservation.take().map(|rp| rp.pipes);
     Ok(())
 }
 
@@ -2599,6 +2673,28 @@ impl MtlExternalRoute {
     /// retained by a stop that did not complete its release).
     pub fn reserved(&self) -> bool {
         self.reservation.is_some()
+    }
+
+    /// The Pipe B–D owner this route's reservation holds.
+    pub(crate) fn shared_pipes(&self) -> Option<&Pipes> {
+        self.reservation.as_ref().map(|rp| &rp.pipes)
+    }
+
+    /// Adopt a sibling route's newer Pipe B–D owner; a route without a
+    /// reservation keeps none.
+    pub(crate) fn adopt_shared_pipes(&mut self, pipes: &Pipes) {
+        if let Some(rp) = self.reservation.as_mut() {
+            rp.pipes = pipes.clone();
+        }
+    }
+
+    /// The owner a sibling adopts after this route changed it: the
+    /// reservation's, or once the post-release owner the proven stop left.
+    pub(crate) fn take_shared_pipes(&mut self) -> Option<Pipes> {
+        match self.reservation.as_ref() {
+            Some(rp) => Some(rp.pipes.clone()),
+            None => self.retired.take(),
+        }
     }
 
     /// Locally stop the route. A stopped route stays stopped; a failed
@@ -2970,6 +3066,43 @@ impl MtlRoute {
         }
     }
 
+    /// The Pipe B–D owner a sibling SST or HDMI route plans beside.
+    fn shared_pipes(&self) -> Option<&Pipes> {
+        match self {
+            MtlRoute::Dp(r) => r.shared_pipes(),
+            MtlRoute::Hdmi(r) => r.shared_pipes(),
+            MtlRoute::Mst(_) => None,
+        }
+    }
+
+    fn adopt_shared_pipes(&mut self, pipes: &Pipes) {
+        match self {
+            MtlRoute::Dp(r) => r.adopt_shared_pipes(pipes),
+            MtlRoute::Hdmi(r) => r.adopt_shared_pipes(pipes),
+            MtlRoute::Mst(_) => {}
+        }
+    }
+
+    fn take_shared_pipes(&mut self) -> Option<Pipes> {
+        match self {
+            MtlRoute::Dp(r) => r.take_shared_pipes(),
+            MtlRoute::Hdmi(r) => r.take_shared_pipes(),
+            MtlRoute::Mst(_) => None,
+        }
+    }
+
+    /// Whether a second independent route may be planned beside this one.
+    fn admits_sibling(&self) -> Result<(), SecondRouteRefusal> {
+        match self {
+            MtlRoute::Mst(_) => Err(SecondRouteRefusal::SiblingMst),
+            MtlRoute::Dp(r) if r.probe.uhbr.is_some() => Err(SecondRouteRefusal::SiblingUhbr),
+            route if !route.live() || route.shared_pipes().is_none() => {
+                Err(SecondRouteRefusal::SiblingNotLive)
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn stop<M: MmioWindow + ?Sized>(&mut self, io: &M) -> Result<(), RouteError> {
         // HDCP off before the transcoder goes down (`intel_hdcp_disable`);
         // inert without `narf.intel.hdcp=1`.
@@ -3041,49 +3174,60 @@ pub enum ServiceOutcome {
 }
 
 /// The route presence a service publishes for lock-free readers
-/// ([`routes_stopped`], [`route_live`]): absent, live, locally stopped, or
-/// retained without a proven stop. It changes only when a service pass
-/// ends, so a reader racing a pass sees the last completed pass's route,
-/// never a transient "not stopped" from the pass merely holding the lock.
-/// Passes that light or stop hardware are serialized against the display
-/// power-management readers by the display's legacy guard, and against
-/// DC5/DC6 re-entry by their `DcUser::External` reference and the
-/// contended-lock rule of [`external_route_blocks_dc`].
+/// ([`routes_stopped`], [`route_live`], [`slot_live`]): whether any route
+/// is live, whether any is not locally stopped (live or retained without a
+/// proven stop), and which route slots scan out. It changes only when a
+/// service pass ends, so a reader racing a pass sees the last completed
+/// pass's routes, never a transient "not stopped" from the pass merely
+/// holding the lock. Passes that light or stop hardware are serialized
+/// against the display power-management readers by the display's legacy
+/// guard, and against DC5/DC6 re-entry by their `DcUser::External`
+/// reference and the contended-lock rule of [`external_route_blocks_dc`].
 #[derive(Debug)]
 pub struct RoutePresence(AtomicU8);
 
-const PRESENCE_ABSENT: u8 = 0;
+/// Some route scans out.
 const PRESENCE_LIVE: u8 = 1;
-const PRESENCE_STOPPED: u8 = 2;
-const PRESENCE_RETAINED: u8 = 3;
+/// Some route is not locally stopped.
+const PRESENCE_HELD: u8 = 2;
+/// Route slot `slot` scans out.
+const fn presence_slot_live(slot: usize) -> u8 {
+    4 << slot
+}
 
 impl RoutePresence {
     /// No route.
     pub const fn new() -> Self {
-        Self(AtomicU8::new(PRESENCE_ABSENT))
+        Self(AtomicU8::new(0))
     }
 
-    fn publish(&self, route: Option<&MtlRoute>) {
-        let code = match route {
-            None => PRESENCE_ABSENT,
-            Some(route) if route.live() => PRESENCE_LIVE,
-            Some(route) if route.stopped() => PRESENCE_STOPPED,
-            Some(_) => PRESENCE_RETAINED,
-        };
+    fn publish(&self, routes: &[Option<MtlRoute>; MAX_ROUTES]) {
+        let mut code = 0;
+        for (slot, route) in routes.iter().enumerate() {
+            match route {
+                Some(route) if route.live() => {
+                    code |= PRESENCE_LIVE | PRESENCE_HELD | presence_slot_live(slot);
+                }
+                Some(route) if !route.stopped() => code |= PRESENCE_HELD,
+                _ => {}
+            }
+        }
         self.0.store(code, Ordering::Release);
     }
 
-    /// No route, or a locally stopped one (its hardware is off).
+    /// No route, or only locally stopped ones (their hardware is off).
     pub fn stopped(&self) -> bool {
-        matches!(
-            self.0.load(Ordering::Acquire),
-            PRESENCE_ABSENT | PRESENCE_STOPPED
-        )
+        self.0.load(Ordering::Acquire) & PRESENCE_HELD == 0
     }
 
-    /// A route is scanning out.
+    /// Some route is scanning out.
     pub fn live(&self) -> bool {
-        self.0.load(Ordering::Acquire) == PRESENCE_LIVE
+        self.0.load(Ordering::Acquire) & PRESENCE_LIVE != 0
+    }
+
+    /// The route in `slot` is scanning out.
+    pub fn slot_live(&self, slot: usize) -> bool {
+        slot < MAX_ROUTES && self.0.load(Ordering::Acquire) & presence_slot_live(slot) != 0
     }
 }
 
@@ -3093,12 +3237,33 @@ impl Default for RoutePresence {
     }
 }
 
-/// Owner of at most one MTL external route, driven by hotplug events.
+/// Owner of the MTL external routes, driven by hotplug events: one route,
+/// or under `narf.intel.ext_routes=2` ([`EXT_ROUTES_OPTION`]) two
+/// independent ones on distinct ports and pipes beside the lit panel.
+///
+/// ## Two routes
+///
+/// Linux lights a second CRTC through the same atomic commit as the first
+/// (`intel_atomic_check` with two active CRTCs: `intel_cdclk_atomic_check`
+/// takes the highest minimum CDCLK, `skl_compute_ddb` and
+/// `skl_compute_dbuf_slices` repartition the DBUF across every active pipe,
+/// `intel_pmdemand_atomic_check` counts the active pipes and combo PHYs and
+/// the highest port clock). Here the second route's pipe joins the layout
+/// the first route's Pipe B–D owner holds programmed: its admission and its
+/// pre-plane transaction are computed over Pipe A, the sibling's pipe and
+/// the new one, with every lit pipe kept lit; a stop's post-plane
+/// repartition keeps the sibling. Each route keeps its own port, PLL,
+/// hotplug pin, retrain and teardown; after every change the sibling adopts
+/// the owner the changed route left, so the two never plan from diverged
+/// layouts. A second route is refused typed ([`SecondRouteRefusal`]) beside
+/// an MST or 128b/132b route, beside a route that is not live, and when it
+/// would itself be MST or 128b/132b. HDCP follows the first owned route
+/// ([`hdcp_route`]).
 #[derive(Debug)]
 pub struct MtlExternalService {
-    route: Option<MtlRoute>,
-    /// The live mode the retained route was connected in (for `Redetect`).
-    live: LiveMode,
+    routes: [Option<MtlRoute>; MAX_ROUTES],
+    /// The live mode each retained route was connected in (for `Redetect`).
+    live: [LiveMode; MAX_ROUTES],
     /// Active source-qualified display profile for probe/resource decisions;
     /// absent for a generation outside this owner.
     profile: Option<ExternalDisplayProfile>,
@@ -3110,6 +3275,9 @@ pub struct MtlExternalService {
     /// The `narf.intel.uhbr` decision for later probes; `None` reads the
     /// boot option at each connect.
     uhbr: Option<bool>,
+    /// The `narf.intel.ext_routes=2` decision; `None` reads the boot option
+    /// at each connect.
+    two_routes: Option<bool>,
 }
 
 impl Default for MtlExternalService {
@@ -3127,13 +3295,14 @@ impl MtlExternalService {
     /// An empty service under an explicit port policy.
     pub const fn with_policy(policy: MtlPortPolicy) -> Self {
         Self {
-            route: None,
-            live: LiveMode::Native,
+            routes: [None, None],
+            live: [LiveMode::Native; MAX_ROUTES],
             profile: Some(ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp)),
             policy,
             display: MtlDisplay::NONE,
             presence: None,
             uhbr: None,
+            two_routes: None,
         }
     }
 
@@ -3175,6 +3344,17 @@ impl MtlExternalService {
         self.uhbr.unwrap_or_else(uhbr::opted_in)
     }
 
+    /// Decide `narf.intel.ext_routes=2` instead of reading the boot option
+    /// (fixtures).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn set_two_routes(&mut self, on: bool) {
+        self.two_routes = Some(on);
+    }
+
+    fn two_routes_on(&self) -> bool {
+        self.two_routes.unwrap_or_else(ext_routes_opted_in)
+    }
+
     /// Replace the display context (the owned panel, the pipe-DMC sink)
     /// used by later activations; a live route keeps the pipe-DMC sink it
     /// reported to.
@@ -3184,11 +3364,13 @@ impl MtlExternalService {
 
     fn publish(&self) {
         if let Some(presence) = self.presence {
-            presence.publish(self.route.as_ref());
-            let non_psr_pipes = match self.route.as_ref() {
-                Some(route) if route.live() => 1u8 << (route.pipe() as u8),
-                _ => 0,
-            };
+            presence.publish(&self.routes);
+            let non_psr_pipes = self
+                .routes
+                .iter()
+                .flatten()
+                .filter(|route| route.live())
+                .fold(0u8, |mask, route| mask | 1u8 << (route.pipe() as u8));
             crate::intel_gpu_psr::set_non_psr_pipes(non_psr_pipes);
         }
     }
@@ -3202,21 +3384,96 @@ impl MtlExternalService {
     /// route is owned: its probe, PLL and DDC choices came from the old
     /// policy.
     pub fn set_policy(&mut self, policy: MtlPortPolicy) -> bool {
-        if self.route.is_some() {
+        if self.routes.iter().any(Option::is_some) {
             return self.policy == policy;
         }
         self.policy = policy;
         true
     }
 
-    /// The retained route, if any.
+    /// The first retained route, if any (the only one without
+    /// `narf.intel.ext_routes=2`).
     pub fn route(&self) -> Option<&MtlRoute> {
-        self.route.as_ref()
+        self.routes.iter().flatten().next()
+    }
+
+    /// The route in `slot` (0 or 1), if any.
+    pub fn route_in(&self, slot: usize) -> Option<&MtlRoute> {
+        self.routes.get(slot)?.as_ref()
+    }
+
+    /// The route owning `port`, if any.
+    pub fn route_on(&self, port: XeLpgPort) -> Option<&MtlRoute> {
+        self.routes.iter().flatten().find(|route| route.port() == port)
+    }
+
+    /// Every retained route.
+    pub fn routes(&self) -> impl Iterator<Item = &MtlRoute> {
+        self.routes.iter().flatten()
+    }
+
+    fn slot_of(&self, port: XeLpgPort) -> Option<usize> {
+        self.routes
+            .iter()
+            .position(|route| route.as_ref().is_some_and(|r| r.port() == port))
+    }
+
+    /// The slot a newly connected sink takes: the first, while nothing is
+    /// owned; under `narf.intel.ext_routes=2` the free one beside a live
+    /// SST or HDMI route. `Ok(None)`: the service is full (or single-route
+    /// and owned), the event changes nothing.
+    fn connect_slot(&self) -> Result<Option<usize>, SecondRouteRefusal> {
+        let free = self.routes.iter().position(Option::is_none);
+        let owned: Option<&MtlRoute> = self.route();
+        match (free, owned) {
+            (Some(slot), None) => Ok(Some(slot)),
+            (Some(_), Some(_)) if !self.two_routes_on() => Ok(None),
+            (Some(slot), Some(sibling)) => sibling.admits_sibling().map(|()| Some(slot)),
+            (None, _) => Ok(None),
+        }
+    }
+
+    /// The slot an event on `port` lights or relights a route in, read
+    /// before the pass so the caller can key its scanout allocation: the
+    /// slot owning `port`, else the one a newly connected sink would take
+    /// (`0` whenever a pass would not light a second route).
+    pub fn event_slot(&self, port: XeLpgPort) -> usize {
+        self.slot_of(port)
+            .or_else(|| self.connect_slot().ok().flatten())
+            .unwrap_or(0)
+    }
+
+    /// The sibling's Pipe B–D owner for an activation into `slot`.
+    fn beside(&self, slot: usize) -> Option<Pipes> {
+        self.routes[1 - slot]
+            .as_ref()
+            .and_then(MtlRoute::shared_pipes)
+            .cloned()
+    }
+
+    /// After the route in (or just taken from) `slot` changed the Pipe B–D
+    /// owner, the sibling adopts it.
+    fn share_from(&mut self, slot: usize, route: &mut MtlRoute) {
+        let pipes = route.take_shared_pipes();
+        self.share(slot, pipes);
+    }
+
+    fn share(&mut self, slot: usize, pipes: Option<Pipes>) {
+        if let (Some(pipes), Some(sibling)) = (pipes, self.routes[1 - slot].as_mut()) {
+            sibling.adopt_shared_pipes(&pipes);
+        }
+    }
+
+    /// Store a route that now holds `slot`, sharing its owner first.
+    fn hold(&mut self, slot: usize, mut route: MtlRoute) {
+        self.share_from(slot, &mut route);
+        self.routes[slot] = Some(route);
     }
 
     fn connect<M: MmioWindow + ?Sized>(
         &mut self,
         io: &M,
+        slot: usize,
         port: XeLpgPort,
         live: LiveMode,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
@@ -3247,12 +3504,12 @@ impl MtlExternalService {
                     _ => ExternalError::UnsupportedPort,
                 }),
             },
-            RoutePlan::Hdmi => self.connect_hdmi(io, port, legacy, alloc),
+            RoutePlan::Hdmi => self.connect_hdmi(io, slot, port, legacy, alloc),
             RoutePlan::Dp | RoutePlan::DpThenHdmi => {
                 match probe_link_profile(io, profile, port, legacy) {
-                    Ok(link) => self.connect_output(io, link, alloc),
+                    Ok(link) => self.connect_output(io, slot, link, alloc),
                     Err(e) if plan == RoutePlan::DpThenHdmi && dpcd_absent(&e) => {
-                        self.connect_hdmi(io, port, legacy, alloc)
+                        self.connect_hdmi(io, slot, port, legacy, alloc)
                     }
                     Err(error) => ServiceOutcome::Refused {
                         port,
@@ -3261,8 +3518,8 @@ impl MtlExternalService {
                 }
             }
         };
-        if self.route.is_some() {
-            self.live = live;
+        if self.routes[slot].is_some() {
+            self.live[slot] = live;
         }
         outcome
     }
@@ -3270,10 +3527,12 @@ impl MtlExternalService {
     fn connect_output<M: MmioWindow + ?Sized>(
         &mut self,
         io: &M,
+        slot: usize,
         link: LinkProbe,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let port = link.port;
+        let second = self.routes[1 - slot].is_some();
         let mut cap = [0];
         if link.raw[0] >= 0x12 {
             if let Err(error) = link.aux(io).dpcd_read(0x21, &mut cap) {
@@ -3283,6 +3542,13 @@ impl MtlExternalService {
                     error: RouteError::Dp(ExternalError::Link(LinkError::AuxFailure(error))),
                 };
             }
+        }
+        if cap[0] & 1 != 0 && second {
+            let _ = link.release(io);
+            return ServiceOutcome::Refused {
+                port,
+                error: RouteError::Dp(ExternalError::SecondRoute(SecondRouteRefusal::Mst)),
+            };
         }
         let uhbr_on = self.uhbr_on();
         if cap[0] & 1 != 0 && uhbr_on {
@@ -3312,7 +3578,7 @@ impl MtlExternalService {
             match MtlMstRoute::connect(io, link, self.policy.decl(port), &self.display, alloc) {
                 Ok(route) => {
                     let (pipe, mode, fb) = route.first().expect("live MST has a first stream");
-                    self.route = Some(MtlRoute::Mst(route));
+                    self.routes[slot] = Some(MtlRoute::Mst(route));
                     ServiceOutcome::Activated {
                         port,
                         protocol: MtlProtocol::DpMst,
@@ -3323,15 +3589,24 @@ impl MtlExternalService {
                 }
                 Err((mut route, error)) => {
                     let _ = route.stop(io);
-                    self.settle_failed(io, MtlRoute::Mst(route), RouteError::Dp(error))
+                    self.settle_failed(io, slot, MtlRoute::Mst(route), RouteError::Dp(error))
                 }
             }
         } else {
             match probe_sink_link(io, link, uhbr_on) {
+                Ok(probe) if second && probe.uhbr.is_some() => {
+                    let _ = release_probe(io, &probe);
+                    ServiceOutcome::Refused {
+                        port,
+                        error: RouteError::Dp(ExternalError::SecondRoute(
+                            SecondRouteRefusal::Uhbr,
+                        )),
+                    }
+                }
                 Ok(mut probe) => {
                     probe.lane_reversal = self.policy.decl(port).lane_reversal;
                     probe.ssc = dp_ssc_enabled(self.policy.use_ssc, probe.max_downspread);
-                    self.connect_dp(io, probe, alloc)
+                    self.connect_dp(io, slot, probe, alloc)
                 }
                 Err(error) => ServiceOutcome::Refused {
                     port,
@@ -3344,6 +3619,7 @@ impl MtlExternalService {
     fn connect_dp<M: MmioWindow + ?Sized>(
         &mut self,
         io: &M,
+        slot: usize,
         probe: MtlSinkProbe,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
@@ -3358,7 +3634,8 @@ impl MtlExternalService {
                 };
             }
         };
-        match activate(io, probe, fb, &self.display) {
+        let beside = self.beside(slot);
+        match activate_beside(io, probe, fb, &self.display, beside) {
             Ok(route) => {
                 let outcome = ServiceOutcome::Activated {
                     port,
@@ -3367,7 +3644,7 @@ impl MtlExternalService {
                     mode: route.probe.mode,
                     fb,
                 };
-                self.route = Some(MtlRoute::Dp(route));
+                self.hold(slot, MtlRoute::Dp(route));
                 outcome
             }
             Err(ActivateError::Refused(probe, error)) => {
@@ -3378,7 +3655,7 @@ impl MtlExternalService {
                 }
             }
             Err(ActivateError::Failed(route, error)) => {
-                self.settle_failed(io, MtlRoute::Dp(route), RouteError::Dp(error))
+                self.settle_failed(io, slot, MtlRoute::Dp(route), RouteError::Dp(error))
             }
         }
     }
@@ -3386,6 +3663,7 @@ impl MtlExternalService {
     fn connect_hdmi<M: MmioWindow + ?Sized>(
         &mut self,
         io: &M,
+        slot: usize,
         port: XeLpgPort,
         legacy: bool,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
@@ -3417,7 +3695,8 @@ impl MtlExternalService {
                 };
             }
         };
-        match activate_hdmi(io, probe, fb, &self.display) {
+        let beside = self.beside(slot);
+        match activate_hdmi_beside(io, probe, fb, &self.display, beside) {
             Ok(route) => {
                 let outcome = ServiceOutcome::Activated {
                     port,
@@ -3426,7 +3705,7 @@ impl MtlExternalService {
                     mode: route.probe.mode,
                     fb,
                 };
-                self.route = Some(MtlRoute::Hdmi(route));
+                self.hold(slot, MtlRoute::Hdmi(route));
                 outcome
             }
             Err((Err(probe), error)) => {
@@ -3437,46 +3716,52 @@ impl MtlExternalService {
                 }
             }
             Err((Ok(route), error)) => {
-                self.settle_failed(io, MtlRoute::Hdmi(route), RouteError::Hdmi(error))
+                self.settle_failed(io, slot, MtlRoute::Hdmi(route), RouteError::Hdmi(error))
             }
         }
     }
 
     /// A failed activation: release a locally stopped route, retain
-    /// anything else.
+    /// anything else. Either way the sibling adopts the owner it left.
     fn settle_failed<M: MmioWindow + ?Sized>(
         &mut self,
         io: &M,
-        route: MtlRoute,
+        slot: usize,
+        mut route: MtlRoute,
         error: RouteError,
     ) -> ServiceOutcome {
         let port = route.port();
+        self.share_from(slot, &mut route);
         if !route.stopped() {
-            self.route = Some(route);
+            self.routes[slot] = Some(route);
             return ServiceOutcome::Retained { port, error };
         }
         match route.release(io) {
             Ok(()) => ServiceOutcome::Refused { port, error },
             Err((route, e)) => {
-                self.route = Some(route);
+                self.routes[slot] = Some(route);
                 ServiceOutcome::Retained { port, error: e }
             }
         }
     }
 
-    fn withdraw<M: MmioWindow + ?Sized>(&mut self, io: &M) -> ServiceOutcome {
-        let Some(mut route) = self.route.take() else {
+    fn withdraw<M: MmioWindow + ?Sized>(&mut self, io: &M, slot: usize) -> ServiceOutcome {
+        let Some(mut route) = self.routes[slot].take() else {
             return ServiceOutcome::Unchanged;
         };
         let port = route.port();
-        if let Err(error) = route.stop(io) {
-            self.route = Some(route);
+        let stopped = route.stop(io);
+        // The post-plane repartition without this pipe (or whatever a
+        // failed stop left reserved) is what the sibling now plans from.
+        self.share_from(slot, &mut route);
+        if let Err(error) = stopped {
+            self.routes[slot] = Some(route);
             return ServiceOutcome::Retained { port, error };
         }
         match route.release(io) {
             Ok(()) => ServiceOutcome::Withdrawn { port },
             Err((route, error)) => {
-                self.route = Some(route);
+                self.routes[slot] = Some(route);
                 ServiceOutcome::Retained { port, error }
             }
         }
@@ -3503,44 +3788,55 @@ impl MtlExternalService {
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let port = event.pin.port();
-        let owned = self.route.as_ref().map(|r| (r.port(), r.protocol()));
-        let owns = owned.map(|(p, _)| p) == Some(port);
+        let Some(slot) = self.slot_of(port) else {
+            return match event.kind {
+                MtlHpdKind::Connected(live) => match self.connect_slot() {
+                    Ok(Some(slot)) => self.connect(io, slot, port, live, alloc),
+                    Ok(None) => ServiceOutcome::Unchanged,
+                    Err(refusal) => ServiceOutcome::Refused {
+                        port,
+                        error: RouteError::Dp(ExternalError::SecondRoute(refusal)),
+                    },
+                },
+                _ => ServiceOutcome::Unchanged,
+            };
+        };
+        let protocol = self.routes[slot].as_ref().map(MtlRoute::protocol);
         match event.kind {
-            MtlHpdKind::Connected(live) if self.route.is_none() => {
-                self.connect(io, port, live, alloc)
-            }
             MtlHpdKind::Connected(_) => ServiceOutcome::Unchanged,
-            MtlHpdKind::Disconnected if owns => self.withdraw(io),
-            MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::DpMst)) => {
+            MtlHpdKind::Disconnected => self.withdraw(io, slot),
+            MtlHpdKind::ShortPulse if protocol == Some(MtlProtocol::DpMst) => {
                 // The sink's CP_IRQ to HDCP first (`intel_dp_mst_hpd_irq`).
-                if let Some(MtlRoute::Mst(route)) = self.route.as_ref() {
+                if let Some(MtlRoute::Mst(route)) = self.routes[slot].as_ref() {
                     let key = crate::intel_hdcp_live::xelpg_key(
                         port as u8,
-                        self.route
+                        self.routes[slot]
                             .as_ref()
                             .map_or(0, |r| r.pipe().transcoder() as u8),
                     );
                     crate::intel_hdcp_live::short_pulse(&mut route.link_aux(io), key, true);
                 }
-                let unchanged = match self.route.as_mut() {
+                let unchanged = match self.routes[slot].as_mut() {
                     Some(MtlRoute::Mst(route)) => route.unchanged(io) == Ok(true),
                     _ => false,
                 };
                 if unchanged {
                     ServiceOutcome::Unchanged
                 } else {
-                    let live = self.live;
-                    match self.withdraw(io) {
-                        ServiceOutcome::Withdrawn { .. } => self.connect(io, port, live, alloc),
+                    let live = self.live[slot];
+                    match self.withdraw(io, slot) {
+                        ServiceOutcome::Withdrawn { .. } => {
+                            self.connect(io, slot, port, live, alloc)
+                        }
                         other => other,
                     }
                 }
             }
             // HDMI has no IRQ_HPD (`intel_hdmi` installs no hpd_pulse).
-            MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::Dp)) => {
+            MtlHpdKind::ShortPulse if protocol == Some(MtlProtocol::Dp) => {
                 // The sink's CP_IRQ to HDCP first (`intel_dp_short_pulse`'s
                 // device service IRQ).
-                if let Some(MtlRoute::Dp(route)) = self.route.as_ref() {
+                if let Some(MtlRoute::Dp(route)) = self.routes[slot].as_ref() {
                     let mut aux =
                         IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
                     crate::intel_hdcp_live::short_pulse(
@@ -3552,19 +3848,19 @@ impl MtlExternalService {
                         false,
                     );
                 }
-                let healthy = match self.route.as_ref() {
+                let healthy = match self.routes[slot].as_ref() {
                     Some(MtlRoute::Dp(route)) => Some(route.link_ok(io)),
                     _ => None,
                 };
                 match healthy {
                     Some(Ok(true)) => ServiceOutcome::Unchanged,
-                    _ => self.retrain(io),
+                    _ => self.retrain(io, slot),
                 }
             }
-            MtlHpdKind::Redetect if owns => {
-                let live = self.live;
-                match self.withdraw(io) {
-                    ServiceOutcome::Withdrawn { .. } => self.connect(io, port, live, alloc),
+            MtlHpdKind::Redetect => {
+                let live = self.live[slot];
+                match self.withdraw(io, slot) {
+                    ServiceOutcome::Withdrawn { .. } => self.connect(io, slot, port, live, alloc),
                     other => other,
                 }
             }
@@ -3573,28 +3869,33 @@ impl MtlExternalService {
     }
 
     /// Lost link on a live DP route: local stop, then a fresh activation
-    /// on the same probe and framebuffer.
-    fn retrain<M: MmioWindow + ?Sized>(&mut self, io: &M) -> ServiceOutcome {
-        let mut route = match self.route.take() {
+    /// on the same probe and framebuffer (beside the sibling route, if
+    /// any, which keeps scanning out).
+    fn retrain<M: MmioWindow + ?Sized>(&mut self, io: &M, slot: usize) -> ServiceOutcome {
+        let mut route = match self.routes[slot].take() {
             Some(MtlRoute::Dp(route)) => route,
             other => {
-                self.route = other;
+                self.routes[slot] = other;
                 return ServiceOutcome::Unchanged;
             }
         };
         let port = route.port();
-        if let Err(error) = route.stop(io) {
-            self.route = Some(MtlRoute::Dp(route));
+        let stopped = route.stop(io);
+        let pipes = route.take_shared_pipes();
+        self.share(slot, pipes);
+        if let Err(error) = stopped {
+            self.routes[slot] = Some(MtlRoute::Dp(route));
             return ServiceOutcome::Retained {
                 port,
                 error: RouteError::Dp(error),
             };
         }
         let fb = route.fb;
-        match activate(io, route.probe.clone(), fb, &self.display) {
+        let beside = self.beside(slot);
+        match activate_beside(io, route.probe.clone(), fb, &self.display, beside) {
             Ok(live) => {
                 let (mode, pipe) = (live.probe.mode, live.pipe());
-                self.route = Some(MtlRoute::Dp(live));
+                self.hold(slot, MtlRoute::Dp(live));
                 ServiceOutcome::Activated {
                     port,
                     protocol: MtlProtocol::Dp,
@@ -3611,7 +3912,7 @@ impl MtlExternalService {
                         error: RouteError::Dp(error),
                     },
                     Err((route, e)) => {
-                        self.route = Some(MtlRoute::Dp(route));
+                        self.routes[slot] = Some(MtlRoute::Dp(route));
                         ServiceOutcome::Retained {
                             port,
                             error: RouteError::Dp(e),
@@ -3620,7 +3921,7 @@ impl MtlExternalService {
                 }
             }
             Err(ActivateError::Failed(failed, error)) => {
-                self.route = Some(MtlRoute::Dp(failed));
+                self.hold(slot, MtlRoute::Dp(failed));
                 ServiceOutcome::Retained {
                     port,
                     error: RouteError::Dp(error),
@@ -3629,13 +3930,17 @@ impl MtlExternalService {
         }
     }
 
-    /// Reset/suspend: stop and release the route. Returns whether nothing
-    /// external remains owned.
+    /// Reset/suspend: stop and release every route (the second first, as
+    /// one commit disables every CRTC). Returns whether nothing external
+    /// remains owned.
     pub fn teardown<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
-        let done = matches!(
-            self.withdraw(io),
-            ServiceOutcome::Withdrawn { .. } | ServiceOutcome::Unchanged
-        );
+        let mut done = true;
+        for slot in (0..MAX_ROUTES).rev() {
+            done &= matches!(
+                self.withdraw(io, slot),
+                ServiceOutcome::Withdrawn { .. } | ServiceOutcome::Unchanged
+            );
+        }
         self.publish();
         done
     }
@@ -3674,7 +3979,7 @@ pub(crate) fn pass_bracket<G, E, R>(
 /// Whether `service`'s route keeps display DC5/DC6 refused between passes:
 /// any route that is not locally stopped (live or quarantined).
 pub(crate) fn service_blocks_dc(service: &MtlExternalService) -> bool {
-    service.route().is_some_and(|route| !route.stopped())
+    service.routes().any(|route| !route.stopped())
 }
 
 /// The process-wide predicate registered with the DC service: a live or
@@ -3807,11 +4112,27 @@ pub fn routes_stopped() -> bool {
     PRESENCE.stopped()
 }
 
-/// Whether the process-wide MTL route is live (scanning out), as the last
+/// Whether a process-wide MTL route is live (scanning out), as the last
 /// completed service pass published it. DC5/DC6 re-entry is gated by
 /// [`external_route_blocks_dc`], which also refuses while a pass runs.
 pub fn route_live() -> bool {
     PRESENCE.live()
+}
+
+/// Whether the process-wide route in `slot` (0, or 1 under
+/// `narf.intel.ext_routes=2`) is live, as the last completed pass
+/// published it.
+pub fn slot_live(slot: usize) -> bool {
+    PRESENCE.slot_live(slot)
+}
+
+/// The slot the next process-wide pass on `port` lights a route in
+/// ([`MtlExternalService::event_slot`]); `0` while a pass holds the
+/// service.
+pub fn event_slot(port: XeLpgPort) -> usize {
+    SERVICE
+        .try_lock()
+        .map_or(0, |service| service.event_slot(port))
 }
 
 /// HDCP (`crate::intel_hdcp_live`): the live DP, HDMI or DP MST route,
@@ -3820,7 +4141,9 @@ pub fn route_live() -> bool {
 pub(crate) fn hdcp_route() -> Option<crate::intel_hdcp_live::XelpgRoute> {
     use crate::intel_hdcp_live::{MstStreams, RouteLink, XelpgRoute};
     let service = SERVICE.try_lock()?;
-    let route = service.route.as_ref().filter(|r| r.live())?;
+    // HDCP follows the first owned route; a second concurrent route is not
+    // offered it.
+    let route = service.route().filter(|r| r.live())?;
     let (protocol, link, mst) = match route {
         // HDCP is not offered on a 128b/132b route.
         MtlRoute::Dp(r) if r.probe.uhbr.is_some() => return None,
@@ -3884,3 +4207,7 @@ pub const fn hpd_pin_for(port: XeLpgPort) -> Option<MtlHpdPin> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_xelpg_external_tests.rs"]
 pub mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_xelpg_two_routes_tests.rs"]
+mod two_routes_tests;

@@ -104,7 +104,7 @@ use crate::intel_gpu_xelpg_external::{
     trans_clk_sel_port, trans_ddi_func_ctl, ExternalDisplayProfile, ExternalError, MtlDisplay,
     PipeRefusal, RoutePipe,
 };
-use crate::intel_gpu_xelpg_pipes::PipeEnableError;
+use crate::intel_gpu_xelpg_pipes::{PipeEnableError, Pipes};
 use crate::intel_gpu_xelpg_tc::{
     connect_for as tc_connect_for, connection_intact, disconnect as tc_disconnect, TcConnection,
     TcMode,
@@ -955,6 +955,9 @@ pub struct MtlHdmiRoute {
     pipe: Pipe,
     /// The pipe's reservation until its post-plane release is proven.
     reservation: Option<RoutePipe>,
+    /// The Pipe B–D owner as the proven release left it, until a sibling
+    /// route adopts it.
+    retired: Option<Pipes>,
 }
 
 fn wr<M: MmioWindow + ?Sized>(io: &M, off: u64, value: u32) -> Result<(), HdmiError> {
@@ -997,10 +1000,23 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     fb: Framebuffer,
     display: &MtlDisplay,
 ) -> Result<MtlHdmiRoute, (Result<MtlHdmiRoute, MtlHdmiProbe>, HdmiError)> {
+    activate_hdmi_beside(io, probe, fb, display, None)
+}
+
+/// [`activate_hdmi`] beside a live sibling route whose Pipe B–D owner is
+/// `beside` (`narf.intel.ext_routes=2`): the new pipe joins that layout.
+#[allow(clippy::result_large_err)]
+pub(crate) fn activate_hdmi_beside<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: MtlHdmiProbe,
+    fb: Framebuffer,
+    display: &MtlDisplay,
+    beside: Option<Pipes>,
+) -> Result<MtlHdmiRoute, (Result<MtlHdmiRoute, MtlHdmiProbe>, HdmiError)> {
     if let Err(e) = crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &probe.mode) {
         return Err((Err(probe), ExternalError::Modeset(e).into()));
     }
-    let choice = match preflight_ip(io, probe.port, display, probe.display_ip) {
+    let choice = match preflight_ip(io, probe.port, display, probe.display_ip, beside) {
         Ok(choice) => choice,
         Err(e) => return Err((Err(probe), e.into())),
     };
@@ -1035,6 +1051,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         state: HdmiRouteState::Stopped,
         pipe: choice.pipe,
         reservation: None,
+        retired: None,
     };
     let dmc = display.pipe_dmc;
     let result = request_pipe_wells(io, ext.pipe)
@@ -1273,7 +1290,7 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
         return Err(stop_failed);
     }
     rp.pipes.release(io, pipe, rp.dmc)?;
-    route.reservation = None;
+    route.retired = route.reservation.take().map(|rp| rp.pipes);
     Ok(())
 }
 
@@ -1296,6 +1313,28 @@ impl MtlHdmiRoute {
     /// Whether the pipe's display resources are still reserved.
     pub fn reserved(&self) -> bool {
         self.reservation.is_some()
+    }
+
+    /// The Pipe B–D owner this route's reservation holds.
+    pub(crate) fn shared_pipes(&self) -> Option<&Pipes> {
+        self.reservation.as_ref().map(|rp| &rp.pipes)
+    }
+
+    /// Adopt a sibling route's newer Pipe B–D owner (same layout, plus or
+    /// minus the sibling's pipe); a route without a reservation keeps none.
+    pub(crate) fn adopt_shared_pipes(&mut self, pipes: &Pipes) {
+        if let Some(rp) = self.reservation.as_mut() {
+            rp.pipes = pipes.clone();
+        }
+    }
+
+    /// The owner a sibling adopts after this route changed it: the
+    /// reservation's, or once the post-release owner the proven stop left.
+    pub(crate) fn take_shared_pipes(&mut self) -> Option<Pipes> {
+        match self.reservation.as_ref() {
+            Some(rp) => Some(rp.pipes.clone()),
+            None => self.retired.take(),
+        }
     }
 
     /// Locally stop; a failed stop quarantines the route.

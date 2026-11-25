@@ -354,8 +354,9 @@ impl Pipes {
     ) -> Result<Self, PipeEnableError> {
         crate::intel_gpu_display_resources::Profile::capture_ip(io, mode, ip)
             .map_err(|_| PipeEnableError::Resource(ResourceError::Diverged))?;
-        // Only the owned single-pipe layout is adopted: one external route
-        // runs at a time, so a lit Pipe B–D here is not this owner's.
+        // Only the owned single-pipe layout is adopted: a first external
+        // route starts from it, so a lit Pipe B–D here is not this owner's
+        // (a second route plans beside its sibling's owner instead).
         for pipe in [Pipe::B, Pipe::C, Pipe::D]
             .into_iter()
             .take(ip.pipe_count() - 1)

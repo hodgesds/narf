@@ -3058,6 +3058,29 @@ static MTL_EXTRA_SCANOUTS: IrqSafeSpinLock<alloc::vec::Vec<(u64, u8, ScanoutAllo
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 /// Serial of the published MTL external image (0 = none published).
 static MTL_PUBLISHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Serial of the second concurrent route's image (`narf.intel.ext_routes=2`,
+/// route slot 1; 0 = none published).
+static MTL_PUBLISHED_SECOND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The image and pipe each route slot last published, so the sibling's
+/// image takes the console back when the active one is withdrawn.
+static MTL_SLOT_IMAGES: IrqSafeSpinLock<
+    [Option<(
+        narf_graphics_driver::generic::GenericFb,
+        crate::intel_gpu_pipes::Pipe,
+    )>; 2],
+> = IrqSafeSpinLock::new([None, None]);
+/// `MTL_EXTRA_SCANOUTS` key of the second route's surface (slot 1 never
+/// carries MST streams, which take keys 1..).
+const MTL_SECOND_SCANOUT_KEY: u8 = 0x80;
+
+/// The publication serial of route slot `slot`.
+fn mtl_slot_serial(slot: usize) -> &'static core::sync::atomic::AtomicU64 {
+    if slot == 0 {
+        &MTL_PUBLISHED
+    } else {
+        &MTL_PUBLISHED_SECOND
+    }
+}
 /// The pipe (CRTC) scanning out the published MTL external image, as
 /// `pipe + 1` (0 = none published).
 static MTL_PUBLISHED_PIPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -3069,7 +3092,10 @@ const MTL_EVENTS_PER_DRAIN: usize = 8;
 /// the internal console or when nothing external is published.
 pub fn active_external_pipe() -> Option<crate::intel_gpu_pipes::Pipe> {
     let serial = ACTIVE_GENERIC.lock().0;
-    if serial == 0 || serial != MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire) {
+    if serial == 0
+        || (serial != MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire)
+            && serial != MTL_PUBLISHED_SECOND.load(core::sync::atomic::Ordering::Acquire))
+    {
         return None;
     }
     let pipe = MTL_PUBLISHED_PIPE
@@ -3091,19 +3117,20 @@ enum MtlPublication {
     Withdraw(u64),
 }
 
-/// The console GGTT window (`scanout_gtt_offset`) of the `stream`th surface
-/// a display-14+ external pass lights. Every surface lit at the same time
-/// needs its own window: an allocation at a window's offset rewrites that
-/// window's PTEs, so two surfaces in one window would both scan out the last
-/// one's pages. The SST/HDMI route's surface, or MST stream 0, takes Pipe
-/// B's window; MST streams 1 and 2 take Pipe C's and D's. `None` past the
-/// last window.
-fn mtl_scanout_window(stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
+/// The console GGTT window (`scanout_gtt_offset`) of stream `stream` of the
+/// route in slot `slot`. Every surface lit at the same time needs its own
+/// window: an allocation at a window's offset rewrites that window's PTEs,
+/// so two surfaces in one window would scan out the last one's pages. Slot
+/// 0's streams (one SST/HDMI route, or up to three MST streams) take Pipe
+/// B, C and D's windows in order; slot 1 (a second concurrent route, never
+/// beside MST) takes Pipe C's. `None` past the last window.
+fn mtl_scanout_window(slot: usize, stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
     use crate::intel_gpu_pipes::Pipe;
-    match stream {
-        0 => Some(Pipe::B),
-        1 => Some(Pipe::C),
-        2 => Some(Pipe::D),
+    match (slot, stream) {
+        (0, 0) => Some(Pipe::B),
+        (0, 1) => Some(Pipe::C),
+        (0, 2) => Some(Pipe::D),
+        (1, 0) => Some(Pipe::C),
         _ => None,
     }
 }
@@ -3134,11 +3161,17 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
         return false;
     };
     before_event();
-    let mut next_scanout = 0u8;
+    // The route slot this event lights (or relights) a route in: slot 1 is
+    // a second concurrent route (`narf.intel.ext_routes=2`) with its own
+    // retained surface in its own GGTT window.
+    let slot = crate::intel_gpu_xelpg_external::event_slot(event.pin.port());
+    let mut next_scanout = if slot == 0 { 0u8 } else { MTL_SECOND_SCANOUT_KEY };
+    let mut stream = 0u8;
     let mut alloc_fb = |mode: &crate::intel_gpu_modeset::Mode| {
         let index = next_scanout;
         next_scanout = next_scanout.checked_add(1)?;
-        let window = mtl_scanout_window(index)?;
+        let window = mtl_scanout_window(slot, stream)?;
+        stream += 1;
         let width = u32::from(mode.h_active);
         let size = scanout_size_bytes(width, u32::from(mode.v_active));
         let reuse = if index == 0 {
@@ -3189,34 +3222,70 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     );
     after_event();
     if let Some(ServiceOutcome::Activated { mode, fb, pipe, .. }) = outcome {
-        let phys = (*MTL_SCANOUT.lock())
-            .filter(|(owner, retained)| {
-                *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
-            })
-            .map(|(_, retained)| retained.phys_base);
+        let phys = if slot == 0 {
+            (*MTL_SCANOUT.lock())
+                .filter(|(owner, retained)| {
+                    *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
+                })
+                .map(|(_, retained)| retained.phys_base)
+        } else {
+            MTL_EXTRA_SCANOUTS
+                .lock()
+                .iter()
+                .find(|(owner, key, retained)| {
+                    *owner == bar
+                        && *key == MTL_SECOND_SCANOUT_KEY
+                        && u64::from(retained.gtt_offset) == fb.phys_addr
+                })
+                .map(|(_, _, retained)| retained.phys_base)
+        };
         let serial = next_external_scanout_serial();
         if let (Some(phys), Some(serial)) = (phys, serial) {
-            MTL_PUBLISHED.store(serial, core::sync::atomic::Ordering::Release);
-            publication(MtlPublication::Publish(
-                narf_graphics_driver::generic::GenericFb::new(
-                    phys,
-                    u32::from(mode.h_active),
-                    u32::from(mode.v_active),
-                    fb.stride_bytes,
-                    32,
-                ),
-                serial,
-                pipe,
-            ));
+            let image = narf_graphics_driver::generic::GenericFb::new(
+                phys,
+                u32::from(mode.h_active),
+                u32::from(mode.v_active),
+                fb.stride_bytes,
+                32,
+            );
+            mtl_slot_serial(slot).store(serial, core::sync::atomic::Ordering::Release);
+            MTL_SLOT_IMAGES.lock()[slot.min(1)] = Some((image, pipe));
+            publication(MtlPublication::Publish(image, serial, pipe));
         }
     }
-    if !crate::intel_gpu_xelpg_external::route_live() {
-        let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
-        if serial != 0 {
-            publication(MtlPublication::Withdraw(serial));
-        }
-    }
+    withdraw_dark_mtl_slots(publication);
     true
+}
+
+/// Withdraw the image of every route slot whose route is no longer live
+/// (serial-matched). When the withdrawn image was the active one and the
+/// sibling route still scans out, the sibling's image takes the console
+/// back under a fresh serial.
+fn withdraw_dark_mtl_slots(publication: &mut dyn FnMut(MtlPublication)) {
+    for slot in 0..2 {
+        if crate::intel_gpu_xelpg_external::slot_live(slot) {
+            continue;
+        }
+        let serial = mtl_slot_serial(slot).swap(0, core::sync::atomic::Ordering::AcqRel);
+        if serial == 0 {
+            continue;
+        }
+        MTL_SLOT_IMAGES.lock()[slot] = None;
+        let active = ACTIVE_GENERIC.lock().0 == serial;
+        publication(MtlPublication::Withdraw(serial));
+        let sibling = 1 - slot;
+        let image = MTL_SLOT_IMAGES.lock()[sibling];
+        if let (true, true, Some((image, pipe))) = (
+            active,
+            crate::intel_gpu_xelpg_external::slot_live(sibling),
+            image,
+        ) {
+            if let Some(serial) = next_external_scanout_serial() {
+                mtl_slot_serial(sibling).store(serial, core::sync::atomic::Ordering::Release);
+                publication(MtlPublication::Publish(image, serial, pipe));
+            }
+        }
+    }
 }
 
 /// Generation-only adapter retained for the native runtime-hook fixtures.
@@ -3475,12 +3544,7 @@ pub(crate) async fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_fil
     } else {
         crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, gpu.chip.generation)
     };
-    if !crate::intel_gpu_xelpg_external::route_live() {
-        let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
-        if serial != 0 {
-            mtl_publish(MtlPublication::Withdraw(serial));
-        }
-    }
+    withdraw_dark_mtl_slots(&mut mtl_publish);
     if done {
         Ok(())
     } else {
@@ -5009,7 +5073,7 @@ pub mod tests {
     fn smoke_mtl_external_streams_take_distinct_ggtt_windows() -> TestResult {
         use crate::intel_gpu_multipipe::scanout_gtt_offset;
         use crate::intel_gpu_pipes::Pipe;
-        let windows: alloc::vec::Vec<_> = (0..4).map(mtl_scanout_window).collect();
+        let windows: alloc::vec::Vec<_> = (0..4).map(|stream| mtl_scanout_window(0, stream)).collect();
         if windows != [Some(Pipe::B), Some(Pipe::C), Some(Pipe::D), None] {
             return TestResult::Fail("streams 0..2 take Pipe B, C, D; stream 3 none");
         }

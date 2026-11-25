@@ -380,7 +380,7 @@ pub fn edid_for(
     e
 }
 
-fn edid_1024() -> Vec<u8> {
+pub(crate) fn edid_1024() -> Vec<u8> {
     edid_for(65_000, 1024, 320, 24, 136, 768, 38, 3, 6)
 }
 
@@ -886,7 +886,7 @@ impl MmioWindow for ExtFake {
     }
 }
 
-fn fb_for(mode: &Mode) -> Option<Framebuffer> {
+pub(crate) fn fb_for(mode: &Mode) -> Option<Framebuffer> {
     Some(Framebuffer {
         phys_addr: 0x100_0000,
         stride_bytes: (u32::from(mode.h_active) * 4).next_multiple_of(64),

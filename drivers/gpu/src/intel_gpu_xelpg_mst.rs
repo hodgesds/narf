@@ -289,7 +289,7 @@ impl MtlMstRoute {
                 }
             };
             let result = match self.streams.last() {
-                None => activate_with_payload(io, probe, fb, display, &mut allocate),
+                None => activate_with_payload(io, probe, fb, display, None, &mut allocate),
                 Some(previous) => activate_secondary(
                     io,
                     probe,
@@ -475,6 +475,7 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
         trained,
         pipe,
         reservation: None,
+        retired: None,
         awaiting_fec_stop: false,
         state: RouteState::Stopped,
         uhbr: None,
