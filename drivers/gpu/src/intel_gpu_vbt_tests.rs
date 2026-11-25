@@ -1402,6 +1402,19 @@ fn vbt_gen12_ddc_overrides_follow_map_ddc_pin() -> TestResult {
         !Gen12DdcOverrides::from_vbt(&panel, Gen12Platform::TigerLake)
             .external_only_for(Gen12Platform::TigerLake)
     );
+    // The owned Rocket Lake panel route needs an eDP child on port A
+    // (`intel_bios_encoder_supports_edp` for PORT_A); an external-only VBT,
+    // another family's resolution or no VBT has none.
+    if !Gen12DdcOverrides::from_vbt(&panel, Gen12Platform::RocketLake)
+        .edp_on_a_for(Gen12Platform::RocketLake)
+        || Gen12DdcOverrides::from_vbt(&panel, Gen12Platform::RocketLake)
+            .edp_on_a_for(Gen12Platform::TigerLake)
+        || Gen12DdcOverrides::from_vbt(&vbt, Gen12Platform::RocketLake)
+            .edp_on_a_for(Gen12Platform::RocketLake)
+        || Gen12DdcOverrides::NONE.edp_on_a_for(Gen12Platform::RocketLake)
+    {
+        return TestResult::Fail("eDP on port A only from this family's VBT");
+    }
     if o.pin(Gen12Platform::TigerLake, Ddi::D) != Some(PinPair::Pin10Tc2)
         || o.pin(Gen12Platform::TigerLake, Ddi::B) != Some(PinPair::Pin2Bxt)
         || o.pin(Gen12Platform::TigerLake, Ddi::E) != Some(PinPair::Pin10Tc2)

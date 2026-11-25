@@ -1787,6 +1787,9 @@ pub struct Gen12DdcOverrides {
     family: Option<crate::intel_gpu_gt::Gen12Platform>,
     pins: [Option<PinPair>; 8],
     external_only: bool,
+    /// The VBT declares an eDP connector on port A
+    /// (`intel_bios_encoder_supports_edp` for `PORT_A`).
+    edp_a: bool,
 }
 
 impl Gen12DdcOverrides {
@@ -1795,18 +1798,22 @@ impl Gen12DdcOverrides {
         family: None,
         pins: [None; 8],
         external_only: false,
+        edp_a: false,
     };
 
     /// The overrides a VBT declares for `family`.
     pub fn from_vbt(vbt: &Vbt, family: crate::intel_gpu_gt::Gen12Platform) -> Self {
         let mut pins = [None; 8];
+        let mut edp_a = false;
         for encoder in vbt.encoders(VbtPlatform::from_gen12(family)) {
             if let Some(slot) = pins.get_mut(encoder.port as usize) {
                 *slot = encoder.hdmi_ddc;
             }
+            edp_a |= encoder.port == 0 && encoder.edp;
         }
         Self {
             family: Some(family),
+            edp_a,
             pins,
             external_only: !vbt.children().is_empty()
                 && vbt.children().iter().all(|child| {
@@ -1818,6 +1825,12 @@ impl Gen12DdcOverrides {
 
     pub(crate) fn external_only_for(&self, family: crate::intel_gpu_gt::Gen12Platform) -> bool {
         self.family == Some(family) && self.external_only
+    }
+
+    /// Whether the VBT resolved for `family` declares an eDP panel on port
+    /// A (`intel_ddi_init`'s `init_dp` with `intel_dp_is_port_edp`).
+    pub(crate) fn edp_on_a_for(&self, family: crate::intel_gpu_gt::Gen12Platform) -> bool {
+        self.family == Some(family) && self.edp_a
     }
 
     /// The HDMI DDC pin for `ddi` on `family`: the VBT pin when these
@@ -1881,6 +1894,10 @@ pub fn install_for_probe(
     let applicable = match generation {
         Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => true,
         Generation::TigerLake | Generation::AlderLake => gen12.is_some(),
+        // Rocket Lake only with its internal panel admitted
+        // (`narf.intel.rkl_edp=1`): the eDP signal bits and the port A
+        // eDP declaration the owned route needs, and the DDC overrides.
+        Generation::RocketLake => gen12.is_some() && crate::intel_gpu_modeset::rkl_edp(),
         // Gen11 (Lane 5): the VRR flag and the eDP
         // low-vswing bit install for the internal panel; the
         // Gen12 DDC overrides below are skipped for IceLake.
@@ -1895,7 +1912,6 @@ pub fn install_for_probe(
         // is ever computed from the installed flag; the Gen9
         // modeset (Lane 5) reads only the low-vswing bit.
         Generation::Skylake | Generation::Broxton => true,
-        _ => false,
     };
     if !applicable {
         return VbtInstall::NotApplicable;

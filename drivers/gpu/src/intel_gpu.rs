@@ -1001,6 +1001,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
+    // Rocket Lake's internal panel (`narf.intel.rkl_edp=1`, default off):
+    // recorded before the VBT install, which it makes applicable.
+    crate::intel_gpu_modeset::set_rkl_edp(
+        dev.chip.generation == Generation::RocketLake
+            && crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip)
+                == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+            && crate::intel_gpu_modeset::rkl_edp_requested(narf_boot::args()),
+    );
     // VBT (`intel_bios_init`): the ACPI OpRegion named by ASLS, read-only.
     // Installed before any external hotplug pass so the MTL port policy,
     // its legacy Type-C hotplug sources, DP SSC and the HDMI DDC pins
@@ -1131,7 +1139,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             },
             &device,
         );
-    } else if dev.chip.generation.display_supported() {
+    } else if crate::intel_gpu_modeset::panel_route(dev.chip.generation)
+        && (dev.chip.generation != Generation::RocketLake || rkl_panel_declared())
+    {
         // eDP panel power sequencing (#1020): the panel must be
         // sequenced on before any AUX traffic (the EDID read
         // inside takeover), modeset, or backlight enable. A
@@ -1201,7 +1211,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // Gen9 Skylake drives the SPT PWM layout, Gen11/Gen12
             // the BXT layout (Lane 8).
             // Gen9 LP's backlight controller is the BXT layout itself.
-            if dev.chip.generation.backlight_supported() {
+            // Rocket Lake's panel (`narf.intel.rkl_edp=1`) takes the CNP PWM
+            // (`cnp_pwm_funcs`, the BXT-layout block the Gen12 install drives).
+            if dev.chip.generation.backlight_supported()
+                || dev.chip.generation == Generation::RocketLake
+            {
                 if dev.chip.generation == Generation::Skylake {
                     narf_drivers_backlight::intel_bl::install_spt(dev.gtt_mmadr);
                 } else if dev.chip.generation == Generation::Broxton {
@@ -1868,7 +1882,7 @@ pub(crate) fn relight_display_locked(
     let nova = kms.as_ref().and_then(|kms| kms.integrated_display_ip())
         == Some(crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS);
     drop(kms);
-    if !display.chip.generation.display_supported() && !xe_lpd_route {
+    if !crate::intel_gpu_modeset::panel_route(display.chip.generation) && !xe_lpd_route {
         return None;
     }
     // Its relight needs the probe's sequencer delays and the panel turned off
@@ -2285,6 +2299,22 @@ struct HdmiSessionState {
 }
 
 static HDMI_SESSION: IrqSafeSpinLock<Option<HdmiSessionState>> = IrqSafeSpinLock::new(None);
+
+/// Rocket Lake's owned panel route needs the VBT to declare eDP on port A
+/// (`intel_ddi_init` creates the eDP connector only then); without one the
+/// panel stays on the firmware route, with a log line.
+fn rkl_panel_declared() -> bool {
+    let declared = crate::intel_gpu_vbt::gen12_ddc_overrides()
+        .edp_on_a_for(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+    if !declared {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "intel-gpu: Rocket Lake panel refused: the VBT declares no eDP on port A"
+        );
+    }
+    declared
+}
 
 /// Drain pending combo-DDI hotplug events and act on them.
 /// Called once at the end of probe (a sink already attached at

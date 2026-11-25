@@ -4074,6 +4074,38 @@ pub(crate) fn clear_ycbcr420_pipe<M: MmioWindow + ?Sized>(io: &M, pipe: Pipe) {
 pub(crate) const PIPE_MISC_YCBCR420: u32 =
     PIPE_MISC_YUV420_ENABLE | PIPE_MISC_YUV420_MODE_FULL_BLEND | PIPE_MISC_OUTPUT_COLORSPACE_YUV;
 
+/// The boot option that admits the Rocket Lake internal panel to the owned
+/// eDP route (default off: without it Rocket Lake keeps its external
+/// outputs only and the panel stays on the firmware route).
+pub const RKL_EDP_OPT_IN: &str = "narf.intel.rkl_edp";
+
+static RKL_EDP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `narf.intel.rkl_edp=1`, with the strict grammar every Intel opt-in uses
+/// ([`crate::intel_gpu_gt::boot_opt_in`]).
+pub fn rkl_edp_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, RKL_EDP_OPT_IN)
+}
+
+/// Probe: record whether this Rocket Lake's internal panel takes the owned
+/// eDP route (the option set on an exact Rocket Lake PCI identity).
+pub(crate) fn set_rkl_edp(enabled: bool) {
+    RKL_EDP.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the Rocket Lake internal panel takes the owned eDP route.
+pub(crate) fn rkl_edp() -> bool {
+    RKL_EDP.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether `generation`'s internal panel takes the owned route: every
+/// [`crate::intel_gpu::Generation::display_supported`] generation, and Rocket
+/// Lake with `narf.intel.rkl_edp=1`.
+pub(crate) fn panel_route(generation: crate::intel_gpu::Generation) -> bool {
+    generation.display_supported()
+        || (generation == crate::intel_gpu::Generation::RocketLake && rkl_edp())
+}
+
 /// Exact known PCI family; no P/S/N inference from the broad generation.
 pub(crate) fn gen12_family_for_chip(
     chip: crate::intel_gpu::ChipInfo,
@@ -4214,8 +4246,21 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
     // route through it. External DP never comes here — it has its own
     // activate path (`intel_gpu_dp`) that calls the recompute with
     // `DisplayPort`.
+    // Rocket Lake's panel takes the Tiger Lake path below only with
+    // `narf.intel.rkl_edp=1` on an exact Rocket Lake identity; otherwise it
+    // has no panel modeset, as before.
+    if generation == Generation::RocketLake
+        && !(rkl_edp() && family == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake))
+    {
+        return Err(ModesetError::UnsupportedGeneration);
+    }
     let result = match generation {
-        Generation::TigerLake | Generation::AlderLake => {
+        // Rocket Lake (`narf.intel.rkl_edp=1`): the Tiger Lake panel path on
+        // its combo PHY A, with the family's PLL set (`rkl_pll_mgr`: DPLL0
+        // for port A, `rkl_combo_dpll`), DPCLKA layout (`RKL_DPCLKA_*`),
+        // power wells (Pipe A and DDI A in PW_1, no PW_2), CDCLK table and
+        // eDP buffer tables (`rkl_get_combo_buf_trans_edp`).
+        Generation::TigerLake | Generation::AlderLake | Generation::RocketLake => {
             let mut ms = Modeset::new(mmio, Ddi::A);
             if let Some(family) = family {
                 ms.set_gen12_family(family);
@@ -4299,10 +4344,9 @@ fn modeset_display_family<M: MmioWindow + ?Sized>(
                 None => ms.modeset(fb, None),
             }
         }
-        // Rocket Lake / Lunar Lake / Panther Lake have no
-        // panel modeset in this module (owned routes elsewhere
-        // or not modeled).
-        Generation::RocketLake | Generation::LunarLake | Generation::PantherLake => {
+        // Lunar Lake and Panther Lake have no panel modeset in this module
+        // (owned routes elsewhere).
+        Generation::LunarLake | Generation::PantherLake => {
             Err(ModesetError::UnsupportedGeneration)
         }
     };
@@ -7709,6 +7753,69 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_rkl_external_dp_ddi_b_full_run
+    );
+
+    /// The Rocket Lake internal panel (`narf.intel.rkl_edp=1`): without the
+    /// option the panel modeset refuses before any write, as before; with it
+    /// the Tiger Lake panel path runs on combo PHY A with Rocket Lake's PLL
+    /// set and DPCLKA layout — `rkl_pll_mgr`'s DPLL0 for port A
+    /// (`RKL_DPLL_CFGCR0(0)` 0x164284 at the 19.2 MHz HBR2 row, never DPLL1's
+    /// 0x16428C), `RKL_DPCLKA_CFGCR0` selecting DPLL0 for PHY A (bits 1:0)
+    /// with `CLK_OFF(PHY A)` (bit 10) set then cleared, and no PW_2 request
+    /// (`rkl_power_wells`: Pipe A and DDI A are PW_1 domains).
+    fn smoke_rkl_panel_modeset_is_opt_in() -> TestResult {
+        use crate::intel_gpu::{ChipInfo, Generation};
+        let chip = ChipInfo {
+            vid: 0x8086,
+            did: 0x4c8a,
+            generation: Generation::RocketLake,
+            asic: "rocketlake",
+        };
+        set_rkl_edp(false);
+        let sink = ScriptedSinkMmio::new(1 << 29);
+        if modeset_display_for_chip(&sink, chip, &fb_1080p(), None)
+            != Err(ModesetError::UnsupportedGeneration)
+            || !sink.writes.borrow().is_empty()
+            || panel_route(Generation::RocketLake)
+            || Generation::RocketLake.display_supported()
+        {
+            return TestResult::Fail("without narf.intel.rkl_edp=1 the RKL panel stays gated");
+        }
+        set_rkl_edp(true);
+        let sink = ScriptedSinkMmio::new(1 << 29);
+        let result = modeset_display_for_chip(&sink, chip, &fb_1080p(), None);
+        let routed = panel_route(Generation::RocketLake);
+        set_rkl_edp(false);
+        let Ok(mode) = result else {
+            return TestResult::Fail("the RKL panel modeset must succeed with the option");
+        };
+        if !routed || mode.pixel_clock_khz != 148_500 || mode.h_active != 1920 {
+            return TestResult::Fail("the RKL panel commits the EDID preferred mode");
+        }
+        if sink.writes_to(0x164284) != alloc::vec![0x01C0_01A5]
+            || sink.writes_to(0x164288) != alloc::vec![0x4B]
+            || !sink.writes_to(0x16428C).is_empty()
+        {
+            return TestResult::Fail("RKL port A programs DPLL0 at the HBR2 row");
+        }
+        if sink.writes_to(0x164280) != alloc::vec![0x400, 0] {
+            return TestResult::Fail("RKL DPCLKA selects DPLL0 for PHY A, then clocks it");
+        }
+        let pg2 = super::pwr_well_req(super::PowerWell::Pg2 as u32);
+        if sink.writes_to(PWR_WELL_CTL2).iter().any(|v| v & pg2 != 0) {
+            return TestResult::Fail("the RKL panel must never request PW_2");
+        }
+        if RKL_EDP_OPT_IN != "narf.intel.rkl_edp"
+            || !rkl_edp_requested(narf_boot::args::KernelCmdline::new("narf.intel.rkl_edp=1"))
+            || rkl_edp_requested(narf_boot::args::KernelCmdline::new("narf.intel.rkl_edp=0"))
+        {
+            return TestResult::Fail("strict opt-in grammar");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_rkl_panel_modeset_is_opt_in
     );
 
     /// Rocket Lake TC1 (DDI D) is a combo port on PHY C: external DP at
