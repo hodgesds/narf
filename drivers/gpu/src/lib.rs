@@ -667,6 +667,8 @@ pub use amdgpu_rdna2_sdma_queues as amdgpu_sdma_navi22_queues;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_smu;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_sdma_navi31;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_sdma_navi48;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_smc_firmware;
