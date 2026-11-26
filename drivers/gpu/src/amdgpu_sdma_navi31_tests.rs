@@ -10,6 +10,10 @@ const DOORBELL_IDX: u32 = 4;
 const RPTR_PHYS: u64 = 0x0000_0002_3000_0000;
 const WPTR_POLL_PHYS: u64 = 0x0000_0002_3000_1000;
 
+/// One row of the die↔revision firmware-set table: the die, its GC version,
+/// its SDMA revision, and the firmware blob the Linux tree stages for it.
+type RevisionCase<'a> = (Navi3Die, (u8, u8, u8), (u8, u8, u8), &'a str);
+
 fn params() -> Navi31RingInit {
     Navi31RingInit {
         gc_base: GC_BASE,
@@ -31,7 +35,7 @@ fn sdma_navi31_revision_table_matches_linux_firmware_sets() -> TestResult {
     // Lane-1 corrected pairing (firmware-set evidence): Navi31 ↔ GC 11.0.0 /
     // SDMA 6.0.0, Navi32 ↔ GC 11.0.3 / SDMA 6.0.3, Navi33 ↔ GC 11.0.2 /
     // SDMA 6.0.2. The early patch tables had 32/33 swapped.
-    let cases: &[(Navi3Die, (u8, u8, u8), (u8, u8, u8), &str)] = &[
+    let cases: &[RevisionCase<'_>] = &[
         (
             Navi3Die::Navi31,
             (11, 0, 0),
