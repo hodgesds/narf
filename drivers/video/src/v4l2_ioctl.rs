@@ -232,6 +232,11 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 const V4L2_PIX_FMT_YUYV: u32 = fourcc(b'Y', b'U', b'Y', b'V');
 const V4L2_PIX_FMT_MJPEG: u32 = fourcc(b'M', b'J', b'P', b'G');
 const V4L2_PIX_FMT_NV12: u32 = fourcc(b'N', b'V', b'1', b'2');
+/// V4L2_PIX_FMT_MPEG (`'MPEG'`, "MPEG-1/2/4 Multiplexed",
+/// videodev2.h): the V4L2 fourcc for a multiplexed stream. This is
+/// the fourcc a UVC stream-based format (`VS_FORMAT_STREAM_BASED`,
+/// e.g. MPEG-2 TS) is selected under (#2503).
+const V4L2_PIX_FMT_MPEG: u32 = fourcc(b'M', b'P', b'E', b'G');
 
 /// Page size for buffer backing.
 const PAGE: usize = 4096;
@@ -741,10 +746,15 @@ fn pixelfmt_fourcc(p: crate::uvc::PixelFmt) -> Option<(u32, &'static str, bool)>
         PixelFmt::Nv12 => (V4L2_PIX_FMT_NV12, "NV12 4:2:0", false),
         PixelFmt::Mjpeg => (V4L2_PIX_FMT_MJPEG, "Motion-JPEG", true),
         PixelFmt::FrameBased => (fourcc(b'H', b'2', b'6', b'4'), "H.264", true),
-        // Stream-based transports have no V4L2 fourcc: their segment
-        // size is negotiated, not described by frame modes, so they
-        // are not offered for STREAMON selection (#1334 remainder).
-        PixelFmt::StreamBased => return None,
+        // Stream-based transports map to the V4L2 multiplexed-stream
+        // fourcc (`V4L2_PIX_FMT_MPEG`, 'MPEG', "MPEG-1/2/4
+        // Multiplexed", videodev2.h): the stream-based example in
+        // the UVC payload specs is MPEG-2 TS, and `StreamFormat`
+        // retains no GUID, so the fourcc is the caller's declaration
+        // that the bytestream is MPEG-multiplexed (#2503).
+        // GUID-qualified discrimination (retaining `guid_format` on
+        // `StreamFormat`) is a follow-up, not this lane.
+        PixelFmt::StreamBased => (V4L2_PIX_FMT_MPEG, "MPEG multiplexed stream", true),
         PixelFmt::Unknown => return None,
     })
 }
@@ -768,9 +778,15 @@ fn interval_to_fract(interval_100ns: u32) -> (u32, u32) {
 }
 
 /// Build a V4L2 `ENUM_FMT` table from parsed UVC streaming descriptors
-/// (`uvc::parse_streaming_descriptors`). Formats with no mapped fourcc, or with
-/// no frame sizes, are skipped. Returns an empty vec if nothing maps — callers
-/// should fall back to [`default_formats`].
+/// (`uvc::parse_streaming_descriptors`). Formats with no mapped fourcc,
+/// or (except stream-based) with no frame sizes, are skipped.
+/// Stream-based formats have no frame modes — their segment size is
+/// negotiated, not described — so they are advertised with an empty
+/// size list (#2503): `S_FMT` keeps the requested dimensions
+/// (`resolve_format` falls back to them when no size matches) and
+/// STREAMON ignores them (frame index 0, no frame-mode lookup).
+/// Returns an empty vec if nothing maps — callers should fall back to
+/// [`default_formats`].
 pub fn uvc_to_v4l2_formats(formats: &[crate::uvc::StreamFormat]) -> Vec<FmtEntry> {
     let mut out = Vec::new();
     for f in formats {
@@ -794,7 +810,7 @@ pub fn uvc_to_v4l2_formats(formats: &[crate::uvc::StreamFormat]) -> Vec<FmtEntry
                 intervals,
             });
         }
-        if sizes.is_empty() {
+        if sizes.is_empty() && f.pixel_fmt != crate::uvc::PixelFmt::StreamBased {
             continue;
         }
         out.push(FmtEntry {

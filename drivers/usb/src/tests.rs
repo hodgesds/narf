@@ -3769,6 +3769,54 @@ fn smoke_usb_uvc_get_cur_version_validation() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_get_cur_version_validation);
 
+// `bmFramingInfo` validation (#2503, UVC 1.5 §4.3.1.1 Table 4-47):
+// D1 (EOF may be present) without D0 (FID required) is a device
+// error, and D7..2 are reserved (0).
+fn smoke_usb_uvc_framing_info_validation() -> TestResult {
+    use crate::uvc::VsProbeCommit;
+    // No framing bits: valid (FID/EOF both optional).
+    let mut v = VsProbeCommit {
+        framing_info: 0,
+        ..VsProbeCommit::default()
+    };
+    if !v.accepted_framing_valid() {
+        return TestResult::Fail("framing 0 must validate");
+    }
+    // D0 alone: valid.
+    v.framing_info = 0x01;
+    if !v.accepted_framing_valid() {
+        return TestResult::Fail("D0 alone must validate");
+    }
+    // D0 + D1: valid.
+    v.framing_info = 0x03;
+    if !v.accepted_framing_valid() {
+        return TestResult::Fail("D0+D1 must validate");
+    }
+    // Masking-defeating: every malformed shape must fail.
+    v.framing_info = 0x02;
+    if v.accepted_framing_valid() {
+        return TestResult::Fail("D1 without D0 must not validate");
+    }
+    v.framing_info = 0x04;
+    if v.accepted_framing_valid() {
+        return TestResult::Fail("reserved D2 must not validate");
+    }
+    v.framing_info = 0x06;
+    if v.accepted_framing_valid() {
+        return TestResult::Fail("D1+D2 without D0 must not validate");
+    }
+    v.framing_info = 0x05;
+    if v.accepted_framing_valid() {
+        return TestResult::Fail("D0 + reserved D2 must not validate");
+    }
+    v.framing_info = 0xFF;
+    if v.accepted_framing_valid() {
+        return TestResult::Fail("all framing bits must not validate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_usb_uvc_framing_info_validation);
+
 fn smoke_usb_uvc_negotiation_rejects_bad_version_triple() -> TestResult {
     let transport = Arc::new(FixtureTransport::new(
         false,
@@ -3851,6 +3899,124 @@ fn smoke_usb_uvc_negotiation_accepts_device_version_range() -> TestResult {
 kernel_test_in!(
     "drivers/usb/uvc",
     smoke_usb_uvc_negotiation_accepts_device_version_range
+);
+
+/// Bind the modelled stream-based camera and attempt negotiation
+/// with the given staged `bmFramingInfo`, returning the transport
+/// (for transfer-log assertions) and the negotiation outcome. One
+/// fresh bind per call, so each case is independent.
+fn uvc_stream_based_negotiate(
+    framing_info: u8,
+) -> (Arc<FixtureTransport>, Result<(), &'static str>) {
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    let transport = Arc::new(FixtureTransport::new(false, false, alloc::vec![]));
+    transport.set_max_video_frame_size(16);
+    transport.set_framing_info(framing_info);
+    let blob = uvc_fixture_config_blob_stream_based();
+    let idx = match narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &blob,
+        None,
+    )) {
+        Ok(idx) => idx,
+        Err(_) => {
+            return (
+                transport,
+                Err("bind against the modelled stream-based camera failed"),
+            );
+        }
+    };
+    // Spec-shaped desired control for a payload with no defined
+    // frame descriptor: frame index 0 (UVC 1.5 §4.3.1.1).
+    let desired = crate::uvc::VsProbeCommit {
+        hint: 1,
+        format_index: 1,
+        frame_index: 0,
+        frame_interval: 333_333,
+        ..crate::uvc::VsProbeCommit::default()
+    };
+    let outcome = narf_scheduler::block_on(crate::uvc::negotiate_and_activate_video_stream_with(
+        &*transport,
+        idx,
+        desired,
+    ))
+    .map(|_| ())
+    .map_err(|_| "negotiation failed");
+    (transport, outcome)
+}
+
+fn smoke_usb_uvc_negotiation_rejects_bad_framing_info() -> TestResult {
+    // D1 (EOF) without D0 (FID): a device error per Table 4-47.
+    let (transport, outcome) = uvc_stream_based_negotiate(0x02);
+    if outcome.is_ok() {
+        return TestResult::Fail("negotiation must fail on D1 without D0");
+    }
+    // The rejection happens before COMMIT: the device must not be
+    // left committed to a stream nobody opened.
+    if transport
+        .log()
+        .iter()
+        .any(|x| matches!(x, FixtureXfer::SetCurCommit { .. }))
+    {
+        return TestResult::Fail("no COMMIT may be sent after a malformed framing answer");
+    }
+    // Reserved D2 set: malformed.
+    if uvc_stream_based_negotiate(0x04).1.is_ok() {
+        return TestResult::Fail("negotiation must fail on reserved D2");
+    }
+    // D1+D2 without D0: malformed.
+    if uvc_stream_based_negotiate(0x06).1.is_ok() {
+        return TestResult::Fail("negotiation must fail on D1+D2 without D0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_negotiation_rejects_bad_framing_info
+);
+
+fn smoke_usb_uvc_negotiation_accepts_valid_framing_info() -> TestResult {
+    for framing in [0x00u8, 0x01, 0x03] {
+        if let Err(e) = uvc_stream_based_negotiate(framing).1 {
+            return TestResult::Fail(e);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_negotiation_accepts_valid_framing_info
+);
+
+// Framing validation is scoped to stream-based formats (#2503): for
+// known frame-based formats Table 4-47 says this control "is
+// ignored", so a frame-based device answering D1 without D0 must
+// still negotiate.
+fn smoke_usb_uvc_framing_ignored_for_frame_based() -> TestResult {
+    let transport = Arc::new(FixtureTransport::new(
+        false,
+        false,
+        uvc_fixture_frame_packets(),
+    ));
+    transport.set_framing_info(0x02);
+    let (idx, desired) = match uvc_negotiate_setup(&transport) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    match narf_scheduler::block_on(crate::uvc::negotiate_and_activate_video_stream_with(
+        &*transport,
+        idx,
+        desired,
+    )) {
+        Ok(_) => TestResult::Pass,
+        Err(_) => TestResult::Fail("frame-based negotiation must ignore bmFramingInfo"),
+    }
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_framing_ignored_for_frame_based
 );
 
 fn smoke_usb_uvc_reassembler_completes_two_packet_frame() -> TestResult {
@@ -4124,6 +4290,80 @@ fn smoke_usb_uvc_reassembly_config_from_negotiated() -> TestResult {
 kernel_test_in!(
     "drivers/usb/uvc",
     smoke_usb_uvc_reassembly_config_from_negotiated
+);
+
+// STREAMON selection of a stream-based format (#2503): the 'MPEG'
+// fourcc maps to the retained stream-based format with frame index 0
+// (UVC 1.5 §4.3.1.1: no defined frame descriptor → 0) and the
+// nominal 30 fps interval; no frame-mode lookup is attempted.
+fn smoke_usb_uvc_desired_probe_commit_stream_based() -> TestResult {
+    use crate::uvc::{UvcDevice, VsProbeCommit};
+    use narf_drivers_video::uvc::{PixelFmt, StreamFormat};
+    let device = UvcDevice {
+        detached: false,
+        slot_id: 7,
+        vc_iface: 0,
+        vs_iface: 1,
+        streaming_endpoints: alloc::vec![],
+        formats: alloc::vec![StreamFormat {
+            format_index: 1,
+            pixel_fmt: PixelFmt::StreamBased,
+            default_frame_index: 0,
+            frames: alloc::vec![],
+        }],
+        active_stream: None,
+        negotiated: None,
+        video_node: 0,
+        stream_generation: 1,
+        capture_pump_generation: 0,
+        capture_stop_requested: false,
+        uvc_version: 0x0150,
+        clock_frequency: 48_000_000,
+        controller: 0,
+        pu_unit_id: 0,
+        ct_unit_id: 0,
+        controls: alloc::vec![],
+        hub_port: None,
+        last_stream: None,
+        suspended_stream: None,
+    };
+    let mpeg = narf_drivers_video::v4l2_ioctl::PixFormat {
+        width: 640,
+        height: 480,
+        fourcc: u32::from_le_bytes(*b"MPEG"),
+    };
+    let desired = match crate::uvc::desired_probe_commit(&device, mpeg) {
+        Some(d) => d,
+        None => return TestResult::Fail("'MPEG' must map to the stream-based format"),
+    };
+    if desired.format_index != 1 || desired.frame_index != 0 {
+        return TestResult::Fail("stream-based probe must carry format 1, frame index 0");
+    }
+    if desired.frame_interval != 333_333 {
+        return TestResult::Fail("stream-based probe must carry the nominal 30 fps interval");
+    }
+    if desired.framing_info != 0 {
+        return TestResult::Fail("stream-based probe must declare no framing requirement");
+    }
+    // Masking-defeating: a fourcc with no retained format maps to
+    // nothing, even on a device that only offers stream-based.
+    let yuyv = narf_drivers_video::v4l2_ioctl::PixFormat {
+        width: 640,
+        height: 480,
+        fourcc: u32::from_le_bytes(*b"YUYV"),
+    };
+    if crate::uvc::desired_probe_commit(&device, yuyv).is_some() {
+        return TestResult::Fail("YUYV must not map on a stream-based-only device");
+    }
+    // The constructed probe must encode at the 1.5 length.
+    if desired.encode_for(0x0150).len() != VsProbeCommit::LEN_V15 {
+        return TestResult::Fail("stream-based probe must encode 34 bytes for a 1.5 device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_desired_probe_commit_stream_based
 );
 
 // ── drivers/usb/uac (sample rate + PCM ring) ───────────────────────
@@ -10815,9 +11055,11 @@ fn smoke_usb_uvc_stream_based_pump_completes_on_length() -> TestResult {
             return TestResult::Fail("bind must retain one stream-based format");
         }
     }
-    // Stream-based formats have no V4L2 fourcc, so STREAMON cannot
-    // select them yet (#1334 remainder): negotiate directly with a
-    // hand-built desired control, as the #1244 tests do.
+    // Stream-based formats are selected at STREAMON through the
+    // 'MPEG' fourcc (#2503); this test negotiates directly with a
+    // hand-built desired control, as the #1244 tests do, to isolate
+    // the pump's length completion from the S_FMT path (covered by
+    // `smoke_usb_uvc_stream_based_streamon_mpeg_e2e`).
     let desired = VsProbeCommit {
         hint: 1,
         format_index: 1,
@@ -10915,6 +11157,280 @@ fn smoke_usb_uvc_stream_based_pump_completes_on_length() -> TestResult {
 kernel_test_in!(
     "drivers/usb/uvc",
     smoke_usb_uvc_stream_based_pump_completes_on_length
+);
+
+// ── Stream-based STREAMON selection, end to end (#2503) ─────────────
+// The full S_FMT → STREAMON path for a stream-based camera: the node
+// advertises the 'MPEG' fourcc, S_FMT commits it, STREAMON negotiates
+// (probe carries frame index 0 — no defined frame descriptor —
+// per UVC 1.5 §4.3.1.1) and the pump delivers a 16-byte segment on
+// buffer fullness after four 4-byte payloads with no EOF/FID.
+fn smoke_usb_uvc_stream_based_streamon_mpeg_e2e() -> TestResult {
+    use crate::uvc::VsProbeCommit;
+    narf_drivers_video::devfs_bridge::__reset_for_test();
+    crate::uvc::__reset_uvc_for_test();
+    let transport = Arc::new(FixtureTransport::new(false, false, alloc::vec![]));
+    transport.set_max_video_frame_size(16);
+    transport.set_framing_info(0);
+    *UVC_FIXTURE_TRANSPORT.lock() = Some(transport.clone());
+    let blob = uvc_fixture_config_blob_stream_based();
+    let idx = match narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &blob,
+        None,
+    )) {
+        Ok(idx) => idx,
+        Err(_) => {
+            return TestResult::Fail("bind against the modelled stream-based camera failed");
+        }
+    };
+    let node = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = match devices.get(idx) {
+            Some(d) => d,
+            None => return TestResult::Fail("bound device missing"),
+        };
+        if device.formats.len() != 1
+            || device.formats[0].pixel_fmt != narf_drivers_video::uvc::PixelFmt::StreamBased
+        {
+            return TestResult::Fail("bind must retain one stream-based format");
+        }
+        device.video_node
+    };
+    if !narf_drivers_video::devfs_bridge::set_stream_ops(node, uvc_fixture_stream_ops()) {
+        return TestResult::Fail("installing fixture stream hooks failed");
+    }
+    let dev = match narf_drivers_video::devfs_bridge::get_device(node) {
+        Some(d) => d,
+        None => return TestResult::Fail("registered video device missing"),
+    };
+    let events: FixtureEvents = Arc::new(IrqSafeSpinLock::new(
+        narf_drivers_video::v4l2_ioctl::FdEvents::new(),
+    ));
+    let ctx = FixtureCtx::new();
+    // ENUM_FMT must advertise the stream-based format as 'MPEG'
+    // with no frame sizes (there are no frame modes to advertise).
+    {
+        let g = dev.lock();
+        let Some(entry) = g
+            .formats
+            .iter()
+            .find(|f| f.fourcc == u32::from_le_bytes(*b"MPEG"))
+        else {
+            return TestResult::Fail("node must advertise the 'MPEG' fourcc");
+        };
+        if !entry.sizes.is_empty() {
+            return TestResult::Fail("'MPEG' entry must advertise no frame sizes");
+        }
+    }
+    // S_FMT: 'MPEG' (dimensions are nominal — a multiplexed stream
+    // has no frame size; S_FMT keeps the requested 640x480).
+    let mpeg = u32::from_le_bytes(*b"MPEG");
+    ctx.put_u32(0, 1);
+    ctx.put_u32(8, 640);
+    ctx.put_u32(12, 480);
+    ctx.put_u32(16, mpeg);
+    match fixture_ioctl(&dev, &events, &ctx, fixture_ioc(1, 5, 208)) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("S_FMT should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().format.fourcc != mpeg {
+        return TestResult::Fail("S_FMT must commit the 'MPEG' fourcc");
+    }
+    // REQBUFS: 2 MMAP buffers.
+    ctx.put_u32(0, 2);
+    ctx.put_u32(4, 1);
+    ctx.put_u32(8, 1);
+    match fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 8, 20)) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("REQBUFS should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    // QBUF both buffers.
+    for index in 0..2u32 {
+        ctx.put_u32(0, index);
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        match fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 15, 88)) {
+            Ok(0) => {}
+            Ok(_) => return TestResult::Fail("QBUF should succeed"),
+            Err(e) => return TestResult::Fail(e),
+        }
+    }
+    // STREAMON runs the hardware composition for the S_FMT format.
+    match fixture_streamon(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMON should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if !dev.lock().streaming {
+        return TestResult::Fail("device should be streaming after STREAMON");
+    }
+    // The pump must derive the stream-based config from the
+    // negotiation the S_FMT format selected.
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let device = match devices.get(idx) {
+            Some(d) => d,
+            None => return TestResult::Fail("bound device missing"),
+        };
+        let config = device.reassembly_config();
+        if !config.stream_based || config.max_frame_size != 16 || config.framing_info != 0 {
+            return TestResult::Fail("pump config must be stream-based, bound 16, framing 0");
+        }
+    }
+    // Drive the capture pump, interleaved with nonblocking DQBUF,
+    // until the modelled segment lands in a queued buffer.
+    let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+        idx,
+        &*transport,
+        generation,
+    ));
+    for packet in [
+        alloc::vec![2u8, 0x80, 0xA0, 0xA1, 0xA2, 0xA3],
+        alloc::vec![2u8, 0x80, 0xA4, 0xA5, 0xA6, 0xA7],
+        alloc::vec![2u8, 0x80, 0xA8, 0xA9, 0xAA, 0xAB],
+        alloc::vec![2u8, 0x80, 0xAC, 0xAD, 0xAE, 0xAF],
+    ] {
+        transport.stage_packet(packet);
+    }
+    let mut dequeued = false;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump.as_mut());
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        match fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 17, 88)) {
+            Ok(0) => {
+                dequeued = true;
+                break;
+            }
+            Ok(r) if r == fixture_eno(11) => continue,
+            Ok(_) => return TestResult::Fail("DQBUF should succeed or EAGAIN"),
+            Err(e) => return TestResult::Fail(e),
+        }
+    }
+    if !dequeued {
+        return TestResult::Fail("DQBUF never returned the modelled segment");
+    }
+    if ctx.get_u32(8) as usize != 16 {
+        return TestResult::Fail("bytesused should equal the 16-byte segment length");
+    }
+    let bytes_ok = {
+        let g = dev.lock();
+        let f0 = g.buffers[0].frames[0];
+        let p = f0.start_address().kernel_ptr::<u8>();
+        let mut buf = [0u8; 16];
+        // SAFETY: f0 is an allocated frame owned by buffer 0; its
+        // direct-map pointer is valid for the 16 delivered bytes.
+        unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 16) };
+        buf == [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ]
+    };
+    if !bytes_ok {
+        return TestResult::Fail("buffer should contain the modelled segment bytes");
+    }
+    // The transfer conversation: SET_CUR(PROBE) must carry the
+    // desired stream parameters — format 1, frame index 0, nominal
+    // 30 fps — at the 34-byte 1.5 length; COMMIT carries the
+    // device-accepted 16-byte segment + framing 0.
+    let log = transport.log();
+    let desired = VsProbeCommit {
+        hint: 1,
+        format_index: 1,
+        frame_index: 0,
+        frame_interval: 333_333,
+        clock_frequency: 48_000_000,
+        framing_info: 0,
+        preferred_version: 0x10,
+        min_version: 0x10,
+        max_version: 0x10,
+        ..VsProbeCommit::default()
+    };
+    let probe_payload = log.iter().find_map(|x| match x {
+        FixtureXfer::SetCurProbe { payload } => Some(payload.clone()),
+        _ => None,
+    });
+    if probe_payload != Some(desired.encode_for(0x0150)) {
+        return TestResult::Fail("SET_CUR(PROBE) should carry format 1, frame index 0, 30 fps");
+    }
+    let mut accepted = desired;
+    accepted.max_video_frame_size = 16;
+    accepted.max_payload_transfer_size = 1024;
+    let commit_payload = log.iter().find_map(|x| match x {
+        FixtureXfer::SetCurCommit { payload } => Some(payload.clone()),
+        _ => None,
+    });
+    if commit_payload != Some(accepted.encode_for(0x0150)) {
+        return TestResult::Fail("SET_CUR(COMMIT) should carry the device-accepted parameters");
+    }
+    let pos = |needle: &FixtureXfer| fixture_log_pos(&log, needle);
+    let positions = [
+        log.iter()
+            .position(|x| matches!(x, FixtureXfer::SetCurProbe { .. })),
+        pos(&FixtureXfer::GetCurProbe),
+        log.iter()
+            .position(|x| matches!(x, FixtureXfer::SetCurCommit { .. })),
+        pos(&FixtureXfer::SetInterface {
+            interface: 1,
+            alt: 1,
+        }),
+        pos(&FixtureXfer::IsochIn),
+    ];
+    let mut order = Vec::new();
+    for position in positions {
+        match position {
+            Some(p) => order.push(p),
+            None => return TestResult::Fail("conversation is missing a required transfer"),
+        }
+    }
+    if !order.windows(2).all(|w| w[0] < w[1]) {
+        return TestResult::Fail("transfer conversation is out of order");
+    }
+    // STREAMOFF reverses the composition.
+    match fixture_streamoff(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMOFF should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().streaming {
+        return TestResult::Fail("STREAMOFF should clear streaming");
+    }
+    // The pump is parked in `isoch_in`; stage one packet to wake it
+    // and let it observe the stop request and exit cleanly.
+    transport.stage_packet(alloc::vec![2u8, 0x83, b'W', b'A', b'K', b'E', b'!']);
+    let mut pump_done = None;
+    for _ in 0..10_000 {
+        if let Poll::Ready(r) = fixture_poll(pump.as_mut()) {
+            pump_done = Some(r);
+            break;
+        }
+    }
+    if !matches!(pump_done, Some(Ok(()))) {
+        return TestResult::Fail("pump should exit Ok after STREAMOFF");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        if devices[idx].active_stream.is_some() {
+            return TestResult::Fail("STREAMOFF should clear the active stream");
+        }
+    }
+    let last_set_interface = transport.log().iter().rev().find_map(|x| match x {
+        FixtureXfer::SetInterface { alt, .. } => Some(*alt),
+        _ => None,
+    });
+    if last_set_interface != Some(0) {
+        return TestResult::Fail("teardown should end with SET_INTERFACE alt 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/uvc",
+    smoke_usb_uvc_stream_based_streamon_mpeg_e2e
 );
 
 /// V4L2 controls from real descriptors, end to end (#809): bind the
