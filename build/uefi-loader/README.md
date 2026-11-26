@@ -9,7 +9,8 @@ checks each SHA-256 before parsing the ELF. It reports firmware SecureBoot/
 SetupMode while services are live. It uses `narf-boot-protocol` to validate the ELF and emit Multiboot2, then a
 position-independent mode bridge enters the existing 32-bit kernel stub.
 EFI loader/runtime/boot-services allocations and the complete final descriptor
-map are retained; a fixed-address kernel allocation collision fails visibly.
+map are retained. The kernel goes to its link address, or a multiple of
+2 MiB higher when firmware owns part of that range.
 
 ## aarch64
 

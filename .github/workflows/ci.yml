@@ -318,6 +318,13 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: cargo xtask efi-image --smoke
 
+      # Firmware that owns part of the kernel's link range, as the ThinkPad
+      # P14s Gen 5 AMD does: the loader places the kernel higher and boot.S
+      # runs it there.
+      - name: Native EFI boot with the kernel's link range held
+        if: matrix.arch == 'x86_64'
+        run: cargo xtask efi-image --smoke --occupy-link-range
+
       - name: NVMe supervisor without a controller
         if: matrix.arch == 'x86_64'
         run: cargo xtask test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme

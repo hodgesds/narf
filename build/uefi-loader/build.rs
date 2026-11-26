@@ -4,8 +4,19 @@ use sha2::{Digest, Sha256};
 use std::{env, fs, path::PathBuf};
 
 fn main() {
-    for name in ["NARF_EFI_KERNEL", "NARF_EFI_INITRAMFS", "NARF_EFI_CMDLINE"] {
+    for name in [
+        "NARF_EFI_KERNEL",
+        "NARF_EFI_INITRAMFS",
+        "NARF_EFI_CMDLINE",
+        "NARF_EFI_OCCUPY_LINK",
+    ] {
         println!("cargo:rerun-if-env-changed={name}");
+    }
+    // Test builds hold part of the kernel's link range before placing it
+    // (`cargo xtask efi-image --occupy-link-range`).
+    println!("cargo:rustc-check-cfg=cfg(narf_occupy_link)");
+    if env::var_os("NARF_EFI_OCCUPY_LINK").is_some() {
+        println!("cargo:rustc-cfg=narf_occupy_link");
     }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("uefi")
         || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64")

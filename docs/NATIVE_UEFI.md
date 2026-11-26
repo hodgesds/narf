@@ -255,8 +255,12 @@ Install the signed output. A later rebuild needs signing again. Secure Boot
 firmware enforcement is tested by `packaging/test-secure-boot.sh`; physical
 laptop acceptance remains a separate gate. See [Secure Boot](SECURE_BOOT.md) for existing key-management policy.
 
-The first native implementation uses the ELF's fixed physical load range
-and rejects a firmware allocation collision. It keeps the loaded EFI image,
+The loader puts the kernel at the ELF's physical load range when that range
+is free. When firmware owns part of it, as on the ThinkPad P14s Gen 5 AMD
+(ACPI NVS and tables at 0x179ec000-0x1f46bfff), the loader puts the kernel a
+multiple of 2 MiB higher in free memory below 4 GiB and prints the address. It
+fails only when no free range fits. `cargo xtask efi-image --smoke
+--occupy-link-range` tests that path under OVMF. The loader keeps the loaded EFI image,
 initramfs, handoff and EFI boot-services pages reserved for the kernel lifetime;
 firmware configuration tables can still refer into the latter. It bounds the
 EFI map to 1024 descriptors and the coalesced kernel map to 64 regions; excess

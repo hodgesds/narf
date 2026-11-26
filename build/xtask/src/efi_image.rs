@@ -59,6 +59,11 @@ pub struct Args {
     /// Build with boot-smoke, boot under OVMF, and require a clean shutdown.
     #[arg(long, conflicts_with = "run")]
     smoke: bool,
+    /// Test: the loader holds a page in the middle of the kernel's link range
+    /// as ACPI NVS before placing the kernel, as some firmware holds part of
+    /// it, so the boot takes the path that places the kernel higher.
+    #[arg(long)]
+    occupy_link_range: bool,
 }
 
 impl Args {
@@ -172,8 +177,14 @@ pub fn run(args: &Args) -> Result<()> {
     let initramfs = stage.join("initramfs.cpio");
     std::fs::write(&initramfs, &cpio)?;
     let target = root.join("target/uefi-loader");
+    let mut loader = Command::new("cargo");
+    if args.occupy_link_range {
+        loader.env("NARF_EFI_OCCUPY_LINK", "1");
+    } else {
+        loader.env_remove("NARF_EFI_OCCUPY_LINK");
+    }
     run_checked(
-        Command::new("cargo")
+        loader
             .args([
                 "build",
                 "--release",
