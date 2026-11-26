@@ -31,6 +31,16 @@
 //! version-ungated like the GMC owner's — a future NBIO audit can tighten
 //! both the version and the strap here.
 //!
+//! Strix Point's NBIO is 7.11, whose strap register is
+//! `RCC_STRAP1_RCC_DEV0_EPF0_STRAP0` — 0x0015 on 7.11.0–7.11.3
+//! (`nbio_7_11_0_offset.h`, `nbio_v7_11_get_rev_id`) and 0x0021 on
+//! 7.11.4–7.11.5 (`nbio_7_11_5_offset.h`, `nbio_v7_11_5_get_rev_id`) —
+//! not the 7.x default 0x0011. `read_strix` resolves the dword from the
+//! discovered NBIO version and fails closed on any other version; the
+//! `strap0` sample and the revision sample both use it. The `(strap >>
+//! 24) & 0xf` extraction is the same on both: `REV_ID` is mask
+//! 0x0F000000, shift 0x18, in both headers.
+//!
 //! The derivation is a pure function of the raw samples ([`derive`]) so the
 //! values Mesa sees are tested against hand-derived Linux results without a
 //! register model in the loop.
@@ -65,6 +75,12 @@ const CC_GC_SA_UNIT_DISABLE: Reg = Reg(0, 0x0fe9);
 const GC_USER_SA_UNIT_DISABLE: Reg = Reg(1, 0x5b92);
 /// `mmRCC_DEV0_EPF0_STRAP0` (NBIO BASE_IDX 2).
 const RCC_DEV0_EPF0_STRAP0: u32 = 0x0011;
+/// `mmRCC_STRAP1_RCC_DEV0_EPF0_STRAP0` (NBIO BASE_IDX 2) on NBIO
+/// 7.11.0–7.11.3 (`nbio_7_11_0_offset.h`, `nbio_v7_11_get_rev_id`).
+const RCC_STRAP1_711: u32 = 0x0015;
+/// The same register on NBIO 7.11.4–7.11.5 (`nbio_7_11_5_offset.h`,
+/// `nbio_v7_11_5_get_rev_id`).
+const RCC_STRAP1_711_5: u32 = 0x0021;
 /// SE/SA/instance broadcast, the selector every GRBM user leaves behind.
 const BROADCAST: u32 = 0xe000_0000;
 /// `AMDGPU_GFX_MAX_SE` x `AMDGPU_GFX_MAX_SH_PER_SE` for GFX11
@@ -262,7 +278,32 @@ impl Layout {
                 bank(gpu, ip::HW_ID_GC, &[(11, 0, 1)], 1, 0x5b96)
                     .map_err(|_| Error::Unsupported)?,
             ],
-            nbio: nbio_bank(gpu)?,
+            nbio: nbio_bank(gpu, RCC_DEV0_EPF0_STRAP0)?,
+        })
+    }
+    fn resolve_strix(gpu: &AmdGpu) -> Result<Self, Error> {
+        if !matches!(
+            (gpu.chip.vid, gpu.chip.did),
+            (crate::amdgpu::AMD_VENDOR, crate::amdgpu::STRIX_POINT)
+        ) {
+            return Err(Error::Unsupported);
+        }
+        // The strap dword is only defined for the listed NBIO versions;
+        // an unlisted version (e.g. 7.11.6) fails closed here, before any
+        // bank is resolved — the same gate `read_strix` applies at the
+        // strap read.
+        strap_dword(gpu)?;
+        // Every topology register is identical between GC 11.0.0 and
+        // 11.5.0 (`gc_11_5_0_offset.h`), so the bank bounds are the
+        // Phoenix ones; only the strap dword differs (see `strap_dword`).
+        Ok(Self {
+            gc: [
+                bank(gpu, ip::HW_ID_GC, &[(11, 5, 0)], 0, 0x13de)
+                    .map_err(|_| Error::Unsupported)?,
+                bank(gpu, ip::HW_ID_GC, &[(11, 5, 0)], 1, 0x5b96)
+                    .map_err(|_| Error::Unsupported)?,
+            ],
+            nbio: nbio_bank(gpu, RCC_STRAP1_711_5)?,
         })
     }
     fn reg(self, reg: Reg) -> u64 {
@@ -272,16 +313,29 @@ impl Layout {
         self.nbio + u64::from(dword) * 4
     }
 }
+/// The NBIO strap dword for Strix Point, from the discovered NBIO
+/// version: 7.11.0–7.11.3 read `RCC_STRAP1` at 0x0015, 7.11.4–7.11.5 at
+/// 0x0021 (`amdgpu_discovery.c` gives the two ranges `nbio_v7_11_funcs`
+/// and `nbio_v7_11_5_funcs`). Any other NBIO version fails closed.
+fn strap_dword(gpu: &AmdGpu) -> Result<u32, Error> {
+    let nbif = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_NBIF, 0).ok_or(Error::Unsupported)?;
+    match (nbif.major, nbif.minor, nbif.revision) {
+        (7, 11, 0..=3) => Ok(RCC_STRAP1_711),
+        (7, 11, 4..=5) => Ok(RCC_STRAP1_711_5),
+        _ => Err(Error::Unsupported),
+    }
+}
 /// Resolve the NBIF bank without gating on an NBIO version (see the GMC
-/// owner): BASE_IDX 2, dword 0x0011, bounded by the BAR.
-fn nbio_bank(gpu: &AmdGpu) -> Result<u64, Error> {
+/// owner): BASE_IDX 2, bounded by the BAR. `last` is the highest strap
+/// dword the caller reads (0x0011 Phoenix, 0x0021 Strix).
+fn nbio_bank(gpu: &AmdGpu, last: u32) -> Result<u64, Error> {
     let ip = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_NBIF, 0).ok_or(Error::Unsupported)?;
     if ip.num_bases < 3 {
         return Err(Error::Unsupported);
     }
     let base = ip.base_addrs[2] as u64 * 4;
     if base
-        .checked_add((0x0011_u64 + 1) * 4)
+        .checked_add((u64::from(last) + 1) * 4)
         .is_none_or(|end| end > gpu.regs.len)
     {
         return Err(Error::Invalid);
@@ -291,10 +345,10 @@ fn nbio_bank(gpu: &AmdGpu) -> Result<u64, Error> {
 fn sample_revision(io: &mut impl Io, layout: &Layout, strap: u32) -> Result<u8, Error> {
     Ok(((checked(io.read(layout.nbio(strap)))? >> 24) & 0xf) as u8)
 }
-fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, Error> {
+fn sample(io: &mut impl Io, layout: &Layout, limits: Limits, strap: u32) -> Result<Sample, Error> {
     let index = layout.reg(GRBM_GFX_INDEX);
     let mut raw = Sample {
-        strap0: checked(io.read(layout.nbio(RCC_DEV0_EPF0_STRAP0)))?,
+        strap0: checked(io.read(layout.nbio(strap)))?,
         gb_addr_config: checked(io.read(layout.reg(GB_ADDR_CONFIG)))?,
         ..Sample::default()
     };
@@ -374,7 +428,49 @@ pub unsafe fn read_phoenix(
     let limits = Limits::from_gc(gpu.gc_info.as_ref().ok_or(Error::Invalid)?)?;
     let layout = Layout::resolve_phoenix(gpu).map_err(|_| Error::Unsupported)?;
     let raw = authority
-        .invoke(Op(|| sample(&mut Mmio(gpu.regs), &layout, limits)))
+        .invoke(Op(|| {
+            sample(&mut Mmio(gpu.regs), &layout, limits, RCC_DEV0_EPF0_STRAP0)
+        }))
+        .map_err(|_| Error::Revoked)??;
+    derive(limits, &raw)
+}
+/// Read the NBIO chip revision independently of GC power and harvesting,
+/// as `soc21.c`'s early init does before `gfx_v11_0_constants_init`.
+///
+/// # Safety
+/// The caller exclusively owns the permanent BAR mapping and PCI device.
+/// The strap is read-only and needs no GRBM selection or powered GC.
+pub unsafe fn read_revision_strix(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<u8, Error> {
+    let layout = Layout::resolve_strix(gpu).map_err(|_| Error::Unsupported)?;
+    let strap = strap_dword(gpu)?;
+    authority
+        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout, strap)))
+        .map_err(|_| Error::Revoked)?
+}
+/// Sample and derive Strix Point's topology: the Phoenix reader with GC
+/// 11.5.0 banks and the NBIO 7.11 strap dword. Every sampled register is
+/// identical between GC 11.0.0 and 11.5.0, and `gfx_v11_0.c` has no
+/// 11.5-specific arms in `get_cu_info` / `setup_rb` / `kiq_setting` or
+/// the ring setup — so the same sample/derive runs.
+///
+/// # Safety
+/// Physical Strix Point with RLC booted and GFX powered (GFXOFF and clock
+/// gating off). The caller owns GRBM indexing, GC and the permanent
+/// register mapping exclusively, with no concurrent queue setup, reset or
+/// power transition. Reads fused and inherited user-disable masks; never
+/// changes them.
+pub unsafe fn read_strix(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<Topology, Error> {
+    let limits = Limits::from_gc(gpu.gc_info.as_ref().ok_or(Error::Invalid)?)?;
+    let layout = Layout::resolve_strix(gpu).map_err(|_| Error::Unsupported)?;
+    let strap = strap_dword(gpu)?;
+    let raw = authority
+        .invoke(Op(|| sample(&mut Mmio(gpu.regs), &layout, limits, strap)))
         .map_err(|_| Error::Revoked)??;
     derive(limits, &raw)
 }

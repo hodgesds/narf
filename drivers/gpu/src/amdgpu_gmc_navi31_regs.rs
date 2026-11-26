@@ -1,6 +1,13 @@
-//! Navi31/32/33 (GC 11.0.x, MMHUB 3.0.0) GMC register tables.
+//! Navi31/32/33 (GC 11.0.x, MMHUB 3.0.0) and Strix Point (GC 11.5.0,
+//! MMHUB 3.0.1/3.0.2) GMC register tables.
 //!
 //! Every offset below is quoted from Linux 7.4-rc2:
+//!
+//! - GFX hub, GC 11.5.0 (Strix Point): `gc_11_5_0_offset.h`. Every
+//!   GCMC/GCVM register is 0x4 above the 11.0.0 table except `FB_OFFSET`
+//!   and the system-aperture defaults; see `GFX_11_5_0`.
+//! - MM hub, MMHUB 3.0.2: `mmhub_3_0_2_offset.h`. The whole block sits
+//!   0x80 below the 3.0.0/3.0.1 table; see `MM_3_0_2`.
 //!
 //! - GFX hub, GC 11.0.0 (Navi31) and 11.0.2 (Navi33, which Linux drives
 //!   with the 11.0.0 function table — `gmc_v11_0_set_gfxhub_funcs` selects
@@ -187,6 +194,93 @@ pub(super) const MM: HubRegs = HubRegs {
     inv_ack: 0x0786,         // linux: regMMVM_INVALIDATE_ENG17_ACK
     inv_sem: 0x0762,         // linux: regMMVM_INVALIDATE_ENG17_SEM
     inv_range: 0x0787,       // linux: regMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+    eng_addr_distance: 2, // linux: regMMVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 - regMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+};
+// linux-ctx: hdr=gc_11_5_0 seg=0
+/// Strix Point (GC 11.5.0): the same table as 11.0.0 with every GCMC/GCVM
+/// register 0x4 higher (`gc_11_5_0_offset.h` vs `gc_11_0_0_offset.h`),
+/// except `FB_OFFSET` (0x15a7) and the system-aperture defaults
+/// (0x15a8/0x15a9), which do not move. The per-engine/per-context strides
+/// agree (REQ/ACK/SEM 1, ADDR_RANGE 2, PT_BASE 2, CNTL 1), and every
+/// field mask/shift/value `program()` uses agrees between
+/// `gc_11_0_0_sh_mask.h` and `gc_11_5_0_sh_mask.h`, so the literals carry
+/// over unchanged.
+pub(super) const GFX_11_5_0: HubRegs = HubRegs {
+    fb_base: 0x167c,         // linux: regGCMC_VM_FB_LOCATION_BASE
+    fb_top: 0x167d,          // linux: regGCMC_VM_FB_LOCATION_TOP
+    fb_offset: 0x15a7,       // linux: regGCMC_VM_FB_OFFSET
+    agp_base: 0x1680,        // linux: regGCMC_VM_AGP_BASE
+    agp_bot: 0x167f,         // linux: regGCMC_VM_AGP_BOT
+    agp_top: 0x167e,         // linux: regGCMC_VM_AGP_TOP
+    sys_low: 0x1681,         // linux: regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR
+    sys_high: 0x1682,        // linux: regGCMC_VM_SYSTEM_APERTURE_HIGH_ADDR
+    sys_default_lo: 0x15a8,  // linux: regGCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB
+    sys_default_hi: 0x15a9,  // linux: regGCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB
+    l1: 0x1683,              // linux: regGCMC_VM_MX_L1_TLB_CNTL
+    l2: 0x15c0,              // linux: regGCVM_L2_CNTL
+    l2_2: 0x15c1,            // linux: regGCVM_L2_CNTL2
+    l2_3: 0x15c2,            // linux: regGCVM_L2_CNTL3
+    l2_4: 0x15d8,            // linux: regGCVM_L2_CNTL4
+    l2_5: 0x15de,            // linux: regGCVM_L2_CNTL5
+    fault_lo: 0x15cf,        // linux: regGCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32
+    fault_hi: 0x15d0,        // linux: regGCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32
+    fault_cntl: 0x15c8,      // linux: regGCVM_L2_PROTECTION_FAULT_CNTL
+    fault_cntl2: 0x15c9,     // linux: regGCVM_L2_PROTECTION_FAULT_CNTL2
+    l2_bank_select: 0x15db,  // linux: regGCVM_L2_BANK_SELECT_RESERVED_CID2
+    ctx: 0x168c,             // linux: regGCVM_CONTEXT0_CNTL
+    pt_base: 0x16f7,         // linux: regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32
+    pt_start: 0x1717,        // linux: regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32
+    pt_end: 0x1737,          // linux: regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32
+    identity_low: 0x15d2,    // linux: regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32
+    identity_high: 0x15d4,   // linux: regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32
+    identity_offset: 0x15d6, // linux: regGCVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32
+    inv_req: 0x16c0,         // linux: regGCVM_INVALIDATE_ENG17_REQ
+    inv_ack: 0x16d2,         // linux: regGCVM_INVALIDATE_ENG17_ACK
+    inv_sem: 0x16ae,         // linux: regGCVM_INVALIDATE_ENG17_SEM
+    inv_range: 0x16d3,       // linux: regGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+    eng_addr_distance: 2, // linux: regGCVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 - regGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
+};
+
+// linux-ctx: hdr=mmhub_3_0_2 seg=0
+/// MMHUB 3.0.2: the whole block sits 0x80 lower than 3.0.0/3.0.1
+/// (`mmhub_3_0_2_offset.h`), on BASE_IDX 0. The field masks/shifts/values
+/// `program()` uses agree across `mmhub_3_0_0_sh_mask.h`,
+/// `mmhub_3_0_1_sh_mask.h` and `mmhub_3_0_2_sh_mask.h`, and the L2
+/// defaults agree in `mmhub_v3_0_2.c:33-35` (`mmhub_v3_0_1.c:33-35`),
+/// so the literals carry over unchanged.
+pub(super) const MM_3_0_2: HubRegs = HubRegs {
+    fb_base: 0x086c,         // linux: regMMMC_VM_FB_LOCATION_BASE
+    fb_top: 0x086d,          // linux: regMMMC_VM_FB_LOCATION_TOP
+    fb_offset: 0x0857,       // linux: regMMMC_VM_FB_OFFSET
+    agp_base: 0x0870,        // linux: regMMMC_VM_AGP_BASE
+    agp_bot: 0x086f,         // linux: regMMMC_VM_AGP_BOT
+    agp_top: 0x086e,         // linux: regMMMC_VM_AGP_TOP
+    sys_low: 0x0871,         // linux: regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR
+    sys_high: 0x0872,        // linux: regMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR
+    sys_default_lo: 0x0858,  // linux: regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB
+    sys_default_hi: 0x0859,  // linux: regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB
+    l1: 0x0873,              // linux: regMMMC_VM_MX_L1_TLB_CNTL
+    l2: 0x0680,              // linux: regMMVM_L2_CNTL
+    l2_2: 0x0681,            // linux: regMMVM_L2_CNTL2
+    l2_3: 0x0682,            // linux: regMMVM_L2_CNTL3
+    l2_4: 0x0698,            // linux: regMMVM_L2_CNTL4
+    l2_5: 0x069e,            // linux: regMMVM_L2_CNTL5
+    fault_lo: 0x068f,        // linux: regMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32
+    fault_hi: 0x0690,        // linux: regMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32
+    fault_cntl: 0x0688,      // linux: regMMVM_L2_PROTECTION_FAULT_CNTL
+    fault_cntl2: 0x0689,     // linux: regMMVM_L2_PROTECTION_FAULT_CNTL2
+    l2_bank_select: 0x069b,  // linux: regMMVM_L2_BANK_SELECT_RESERVED_CID2
+    ctx: 0x06c0,             // linux: regMMVM_CONTEXT0_CNTL
+    pt_base: 0x072b,         // linux: regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32
+    pt_start: 0x074b,        // linux: regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32
+    pt_end: 0x076b,          // linux: regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32
+    identity_low: 0x0692,    // linux: regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32
+    identity_high: 0x0694,   // linux: regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32
+    identity_offset: 0x0696, // linux: regMMVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32
+    inv_req: 0x06f4,         // linux: regMMVM_INVALIDATE_ENG17_REQ
+    inv_ack: 0x0706,         // linux: regMMVM_INVALIDATE_ENG17_ACK
+    inv_sem: 0x06e2,         // linux: regMMVM_INVALIDATE_ENG17_SEM
+    inv_range: 0x0707,       // linux: regMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
     eng_addr_distance: 2, // linux: regMMVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 - regMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32
 };
 // linux-ctx: reset

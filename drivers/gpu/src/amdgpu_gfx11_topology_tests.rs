@@ -230,7 +230,7 @@ fn gfx11_topology_register_model_selects_each_array_and_restores_broadcast() -> 
         dead: false,
         disabled_sa: 0,
     };
-    let raw = sample(&mut f, &layout(), limits()).unwrap();
+    let raw = sample(&mut f, &layout(), limits(), RCC_DEV0_EPF0_STRAP0).unwrap();
     let t = derive(limits(), &raw).unwrap();
     let selectors = [0x4000_0000, 0x4000_0100, BROADCAST];
     // SH1 loses WGP0 (bitmap 0x3c, 4 CUs); the GC_USER_RB value staged on
@@ -252,7 +252,9 @@ fn gfx11_topology_register_model_selects_each_array_and_restores_broadcast() -> 
         dead: true,
         disabled_sa: 0,
     };
-    if sample(&mut dead, &layout(), limits()) != Err(Error::DeviceGone) || dead.index != BROADCAST {
+    if sample(&mut dead, &layout(), limits(), RCC_DEV0_EPF0_STRAP0) != Err(Error::DeviceGone)
+        || dead.index != BROADCAST
+    {
         return TestResult::Fail("device loss left the GRBM selector changed");
     }
     TestResult::Pass
@@ -269,7 +271,7 @@ fn gfx11_topology_skips_whole_disabled_shader_arrays() -> TestResult {
         dead: false,
         disabled_sa: 2,
     };
-    let raw = sample(&mut f, &layout(), limits()).unwrap();
+    let raw = sample(&mut f, &layout(), limits(), RCC_DEV0_EPF0_STRAP0).unwrap();
     let t = derive(limits(), &raw).unwrap();
     if f.writes.contains(&0x4000_0100)
         || f.index != BROADCAST
@@ -295,7 +297,7 @@ fn gfx11_topology_revision_does_not_require_gc_harvest() -> TestResult {
     };
     if sample_revision(&mut f, &layout(), RCC_DEV0_EPF0_STRAP0) != Ok(2)
         || !f.writes.is_empty()
-        || sample(&mut f, &layout(), limits()) != Err(Error::DeviceGone)
+        || sample(&mut f, &layout(), limits(), RCC_DEV0_EPF0_STRAP0) != Err(Error::DeviceGone)
         || f.index != BROADCAST
     {
         return TestResult::Fail("NBIO revision coupled to GC availability or changed selection");
@@ -365,4 +367,88 @@ fn gfx11_topology_layout_resolves_only_phoenix() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/phoenix",
     gfx11_topology_layout_resolves_only_phoenix
+);
+
+/// Strix Point resolves its own topology layout: GC 11.5.0 banks, the
+/// NBIO bank bounded by the 7.11 strap dword (0x0021), and the strap
+/// dword itself from the discovered NBIO version — 0x0015 on 7.11.0,
+/// 0x0021 on 7.11.5. A Phoenix DID, GC 11.0.1, a window-0-only NBIF,
+/// and an NBIO 7.11.6 are all refused.
+fn gfx11_topology_layout_resolves_strix() -> TestResult {
+    use crate::amdgpu_discovery as d;
+    let gpu = || {
+        let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(
+            crate::amdgpu::AMD_VENDOR,
+            crate::amdgpu::STRIX_POINT,
+        )
+        .unwrap();
+        let template = gpu.ip_blocks[0];
+        let ip = |id, v: (u8, u8, u8), base: u32| {
+            let mut block = template;
+            block.hw_id = id;
+            (block.major, block.minor, block.revision) = v;
+            block.num_bases = 1;
+            block.base_addrs[0] = base;
+            block
+        };
+        let mut nbif = ip(d::HW_ID_NBIF, (7, 11, 0), 0);
+        nbif.num_bases = 3;
+        nbif.base_addrs[2] = 0x3000;
+        let mut gc = ip(d::HW_ID_GC, (11, 5, 0), 0x4000);
+        gc.num_bases = 2;
+        gc.base_addrs[1] = 0x8000;
+        gpu.ip_blocks = vec![gc, nbif];
+        gpu
+    };
+    let layout = match Layout::resolve_strix(&gpu()) {
+        Ok(layout) => layout,
+        Err(_) => return TestResult::Fail("Strix topology layout refused"),
+    };
+    if layout.gc != [0x4000 * 4, 0x8000 * 4] || layout.nbio != 0x3000 * 4 {
+        return TestResult::Fail("Strix topology banks");
+    }
+    if strap_dword(&gpu()) != Ok(0x0015) {
+        return TestResult::Fail("NBIO 7.11.0 strap dword");
+    }
+    let mut nbif5 = gpu();
+    nbif5.ip_blocks[1].revision = 5;
+    if strap_dword(&nbif5) != Ok(0x0021) {
+        return TestResult::Fail("NBIO 7.11.5 strap dword");
+    }
+    if Layout::resolve_strix(&nbif5).is_err() {
+        return TestResult::Fail("Strix topology layout refused NBIO 7.11.5");
+    }
+    let mut phoenix = gpu();
+    phoenix.chip = crate::amdgpu::__test_chip_info_for_pci_id(
+        crate::amdgpu::AMD_VENDOR,
+        crate::amdgpu::PHOENIX1,
+    )
+    .unwrap();
+    let mut gc110 = gpu();
+    gc110.ip_blocks[0].revision = 1;
+    gc110.ip_blocks[0].minor = 0;
+    let mut nbif2 = gpu();
+    nbif2.ip_blocks[1].num_bases = 2;
+    let mut nbif716 = gpu();
+    nbif716.ip_blocks[1].revision = 6;
+    // The strap resolver fails closed on the unlisted NBIO version too.
+    if strap_dword(&nbif716).is_ok() {
+        return TestResult::Fail("strap resolver admitted NBIO 7.11.6");
+    }
+    for (bad, why) in [
+        (phoenix, "topology layout admitted Phoenix"),
+        (gc110, "topology layout admitted GC 11.0.1"),
+        (nbif2, "topology layout admitted a window-0-only NBIF"),
+        (nbif716, "topology layout admitted NBIO 7.11.6"),
+    ] {
+        if Layout::resolve_strix(&bad).is_ok() {
+            return TestResult::Fail(why);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/strix",
+    gfx11_topology_layout_resolves_strix
 );

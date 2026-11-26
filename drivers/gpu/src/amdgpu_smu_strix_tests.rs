@@ -19,6 +19,10 @@ struct Fake {
     replies: VecDeque<Option<(u32, u32)>>,
     log: Vec<(u32, u32)>,
     reads: usize,
+    /// Scripted `MP1_FIRMWARE_FLAGS` value for the SMN read, and the
+    /// addresses the engine read through it.
+    smn_flags: u32,
+    smn_reads: Vec<u32>,
 }
 const MP1_BASE: u32 = 0x1000;
 const RESP: u32 = MP1_BASE + MP1_C2PMSG_RESP_REL;
@@ -47,6 +51,10 @@ impl SmuMmio for Fake {
             _ => {}
         }
     }
+    fn read_smn(&mut self, address: u32) -> u32 {
+        self.smn_reads.push(address);
+        self.smn_flags
+    }
 }
 fn engine(replies: &[Option<(u32, u32)>]) -> Engine<Fake> {
     Engine {
@@ -56,6 +64,8 @@ fn engine(replies: &[Option<(u32, u32)>]) -> Engine<Fake> {
             replies: replies.iter().copied().collect(),
             log: Vec::new(),
             reads: 0,
+            smn_flags: FIRMWARE_FLAGS_INTERRUPTS_ENABLED,
+            smn_reads: Vec::new(),
         },
         authority: Cap::bootstrap(),
         mp1_base: MP1_BASE,
@@ -95,7 +105,7 @@ fn smu_strix_mailbox_offsets_and_v14_opcodes() -> TestResult {
         || (v14::V14_MSG_POWER_UP_JPEG1, v14::V14_MSG_POWER_DOWN_JPEG1) != (0x27, 0x26)
         || v14::V14_MSG_GFX_DEVICE_DRIVER_RESET != 0x11
     {
-        return TestResult::Fail("SMU 14.0.1 opcodes");
+        return TestResult::Fail("SMU 14.0.0 opcodes");
     }
     TestResult::Pass
 }
@@ -111,7 +121,7 @@ fn smu_strix_start_reads_versions_in_linux_order() -> TestResult {
     let mut e = engine(&[
         Some((RESP_OK, TEST_SENTINEL)),
         Some((RESP_OK, PMFW_VERSION)),
-        Some((RESP_OK, SMU_14_0_1_DRIVER_IF_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
         Some((RESP_OK, 0)),
     ]);
     let versions = run(e.start());
@@ -128,7 +138,7 @@ fn smu_strix_start_reads_versions_in_linux_order() -> TestResult {
     ];
     let wanted = Versions {
         smu: PMFW_VERSION,
-        driver_if: SMU_14_0_1_DRIVER_IF_VERSION,
+        driver_if: SMU_14_0_0_DRIVER_IF_VERSION,
     };
     if versions != Ok(wanted)
         || !wanted.driver_if_matches()
@@ -149,24 +159,54 @@ kernel_test_in!(
     smu_strix_start_reads_versions_in_linux_order
 );
 
-/// A driver-IF of 0x7 — the value MP1 14.0.0 / 14.0.4 / 14.0.5 report —
-/// is refused and leaves the versions unread. There is no accepted newer
-/// value on 14.0.1, unlike Phoenix's 8.
-fn smu_strix_driver_if_seven_is_refused() -> TestResult {
+/// A driver-IF of 0x6 — the value MP1 14.0.1 (Strix Halo) reports — is
+/// refused and leaves the versions unread. There is no accepted newer
+/// value on 14.0.0, unlike Phoenix's 8.
+fn smu_strix_driver_if_six_is_refused() -> TestResult {
     let mut e = engine(&[
         Some((RESP_OK, TEST_SENTINEL)),
         Some((RESP_OK, PMFW_VERSION)),
-        Some((RESP_OK, 7)),
+        Some((RESP_OK, 6)),
     ]);
-    if run(e.start()) != Err(Error::DriverIfMismatch(7)) || e.versions.is_some() {
-        return TestResult::Fail("driver-IF 7 was accepted or the versions leaked");
+    if run(e.start()) != Err(Error::DriverIfMismatch(6)) || e.versions.is_some() {
+        return TestResult::Fail("driver-IF 6 was accepted or the versions leaked");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/gpu/smu-strix",
-    smu_strix_driver_if_seven_is_refused
-);
+kernel_test_in!("drivers/gpu/smu-strix", smu_strix_driver_if_six_is_refused);
+
+/// The firmware-flags gate runs before any message: a clear
+/// INTERRUPTS_ENABLED bit fails `start` with `FirmwareNotReady` and
+/// sends nothing, while a set bit lets the mailbox sequence run. The
+/// SMN read goes to `MP1_FIRMWARE_FLAGS` (0x03b10028).
+fn smu_strix_firmware_flags_gate() -> TestResult {
+    let mut cold = engine(&[
+        Some((RESP_OK, TEST_SENTINEL)),
+        Some((RESP_OK, PMFW_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
+    ]);
+    cold.io.smn_flags = 0;
+    if run(cold.start()) != Err(Error::FirmwareNotReady)
+        || !cold.io.log.is_empty()
+        || cold.io.reads != 0
+        || cold.versions.is_some()
+    {
+        return TestResult::Fail("firmware-flags gate did not fail closed first");
+    }
+    if cold.io.smn_reads != [MP1_FIRMWARE_FLAGS] {
+        return TestResult::Fail("firmware-flags read went to the wrong address");
+    }
+    let mut e = engine(&[
+        Some((RESP_OK, TEST_SENTINEL)),
+        Some((RESP_OK, PMFW_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
+    ]);
+    if run(e.start()).is_err() || e.io.smn_reads != [MP1_FIRMWARE_FLAGS] {
+        return TestResult::Fail("firmware-flags gate blocked a ready firmware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/smu-strix", smu_strix_firmware_flags_gate);
 
 /// A TestMessage that does not echo the sentinel fails start before any
 /// version is read.
@@ -201,7 +241,7 @@ fn smu_strix_mode2_reset_message() -> TestResult {
     let mut e = engine(&[
         Some((RESP_OK, TEST_SENTINEL)),
         Some((RESP_OK, PMFW_VERSION)),
-        Some((RESP_OK, SMU_14_0_1_DRIVER_IF_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
         Some((RESP_OK, 0)),
     ]);
     if run(e.start()).is_err()
@@ -239,7 +279,7 @@ fn smu_strix_vcn_jpeg_gfxoff_messages() -> TestResult {
     let mut e = engine(&[
         Some((RESP_OK, TEST_SENTINEL)),
         Some((RESP_OK, PMFW_VERSION)),
-        Some((RESP_OK, SMU_14_0_1_DRIVER_IF_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
         Some((RESP_OK, 0)),
         Some((RESP_OK, 0)),
         Some((RESP_OK, 0)),
@@ -285,7 +325,7 @@ fn smu_strix_rejection_and_hang_follow_smu_cmn() -> TestResult {
     let mut e = engine(&[
         Some((RESP_OK, TEST_SENTINEL)),
         Some((RESP_OK, PMFW_VERSION)),
-        Some((RESP_OK, SMU_14_0_1_DRIVER_IF_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
         Some((RESP_PREREQ, 0)),
         Some((RESP_OK, 0)),
         Some((0x42, 0)),
@@ -320,7 +360,7 @@ fn smu_strix_unanswered_message_times_out() -> TestResult {
     let mut e = engine(&[
         Some((RESP_OK, TEST_SENTINEL)),
         Some((RESP_OK, PMFW_VERSION)),
-        Some((RESP_OK, SMU_14_0_1_DRIVER_IF_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
         None,
     ]);
     run(e.start()).unwrap();
@@ -339,7 +379,7 @@ fn smu_strix_revocation_blocks_every_access() -> TestResult {
     let mut e = engine(&[
         Some((RESP_OK, TEST_SENTINEL)),
         Some((RESP_OK, PMFW_VERSION)),
-        Some((RESP_OK, SMU_14_0_1_DRIVER_IF_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
     ]);
     e.authority.revoke();
     if run(e.start()) != Err(Error::Revoked) || e.io.reads != 0 || !e.io.log.is_empty() {
@@ -358,7 +398,7 @@ fn smu_strix_vanished_device_reports_device_gone() -> TestResult {
     let mut e = engine(&[
         Some((RESP_OK, TEST_SENTINEL)),
         Some((RESP_OK, PMFW_VERSION)),
-        Some((RESP_OK, SMU_14_0_1_DRIVER_IF_VERSION)),
+        Some((RESP_OK, SMU_14_0_0_DRIVER_IF_VERSION)),
     ]);
     e.io.response = u32::MAX;
     if run(e.start()) != Err(Error::DeviceGone) {
@@ -371,9 +411,12 @@ kernel_test_in!(
     smu_strix_vanished_device_reports_device_gone
 );
 
-/// `resolve` admits only Strix Point (1002:150E) with MP1 14.0.1 at
-/// BASE_IDX 1. Phoenix, Navi22, a 13.0.4 mailbox, and a window-0-only
-/// layout are all refused.
+/// `resolve` admits only Strix Point (1002:150E) with MP1 14.0.0 at
+/// BASE_IDX 1 and an NBIO 7.11 bank at BASE_IDX 0. Phoenix, Navi22, a
+/// 13.0.4 mailbox, the 14.0.1 mailbox #2486 admitted (Strix Halo, not
+/// Strix Point), a window-0-only layout, and a missing or 7.11.6 NBIO
+/// are all refused. NBIO 7.11.5 resolves too: the SMN pair is at the
+/// same dwords in both 7.11 headers.
 fn smu_strix_resolves_only_the_audited_layout() -> TestResult {
     use crate::amdgpu_discovery as d;
     let gpu = || {
@@ -392,11 +435,21 @@ fn smu_strix_resolves_only_the_audited_layout() -> TestResult {
             block.base_addrs[1] = base1;
             block
         };
-        gpu.ip_blocks = vec![ip(d::HW_ID_MP1, (14, 0, 1), 0x2000)];
+        let mut nbif = template;
+        nbif.hw_id = d::HW_ID_NBIF;
+        (nbif.major, nbif.minor, nbif.revision) = (7, 11, 0);
+        nbif.num_bases = 1;
+        nbif.base_addrs[0] = 0x3000;
+        gpu.ip_blocks = vec![ip(d::HW_ID_MP1, (14, 0, 0), 0x2000), nbif];
         gpu
     };
-    if resolve(&gpu()) != Ok(0x2000 * 4) {
+    if resolve(&gpu()) != Ok((0x2000 * 4, 0x3000 * 4)) {
         return TestResult::Fail("Strix SMU layout refused");
+    }
+    let mut nbif5 = gpu();
+    nbif5.ip_blocks[1].revision = 5;
+    if resolve(&nbif5) != Ok((0x2000 * 4, 0x3000 * 4)) {
+        return TestResult::Fail("Strix SMU layout refused NBIO 7.11.5");
     }
     let mut phoenix = gpu();
     phoenix.chip = crate::amdgpu::__test_chip_info_for_pci_id(
@@ -410,15 +463,25 @@ fn smu_strix_resolves_only_the_audited_layout() -> TestResult {
         crate::amdgpu::NAVI22,
     )
     .unwrap();
-    let mut smu13 = gpu();
-    (smu13.ip_blocks[0].minor, smu13.ip_blocks[0].revision) = (0, 4);
+    let mut smu1401 = gpu();
+    smu1401.ip_blocks[0].revision = 1;
+    let mut smu1304 = gpu();
+    (smu1304.ip_blocks[0].minor, smu1304.ip_blocks[0].revision) = (0, 4);
+    smu1304.ip_blocks[0].major = 13;
     let mut window0 = gpu();
     window0.ip_blocks[0].num_bases = 1;
+    let mut no_nbio = gpu();
+    no_nbio.ip_blocks.truncate(1);
+    let mut nbif716 = gpu();
+    nbif716.ip_blocks[1].revision = 6;
     for (bad, why) in [
-        (phoenix, "SMU 14.0.1 mailbox admitted Phoenix"),
-        (navi22, "SMU 14.0.1 mailbox admitted a discrete GPU"),
-        (smu13, "SMU 14.0.1 mailbox admitted MP1 13.0.4"),
-        (window0, "SMU 14.0.1 mailbox admitted a window-0-only MP1"),
+        (phoenix, "SMU 14.0.0 mailbox admitted Phoenix"),
+        (navi22, "SMU 14.0.0 mailbox admitted a discrete GPU"),
+        (smu1401, "SMU 14.0.0 mailbox admitted MP1 14.0.1"),
+        (smu1304, "SMU 14.0.0 mailbox admitted MP1 13.0.4"),
+        (window0, "SMU 14.0.0 mailbox admitted a window-0-only MP1"),
+        (no_nbio, "SMU 14.0.0 mailbox admitted a missing NBIO"),
+        (nbif716, "SMU 14.0.0 mailbox admitted NBIO 7.11.6"),
     ] {
         if resolve(&bad) != Err(Error::Unsupported) {
             return TestResult::Fail(why);

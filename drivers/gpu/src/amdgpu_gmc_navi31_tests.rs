@@ -4,7 +4,9 @@
 use super::*;
 use crate::amdgpu::__test_chip_info_for_pci_id;
 use crate::amdgpu_gfx_navi22::tests::gpu as base_gpu;
-use crate::amdgpu_vmhub_regs::{GFXHUB_V3_0, GFXHUB_V3_0_3, MMHUB_V3_0};
+use crate::amdgpu_vmhub_regs::{
+    GFXHUB_V11_5_0, GFXHUB_V3_0, GFXHUB_V3_0_3, MMHUB_V3_0, MMHUB_V3_0_2,
+};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -54,7 +56,12 @@ impl Io for Fake {
         self.writes.push((address, value));
         self.registers.insert(address, value);
         // A released MMHUB semaphore reads 1 (acquired) on the next sample.
-        if address == 0x20000 + u64::from(MM.inv_sem) * 4 && value == 0 {
+        // Both MMHUB tables' semaphore registers: the 3.0.0/3.0.1 one
+        // (0x0762) and the 3.0.2 one (0x06e2).
+        if (address == 0x20000 + u64::from(MM.inv_sem) * 4
+            || address == 0x20000 + u64::from(MM_3_0_2.inv_sem) * 4)
+            && value == 0
+        {
             self.registers.insert(address, 1);
         }
         if let Some((when, cap)) = self.revoke_on {
@@ -84,27 +91,31 @@ fn pool() -> Pool {
     // SAFETY: Fake owns all memory accesses; mapping is never dereferenced.
     unsafe { Pool::from_owned_range(map, 0x8_0000_4000) }.unwrap()
 }
-fn layout_for(die: Gfx11Die) -> Layout {
+fn layout_for_mm(die: Gfx11Die, mm: HubRegs, mm_vmhub: VmHubRegs) -> Layout {
     let (gfx, gfx_vmhub) = match die {
         Gfx11Die::Navi32 => (GFX_11_0_3, GFXHUB_V3_0_3),
+        Gfx11Die::Strix => (GFX_11_5_0, GFXHUB_V11_5_0),
         _ => (GFX, GFXHUB_V3_0),
     };
     Layout {
         die,
         bases: [0x10000, 0x20000],
-        hubs: [gfx, MM],
-        vmhub: [gfx_vmhub, MMHUB_V3_0],
+        hubs: [gfx, mm],
+        vmhub: [gfx_vmhub, mm_vmhub],
         nbio: 0x30000,
         osssys: 0x40000,
     }
 }
 fn fixture_for(die: Gfx11Die) -> (Pool, Engine<Fake>) {
+    fixture_for_mm(die, MM, MMHUB_V3_0)
+}
+fn fixture_for_mm(die: Gfx11Die, mm: HubRegs, mm_vmhub: VmHubRegs) -> (Pool, Engine<Fake>) {
     let pool = pool();
     let mut io = Fake::new();
-    let layout = layout_for(die);
+    let layout = layout_for_mm(die, mm, mm_vmhub);
     io.registers.insert(0x30000 + 0x12d * 4, 0x7f000);
     io.base_regs(0x10000, layout.hubs[0]);
-    io.base_regs(0x20000, MM);
+    io.base_regs(0x20000, layout.hubs[1]);
     let engine = Engine {
         io,
         authority: Cap::bootstrap(),
@@ -125,13 +136,14 @@ fn run<T>(future: impl Future<Output = T>) -> T {
 }
 
 /// The corrected die↔GC pairing (lane 1), now including Phoenix's
-/// GC 11.0.1 as a first-class die of this owner.
+/// GC 11.0.1 and Strix Point's GC 11.5.0 as first-class dies of this owner.
 fn gmc_navi31_die_identity() -> TestResult {
     if Gfx11Die::from_gc((11, 0, 0)) != Some(Gfx11Die::Navi31)
         || Gfx11Die::from_gc((11, 0, 3)) != Some(Gfx11Die::Navi32)
         || Gfx11Die::from_gc((11, 0, 2)) != Some(Gfx11Die::Navi33)
         || Gfx11Die::from_gc((11, 0, 1)) != Some(Gfx11Die::Phoenix)
-        || Gfx11Die::from_gc((11, 5, 0)).is_some()
+        || Gfx11Die::from_gc((11, 5, 0)) != Some(Gfx11Die::Strix)
+        || Gfx11Die::from_gc((11, 5, 1)).is_some()
     {
         return TestResult::Fail("die from GC version");
     }
@@ -139,6 +151,7 @@ fn gmc_navi31_die_identity() -> TestResult {
         || Gfx11Die::Navi32.gc_version() != (11, 0, 3)
         || Gfx11Die::Navi33.gc_version() != (11, 0, 2)
         || Gfx11Die::Phoenix.gc_version() != (11, 0, 1)
+        || Gfx11Die::Strix.gc_version() != (11, 5, 0)
     {
         return TestResult::Fail("GC version round trip");
     }
@@ -398,6 +411,186 @@ fn gmc_navi31_phoenix_resolves_mmhub_3_0_1_on_window_1() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gmc-navi31",
     gmc_navi31_phoenix_resolves_mmhub_3_0_1_on_window_1
+);
+
+/// Strix Point takes the same owner with GC 11.5.0 and either MMHUB
+/// 3.0.1 on BASE_IDX 1 or MMHUB 3.0.2 on BASE_IDX 0: the resolved table
+/// travels with the layout, so a 3.0.2 part programs the 0x80-lower block.
+/// A Phoenix DID reporting GC 11.5.0, a Strix DID reporting GC 11.0.1, a
+/// 3.0.0 MMHUB on Strix, and a 3.0.1 MMHUB on window 0 are all refused.
+fn gmc_navi31_strix_resolves_mmhub_3_0_1_or_3_0_2() -> TestResult {
+    let pool = pool();
+    let cap = || Cap::bootstrap();
+    let strix = |f: fn(&mut AmdGpu)| {
+        let mut gpu = descriptor(|_| {});
+        gpu.chip = __test_chip_info_for_pci_id(0x1002, 0x150E).unwrap();
+        (
+            gpu.ip_blocks[0].major,
+            gpu.ip_blocks[0].minor,
+            gpu.ip_blocks[0].revision,
+        ) = (11, 5, 0);
+        (
+            gpu.ip_blocks[1].major,
+            gpu.ip_blocks[1].minor,
+            gpu.ip_blocks[1].revision,
+        ) = (3, 0, 1);
+        gpu.ip_blocks[1].num_bases = 2;
+        gpu.ip_blocks[1].base_addrs[1] = 0x8000;
+        f(&mut gpu);
+        gpu
+    };
+    let gpu = strix(|_| {});
+    let gmc = match gmc_new(&gpu, cap(), &pool) {
+        Ok(gmc) => gmc,
+        Err(_) => return TestResult::Fail("Strix 3.0.1 happy path"),
+    };
+    if gmc.die() != Gfx11Die::Strix || gmc.state() != State::Prepared {
+        return TestResult::Fail("Strix 3.0.1 die or state");
+    }
+    drop(gmc);
+    let gpu = strix(|g| {
+        g.ip_blocks[1].revision = 2;
+        g.ip_blocks[1].num_bases = 1;
+    });
+    let gmc = match gmc_new(&gpu, cap(), &pool) {
+        Ok(gmc) => gmc,
+        Err(_) => return TestResult::Fail("Strix 3.0.2 happy path"),
+    };
+    if gmc.die() != Gfx11Die::Strix || gmc.state() != State::Prepared {
+        return TestResult::Fail("Strix 3.0.2 die or state");
+    }
+    drop(gmc);
+    let cases: [GmcCase<'_>; 4] = [
+        ("Phoenix DID with GC 11.5.0", |g| {
+            g.chip = __test_chip_info_for_pci_id(0x1002, 0x15BF).unwrap();
+        }),
+        ("Strix DID with GC 11.0.1", |g| {
+            (
+                g.ip_blocks[0].major,
+                g.ip_blocks[0].minor,
+                g.ip_blocks[0].revision,
+            ) = (11, 0, 1);
+        }),
+        ("MMHUB 3.0.0 on Strix", |g| {
+            g.ip_blocks[1].revision = 0;
+        }),
+        ("MMHUB 3.0.1 on window 0", |g| {
+            g.ip_blocks[1].num_bases = 1;
+        }),
+    ];
+    for (name, mutate) in cases {
+        let gpu = strix(mutate);
+        if gmc_new(&gpu, cap(), &pool).is_ok() || pool.available() != BYTES {
+            return TestResult::Fail(name);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi31",
+    gmc_navi31_strix_resolves_mmhub_3_0_1_or_3_0_2
+);
+
+/// VMID0 bring-up on both Strix hubs — the GC 11.5.0 table and the MMHUB
+/// 3.0.2 table — with the same GFX11 literals as Navi31 (the field values
+/// agree across `gc_11_5_0_sh_mask.h` / `mmhub_3_0_2_sh_mask.h`), one TLB
+/// invalidation of VMID0 per hub on engine 17, the MMHUB semaphore held
+/// around its flush, then the MMHUB private-cache invalidation bit. The
+/// 3.0.1 arm reuses the existing `MM` table and is covered by the resolve
+/// test above.
+fn gmc_navi31_strix_initialize_programs_both_hubs_and_flushes_tlb() -> TestResult {
+    let (_pool, mut engine) = fixture_for_mm(Gfx11Die::Strix, MM_3_0_2, MMHUB_V3_0_2);
+    let aperture = match run(engine.initialize()) {
+        Ok(aperture) => aperture,
+        Err(_) => return TestResult::Fail("initialize"),
+    };
+    if engine.state != State::Ready || !engine.state.vmid0_ready() {
+        return TestResult::Fail("ready state");
+    }
+    // The aperture starts on a 2 MiB boundary past the 16 GiB VRAM.
+    if aperture.start != 0xc_0000_0000 || aperture.size != APERTURE_SIZE {
+        return TestResult::Fail("aperture placement");
+    }
+    let reg = |base: u64, r: u32| engine.io.registers.get(&(base + u64::from(r) * 4)).copied();
+    for (base, r) in [(0x10000, GFX_11_5_0), (0x20000, MM_3_0_2)] {
+        // L1: ENABLE_L1_TLB | SYSTEM_ACCESS_MODE=3 | ADM | MTYPE=UC(3).
+        if reg(base, r.l1) != Some(0x1859) {
+            return TestResult::Fail("L1 TLB control");
+        }
+        // L2: ENABLE_L2_CACHE | CONTEXT1_IDENTITY_ACCESS_MODE=1, the
+        // default page staying in VRAM (OUT_TO_SYSTEM_MEMORY clear).
+        if reg(base, r.l2) != Some(0x80001) {
+            return TestResult::Fail("L2 cache control");
+        }
+        if reg(base, r.l2_3) != Some(0x80130009) {
+            return TestResult::Fail("L2 CNTL3");
+        }
+        if reg(base, r.l2_4) != Some(0x01) || reg(base, r.l2_5) != Some(0x3fe0) {
+            return TestResult::Fail("L2 CNTL4/5");
+        }
+        // All eleven fault-enable defaults, status-address bits clear.
+        if reg(base, r.fault_cntl) != Some(0x1ffc) {
+            return TestResult::Fail("fault control");
+        }
+        if reg(base, r.fault_cntl2) != Some(0x40000) {
+            return TestResult::Fail("fault CNTL2");
+        }
+        // VMID0: ENABLE + the seven fault-enable defaults, flat PT.
+        if reg(base, r.ctx) != Some(0x555401) {
+            return TestResult::Fail("VMID0 context");
+        }
+        // The invalidation ranges cover the 48-bit space.
+        for index in 0..18u64 {
+            let lo = reg(base, r.inv_range + (index * 2) as u32);
+            let hi = reg(base, r.inv_range + (index * 2) as u32 + 1);
+            if lo != Some(0xffffffff) || hi != Some(0x1f) {
+                return TestResult::Fail("invalidation range");
+            }
+        }
+        // The kernel engine's invalidation of VMID0.
+        if !engine
+            .io
+            .writes
+            .contains(&(base + u64::from(r.inv_req) * 4, 0xf80001))
+        {
+            return TestResult::Fail("TLB invalidation request");
+        }
+    }
+    // MMHUB-only: the semaphore was released, then the private-cache
+    // invalidation bit was set in the bank-select register.
+    if !engine
+        .io
+        .writes
+        .contains(&(0x20000 + u64::from(MM_3_0_2.inv_sem) * 4, 0))
+        || reg(0x20000, MM_3_0_2.l2_bank_select) != Some(1 << 25)
+    {
+        return TestResult::Fail("MMHUB private-cache invalidation");
+    }
+    // The GFX hub's semaphore was never touched.
+    if engine
+        .io
+        .writes
+        .iter()
+        .any(|(a, _)| *a == 0x10000 + u64::from(GFX_11_5_0.inv_sem) * 4)
+    {
+        return TestResult::Fail("GFX semaphore touched");
+    }
+    // The FB agreement check read the MM hub's own registers: a 3.0.2
+    // part's FB base lives at 0x086c, and the stale 0x08ec read would
+    // have failed `initialize` with `Invalid`.
+    if reg(0x20000, MM_3_0_2.fb_base) != Some(0x800)
+        || reg(0x20000, MM_3_0_2.fb_offset) != Some(0x100)
+    {
+        return TestResult::Fail("MMHUB 3.0.2 FB registers");
+    }
+    if run(engine.initialize()) != Err(Error::Busy) {
+        return TestResult::Fail("second initialize not refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi31",
+    gmc_navi31_strix_initialize_programs_both_hubs_and_flushes_tlb
 );
 
 /// VMID0 bring-up on both hubs, with the GFX11 literals from

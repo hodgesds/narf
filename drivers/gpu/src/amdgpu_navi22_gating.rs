@@ -50,6 +50,7 @@ pub mod pg {
     pub const VCN_DPG: u32 = 1 << 15; // linux: AMD_PG_SUPPORT_VCN_DPG
     pub const ATHUB: u32 = 1 << 16; // linux: AMD_PG_SUPPORT_ATHUB
     pub const JPEG: u32 = 1 << 17; // linux: AMD_PG_SUPPORT_JPEG
+    pub const JPEG_DPG: u32 = 1 << 19; // linux: AMD_PG_SUPPORT_JPEG_DPG
 }
 /// nv.c `nv_common_early_init`, `case IP_VERSION(10, 3, 2)`. No MGLS, FGCG,
 /// 3D CGLS, CP/RLC LS, SDMA, BIF or ROM gating on this ASIC.
@@ -133,6 +134,39 @@ pub const PHOENIX_CG: u64 = cg::GFX_CGCG
 /// The same case's `pg_flags`: identical to Raphael's — GFX_PG (which
 /// gates `gfx_v11_cntl_pg`), VCN, VCN_DPG, JPEG.
 pub const PHOENIX_PG: u32 = pg::GFX_PG | pg::VCN | pg::VCN_DPG | pg::JPEG;
+
+/// `soc21.c` `nv_common_early_init`, `case IP_VERSION(11, 5, 0)`
+/// (Strix Point). Phoenix's flags plus `GFX_3D_CGCG`, `GFX_3D_CGLS`,
+/// `HDP_DS` and `HDP_SD`, minus `HDP_MGCG`: the 11.5.0 arm lists
+/// `GFX_3D_CGCG`, `GFX_3D_CGLS`, `HDP_DS`, `HDP_SD` and no `HDP_MGCG`,
+/// where the 11.0.1 arm has `HDP_MGCG` and neither 3D flag nor DS/SD.
+/// The full GC11 `Gating` owner is still a flagged remainder; these
+/// flags are what the Strix coordinator records and the power-gating
+/// predicate (`gfx_v11_cntl_pg` runs only with `GFX_PG`) reads.
+pub const STRIX_CG: u64 = cg::GFX_CGCG
+    | cg::GFX_CGLS
+    | cg::GFX_MGCG
+    | cg::GFX_FGCG
+    | cg::REPEATER_FGCG
+    | cg::GFX_PERF_CLK
+    | cg::MC_MGCG
+    | cg::MC_LS
+    | cg::HDP_LS
+    | cg::HDP_DS
+    | cg::HDP_SD
+    | cg::ATHUB_MGCG
+    | cg::ATHUB_LS
+    | cg::IH_CG
+    | cg::BIF_MGCG
+    | cg::BIF_LS
+    | cg::VCN_MGCG
+    | cg::JPEG_MGCG
+    | cg::GFX_3D_CGCG
+    | cg::GFX_3D_CGLS;
+
+/// The same case's `pg_flags`: Phoenix's plus `JPEG_DPG` — the 11.5.0
+/// arm lists `JPEG_DPG` where the 11.0.1 arm does not.
+pub const STRIX_PG: u32 = pg::GFX_PG | pg::VCN | pg::VCN_DPG | pg::JPEG | pg::JPEG_DPG;
 
 /// `nv_common_early_init` flags for bare-metal discrete RDNA2.
 pub fn profile_flags(profile: &crate::amdgpu_rdna2::Profile) -> (u64, u32) {

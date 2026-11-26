@@ -1,7 +1,11 @@
-//! Phoenix OSSSYS6 interrupt-vector rings. Register source: Linux
+//! Phoenix and Strix Point OSSSYS6 interrupt-vector rings. Register source: Linux
 //! `ih_v6_0.c` and the `osssys_6_0_0` offset / shift-mask headers. This
 //! owner initially polls; host interrupt delivery stays disabled until an
-//! MSI route is installed.
+//! MSI route is installed. Strix Point uses the same rings (`ih_v6_0.c`
+//! has no version arms and includes `osssys_6_0_0_offset.h`); only the GC
+//! aperture check moves — `FB_LOCATION_BASE`/`TOP` are 0x167c/0x167d on
+//! GC 11.5.0, 0x1678/0x1679 on GC 11.0.1 — so the layout carries the
+//! FB dwords per die.
 //!
 //! The v6 ring layout differs from ih7's: ring0 is
 //! CNTL 0x80 / BASE 0x81 / BASE_HI 0x82 / RPTR 0x83 / WPTR 0x84 /
@@ -157,29 +161,37 @@ struct Layout {
     oss: u64,
     gc: u64,
     nbio: u64,
+    /// `GCMC_VM_FB_LOCATION_BASE` / `_TOP` dwords: 0x1678/0x1679 on
+    /// Phoenix (GC 11.0.1), 0x167c/0x167d on Strix Point (GC 11.5.0).
+    fb_base: u32,
+    fb_top: u32,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
-        // DID-gated like the SMU owner: Strix shares Family::Phoenix but is
-        // RDNA3.5 with its own IH.
-        if !matches!(
-            (gpu.chip.vid, gpu.chip.did),
+        // DID-gated like the SMU owner: Phoenix is GC 11.0.1, Strix Point
+        // is GC 11.5.0 with its FB aperture registers 0x4 higher
+        // (`gc_11_5_0_offset.h`). OSSSYS is 6.0.0 for both: `ih_v6_0.c`
+        // is version-agnostic, and the 6.0.0 bank is the one Linux's
+        // `amdgpu_discovery.c` gives every soc21 part.
+        let (gc_version, fb_base, fb_top) = match (gpu.chip.vid, gpu.chip.did) {
             (crate::amdgpu::AMD_VENDOR, crate::amdgpu::PHOENIX_HAWKPOINT1)
-                | (crate::amdgpu::AMD_VENDOR, crate::amdgpu::PHOENIX1)
-                | (crate::amdgpu::AMD_VENDOR, crate::amdgpu::PHOENIX2)
-        ) {
-            return Err(Error::Unsupported);
-        }
+            | (crate::amdgpu::AMD_VENDOR, crate::amdgpu::PHOENIX1)
+            | (crate::amdgpu::AMD_VENDOR, crate::amdgpu::PHOENIX2) => ((11, 0, 1), 0x1678, 0x1679),
+            (crate::amdgpu::AMD_VENDOR, crate::amdgpu::STRIX_POINT) => ((11, 5, 0), 0x167c, 0x167d),
+            _ => return Err(Error::Unsupported),
+        };
         // Highest dword the owner touches: ring1's client-config data.
         let oss =
             bank(gpu, ip::HW_ID_OSSSYS, &[(6, 0, 0)], 0, 0x186).map_err(|_| Error::Unsupported)?;
-        // The GC aperture check reads FB_LOCATION_BASE/TOP (0x1678/0x1679).
+        // The GC aperture check reads FB_LOCATION_BASE/TOP.
         let gc =
-            bank(gpu, ip::HW_ID_GC, &[(11, 0, 1)], 0, 0x1679).map_err(|_| Error::Unsupported)?;
+            bank(gpu, ip::HW_ID_GC, &[gc_version], 0, fb_top).map_err(|_| Error::Unsupported)?;
         Ok(Self {
             oss,
             gc,
             nbio: nbio_bank(gpu)?,
+            fb_base,
+            fb_top,
         })
     }
     fn at(self, index: u64) -> u64 {
@@ -349,10 +361,13 @@ impl<I: Io> Engine<I> {
         let map = self.memory.mapping();
         self.access(|io| {
             preflight(io, l)?;
-            // `GCMC_VM_FB_LOCATION_BASE/TOP` (0x1678/0x1679), the GFX11
-            // aperture the GMC owner programs; the ring must live inside it.
-            let fb = u64::from(read(io, l.gc + 0x1678 * 4)? & 0xffffff) << 24;
-            let end = (u64::from(read(io, l.gc + 0x1679 * 4)? & 0xffffff) + 1) << 24;
+            // `GCMC_VM_FB_LOCATION_BASE/TOP`, the GFX11 aperture the GMC
+            // owner programs; the ring must live inside it. The dwords
+            // come from the layout (0x1678/0x1679 Phoenix, 0x167c/0x167d
+            // Strix) — the hardcoded Phoenix pair would read the wrong
+            // registers on Strix.
+            let fb = u64::from(read(io, l.gc + u64::from(l.fb_base) * 4)? & 0xffffff) << 24;
+            let end = (u64::from(read(io, l.gc + u64::from(l.fb_top) * 4)? & 0xffffff) + 1) << 24;
             if address < fb
                 || address
                     .checked_add(BYTES)

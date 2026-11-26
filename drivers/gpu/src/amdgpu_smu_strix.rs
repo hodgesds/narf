@@ -1,4 +1,4 @@
-//! Strix Point SMU 14.0.1 graphics mailbox: the `smu_v14_0_0_ppsmc.h`
+//! Strix Point SMU 14.0.0 graphics mailbox: the `smu_v14_0_0_ppsmc.h`
 //! messages a GFX bring-up needs, sent over the `C2PMSG_66` (argument) /
 //! `82` (message) / `90` (response) MMIO mailbox through the shared
 //! `amdgpu_smu` `smu_msg_v1` protocol.
@@ -10,27 +10,43 @@
 //! This is not Phoenix's 13.0.4 message space (`amdgpu_smu_phoenix`,
 //! where VCN/JPEG power are generic 0x06/0x07 and 0x21/0x22) and not the
 //! 13.0.0 Navi31 message space (`amdgpu_smu_v13_0`, where e.g.
-//! AllowGfxOff is 0x28/0x29). MP1 14.0.1 uses the v14_0_0 table
-//! (`amdgpu_smu_v14`); MP1 14.0.0 / 14.0.4 / 14.0.5 share the table but
-//! report driver-IF 0x7 and are different parts, not admitted here.
+//! AllowGfxOff is 0x28/0x29). MP1 14.0.0 uses the v14_0_0 table
+//! (`amdgpu_smu_v14`) and reports driver-IF **0x7**
+//! (`SMU14_DRIVER_IF_VERSION_SMU_V14_0_0`, `smu_v14_0_0_ppt.c:68`).
 //!
-//! `FIRMWARE_FLAGS` check: Linux DOES check it for 14.0.1
+//! Correction to merged #2486 (which this lane fixes): #2486 gated on MP1
+//! 14.0.1 / driver-IF 0x6, but 14.0.1 is **Strix Halo**, not Strix Point.
+//! The APU ASIC info table (`Documentation/gpu/amdgpu/apu-asic-info-table.csv`,
+//! Linux 7.4-rc2) lists Strix Point (Ryzen AI 300 series) at MP1 14.0.0
+//! and Strix Halo at MP1 14.0.1; `smu_v14_0_0_set_ppt_funcs` assigns 0x7
+//! to 14.0.0/14.0.4/14.0.5 and 0x6 to 14.0.1. A 14.0.1 gate would fail
+//! `Unsupported` on real Strix Point, and a 0x6-only `start` would fail
+//! `DriverIfMismatch(0x7)` on its PMFW. The PSP firmware names follow the
+//! same correction (`psp_14_0_0_toc/ta.bin`, from MP0 14.0.0).
+//!
+//! `FIRMWARE_FLAGS` check: Linux checks it for v14
 //! (`smu_v14_0_check_fw_status` reads `smnMP1_FIRMWARE_FLAGS_14_0_0`
-//! 0x3010028 on the APU path and requires the INTERRUPTS_ENABLED bit),
-//! unlike 13.0.4 where it skips the check. This engine does NOT do the
-//! check: the `MP1_CRU1_MP1_FIRMWARE_FLAGS__INTERRUPTS_ENABLED` mask and
-//! shift are not in the Linux reference checkout, and the engine has no
-//! SMN-read path (the mailbox is BAR5 MMIO; the flags register is an SMN
-//! address). `start` proves PMFW liveness with `TestMessage` instead.
-//! Closing that gap — the CRU1 bit plus an SMN read — is a named
-//! remainder, not a silent skip.
+//! 0x3010028 on the APU path and requires the INTERRUPTS_ENABLED bit,
+//! called before `GetDriverIfVersion` in `amdgpu_smu.c`), unlike 13.0.4
+//! where it skips the check. This engine does the check first in `start`:
+//! the flags address is `MP1_Public (0x03b0_0000) | 0x0301_0028` =
+//! `0x03b1_0028`, read through the NBIO 7.11 `PCIE_INDEX2`/`DATA2` pair
+//! (BASE_IDX 0) via the shared `amdgpu_smn::read` — the `SmuMmio::read_smn`
+//! path, which the engine's `Mmio` implements and the test `Fake` scripts.
+//! A clear bit fails `start` with `FirmwareNotReady` before any message
+//! is sent. The check is a single read, as in Linux: PMFW is
+//! BIOS-resident and long up by the time the ColdBoot runs, so no poll.
+//! A vanished device reads back all ones (bit set) and passes this check
+//! spuriously, but the mailbox liveness check in the next send reports
+//! `DeviceGone` immediately after.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as discovery,
     amdgpu_psp_ring::bank,
+    amdgpu_smn::NBIO_VERSIONS_711,
     amdgpu_smu::{
         send_message_get, send_message_void, SmuError, SmuMmio, MP1_C2PMSG_RESP_REL,
-        SMU_14_0_1_DRIVER_IF_VERSION,
+        SMU_14_0_0_DRIVER_IF_VERSION,
     },
     amdgpu_smu_v14 as v14,
 };
@@ -40,6 +56,13 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 const MODE2_RESET: u32 = 2; // linux: MODE2_RESET
 /// `amdgpu_smu::bring_up`'s sentinel, echoed back by `TestMessage`.
 const TEST_SENTINEL: u32 = 0xDEAD_BEEF;
+/// `smnMP1_FIRMWARE_FLAGS_14_0_0` (`smu_v14_0.h:37`) reached through
+/// `MP1_Public` (`0x03b0_0000`, the Navi22 precedent's base):
+/// `0x03b0_0000 | 0x0301_0028`.
+const MP1_FIRMWARE_FLAGS: u32 = 0x03b1_0028;
+/// `MP1_CRU1_MP1_FIRMWARE_FLAGS__INTERRUPTS_ENABLED` (`mp_14_0_0_sh_mask.h`):
+/// bit 0.
+const FIRMWARE_FLAGS_INTERRUPTS_ENABLED: u32 = 1 << 0;
 
 #[allow(
     dead_code,
@@ -73,8 +96,12 @@ pub enum Error {
         got: u32,
     },
     /// `GetDriverIfVersion` returned a schema version outside
-    /// `SMU_14_0_1_DRIVER_IF_VERSION`, with the reported value.
+    /// `SMU_14_0_0_DRIVER_IF_VERSION`, with the reported value.
     DriverIfMismatch(u32),
+    /// PMFW has not raised `MP1_FIRMWARE_FLAGS.INTERRUPTS_ENABLED`
+    /// (`-EIO`, `smu_v14_0_check_fw_status`): the firmware is not ready
+    /// to take messages.
+    FirmwareNotReady,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,24 +113,34 @@ pub struct Versions {
 }
 impl Versions {
     /// True when the firmware reports the driver-IF schema NARF was
-    /// compiled against (0x06). Anything else fails `start` outright;
+    /// compiled against (0x07). Anything else fails `start` outright;
     /// there is no known newer value to accept the way Phoenix accepts 8.
     pub fn driver_if_matches(&self) -> bool {
-        self.driver_if == SMU_14_0_1_DRIVER_IF_VERSION
+        self.driver_if == SMU_14_0_0_DRIVER_IF_VERSION
     }
 }
 
 #[derive(Debug)]
-struct Mmio(MmioRegion);
+struct Mmio {
+    regs: MmioRegion,
+    /// NBIO 7.11 bank (BASE_IDX 0) for the `PCIE_INDEX2`/`DATA2` pair.
+    nbio: u64,
+}
 impl SmuMmio for Mmio {
     fn read(&mut self, at: u32) -> u32 {
         // SAFETY: the constructor bounds the MP1 bank through BAR5 and the
         // caller invokes this under live PCI authority.
-        unsafe { self.0.read32(u64::from(at)) }
+        unsafe { self.regs.read32(u64::from(at)) }
     }
     fn write(&mut self, at: u32, value: u32) {
         // SAFETY: as read.
-        unsafe { self.0.write32(u64::from(at), value) };
+        unsafe { self.regs.write32(u64::from(at), value) };
+    }
+    fn read_smn(&mut self, address: u32) -> u32 {
+        // SAFETY: `resolve` bounds the NBIO bank through BAR5 to reach
+        // `PCIE_DATA2`, and the caller invokes this under live PCI
+        // authority; the SMN latch serializes the index/data steps.
+        unsafe { crate::amdgpu_smn::read(&self.regs, self.nbio, address) }
     }
 }
 struct Op<F>(F);
@@ -137,6 +174,16 @@ impl<I: SmuMmio> Engine<I> {
         let resp = self.access(|io| io.read(mp1_base + MP1_C2PMSG_RESP_REL))?;
         if resp == u32::MAX {
             return Err(Error::DeviceGone);
+        }
+        Ok(())
+    }
+    /// `smu_v14_0_check_fw_status`: a single read of
+    /// `MP1_FIRMWARE_FLAGS`, requiring INTERRUPTS_ENABLED. Called before
+    /// any message, as Linux calls it before `GetDriverIfVersion`.
+    fn check_fw_status(&mut self) -> Result<(), Error> {
+        let flags = self.access(|io| io.read_smn(MP1_FIRMWARE_FLAGS))?;
+        if flags & FIRMWARE_FLAGS_INTERRUPTS_ENABLED == 0 {
+            return Err(Error::FirmwareNotReady);
         }
         Ok(())
     }
@@ -177,9 +224,9 @@ impl<I: SmuMmio> Engine<I> {
         result.map_err(|e| self.decode(e))
     }
     async fn start(&mut self) -> Result<Versions, Error> {
-        // `amdgpu_smu::bring_up`'s three steps. No FIRMWARE_FLAGS check:
-        // see the module header — the CRU1 bit is not in the reference
-        // checkout and the engine has no SMN-read path.
+        // `smu_v14_0_check_fw_status` first, then `amdgpu_smu::bring_up`'s
+        // three steps: TestMessage echo, GetPmfwVersion, GetDriverIfVersion.
+        self.check_fw_status()?;
         let echoed = self.send(v14::V14_MSG_TEST, TEST_SENTINEL).await?;
         if echoed != TEST_SENTINEL {
             return Err(Error::EchoMismatch {
@@ -189,7 +236,7 @@ impl<I: SmuMmio> Engine<I> {
         }
         let smu = self.send(v14::V14_MSG_GET_PMFW_VERSION, 0).await?;
         let driver_if = self.send(v14::V14_MSG_GET_DRIVER_IF, 0).await?;
-        if driver_if != SMU_14_0_1_DRIVER_IF_VERSION {
+        if driver_if != SMU_14_0_0_DRIVER_IF_VERSION {
             return Err(Error::DriverIfMismatch(driver_if));
         }
         let versions = Versions { smu, driver_if };
@@ -217,9 +264,12 @@ impl Smu {
     /// window 1) for this object's lifetime and holds matching PCI authority
     /// and a permanent register mapping.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
-        let mp1_base = resolve(gpu)?;
+        let (mp1_base, nbio) = resolve(gpu)?;
         Ok(Self(Engine {
-            io: Mmio(gpu.regs),
+            io: Mmio {
+                regs: gpu.regs,
+                nbio,
+            },
             authority,
             mp1_base,
             hung: false,
@@ -234,7 +284,7 @@ impl Smu {
     pub fn versions(&self) -> Option<Versions> {
         self.0.versions
     }
-    /// `smu_v14_0_0_gfx_off_control` on MP1 14.0.1.
+    /// `smu_v14_0_0_gfx_off_control` on MP1 14.0.0.
     pub async fn set_gfxoff(&mut self, allow: bool) -> Result<(), Error> {
         let message = if allow {
             v14::V14_MSG_ALLOW_GFX_OFF
@@ -263,8 +313,8 @@ impl Smu {
     }
     /// `smu_v14_0_0_mode2_reset`: GfxDeviceDriverReset(MODE2_RESET). PMFW
     /// resets the graphics, SDMA and multimedia engines; nothing they ran
-    /// survives. Strix Point resets with MODE2 (`soc21.c` maps MP1 14.0.1
-    /// to `AMD_RESET_METHOD_MODE2`).
+    /// survives. Strix Point resets with MODE2 (`soc21.c` maps MP1 14.0.0
+    /// — and 14.0.1/14.0.4/14.0.5 — to `AMD_RESET_METHOD_MODE2`).
     ///
     /// # Safety
     /// Every owner of those engines is quiesced and will be rebuilt, as
@@ -276,20 +326,25 @@ impl Smu {
     }
 }
 
-/// The MP1 window-1 base, after proving the GPU is Strix Point
-/// (1002:150E) with MP1 14.0.1 — the one MP1 version Linux's `soc21.c`
-/// covers with the v14_0_0 driver. `last` is `C2PMSG_90`, the highest
-/// mailbox dword.
-fn resolve(gpu: &AmdGpu) -> Result<u32, Error> {
+/// The MP1 window-1 base and the NBIO 7.11 bank for the firmware-flags
+/// SMN read, after proving the GPU is Strix Point (1002:150E) with MP1
+/// 14.0.0 — the one MP1 version Linux's `soc21.c` covers with the v14_0_0
+/// driver for Strix Point. `last` is `C2PMSG_90`, the highest mailbox
+/// dword; the NBIO bank is bounded by `PCIE_DATA2` (0x0f), the highest
+/// dword the SMN read touches.
+fn resolve(gpu: &AmdGpu) -> Result<(u32, u64), Error> {
     if !matches!(
         (gpu.chip.vid, gpu.chip.did),
         (crate::amdgpu::AMD_VENDOR, crate::amdgpu::STRIX_POINT)
     ) {
         return Err(Error::Unsupported);
     }
-    let base =
-        bank(gpu, discovery::HW_ID_MP1, &[(14, 0, 1)], 1, 0x29a).map_err(|_| Error::Unsupported)?;
-    u32::try_from(base).map_err(|_| Error::Unsupported)
+    let mp1 =
+        bank(gpu, discovery::HW_ID_MP1, &[(14, 0, 0)], 1, 0x29a).map_err(|_| Error::Unsupported)?;
+    let nbio = bank(gpu, discovery::HW_ID_NBIF, NBIO_VERSIONS_711, 0, 0x0f)
+        .map_err(|_| Error::Unsupported)?;
+    let mp1_base = u32::try_from(mp1).map_err(|_| Error::Unsupported)?;
+    Ok((mp1_base, nbio))
 }
 
 #[cfg(feature = "kernel-test")]
