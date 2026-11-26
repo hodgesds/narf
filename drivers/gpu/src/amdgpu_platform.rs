@@ -3232,6 +3232,21 @@ mod tests {
                     version: (3, 1, 5),
                     ..dcn314_expected
                 },
+                // dcn/dcn_3_2_0_offset.h and dcn_3_2_1_offset.h: every
+                // register this scan reads sits at the 3.1.4 offset on
+                // _BASE_IDX 2 (HUBP1_DCHUBP_CNTL 0x06cf, OTG1_OTG_CONTROL
+                // 0x1bc1), and both run 4 pipes (dcn32_resource.c and
+                // dcn321_resource.c both start `num_pipes = 4`). The two
+                // headers do move other blocks (ADR_CFG VUPDATE locks,
+                // HUBPREQ_DEBUG, MALL regs) — none of them is read here.
+                SurfaceWindow {
+                    version: (3, 2, 0),
+                    ..dcn314_expected
+                },
+                SurfaceWindow {
+                    version: (3, 2, 1),
+                    ..dcn314_expected
+                },
                 dcn350_expected,
                 dcn300_expected,
                 dcn401_expected,
