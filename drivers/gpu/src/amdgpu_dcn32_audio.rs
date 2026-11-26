@@ -82,6 +82,7 @@ const LAST_BANK1: u64 = 0x00af; // linux: mmDCCG_AUDIO_DTO1_MODULE
 /// The UHBR symbol clock, in MHz, for a 128b/132b rate. Linux's
 /// `check_audio_bandwidth_dp` bounds both legacy and UHBR symbol clocks
 /// by [`SYMBOL_CLOCK_MAX_MHZ`].
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
 pub(crate) fn uhbr_symbol_clock_mhz(rate: UhbrRate) -> F {
     match rate {
         UhbrRate::Uhbr10 => F::fraction(3125, 10),
@@ -274,6 +275,7 @@ pub enum AudioLink {
 /// config's bits per pixel (1/16 bpp) and slices per line. The modeset
 /// caller builds this from its DSC config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
 pub(crate) struct AudioDsc {
     pub bpp_x16: u32,
     pub slices: u32,
@@ -289,6 +291,7 @@ pub(crate) struct AudioDsc {
 /// 88.2/96/176.4/192 kHz), or `None` for a malformed timing or link. The
 /// legacy rate is validated to the four DP link rates; the 4.0.1 port
 /// takes its legacy settings from a validated `DpPhySettings` instead.
+#[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
 pub(crate) fn rates(
     t: &Timing,
     bpc: u32,

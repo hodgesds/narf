@@ -38,6 +38,7 @@ pub struct Dsc32 {
 impl Dsc32 {
     /// Bind the DSC engines at DCN base index 2. Refuses any profile that
     /// is not DCN 3.2 — the power registers differ on every other DCN.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn bind(regs: Regs, dcn2: u64, profile: Profile) -> Result<Self, Error> {
         if !matches!(profile, Profile::Dcn320 | Profile::Dcn321) {
             return Err(Error::Unsupported);

@@ -382,6 +382,7 @@ impl<A: Aux> core::fmt::Debug for UhbrLink<A> {
 }
 
 impl<A: Aux + Send> UhbrLink<A> {
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn new(regs: Regs, dcn2: u64, aux: A) -> Self {
         Self { regs, dcn2, aux }
     }
@@ -509,7 +510,7 @@ impl<A: Aux + Send> UhbrLink<A> {
         io: &mut impl UhbrTransport,
         plan: &UhbrLinkTrained,
     ) -> Result<(), Error> {
-        self.write(0x102, &mut [0]).await?;
+        self.write(0x102, &[0]).await?;
         let polls = if plan.repeaters != 0 {
             u32::from(plan.repeaters) * 300
         } else {
@@ -569,10 +570,7 @@ impl<A: Aux + Send> UhbrLink<A> {
         // A failed probe means no repeater chain (the native AUX engine
         // has no error-code granularity to distinguish it).
         self.aux.set_timeout_us(AUX_TIMEOUT_LTTPR_US).await?;
-        let caps = match self.read::<10>(LTTPR_CAPS).await {
-            Ok(caps) => Some(caps),
-            Err(_) => None,
-        };
+        let caps = self.read::<10>(LTTPR_CAPS).await.ok();
         let Some(caps) = caps else {
             self.aux.set_timeout_us(AUX_TIMEOUT_DEFAULT_US).await?;
             return Ok(None);
@@ -599,7 +597,7 @@ impl<A: Aux + Send> UhbrLink<A> {
         chain: Option<Lttpr>,
     ) -> Result<(), Error> {
         let s = plan.settings;
-        self.write(0x600, &mut [1]).await?;
+        self.write(0x600, &[1]).await?;
         io.delay(1000).await;
         if self.read::<1>(0x600).await?[0] & 7 != 1 {
             return Err(Error::Training(TrainingError::SinkReadback(0x600)));
@@ -609,18 +607,17 @@ impl<A: Aux + Send> UhbrLink<A> {
         if let Some(r) = chain {
             // The count and transparent mode retrieve_link_cap leaves,
             // then dp_decide_128b_132b_lttpr_mode's non-transparent mode.
-            self.write(LTTPR_TOTAL_COUNT, &mut [r.raw_count]).await?;
-            self.write(LTTPR_MODE, &mut [LTTPR_MODE_TRANSPARENT])
-                .await?;
-            self.write(LTTPR_MODE, &mut [LTTPR_MODE_NON_TRANSPARENT])
+            self.write(LTTPR_TOTAL_COUNT, &[r.raw_count]).await?;
+            self.write(LTTPR_MODE, &[LTTPR_MODE_TRANSPARENT]).await?;
+            self.write(LTTPR_MODE, &[LTTPR_MODE_NON_TRANSPARENT])
                 .await?;
         }
-        self.write(CHANNEL_CODING_SET, &mut [2]).await?;
+        self.write(CHANNEL_CODING_SET, &[2]).await?;
         // dpcd_set_link_settings: 0.5% downspread, lanes without enhanced
         // framing or post-LT adjustment, the 128b/132b rate code.
-        self.write(0x107, &mut [0x10]).await?;
-        self.write(0x101, &mut [s.lanes]).await?;
-        self.write(0x100, &mut [s.rate.dpcd_code()]).await?;
+        self.write(0x107, &[0x10]).await?;
+        self.write(0x101, &[s.lanes]).await?;
+        self.write(0x100, &[s.rate.dpcd_code()]).await?;
         self.verify(plan)
     }
 
@@ -652,7 +649,7 @@ impl<A: Aux + Send> UhbrLink<A> {
         let failed = || Error::Training(TrainingError::Equalization);
         self.set_mode(plan.link, MODE_TPS1)?;
         plan.mode = MODE_TPS1;
-        self.write(0x102, &mut [1]).await?;
+        self.write(0x102, &[1]).await?;
         let mut interval = uhbr_interval_us(self.read::<1>(UHBR_AUX_RD_INTERVAL).await?[0]);
         let mut status = self.status(plan).await?;
         let mut requests = requested_presets(status);
@@ -663,7 +660,7 @@ impl<A: Aux + Send> UhbrLink<A> {
         let mut burst = [0u8; 5];
         burst[0] = 2;
         burst[1..1 + usize::from(lanes)].copy_from_slice(&requests[..usize::from(lanes)]);
-        self.write(0x102, &mut burst).await?;
+        self.write(0x102, &burst).await?;
         let mut wait = 0;
         let mut loops = 1;
         loop {
@@ -680,7 +677,7 @@ impl<A: Aux + Send> UhbrLink<A> {
                 return Err(failed());
             }
             self.ffe(io, plan, source_preset(requests, lanes)).await?;
-            self.write(0x103, &mut requests).await?;
+            self.write(0x103, &requests).await?;
             loops += 1;
         }
         // EQ interlane alignment, within 400 ms of training altogether.
@@ -703,7 +700,7 @@ impl<A: Aux + Send> UhbrLink<A> {
         io: &mut impl UhbrTransport,
         plan: &mut UhbrLinkTrained,
     ) -> Result<(), Error> {
-        self.write(0x102, &mut [3]).await?;
+        self.write(0x102, &[3]).await?;
         let limit = (u64::from(plan.repeaters) + 1) * CDS_WAIT_PER_HOP_US;
         let mut wait = 0;
         loop {
@@ -812,7 +809,7 @@ impl<A: Aux + Send> UhbrLink<A> {
     ) -> Result<(), Error> {
         // An idle MST branch stays powered for AUX and up requests.
         if sink && !plan.settings.mst {
-            self.write(0x600, &mut [2]).await?;
+            self.write(0x600, &[2]).await?;
             self.verify(plan)?;
         }
         self.link_disable(plan.link)?;
