@@ -1026,6 +1026,83 @@ pub(crate) mod tests {
         dmub_firmware_requires_exact_discovery_and_live_authority
     );
 
+    fn dmub_shared_attach_refuses_dcn4() -> TestResult {
+        use crate::amdgpu::{ChipInfo, Family, AMD_VENDOR, PHOENIX_HAWKPOINT1};
+        use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
+        let region = MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 0,
+            kind: narf_bus::BarKind::Mmio32 {
+                prefetchable: false,
+            },
+        };
+        let mut gpu = AmdGpu {
+            fb_bar: region,
+            regs: region,
+            chip: ChipInfo {
+                vid: AMD_VENDOR,
+                did: PHOENIX_HAWKPOINT1,
+                family: Family::Phoenix,
+                asic: "phoenix",
+                fw_name: "amdgpu/unused.bin",
+                fw_list: &[],
+                revision: 0,
+                rev_id: 0,
+                mall_size: 0,
+            },
+            vram: Default::default(),
+            mode: None,
+            backlight_percent: None,
+            fw_loaded: false,
+            ip_blocks: alloc::vec![],
+            vbios: None,
+            // Synthetic fixture: no discovery blob, so no GC table.
+            gc_info: None,
+        };
+        // DCN 4.x (Navi44/Navi48) must never reach the shared DMUB
+        // mailbox path: the shared attach fails closed before any MMIO,
+        // and the Navi48 owner carries its own DMUB. Pin both dies so
+        // a future DMUB_VERSIONS widening cannot silently admit them.
+        for (major, minor, revision) in [(4u8, 0u8, 1u8), (4u8, 1u8, 0u8)] {
+            gpu.ip_blocks.clear();
+            gpu.ip_blocks.push(IpBlock {
+                hw_id: HW_ID_DCN,
+                instance: 0,
+                major,
+                minor,
+                revision,
+                sub_revision: 0,
+                variant: 0,
+                base_addrs: [0; MAX_BASE_ADDRS],
+                num_bases: 3,
+            });
+            if !matches!(dmub_ip(&gpu), Err(Error::Unsupported)) {
+                return TestResult::Fail("DCN 4.x admitted by the shared DMUB version gate");
+            }
+            if Regs::for_version((major, minor, revision)).is_some() {
+                return TestResult::Fail("DCN 4.x has a shared DMUB register map");
+            }
+            // SAFETY: the attach fails closed at the version gate before
+            // any MMIO; the fixture's zero-length regions are never read.
+            if !matches!(unsafe { Dmub::attach(&gpu) }, Err(Error::Unsupported)) {
+                return TestResult::Fail("shared DMUB attach admitted DCN 4.x");
+            }
+        }
+        // Positive control: DCN 3.1.4 is still admitted past both gates.
+        gpu.ip_blocks[0].major = 3;
+        gpu.ip_blocks[0].minor = 1;
+        gpu.ip_blocks[0].revision = 4;
+        if dmub_ip(&gpu).is_err() {
+            return TestResult::Fail("DCN 3.1.4 refused by the shared DMUB version gate");
+        }
+        if Regs::for_version((3, 1, 4)).is_none() {
+            return TestResult::Fail("DCN 3.1.4 lost its shared DMUB register map");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/amdgpu-dmub", dmub_shared_attach_refuses_dcn4);
+
     fn dmub_mailbox_completion_wrap_and_cancel() -> TestResult {
         use core::{
             future::Future,
