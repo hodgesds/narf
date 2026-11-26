@@ -9,6 +9,16 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 struct ExecutorFixture;
 impl ExecutorFixture {
     fn new() -> Self {
+        // Bring this CPU's timer wheel up to now before arming. Wheel
+        // timers expire only in an executor round, and the smokes before
+        // this one may run for minutes without one, so a live periodic
+        // timer (the boot NIC's transmit watchdog) can sit overdue. A wheel
+        // with a due timer forwards its clock no further than that timer
+        // (`forward_timer_base`), and the work's 5-jiffy timer, indexed
+        // against a clock that far behind, lands in a coarse bucket seconds
+        // out. Expire them first: anything their callbacks queue goes with
+        // the reset below.
+        narf_time::timer::run_timer_softirq();
         // Earlier native fixtures can retain driver workers along with
         // their DMA owners. This smoke drives its own task graph; polling
         // those unrelated workers can stall in a fixture with no target.
