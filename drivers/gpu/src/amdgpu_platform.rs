@@ -2973,13 +2973,35 @@ mod tests {
     /// row with no case is a window nothing has verified.
     fn platform_register_windows_match_the_amd_headers() -> TestResult {
         // `gc/gc_11_0_0_offset.h`: regGCVM_CONTEXT0_CNTL 0x1688 _BASE_IDX 0,
-        // regGCVM_CONTEXT15_CNTL 0x1697. Both GC 11.0.x revisions use it.
+        // regGCVM_CONTEXT15_CNTL 0x1697. Every GC 11.0.x revision uses it
+        // except 11.0.3: `gc/gc_11_0_3_offset.h` puts the whole GCMC/GCVM
+        // block 0x10 higher, CONTEXT0 at 0x1698 (CONTEXT15 0x16a7). No
+        // gc_11_0_2 header exists; Linux drives 11.0.2 with the 11.0.0
+        // function table (`gmc_v11_0_set_gfxhub_funcs` default).
         let gfxhub_expected = [
             // gc_12_0_0_offset.h: regGCVM_CONTEXT0_CNTL 0x1624 _BASE_IDX 0.
             VmWindow {
                 version: (12, 0, 1),
                 base_idx: 0,
                 ctx0_cntl: 0x1624,
+            },
+            // Navi31 (RX 7900), GC 11.0.0.
+            VmWindow {
+                version: (11, 0, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x1688,
+            },
+            // Navi33 (RX 7600), GC 11.0.2: same 11.0.0 table as Navi31.
+            VmWindow {
+                version: (11, 0, 2),
+                base_idx: 0,
+                ctx0_cntl: 0x1688,
+            },
+            // Navi32 (RX 7800 XT), GC 11.0.3: the block sits 0x10 higher.
+            VmWindow {
+                version: (11, 0, 3),
+                base_idx: 0,
+                ctx0_cntl: 0x1698,
             },
             VmWindow {
                 version: (11, 0, 1),

@@ -277,17 +277,14 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         // successful preparation excludes every later legacy MMIO accessor.
         // Nothing the driver allocates lies past the BAR: every owner takes
         // CPU-visible memory from `pool`, so that range is all clients'.
-        let (unmapped, pool) = unsafe { (plan.unmapped_pool(), plan.into_pool()) };
-        let (unmapped, pool) = (
-            unmapped.map_err(Error::Memory)?,
-            pool.map_err(Error::Memory)?,
-        );
+        // The VRAM past the BAR has no owner yet: `ColdBoot` takes only the
+        // CPU-visible `pool`. The parked Mes/Ih lanes re-add the unmapped
+        // retention when they land (Navi48's `pin_vram` pattern).
+        let pool = unsafe { plan.into_pool() }.map_err(Error::Memory)?;
         // SAFETY: inventory covers every inherited client and CPU framebuffer
         // writers are paused. Construction performs bounded reads, never writes.
         let prepared = unsafe {
-            boot::ColdBoot::new(
-                gpu, pci, authority, &pool, unmapped, firmware, training, skeleton,
-            )
+            boot::ColdBoot::new(gpu, pci, authority, &pool, firmware, training, skeleton)
         }
         .map_err(Error::Firmware)?;
         *owner = Some(Owner::ColdBoot(alloc::boxed::Box::new(prepared)));

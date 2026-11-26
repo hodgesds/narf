@@ -190,11 +190,8 @@ impl<B: Backend> Sequence<B> {
 struct Hardware {
     chip: Rdna3Chip,
     gpu: AmdGpu,
-    pci: narf_bus::BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
-    /// The VRAM past the BAR, if any; `pool` is the CPU-visible prefix.
-    unmapped: Option<crate::amdgpu_vram::UnmappedPool>,
     firmware: Firmware,
     trainer: Option<training::Trainer>,
     sos: Option<sos::Bootloader>,
@@ -349,7 +346,6 @@ impl ColdBoot {
         pci: narf_bus::BusDevice,
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
-        unmapped: Option<crate::amdgpu_vram::UnmappedPool>,
         firmware: Firmware,
         exchange: Option<Training>,
         skeleton: Skeleton,
@@ -422,10 +418,8 @@ impl ColdBoot {
                 backend: Hardware {
                     chip,
                     gpu: saved,
-                    pci,
                     authority,
                     pool: pool.clone(),
-                    unmapped,
                     firmware,
                     trainer,
                     sos: None,

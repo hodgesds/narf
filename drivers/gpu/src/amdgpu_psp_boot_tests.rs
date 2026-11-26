@@ -374,6 +374,10 @@ fn psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads() -> Test
     }
     TestResult::Pass
 }
+kernel_test_in!(
+    "drivers/gpu/psp-boot",
+    psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads
+);
 fn psp13_gpu() -> crate::amdgpu::AmdGpu {
     crate::amdgpu_rdna3::tests::gpu()
 }
@@ -407,7 +411,7 @@ fn psp13_profile_selects_navi31_sos_and_refuses_navi32_33() -> TestResult {
         profile_.apply(&mut g);
         match profile_.chip() {
             crate::amdgpu_rdna3::Rdna3Chip::Navi31 => {
-                if profile(&g).map(|(t, b)| (t, b)) != Ok((Target::Psp13_0_0, 0)) {
+                if profile(&g) != Ok((Target::Psp13_0_0, 0)) {
                     return TestResult::Fail("Navi31 did not select the PSP13 SOS");
                 }
             }
