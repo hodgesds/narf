@@ -15,7 +15,7 @@
 //! the die↔revision pairing rests on firmware sets, as lane 1 documented
 //! (Ubuntu LP#2034103 lists the GC 11.0.3 set — `gc_11_0_3` + `psp_13_0_10`
 //! + `sdma_6_0_3` + `smu_13_0_10` + `vcn_4_0_0` — for Navi32 hardware; the
-//! Gentoo AMDGPU firmware table maps NAVI31 → 11.0.0 set, NAVI32 → 11.0.3
+//!   Gentoo AMDGPU firmware table maps NAVI31 → 11.0.0 set, NAVI32 → 11.0.3
 //!   set, NAVI33 → 11.0.2 set). What the ref tree *does* confirm is that
 //!   `sdma_v6_0.c` handles exactly revisions 6.0.0–6.0.3 (plus 6.1.x) with one
 //!   firmware blob per revision (`MODULE_FIRMWARE("amdgpu/sdma_6_0_0.bin")`
