@@ -1194,12 +1194,12 @@ fn boxed_navi48_images(
         .enumerate()
     {
         let image = firmware.image(*source).map_err(|_| Error::Invalid)?;
+        let base = core::ptr::addr_of_mut!(*slot) as *mut crate::amdgpu_navi48_firmware::Image<'_>;
         // SAFETY: `index` counts 0..11 over `Source::ALL`'s exactly 11
         // entries, so each heap slot is written exactly once before
         // `assume_init` below. An early `?` drops the box with some
         // slots unwritten; that leaks nothing, because `Image` owns no
         // allocation and has no `Drop` impl.
-        let base = core::ptr::addr_of_mut!(*slot) as *mut crate::amdgpu_navi48_firmware::Image<'_>;
         unsafe {
             base.add(index).write(image);
         }
