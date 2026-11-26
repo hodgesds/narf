@@ -132,20 +132,12 @@ struct State {
     /// Routing the GSC sources onto GT0's delivery failed; the GSC is polled.
     gsc_irq_failed: bool,
     /// `narf.intel.pxp=1` beside the GSC: struct xe_pxp and its hardware
-    /// half for the device's lifetime, once xe_pxp_init succeeded.
-    pxp: Option<PxpOwner>,
-    /// xe_pxp_init ran (once per device, on the first eligible GT1).
-    pxp_tried: bool,
+    /// half for the device's lifetime, once xe_pxp_init succeeded (tried
+    /// once per device, on the first eligible GT1).
+    pxp: crate::intel_gpu_gt::media::pxp::Runtime<crate::intel_gpu_gt::media::pxp::GemClient>,
     /// Routing the KCR causes failed: terminations then never complete and
     /// a start that needs one times out.
     kcr_irq_failed: bool,
-}
-
-/// `struct xe_pxp`: the state the uAPI shares, and the worker's engine over
-/// the GSC client object.
-struct PxpOwner {
-    pxp: Arc<crate::intel_gpu_gt::media::pxp::Pxp>,
-    engine: crate::intel_gpu_gt::media::pxp::Engine<crate::intel_gpu_gt::media::pxp::GemClient>,
 }
 
 type GscOwner = crate::intel_gpu_gt::media::gsc::owner::GscOwner<
@@ -1112,6 +1104,9 @@ impl crate::intel_gpu_user::UserBackend for Backend {
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         Some(self.power_controls.clone())
     }
+    fn cpu_addr_mirror(&self) -> bool {
+        crate::intel_gpu_xe_vm::svm::opted_in()
+    }
     fn native_xe(&self) -> bool {
         // Fixed-mode KMS becomes usable at probe, before this GT has even
         // observed its two firmware frames. Advertise Mesa submission on
@@ -1860,8 +1855,7 @@ pub(crate) fn start_pending() {
                 gsc: None,
                 gsc_reported: None,
                 gsc_irq_failed: false,
-                pxp: None,
-                pxp_tried: false,
+                pxp: Default::default(),
                 kcr_irq_failed: false,
             }),
             suspended: AtomicBool::new(false),
@@ -3316,10 +3310,7 @@ impl Owner {
                 if let Some(irq) = state.irq.as_ref() {
                     irq.unroute_kcr();
                 }
-                if let Some(owner) = state.pxp.as_mut() {
-                    owner.engine.abort(&owner.pxp);
-                    owner.pxp.suspend();
-                }
+                state.pxp.lost();
             }
         } else if let Some(publication) = guc.publication() {
             // Every engine executed and retired its private PPGTT job.
@@ -3493,8 +3484,7 @@ impl Owner {
             gsc,
             media_guc,
             irq,
-            pxp: owner,
-            pxp_tried,
+            pxp: runtime,
             kcr_irq_failed,
             ..
         } = state;
@@ -3505,59 +3495,24 @@ impl Owner {
             return;
         }
         let media = MediaWindow::new(&self.pending.window);
-        if owner.is_none() {
-            if core::mem::replace(pxp_tried, true) {
-                return;
-            }
-            // xe_pxp_init: GSCCS0, loadable GSC firmware and (below media
-            // 35) loadable HuC firmware, then a VCS for terminations.
-            let gsc_ok = gsc.status().loadable();
-            let huc_ok = guc.huc_object().is_some();
-            if !gsc_ok || !huc_ok || guc.pxp_vcs().is_none() {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "intel-gt card{}: PXP skipped: unsatisfied deps (GSC {}, HuC {}, VCS {})",
-                    self.pending.index,
-                    gsc_ok,
-                    huc_ok,
-                    guc.pxp_vcs().is_some()
-                );
-                return;
-            }
-            pxp::kcr_set(&media, true);
-            let client = match pxp::GemClient::new(platform) {
-                Ok(client) => client,
-                Err(error) => {
-                    // out_kcr_disable; Linux then fails the probe.
-                    pxp::kcr_set(&media, false);
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "intel-gt card{}: PXP initialization failed ({}); PXP disabled",
-                        self.pending.index,
-                        error.errno()
-                    );
-                    return;
-                }
+        // xe_pxp_init: GSCCS0, loadable GSC firmware and (below media 35)
+        // loadable HuC firmware, then a VCS for terminations. The HuC is in
+        // error once either authentication failed.
+        let view = pxp::Gt1View {
+            gsc_loadable: gsc.status().loadable(),
+            huc_staged: guc.huc_object().is_some(),
+            vcs: guc.pxp_vcs().is_some(),
+            gsc_idle: gsc.idle(),
+            gsc_error: gsc.status().error(),
+            huc_error: gsc.huc() == Some(false) || guc.huc_outcome() == Some(false),
+        };
+        let index = self.pending.index;
+        // xe_irq_enable_hwe's KCR pair, beside the GSC sources, once PXP
+        // exists; then the causes latched since the last pass.
+        let kcr = || {
+            let Some(irq) = irq.as_ref() else {
+                return 0;
             };
-            // xe_gsc_create_host_session_id: a random handle (never logged).
-            let session = narf_memory::kaslr::random_u64().0;
-            let shared = pxp::Pxp::new();
-            *owner = Some(PxpOwner {
-                pxp: shared.clone(),
-                engine: pxp::Engine::new(client, session),
-            });
-            // The display checks protected planes' keys against it
-            // (xe_pxp_obj_key_check).
-            crate::intel_gpu_gt::media::pxp::set_display_pxp(Some(&shared));
-            if let Some(mode) = crate::drm_registry::mode_state(self.pending.index) {
-                mode.lock().intel_pxp_planes = true;
-            }
-            *self.user_pxp.lock() = Some(shared);
-            log(self.pending.index, "PXP initialized; KCR enabled");
-        }
-        let owner = owner.as_mut().expect("PXP owner");
-        // xe_irq_enable_hwe's KCR pair, beside the GSC sources.
-        if let Some(irq) = irq.as_ref() {
             if !irq.kcr_routed() && !*kcr_irq_failed {
                 if let Err(error) = irq.route_kcr() {
                     *kcr_irq_failed = true;
@@ -3565,35 +3520,60 @@ impl Owner {
                     let _ = writeln!(
                         narf_console::Writer,
                         "intel-gt card{}: KCR IRQ routing refused ({:?}); PXP terminations cannot complete",
-                        self.pending.index,
+                        index,
                         error
                     );
                 }
             }
-        }
-        let events = irq.as_ref().map_or(0, |irq| irq.take_kcr_events());
-        // xe_pxp_pm_resume once GT1 runs again and no GSC load is pending.
-        // KCR causes latched before it belong to the stopped GT1 and are
-        // dropped, as xe_pm_runtime_get_if_active drops them.
-        if !owner.pxp.live() {
-            if !gsc.idle() {
-                return;
+            irq.take_kcr_events()
+        };
+        // xe_gsc_create_host_session_id: a random handle (never logged).
+        let resources = || {
+            pxp::GemClient::new(platform).map(|client| (client, narf_memory::kaslr::random_u64().0))
+        };
+        let pass = runtime.service(
+            view,
+            now,
+            &mut PxpQueue::new(guc, now),
+            &media,
+            resources,
+            kcr,
+        );
+        match pass {
+            pxp::Pass::Skipped => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gt card{}: PXP skipped: unsatisfied deps (GSC {}, HuC {}, VCS {})",
+                    index,
+                    view.gsc_loadable,
+                    view.huc_staged,
+                    view.vcs
+                );
             }
-            pxp::kcr_set(&media, true);
-            owner.pxp.resume(true);
-        } else {
-            owner.pxp.irq(events);
+            pxp::Pass::InitFailed(error) => {
+                // out_kcr_disable; Linux then fails the probe.
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gt card{}: PXP initialization failed ({}); PXP disabled",
+                    index,
+                    error.errno()
+                );
+            }
+            pxp::Pass::Ran {
+                initialized: Some(shared),
+                ..
+            } => {
+                // The display checks protected planes' keys against it
+                // (xe_pxp_obj_key_check).
+                pxp::set_display_pxp(Some(&shared));
+                if let Some(mode) = crate::drm_registry::mode_state(index) {
+                    mode.lock().intel_pxp_planes = true;
+                }
+                *self.user_pxp.lock() = Some(shared);
+                log(index, "PXP initialized; KCR enabled");
+            }
+            pxp::Pass::Disabled | pxp::Pass::ResumeDeferred | pxp::Pass::Ran { .. } => {}
         }
-        // The HuC is in error once either authentication failed.
-        let huc_error = gsc.huc() == Some(false) || guc.huc_outcome() == Some(false);
-        owner
-            .pxp
-            .publish(pxp::readiness(gsc.status().error(), huc_error, &media));
-        // New PXP work waits while the GSC worker runs; work in flight goes on.
-        let begin = gsc.idle();
-        let _ = owner
-            .engine
-            .poll(&owner.pxp, now, &mut PxpQueue::new(guc, now), &media, begin);
     }
 
     /// xe_pxp_pm_suspend before GT1 stops: the worker's PXP job finishes
@@ -3603,35 +3583,13 @@ impl Owner {
     fn suspend_pxp(&self, state: &mut State, now: u64, wait: bool) -> bool {
         use crate::intel_gpu_gt::media::{MediaGucState, MediaWindow, PxpQueue};
         let State { pxp, media_guc, .. } = state;
-        let Some(owner) = pxp.as_mut() else {
-            return true;
-        };
-        if !owner.engine.idle() {
-            let media = MediaWindow::new(&self.pending.window);
-            let done = match media_guc
-                .as_mut()
-                .filter(|guc| guc.state() == MediaGucState::Running)
-            {
-                Some(guc) => {
-                    owner
-                        .engine
-                        .quiesce(&owner.pxp, now, &mut PxpQueue::new(guc, now), &media)
-                }
-                // GT1 no longer runs: the job can never finish.
-                None => {
-                    owner.engine.abort(&owner.pxp);
-                    true
-                }
-            };
-            if !done {
-                if wait {
-                    return false;
-                }
-                owner.engine.abort(&owner.pxp);
-            }
-        }
-        owner.pxp.suspend();
-        true
+        let media = MediaWindow::new(&self.pending.window);
+        // GT1 no longer running: the job can never finish.
+        let mut port = media_guc
+            .as_mut()
+            .filter(|guc| guc.state() == MediaGucState::Running)
+            .map(|guc| PxpQueue::new(guc, now));
+        pxp.suspend(now, port.as_mut(), &media, wait)
     }
 
     /// Release the media GT owner's wake requests and advance a verified
@@ -4481,6 +4439,16 @@ pub(crate) fn probe_nvl_display(
     Ok(())
 }
 
+/// The boot option that installs DG1's KMS owner over its firmware-lit
+/// Pipe A, as DG2 and Battlemage get theirs (default off).
+pub const DG1_KMS_OPT_IN: &str = "narf.intel.dg1_kms";
+
+/// `narf.intel.dg1_kms=1`, with the strict grammar every Intel opt-in uses
+/// ([`crate::intel_gpu_gt::boot_opt_in`]).
+pub fn dg1_kms_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, DG1_KMS_OPT_IN)
+}
+
 pub(crate) fn probe_discrete(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
@@ -4530,8 +4498,11 @@ pub(crate) fn probe_discrete(
         unsafe { card.install_lmem_bar(lmem) };
     }
     let display_window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
-    let discrete_display = platform
-        .has_display()
+    // DG1's display gets its KMS owner only with `narf.intel.dg1_kms=1`
+    // (default off: its lit display keeps the GT-only profile, as before).
+    let admitted = platform != GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::Dg1)
+        || dg1_kms_requested(narf_boot::args());
+    let discrete_display = (platform.has_display() && admitted)
         .then(|| crate::intel_gpu_xe2lpd::DiscreteDisplayIp::identify(&display_window, platform))
         .and_then(Result::ok);
     let discrete_console = discrete_display

@@ -5183,6 +5183,11 @@ fn intel_primary_formats_blob(card: &crate::drm::card::Card, id: u32) -> Option<
     if card.intel_tile4 {
         modifiers.push(crate::intel_gpu_scanout::TILE4_MODIFIER);
     }
+    // narf.intel.ccs=1 with Tile4 qualified: the compressed modifiers of
+    // the card's display (intel_fb.c intel_modifiers), XR24 only.
+    if let Some(display_ver) = card.intel_ccs.filter(|_| card.intel_tile4) {
+        modifiers.extend(crate::intel_gpu_scanout::ccs::advertised(display_ver));
+    }
     let formats = card
         .intel_primary_formats()
         .unwrap_or(&[DRM_FORMAT_XRGB8888]);

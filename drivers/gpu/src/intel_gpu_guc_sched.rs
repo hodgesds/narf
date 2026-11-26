@@ -1387,18 +1387,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
         } else {
             context_image(&image, self.platform, ring.ggtt_offset());
         }
-        // xe_lrc.c XE_LRC_CREATE_RUNALONE: a PXP queue on RCS/CCS below
-        // graphics 20 keeps the EUs to itself. The masked enable joins the
+        // xe_lrc.c XE_LRC_CREATE_RUNALONE: the masked enable joins the
         // CTX_CONTEXT_CONTROL value after every restore above.
-        if user.as_ref().is_some_and(|claim| claim.run_alone())
-            && (engine == Engine::Rcs0 || engine.is_compute())
-        {
-            const CTX_CTRL_RUN_ALONE: u32 = 1 << 7;
+        if let Some(claim) = &user {
             let control = image.read32(REGS + 3 * 4);
-            image.write32(
-                REGS + 3 * 4,
-                control | CTX_CTRL_RUN_ALONE << 16 | CTX_CTRL_RUN_ALONE,
-            );
+            let wanted = run_alone_control(engine, claim.run_alone(), control);
+            if wanted != control {
+                image.write32(REGS + 3 * 4, wanted);
+            }
         }
         // OACTXCONTROL image value (issue #1821): after the image is
         // built — and after any state restore above, which overwrites
@@ -2615,6 +2611,23 @@ pub(crate) fn preemption_timeout_us(engine: Engine) -> u32 {
         DEFAULT.max(GSC_MIN)
     } else {
         DEFAULT
+    }
+}
+
+/// `CTX_CTRL_RUN_ALONE` (regs/xe_engine_regs.h, bit 7).
+const CTX_CTRL_RUN_ALONE: u32 = 1 << 7;
+
+/// The CTX_CONTEXT_CONTROL value of a user LRC on `engine`.
+/// `__xe_exec_queue_init` asks XE_LRC_CREATE_RUNALONE of a PXP queue on
+/// RCS or CCS below graphics 20 (`run_alone`), and `xe_lrc_init` ORs
+/// `REG_MASKED_FIELD_ENABLE(CTX_CTRL_RUN_ALONE)` into `control`. No other
+/// engine class runs alone. (Graphics 20+ would use CTX_CTRL_PXP_ENABLE;
+/// NARF's PXP is MTL/Arrow only.)
+pub(crate) fn run_alone_control(engine: Engine, run_alone: bool, control: u32) -> u32 {
+    if run_alone && (engine == Engine::Rcs0 || engine.is_compute()) {
+        control | CTX_CTRL_RUN_ALONE << 16 | CTX_CTRL_RUN_ALONE
+    } else {
+        control
     }
 }
 

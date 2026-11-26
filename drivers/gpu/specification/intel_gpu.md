@@ -716,7 +716,11 @@ Internal display programming admits qualified Gen12 (Tiger Lake / Alder Lake /
 Raptor Lake), Gen11, Gen9 and Gen9 LP, and the separate Meteor/Arrow Lake
 Xe-LPG sequence. Rocket Lake
 has an exact GT and VBT metadata profile; its external outputs on DDI B and
-TC1/TC2 are admitted, and its internal display-programming gate stays closed.
+TC1/TC2 are admitted, and its internal display-programming gate stays closed
+unless `narf.intel.rkl_edp=1` admits the panel: then a VBT declaring eDP on
+port A routes it through the Tiger Lake panel modeset on combo PHY A
+(`rkl_pll_mgr`'s DPLL0, the RKL `DPCLKA_CFGCR0` layout, no PW_2, the RKL
+CDCLK and eDP buffer tables) with the CNP-layout PWM and no PSR.
 Arrow Lake shares the `MeteorLake` classification and Linux's `mtl_desc`
 display descriptor. Lunar, Panther and Wildcat Lake and Nova Lake-S keep
 their headless execution profile unless their per-device route is requested
@@ -1134,6 +1138,11 @@ Public interface:
   T10 500 ms, T11+T12 610 ms). `init_registers` programs the
   delay registers and the PP_CONTROL cycle-delay field
   (100 ms granularity on CNP+ PCH — there is no PP_DIVISOR).
+  On a display-9 panel with a pre-CNP south display (SPT, KBP,
+  CMP-V) `narf.intel.pp_divisor=1` programs `PP_DIVISOR`
+  instead (`(100 * rawclk_MHz) / 2 - 1` and the cycle delay
+  plus one, `pps_init_registers`), decodes the cycle from it,
+  and the Gen9 resume relight reprograms it.
   `power_on` enforces the power cycle (status-side
   IDLE_CYCLE poll plus the software remainder of T11+T12
   from the recorded power-off stamp) before setting
@@ -1457,7 +1466,10 @@ Public interface:
   registers the resident copy with the PM core for the
   resume reload. Non-fatal: any failure only disables
   runtime power management and the display still modesets.
-  DG1 has no Gen12 modeset path and is not wired.
+  DG1 has no Gen12 modeset path and is not wired; with
+  `narf.intel.dg1_kms=1` its firmware-lit Pipe A gets the
+  discrete KMS owner DG2 has (`DiscreteDisplayIp::Dg1`,
+  display 12, the Tiger Lake KMS profile).
 
 Invariants:
 
@@ -1884,7 +1896,11 @@ correction:
   the Gen9 modeset, AUX, GMBUS (Gen9 LP only), hotplug, the
   external pass, the panel power-off and KMS sessions hold
   references, and the execlists GT holds `GT_IRQ` while
-  unparked (`__gt_unpark`); the last release re-enters DC6
+  unparked (`__gt_unpark`; with
+  `narf.intel.execlists_suspend=1` its system-sleep
+  preparation drains, disables RPS/RC6, resets the GT and
+  drops it, and the resume brings the GT up again); the last
+  release re-enters DC6
   (display 9, Wa Display #1183 first) or DC5 (Broxton /
   Gemini Lake) 17 ms later (100 ms after the GT parks),
   refused with power well 2 requested or on,
@@ -2079,15 +2095,27 @@ programme's last lane; `external_display_supported()` and
   touched. Verification method: each constant and sequence
   was transcribed from the named Linux source and pinned by
   a fixture that asserts the exact register write sequence
-  — the module is register-level routing only. Live
-  IRQ-handler wiring is a named remainder (no
-  interrupt-domain registration exists in this crate yet).
+  — the primitives are register-level. With
+  `narf.intel.gen9_irq=1` the interrupt owner wires them:
+  MSI with a hard handler that only turns the master off and
+  latches it, and a task-context pass in `gen8_irq_handler`'s
+  order (GT banks, DE misc, DE port, pipes, the SPT PCH) that
+  turns it on again, with Linux's postinstall masks and the
+  hotplug monitor acknowledging and latching its own pins;
+  a trigger runs the external-output pass, and
+  `intel_irq_suspend` / `intel_irq_resume` bracket system
+  sleep (DC9 also refuses while its software flag is set).
 - HPD / external sessions: the session layer
   (`enable_external_hpd`, `poll_external_hpd`, `dp_connect` /
   `hdmi_connect` / `mst_connect`) admits Gen9 through
   `SourceFamily::Gen9`, with the SPT-class south hotplug bank
   (`HpdBank::Spt`, polled) and the SPT DDC pins, and MST runs
-  on the same sources. `intel_gpu_gen9_irq` has no caller.
+  on the same sources. Without `narf.intel.gen9_irq=1`
+  hotplug is polled at probe only. Two external outputs
+  share DPLL1 unless `narf.intel.gen9_dpll=1` arbitrates
+  DPLL1-3 from the hardware (`intel_find_dpll`: a live port's
+  DPLL at the same state is shared, else the first free one,
+  else a typed refusal; a shared DPLL is never retuned).
 - Backlight: Skylake drives the SPT PWM block
   (`intel_bl.rs` `PwmLayout::Spt`: max = `BLC_PWM_PCH_CTL2`
   0xC8254 >> 16, duty RMW into CTL2's low 16 bits,
@@ -2838,8 +2866,8 @@ pin table (`GmbusPinTable::for_generation(Generation::IceLake)
   6 bpc pipes"): the panel and external DP run at 6 bpc when the EDID or
   the VBT limit them to it or only 18 bpp fits, and an eDP panel that
   publishes `DP_SUPPORTED_LINK_RATES` trains with `DP_LINK_RATE_SET`.
-  Bigjoiner, the uncompressed joiner, more than four slices and UHBR
-  stay refused. The pipe scaler for panel fitting
+  Bigjoiner, the uncompressed joiner and more than four slices stay
+  refused; 128b/132b DSC runs only behind `narf.intel.uhbr=1`. The pipe scaler for panel fitting
   (`intel_gpu_xelpg_scaler`) is plumbed through
   `XeLpgModeset::with_panel_fit`; no production caller requests a fit.
 
@@ -2976,9 +3004,19 @@ at PAT3 at a 2 MiB-aligned GGTT address (`tgl_plane_min_alignment`, 512 x
 at the view's tile origin (`DptLayout::with_origin`). Tile4 and X are advertised on display 20 through the display-14
 qualification without the chicken read (`tiled_profile` returns the proved
 IP, `Primary::capture_ip`), and their watermarks are the display-14 tiled
-images (skl_watermark.c has no DPT term). Compressed modifiers
-(`I915_FORMAT_MOD_4_TILED_LNL_CCS`) are not accepted: only plain X and
-Tile4 reach the presenter and its PLANE_CTL never sets decompression.
+images (skl_watermark.c has no DPT term). Compressed modifiers reach
+ADDFB2 only under `narf.intel.ccs=1` (`intel_gpu_scanout::ccs`): display
+14's `I915_FORMAT_MOD_4_TILED_MTL_RC_CCS`, `_MC_CCS` and `_RC_CCS_CC` on
+the i915 personality (AuxCCS plane, clear-colour plane; xe has no AuxCCS
+on MTL) and display 20/30's `_LNL_CCS` (flat CCS, compression from the
+BO's PAT, no AUX plane), with `intel_framebuffer_init`'s CCS plane rules;
+they are advertised in IN_FORMATS and reach the presenter as an unpanned
+Tile4 view whose DSB arm carries `PLANE_CC_VAL` (the CC plane's native
+value at offset 16), `PLANE_AUX_DIST`/`PLANE_AUX_OFFSET` and the
+decompression bits, which the latch proof verifies; on display 20 the
+DPT remaps at the source stride (`calc_plane_remap_info` for CCS). The
+AUX plane is sized in 64-byte x 64-line CCS tiles. Implemented with native
+fixtures.
 
 Xe `SCANOUT` at creation. `DRM_XE_GEM_CREATE_FLAG_SCANOUT` is admitted on
 the display-preserving profile (`UserBackend::display_preserving`) as
@@ -3201,15 +3239,25 @@ pages or the LMEM BAR, bounded by the buffer); DMA_BUF_IOCTL_SYNC on the
 shared reservation orders CPU access. An integrated display takes it as a
 framebuffer (no FORCE_WC needed, so it may be bound) and pins the export
 (`dma_buf_pin`) for the import's life before the GGTT maps its pages; a
-discrete display refuses it (`__xe_pin_fb_vma` pins to VRAM0). It has no
+discrete display refuses it (`__xe_pin_fb_vma` pins to VRAM0).
+DMA_BUF_IOCTL_SYNC START on an Intel dma-buf runs the exporter's
+`begin_cpu_access` hook (`narf_filesystem::dma_buf::DmaBufCpuAccess`) after
+its fence wait: for CPU reads (SYNC_READ, SYNC_RW) a VRAM|system export
+migrates to system memory (`xe_dma_buf_begin_cpu_access`,
+`xe_bo_migrate(bo, XE_PL_TT)`) under the exporter's runtime-PM reference,
+notifying dynamic importers and retiring CPU mappings first; a pinned
+export (EBUSY), a VRAM-only one (EINVAL), a live CPU mapping of the BAR or
+a failed copy leaves it in place and the SYNC still succeeds, as Linux's
+hook returns 0. Writes never migrate. It has no
 kernel CPU copy, migration, i915 compatibility exec or mmap, CPU-copy
 presentation or cursor use. A reimport returns its handle; a re-export names
 the original buffer. Live imports request peer-to-peer only with
 `narf.intel.prime_p2p=1`. Native fixtures (`drivers/gpu/intel_gpu_prime`,
 the smallbar suite and `io/p2pdma`) cover BAR bus addresses, migration, the
 pinned, VRAM-only and nonvisible refusals, import binding, move
-notification and rebind, suspend of a pinned export, import mmap and
-import scanout.
+notification and rebind, suspend of a pinned export, import mmap, import
+scanout and the `begin_cpu_access` migration
+(`smoke_xe_prime_begin_cpu_access_migrates_vram_for_cpu_reads`).
 
 Native terminal fences now back the shared per-object dma-buf reservation.
 GuC and Gen12 resident admission check synchronous conflicts across the
@@ -3763,7 +3811,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | Native gamma activation/bypass | 1024-entry Pipe-A LUT, owned copies/blobs, safe inactive preload, preserved flips and later-frame restoration | Implemented; native fixtures pass |
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
-| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20). Swap, lazy-free and compaction now refuse pinned pages, and VRAM CPU mappings are revoked and refaulted across runtime suspend (§20); i915 GEM_USERPTR (`i915_gem_userptr_ioctl`) and the Xe LR_MODE/FAULT_MODE VM flags with PREFETCH are admitted ("Completion of Intel iGPU and Discrete Arc Support"); CPU-address-mirror VMs remain |
+| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20). Swap, lazy-free and compaction now refuse pinned pages, and VRAM CPU mappings are revoked and refaulted across runtime suspend (§20); i915 GEM_USERPTR (`i915_gem_userptr_ioctl`) and the Xe LR_MODE/FAULT_MODE VM flags with PREFETCH are admitted ("Completion of Intel iGPU and Discrete Arc Support"); CPU-address-mirror VMs are admitted on USM devices behind `narf.intel.svm=1`, populated by PREFETCH and by the fault service, zapped by CPU invalidations and refaulted at EXEC (§20, native fixtures added); routing hardware GPU faults to that service (ASIDs, the GuC G2H fault path) and VRAM migration remain |
 | Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations | Open; DG2/BMG evict VRAM to system memory (flat-CCS saved) and migrate it back, evict under OOM at GEM_CREATE, re-migrate at exec and drain for suspend ("Completion of Intel iGPU and Discrete Arc Support"); CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20); DG1 publishes VRAM below `GSMBASE` (§5); cross-device VRAM PRIME runs with static attachments, and peer-to-peer behind `narf.intel.prime_p2p=1` (§19), unvalidated on hardware. Dynamic (move-notify) importers, in-place suspend of a pinned VRAM export, import mmap through the exporter and integrated-display scanout of an import are implemented with native fixtures (§19); alias revocation and nonvisible allocation beyond the BMG headless profile remain |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
@@ -3773,7 +3821,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; opt-in MTL/Arrow GT1 runs its own media GuC, schedules fused VCS/VECS with media-only ADS, default LRCs, CT GGTT invalidation and routed interrupts, and publishes native Xe gt_id 1 after per-engine private-PPGTT jobs retire, including GT1 engine-cycles and topology (with GT1's L3 bank entry) queries; with `narf.intel.huc=1` its media GuC DMA-loads and authenticates the MTL HuC and query7 type1 reports it; GT1 runs GuC SLPC from its own media fuses, GuC RC6 and powergating before publication (a failed start stops GT1, as xe_uc_load_hw fails) and returns RC6/powergating to the host before every stop; with `narf.intel.gsc=1` the media GuC's stop honours Wa_14015076503, GSCCS0 is scheduled beside VCS/VECS, the GSC private object lives in a device-lifetime stolen claim behind a fixed GGTT DM window, and the runtime runs the GSC worker: firmware load, compatibility query and HuC authentication via the GSC, then the proxy channel once the MEI GSC proxy component (drivers/platform) is bound, else Linux's tolerated ENODEV. Media-GT OAM Unit 1 streams with MPEC formats and VCS/VECS exec queues, and GT1 frequency/idle sysfs (`gt1/` and `tile0/gt1/{freq0,gtidle}/` with live `MTL_MEDIA_MC6` residency and `MTL_MIRROR_TARGET_WP1` CAGF readout) implemented with native fixtures. The MEI GSC proxy client is in drivers/platform; with `narf.intel.pxp=1` GT1 also runs Xe PXP (KCR, the ARB session through the GSC, terminations on IRQ, GT1 stop and resume) with native fixtures. Silicon acceptance remains |
 | Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; opt-in (`narf.intel.oa=1`) main-GT OAG streams on DG2, MTL/Arrow, BMG and LNL implemented with native fixtures: query 8, ADD/REMOVE_CONFIG, open, ENABLE/DISABLE/CONFIG/STATUS/INFO and read/poll with source errno order, kernel-ring LRI configuration, landing/wrap/status handling and reset/suspend teardown; opt-in (`narf.intel.devcoredump=1`) GuC error-capture lists, STATE_CAPTURE extraction/matching, the manual timeout fallback and the version-4 coredump text (header, exec-queue policy, job batch addresses, HW-engine registers) implemented with native fixtures; OA mmap (read-only private PFN mapping with VM_DONTCOPY/VM_DONTEXPAND semantics in the syscall layer), `metrics/<uuid>/id`, `dev.xe.observation_paranoid` and i915 GETPARAM 57 implemented; legacy i915 perf UAPI compatibility (PERF_OPEN, ADD_CONFIG, REMOVE_CONFIG, stream ioctls ENABLE/DISABLE/CONFIG, sample header prepending, query item 3 DRM_I915_QUERY_PERF_CONFIG, GETPARAM 54 PERF_REVISION) implemented with native fixtures; OA syncs (`DRM_XE_OA_CAPS_SYNCS`, in-fence waiting, out-fence and user-fence release on stream open and CONFIG), media-GT OAM UAPI coverage with synthetic independent GT owners (MPEC formats 8/9, VCS/VECS mapping, concurrent stream permits), and parallel queue creation across Copy, Compute, and Video engines (classes 1..=4) implemented with native fixtures; OAR/OAC exec-queue streams with per-context OAR/OAC programming at enable/disable retiring on the bound queue through the trusted-submit-on-user-context entry point, RING_CONTEXT_CONTROL reaching the queue's saved state, implemented with native fixtures; steered manual capture and the coredump's wall-clock snapshot time and guilty process name implemented with native fixtures |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; display14 resource transactions landed: all-pipes-off owned Pipe-A entry, live repartitioning, the Pipe B-D owner (production caller: the MTL external route; pipe-DMC bracket and IRQ-masked evasion around every arm; the display-14 crtc registers of hsw_crtc_enable; the all-off post-plane lowering after the last release) and SAGV with QGV derating; the fixed Pipe-A KMS owner proves its share of the published multi-pipe layout, so flips, the cursor, color/DSB, Tile4/XR30 and PSR keep working beside a lit external; display-14 DSC landed (the eDP panel compresses when Linux would and external DP compresses with FEC, with the VDSC CDCLK and prefill terms in the resource transaction and read back by every later proof); display-14 6 bpc pipes landed (EDID bpc and VBT `edp.bpp` limits, 18 bpp before DSC, dithered `PIPE_MISC`, BPC_6 and the 6 bpc MSA on Pipe A and Pipes B-D); ADL-P/N write display 13's `TRANS_VBLANK`; the display-14 pipe-scaler panel fitter (`XeLpgModeset::with_panel_fit`, aspect/center/fullscreen scaling, filter selection, `PIPE_SRCSZ`, `SKL_PS_*`, sized framebuffer validation) and bigjoiner master/slave programming (`XeLpgModeset::with_bigjoiner`, `ICL_PIPE_DSS_CTL1` master/secondary joiner enable, watermark scaler prefill lines) wired with native fixtures; VRR foundation landed (#1768): honest sink capability (DPCD Ignore-MSA + EDID range spread > 10 Hz, VBT vrr gate for eDP, per-connector vrr_capable published instead of the hardcoded Some(true)), vrr_enabled in atomic CrtcState forcing a full modeset on toggle (Intel only), and per-modeset VRR timing recompute from the committed mode + sink range (Linux vmin-from-max_vfreq / flipline semantics, vmin>=vmax / interlace / joiner bails, late guardband phase + Gen12 pipeline_full). VRR readback landed (#1772): GOP-left state decoded into VRR_STATE at install/modeset setup, fixed-RR TGs disabled (CMRR exempt), reconciled enable surfaced to the atomic Card::vrr_enabled slot. VRR sequencing landed (#1769): VRR timings programmed in the Gen12 and Xe-LPG (non-Xe3) modesets from the committed mode + stored sink range (`intel_vrr_set_transcoder_timings` during transcoder configuration), TG enabled after the transcoder (`intel_vrr_enable`), VRR disabled before the transcoder stop (`intel_vrr_disable`, timed 1000 ms wait surfacing `TimedOut`, `TRANS_VRR_VSYNC` cleared on AS-SDP displays), push writes `TRANS_PUSH_EN \| TRANS_PUSH_SEND` with an `is_push_sent` readback, `on_plane_flip` takes the CRTC from the owning display instead of hardcoding 1, and `request_vrr_enabled` returns hardware failures instead of swallowing them (the request stays retained in `VRR_STATE` for the next modeset when the controller is not up or no timings are stored).. CMRR landed (#1771): `is_cmrr_frac_required` tolerance check (0.10 Hz, Linux `intel_vrr.c`) + eDP auto-enable in the per-modeset compute with the built-in-panel modeset wired in (no sink range required — eDP discovery publishes none yet), `CmrrTimings::compute` reconciled with Linux `cmrr_get_vtotal` (derived vtotal, /1001 video multipliers resolving Linux's open TODO), and CMRR stays sysfs-only for manual control (no DRM-visible control — Linux has no CMRR property) DPCD+PSR landed (#1770): DPCD MSA-ignore programming (`DP_DOWNSPREAD_CTRL` 0x107 bit 7, read-modify-write preserving SSC, sink-advertised + not fixed-RR, synced on VRR/CMRR toggle and every Pipe-A modeset) and PSR×VRR mutual exclusion (PSR refused while the VRR TG runs variable-rate, fixed-RR TG relaxation via CMRR, re-evaluated at every latch since the refusal is not latched, SCL floor 1 with the VRR TG per wa_14015401596 with the guardband computed against it) |
-| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz; YCbCr 4:2:0 on display 14/20) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); PSR2 with selective fetch on that panel implemented (§20), driven by FB_DAMAGE_CLIPS and DIRTYFB damage and falling back to PSR1 with a typed reason; 6 bpc eDP and DP outputs and `DP_LINK_RATE_SET` training of display-14 eDP rate-table panels implemented with native fixtures (§20); the MTL/Arrow panel's full crtc disable and enable (PPS, DDI, PLL) and Linux's link-training fallback ladder on the panel implemented with native fixtures (§20); DP-alt pin D, native/legacy board reversal, live TBT DP-IN display routing and display-14 MST now have native implementations (USB-C display checkpoint below); UHBR10/20 SST (128b/132b) on the C20 and LT ports behind `narf.intel.uhbr=1` implemented with native fixtures (§20 "DP 2.0 UHBR"); native HDMI FRL, UHBR over MST, DSC or Thunderbolt alt mode, a second independent concurrent external route and Panel Replay remain open |
+| Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; MTL DP SST on DDI B/TC DP-alt and HDMI TMDS (DDI B, VBT-declared legacy Type-C; HDMI 2.0 scrambling/SCDC to 594 MHz; YCbCr 4:2:0 on display 14/20) runtime-wired through one hotplug service on Pipes B-D beside the lit panel (live resource repartition, PM demand at the route port clock, pipe published with the image), Type-C ownership, owned PICA/south hotplug and display-14 AUX power implemented with native fixtures; VBT port facts (OpRegion VBT: ports, legacy Type-C, DDC pins, DP SSC; Gen12 DDC pins) and Gen12/MTL E-DDC implemented with native fixtures; DC-state join implemented; PSR1 on the KMS-owned MTL/Arrow Pipe-A eDP implemented (§20) with the display-14 watermark provider (Wa_14015648006) and the VBT PSR gate and wake times, so it can enable on hardware whose VBT enables PSR for the panel and whose Pipe-A watermarks are the owned modeset's; panel KMS flips, cursor, color/DSB and PSR keep running while an external is lit (the external pass brackets Pipe A with the FBC/PSR pre/post plane updates and idles an in-flight panel DSB); eDP DSC on the panel and DP DSC with FEC on Pipes B-D implemented with native fixtures (§20); PSR2 with selective fetch on that panel implemented (§20), driven by FB_DAMAGE_CLIPS and DIRTYFB damage and falling back to PSR1 with a typed reason; 6 bpc eDP and DP outputs and `DP_LINK_RATE_SET` training of display-14 eDP rate-table panels implemented with native fixtures (§20); the MTL/Arrow panel's full crtc disable and enable (PPS, DDI, PLL) and Linux's link-training fallback ladder on the panel implemented with native fixtures (§20); DP-alt pin D, native/legacy board reversal, live TBT DP-IN display routing and display-14 MST now have native implementations (USB-C display checkpoint below); UHBR10/20 SST (128b/132b) on the C20 and LT ports behind `narf.intel.uhbr=1` implemented with native fixtures (§20 "DP 2.0 UHBR"); UHBR over Thunderbolt alt mode (display 30+, DP tunnel BW allocation), through LTTPRs and with the reduced-parameter retry implemented with native fixtures behind the same option, DSC over 128b/132b SST and 128b/132b MST implemented with native fixtures behind the same option, and UHBR routes offered to HDCP (`narf.intel.hdcp=1`), SST as DP SST and MST with stream encryption; deep colour, YCbCr 4:4:4 into a DP PCON and HDMI/DP audio behind `narf.intel.hdmi14_ext=1` implemented with native fixtures; a second concurrent SST DP or HDMI route on Pipes B-D beside the panel (`narf.intel.ext_routes=2`: one joint DBUF/DDB/WM/MBUS/CDCLK/PM-demand plan across both, independent hotplug, retrain and teardown, per-slot scanout and publication) implemented with native fixtures; Panel Replay (`narf.intel.panel_replay=1`) on the display-20/30 KMS eDP (sink enable before training, AUX-less ALPM, selective update over replay) implemented with native fixtures, and for external DP on display 14+ as an owner the external routes do not yet enable; native HDMI FRL (refused: Linux 7.4 has no source FRL training), DSC over 128b/132b MST, MST or UHBR beside a second route, and Panel Replay with the AS SDP remain open |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
 | Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Full-AUX panel backlight | Qualified MTL/Arrow VESA eDP caps/mode/width, arbitrated live-route AUX owner, retained brightness intent and verified panel suspend/relight | Implemented; native fixtures pass |
@@ -4904,7 +4952,7 @@ that state:
 | HPD polling, external DP/HDMI/MST, USB-C bridge | `poll_dp_hpd_events` runs at probe under `legacy()`. `service_external_sst` returns before any guard or MMIO without a DP session. Gen12 external admission and the bridge take `legacy()`. Joined: every MTL external hardware pass (HPD poll, event handling with Type-C connect/disconnect, probe, activate, stop, and the suspend/GT-reset teardown) runs in `intel_gpu_xelpg_external::with_dc_off`, which takes one `DcUser::External` reference before its first register access and runs nothing if DC states cannot be exited. Probe registers `external_route_blocks_dc` with `register_external_live`, so a live or quarantined route, or a pass in progress, refuses re-entry between passes. |
 | Frame-counter, scanline and pipe-status reads | Under `Guard`, the modeset reference or the format-refresh reference. |
 | Format discovery (GETPLANE, IN_FORMATS) | `publish_console_formats` runs under Init at install, under `LegacyGuard` on console replacement, and under the publication-refresh reference. |
-| debugfs / sysfs readers | No debugfs. Intel sysfs attributes (runtime power, error reports, power controls, hwmon, CCS) read cached state or GT registers only. |
+| debugfs / sysfs readers | The HDCP debugfs files (`narf.intel.hdcp=1` only) touch no register: a sink capability read is answered by the HDCP service pass. Intel sysfs attributes (runtime power, error reports, power controls, hwmon, CCS) read cached state or GT registers only. |
 | Error capture | GT-only register lists (GuC status/DMA, GDRST, GT interrupt, engine ring registers). |
 | Gen12 PM core (`PmBarWindow`) | Unreachable: registered only for Gen12. |
 | DC service itself | Re-entry checks run only from DC0. Loads and suspend steps hold their own references. |
@@ -5275,7 +5323,9 @@ are Linux b90c984d `intel_ddi.c` (`intel_ddi_init`, `intel_ddi_enable_hdmi`,
   594 MHz. Linux only logs an SCDC failure; here a stream that needs
   scrambling fails activation and is stopped locally. FRL stays refused.
 
-Remaining: HDMI FRL, audio, deep colour and YCbCr 4:4:4. The VBT parser,
+Remaining: HDMI FRL (Linux has no source FRL training; refused). Deep
+colour, YCbCr 4:4:4 and audio run behind `narf.intel.hdmi14_ext=1` (see
+"Display 14+ deep colour, YCbCr 4:4:4, audio and HDMI FRL facts"). The VBT parser,
 E-DDC, the computed C10/C20 HDMI PLL states, YCbCr 4:2:0 and the DC-state
 join are later sections. Native fixtures cover
 these paths. They are not physical sink or visible-pixel acceptance.
@@ -6245,9 +6295,15 @@ hardware ignores it there. The Pipe A modeset and the Pipes B–D owner now
 do the same. The display-14 DSB timing proof compares only the end field;
 the Gen12 proof is unchanged.
 
+The search is Linux 7.4-rc4's (`intel_dp_dsc_compute_config`,
+`dsc_compute_compressed_bpp`, `dsc_compute_link_config`): it adds the
+DP 2.0 / eDP 1.5 maximum bpp delta (`intel_dp_dsc_max_delta_bppx16`) and the
+128b/132b configurations (`compute_with`, behind `narf.intel.uhbr=1`); every
+existing fixture picks the same configuration under it.
+
 Remaining: the joiner, more than four slices, YCbCr DSC and fractional-bpp
-limits beyond the sink's increment, UHBR DSC, MST DSC and the DSC throughput
-quirk of branch devices (branches refuse). 6 bpc output, `DP_LINK_RATE_SET`
+limits beyond the sink's increment, MST DSC and the DSC throughput quirk of
+branch devices (branches refuse). 6 bpc output, `DP_LINK_RATE_SET`
 training, the VBT's `edp.bpp` clamp and display 13's `TRANS_VBLANK` are the
 next section. Physical Intel acceptance is open.
 
@@ -6819,13 +6875,18 @@ uAPI with `xe->pxp` published:
   (xe_vm_validate_protected), are Linux's ENOEXEC, which FsError cannot
   carry: NARF answers EINVAL. UNMAP and UNMAP_ALL are never checked.
 - A killed queue is ECANCELED on EXEC, as Linux's reset_status reports.
-- A protected linear XR24 object becomes a framebuffer once PXP is up on the
-  card (drm/card.rs, `intel_pxp_planes`). Each primary-plane arm runs
-  `check_protection`: a current key sets `PLANE_SURF_DECRYPT`, a stale one
-  (or no PXP) scans out through an all-zero plane CSC
-  (`icl_plane_csc_load_black`). The DSB arm and the KMS owner's CPU copy
-  refuse protected frames; tiled and XR30 protected framebuffers are
-  refused.
+- A protected object becomes a framebuffer once PXP is up on the card
+  (drm/card.rs, `intel_pxp_planes`), in any layout and format the plane
+  takes (linear, X and Tile4 XR24, linear XR30), as Linux places no bound
+  on one. Each primary-plane arm, CPU or DSB, runs `check_protection`: a
+  current key sets `PLANE_SURF_DECRYPT`, a stale one (or no PXP) scans out
+  through an all-zero plane CSC (`icl_plane_csc_load_black`, with
+  `glk_plane_color_ctl`'s CSC enable), all latched by the same SURF write;
+  a staged DSB arm cancelled unarmed leaves the plane's black state as it
+  was. The color owner admits `PLANE_COLOR_PLANE_CSC_ENABLE` exactly while
+  the scanout owner armed the plane black. The KMS owner's CPU copy still
+  refuses protected frames, and a first color transaction over a plane
+  already black is refused until an unprotected frame is shown.
 
 Threat assumptions with the option:
 - Key material never reaches NARF. The GSC firmware and KCR hold every
@@ -6852,8 +6913,20 @@ Fixtures:
   `smoke_pxp_arb_session_start_sends_the_linux_init_session_packet`,
   `smoke_pxp_terminates_on_suspend_and_resume`,
   `smoke_pxp_key_check_refuses_a_stale_object_after_termination`,
-  `smoke_pxp_start_failures_keep_linux_errnos` and
-  `smoke_pxp_stop_quiesces_or_aborts_hardware_work`.
+  `smoke_pxp_start_failures_keep_linux_errnos`,
+  `smoke_pxp_stop_quiesces_or_aborts_hardware_work`,
+  `smoke_pxp_runtime_wiring_inits_once_suspends_and_resumes` (the GT
+  runtime's `service_pxp` / `suspend_pxp` over `pxp::Runtime`: init once
+  and only with its dependencies, the failed-allocation KCR disable, KCR
+  causes, suspend, the deferred resume and a stop that cannot wait) and
+  `smoke_pxp_run_alone_lrc_bit_on_render_and_compute_only` (the
+  CTX_CONTEXT_CONTROL value the submit path writes: 0x00090008 becomes
+  0x00890088 on RCS0/CCS0 only).
+- `drivers/gpu/intel_gpu_scanout`:
+  `scanout_pxp_protected_plane_decrypts_then_goes_black` and
+  `scanout_pxp_protected_dsb_arm_decrypts_or_loads_the_black_csc`;
+  `drivers/gpu/intel_gpu_color`:
+  `smoke_intel_ctm_admits_the_plane_csc_only_while_the_plane_is_black`.
 - `drivers/gpu/intel_gpu_media_gt`:
   `smoke_mtl_media_gt_kcr_irq_enables_decodes_and_resets` (the IRQ model),
   `smoke_media_gt_pxp_jobs_run_on_gsccs_ppgtt_and_the_first_vcs` (the media
@@ -6861,10 +6934,11 @@ Fixtures:
   (native Xe with a published `xe->pxp`).
 The packet bytes, termination words, register values and errnos are the
 Linux ABI's, never recorded from this implementation. Nothing here has run
-on physical Intel hardware. Not covered natively: the RUN_ALONE bit in a
-submitted LRC, the runtime's init/suspend/resume wiring (no runtime model),
-and the real GSC firmware's acceptance of NARF's PPGTT address and inline
-VCS termination.
+on physical Intel hardware. Not covered natively: a protected queue's LRC
+submitted through the GuC model (the fixture pins the value the submit path
+computes), the runtime's real GSC worker and media GuC behind the
+`pxp::Runtime` model, and the real GSC firmware's acceptance of NARF's PPGTT
+address and inline VCS termination.
 
 ### Xe OA streams on the main-GT OAG unit — native fixtures added
 
@@ -7840,6 +7914,61 @@ Fixtures:
   path. The existing `smoke_xe_userptr_bind_exec_validation_and_retirement`
   keeps its expectations.
 
+### Xe CPU-address-mirror VMs (`narf.intel.svm=1`) — native fixtures added
+
+Sources are Linux 7.4-rc4: `xe_vm.c` (`vm_bind_ioctl_check_args`, the
+`CPU_ADDR_MIRROR` paths of `vm_bind_ioctl_ops_create`/`_parse`,
+`xe_vm_find_cpu_addr_mirror_vma_range`, `prefetch_ranges`), `xe_svm.c`,
+`xe_pagefault.c`, `xe_guc_pagefault.c`, `xe_query.c` and `drm_gpusvm.c`. The
+code is `intel_gpu_xe_svm.rs` (`intel_gpu_xe_vm::svm`).
+
+- **Admission.** The strict option `narf.intel.svm=1` (default off) makes the
+  GT owner publish GPUSVM (`UserBackend::cpu_addr_mirror`). On a USM device
+  (`has_usm`: graphics 20 and later, so Lunar Lake, Panther/Wildcat Lake,
+  Nova Lake-S and Battlemage) a FAULT_MODE VM then mirrors the address space
+  of the process that created it, and DEVICE_QUERY sets
+  `DRM_XE_QUERY_CONFIG_FLAG_HAS_CPU_ADDR_MIRROR`. With the option off, on
+  Meteor/Arrow Lake, DG2 and Gen12, or on a VM without FAULT_MODE,
+  `CPU_ADDR_MIRROR` and `MADVISE_AUTORESET` stay EINVAL. A mirror is a MAP
+  with no object and no `cpu_addr_mirror_offset`, with a coherent PAT on an
+  iGPU. NARF also refuses compressed PAT indices and NULL on a mirror, which
+  Linux admits. AUTORESET is admitted and has nothing to reset (there is no
+  `DRM_IOCTL_XE_MADVISE`).
+- **VMAs and ranges.** A mirror MAP reserves a VMA, absorbing adjacent mirror
+  VMAs, and maps nothing. A VMA change that removes part of a mirror still
+  holding an SVM range is EBUSY; ranges a CPU unmap removed are
+  garbage-collected first. A range is the largest of the 2 MiB, 64 KiB and
+  4 KiB chunks that fits the mirror, overlaps no range and whose pages the CPU
+  maps (checked by collecting them: drivers have no CPU VMA lookup). Each has
+  its own memory/ interval notifier, and its pages are pinned inside
+  `read_begin`/`read_retry` (`drm_gpusvm_get_pages`).
+- **Faults.** NARF's GPU takes no recoverable fault: each job runs on private
+  tables built at EXEC, and contexts carry no ASID. `svm::guc` decodes the
+  GuC `REPORT_PAGE_FAULT_REQ_DESC` payload and encodes the
+  `PAGE_FAULT_RES_DESC` reply; `XeFile::service_page_fault` services a fault
+  (`xe_pagefault_service`, `__xe_svm_handle_pagefault`) from the creator's
+  context only (ENOSYS from another process). Nothing routes a hardware fault
+  there yet. PREFETCH over a mirror populates its chunks and skips CPU holes,
+  at most 512 MiB of mirror per PREFETCH.
+- **Invalidation.** Callbacks do not block. An invalidated range is left out
+  of every job built afterwards, and EXEC refaults it from the creator's
+  context, leaving it unmapped if that fails. An UNMAP also
+  garbage-collects it, so only a new fault recreates it. A job built earlier
+  keeps its pins until it retires, as for USERPTR. Populated ranges count
+  against the job tables' 4096 entries and 512 MiB (ENOMEM).
+- **No device memory.** NARF behaves as Linux built without
+  `CONFIG_DRM_XE_PAGEMAP`: `svm::Pagemap` is uninhabited, so ranges stay in
+  system memory on Battlemage too, including for a PREFETCH to VRAM.
+
+Fixtures: `drivers/gpu/intel_gpu_xe`:
+`smoke_xe_svm_option_off_refusal_and_mirror_bind_admission`,
+`smoke_xe_svm_mirror_vma_merge_carve_and_cover`,
+`smoke_xe_svm_guc_fault_descriptor_and_reply`; `drivers/gpu/intel_gpu_user`:
+`smoke_xe_svm_gpu_fault_populates_zaps_and_refaults` (Lunar Lake GT model).
+Not done: hardware fault delivery (ASIDs in the LRC, the G2H 0x6002 route,
+in-place PTE updates of a running job and TLB invalidation), VRAM migration,
+madvise, and a silicon run.
+
 ### Pinned USERPTR pages survive reclaim — native fixtures added
 
 Sources are Linux b90c984d: `mm/vmscan.c::shrink_folio_list` (the two
@@ -8093,11 +8222,24 @@ firmware command set), `intel_hdcp_shim` (DP and HDMI sinks) and
   connector_property_event`: change, `HOTPLUG=1`, `CONNECTOR`,
   `PROPERTY`, as `drm_sysfs_connector_property_event`).
 - Routes: the connector binds to the function's single live route: a
-  Gen12 HPD DP/HDMI/MST session, a display 14+ DP/HDMI/MST route, or the
-  route a Tiger/Alder Lake-P firmware display lit (`TRANS_DDI_FUNC_CTL`
-  readout; DP on combo DDIs whose sink is not eDP, HDMI with the DDI's
-  default DDC pin). Several routes, older displays and other platforms'
-  firmware routes are refused with typed errors (`HdcpError`).
+  Gen12 HPD DP/HDMI/MST session, a Gen9 or Gen11 one (display 9, 10 on
+  Gemini Lake, 11), a display 14+ DP/HDMI/MST route, or the route a
+  Tiger/Alder Lake-P firmware display lit (`TRANS_DDI_FUNC_CTL` readout; DP
+  on combo DDIs whose sink is not eDP, HDMI with the DDI's default DDC
+  pin). Several routes, a display 9-11 session on DDI E or later
+  (`is_hdcp_supported`) and other platforms' firmware routes are refused
+  with typed errors (`HdcpError`).
+- Display 9-11 (`TRANS_HDCP(display)` false, `HdcpHw`): the DDI port's
+  `PORT_HDCP_*` block (A 0x66800, B 0x66500, C 0x66600, D 0x66700) for
+  HDCP 1.4 and 2.2, `PIPE_HDCP2_STREAM_STATUS(pipe)` and the port's one
+  HDCP 1.4 status for MST streams, the DDI repeater bits
+  (`HDCP_DDIx_REP_PRESENT | HDCP_DDIx_SHA1_M0`), PW_1 at
+  `SKL_PW_CTL_IDX_PW_1` (14) on display 9 and 10, the fuse load through
+  the pcode mailbox (`SKL_PCODE_LOAD_HDCP_KEYS`) on display 9 except
+  Broxton, no line rekeying, and a firmware port ID naming the DDI
+  (`intel_get_hdcp_ddi_index`) with no transcoder. HDCP 2.2 only where
+  `is_hdcp2_supported` admits it (display 10+, Kaby/Coffee/Comet Lake);
+  Skylake and Broxton use HDCP 1.4.
 - DP MST (`intel_hdcp::mst`): the link authenticates on the master
   transcoder and every stream of the route is encrypted by
   `TRANS_DDI_HDCP_SELECT` in its own transcoder, confirmed by
@@ -8116,14 +8258,33 @@ firmware command set), `intel_hdcp_shim` (DP and HDMI sinks) and
   stream management, HDMI line-rekey control by display stepping, link
   check every 500 ms. Firmware: the MEI HDCP client
   (`narf_drivers_platform::mei_hdcp`, joined through
-  `narf_drivers::hdcp_component`) on display 12/13; the media GT's GSC on
+  `narf_drivers::hdcp_component`) below display 14, bound on the TGP, ADP
+  and RPL PCHs and, for Coffee and Comet Lake, on CNP-H and CMP-LP/H (the
+  other display 9-11 PCHs are not claimed by the MEI driver, so they fall
+  back to HDCP 1.4); the media GT's GSC on
   14+ (with `narf.intel.media_gt=1 narf.intel.gsc=1`), whose worker
   submits each framed command from its packet object. Without the firmware
   type-0 content falls back to HDCP 1.4 and type 1 is refused.
 - SRM: `display_hdcp_srm.bin` from the firmware registry; none revokes
   nothing, as in Linux.
-- Not done: the HDCP debugfs files, Gen9/Gen11 port-indexed HDCP
-  registers, and any silicon run.
+- debugfs (`intel_hdcp_debugfs`, `intel_hdcp_connector_debugfs_add`):
+  `/sys/kernel/debug/dri/<minor>/<DP-n|HDMI-A-n|HDMI-B-n>/` holds
+  `i915_hdcp_sink_capability` (0444: "<name>:<id> HDCP version: " then
+  "HDCP1.4 ", "HDCP2.2 " or "None"; the sink is read on the HDCP service
+  pass, ENODEV without a route, ETIMEDOUT after 2 s) and
+  `i915_force_hdcp14` (0644: "yes"/"no", ENODEV without a route; a write
+  takes `kstrtobool` and limits the next enable and link check to HDCP
+  1.4). NARF has no DRM debugfs core: this module owns `dri/` through
+  `narf_filesystem::debugfs::register_dir`, only with the option.
+- Fixtures: `drivers/gpu/intel_hdcp` also runs
+  `smoke_intel_hdcp_gen9_gen11_port_layout`,
+  `smoke_intel_hdcp14_gen9_port_registers_and_pcode_key_load`,
+  `smoke_intel_hdcp_gen11_hdmi14_and_hdcp22_mei_port_data`,
+  `smoke_intel_hdcp_debugfs_names_texts_and_bool_grammar` and
+  `smoke_intel_hdcp_debugfs_capability_and_force_through_the_service`.
+- Not done: Gen9/Gen11 MST HDCP has no fixture of its own (its registers
+  are the layout fixture's), HDCP 2.2 on the Gen9/Gen11 PCHs the MEI driver
+  does not claim, and any silicon run.
 
 ### DP 2.0 UHBR on display 14+ external DP (`narf.intel.uhbr=1`) — native fixtures added
 
@@ -8141,11 +8302,97 @@ UHBR images and TX FFE presets in `intel_gpu_xelpg` and the LT UHBR enable in
   UHBR10 and UHBR20 on the Meteor/Arrow and Lunar Lake TC ports, Panther
   Lake's C20 DDI B and TC ports and Nova Lake's LT ports; none on C10 PHYs or
   Wildcat Lake; UHBR13.5 never (only `bmg_rates` has it).
+- Thunderbolt alt mode (display 30+): `intel_gpu_dp_tunnel` is the DPCD
+  side of `drm_dp_tunnel.c` for one tunnel (detect, BW allocation enable,
+  the 3000 ms bandwidth request); the tunnel supplies the DPRX's 128b/132b
+  rates, lane count and bandwidth cap (with the lane 0 mapping
+  workaround), the stream's bandwidth is requested before the port and
+  freed after it, and the port clock is `XELPDP_DDI_CLOCK_SELECT_TBT_312_5`
+  / `_625` (`enable_tbt_clock_khz`). An 8b/10b probe hands the tunnel back
+  to its legacy allocation. Display 14/20 have no TBT UHBR select and refuse
+  (`UhbrRefusal::Tbt`).
+- LTTPRs: the common caps bound the link and mask the UHBR rates; the
+  enable runs `intel_dp_init_lttpr_and_dprx_caps` (non-transparent mode),
+  `drm_dp_lttpr_wake_timeout_setup` and the start-of-training re-init, and
+  trains with the repeater count. The stop hands the repeaters back to
+  transparent mode, because the 8b/10b route does not train per hop.
+- Fallback: `intel_dp_link_caps.c`'s configuration orders and
+  `intel_dp_get_link_train_fallback_values` (`uhbr::LinkCaps`); a failed
+  128b/132b training stops the route and retries once at the reduced
+  configuration the modeset retry's `intel_dp_compute_link_config_wide`
+  picks, 128b/132b or 8b/10b.
+- HDCP: a 128b/132b SST route is offered as DP SST (`hdcp_route_of`), as
+  Linux's SST shim takes it.
+- VBT: `BDB_VSWING_PREEMPH` table 5 for a child with `use_vbt_vswing`
+  replaces `mtl_c20_trans_uhbr` on C20 ports (`intel_bios_get_c20_vspeo`).
+- DSC: Linux 7.4's search (`intel_gpu_xelpg_dsc::compute_with`) tries the
+  128b/132b configurations after the 8b/10b ones at each compressed bpp
+  (`uhbr::dsc_mtp_tu`: the slice-aware MTP, implicit FEC, display 14's
+  DSC->DPT limit). A 128b/132b result enables the sink's decompression with
+  no `DP_FEC_READY` or `DP_TP_CTL` FEC and programs the compressed MTP M/N,
+  the PPS SDP and the VDSC engines.
+- MST: a hub whose highest-bandwidth common configuration is UHBR runs
+  128b/132b MST (`intel_gpu_xelpg_mst.rs`, `uhbr::mst_stream`): 64 slots
+  from slot 0 with `drm_dp_get_vc_payload_bw`, the remote PBN/TU, the
+  primary's 128b/132b training without the SST payload, every stream's
+  `TRANS_DP2_CTL`, VFREQ and 128b/132b function on the master's transport,
+  and Linux's payload part 1 / function / ACT / part 2 order. HDCP stream
+  encryption sees its streams. 8b/10b MST is unchanged.
 - Route: `ExternalError::Uhbr` (`UhbrRefusal`) carries the typed refusals:
-  128b/132b MST, DSC with a common UHBR rate, Thunderbolt alt mode, LTTPRs,
-  MTP slot overflow, and failed training or payload (no reduced-parameter
-  retry). HDCP is not offered on a 128b/132b route.
-- Not done: the refusals above, VBT C20 vswing overrides, a silicon run.
+  Thunderbolt UHBR on display 14/20, 128b/132b MST over Thunderbolt (the
+  tunnel's per-stream bandwidth), a failed tunnel bandwidth request, MTP
+  slot overflow, a failed training with no reduced configuration (or a
+  failed retry; compressed and MST routes do not retry), and a failed
+  payload.
+- Not done: DSC over 128b/132b MST, 128b/132b MST through a DP tunnel, the
+  per-hop 8b/10b LTTPR training, the VBT DP 1.4 C20 and C10 overrides, a
+  silicon run.
+
+### Display 14+ deep colour, YCbCr 4:4:4, audio and HDMI FRL facts (`narf.intel.hdmi14_ext=1`) — native fixtures added
+
+`intel_gpu_xelpg_color` and `intel_gpu_xelpg_audio` (submodules of
+`intel_gpu_xelpg_external`), the FRL facts in `intel_gpu_xelpg_hdmi` and
+`intel_gpu_xelpg`, and the audio component seam in
+`narf_drivers_sound::display_audio`, after Linux 7.4-rc4 `intel_hdmi.c`,
+`intel_dp.c`, `intel_ddi.c`, `intel_display.c`, `intel_audio.c`,
+`intel_cx0_phy.c`, `drm_edid.c`, `drm_dp_helper.c`, `sound/hda/core/component.c`
+and `sound/hda/codecs/hdmi/intelhdmi.c`.
+
+- Option: `narf.intel.hdmi14_ext=1` (strict, default off). Without it the
+  routes keep 8 bpc (6 bpc DP) RGB, write no GCP, PCON or audio register,
+  and bind no audio component.
+- Deep colour: the pipe maximum is `compute_sink_pipe_bpp` over
+  `update_display_info`'s bpc (HDMI VSDB DC flags for EDID 1.3, the EDID
+  1.4 depth field) with `max_requested_bpc` 12. HDMI takes
+  `intel_hdmi_compute_bpc` (sink DC flags, `hdmi_port_clock_valid` at the
+  scaled TMDS clock); DP takes `intel_dp_compute_link_config_wide` above
+  24 bpp on 8b/10b, before DSC. The pipe carries `PIPE_MISC` BPC_10 /
+  BPC_12_ADLP, `TRANS_DDI_BPC_10` / `_12`, the DP MSA depth and M/N at the
+  pipe bpp; HDMI sinks get the GCP. Not taken: a DP branch device, UHBR,
+  MST and DSC (8 bpc search kept), and a deep C20 clock this driver cannot
+  build a PLL for (the depth steps down).
+- YCbCr 4:4:4: only Linux's case, a DPCD 1.3+ branch whose HDMI DFP
+  converts 4:4:4 to 4:2:0 but not RGB to YCbCr, feeding a 4:2:0-only mode:
+  `intel_dp_configure_protocol_converter`, the BT.709 output CSC with
+  `PIPE_MISC_OUTPUT_COLORSPACE_YUV` and `DP_MSA_MISC_COLOR_YCBCR_444_BT709`.
+  A 4:2:0 output on the DP link is refused (`ColorRefusal::Ycbcr420Output`).
+  HDMI never drives 4:4:4 (`intel_hdmi_output_format`).
+- Audio: `hsw_audio_codec_enable` / `_disable` after the plane update and
+  before the plane disable (DSC hblank workaround, SDP split, Wa_14020863754,
+  HDMI pixel-clock field and deep-colour N tables), the ELD only through
+  the component (`intel_audio_compute_config`: Linux's baseline length, AI,
+  HDMI SAD pruning, A/V sync delay), `find_audio_state`, `get_power`,
+  `codec_wake_override`, `sync_audio_rate`, `get_eld`, `AUD_TS_CDCLK`
+  around CDCLK changes and the 192 MHz `intel_audio_min_cdclk` floor. MST
+  routes take no audio. The ELD is Linux's connector ELD (`drm_edid_to_eld`),
+  so a sink that declares only basic audio gets audio with a SAD-less ELD.
+  The component is bound at GPU probe and holds no power well (the live
+  route holds PW_2). The HDA driver's Intel HDMI codec consumes it.
+- HDMI FRL: Linux 7.4 has no native FRL link training for the source, so
+  FRL stays refused (`HdmiError::FrlUnsupported` above 600 MHz on an FRL
+  sink). Carried: `intel_hdmi_is_frl`, the sink's max FRL rate, the C20 FRL
+  tables and VDR parameters, DIV18CLK and the FRL link symbol clock.
+- Not done: silicon runs and the gaps above.
 
 ## Completion of Intel iGPU and Discrete Arc Support
 

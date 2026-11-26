@@ -1019,6 +1019,9 @@ impl ColdBoot {
     /// Fresh firmware/queue/display owners after a proven full reset. Old
     /// reservations stay quarantined; the client heap's allocator is reused
     /// so live allocations cannot overlap the new owner's reservations.
+    // Out of line, as build/frame-budget.txt lists it: inlined into
+    // after_reset_boxed, its 16 KiB frame became that wrapper's.
+    #[inline(never)]
     pub(crate) unsafe fn after_reset(&mut self) -> Result<Self, Error> {
         let Some(crate::amdgpu_reset_navi22::State::Complete(report)) =
             self.reset.as_ref().map(|r| r.state())

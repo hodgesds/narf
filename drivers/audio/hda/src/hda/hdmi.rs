@@ -635,12 +635,17 @@ pub(crate) struct Port {
 }
 
 impl IntelHda {
-    /// Every ATI codec output path, unsensed.
+    /// Every ATI codec output path and every Intel one bound to the
+    /// display's audio component, unsensed.
     pub(super) fn hdmi_ports(&self) -> Vec<Port> {
         self.outputs
             .iter()
             .enumerate()
-            .filter(|(_, path)| hda_codec::is_ati_hdmi(&self.graphs[path.codec]))
+            .filter(|(_, path)| {
+                let graph = &self.graphs[path.codec];
+                hda_codec::is_ati_hdmi(graph)
+                    || super::intelhdmi::bound_graph_model(graph).is_some()
+            })
             .map(|(output, _)| Port {
                 output,
                 present: false,
@@ -796,6 +801,19 @@ impl IntelHda {
             let path = &self.outputs[output];
             let graph = &self.graphs[path.codec];
             let pin = path.nodes.pin_nid;
+            // An Intel pin: `sync_eld_via_acomp` (no sense verb).
+            if hda_codec::intel_hdmi_model(graph).is_some() {
+                let (present, sink) = self.intel_sense(graph, pin);
+                let mut ports = self.hdmi.lock();
+                let port = &mut ports[index];
+                port.eldv = sink.is_some();
+                if port.present != present || port.sink != sink {
+                    port.present = present;
+                    port.sink = sink;
+                    changed.push(index);
+                }
+                continue;
+            }
             let sense = self.verb_async(graph.addr, pin, GET_PIN_SENSE << 8).await?;
             let present = sense & PINSENSE_PRESENCE != 0;
             let eldv = present && sense & PINSENSE_ELDV != 0;
@@ -1079,10 +1097,10 @@ impl IntelHda {
 
     /// Pre-rev3 ATI codecs remap channels in pairs (has_amd_full_remap_support).
     fn hdmi_paired(&self) -> bool {
-        self.hdmi
-            .lock()
-            .iter()
-            .any(|p| !hda_codec::ati_hdmi_rev3(&self.graphs[self.outputs[p.output].codec]))
+        self.hdmi.lock().iter().any(|p| {
+            let graph = &self.graphs[self.outputs[p.output].codec];
+            hda_codec::is_ati_hdmi(graph) && !hda_codec::ati_hdmi_rev3(graph)
+        })
     }
 
     /// `set_dig_out_convert` on the converter HDMI PCM `pcm` is assigned
@@ -1194,6 +1212,12 @@ impl IntelHda {
             for output in self.pcm_outputs() {
                 let path = &self.outputs[output];
                 let graph = &self.graphs[path.codec];
+                if hda_codec::intel_hdmi_model(graph).is_some() {
+                    let sink = self.hdmi_sink(output);
+                    self.intel_hdmi_infoframe(graph, &path.nodes, channels, sink.as_ref(), &pcm)
+                        .map_err(|_| SoundError::BadState)?;
+                    continue;
+                }
                 if !hda_codec::is_ati_hdmi(graph) {
                     continue;
                 }

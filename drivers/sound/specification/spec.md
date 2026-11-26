@@ -130,6 +130,22 @@ own file is configured, and configuration does not start capture.
 Unimplemented ALSA timer/sequencer devices are absent from devfs and sysfs;
 the former write-discarding placeholder nodes are not published.
 
+`display_audio` is the display-audio meeting point. Its ELD publication sink
+(`build_eld`, `publish_display_audio`, `clear_display_audio`,
+`display_audio_snapshot`) is joined by the audio component seam of
+`drm_audio_component`: a display driver binds a `DisplayAudioComponent`
+(`get_power`, `put_power`, `codec_wake_override`, `get_cdclk_freq`,
+`sync_audio_rate`, `get_eld`) with `bind_display_audio_component`, an HDA
+codec driver registers a `DisplayAudioCodec` (`pin2port`, `pin_eld_notify`)
+with `register_display_audio_codec`, and the display side calls
+`notify_pin_eld(port, pipe)`. `acomp_get_eld`, `acomp_sync_audio_rate`,
+`acomp_set_codec_wakeup` and `DisplayPower::set` are the HDA-core helpers of
+`sound/hda/core/component.c` over explicit halves (`ComponentError::NoDevice`
+for `-ENODEV`, `Invalid` for `-EINVAL`). No lock is held across a call into
+either half. The Intel display-14+ routes bind a component under
+`narf.intel.hdmi14_ext=1`, and the HDA driver's Intel HDMI codec registers
+the codec half when it binds to it.
+
 ### 3.1 Linux ALSA PCM and control ABI
 
 The bridge implements the 64-bit `sound/asound.h` layouts shared by x86_64

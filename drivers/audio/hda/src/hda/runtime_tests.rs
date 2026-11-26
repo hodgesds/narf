@@ -82,6 +82,13 @@ struct Model {
     /// 0 until written — like a codec fresh out of reset — unless
     /// the fixture pre-seeds it.
     coef: Vec<(u8, u16, u16)>,
+    /// Answer as an Intel Meteor Lake HDMI/DP codec (`intel_response`).
+    intel: bool,
+    /// Intel: the vendor parameter on node 2 (`INTEL_SET_VENDOR_VERB`).
+    intel_vendor: u32,
+    /// Intel: each node's connection select and actual power state.
+    intel_sel: [u32; 8],
+    intel_power: [u32; 8],
 }
 impl Model {
     fn step(&mut self) {
@@ -130,6 +137,8 @@ impl Model {
                     self.navi22_response(command)
                 } else if self.ati {
                     self.ati_response(command)
+                } else if self.intel {
+                    self.intel_response(command)
                 } else if self.yoga9 {
                     self.yoga9_response(command)
                 } else {
@@ -219,7 +228,7 @@ impl Model {
                 // coef value spans the verb field's low byte and
                 // the payload byte, so the verb match masks to
                 // the 4-bit verb id (0x500 / 0x400).
-                if !self.ati && !self.navi22 {
+                if !self.ati && !self.navi22 && !self.intel {
                     let nid = (command >> 20) as u8;
                     let verb = (command >> 8) & 0xfff;
                     let payload = command as u8;
@@ -520,6 +529,65 @@ impl Model {
         }
     }
 }
+impl Model {
+    /// An Intel Meteor Lake HDMI/DP codec (0x8086281d, `MODEL_ADLP`) at
+    /// address 0: AFG 1; converters 2, 3 and 5 (digital, eight channels);
+    /// pin 4 (port A, no physical connection) and pin 6 (port B, a jack),
+    /// each connected to all three converters. Nodes 5 and 6 only appear
+    /// once `INTEL_EN_ALL_PIN_CVTS` is set on node 2, as on hardware whose
+    /// BIOS left the second and third converters hidden. Pin 6 comes up in
+    /// D3 until set to D0. DIP and channel-slot writes only land in the
+    /// verb log; the DIP transmit state reads "disabled".
+    fn intel_response(&mut self, command: u32) -> u32 {
+        let nid = (command >> 20) as u8;
+        let verb = (command >> 8) & 0xfff;
+        let param = command as u8;
+        let converter = matches!(nid, 2 | 3 | 5);
+        let pin = matches!(nid, 4 | 6);
+        let slot = usize::from(nid & 7);
+        match (nid, verb, param) {
+            (0, 0xf00, 0) => 0x8086281d,
+            (0, 0xf00, 2) => 0x0010_0000,
+            (0, 0xf00, 4) => 0x00010001,
+            (1, 0xf00, 5) => 1,
+            (1, 0xf00, 4) if self.intel_vendor & 1 != 0 => 0x00020005,
+            (1, 0xf00, 4) => 0x00020003,
+            // 16/20/24/32-bit, 32..192 kHz; PCM.
+            (1, 0xf00, 0xa) => 0x001e_07f0,
+            (1, 0xf00, 0xb) => 1,
+            (2, 0xf81, _) => self.intel_vendor,
+            (2, 0x781, value) => {
+                self.intel_vendor = u32::from(value);
+                self.intel_vendor
+            }
+            // Digital Audio Output, power control, eight channels.
+            (_, 0xf00, 9) if converter => (3 << 13) | 0x601,
+            // Digital pin, power control, connection list, unsol, out amp.
+            (_, 0xf00, 9) if pin => (4 << 20) | 0x785,
+            // HBR, DP, HDMI, output, presence detect.
+            (_, 0xf00, 0xc) if pin => (1 << 27) | (1 << 24) | 0x94,
+            (_, 0xf00, 0xe) if pin => 3,
+            (_, 0xf02, _) if pin => 0x0005_0302,
+            (_, 0xf00, 0x12) => 0x8000_0000,
+            (4, 0xf1c, _) => 0x5856_0020,
+            (6, 0xf1c, _) => 0x1856_0010,
+            (_, 0xf01, _) if pin => self.intel_sel[slot],
+            (_, 0x701, index) if pin => {
+                self.intel_sel[slot] = u32::from(index);
+                0
+            }
+            (_, 0xf05, _) => self.intel_power[slot],
+            (_, 0x705, state) => {
+                self.intel_power[slot] = u32::from(state & 0xf) * 0x11;
+                0
+            }
+            (_, 0xf2d, _) if converter => 1,
+            (_, 0xf07, _) if pin => 0x40,
+            _ => 0,
+        }
+    }
+}
+
 fn pump() {
     let model = MODEL.lock();
     if *model != 0 {
@@ -550,6 +618,8 @@ struct FixtureConfig {
     seed_coef: &'static [(u8, u16, u16)],
     /// STATESTS reads 0: the link has no codec at all.
     no_codecs: bool,
+    /// Answer as the Intel Meteor Lake HDMI codec.
+    intel: bool,
 }
 
 struct Fixture {
@@ -677,6 +747,7 @@ impl Fixture {
             codec_mask,
             seed_coef,
             no_codecs,
+            intel,
         } = config;
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
@@ -738,6 +809,10 @@ impl Fixture {
                     coef.extend_from_slice(seed_coef);
                     coef
                 },
+                intel,
+                intel_vendor: 0,
+                intel_sel: [0; 8],
+                intel_power: [0, 0, 0, 0, 0, 0, 0x33, 0],
             }),
         };
         *MODEL.lock() = &mut *fixture.model as *mut Model as usize;
@@ -4315,3 +4390,260 @@ kernel_test_in!(
     "audio/hda/pm-system",
     native_hda_pm_system_suspend_stops_prepared_streams
 );
+
+// ── Intel HDMI/DP codec over the display-audio component ─────────────
+
+/// A scripted Intel display (the `drm_audio_component_ops` half): an ELD
+/// for display port B once "hotplugged", and every call it receives.
+#[derive(Debug)]
+struct ScriptedDisplay {
+    state: IrqSafeSpinLock<ScriptedState>,
+}
+
+#[derive(Debug, Default)]
+struct ScriptedState {
+    /// The ELD on port 1 (PORT_B), when a monitor is lit there.
+    eld: Option<Vec<u8>>,
+    calls: Vec<(&'static str, i32, i32, u32)>,
+}
+
+impl narf_drivers_sound::display_audio::DisplayAudioComponent for ScriptedDisplay {
+    fn get_power(&self) -> u64 {
+        self.state.lock().calls.push(("get_power", 0, 0, 0));
+        1
+    }
+    fn put_power(&self, cookie: u64) {
+        self.state
+            .lock()
+            .calls
+            .push(("put_power", 0, 0, cookie as u32));
+    }
+    fn codec_wake_override(&self, enable: bool) {
+        self.state
+            .lock()
+            .calls
+            .push(("wake", 0, 0, u32::from(enable)));
+    }
+    fn get_cdclk_freq(&self) -> Result<u32, narf_drivers_sound::display_audio::ComponentError> {
+        Ok(307_200)
+    }
+    fn sync_audio_rate(
+        &self,
+        port: i32,
+        pipe: i32,
+        rate: u32,
+    ) -> Result<(), narf_drivers_sound::display_audio::ComponentError> {
+        let mut state = self.state.lock();
+        state.calls.push(("rate", port, pipe, rate));
+        if port == 1 && state.eld.is_some() {
+            Ok(())
+        } else {
+            Err(narf_drivers_sound::display_audio::ComponentError::NoDevice)
+        }
+    }
+    fn get_eld(
+        &self,
+        port: i32,
+        _pipe: i32,
+        buf: &mut [u8],
+    ) -> Result<(bool, usize), narf_drivers_sound::display_audio::ComponentError> {
+        let state = self.state.lock();
+        match (&state.eld, port) {
+            (Some(eld), 1) => {
+                let n = eld.len().min(buf.len());
+                buf[..n].copy_from_slice(&eld[..n]);
+                Ok((true, eld.len()))
+            }
+            _ => Err(narf_drivers_sound::display_audio::ComponentError::Invalid),
+        }
+    }
+}
+
+static SCRIPTED_DISPLAY: ScriptedDisplay = ScriptedDisplay {
+    state: IrqSafeSpinLock::new(ScriptedState {
+        eld: None,
+        calls: Vec::new(),
+    }),
+};
+
+/// The ELD i915 hands the codec for a stereo LPCM HDMI sink
+/// (`drm_edid_to_eld`): CEA-861-D, CTA revision 3, one SAD (2 ch, 32-48
+/// kHz, 16/20/24-bit), FL/FR, baseline 6 units (28 bytes).
+const INTEL_SINK_ELD: [u8; 28] = [
+    0x10, 0, 6, 0, 0x60, 0x10, 0, 0x01, //
+    0, 0, 0, 0, 0, 0, 0, 0, //
+    0x3a, 0xc4, 0x34, 0x12, 0x09, 0x07, 0x07, 0, //
+    0, 0, 0, 0,
+];
+
+fn intel_fixture() -> Result<Fixture, &'static str> {
+    Fixture::build_model(FixtureConfig {
+        intel: true,
+        ..Default::default()
+    })
+}
+
+/// Without the display's audio component an Intel HDMI codec is not
+/// bound (`alloc_intel_hdmi`): no vendor verb, no path, no port.
+fn native_hda_intel_hdmi_unbound_without_component() -> TestResult {
+    use narf_drivers_sound::display_audio as acomp;
+    acomp::unbind_display_audio_component();
+    let fixture = match intel_fixture() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let vendor_verbs = fixture
+        .model
+        .verbs
+        .iter()
+        .filter(|v| (*v >> 8) & 0xfff == 0xf81 || (*v >> 8) & 0xfff == 0x781)
+        .count();
+    if dev.codecs()[0].vendor_id != 0x8086281d
+        || !dev.outputs.is_empty()
+        || !dev.hdmi.lock().is_empty()
+        || vendor_verbs != 0
+    {
+        return TestResult::Fail("an unbound Intel HDMI codec must stay untouched");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_intel_hdmi_unbound_without_component);
+
+/// The Intel HDMI codec end to end against a scripted display: the codec
+/// binds to the component (`snd_hdac_i915_init`), gets
+/// `intel_haswell_enable_all_pins` and the DP 1.2 fixup before its widgets
+/// are read (the hidden converter and pin appear), and port B's pin 6 takes
+/// converter 2. Hotplug: the display lights port B and calls
+/// `pin_eld_notify(PORT_B, -1)`; the codec marks its jack dirty
+/// (`intel_pin_eld_notify` maps port 1 to pin 6, `intel_port2pin`), and the
+/// re-read takes the ELD through the component (`snd_hdac_acomp_get_eld`
+/// over `intel_pin2port`, dev 0). Stream start: display power with the codec
+/// wake pulse (`snd_hdac_display_power`), the vendor verbs before the AFG's
+/// D0, `haswell_verify_D0` (pin 6 to D0), the pin's converter select,
+/// `snd_hdac_sync_audio_rate(port 1, dev 0, 48000)`, the standard slot map
+/// for CA 0, the HDMI audio InfoFrame (stop, nine bytes, start), the IEC
+/// coding type, then the stream format and tag.
+fn native_hda_intel_hdmi_component_end_to_end() -> TestResult {
+    use narf_drivers_sound::display_audio as acomp;
+    acomp::unbind_display_audio_component();
+    *SCRIPTED_DISPLAY.state.lock() = ScriptedState::default();
+    super::super::intelhdmi::reset_display_power_for_test();
+    if !acomp::bind_display_audio_component(&SCRIPTED_DISPLAY) {
+        return TestResult::Fail("the scripted display must bind");
+    }
+    let result = intel_end_to_end();
+    acomp::unbind_display_audio_component();
+    acomp::unregister_display_audio_codec();
+    super::super::intelhdmi::reset_display_power_for_test();
+    result
+}
+
+fn intel_end_to_end() -> TestResult {
+    let fixture = match intel_fixture() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    // Probe: the vendor verbs precede the widget count read that finds the
+    // hidden nodes.
+    let verbs = fixture.model.verbs.clone();
+    let at = |v: u32| verbs.iter().position(|x| *x == v);
+    match (
+        at(make_verb(0, 2, 0x78101)),
+        at(make_verb(0, 2, 0x78103)),
+        verbs
+            .iter()
+            .rposition(|x| *x == make_verb(0, 1, VERB_GET_PARAMETER | 4)),
+    ) {
+        (Some(all), Some(dp12), Some(count)) if all < dp12 && dp12 < count => {}
+        _ => return TestResult::Fail("EN_ALL_PIN_CVTS and EN_DP12 must precede the widget walk"),
+    }
+    if dev.outputs.len() != 1
+        || dev.outputs[0].nodes.pin_nid != 6
+        || dev.outputs[0].nodes.converter_nid != 2
+        || dev.hdmi.lock().len() != 1
+    {
+        return TestResult::Fail("port B's pin 6 must take converter 2");
+    }
+    super::super::intelhdmi::register_notifier(&dev);
+    // Hotplug: the display lights port B and notifies.
+    SCRIPTED_DISPLAY.state.lock().eld = Some(INTEL_SINK_ELD.to_vec());
+    dev.jack_dirty.store(false, Ordering::Release);
+    narf_drivers_sound::display_audio::notify_pin_eld(1, -1);
+    if !dev.jack_dirty.load(Ordering::Acquire) {
+        return TestResult::Fail("pin_eld_notify(PORT_B) must mark the codec's jack dirty");
+    }
+    // A port the codec has no pin for is not its event.
+    dev.jack_dirty.store(false, Ordering::Release);
+    narf_drivers_sound::display_audio::notify_pin_eld(5, -1);
+    if dev.jack_dirty.load(Ordering::Acquire) {
+        return TestResult::Fail("a port without a pin must not mark the jack");
+    }
+    if dev.refresh_hdmi(false).is_err() {
+        return TestResult::Fail("the jack re-read must run");
+    }
+    let (jack, eld) = dev.hdmi_jack();
+    if !jack || eld != INTEL_SINK_ELD {
+        return TestResult::Fail("the ELD must come through the component");
+    }
+    // Stream start on the port's PCM (device 3).
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 3) else {
+        return TestResult::Fail("open the HDMI PCM");
+    };
+    let first = fixture.model.verbs.len();
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure Intel HDMI playback");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    let at = |v: u32| verbs.iter().position(|x| *x == v);
+    let expected = [
+        make_verb(0, 2, 0xf8100), // vendor verbs re-issued
+        make_verb(0, 1, 0x70500), // then the AFG to D0
+        make_verb(0, 6, 0x70500), // pin 6 out of its D3
+        make_verb(0, 6, 0xf0100), // the converter select
+        make_verb(0, 6, 0x73400), // slot 0 <- channel 0
+        make_verb(0, 6, 0x73411), // slot 1 <- channel 1
+        make_verb(0, 6, 0x734f7), // slot 7 empty
+        make_verb(0, 6, 0x73200), // InfoFrame transmit off
+        make_verb(0, 6, 0x73184), // type 0x84
+        make_verb(0, 6, 0x73170), // checksum
+        make_verb(0, 6, 0x732c0), // best effort
+        make_verb(0, 2, 0x73e00), // ICT (no HBR)
+        make_verb(0, 2, 0x70610), // stream tag
+    ];
+    let positions: Vec<Option<usize>> = expected.iter().map(|v| at(*v)).collect();
+    if positions.iter().any(Option::is_none) || positions.windows(2).any(|w| w[0] > w[1]) {
+        return TestResult::Fail("the Intel HDMI prepare verbs differ from Linux's order");
+    }
+    // The converter channel count already reads two: no write.
+    if verbs
+        .iter()
+        .any(|v| *v >> 20 == 2 && (*v >> 8) & 0xfff == 0x72d)
+    {
+        return TestResult::Fail("a matching channel count must not be rewritten");
+    }
+    // Power once (the bus keeps it), then a rate sync per codec setup: the
+    // configure and the prepare each run snd_hda_hdmi_generic_pcm_prepare.
+    let calls = SCRIPTED_DISPLAY.state.lock().calls.clone();
+    if calls.len() < 4
+        || calls[..4]
+            != [
+                ("get_power", 0, 0, 0),
+                ("wake", 0, 0, 1),
+                ("wake", 0, 0, 0),
+                ("rate", 1, 0, 48_000),
+            ]
+        || calls[4..].iter().any(|c| *c != ("rate", 1, 0, 48_000))
+    {
+        return TestResult::Fail("stream start must take power, pulse the wake and sync the rate");
+    }
+    drop(playback);
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_intel_hdmi_component_end_to_end);

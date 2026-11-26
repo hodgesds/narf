@@ -2,6 +2,20 @@
 //! stream owns the link/transport; secondary streams own only their pipe.
 //! A topology change rebuilds the stream set in reverse stop order, keeping
 //! the primary transport alive until the last secondary has stopped.
+//!
+//! Under `narf.intel.uhbr=1` a hub whose best common configuration is UHBR
+//! runs 128b/132b MST (`intel_dp_mst.c` over a UHBR link,
+//! [`super::UhbrMstLink`]): the 64 MTP slots from slot 0 with
+//! `drm_dp_get_vc_payload_bw`'s divider and each stream's remote TU
+//! ([`super::uhbr::mst_stream`]); the primary trains the link at 128b/132b
+//! with no SST payload; every stream sets `TRANS_DP2_CTL`, the VFREQ pair and
+//! `TRANS_DDI_FUNC_CTL` in 128b/132b mode on the master's MST transport (a
+//! secondary configures it before its enable,
+//! `intel_ddi_config_transcoder_func`); and each stream's payload follows
+//! `mst_stream_pre_enable` / `mst_stream_enable`: the DPCD payload table
+//! (`drm_dp_add_payload_part1`), the function, the ACT, the sink's ACT
+//! handled, then ALLOCATE_PAYLOAD (`drm_dp_add_payload_part2`). The 8b/10b
+//! MST route is unchanged.
 use super::*;
 use crate::dp_mst_mgr::{Manager, MstAux, Sink, Topology};
 use alloc::{boxed::Box, vec::Vec};
@@ -134,11 +148,13 @@ impl MtlMstRoute {
         decl: MtlPortDecl,
         display: &MtlDisplay,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        uhbr: Option<UhbrMstLink>,
     ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
         let mut aux = crate::intel_gpu_mst::IntelMstAux::xelpdp(io, link.port, link.tbt());
-        Self::connect_aux(io, link, decl, display, alloc, &mut aux)
+        Self::connect_aux_with(io, link, decl, display, alloc, &mut aux, uhbr)
     }
 
+    #[cfg(feature = "kernel-test")]
     fn connect_aux<M: MmioWindow + ?Sized, A: MstAux>(
         io: &M,
         link: LinkProbe,
@@ -146,6 +162,18 @@ impl MtlMstRoute {
         display: &MtlDisplay,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
         aux: &mut A,
+    ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
+        Self::connect_aux_with(io, link, decl, display, alloc, aux, None)
+    }
+
+    fn connect_aux_with<M: MmioWindow + ?Sized, A: MstAux>(
+        io: &M,
+        link: LinkProbe,
+        decl: MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+        uhbr: Option<UhbrMstLink>,
     ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
         let mut owner = Box::new(Self {
             link,
@@ -156,7 +184,7 @@ impl MtlMstRoute {
             first: None,
             stopped: false,
         });
-        let result = owner.start(io, decl, display, alloc, aux);
+        let result = owner.start(io, decl, display, alloc, aux, uhbr);
         match result {
             Ok(()) => Ok(owner),
             Err(error) => Err((owner, error)),
@@ -170,6 +198,7 @@ impl MtlMstRoute {
         display: &MtlDisplay,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
         aux: &mut A,
+        uhbr: Option<UhbrMstLink>,
     ) -> Result<(), ExternalError> {
         complete(self.manager.start(aux, &self.link.raw))?;
         let topology = complete(self.manager.probe(aux))?;
@@ -194,21 +223,42 @@ impl MtlMstRoute {
             max_rate: TrainRate::Hbr3,
             max_lanes: self.link.tc.map_or(4, |tc| tc.max_lanes),
         };
-        let negotiated = negotiate(&source, &caps, u64::MAX);
+        let mut negotiated = negotiate(&source, &caps, u64::MAX);
         let link_kbps = negotiated.rate.payload_kbps(negotiated.lanes) as u32;
-        let mut slot = 1u8;
+        if let Some(u) = uhbr {
+            negotiated.lanes = u.lanes;
+        }
+        // drm_dp_mst_update_slots: 8b/10b keeps slot 0 for the MTP header.
+        let mut slot = if uhbr.is_some() {
+            uhbr::MST_START_SLOT
+        } else {
+            1u8
+        };
         for sink in sinks {
             let topology = self.topology.as_ref().expect("probed");
             let edid = complete(self.manager.read_edid_block(aux, topology, sink, 0))?;
             let mode = crate::intel_gpu_dp::mode_from_edid(&edid)
                 .map_err(|_| ExternalError::Mst(MstFailure::Sideband))?;
-            let pbn = crate::dp_mst::calc_pbn_mode(mode.pixel_clock_khz, 24 * 16);
-            let slots = crate::dp_mst::time_slots(pbn, crate::dp_mst::pbn_div(link_kbps));
+            // 128b/132b: mst_stream_compute_link_config at the link's rate.
+            let stream = uhbr.and_then(|u| uhbr_stream(&u, &mode));
+            if uhbr.is_some() && stream.is_none() {
+                continue;
+            }
+            let (pbn, slots) = match &stream {
+                Some(s) => (s.pbn, u32::from(s.slots)),
+                None => {
+                    let pbn = crate::dp_mst::calc_pbn_mode(mode.pixel_clock_khz, 24 * 16);
+                    (
+                        pbn,
+                        crate::dp_mst::time_slots(pbn, crate::dp_mst::pbn_div(link_kbps)),
+                    )
+                }
+            };
             let path = topology
                 .path(sink)
                 .ok_or(ExternalError::Mst(MstFailure::Sideband))?;
             if slots == 0
-                || slots > 63
+                || (uhbr.is_none() && slots > 63)
                 || u32::from(slot) + slots > 64
                 || path.iter().any(|hop| {
                     ledger
@@ -249,8 +299,11 @@ impl MtlMstRoute {
                 edid: Box::new([0; EDID_CAPACITY]),
                 edid_len: 128,
                 dsc: None,
-                pipe_bpp: 24,
-                uhbr: None,
+                pipe_bpp: stream.as_ref().map_or(24, |s| s.pipe_bpp),
+                uhbr: uhbr.zip(stream.as_ref()).map(|(u, s)| uhbr_plan(&u, s)),
+                output: super::color::DpOutput::default(),
+                audio: None,
+                c20_uhbr_vspeo: decl.c20_uhbr_vspeo.filter(|_| uhbr.is_some()).map(Box::new),
             };
             // Copy the EDID straight into the probe's own buffer: a
             // separate 512-byte staging array is a second stack slot in
@@ -264,13 +317,30 @@ impl MtlMstRoute {
                 .ok_or(ExternalError::Mst(MstFailure::Sideband))?
                 .info
                 .sdp_streams;
-            complete(crate::dp_mst_mgr::write_payload(
-                aux,
-                vcpi,
-                slot,
-                slots as u8,
-            ))?;
-            let mut allocate = |_| {
+            // 8b/10b: the DPCD payload table now; 128b/132b: at the
+            // stream's activation (drm_dp_add_payload_part1 follows the
+            // primary's training).
+            if uhbr.is_none() {
+                complete(crate::dp_mst_mgr::write_payload(
+                    aux,
+                    vcpi,
+                    slot,
+                    slots as u8,
+                ))?;
+            }
+            let start_slot = slot;
+            let mut allocate = |_: Transcoder, step: PayloadStep| {
+                if step == PayloadStep::Part1 {
+                    if uhbr.is_some() {
+                        complete(crate::dp_mst_mgr::write_payload(
+                            aux,
+                            vcpi,
+                            start_slot,
+                            slots as u8,
+                        ))?;
+                    }
+                    return Ok(());
+                }
                 sink_act(aux)?;
                 let request = crate::dp_mst::Request::AllocatePayload {
                     port: sink.port,
@@ -289,7 +359,7 @@ impl MtlMstRoute {
                 }
             };
             let result = match self.streams.last() {
-                None => activate_with_payload(io, probe, fb, display, &mut allocate),
+                None => activate_with_payload(io, probe, fb, display, None, &mut allocate),
                 Some(previous) => activate_secondary(
                     io,
                     probe,
@@ -435,6 +505,30 @@ impl MtlMstRoute {
     }
 }
 
+/// The stream of [`uhbr::mst_stream`] for `mode` on the 128b/132b link
+/// (out of line: the connect loop's frame stays small).
+#[inline(never)]
+fn uhbr_stream(link: &UhbrMstLink, mode: &Mode) -> Option<uhbr::MstUhbrStream> {
+    uhbr::mst_stream(link.rate, link.lanes, mode, dsc::PIPE_BPP)
+}
+
+/// The boxed plan a 128b/132b MST stream's probe carries.
+#[inline(never)]
+fn uhbr_plan(link: &UhbrMstLink, stream: &uhbr::MstUhbrStream) -> Box<UhbrPlan> {
+    Box::new(UhbrPlan {
+        link: uhbr::UhbrLink {
+            rate: link.rate,
+            lanes: link.lanes,
+            pipe_bpp: stream.pipe_bpp,
+        },
+        stream: stream.stream,
+        post_lt_adj_req: link.post_lt_adj_req,
+        tunnel: None,
+        caps: link.caps,
+        max_bpp: dsc::PIPE_BPP as u8,
+    })
+}
+
 #[allow(clippy::result_large_err)]
 fn activate_secondary<M: MmioWindow + ?Sized>(
     io: &M,
@@ -442,25 +536,29 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
     fb: Framebuffer,
     display: &MtlDisplay,
     pipes: Pipes,
-    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
+    payload: &mut dyn FnMut(Transcoder, PayloadStep) -> Result<(), ExternalError>,
 ) -> Result<MtlExternalRoute, ActivateError> {
     let pipe = match free_pipe(io, ExternalDisplayProfile::for_ip(probe.display_ip)) {
         Ok(pipe) => pipe,
         Err(error) => return Err(ActivateError::Refused(probe, error)),
     };
     let choice = PipeChoice { pipe, pipes };
-    let ext = match external_pipe(
+    let mut ext = match external_pipe(
         &choice,
         probe.port,
         &probe.mode,
         &fb,
-        link_clock_khz(probe.negotiated.rate),
+        probe.port_clock_khz(),
         None,
-        24,
+        probe.pipe_bpp,
     ) {
         Ok(ext) => ext,
         Err(error) => return Err(ActivateError::Refused(probe, error)),
     };
+    // intel_dp_compute_min_hblank: display 30 programs it for 128b/132b MST.
+    if probe.uhbr.is_some() && probe.display_ip.is_display30() {
+        ext.min_hblank = uhbr::min_hblank(&probe.mode, probe.pipe_bpp);
+    }
     if let Err(error) = choice.pipes.admit(io, &ext) {
         return Err(ActivateError::Refused(probe, error.into()));
     }
@@ -475,9 +573,11 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
         trained,
         pipe,
         reservation: None,
+        retired: None,
         awaiting_fec_stop: false,
         state: RouteState::Stopped,
         uhbr: None,
+        audio: None,
     };
     let result = (|| {
         request_pipe_wells(io, pipe)?;
@@ -487,6 +587,17 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
             trans_clk_sel(pipe.transcoder()),
             trans_clk_sel_port(route.port()),
         )?;
+        // intel_ddi_config_transcoder_func for a following stream (display
+        // 13+): TRANS_DP2_CTL and the function without ENABLE (128b/132b).
+        if let Some(plan) = route.probe.uhbr.as_deref().copied() {
+            let trans = pipe.transcoder();
+            write(io, trans_dp2_ctl(trans), TRANS_DP2_128B132B_CHANNEL_CODING)?;
+            write(
+                io,
+                trans_ddi_func_ctl(trans),
+                uhbr_func(&route.probe, trans, plan.link.lanes) & !TRANS_DDI_FUNC_ENABLE,
+            )?;
+        }
         finish(io, &mut route, &trained, payload)
     })();
     match result {
@@ -518,6 +629,11 @@ fn stop_stream<M: MmioWindow + ?Sized>(
             trans_ddi_func_ctl(trans),
             func & !(TRANS_DDI_FUNC_ENABLE | TRANS_DDI_PORT_AND_MODE | (1 << 8)),
         )?;
+        // intel_ddi_disable_transcoder_func on a slave: the DP2 configuration
+        // off too.
+        if route.probe.uhbr.is_some() {
+            write(io, trans_dp2_ctl(trans), 0)?;
+        }
         write(io, trans_clk_sel(trans), 0)?;
         rp.pipes.release(io, rp.pipe, rp.dmc)?;
     }
@@ -766,5 +882,208 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xelpg_mst",
         smoke_nvl_mst_two_streams_over_lt_port_b
+    );
+    /// [`Branch`] that also records each DPCD payload-table write
+    /// (`DP_PAYLOAD_ALLOCATE_SET`: VCPID, start slot, slot count) with the
+    /// number of MMIO writes the source had made by then.
+    struct Logged<'a> {
+        inner: Branch<'a>,
+        payload: Vec<([u8; 3], usize)>,
+    }
+    impl MstAux for Logged<'_> {
+        type Error = ();
+        async fn read(&mut self, address: u32, out: &mut [u8]) -> Result<(), ()> {
+            self.inner.read(address, out).await
+        }
+        async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), ()> {
+            if address == 0x1C0 && data.len() == 3 {
+                let at = self.inner.io.writes.borrow().len();
+                self.payload.push(([data[0], data[1], data[2]], at));
+            }
+            self.inner.write(address, data).await
+        }
+        async fn delay(&mut self, us: u64) {
+            self.inner.delay(us).await
+        }
+    }
+
+    /// 128b/132b MST (`intel_dp_mst.c` over a UHBR link) on Meteor Lake TC1
+    /// (pin C, four lanes) behind a DP 2.0 hub with UHBR10/20: Linux takes
+    /// the highest-bandwidth common configuration, UHBR20 x4. Each 1024x768
+    /// 65 MHz stream (`intel_dp_mtp_tu_compute_config`, values from Linux
+    /// 7.4's formulas): `drm_dp_get_vc_payload_bw(2000000, 4)` = 733563
+    /// (20.12), the remote PBN `DIV_ROUND_UP(rate * 64, 54000)` = 233 with the
+    /// SSC margin, the remote TU 2, the allocated PBN 358 and two slots from
+    /// slot 0 (`drm_dp_mst_update_slots(DP_CAP_ANSI_128B132B)`), `DATA_M` =
+    /// `TU_SIZE(2)` | 0x0294b6, `LINK_M` 65000 / 625000 at N 0x80000 =
+    /// 0xd4fd. The primary trains at 128b/132b and writes no SST payload; its
+    /// DPCD payload (VCPID 2, slots 0..2) follows the training and precedes
+    /// its function enable (`drm_dp_add_payload_part1` in
+    /// `mst_stream_pre_enable`); the second stream (VCPID 3, slots 2..4)
+    /// configures `TRANS_DP2_CTL` and its 128b/132b function on transcoder
+    /// B's transport; both program the VFREQ pair (65 MHz: 0x300 /
+    /// 0xdfd24000). HDCP sees both streams for stream encryption
+    /// (`intel_hdcp_mst.rs`). The stop clears both DP2 configurations.
+    fn smoke_mtl_mst_128b132b_two_streams_on_uhbr20() -> TestResult {
+        let io = ExtFake::new(
+            XeLpgPort::Tc1,
+            DpSink::dp20(0x14, edid(), uhbr::DP_UHBR10 | uhbr::DP_UHBR20),
+        );
+        let Ok(link) = probe_link(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) else {
+            return TestResult::Fail("the DP 2.0 hub must answer its DPCD");
+        };
+        let u = match uhbr_mst_link(&io, &link) {
+            Ok(Some(u)) if u.rate == uhbr::UhbrRate::Uhbr20 && u.lanes == 4 => u,
+            _ => return TestResult::Fail("Linux runs MST at the highest bandwidth: UHBR20 x4"),
+        };
+        let mut aux = Logged {
+            inner: branch(&io),
+            payload: Vec::new(),
+        };
+        let mut index = 0;
+        let owner = match MtlMstRoute::connect_aux_with(
+            &io,
+            link,
+            MtlPortDecl::USB_C,
+            &MtlDisplay::NONE,
+            &mut |mode| Some(fb(mode, &mut index)),
+            &mut aux,
+            Some(u),
+        ) {
+            Ok(owner) => owner,
+            Err((_, error)) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "128b/132b MST connect: {error:?}");
+                return TestResult::Fail("128b/132b MST must light two remote-EDID sinks");
+            }
+        };
+        let mn = [(1 << 25) | 0x02_94b6, 0x80_0000, 0xd4fd, 0x8_0000];
+        if owner.stream_count() != 2
+            || owner.streams[0].route.pipe != Pipe::B
+            || owner.streams[1].route.pipe != Pipe::C
+            || owner.streams[0].slot != 0
+            || owner.streams[1].slot != 2
+            || owner.streams.iter().any(|s| {
+                s.vcpi != s.route.pipe as u8 + 1
+                    || s.route.probe.mst.map(|m| m.slots) != Some(2)
+                    || s.route
+                        .probe
+                        .uhbr
+                        .as_deref()
+                        .map(|p| (p.link, p.stream.tu, p.stream.m_n))
+                        != Some((
+                            uhbr::UhbrLink {
+                                rate: uhbr::UhbrRate::Uhbr20,
+                                lanes: 4,
+                                pipe_bpp: 24,
+                            },
+                            2,
+                            mn,
+                        ))
+            })
+        {
+            return TestResult::Fail("two 128b/132b streams: Linux's slots from 0, TU and M/N");
+        }
+        // The hub's payload table: the reset, then VCPID 2 at slot 0 and
+        // VCPID 3 at slot 2, two slots each; never the SST VCPID 1.
+        let tables: Vec<[u8; 3]> = aux.payload.iter().map(|&(t, _)| t).collect();
+        if tables != [[0, 0, 0x3f], [2, 0, 2], [3, 2, 2]] {
+            return TestResult::Fail("payload part 1 must allocate slots 0..2 and 2..4");
+        }
+        let at = aux.payload[1].1;
+        let trained =
+            io.first_write(|r, v| r == dp_tp_ctl(Transcoder::B) && v & (7 << 8) == 3 << 8);
+        let func_on = io.first_write(|r, v| {
+            r == trans_ddi_func_ctl(Transcoder::B) && v & TRANS_DDI_FUNC_ENABLE != 0
+        });
+        if !matches!((trained, func_on), (Some(t), Some(f)) if t < at && at <= f) {
+            return TestResult::Fail("part 1 follows the training and precedes the function");
+        }
+        let func_c = io.writes_to(trans_ddi_func_ctl(Transcoder::C));
+        let want_c = (crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
+            XeLpgPort::Tc1.func_ctl_index(),
+            crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
+            4,
+        ) & !(7 << 24))
+            | TRANS_DDI_MODE_128B132B
+            | (1 << 10);
+        if io.writes_to(trans_dp2_ctl(Transcoder::B)).first()
+            != Some(&TRANS_DP2_128B132B_CHANNEL_CODING)
+            || io.writes_to(trans_dp2_ctl(Transcoder::C)).first()
+                != Some(&TRANS_DP2_128B132B_CHANNEL_CODING)
+            || func_c.first() != Some(&(want_c & !TRANS_DDI_FUNC_ENABLE))
+            || func_c.last() != Some(&(want_c | (1 << 8)))
+            || io.writes_to(trans_dp2_vfreqhigh(Transcoder::C)) != [0x300]
+            || io.writes_to(trans_dp2_vfreqlow(Transcoder::C)) != [0xdfd2_4000]
+            || io.writes_to(trans_dp2_vfreqhigh(Transcoder::B)) != [0x300]
+            || io.read32(0x62540) & DP_TP_CTL_ENABLE != 0
+            || io.read32(dp_tp_ctl(Transcoder::B)) & DP_TP_CTL_MODE_MST == 0
+        {
+            return TestResult::Fail("each stream runs 128b/132b on transcoder B's transport");
+        }
+        for t in [Transcoder::B, Transcoder::C] {
+            let m1 = io.read32(t.base() + crate::intel_gpu_pipes::PIPE_DATA_M1_OFFSET);
+            if m1 != mn[0] {
+                return TestResult::Fail("each stream's TU_SIZE(2) and data M");
+            }
+        }
+        // HDCP 2.x stream encryption takes both streams, master first.
+        let route = MtlRoute::Mst(owner);
+        let streams = crate::intel_hdcp_live::MstStreams::new(&[(1, 2), (2, 3)]);
+        match hdcp_route_of(&route) {
+            Some(r) if Some(r.mst) == streams && r.transcoder == 1 => {}
+            _ => return TestResult::Fail("HDCP must see both 128b/132b MST streams"),
+        }
+        let MtlRoute::Mst(mut owner) = route else {
+            return TestResult::Fail("the route is MST");
+        };
+        if owner.stop_aux(&io, &mut aux).is_err() || !owner.stopped() {
+            return TestResult::Fail("128b/132b MST must stop both streams");
+        }
+        if io.writes_to(trans_dp2_ctl(Transcoder::C)).last() != Some(&0)
+            || io.writes_to(trans_dp2_ctl(Transcoder::B)).last() != Some(&0)
+            || owner.release(&io).is_err()
+        {
+            return TestResult::Fail("the stop must clear both DP2 configurations and release");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_mtl_mst_128b132b_two_streams_on_uhbr20
+    );
+
+    /// What keeps a hub off 128b/132b MST under `narf.intel.uhbr=1`: no
+    /// 128b/132b support (the 8b/10b MST route stands), and Thunderbolt alt
+    /// mode, refused typed before any sideband message (display 14: no TBT
+    /// UHBR clock).
+    fn smoke_mtl_mst_uhbr_link_choice() -> TestResult {
+        let io = ExtFake::new(XeLpgPort::Tc1, DpSink::new(0x14, edid()));
+        let Ok(link) = probe_link(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) else {
+            return TestResult::Fail("the hub must answer its DPCD");
+        };
+        if uhbr_mst_link(&io, &link) != Ok(None) || link.release(&io).is_err() {
+            return TestResult::Fail("an 8b/10b hub keeps 8b/10b MST");
+        }
+        let io = ExtFake::new(
+            XeLpgPort::Tc2,
+            DpSink::dp20(0x14, edid(), uhbr::DP_UHBR10 | uhbr::DP_UHBR20),
+        );
+        io.pica_isr
+            .set(crate::intel_gpu_xelpg_hpd::pica_tbt_hotplug(1));
+        let Ok(link) = probe_link(&io, Generation::MeteorLake, XeLpgPort::Tc2, false) else {
+            return TestResult::Fail("the TBT hub must answer its DPCD");
+        };
+        if !link.tbt()
+            || uhbr_mst_link(&io, &link) != Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt))
+        {
+            return TestResult::Fail("display-14 TBT has no UHBR clock: typed Tbt");
+        }
+        let _ = link.release(&io);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_mtl_mst_uhbr_link_choice
     );
 }

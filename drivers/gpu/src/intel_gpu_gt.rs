@@ -30,6 +30,17 @@ pub use media::gsc::load::{register_csme_proxy, unregister_csme_proxy, CsmeProxy
 /// duplicate occurrence refuses the option; post-separator init arguments
 /// neither enable nor negate it.
 pub(crate) fn boot_opt_in(args: narf_boot::args::KernelCmdline<'_>, name: &str) -> bool {
+    boot_opt_is(args, name, "1")
+}
+
+/// [`boot_opt_in`]'s grammar for an option whose one enabling value is
+/// `want` (`narf.intel.ext_routes=2`): exactly one `name=want` before the
+/// first `--`. Any other value, a bare name or a duplicate refuses it.
+pub(crate) fn boot_opt_is(
+    args: narf_boot::args::KernelCmdline<'_>,
+    name: &str,
+    want: &str,
+) -> bool {
     let mut enabled = false;
     for token in args.tokens().take_while(|token| *token != "--") {
         let Some(rest) = token.strip_prefix(name) else {
@@ -39,7 +50,7 @@ pub(crate) fn boot_opt_in(args: narf_boot::args::KernelCmdline<'_>, name: &str) 
             return false;
         }
         if let Some(value) = rest.strip_prefix('=') {
-            if enabled || value != "1" {
+            if enabled || value != want {
                 return false;
             }
             enabled = true;

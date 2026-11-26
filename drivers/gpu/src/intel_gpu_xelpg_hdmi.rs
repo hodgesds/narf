@@ -78,8 +78,12 @@
 //! at 8 bpc on display 14 and 20 (a Y420VDB VIC, or a Y420CMDB VIC whose RGB
 //! link is invalid): half the TMDS clock, the 1:1 pipe scaler in the
 //! resource transaction's prefill, the BT.709 output CSC, `PIPE_MISC` YUV
-//! and the Y420 AVI infoframe; display 30 keeps RGB. Audio, deep color,
-//! YCbCr 4:4:4 and HDMI 2.1 FRL remain out of scope.
+//! and the Y420 AVI infoframe; display 30 keeps RGB. Under
+//! `narf.intel.hdmi14_ext=1` the route also takes Linux's deep colour (10
+//! and 12 bpc with the GCP, [`crate::intel_gpu_xelpg_external::color`]) and
+//! HDMI audio ([`crate::intel_gpu_xelpg_external::audio`]). Linux never
+//! drives YCbCr 4:4:4 over HDMI, and HDMI 2.1 FRL stays refused: Linux 7.4
+//! has no source FRL link training (its FRL facts are below).
 //!
 //! DDC pins come from the corrected GMBUS numbering
 //! ([`crate::intel_gpu_gmbus::PinPair`], `gmbus_pins_mtp`): DDI B is pin 2
@@ -104,7 +108,7 @@ use crate::intel_gpu_xelpg_external::{
     trans_clk_sel_port, trans_ddi_func_ctl, ExternalDisplayProfile, ExternalError, MtlDisplay,
     PipeRefusal, RoutePipe,
 };
-use crate::intel_gpu_xelpg_pipes::PipeEnableError;
+use crate::intel_gpu_xelpg_pipes::{PipeEnableError, Pipes};
 use crate::intel_gpu_xelpg_tc::{
     connect_for as tc_connect_for, connection_intact, disconnect as tc_disconnect, TcConnection,
     TcMode,
@@ -117,8 +121,21 @@ include!("intel_gpu_xelpg_hdmi_tables.rs");
 pub const MAX_TMDS_KHZ_UNSCRAMBLED: u32 = 340_000;
 /// Lowest HDMI TMDS clock (`intel_c20_get_hdmi_rate` range floor).
 pub const MIN_TMDS_KHZ: u32 = 25_000;
-/// `intel_hdmi_is_frl` clocks.
+/// `intel_hdmi_is_frl` clocks: 3, 6, 8, 10 and 12 Gbps per lane.
 const FRL_CLOCKS_KHZ: [u32; 5] = [300_000, 600_000, 800_000, 1_000_000, 1_200_000];
+
+/// `intel_hdmi_is_frl`: `clock_khz` is an FRL rate within
+/// `intel_dpll_clock_matches`' 1 kHz.
+pub const fn is_frl(clock_khz: u32) -> bool {
+    let mut i = 0;
+    while i < FRL_CLOCKS_KHZ.len() {
+        if clock_khz.abs_diff(FRL_CLOCKS_KHZ[i]) <= 1 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
 
 /// `PIPE_FRMCOUNT_G4X`, primary `PLANE_SURF` / `PLANE_SURFLIVE`, relative
 /// to [`Pipe::base`].
@@ -139,6 +156,16 @@ pub enum HdmiError {
     UnsupportedClock(u32),
     /// The clock is an FRL rate or FRL-ambiguous.
     FrlClock(u32),
+    /// The mode's TMDS clock is above the 600 MHz source maximum and the
+    /// sink declares HDMI 2.1 FRL. Linux 7.4 has no native FRL link
+    /// training for the source (`intel_hdmi_mode_valid` prunes these
+    /// modes; its FRL path is a DP PCON's), so the stream is refused.
+    FrlUnsupported {
+        /// The mode's TMDS clock in kHz.
+        clock_khz: u32,
+        /// `intel_hdmi_sink_max_frl_rate` in Gbps.
+        sink_max_frl_gbps: u32,
+    },
     /// The clock is above 340 MHz and the sink declares no scrambling
     /// (no SCDC or no Max_TMDS_Character_Rate in its HF-VSDB/HF-SCDB).
     ScramblingRequired(u32),
@@ -228,6 +255,29 @@ pub struct SinkScdc {
 /// `cea_db_collection_size` bounds (bytes 4..d, d in 4..=127).
 pub fn parse_sink_scdc(edid: &[u8]) -> SinkScdc {
     let mut out = SinkScdc::default();
+    for_each_forum_block(edid, |hf| {
+        if hf[6] & 0x80 != 0 {
+            out.scdc = true;
+        }
+        if hf[5] != 0 {
+            let max = u32::from(hf[5]) * 5_000;
+            if max > MAX_TMDS_KHZ_UNSCRAMBLED {
+                out.max_tmds_clock_khz = max;
+            }
+            if out.scdc {
+                out.scrambling = true;
+                if hf[6] & 0x08 != 0 {
+                    out.low_rates = true;
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Run `f` on every HDMI Forum block (header byte first, at least eight
+/// bytes) of `edid`'s valid revision 3+ CTA extensions.
+fn for_each_forum_block(edid: &[u8], mut f: impl FnMut(&[u8])) {
     for ext in edid.chunks_exact(128).skip(1) {
         let sum = ext.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
         if ext[0] != CEA_EXT || ext[1] < 3 || sum != 0 {
@@ -249,26 +299,11 @@ pub fn parse_sink_scdc(edid: &[u8]) -> SinkScdc {
                 && ((tag == CTA_DB_VENDOR && hf[1..4] == HDMI_FORUM_OUI)
                     || (tag == CTA_DB_EXTENDED_TAG && hf[1] == CTA_EXT_DB_HF_SCDB));
             if forum {
-                if hf[6] & 0x80 != 0 {
-                    out.scdc = true;
-                }
-                if hf[5] != 0 {
-                    let max = u32::from(hf[5]) * 5_000;
-                    if max > MAX_TMDS_KHZ_UNSCRAMBLED {
-                        out.max_tmds_clock_khz = max;
-                    }
-                    if out.scdc {
-                        out.scrambling = true;
-                        if hf[6] & 0x08 != 0 {
-                            out.low_rates = true;
-                        }
-                    }
-                }
+                f(hf);
             }
             index += 1 + len;
         }
     }
-    out
 }
 
 /// The TMDS link state the source drives: `crtc_state->hdmi_scrambling`
@@ -303,6 +338,158 @@ pub fn tmds_link(clock_khz: u32, sink: &SinkScdc) -> Result<TmdsLink, HdmiError>
         scrambling: sink.scrambling && (sink.low_rates || high),
         high_tmds_clock_ratio: sink.scrambling && high,
     })
+}
+
+// ── HDMI 2.1 FRL facts ───────────────────────────────────────────────
+//
+// Linux 7.4 has no native HDMI FRL link training for the source: the SCDC
+// FRL registers (`SCDC_CONFIG_1`, `SCDC_FLT_READY`, `SCDC_STATUS_FLAGS_1`)
+// are only read by `drm_scdc_read_state` for debugfs, i915 never writes
+// them, and `intel_hdmi_mode_valid` prunes every mode above 600 MHz
+// ("Current platforms do not support FRL"). What it has is the rate
+// detection (`intel_hdmi_is_frl`, `intel_hdmi_sink_max_frl_rate`,
+// `intel_hdmi_sink_dsc_max_frl_rate`, used by the DP PCON path) and the
+// PHY half: the FRL entries of `mtl_c20_hdmi_tables[]`, the FRL VDR
+// parameters ([`crate::intel_gpu_xelpg::C20Vdr::hdmi`]), the DIV18CLK
+// clock select ([`crate::intel_gpu_xelpg::ddi_clock_select`]) and the
+// FRL link symbol clock
+// ([`crate::intel_gpu_xelpg::hdmi_link_symbol_clock_khz`]). Those are
+// carried here; an FRL stream stays a typed refusal
+// ([`HdmiError::FrlUnsupported`], [`HdmiError::FrlClock`]).
+
+/// The sink's FRL capability as `drm_parse_hdmi_forum_scds` records it
+/// (`drm_get_max_frl_rate` of `hf_scds[7]` bits 7:4, and of `hf_scds[12]`
+/// when `hf_scds[11]` declares DSC).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SinkFrl {
+    /// `hdmi.max_lanes`.
+    pub max_lanes: u8,
+    /// `hdmi.max_frl_rate_per_lane` (Gbps).
+    pub max_frl_rate_per_lane: u8,
+    /// `hdmi.dsc_cap.max_lanes`.
+    pub dsc_max_lanes: u8,
+    /// `hdmi.dsc_cap.max_frl_rate_per_lane` (Gbps).
+    pub dsc_max_frl_rate_per_lane: u8,
+}
+
+impl SinkFrl {
+    /// `intel_hdmi_sink_max_frl_rate`: lanes × rate per lane (Gbps).
+    pub const fn max_frl_rate(&self) -> u32 {
+        self.max_lanes as u32 * self.max_frl_rate_per_lane as u32
+    }
+
+    /// `intel_hdmi_sink_dsc_max_frl_rate`: 0 unless both DSC fields are set.
+    pub const fn dsc_max_frl_rate(&self) -> u32 {
+        if self.dsc_max_lanes == 0 || self.dsc_max_frl_rate_per_lane == 0 {
+            0
+        } else {
+            self.dsc_max_lanes as u32 * self.dsc_max_frl_rate_per_lane as u32
+        }
+    }
+}
+
+/// `drm_get_max_frl_rate`: (lanes, Gbps per lane) of a `Max_FRL_Rate` code.
+pub const fn max_frl_rate(code: u8) -> (u8, u8) {
+    match code {
+        1 => (3, 3),
+        2 => (3, 6),
+        3 => (4, 6),
+        4 => (4, 8),
+        5 => (4, 10),
+        6 => (4, 12),
+        7 => (4, 16),
+        8 => (4, 20),
+        9 => (4, 24),
+        _ => (0, 0),
+    }
+}
+
+/// Parse the FRL fields of `edid`'s HDMI Forum blocks (the HF-VSDB or
+/// HF-SCDB [`parse_sink_scdc`] walks).
+pub fn parse_sink_frl(edid: &[u8]) -> SinkFrl {
+    let mut out = SinkFrl::default();
+    for_each_forum_block(edid, |hf| {
+        if hf[7] != 0 {
+            (out.max_lanes, out.max_frl_rate_per_lane) = max_frl_rate(hf[7] >> 4);
+        }
+        // cea_db_payload_len(hf_scds) >= 11 && hf_scds[11]: drm_parse_dsc_info,
+        // whose max FRL rate needs a payload of 12 and a nonzero hf_scds[12].
+        if hf.len() > 11 && hf[11] != 0 && hf.len() > 12 && hf[12] != 0 {
+            (out.dsc_max_lanes, out.dsc_max_frl_rate_per_lane) = max_frl_rate(hf[12] >> 4);
+        }
+    });
+    out
+}
+
+/// The FRL entries of Linux 7.4 `mtl_c20_hdmi_tables[]` (`mtl_c20_hdmi_300`
+/// .. `mtl_c20_hdmi_1200`), hand-transcribed: (port clock kHz, PLL state).
+/// No route programs them.
+pub const C20_HDMI_FRL_TABLES: [(u32, C20PllState); 5] = [
+    (
+        300_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x309C, 0x2110, 0xCA06, 0xBE40, 0x0000, 0x0000, 0x2200, 0x0001, 0x2000, 0x0000,
+                0x0004,
+            ],
+        },
+    ),
+    (
+        600_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x109C, 0x2108, 0xCA06, 0xBE40, 0x0000, 0x0000, 0x2200, 0x0001, 0x2000, 0x0000,
+                0x0004,
+            ],
+        },
+    ),
+    (
+        800_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x10D0, 0x2108, 0x4A06, 0xBE40, 0x0000, 0x0000, 0x2200, 0x0003, 0x2AAA, 0x0002,
+                0x0004,
+            ],
+        },
+    ),
+    (
+        1_000_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x1104, 0x2108, 0x0A06, 0xBE40, 0x0000, 0x0000, 0x2200, 0x0003, 0x3555, 0x0001,
+                0x0004,
+            ],
+        },
+    ),
+    (
+        1_200_000,
+        C20PllState {
+            tx: [0xBE98, 0x8800, 0x0000],
+            cmn: [0x0500, 0x0005, 0x0000, 0x0000],
+            mpllb: [
+                0x1138, 0x2108, 0x5486, 0xFE40, 0x0000, 0x0000, 0x2200, 0x0001, 0x4000, 0x0000,
+                0x0004,
+            ],
+        },
+    ),
+];
+
+/// The C20 FRL PLL state and VDR parameters for an FRL port clock (the
+/// table entry and `intel_c20_calc_vdr_params`); `None` for any other
+/// clock.
+pub fn c20_hdmi_frl_state(port_clock_khz: u32) -> Option<(C20PllState, C20Vdr)> {
+    let (_, state) = C20_HDMI_FRL_TABLES
+        .iter()
+        .find(|(clock, _)| *clock == port_clock_khz)?;
+    Some((*state, C20Vdr::hdmi(port_clock_khz)?))
 }
 
 // ── SCDC (drm_scdc_helper.c over the GMBUS transport) ─────────────────
@@ -650,7 +837,7 @@ pub fn hdmi_pll_request_kind(
     legacy: bool,
     c20_tx_cfg1: Option<u16>,
 ) -> Result<PllRequest, HdmiError> {
-    if FRL_CLOCKS_KHZ.contains(&clock_khz) {
+    if is_frl(clock_khz) {
         return Err(HdmiError::FrlClock(clock_khz));
     }
     if clock_khz < MIN_TMDS_KHZ {
@@ -765,8 +952,20 @@ pub struct MtlHdmiProbe {
     /// The DDC pin EDID and SCDC traffic use (the port policy's
     /// `intel_hdmi_ddc_pin` result).
     pub ddc: PinPair,
-    /// The output format (`intel_hdmi_compute_output_format` at 8 bpc).
+    /// The output format (`intel_hdmi_compute_output_format`).
     pub format: crate::intel_gpu_hdmi::SinkFormat,
+    /// The pipe's bpc (`intel_hdmi_compute_bpc`): 8, or 10 or 12 under
+    /// `narf.intel.hdmi14_ext=1` ([`crate::intel_gpu_xelpg_external::color`]).
+    pub bpc: u8,
+    /// The probe ran under `narf.intel.hdmi14_ext=1`: the route sends the
+    /// General Control Packet to an HDMI sink
+    /// (`intel_hdmi_compute_gcp_infoframe`).
+    pub ext: bool,
+    /// The sink's ELD (`drm_edid_to_eld`) when the route enables audio
+    /// (`narf.intel.hdmi14_ext=1`, `intel_hdmi_has_audio`: an HDMI sink
+    /// that declares basic audio or audio descriptors).
+    pub audio:
+        Option<alloc::boxed::Box<[u8; crate::intel_gpu_xelpg_external::audio::MAX_ELD_BYTES]>>,
     /// EDID bytes (`edid_len` valid).
     pub edid: alloc::boxed::Box<[u8; crate::intel_gpu_hdmi::EDID_CAPACITY]>,
     /// Valid EDID length.
@@ -804,13 +1003,33 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
 
 /// [`probe_hdmi`] for an exact source profile. Meteor, Lunar and Panther
 /// Lake drive HDMI on their admitted ports; Wildcat Lake's 30.02 profile
-/// has no qualified HDMI route.
+/// has no qualified HDMI route. Deep colour follows
+/// `narf.intel.hdmi14_ext`.
 pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
     io: &M,
     profile: ExternalDisplayProfile,
     port: XeLpgPort,
     legacy_port: bool,
     ddc: Option<PinPair>,
+) -> Result<MtlHdmiProbe, HdmiError> {
+    probe_hdmi_profile_ext(
+        io,
+        profile,
+        port,
+        legacy_port,
+        ddc,
+        crate::intel_gpu_xelpg_external::color::opted_in(),
+    )
+}
+
+/// [`probe_hdmi_profile`] with an explicit `narf.intel.hdmi14_ext` decision.
+pub(crate) fn probe_hdmi_profile_ext<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    port: XeLpgPort,
+    legacy_port: bool,
+    ddc: Option<PinPair>,
+    ext: bool,
 ) -> Result<MtlHdmiProbe, HdmiError> {
     let display_ip = profile.display_ip();
     if display_ip == DisplayIp::WildcatLake {
@@ -849,7 +1068,7 @@ pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
     let mode = crate::intel_gpu_dp::mode_from_edid(&edid[..edid_len])
         .map_err(|_| rollback(HdmiError::Edid))?;
     let sink = parse_sink_scdc(&edid[..edid_len]);
-    let (format, pll, link) = output_for(
+    let (format, bpc, pll, link) = output_for(
         io,
         display_ip,
         port,
@@ -857,6 +1076,7 @@ pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
         &mode,
         &edid[..edid_len],
         &sink,
+        ext,
     )
     .map_err(rollback)?;
     if !io.display_access_ok() {
@@ -872,20 +1092,51 @@ pub(crate) fn probe_hdmi_profile<M: MmioWindow + ?Sized>(
         link,
         ddc: pin,
         format,
+        bpc,
+        ext,
+        audio: hdmi_audio(&edid[..edid_len], ext).map(alloc::boxed::Box::new),
         edid: alloc::boxed::Box::new(edid),
         edid_len,
     })
 }
 
-/// `intel_hdmi_compute_output_format` at 8 bpc for `mode` on `port`: a
-/// 4:2:0-only VIC (Y420VDB) goes out as YCbCr 4:2:0 on an HDMI sink, any
-/// other mode as RGB, falling back to 4:2:0 when RGB has no valid TMDS
-/// link and the VIC is 4:2:0-also (Y420CMDB). 4:2:0 halves the TMDS clock
+/// `intel_hdmi_has_audio` under `narf.intel.hdmi14_ext=1`: an HDMI sink
+/// whose `display_info.has_audio` holds (basic audio or an audio data
+/// block) gets audio with Linux's connector ELD (`drm_edid_to_eld`), SADs
+/// or none.
+fn hdmi_audio(
+    edid: &[u8],
+    ext: bool,
+) -> Option<[u8; crate::intel_gpu_xelpg_external::audio::MAX_ELD_BYTES]> {
+    use crate::intel_gpu_xelpg_external::audio;
+    if !ext || !crate::intel_gpu_hdmi::is_hdmi_sink(edid) || !audio::edid_has_audio(edid) {
+        return None;
+    }
+    Some(audio::eld_from_edid(edid, false))
+}
+
+/// The output an HDMI probe resolves: format, pipe bpc, PLL request and
+/// TMDS link.
+type HdmiOutput = (crate::intel_gpu_hdmi::SinkFormat, u8, PllRequest, TmdsLink);
+
+/// `intel_hdmi_compute_output_format` for `mode` on `port`: a 4:2:0-only
+/// VIC (Y420VDB) goes out as YCbCr 4:2:0 on an HDMI sink, any other mode as
+/// RGB, falling back to 4:2:0 when RGB has no valid TMDS link and the VIC is
+/// 4:2:0-also (Y420CMDB). 4:2:0 halves the TMDS clock
 /// (`intel_hdmi_tmds_clock`) and needs the pipe scaler, which takes at most
 /// 8192 active pixels (`skl_scaler_mode_valid` compares `hdisplay` with
 /// the display-14 maximum source height). Display 30 is not qualified for
 /// it: its VRR timing-generator guardband carries no scaler prefill here.
-/// Returns the format with its PLL request and TMDS link.
+///
+/// Each format runs at 8 bpc, or with `ext` (`narf.intel.hdmi14_ext=1`) at
+/// `intel_hdmi_compute_bpc`'s depth: from the pipe maximum
+/// ([`crate::intel_gpu_xelpg_external::color::max_pipe_bpp`]) down in steps
+/// of 2 bpc, the first above 8 that `hdmi_bpc_possible` and
+/// `hdmi_port_clock_valid` admit at its TMDS clock and whose PLL and TMDS
+/// link resolve; 8 bpc when none does. A depth whose PLL this driver cannot
+/// build (a C20 clock without a table or the platform's `tx[1]` fact)
+/// steps down where Linux would compute it.
+#[allow(clippy::too_many_arguments)]
 fn output_for<M: MmioWindow + ?Sized>(
     io: &M,
     ip: DisplayIp,
@@ -894,30 +1145,76 @@ fn output_for<M: MmioWindow + ?Sized>(
     mode: &Mode,
     edid: &[u8],
     sink: &SinkScdc,
-) -> Result<(crate::intel_gpu_hdmi::SinkFormat, PllRequest, TmdsLink), HdmiError> {
+    ext: bool,
+) -> Result<HdmiOutput, HdmiError> {
     use crate::intel_gpu_hdmi::{
         parse_hdmi_vsdb, parse_ycbcr420, tmds_clock_for, vic_for_mode, SinkFormat,
     };
+    use crate::intel_gpu_xelpg_external::color;
     let kind = crate::intel_gpu_xelpg::phy_kind(io, port);
     let lt = io.has_lt_phy();
-    let link_for = |format| {
-        let clock = tmds_clock_for(mode.pixel_clock_khz, 8, format);
+    let link_for = |format, bpc| -> Result<HdmiOutput, HdmiError> {
+        let clock = tmds_clock_for(mode.pixel_clock_khz, bpc, format);
         let pll = if lt {
             lt_hdmi_request(clock)?
         } else {
             hdmi_pll_request_kind(kind, clock, type_c, io.c20_hdmi_tx_cfg1())?
         };
-        Ok((format, pll, tmds_link(clock, sink)?))
+        Ok((format, bpc, pll, tmds_link(clock, sink)?))
     };
     let y420 = parse_ycbcr420(edid);
+    let vsdb = parse_hdmi_vsdb(edid);
+    let start = if ext {
+        (color::max_pipe_bpp(color::sink_display_bpc(edid)) / 3).max(8) as u8
+    } else {
+        8
+    };
+    let limit = color::hdmi_port_clock_limit(edid);
+    let with_depth = |format| -> Result<HdmiOutput, HdmiError> {
+        let mut bpc = start;
+        while bpc > 8 {
+            let tmds = tmds_clock_for(mode.pixel_clock_khz, bpc, format);
+            if color::sink_bpc_possible(bpc, vsdb, &y420, format)
+                && color::hdmi_port_clock_valid(tmds, limit, type_c)
+            {
+                if let Ok(output) = link_for(format, bpc) {
+                    return Ok(output);
+                }
+            }
+            bpc -= 2;
+        }
+        link_for(format, 8)
+    };
     let vic = vic_for_mode(mode);
-    let allowed = parse_hdmi_vsdb(edid).is_some() && !ip.is_display30() && mode.h_active <= 8192;
-    if allowed && y420.only(vic) {
-        return link_for(SinkFormat::Ycbcr420);
-    }
-    match link_for(SinkFormat::Rgb) {
-        Err(e) if allowed && y420.also(vic) => link_for(SinkFormat::Ycbcr420).map_err(|_| e),
-        result => result,
+    let allowed = vsdb.is_some() && !ip.is_display30() && mode.h_active <= 8192;
+    let result = if allowed && y420.only(vic) {
+        with_depth(SinkFormat::Ycbcr420)
+    } else {
+        match with_depth(SinkFormat::Rgb) {
+            Err(e) if allowed && y420.also(vic) => with_depth(SinkFormat::Ycbcr420).map_err(|_| e),
+            result => result,
+        }
+    };
+    result.map_err(|e| frl_refusal(e, edid))
+}
+
+/// A clock above the 600 MHz source maximum on a sink that declares FRL
+/// (`intel_hdmi_sink_max_frl_rate` nonzero) is [`HdmiError::FrlUnsupported`]:
+/// only FRL could carry it, and Linux has no native FRL training.
+fn frl_refusal(e: HdmiError, edid: &[u8]) -> HdmiError {
+    match e {
+        HdmiError::UnsupportedClock(clock_khz) | HdmiError::FrlClock(clock_khz)
+            if clock_khz > SOURCE_MAX_TMDS_KHZ =>
+        {
+            match parse_sink_frl(edid).max_frl_rate() {
+                0 => e,
+                sink_max_frl_gbps => HdmiError::FrlUnsupported {
+                    clock_khz,
+                    sink_max_frl_gbps,
+                },
+            }
+        }
+        e => e,
     }
 }
 
@@ -955,6 +1252,12 @@ pub struct MtlHdmiRoute {
     pipe: Pipe,
     /// The pipe's reservation until its post-plane release is proven.
     reservation: Option<RoutePipe>,
+    /// The Pipe B–D owner as the proven release left it, until a sibling
+    /// route adopts it.
+    retired: Option<Pipes>,
+    /// The audio stream `intel_audio_codec_enable` started, until its
+    /// disable.
+    audio: Option<crate::intel_gpu_xelpg_external::audio::AudioStream>,
 }
 
 fn wr<M: MmioWindow + ?Sized>(io: &M, off: u64, value: u32) -> Result<(), HdmiError> {
@@ -997,10 +1300,23 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     fb: Framebuffer,
     display: &MtlDisplay,
 ) -> Result<MtlHdmiRoute, (Result<MtlHdmiRoute, MtlHdmiProbe>, HdmiError)> {
+    activate_hdmi_beside(io, probe, fb, display, None)
+}
+
+/// [`activate_hdmi`] beside a live sibling route whose Pipe B–D owner is
+/// `beside` (`narf.intel.ext_routes=2`): the new pipe joins that layout.
+#[allow(clippy::result_large_err)]
+pub(crate) fn activate_hdmi_beside<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: MtlHdmiProbe,
+    fb: Framebuffer,
+    display: &MtlDisplay,
+    beside: Option<Pipes>,
+) -> Result<MtlHdmiRoute, (Result<MtlHdmiRoute, MtlHdmiProbe>, HdmiError)> {
     if let Err(e) = crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &probe.mode) {
         return Err((Err(probe), ExternalError::Modeset(e).into()));
     }
-    let choice = match preflight_ip(io, probe.port, display, probe.display_ip) {
+    let choice = match preflight_ip(io, probe.port, display, probe.display_ip, beside) {
         Ok(choice) => choice,
         Err(e) => return Err((Err(probe), e.into())),
     };
@@ -1017,7 +1333,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         &fb,
         probe.pll.port_clock_khz,
         None,
-        crate::intel_gpu_xelpg_dsc::PIPE_BPP,
+        u32::from(probe.bpc) * 3,
     ) {
         Ok(ext) => ext,
         Err(e) => return Err((Err(probe), e.into())),
@@ -1026,6 +1342,7 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     if probe.format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420 {
         ext.scaler = Some(crate::intel_gpu_modeset::ycbcr420_scaler(&probe.mode));
     }
+    ext.audio = probe.audio.is_some();
     if let Err(e) = choice.pipes.admit(io, &ext) {
         return Err((Err(probe), e.into()));
     }
@@ -1035,10 +1352,12 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
         state: HdmiRouteState::Stopped,
         pipe: choice.pipe,
         reservation: None,
+        retired: None,
+        audio: None,
     };
     let dmc = display.pipe_dmc;
     let result = request_pipe_wells(io, ext.pipe)
-        .and_then(|()| reserve_pipe(io, choice, &ext, dmc))
+        .and_then(|()| reserve_audio_pipe(io, choice, &ext, dmc))
         .map_err(HdmiError::from)
         .and_then(|rp| {
             route.reservation = Some(rp);
@@ -1059,6 +1378,26 @@ pub fn activate_hdmi<M: MmioWindow + ?Sized>(
     }
 }
 
+/// [`reserve_pipe`] bracketed, for a pipe with audio, by
+/// `intel_audio_cdclk_change_pre` / `_post` (the transaction may move
+/// CDCLK, and `AUD_TS_CDCLK_M/N` follow it).
+pub(crate) fn reserve_audio_pipe<M: MmioWindow + ?Sized>(
+    io: &M,
+    choice: crate::intel_gpu_xelpg_external::PipeChoice,
+    ext: &crate::intel_gpu_xelpg_pipes::ExternalPipe,
+    dmc: &'static (dyn crate::intel_gpu_dc_states::PipeDmc + Sync),
+) -> Result<RoutePipe, ExternalError> {
+    use crate::intel_gpu_xelpg_external::audio;
+    if ext.audio {
+        audio::cdclk_change_pre(io).map_err(|_| ExternalError::AccessLost)?;
+    }
+    let result = reserve_pipe(io, choice, ext, dmc);
+    if ext.audio {
+        let _ = audio::cdclk_change_post(io);
+    }
+    result
+}
+
 fn reservation(route: &mut MtlHdmiRoute) -> Result<&mut RoutePipe, HdmiError> {
     route
         .reservation
@@ -1077,6 +1416,11 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         route.probe.display_ip,
         route.probe.format,
     );
+    let bpc = route.probe.bpc;
+    // intel_hdmi_compute_gcp_infoframe (narf.intel.hdmi14_ext=1): every
+    // HDMI sink with infoframes gets the General Control Packet.
+    let gcp = route.probe.ext
+        && crate::intel_gpu_hdmi::is_hdmi_sink(&route.probe.edid[..route.probe.edid_len]);
     let rp = reservation(route)?;
     let (pipe, trans) = (rp.pipe, rp.transcoder());
     // intel_ddi_pre_enable_hdmi: PLL (intel_lt_phy_pll_enable on display
@@ -1096,6 +1440,9 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         trans,
         &crate::intel_gpu_hdmi::pack_avi_infoframe_for(&mode, format),
     );
+    if gcp {
+        crate::intel_gpu_hdmi::write_gcp(io, trans, bpc, &mode);
+    }
     // hsw_crtc_enable: source size, timings, RGB bypass (pipe off).
     rp.pipes.program_timings(io, pipe)?;
     // A 4:2:0 stream: bdw_set_pipe_misc's YUV encoding, skl_pfit_enable's
@@ -1107,11 +1454,12 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         crate::intel_gpu_modeset::program_ycbcr420_pipe(io, pipe, &mode);
     }
     // intel_ddi_enable: transcoder function, then the transcoder.
+    // TRANS_DDI_BPC_10 / _12 for a deep-colour pipe (BPC_8 is 0).
     let func = crate::intel_gpu_pipes::build_trans_ddi_func_ctl_hdmi(
         port.func_ctl_index(),
         link.scrambling,
         link.high_tmds_clock_ratio,
-    );
+    ) | crate::intel_gpu_xelpg_dsc::trans_ddi_bpc(u32::from(bpc) * 3);
     wr(io, trans_ddi_func_ctl(trans), func)?;
     // Display 30 always scans out through the VRR timing generator,
     // programmed and enabled after TRANS_DDI_FUNC_CTL and before TRANSCONF
@@ -1159,7 +1507,42 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
     wait_port_buf_active(io, port).map_err(phy_err)?;
     // intel_update_crtc: the primary, armed under vblank evasion.
     rp.pipes.arm_primary(io, pipe)?;
-    observe_hdmi(io, route, func, start)
+    observe_hdmi(io, route, func, start)?;
+    // intel_post_plane_update: intel_encoders_audio_enable.
+    let Some(connector_eld) = route.probe.audio.clone() else {
+        return Ok(());
+    };
+    use crate::intel_gpu_xelpg_external::audio;
+    let stream = audio::AudioStream {
+        trans,
+        pipe,
+        port: port.port_enum() as i32,
+        dp: false,
+        uhbr: false,
+        crtc_clock_khz: mode.pixel_clock_khz,
+        port_clock_khz: pll.port_clock_khz,
+        pipe_bpp: u32::from(bpc) * 3,
+        lane_count: HDMI_LANES,
+        h_active: mode.h_active,
+        h_total: mode.h_total,
+        v_active: mode.v_active,
+        dsc_bpp_x16: None,
+        ycbcr420: format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420,
+        wa_14020863754: audio::needs_wa_14020863754(ip),
+    };
+    let edid = &route.probe.edid[..route.probe.edid_len];
+    let eld = audio::compute_eld(&connector_eld, edid, &stream);
+    // The shared sink takes the builder's publication (none without SADs).
+    let publication = narf_drivers_sound::display_audio::build_eld(
+        edid,
+        narf_drivers_sound::display_audio::DisplayConnector::Hdmi,
+        0,
+    );
+    // The stream is the route's to disable from here on, even if a step
+    // of the enable failed.
+    route.audio = Some(stream);
+    audio::audio_codec_enable(io, &stream, &eld, publication)
+        .map_err(|_| ExternalError::AccessLost.into())
 }
 
 fn observe_hdmi<M: MmioWindow + ?Sized>(
@@ -1231,6 +1614,12 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     );
     let stop_failed: HdmiError =
         ExternalError::Modeset(ModesetError::PipelineStopUnavailable).into();
+    // intel_pre_plane_update: intel_encoders_audio_disable, before the
+    // planes go (best effort: the stop proof is the pipe's).
+    let had_audio = route.probe.audio.is_some();
+    if let Some(stream) = route.audio.take() {
+        let _ = crate::intel_gpu_xelpg_external::audio::audio_codec_disable(io, &stream);
+    }
     let Some(rp) = route.reservation.as_mut() else {
         return Ok(());
     };
@@ -1272,8 +1661,8 @@ fn stop_hdmi_local<M: MmioWindow + ?Sized>(
     if ddi & DDI_BUF_CTL_ENABLE != 0 || buf & PORT_BUF_PHY_IDLE == 0 || clock & 0xCC00_0000 != 0 {
         return Err(stop_failed);
     }
-    rp.pipes.release(io, pipe, rp.dmc)?;
-    route.reservation = None;
+    crate::intel_gpu_xelpg_external::release_audio_pipe(io, rp, had_audio)?;
+    route.retired = route.reservation.take().map(|rp| rp.pipes);
     Ok(())
 }
 
@@ -1296,6 +1685,28 @@ impl MtlHdmiRoute {
     /// Whether the pipe's display resources are still reserved.
     pub fn reserved(&self) -> bool {
         self.reservation.is_some()
+    }
+
+    /// The Pipe B–D owner this route's reservation holds.
+    pub(crate) fn shared_pipes(&self) -> Option<&Pipes> {
+        self.reservation.as_ref().map(|rp| &rp.pipes)
+    }
+
+    /// Adopt a sibling route's newer Pipe B–D owner (same layout, plus or
+    /// minus the sibling's pipe); a route without a reservation keeps none.
+    pub(crate) fn adopt_shared_pipes(&mut self, pipes: &Pipes) {
+        if let Some(rp) = self.reservation.as_mut() {
+            rp.pipes = pipes.clone();
+        }
+    }
+
+    /// The owner a sibling adopts after this route changed it: the
+    /// reservation's, or once the post-release owner the proven stop left.
+    pub(crate) fn take_shared_pipes(&mut self) -> Option<Pipes> {
+        match self.reservation.as_ref() {
+            Some(rp) => Some(rp.pipes.clone()),
+            None => self.retired.take(),
+        }
     }
 
     /// Locally stop; a failed stop quarantines the route.

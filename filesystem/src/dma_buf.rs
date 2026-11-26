@@ -12,6 +12,14 @@
 //! core reaches them only through [`IoctlContext::sync_file_fences`] and
 //! [`IoctlContext::install_sync_file`].
 //!
+//! An exporter that prepares the buffer for CPU access (Linux
+//! `dma_buf_ops.begin_cpu_access`, such as xe's migration of a VRAM export
+//! to system memory for reads) implements [`DmaBufCpuAccess`]; its file's
+//! DMA_BUF_IOCTL_SYNC awaits it before the implicit-fence wait, in the
+//! [`DmaDataDirection`] the SYNC flags give. Exporters without the hook
+//! (the DRM PRIME exporters' `drm_gem_prime_dmabuf_ops`) use
+//! [`dma_buf_ioctl`] as it is.
+//!
 //! An importer that can follow a moving buffer registers as a dynamic
 //! attachment ([`DmaBufAttachOps`], Linux `dma_buf_dynamic_attach` with
 //! `importer_ops`); the exporter calls [`DmaBufObject::invalidate_mappings`]
@@ -24,7 +32,7 @@
 //! `dma_buf_dynamic_attach`, `dma_buf_invalidate_mappings`),
 //! `drivers/dma-buf/dma-resv.c`, `include/uapi/linux/dma-buf.h`.
 
-use crate::{DrmFence, FsError, InstallFdError, IoctlContext};
+use crate::{DrmFence, FsError, FsFuture, InstallFdError, IoctlContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -58,6 +66,54 @@ pub const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: u32 = 0x4008_6203;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
+
+/// Linux `enum dma_data_direction` of a CPU access bracket, as
+/// `dma_buf_ioctl` derives it from DMA_BUF_IOCTL_SYNC's direction bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaDataDirection {
+    /// `DMA_BIDIRECTIONAL`: `DMA_BUF_SYNC_RW`.
+    Bidirectional,
+    /// `DMA_TO_DEVICE`: `DMA_BUF_SYNC_WRITE`.
+    ToDevice,
+    /// `DMA_FROM_DEVICE`: `DMA_BUF_SYNC_READ`.
+    FromDevice,
+}
+
+impl DmaDataDirection {
+    /// The direction of DMA_BUF_IOCTL_SYNC `flags`; `None` when neither
+    /// direction bit is set (`dma_buf_ioctl`'s -EINVAL).
+    pub fn from_sync_flags(flags: u64) -> Option<Self> {
+        match flags & DMA_BUF_SYNC_RW {
+            DMA_BUF_SYNC_RW => Some(Self::Bidirectional),
+            DMA_BUF_SYNC_WRITE => Some(Self::ToDevice),
+            DMA_BUF_SYNC_READ => Some(Self::FromDevice),
+            _ => None,
+        }
+    }
+
+    /// The CPU reads what the device wrote: `DMA_BIDIRECTIONAL` or
+    /// `DMA_FROM_DEVICE` (`xe_dma_buf_begin_cpu_access`'s `reads`).
+    pub fn cpu_reads(self) -> bool {
+        matches!(self, Self::Bidirectional | Self::FromDevice)
+    }
+
+    /// The CPU writes for the device: `DMA_BIDIRECTIONAL` or
+    /// `DMA_TO_DEVICE` (`__dma_buf_begin_cpu_access`'s `write`).
+    pub fn cpu_writes(self) -> bool {
+        matches!(self, Self::Bidirectional | Self::ToDevice)
+    }
+}
+
+/// Linux `dma_buf_ops.begin_cpu_access` of an exporter that prepares its
+/// buffer for CPU access. `dma_buf_begin_cpu_access` runs it first, with
+/// no dma-buf lock held, and the implicit-fence wait follows only when it
+/// succeeds; its error is the ioctl's. It may do GPU work (a migration), so
+/// it is asynchronous: the exporter file whose `ioctl_user` answers
+/// DMA_BUF_IOCTL_SYNC START awaits it. A second call after the buffer is
+/// prepared must be cheap, as a parked SYNC re-executes.
+pub trait DmaBufCpuAccess: Send + Sync {
+    fn begin_cpu_access(&self, direction: DmaDataDirection) -> FsFuture<'_, ()>;
+}
 
 /// Linux `enum dma_resv_usage`, in its documented total order: querying a
 /// usage returns every fence whose usage is less than or equal to it. NARF
@@ -410,11 +466,10 @@ pub fn dma_buf_ioctl(
             }
             // DMA_FROM_DEVICE / DMA_TO_DEVICE / DMA_BIDIRECTIONAL; neither
             // direction bit is -EINVAL.
-            let write = match flags & DMA_BUF_SYNC_RW {
-                DMA_BUF_SYNC_READ => false,
-                DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_RW => true,
-                _ => return neg(EINVAL),
+            let Some(direction) = DmaDataDirection::from_sync_flags(flags) else {
+                return neg(EINVAL);
             };
+            let write = direction.cpu_writes();
             if flags & DMA_BUF_SYNC_END != 0 {
                 // dma_buf_end_cpu_access: NARF's exporters are CPU-coherent
                 // and have no `end_cpu_access` hook, so this is 0.
@@ -422,9 +477,10 @@ pub fn dma_buf_ioctl(
             }
             // dma_buf_begin_cpu_access → __dma_buf_begin_cpu_access: wait,
             // interruptibly and without timeout, on the implicit fences of
-            // `dma_resv_usage_rw(write)`. (The DRM PRIME exporters,
-            // `drm_gem_prime_dmabuf_ops`, have no `begin_cpu_access`, and
-            // coherent memory needs no cache maintenance.)
+            // `dma_resv_usage_rw(write)`. (The exporters that reach this,
+            // like `drm_gem_prime_dmabuf_ops`, have no `begin_cpu_access`
+            // ([`DmaBufCpuAccess`]), and coherent memory needs no cache
+            // maintenance.)
             //
             // The wait is `dma_resv_wait_timeout(.., intr = true, ..)`: a
             // user task parks and re-executes this ioctl (everything above is

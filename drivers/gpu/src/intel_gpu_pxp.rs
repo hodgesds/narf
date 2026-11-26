@@ -1318,6 +1318,191 @@ impl<C: Client> Engine<C> {
     }
 }
 
+// ── Runtime wiring ──────────────────────────────────────────────────
+
+/// What the GT runtime worker observes of a running GT1 that schedules
+/// GSCCS0, on one pass (`service_pxp`'s inputs).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Gt1View {
+    /// xe_pxp_init's firmware dependencies: the GSC firmware is loadable
+    /// and (below media 35) a HuC is staged on the media GuC.
+    pub(crate) gsc_loadable: bool,
+    pub(crate) huc_staged: bool,
+    /// GT1 has a VCS for the terminations.
+    pub(crate) vcs: bool,
+    /// No GSC load, authentication or proxy step is pending.
+    pub(crate) gsc_idle: bool,
+    /// xe_pxp_get_readiness_status's firmware error states.
+    pub(crate) gsc_error: bool,
+    pub(crate) huc_error: bool,
+}
+
+/// What one runtime pass did with PXP.
+#[derive(Debug)]
+pub(crate) enum Pass {
+    /// xe_pxp_init ran before without success: nothing runs (Linux runs
+    /// it once, at probe).
+    Disabled,
+    /// xe_pxp_init's "Skipping PXP due to unsatisfied FW deps": `xe->pxp`
+    /// stays NULL and no KCR register is touched.
+    Skipped,
+    /// xe_pxp_init failed after kcr_pxp_enable: KCR is disabled again
+    /// (out_kcr_disable). Linux then fails the probe; PXP stays disabled.
+    InitFailed(PxpError),
+    /// GT1 runs again, but xe_pxp_pm_resume waits for the GSC worker.
+    ResumeDeferred,
+    /// The pass ran. `initialized` is the PXP xe_pxp_init created on this
+    /// pass, for the uAPI and the display to publish; `resumed` says
+    /// xe_pxp_pm_resume ran.
+    Ran {
+        initialized: Option<Arc<Pxp>>,
+        #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+        resumed: bool,
+    },
+}
+
+struct Owner<C: Client> {
+    pxp: Arc<Pxp>,
+    engine: Engine<C>,
+}
+
+/// `struct xe_pxp` as the GT runtime owns it for the device's lifetime: the
+/// state the uAPI shares and the worker's engine over the GSC client
+/// object, created by the first eligible [`Runtime::service`].
+pub(crate) struct Runtime<C: Client> {
+    owner: Option<Owner<C>>,
+    tried: bool,
+}
+
+impl<C: Client> Default for Runtime<C> {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            tried: false,
+        }
+    }
+}
+
+impl<C: Client> Runtime<C> {
+    /// `xe->pxp`, once xe_pxp_init succeeded.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
+    pub(crate) fn pxp(&self) -> Option<&Arc<Pxp>> {
+        self.owner.as_ref().map(|owner| &owner.pxp)
+    }
+
+    /// One `service_pxp` pass on a running GT1 with GSCCS0 scheduled:
+    /// - xe_pxp_init once per device: kcr_pxp_enable, then the GSC client
+    ///   resources and host session handle from `resources` (a failure
+    ///   disables KCR again);
+    /// - xe_pxp_pm_resume after a GT1 stop, once the GSC worker is idle
+    ///   (kcr_pxp_enable, then the deferred termination); KCR causes latched
+    ///   before it belong to the stopped GT1 and are dropped, as
+    ///   xe_pm_runtime_get_if_active drops them;
+    /// - otherwise the KCR causes `kcr` collects (xe_pxp_irq_handler; it
+    ///   runs only once PXP exists, so it may route the KCR interrupts);
+    /// - then the readiness the uAPI reads, and one bounded poll of the
+    ///   hardware work, beginning new work only while the GSC worker is
+    ///   idle.
+    pub(crate) fn service<P: Port<C>>(
+        &mut self,
+        view: Gt1View,
+        now: u64,
+        port: &mut P,
+        mmio: &impl MmioWindow,
+        resources: impl FnOnce() -> Result<(C, u64), PxpError>,
+        kcr: impl FnOnce() -> u32,
+    ) -> Pass {
+        let mut initialized = None;
+        if self.owner.is_none() {
+            if core::mem::replace(&mut self.tried, true) {
+                return Pass::Disabled;
+            }
+            if !view.gsc_loadable || !view.huc_staged || !view.vcs {
+                return Pass::Skipped;
+            }
+            kcr_set(mmio, true);
+            let (client, session) = match resources() {
+                Ok(resources) => resources,
+                Err(error) => {
+                    kcr_set(mmio, false);
+                    return Pass::InitFailed(error);
+                }
+            };
+            let pxp = Pxp::new();
+            self.owner = Some(Owner {
+                pxp: pxp.clone(),
+                engine: Engine::new(client, session),
+            });
+            initialized = Some(pxp);
+        }
+        let owner = self.owner.as_mut().expect("PXP owner");
+        let events = kcr();
+        let mut resumed = false;
+        if !owner.pxp.live() {
+            if !view.gsc_idle {
+                return Pass::ResumeDeferred;
+            }
+            kcr_set(mmio, true);
+            owner.pxp.resume(true);
+            resumed = true;
+        } else {
+            owner.pxp.irq(events);
+        }
+        owner
+            .pxp
+            .publish(readiness(view.gsc_error, view.huc_error, mmio));
+        let _ = owner
+            .engine
+            .poll(&owner.pxp, now, port, mmio, view.gsc_idle);
+        Pass::Ran {
+            initialized,
+            resumed,
+        }
+    }
+
+    /// xe_pxp_pm_suspend before GT1 stops: the hardware work in flight
+    /// finishes on `port` (each step is bounded) or, without a running GT1
+    /// or when the stop cannot `wait`, fails as its job would; then queues
+    /// are killed and the key moves on. `false` while a job still runs.
+    pub(crate) fn suspend<P: Port<C>>(
+        &mut self,
+        now: u64,
+        port: Option<&mut P>,
+        mmio: &impl MmioWindow,
+        wait: bool,
+    ) -> bool {
+        let Some(owner) = self.owner.as_mut() else {
+            return true;
+        };
+        if !owner.engine.idle() {
+            let done = match port {
+                Some(port) => owner.engine.quiesce(&owner.pxp, now, port, mmio),
+                None => {
+                    owner.engine.abort(&owner.pxp);
+                    true
+                }
+            };
+            if !done {
+                if wait {
+                    return false;
+                }
+                owner.engine.abort(&owner.pxp);
+            }
+        }
+        owner.pxp.suspend();
+        true
+    }
+
+    /// GT1 left Running under the worker: the work in flight can never
+    /// finish, and the next GT1 start resumes PXP.
+    pub(crate) fn lost(&mut self) {
+        if let Some(owner) = self.owner.as_mut() {
+            owner.engine.abort(&owner.pxp);
+            owner.pxp.suspend();
+        }
+    }
+}
+
 // ── Display: protected planes ───────────────────────────────────────
 
 /// The PXP the display checks plane keys against (`xe->pxp` as

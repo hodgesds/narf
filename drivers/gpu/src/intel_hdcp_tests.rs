@@ -70,6 +70,15 @@ struct RegState {
     writes: Vec<(u64, u32)>,
     /// An MST stream transcoder whose encryption never confirms.
     stuck_stream: Option<u8>,
+    /// Where the HDCP block sits: the transcoder's (display 12+) or a
+    /// display 9-11 port's.
+    layout: Option<HdcpRegs>,
+}
+
+impl RegState {
+    fn layout(&self) -> HdcpRegs {
+        self.layout.unwrap_or(HdcpRegs::Transcoder)
+    }
 }
 
 struct Regs(IrqSafeSpinLock<RegState>);
@@ -83,6 +92,18 @@ impl Regs {
             s.an = [0x0403_0201, 0x0807_0605];
             s.r0 = 0x1234;
             s.regs.insert(HSW_PWR_WELL_CTL2, 0b11);
+        }
+        r
+    }
+    /// A display 9-11 port's HDCP block for the link on transcoder `t`,
+    /// with PW_1 (index `pw1_idx`) requested and on in the driver register.
+    fn legacy(t: u8, port: u8, pw1_idx: u8) -> Self {
+        let r = Self::new(t);
+        {
+            let mut s = r.0.lock();
+            s.layout = Some(HdcpRegs::Port(port));
+            s.regs
+                .insert(HSW_PWR_WELL_CTL2, 0b11 << (2 * u32::from(pw1_idx)));
         }
         r
     }
@@ -110,23 +131,30 @@ impl MmioWindow for Regs {
     fn read32(&self, off: u64) -> u32 {
         let s = self.0.lock();
         let t = s.t;
-        if off == trans_hdcp_anlo(t) {
+        let layout = s.layout();
+        if off == layout.anlo(t) {
             return s.an[0];
         }
-        if off == trans_hdcp_anhi(t) {
+        if off == layout.anhi(t) {
             return s.an[1];
+        }
+        if off == crate::intel_gpu_pcode::PCODE_MAILBOX {
+            // The punit answered at once.
+            return s.regs.get(&off).copied().unwrap_or(0) & !crate::intel_gpu_pcode::PCODE_READY;
         }
         let v = *s.regs.get(&off).unwrap_or(&0);
         // DP MST: a stream is encrypted while its TRANS_DDI_FUNC_CTL HDCP
         // select is set on an encrypted link (the master's
-        // LINK_ENCRYPTION_STATUS, or its HDCP 1.4 ENC).
+        // LINK_ENCRYPTION_STATUS, or its HDCP 1.4 ENC). Below display 12
+        // every stream's HDCP 1.4 bit is in the port's one status register.
+        let mut stream_bits = None;
         for x in 0..4u8 {
             let select = s.regs.get(&trans_ddi_func_ctl(x)).copied().unwrap_or(0)
                 & mst::TRANS_DDI_HDCP_SELECT
                 != 0
                 && s.stuck_stream != Some(x);
-            if off == mst::trans_hdcp2_stream_status(x) {
-                let link = s.regs.get(&trans_hdcp2_status(t)).copied().unwrap_or(0)
+            if off == layout.hdcp2_stream_status(x) {
+                let link = s.regs.get(&layout.hdcp2_status(t)).copied().unwrap_or(0)
                     & LINK_ENCRYPTION_STATUS
                     != 0;
                 return v | if select && link {
@@ -135,15 +163,17 @@ impl MmioWindow for Regs {
                     0
                 };
             }
-            if off == trans_hdcp_status(x) {
+            if off == layout.status(x) {
                 let enc =
-                    s.regs.get(&trans_hdcp_status(t)).copied().unwrap_or(0) & HDCP_STATUS_ENC != 0;
-                return v | if select && enc {
-                    mst::hdcp_status_stream_enc(x)
-                } else {
-                    0
-                };
+                    s.regs.get(&layout.status(t)).copied().unwrap_or(0) & HDCP_STATUS_ENC != 0;
+                let bits = stream_bits.get_or_insert(0);
+                if select && enc {
+                    *bits |= mst::hdcp_status_stream_enc(x);
+                }
             }
+        }
+        if let Some(bits) = stream_bits {
+            return v | bits;
         }
         if off == HDCP_REP_CTL {
             let mut v = v | HDCP_SHA1_READY;
@@ -165,10 +195,18 @@ impl MmioWindow for Regs {
         let mut s = self.0.lock();
         s.writes.push((off, val));
         let t = s.t;
-        let status = trans_hdcp_status(t);
+        let layout = s.layout();
+        let status = layout.status(t);
         let st = |s: &mut RegState| -> u32 { *s.regs.get(&status).unwrap_or(&0) };
-        if off == HDCP_KEY_CONF {
-            if val & HDCP_KEY_LOAD_TRIGGER != 0 {
+        // Gen9 big core: SKL_PCODE_LOAD_HDCP_KEYS with data 1 loads the fuses.
+        let pcode_load = off == crate::intel_gpu_pcode::PCODE_MAILBOX
+            && val == crate::intel_gpu_pcode::PCODE_READY | SKL_PCODE_LOAD_HDCP_KEYS
+            && s.regs.get(&crate::intel_gpu_pcode::PCODE_DATA0) == Some(&1);
+        if (off == HDCP_KEY_CONF && val & HDCP_KEY_LOAD_TRIGGER != 0) || pcode_load {
+            if pcode_load {
+                s.regs.insert(off, val);
+            }
+            {
                 let bits = if s.key_fails {
                     HDCP_KEY_LOAD_DONE
                 } else {
@@ -176,11 +214,12 @@ impl MmioWindow for Regs {
                 };
                 s.regs.insert(HDCP_KEY_STATUS, bits);
             }
+        } else if off == HDCP_KEY_CONF {
         } else if off == HDCP_KEY_STATUS {
             // Write one to clear.
             let v = *s.regs.get(&off).unwrap_or(&0);
             s.regs.insert(off, v & !val);
-        } else if off == trans_hdcp_conf(t) {
+        } else if off == layout.conf(t) {
             let v = match val {
                 HDCP_CONF_CAPTURE_AN => st(&mut s) | HDCP_STATUS_AN_READY,
                 HDCP_CONF_AUTH_AND_ENC => st(&mut s) | HDCP_STATUS_R0_READY,
@@ -188,7 +227,7 @@ impl MmioWindow for Regs {
             };
             s.regs.insert(status, v);
             s.regs.insert(off, val);
-        } else if off == trans_hdcp_rprime(t) {
+        } else if off == layout.rprime(t) {
             if val == u32::from(s.r0) {
                 let v = st(&mut s) | HDCP_STATUS_RI_MATCH | HDCP_STATUS_ENC;
                 s.regs.insert(status, v);
@@ -201,8 +240,8 @@ impl MmioWindow for Regs {
         } else if off == HDCP_SHA_TEXT {
             let mode = *s.regs.get(&HDCP_REP_CTL).unwrap_or(&0) & 0xe;
             s.sha.push((mode, val));
-        } else if off == trans_hdcp2_ctl(t) {
-            let st2 = trans_hdcp2_status(t);
+        } else if off == layout.hdcp2_ctl(t) {
+            let st2 = layout.hdcp2_status(t);
             let mut v = *s.regs.get(&st2).unwrap_or(&0);
             if val & CTL_LINK_ENCRYPTION_REQ != 0 && v & LINK_AUTH_STATUS != 0 {
                 v |= LINK_ENCRYPTION_STATUS;
@@ -504,7 +543,6 @@ fn buffer_len_in(id: u32, len: usize) -> Option<u32> {
 
 struct FwModel<'r> {
     regs: &'r Regs,
-    t: u8,
     protocol: u8,
     d: Hdcp2Data,
     stored_km: bool,
@@ -516,6 +554,10 @@ struct FwModel<'r> {
     /// The (stream ID, type) pairs a DP MST port manages; `None` for SST
     /// and HDMI (stream 0 of the content type).
     mst_streams: Option<Vec<(u8, u8)>>,
+    /// The `hdcp_port_id` every command must carry, and the register its
+    /// enable_hdcp_auth makes the hardware set LINK_AUTH_STATUS in.
+    port_id: [u8; 4],
+    auth_status: u64,
 }
 
 impl core::fmt::Debug for FwModel<'_> {
@@ -528,7 +570,6 @@ impl<'r> FwModel<'r> {
     fn new(regs: &'r Regs, t: u8, protocol: u8, d: Hdcp2Data) -> Self {
         Self {
             regs,
-            t,
             protocol,
             d,
             stored_km: false,
@@ -537,7 +578,17 @@ impl<'r> FwModel<'r> {
             log: Vec::new(),
             bad: None,
             mst_streams: None,
+            port_id: [1, 0, 0x10 + t, 0],
+            auth_status: trans_hdcp2_status(t),
         }
+    }
+    /// The firmware of a display 9-11 port: `hdcp_port_id` names the DDI
+    /// (`intel_get_hdcp_ddi_index`) and an invalid transcoder.
+    fn legacy(regs: &'r Regs, t: u8, port: u8, protocol: u8, d: Hdcp2Data) -> Self {
+        let mut fw = Self::new(regs, t, protocol, d);
+        fw.port_id = [1, msg::hdcp_ddi_index(port), 0, 0];
+        fw.auth_status = HdcpRegs::Port(port).hdcp2_status(t);
+        fw
     }
 
     fn check(&mut self, ok: bool, what: &'static str) {
@@ -558,8 +609,9 @@ impl<'r> FwModel<'r> {
                 && le(&cmd[12..16]) as usize == cmd.len() - 16,
             "buffer_len",
         );
-        // INTEGRATED, physical port 0 (Gen12+), HDCP_TRANSCODER_A + t.
-        self.check(cmd[16..20] == [1, 0, 0x10 + self.t, 0], "hdcp_port_id");
+        // INTEGRATED, physical port 0 (Gen12+), HDCP_TRANSCODER_A + t; or a
+        // display 9-11 DDI and no transcoder.
+        self.check(cmd[16..20] == self.port_id, "hdcp_port_id");
         let p = &cmd[20..];
         let mut status = 0;
         if let Some((fid, fstatus, n)) = self.fail {
@@ -596,8 +648,7 @@ impl<'r> FwModel<'r> {
                     .map_or(self.content_type, |s| s[0].1);
                 self.check(p == [ty], "enable_auth stream_type");
                 if status == 0 {
-                    self.regs
-                        .set_bits(trans_hdcp2_status(self.t), LINK_AUTH_STATUS);
+                    self.regs.set_bits(self.auth_status, LINK_AUTH_STATUS);
                 }
             }
             0x0003_1008 => {
@@ -1425,6 +1476,8 @@ fn hdcp22_dp_cp_irq() -> TestResult {
             tbt_io: false,
         }),
         display_ver: 14,
+        hw: HdcpHw::TRANSCODER,
+        hdcp2: true,
         rekey: LineRekey::None,
         cp_irq: true,
         mst: live::MstStreams::default(),
@@ -1999,3 +2052,350 @@ kernel_test_in!(
 
 #[path = "intel_hdcp_mst_tests.rs"]
 mod mst_tests;
+
+// ── Display 9 to 11: the port-indexed HDCP block ─────────────────────
+
+/// The display 9-11 HDCP registers by DDI port (`intel_hdcp_regs.h`:
+/// `_PORTA..F_HDCP_AUTHENC` = `_PORTx_HDCP2_BASE` 0x66800, 0x66500,
+/// 0x66600, 0x66700, 0x66a00, 0x66900 plus the field offsets,
+/// `PIPE_HDCP2_STREAM_STATUS`, `PORT_HDCP2_AUTH_STREAM`, and
+/// `HDCP_DDIx_REP_PRESENT | HDCP_DDIx_SHA1_M0`), `intel_get_hdcp_ddi_index`,
+/// and what `intel_hdcp.c` decides by display version: `is_hdcp_supported`
+/// (no port past D below display 12), `intel_hdcp_load_keys` (the pcode
+/// mailbox on display 9 except Broxton), `SKL_PW_CTL_IDX_PW_1` 14 and
+/// `ICL_PW_CTL_IDX_PW_1` 0, and `is_hdcp2_supported` (display 10+, Kaby,
+/// Coffee and Comet Lake). The display 12+ transcoder layout is unchanged.
+fn smoke_intel_hdcp_gen9_gen11_port_layout() -> TestResult {
+    use crate::intel_gpu_gt::{Gen11Platform, Gen12Platform, Gen9Platform, GtPlatform};
+    let (a, b, c, d) = (
+        HdcpRegs::Port(0),
+        HdcpRegs::Port(1),
+        HdcpRegs::Port(2),
+        HdcpRegs::Port(3),
+    );
+    let t = HdcpRegs::Transcoder;
+    let addresses = [
+        (a.conf(0), 0x66800),
+        (b.conf(2), 0x66500),
+        (c.conf(0), 0x66600),
+        (d.conf(0), 0x66700),
+        (b.aninit(0), 0x66504),
+        (b.anlo(0), 0x66508),
+        (b.anhi(0), 0x6650c),
+        (b.bksvlo(0), 0x66510),
+        (b.bksvhi(0), 0x66514),
+        (b.rprime(0), 0x66518),
+        (b.status(0), 0x6651c),
+        (b.hdcp2_auth(0), 0x66598),
+        (b.hdcp2_ctl(0), 0x665b0),
+        (b.hdcp2_status(0), 0x665b4),
+        (a.hdcp2_ctl(0), 0x668b0),
+        (b.hdcp2_stream_status(0), 0x668c0),
+        (b.hdcp2_stream_status(1), 0x665c0),
+        (b.hdcp2_stream_status(2), 0x666c0),
+        (b.hdcp2_stream_status(3), 0x667c0),
+        (b.hdcp2_auth_stream(3), 0x66f04),
+        (d.hdcp2_auth_stream(0), 0x66f0c),
+        (port_hdcp_base(4), 0x66a00),
+        (port_hdcp_base(5), 0x66900),
+        (t.conf(2), 0x66600),
+        (t.status(1), 0x6651c),
+        (t.hdcp2_status(1), 0x665b4),
+        (t.hdcp2_stream_status(1), 0x665c0),
+        (t.hdcp2_auth_stream(1), 0x66f04),
+    ];
+    if addresses.iter().any(|&(got, want)| got != want) {
+        return TestResult::Fail("HDCP register address");
+    }
+    if [0u8, 1, 2, 3, 4, 5].map(|p| HdcpRegs::Port(p).repeater_ctl(3))
+        != [
+            0x2020_0000,
+            0x4010_0000,
+            0x1030_0000,
+            0x0840_0000,
+            0x0260_0000,
+            0,
+        ]
+        || t.repeater_ctl(0) != 0x8010_0000
+        || t.repeater_ctl(3) != 0x1040_0000
+    {
+        return TestResult::Fail("intel_hdcp_get_repeater_ctl");
+    }
+    if [0u8, 1, 2, 3, 4, 5, 6].map(msg::hdcp_ddi_index) != [7, 1, 2, 3, 4, 5, 0] {
+        return TestResult::Fail("intel_get_hdcp_ddi_index");
+    }
+    let hw = |regs, pcode_key_load, pw1_idx| HdcpHw {
+        regs,
+        pcode_key_load,
+        pw1_idx,
+    };
+    if HdcpHw::legacy(9, true, 1) != Some(hw(b, true, 14))
+        || HdcpHw::legacy(9, false, 1) != Some(hw(b, false, 14))
+        || HdcpHw::legacy(10, false, 0) != Some(hw(a, false, 14))
+        || HdcpHw::legacy(11, false, 3) != Some(hw(d, false, 0))
+        || HdcpHw::legacy(9, true, 4).is_some()
+        || HdcpHw::legacy(11, false, 5).is_some()
+        || HdcpHw::legacy(12, false, 0).is_some()
+        || HdcpHw::TRANSCODER != hw(t, false, 0)
+    {
+        return TestResult::Fail("HdcpHw by display version");
+    }
+    let legacy = |p| live::LegacyDisplay::of(p).map(|l| (l.display_ver, l.big_core, l.hdcp2));
+    if legacy(GtPlatform::Gen9(Gen9Platform::Skylake)) != Some((9, true, false))
+        || legacy(GtPlatform::Gen9(Gen9Platform::KabyLake)) != Some((9, true, true))
+        || legacy(GtPlatform::Gen9(Gen9Platform::CometLake)) != Some((9, true, true))
+        || legacy(GtPlatform::Gen9(Gen9Platform::Broxton)) != Some((9, false, false))
+        || legacy(GtPlatform::Gen9(Gen9Platform::GeminiLake)) != Some((10, false, true))
+        || legacy(GtPlatform::Gen11(Gen11Platform::IceLake)) != Some((11, false, true))
+        || legacy(GtPlatform::Gen11(Gen11Platform::JasperLake)) != Some((11, false, true))
+        || legacy(GtPlatform::Gen12(Gen12Platform::TigerLake)).is_some()
+    {
+        return TestResult::Fail("LegacyDisplay by platform");
+    }
+    // A Gen11 session on DDI B is a port-B route without line rekeying; DDI
+    // E has no HDCP below display 12.
+    let ice = live::LegacyDisplay::of(GtPlatform::Gen11(Gen11Platform::IceLake)).unwrap();
+    let route = ice.route(
+        crate::intel_gpu_ddi::Ddi::B,
+        0,
+        Protocol::Dp,
+        live::RouteLink::Dp(shim::AuxPort::Gen12(crate::intel_gpu_ddi::Ddi::B)),
+        live::MstStreams::default(),
+    );
+    if route.is_none_or(|r| {
+        r.display_ver != 11
+            || r.hw != hw(b, false, 0)
+            || !r.hdcp2
+            || r.rekey != LineRekey::None
+            || r.key != live::gen12_key(crate::intel_gpu_ddi::Ddi::B)
+    }) || ice
+        .route(
+            crate::intel_gpu_ddi::Ddi::E,
+            0,
+            Protocol::Hdmi,
+            live::RouteLink::Dp(shim::AuxPort::Gen12(crate::intel_gpu_ddi::Ddi::E)),
+            live::MstStreams::default(),
+        )
+        .is_some()
+    {
+        return TestResult::Fail("Gen11 HDCP route");
+    }
+    // The firmware's port ID names the DDI, never a transcoder.
+    let link = HdcpLink::new(Protocol::Dp, 2, LineRekey::None, true).with_hw(hw(a, false, 0));
+    if link.port_data.port_id() != [1, 7, 0, 0] {
+        return TestResult::Fail("display 9-11 hdcp_port_id");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_hdcp",
+    smoke_intel_hdcp_gen9_gen11_port_layout
+);
+
+/// HDCP 1.4 over DP on a Gen9 big-core DDI B, transcoder A: the fuse load
+/// goes through the pcode mailbox (`SKL_PCODE_LOAD_HDCP_KEYS`, data 1) and
+/// `HDCP_KEY_CONF` carries only the Aksv send; An, Bksv, Ri' and CONF use
+/// port B's block and nothing touches transcoder A's. PW_1 is index 14:
+/// ICL's index-0 bit alone is not PW_1 here, and the BIOS request counts.
+/// The link check and disable stay on the port's registers.
+fn smoke_intel_hdcp14_gen9_port_registers_and_pcode_key_load() -> TestResult {
+    use crate::intel_gpu_pcode::{PCODE_DATA0, PCODE_DATA1, PCODE_MAILBOX};
+    let hw = HdcpHw::legacy(9, true, 1).unwrap();
+    let regs = Regs::legacy(0, 1, SKL_PW_CTL_IDX_PW_1);
+    let mut s = DpShim::new(DpSink::hdcp14(false));
+    let mut env = Env::default();
+    let mut link = HdcpLink::new(Protocol::Dp, 0, LineRekey::None, false).with_hw(hw);
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: None::<&mut FwModel>,
+        env: &mut env,
+    };
+    if drive(link.enable(&mut cx, 0)) != Some(Ok(())) || !link.hdcp_encrypted {
+        return TestResult::Fail("Gen9 HDCP 1.4 DP enable failed");
+    }
+    if regs.wrote(PCODE_DATA0) != [1]
+        || regs.wrote(PCODE_DATA1) != [0]
+        || regs.wrote(PCODE_MAILBOX) != [0x8000_0005]
+        || regs.wrote(HDCP_KEY_CONF) != [HDCP_AKSV_SEND_TRIGGER]
+    {
+        return TestResult::Fail("Gen9 key load not through the pcode mailbox");
+    }
+    if regs.wrote(0x66504).len() != 2
+        || regs.wrote(0x66500) != [HDCP_CONF_CAPTURE_AN, HDCP_CONF_AUTH_AND_ENC]
+        || regs.wrote(0x66510) != [0x0f0f_0f0f]
+        || regs.wrote(0x66514) != [0x0f]
+        || regs.wrote(0x66518) != [0x1234]
+        || (0x66400..0x66420)
+            .step_by(4)
+            .any(|r| !regs.wrote(r).is_empty())
+    {
+        return TestResult::Fail("Gen9 HDCP 1.4 port register sequence");
+    }
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: None::<&mut FwModel>,
+        env: &mut env,
+    };
+    if drive(link.check_link(&mut cx)) != Some(Ok(()))
+        || drive(link.disable(&mut cx)) != Some(Ok(()))
+        || regs.get(0x66500) != 0
+        || link.value != CpValue::Undesired
+    {
+        return TestResult::Fail("Gen9 HDCP 1.4 check or disable");
+    }
+    // PW_1 at ICL's index only: refused before any key register.
+    let regs = Regs::legacy(0, 1, ICL_PW_CTL_IDX_PW_1);
+    let mut link = HdcpLink::new(Protocol::Dp, 0, LineRekey::None, false).with_hw(hw);
+    let mut s = DpShim::new(DpSink::hdcp14(false));
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: None::<&mut FwModel>,
+        env: &mut env,
+    };
+    if drive(link.enable(&mut cx, 0)) != Some(Err(HdcpError::KeyNotLoadable))
+        || !regs.wrote(PCODE_MAILBOX).is_empty()
+        || !regs.wrote(HDCP_KEY_CONF).is_empty()
+    {
+        return TestResult::Fail("Gen9 key load without PW_1");
+    }
+    // The BIOS request of PW_1 (index 14) suffices.
+    regs.0.lock().regs.insert(
+        HSW_PWR_WELL_CTL1,
+        0b11 << (2 * u32::from(SKL_PW_CTL_IDX_PW_1)),
+    );
+    if drive(link.enable(&mut cx, 0)) != Some(Ok(())) {
+        return TestResult::Fail("BIOS-requested Gen9 PW_1 not accepted");
+    }
+    // Broxton (display 9, not big core) writes HDCP_KEY_LOAD_TRIGGER.
+    let regs = Regs::legacy(0, 1, SKL_PW_CTL_IDX_PW_1);
+    let mut link = HdcpLink::new(Protocol::Dp, 0, LineRekey::None, false)
+        .with_hw(HdcpHw::legacy(9, false, 1).unwrap());
+    let mut s = DpShim::new(DpSink::hdcp14(false));
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: None::<&mut FwModel>,
+        env: &mut env,
+    };
+    if drive(link.enable(&mut cx, 0)) != Some(Ok(()))
+        || !regs.wrote(PCODE_MAILBOX).is_empty()
+        || regs.wrote(HDCP_KEY_CONF) != [HDCP_KEY_LOAD_TRIGGER, HDCP_AKSV_SEND_TRIGGER]
+    {
+        return TestResult::Fail("Broxton key load not through HDCP_KEY_CONF");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_hdcp",
+    smoke_intel_hdcp14_gen9_port_registers_and_pcode_key_load
+);
+
+/// Gen11: HDCP 1.4 over HDMI on DDI C, transcoder B, loads its keys with
+/// `HDCP_KEY_CONF`, signals in the transcoder's `TRANS_DDI_FUNC_CTL` and
+/// checks Ri' on port C's block. HDCP 2.2 over DP on DDI B through the MEI
+/// client: every command's `hdcp_port_id` is {INTEGRATED, HDCP_DDI_B, no
+/// transcoder}, LINK_AUTH and the encryption request are port B's
+/// `HDCP2_STATUS` / `HDCP2_CTL`, and transcoder A's HDCP 2.2 block is never
+/// written. A Skylake link (`is_hdcp2_supported` false) never asks the
+/// firmware: type 0 takes HDCP 1.4 and type 1 is refused.
+fn smoke_intel_hdcp_gen11_hdmi14_and_hdcp22_mei_port_data() -> TestResult {
+    let regs = Regs::legacy(1, 2, ICL_PW_CTL_IDX_PW_1);
+    let mut s = HdmiShim::new(HdmiSink::hdcp14());
+    let mut env = Env::default();
+    let mut link = HdcpLink::new(Protocol::Hdmi, 1, LineRekey::None, true)
+        .with_hw(HdcpHw::legacy(11, false, 2).unwrap());
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: None::<&mut FwModel>,
+        env: &mut env,
+    };
+    if drive(link.enable(&mut cx, 0)) != Some(Ok(())) {
+        return TestResult::Fail("Gen11 HDCP 1.4 HDMI enable failed");
+    }
+    if regs.wrote(HDCP_KEY_CONF) != [HDCP_KEY_LOAD_TRIGGER, HDCP_AKSV_SEND_TRIGGER]
+        || !regs.wrote(crate::intel_gpu_pcode::PCODE_MAILBOX).is_empty()
+        || regs.wrote(0x66600) != [HDCP_CONF_CAPTURE_AN, HDCP_CONF_AUTH_AND_ENC]
+        || regs.get(trans_ddi_func_ctl(1)) & TRANS_DDI_HDCP_SIGNALLING == 0
+    {
+        return TestResult::Fail("Gen11 HDMI key load, CONF or signalling");
+    }
+    if drive(link.check_link(&mut cx)) != Some(Ok(())) || regs.wrote(0x66618).len() < 2 {
+        return TestResult::Fail("Gen11 HDMI Ri' check not on port C");
+    }
+
+    let regs = Regs::legacy(0, 1, ICL_PW_CTL_IDX_PW_1);
+    let d = Hdcp2Data::new(false);
+    let mut s = DpShim::new(DpSink::hdcp22(&d));
+    let mut fw = FwModel::legacy(&regs, 0, 1, msg::HDCP_PROTOCOL_DP, Hdcp2Data::new(false));
+    let mut link = HdcpLink::new(Protocol::Dp, 0, LineRekey::None, true)
+        .with_hw(HdcpHw::legacy(11, false, 1).unwrap());
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: Some(&mut fw),
+        env: &mut env,
+    };
+    let r = drive(link.enable(&mut cx, 0));
+    if let Some(bad) = fw.bad {
+        return TestResult::Fail(bad);
+    }
+    if r != Some(Ok(())) || !link.hdcp2_encrypted || link.port_data.hdcp_transcoder != 0 {
+        return TestResult::Fail("Gen11 HDCP 2.2 DP enable failed");
+    }
+    if regs.get(0x665b0) & CTL_LINK_ENCRYPTION_REQ == 0
+        || !regs.wrote(trans_hdcp2_ctl(0)).is_empty()
+    {
+        return TestResult::Fail("Gen11 HDCP 2.2 encryption not on port B");
+    }
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: Some(&mut fw),
+        env: &mut env,
+    };
+    if drive(link.disable(&mut cx)) != Some(Ok(()))
+        || regs.get(0x665b0) & CTL_LINK_ENCRYPTION_REQ != 0
+        || fw.log.last() != Some(&0x0003_100a)
+    {
+        return TestResult::Fail("Gen11 HDCP 2.2 disable");
+    }
+
+    // Skylake: the firmware is bound but the platform has no HDCP 2.2.
+    let regs = Regs::legacy(0, 1, SKL_PW_CTL_IDX_PW_1);
+    let mut sink = DpSink::hdcp22(&d);
+    sink.put(shim::DP_AUX_HDCP_BKSV, &BKSV);
+    sink.put(shim::DP_AUX_HDCP_RI_PRIME, &RI);
+    sink.put(shim::DP_AUX_HDCP_BCAPS, &[shim::DP_BCAPS_HDCP_CAPABLE]);
+    let mut s = DpShim::new(sink);
+    let mut fw = FwModel::legacy(&regs, 0, 1, msg::HDCP_PROTOCOL_DP, Hdcp2Data::new(false));
+    let skylake = live::LegacyDisplay::of(crate::intel_gpu_gt::GtPlatform::Gen9(
+        crate::intel_gpu_gt::Gen9Platform::Skylake,
+    ))
+    .unwrap();
+    let mut link = HdcpLink::new(Protocol::Dp, 0, LineRekey::None, skylake.hdcp2)
+        .with_hw(HdcpHw::legacy(9, true, 1).unwrap());
+    let mut cx = Ctx {
+        io: &regs,
+        shim: &mut s,
+        fw: Some(&mut fw),
+        env: &mut env,
+    };
+    if drive(link.enable(&mut cx, 1)) != Some(Err(HdcpError::Type1Unavailable)) {
+        return TestResult::Fail("Skylake type 1 not refused");
+    }
+    if drive(link.enable(&mut cx, 0)) != Some(Ok(())) || !link.hdcp_encrypted {
+        return TestResult::Fail("Skylake type 0 did not take HDCP 1.4");
+    }
+    if !fw.log.is_empty() {
+        return TestResult::Fail("Skylake asked the HDCP 2.2 firmware");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_hdcp",
+    smoke_intel_hdcp_gen11_hdmi14_and_hdcp22_mei_port_data
+);

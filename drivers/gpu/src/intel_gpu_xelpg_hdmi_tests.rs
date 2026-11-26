@@ -275,6 +275,9 @@ fn hdmi_probe_b() -> MtlHdmiProbe {
         link: TmdsLink::default(),
         ddc: PinPair::Pin2Bxt,
         format: crate::intel_gpu_hdmi::SinkFormat::Rgb,
+        bpc: 8,
+        ext: false,
+        audio: None,
         edid: alloc::boxed::Box::new([0; crate::intel_gpu_hdmi::EDID_CAPACITY]),
         edid_len: 0,
     }
@@ -1042,4 +1045,364 @@ fn smoke_c10_hdmi_snps_pll_matches_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_hdmi",
     smoke_c10_hdmi_snps_pll_matches_linux
+);
+
+/// HF-VSDB with the FRL and DSC bytes (`hf_scds[7]`, `[11]`, `[12]`):
+/// payload 12, rate 120 (600 MHz), SCDC.
+fn hf_vsdb_frl(frl: u8, dsc: u8, dsc_frl: u8) -> [u8; 13] {
+    [
+        (3 << 5) | 12,
+        0xD8,
+        0x5D,
+        0xC4,
+        1,
+        120,
+        0x80,
+        frl,
+        0,
+        0,
+        0,
+        dsc,
+        dsc_frl,
+    ]
+}
+
+/// The HDMI 2.1 FRL facts Linux 7.4 carries, pinned against its sources:
+/// `intel_hdmi_is_frl` (with `intel_dpll_clock_matches`' 1 kHz),
+/// `drm_get_max_frl_rate` / `intel_hdmi_sink_max_frl_rate` /
+/// `intel_hdmi_sink_dsc_max_frl_rate`, the FRL entries of
+/// `mtl_c20_hdmi_tables[]`, `intel_c20_calc_vdr_params` /
+/// `intel_c20_get_hdmi_rate`, `intel_program_port_clock_ctl`'s DIV18CLK and
+/// `intel_ddi_link_symbol_clock`. The route still refuses FRL: a mode above
+/// the source's 600 MHz on an FRL sink is `FrlUnsupported`.
+fn smoke_xe_hdmi_frl_facts_and_refusal() -> TestResult {
+    use crate::intel_gpu_xelpg::{
+        c20_hdmi_rate, ddi_clock_select, hdmi_link_symbol_clock_khz, C20_SERDES_IS_HDMI_FRL,
+        DDI_CLOCK_SELECT_DIV18CLK,
+    };
+    for (clock, frl) in [
+        (300_000, true),
+        (299_999, true),
+        (600_001, true),
+        (800_000, true),
+        (1_000_000, true),
+        (1_200_001, true),
+        (299_998, false),
+        (297_000, false),
+        (594_000, false),
+    ] {
+        if is_frl(clock) != frl {
+            return TestResult::Fail("intel_hdmi_is_frl takes the five rates within 1 kHz");
+        }
+    }
+    // An FRL-ambiguous TMDS clock refuses with the 1 kHz tolerance too.
+    if hdmi_pll_request(XeLpgPort::B, 299_999, false) != Err(HdmiError::FrlClock(299_999)) {
+        return TestResult::Fail("an FRL clock within 1 kHz must refuse as FRL");
+    }
+    // drm_get_max_frl_rate: code 6 is 4 lanes x 12 Gbps, code 3 is 4 x 6.
+    let frl = parse_sink_frl(&edid_with_cta(edid_4k60(), &hf_vsdb_frl(0x60, 0x80, 0x30)));
+    if frl
+        != (SinkFrl {
+            max_lanes: 4,
+            max_frl_rate_per_lane: 12,
+            dsc_max_lanes: 4,
+            dsc_max_frl_rate_per_lane: 6,
+        })
+        || frl.max_frl_rate() != 48
+        || frl.dsc_max_frl_rate() != 24
+    {
+        return TestResult::Fail("the HF-VSDB FRL fields must decode as drm_edid does");
+    }
+    // Code 1 is 3 lanes x 3 Gbps; no DSC byte, no DSC rate.
+    let frl = parse_sink_frl(&edid_with_cta(edid_4k60(), &hf_vsdb_frl(0x10, 0, 0x30)));
+    if frl.max_frl_rate() != 9 || frl.dsc_max_frl_rate() != 0 {
+        return TestResult::Fail("a 3x3 FRL sink without DSC must decode as 9 Gbps, no DSC");
+    }
+    if parse_sink_frl(&edid_with_cta(edid_4k60(), &hf_vsdb(120, 0x80))) != SinkFrl::default() {
+        return TestResult::Fail("an HF-VSDB without FRL must declare none");
+    }
+    // The C20 FRL tables and VDR parameters.
+    match c20_hdmi_frl_state(1_000_000) {
+        Some((state, vdr))
+            if state.tx == [0xBE98, 0x8800, 0x0000]
+                && state.mpllb[0] == 0x1104
+                && state.mpllb[8] == 0x3555
+                && vdr.custom_width == 1
+                && vdr.serdes_rate == C20_SERDES_IS_HDMI_FRL
+                && vdr.hdmi_rate == Some(3) => {}
+        _ => return TestResult::Fail("mtl_c20_hdmi_1000 and its FRL VDR differ from Linux"),
+    }
+    match c20_hdmi_frl_state(1_200_000) {
+        Some((state, vdr)) if state.mpllb[3] == 0xFE40 && vdr.hdmi_rate == Some(1) => {}
+        _ => return TestResult::Fail("mtl_c20_hdmi_1200 and its HDMI rate differ from Linux"),
+    }
+    if c20_hdmi_frl_state(594_000).is_some()
+        || C20Vdr::hdmi(800_000).and_then(|v| v.hdmi_rate) != Some(2)
+        || C20Vdr::hdmi(148_500) != Some(C20Vdr::hdmi_tmds())
+        // Linux: 300 MHz is FRL for the width/serdes byte, TMDS for the rate.
+        || C20Vdr::hdmi(300_000)
+            != Some(C20Vdr {
+                custom_width: 1,
+                serdes_rate: C20_SERDES_IS_HDMI_FRL,
+                hdmi_rate: Some(0),
+            })
+        || C20Vdr::hdmi(25_000).is_some()
+        || c20_hdmi_rate(1_100_000).is_some()
+    {
+        return TestResult::Fail("intel_c20_calc_vdr_params' HDMI cases differ from Linux");
+    }
+    // DIV18CLK and the 18-bit FRL symbol clock; TMDS keeps maxPCLK.
+    let mut req = hdmi_pll_request(XeLpgPort::B, 594_000, false).unwrap();
+    if ddi_clock_select(&req) != DDI_CLOCK_SELECT_MAXPCLK {
+        return TestResult::Fail("TMDS must select maxPCLK");
+    }
+    req.port_clock_khz = 1_200_000;
+    if ddi_clock_select(&req) != DDI_CLOCK_SELECT_DIV18CLK
+        || hdmi_link_symbol_clock_khz(1_200_000) != 666_667
+        || hdmi_link_symbol_clock_khz(800_000) != 444_444
+        || hdmi_link_symbol_clock_khz(594_000) != 594_000
+    {
+        return TestResult::Fail("FRL must select DIV18CLK and an 18-bit symbol clock");
+    }
+    // A 640 MHz mode on a 48 Gbps FRL sink: only FRL could carry it.
+    let edid = edid_with_cta(
+        edid_for(640_000, 3840, 560, 176, 88, 2160, 90, 8, 10),
+        &hf_vsdb_frl(0x60, 0, 0),
+    );
+    let io = ddi_b_hdmi_sink(&edid);
+    match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
+        Err(HdmiError::FrlUnsupported {
+            clock_khz: 640_000,
+            sink_max_frl_gbps: 48,
+        }) => {}
+        _ => return TestResult::Fail("a mode only FRL carries must refuse FrlUnsupported"),
+    }
+    // Without FRL in the sink it stays an unsupported clock.
+    let edid = edid_with_cta(
+        edid_for(640_000, 3840, 560, 176, 88, 2160, 90, 8, 10),
+        &hf_vsdb(120, 0x80),
+    );
+    let io = ddi_b_hdmi_sink(&edid);
+    match probe_hdmi(
+        &io,
+        Generation::MeteorLake,
+        XeLpgPort::B,
+        false,
+        ddc_pin(XeLpgPort::B),
+    ) {
+        Err(HdmiError::UnsupportedClock(640_000)) => TestResult::Pass,
+        _ => TestResult::Fail("a TMDS sink's 640 MHz mode must stay UnsupportedClock"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_xe_hdmi_frl_facts_and_refusal
+);
+
+// ── Deep colour (narf.intel.hdmi14_ext=1) ───────────────────────────────
+
+/// A 1080p60 EDID 1.3 digital sink (no EDID 1.4 depth field, so the HDMI
+/// VSDB's deep colour is its `display_info.bpc`) with `flags` in its VSDB.
+fn edid_1080p_deep(flags: u8) -> Vec<u8> {
+    let mut base = edid_1080p();
+    base[19] = 3;
+    base[20] = 0x80;
+    edid_with_cta(
+        base,
+        &crate::intel_gpu_xelpg_external::color::tests::hdmi_vsdb(flags, 0),
+    )
+}
+
+fn probe_deep(io: &ExtFake, ext: bool) -> Result<MtlHdmiProbe, HdmiError> {
+    let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_generation(
+        Generation::MeteorLake,
+    )
+    .expect("Meteor Lake profile");
+    probe_hdmi_profile_ext(io, profile, XeLpgPort::B, false, ddc_pin(XeLpgPort::B), ext)
+}
+
+/// `intel_hdmi_compute_bpc` on DDI B (C10): a DC_30 sink runs 1080p60 at
+/// 10 bpc (TMDS 185.625 MHz), a DC_36 sink at 12 bpc (222.75 MHz); the pipe
+/// carries `PIPE_MISC` BPC_10 / BPC_12_ADLP and `TRANS_DDI_BPC_10` / `_12`,
+/// `DDI_CLK_VALFREQ` the TMDS clock, and the General Control Packet the
+/// colour indication with the default phase (1920/2200/2008/2052 are all
+/// multiples of the 4- and 2-pixel groups). Without the option the same
+/// sinks stay at 8 bpc and get no GCP.
+fn smoke_xe_hdmi_deep_colour_10_and_12_bpc_routes() -> TestResult {
+    use crate::intel_gpu_hdmi::{
+        GCP_COLOR_INDICATION, GCP_DEFAULT_PHASE_ENABLE, VIDEO_DIP_CTL_OFFSET, VIDEO_DIP_ENABLE_GCP,
+        VIDEO_DIP_GCP_OFFSET,
+    };
+    let fb = Framebuffer {
+        phys_addr: 0x100_0000,
+        stride_bytes: 1920 * 4,
+        format: PixelFormat::Xrgb8888,
+    };
+    for (flags, bpc, tmds, misc_bpc, func_bpc) in [
+        (0x10u8, 10u8, 185_625u32, 1u32 << 5, 1u32 << 20),
+        (0x30, 12, 222_750, 4 << 5, 3 << 20),
+    ] {
+        let io = ddi_b_hdmi_sink(&edid_1080p_deep(flags));
+        let probe = match probe_deep(&io, true) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("a deep-colour sink must probe"),
+        };
+        if probe.bpc != bpc || probe.pll.port_clock_khz != tmds || probe.link != TmdsLink::default()
+        {
+            return TestResult::Fail("intel_hdmi_compute_bpc must pick the sink's deepest bpc");
+        }
+        let mut route = match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
+            Ok(route) if route.state() == HdmiRouteState::Live => route,
+            _ => return TestResult::Fail("a deep-colour HDMI route must light Pipe B"),
+        };
+        let misc = Pipe::B.base() + crate::intel_gpu_xelpg_dsc::PIPE_MISC_OFFSET;
+        if io.read32(misc) & (7 << 5) != misc_bpc
+            || io.read32(TRANS_DDI_FUNC_CTL_B) & (7 << 20) != func_bpc
+            || io.phy.writes_to(0x6_4130) != [tmds]
+        {
+            return TestResult::Fail("PIPE_MISC, TRANS_DDI_FUNC_CTL or VALFREQ lacks the depth");
+        }
+        let trans = Transcoder::B.base();
+        if io.read32(trans + VIDEO_DIP_GCP_OFFSET)
+            != GCP_COLOR_INDICATION | GCP_DEFAULT_PHASE_ENABLE
+            || io.read32(trans + VIDEO_DIP_CTL_OFFSET) & VIDEO_DIP_ENABLE_GCP == 0
+        {
+            return TestResult::Fail("the GCP must carry the colour indication and phase");
+        }
+        if route.stop(&io).is_err()
+            || io.read32(trans + VIDEO_DIP_CTL_OFFSET) & VIDEO_DIP_ENABLE_GCP != 0
+        {
+            return TestResult::Fail("the stop must clear the GCP");
+        }
+        // narf.intel.hdmi14_ext off: 8 bpc, no GCP.
+        let io = ddi_b_hdmi_sink(&edid_1080p_deep(flags));
+        match probe_deep(&io, false) {
+            Ok(p) if p.bpc == 8 && p.pll.port_clock_khz == 148_500 && !p.ext => {}
+            _ => return TestResult::Fail("without the option the sink must stay at 8 bpc"),
+        }
+    }
+    // An EDID 1.4 sink declaring 8 bits per colour keeps 8 bpc despite its
+    // DC_36 (update_display_info's depth field replaces the VSDB's).
+    let mut base = edid_1080p();
+    base[20] = 0x80 | (2 << 4);
+    let io = ddi_b_hdmi_sink(&edid_with_cta(
+        base,
+        &crate::intel_gpu_xelpg_external::color::tests::hdmi_vsdb(0x30, 0),
+    ));
+    match probe_deep(&io, true) {
+        Ok(p) if p.bpc == 8 && p.pll.port_clock_khz == 148_500 => {}
+        _ => return TestResult::Fail("an 8 bpc EDID 1.4 sink must stay at 8 bpc"),
+    }
+    // A VSDB max TMDS of 200 MHz admits 10 bpc (185.625) but not 12
+    // (222.75): the depth steps down.
+    let mut base = edid_1080p();
+    base[19] = 3;
+    base[20] = 0x80;
+    let io = ddi_b_hdmi_sink(&edid_with_cta(
+        base,
+        &crate::intel_gpu_xelpg_external::color::tests::hdmi_vsdb(0x30, 40),
+    ));
+    match probe_deep(&io, true) {
+        Ok(p) if p.bpc == 10 && p.pll.port_clock_khz == 185_625 => TestResult::Pass,
+        _ => TestResult::Fail("a sink TMDS limit must step 12 bpc down to 10"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_xe_hdmi_deep_colour_10_and_12_bpc_routes
+);
+
+// ── HDMI audio (narf.intel.hdmi14_ext=1) ────────────────────────────────
+
+/// The HDMI route's ELD/audio enable sequence with a scripted HDA side
+/// (`intel_post_plane_update` → `intel_audio_codec_enable`): the probe
+/// builds the sink's ELD, the live route raises `AUDIO_OUTPUT_ENABLE` for
+/// Transcoder B and invalidates its ELD_VALID (never sets it), programs the
+/// HDMI `AUD_CONFIG` (138.5 MHz: field 1, automatic N), brackets the
+/// resource transaction with `AUD_TS_CDCLK`, and notifies
+/// `pin_eld_notify(PORT_B, -1)`; the codec reads the pruned ELD through pin
+/// 0x6. The stop disables audio before the planes and notifies again.
+fn smoke_xe_hdmi_audio_route_with_scripted_hda() -> TestResult {
+    use crate::intel_gpu_xelpg_external::audio::{self, tests as at};
+    use narf_drivers_sound::display_audio as acomp;
+    audio::reset_for_test();
+    acomp::register_display_audio_codec(&at::SCRIPTED_HDA);
+    let result = (|| {
+        let io = ddi_b_hdmi_sink(&at::audio_edid());
+        let probe = match probe_deep(&io, true) {
+            Ok(p) if p.audio.is_some() && p.bpc == 8 => p,
+            _ => return TestResult::Fail("an HDMI sink with SADs must probe with audio"),
+        };
+        let fb = Framebuffer {
+            phys_addr: 0x100_0000,
+            stride_bytes: 1920 * 4,
+            format: PixelFormat::Xrgb8888,
+        };
+        let before = at::NOTIFY_COUNT.load(core::sync::atomic::Ordering::SeqCst);
+        let mut route = match activate_hdmi(&io, probe, fb, &MtlDisplay::NONE) {
+            Ok(route) if route.state() == HdmiRouteState::Live => route,
+            _ => return TestResult::Fail("the HDMI audio route must light"),
+        };
+        let pin = io.writes_to(crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD);
+        let output = crate::intel_gpu_audio::aud_output_enable(Transcoder::B);
+        if pin.first() != Some(&output)
+            || pin
+                .iter()
+                .any(|v| v & crate::intel_gpu_audio::aud_eld_valid(Transcoder::B) != 0)
+            || io.writes_to(crate::intel_gpu_audio::aud_cfg_off(Transcoder::B)) != [1 << 16]
+            || io.writes_to(audio::AUD_TS_CDCLK_M).last() != Some(&(60 | audio::AUD_TS_CDCLK_M_EN))
+            || at::NOTIFY_COUNT.load(core::sync::atomic::Ordering::SeqCst) != before + 1
+            || at::NOTIFY_PORT.load(core::sync::atomic::Ordering::SeqCst) != 1
+            || at::NOTIFY_PIPE.load(core::sync::atomic::Ordering::SeqCst) != -1
+        {
+            return TestResult::Fail("the route must enable audio and notify PORT_B");
+        }
+        // The audio enable follows the armed primary and its witness.
+        match (
+            position(&io, |o, _| o == PLANE_SURF_1 + Pipe::B.base()),
+            position(&io, |o, _| {
+                o == crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD
+            }),
+        ) {
+            (Some(plane), Some(audio)) if plane < audio => {}
+            _ => return TestResult::Fail("audio must start after the plane update"),
+        }
+        let component = audio::XelpgAudioComponent { io: &io };
+        let mut buf = [0u8; 128];
+        match acomp::acomp_get_eld(Some(&component), Some(&at::SCRIPTED_HDA), 0x6, 0, &mut buf) {
+            // Two SADs survive the 160-clock blanking.
+            Ok((true, _)) if buf[5] >> 4 == 2 => {}
+            _ => return TestResult::Fail("the codec must read the pruned ELD on pin 0x6"),
+        }
+        if route.stop(&io).is_err()
+            || at::NOTIFY_COUNT.load(core::sync::atomic::Ordering::SeqCst) != before + 2
+            || acomp::acomp_get_eld(Some(&component), Some(&at::SCRIPTED_HDA), 0x6, 0, &mut buf)
+                .is_ok()
+            || io
+                .writes_to(crate::intel_gpu_audio::HSW_AUD_PIN_ELD_CP_VLD)
+                .last()
+                != Some(&0)
+        {
+            return TestResult::Fail("the stop must disable audio and withdraw the ELD");
+        }
+        // Without the option: no ELD, no audio register.
+        let io = ddi_b_hdmi_sink(&at::audio_edid());
+        match probe_deep(&io, false) {
+            Ok(p) if p.audio.is_none() => TestResult::Pass,
+            _ => TestResult::Fail("without the option the probe must not take audio"),
+        }
+    })();
+    acomp::unregister_display_audio_codec();
+    audio::reset_for_test();
+    result
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_xe_hdmi_audio_route_with_scripted_hda
 );

@@ -2,6 +2,7 @@
 //! sequencing and AMD quirks follow /usr/src/linux/sound/hda/{core,controllers}.
 
 mod hdmi;
+mod intelhdmi;
 pub mod quirks;
 mod routing;
 mod runtime;

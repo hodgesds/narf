@@ -336,6 +336,195 @@ pub fn display_audio_snapshot() -> Vec<(DisplaySinkId, DisplayAudioPublication)>
     table.iter().filter_map(|slot| slot.clone()).collect()
 }
 
+// ── Audio component (drm_audio_component) ─────────────────────────
+//
+// SEAM — DISPLAY AUDIO COMPONENT. The second half of display audio, as
+// Linux binds it between i915 and snd-hda (`include/drm/drm_audio_component.h`,
+// `sound/hda/core/component.c`): the display driver implements
+// [`DisplayAudioComponent`] (`drm_audio_component_ops`: get_power,
+// put_power, codec_wake_override, get_cdclk_freq, sync_audio_rate,
+// get_eld) and binds it; the HDA codec driver implements
+// [`DisplayAudioCodec`] (`drm_audio_component_audio_ops`: pin2port,
+// pin_eld_notify) and registers it. The display side tells the codec an
+// ELD changed with [`notify_pin_eld`]; the codec reads it back through
+// [`acomp_get_eld`] and asks for N/CTS through [`acomp_sync_audio_rate`],
+// both addressed by its pin NID through `pin2port`. The HDA-core helpers
+// take the two halves explicitly so a scripted codec can drive them; the
+// registry wrappers pass the bound ones. No lock is held across a call
+// into either half.
+
+/// The component calls' errors.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ComponentError {
+    /// No component is bound, or it lacks the op (`-ENODEV`).
+    NoDevice,
+    /// `pin2port` found no port, or the display has no stream on that
+    /// port and pipe (`-EINVAL`).
+    Invalid,
+}
+
+/// The display driver's half (`drm_audio_component_ops`). `port` is the
+/// display's port number (Linux `enum port`) and `pipe` its CPU
+/// transcoder for MST and UHBR streams, -1 otherwise.
+pub trait DisplayAudioComponent {
+    /// `get_power`: hold display audio power; the cookie goes back to
+    /// [`Self::put_power`].
+    fn get_power(&self) -> u64;
+    /// `put_power`.
+    fn put_power(&self, cookie: u64);
+    /// `codec_wake_override`: force the codec wake signal.
+    fn codec_wake_override(&self, enable: bool);
+    /// `get_cdclk_freq` in kHz.
+    fn get_cdclk_freq(&self) -> Result<u32, ComponentError>;
+    /// `sync_audio_rate`: program N/CTS for `rate` Hz.
+    fn sync_audio_rate(&self, port: i32, pipe: i32, rate: u32) -> Result<(), ComponentError>;
+    /// `get_eld`: whether audio is enabled on the stream and the whole
+    /// ELD's size; at most `buf.len()` bytes are copied.
+    fn get_eld(
+        &self,
+        port: i32,
+        pipe: i32,
+        buf: &mut [u8],
+    ) -> Result<(bool, usize), ComponentError>;
+}
+
+/// The HDA codec driver's half (`drm_audio_component_audio_ops`).
+pub trait DisplayAudioCodec {
+    /// `pin2port`: the display port behind pin widget `pin_nid`.
+    fn pin2port(&self, pin_nid: u32) -> Option<i32>;
+    /// `pin_eld_notify`: the ELD on `port` / `pipe` changed.
+    fn pin_eld_notify(&self, port: i32, pipe: i32);
+}
+
+static COMPONENT: IrqSafeSpinLock<Option<&'static (dyn DisplayAudioComponent + Sync)>> =
+    IrqSafeSpinLock::new(None);
+static CODEC: IrqSafeSpinLock<Option<&'static (dyn DisplayAudioCodec + Sync)>> =
+    IrqSafeSpinLock::new(None);
+
+/// Bind the display's half (`intel_audio_component_bind`); refused when
+/// one is already bound (`-EEXIST`).
+pub fn bind_display_audio_component(ops: &'static (dyn DisplayAudioComponent + Sync)) -> bool {
+    let mut slot = COMPONENT.lock();
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(ops);
+    true
+}
+
+/// Unbind the display's half (`intel_audio_component_unbind`).
+pub fn unbind_display_audio_component() {
+    *COMPONENT.lock() = None;
+}
+
+/// The bound display half, if any.
+pub fn display_audio_component() -> Option<&'static (dyn DisplayAudioComponent + Sync)> {
+    *COMPONENT.lock()
+}
+
+/// Register the codec's half (`snd_hdac_acomp_register_notifier`).
+pub fn register_display_audio_codec(ops: &'static (dyn DisplayAudioCodec + Sync)) {
+    *CODEC.lock() = Some(ops);
+}
+
+/// Drop the codec's half.
+pub fn unregister_display_audio_codec() {
+    *CODEC.lock() = None;
+}
+
+/// The display side's `acomp->base.audio_ops->pin_eld_notify` call; a
+/// no-op without a registered codec.
+pub fn notify_pin_eld(port: i32, pipe: i32) {
+    let codec = *CODEC.lock();
+    if let Some(codec) = codec {
+        codec.pin_eld_notify(port, pipe);
+    }
+}
+
+/// The port the codec maps `nid` to (`snd_hdac_acomp_get_eld`'s
+/// `pin2port` step: the NID itself without a codec half).
+fn port_for(codec: Option<&dyn DisplayAudioCodec>, nid: u32) -> Result<i32, ComponentError> {
+    match codec {
+        Some(codec) => codec.pin2port(nid).ok_or(ComponentError::Invalid),
+        None => i32::try_from(nid).map_err(|_| ComponentError::Invalid),
+    }
+}
+
+/// `snd_hdac_acomp_get_eld`: the ELD of the stream behind pin `nid` /
+/// `dev_id`.
+pub fn acomp_get_eld(
+    component: Option<&dyn DisplayAudioComponent>,
+    codec: Option<&dyn DisplayAudioCodec>,
+    nid: u32,
+    dev_id: i32,
+    buf: &mut [u8],
+) -> Result<(bool, usize), ComponentError> {
+    let component = component.ok_or(ComponentError::NoDevice)?;
+    let port = port_for(codec, nid)?;
+    component.get_eld(port, dev_id, buf)
+}
+
+/// `snd_hdac_sync_audio_rate`: N/CTS for `rate` on pin `nid` / `dev_id`.
+pub fn acomp_sync_audio_rate(
+    component: Option<&dyn DisplayAudioComponent>,
+    codec: Option<&dyn DisplayAudioCodec>,
+    nid: u32,
+    dev_id: i32,
+    rate: u32,
+) -> Result<(), ComponentError> {
+    let component = component.ok_or(ComponentError::NoDevice)?;
+    let port = port_for(codec, nid)?;
+    component.sync_audio_rate(port, dev_id, rate)
+}
+
+/// `snd_hdac_set_codec_wakeup`.
+pub fn acomp_set_codec_wakeup(
+    component: Option<&dyn DisplayAudioComponent>,
+    enable: bool,
+) -> Result<(), ComponentError> {
+    component
+        .ok_or(ComponentError::NoDevice)?
+        .codec_wake_override(enable);
+    Ok(())
+}
+
+/// `snd_hdac_display_power`'s bus state: which users (the controller and
+/// each codec address) want display power, and the held cookie.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DisplayPower {
+    /// `bus->display_power_status`, one bit per user index.
+    pub status: u64,
+    /// `bus->display_power_active`: the held cookie.
+    pub active: Option<u64>,
+}
+
+impl DisplayPower {
+    /// `snd_hdac_display_power(bus, idx, enable)`: the first user takes the
+    /// component's power and pulses the codec wakeup (on, then off); the
+    /// last user returns it.
+    pub fn set(&mut self, component: Option<&dyn DisplayAudioComponent>, idx: u32, enable: bool) {
+        let bit = 1u64 << (idx & 63);
+        if enable {
+            self.status |= bit;
+        } else {
+            self.status &= !bit;
+        }
+        let Some(component) = component else {
+            return;
+        };
+        if self.status != 0 {
+            if self.active.is_none() {
+                let cookie = component.get_power();
+                component.codec_wake_override(true);
+                component.codec_wake_override(false);
+                self.active = Some(cookie);
+            }
+        } else if let Some(cookie) = self.active.take() {
+            component.put_power(cookie);
+        }
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
@@ -516,4 +705,125 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/sound/display_audio", smoke_publish_clear_roundtrip);
+
+    /// A scripted display half: one stream on port 1, a call log.
+    struct ScriptedDisplay {
+        calls: core::cell::RefCell<Vec<(&'static str, i32, i32, u32)>>,
+    }
+
+    impl DisplayAudioComponent for ScriptedDisplay {
+        fn get_power(&self) -> u64 {
+            self.calls.borrow_mut().push(("get_power", 0, 0, 0));
+            7
+        }
+        fn put_power(&self, cookie: u64) {
+            self.calls
+                .borrow_mut()
+                .push(("put_power", 0, 0, cookie as u32));
+        }
+        fn codec_wake_override(&self, enable: bool) {
+            self.calls
+                .borrow_mut()
+                .push(("wake", 0, 0, u32::from(enable)));
+        }
+        fn get_cdclk_freq(&self) -> Result<u32, ComponentError> {
+            Ok(307_200)
+        }
+        fn sync_audio_rate(&self, port: i32, pipe: i32, rate: u32) -> Result<(), ComponentError> {
+            self.calls.borrow_mut().push(("rate", port, pipe, rate));
+            if port == 1 {
+                Ok(())
+            } else {
+                Err(ComponentError::NoDevice)
+            }
+        }
+        fn get_eld(
+            &self,
+            port: i32,
+            pipe: i32,
+            buf: &mut [u8],
+        ) -> Result<(bool, usize), ComponentError> {
+            self.calls.borrow_mut().push(("eld", port, pipe, 0));
+            if port != 1 {
+                return Err(ComponentError::Invalid);
+            }
+            let eld = [0x10u8, 0, 5, 0, 0, 0x10];
+            let n = eld.len().min(buf.len());
+            buf[..n].copy_from_slice(&eld[..n]);
+            Ok((true, eld.len()))
+        }
+    }
+
+    /// A scripted codec half: pin 6 is port 1 (the Tiger Lake+ map's
+    /// PORT_B pin, `intel_pin2port`).
+    struct ScriptedCodec;
+
+    impl DisplayAudioCodec for ScriptedCodec {
+        fn pin2port(&self, pin_nid: u32) -> Option<i32> {
+            (pin_nid == 6).then_some(1)
+        }
+        fn pin_eld_notify(&self, _port: i32, _pipe: i32) {}
+    }
+
+    /// `sound/hda/core/component.c`: `snd_hdac_acomp_get_eld` and
+    /// `snd_hdac_sync_audio_rate` map the pin through `pin2port` (-EINVAL
+    /// when it fails) and pass `dev_id` as the pipe; no component is
+    /// -ENODEV; `snd_hdac_display_power` takes the power once for the first
+    /// user, pulses the codec wakeup on then off, and returns it with the
+    /// last user.
+    fn smoke_display_audio_component_hda_side() -> TestResult {
+        let display = ScriptedDisplay {
+            calls: core::cell::RefCell::new(Vec::new()),
+        };
+        let codec = ScriptedCodec;
+        let mut buf = [0u8; 4];
+        if acomp_get_eld(Some(&display), Some(&codec), 6, -1, &mut buf) != Ok((true, 6))
+            || buf != [0x10, 0, 5, 0]
+            || acomp_get_eld(Some(&display), Some(&codec), 8, -1, &mut buf)
+                != Err(ComponentError::Invalid)
+            || acomp_get_eld(None, Some(&codec), 6, -1, &mut buf) != Err(ComponentError::NoDevice)
+            || acomp_sync_audio_rate(Some(&display), Some(&codec), 6, 2, 48_000) != Ok(())
+            || acomp_sync_audio_rate(Some(&display), None, 6, -1, 48_000)
+                != Err(ComponentError::NoDevice)
+        {
+            return TestResult::Fail("the HDA-core component helpers differ from component.c");
+        }
+        if display.calls.borrow()[..]
+            != [
+                ("eld", 1, -1, 0),
+                ("rate", 1, 2, 48_000),
+                ("rate", 6, -1, 48_000),
+            ][..]
+        {
+            return TestResult::Fail("pin2port must map the pin, dev_id must be the pipe");
+        }
+        display.calls.borrow_mut().clear();
+        let mut power = DisplayPower::default();
+        power.set(Some(&display), 0, true);
+        power.set(Some(&display), 2, true);
+        power.set(Some(&display), 0, false);
+        if power.active != Some(7) || power.status != 1 << 2 {
+            return TestResult::Fail("display power must stay held while a user wants it");
+        }
+        power.set(Some(&display), 2, false);
+        if power.active.is_some()
+            || display.calls.borrow()[..]
+                != [
+                    ("get_power", 0, 0, 0),
+                    ("wake", 0, 0, 1),
+                    ("wake", 0, 0, 0),
+                    ("put_power", 0, 0, 7),
+                ][..]
+        {
+            return TestResult::Fail("snd_hdac_display_power must get, pulse wake and put once");
+        }
+        if acomp_set_codec_wakeup(None, true) != Err(ComponentError::NoDevice) {
+            return TestResult::Fail("codec wakeup without a component is -ENODEV");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/sound/display_audio",
+        smoke_display_audio_component_hda_side
+    );
 }

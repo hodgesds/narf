@@ -21,10 +21,18 @@
 //!   is the policy's `select_task_rq` (a policy that returns `None` does no
 //!   placement), so an operator needs to see what is active.
 //! - `steal_strategy` (ro) — the installed `StealStrategy` name.
+//!
+//! Drivers add their own top-level directories with [`register_dir`]
+//! (Linux `debugfs_create_dir(name, NULL)`, as DRM creates `dri/`). Their
+//! inodes take numbers from [`alloc_ino`] and the superblock identity of
+//! [`attrs`], as Linux's `debugfs_get_inode` numbers every entry from
+//! `get_next_ino()` on the one superblock.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
@@ -153,7 +161,51 @@ fn debugfs_attrs() -> crate::InodeAttrs {
     }
 }
 
-/// `/sys/kernel/debug` — one subdir today: `sched/`.
+/// The superblock identity every debugfs inode carries, for a registered
+/// directory's entries.
+pub fn attrs() -> crate::InodeAttrs {
+    debugfs_attrs()
+}
+
+/// The first inode number [`alloc_ino`] hands out: past the fixed tree.
+const DYNAMIC_INO_BASE: u64 = 1 << 20;
+static NEXT_INO: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(DYNAMIC_INO_BASE);
+
+/// `get_next_ino()` for an entry of a registered directory: unique on this
+/// superblock, never one of the fixed tree's numbers.
+pub fn alloc_ino() -> u64 {
+    alloc_ino_range(1)
+}
+
+/// `count` consecutive [`alloc_ino`] numbers, for a directory whose
+/// entries are made on lookup and need stable numbers; the first.
+pub fn alloc_ino_range(count: u64) -> u64 {
+    NEXT_INO.fetch_add(count.max(1), core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Driver directories at the root, in registration order.
+static DIRS: IrqSafeSpinLock<Vec<(&'static str, Arc<dyn DirOps>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// `debugfs_create_dir(name, NULL)`: `dir` appears as
+/// `/sys/kernel/debug/<name>` in every debugfs mount. A name already
+/// present (or `sched`) is `AlreadyExists`.
+pub fn register_dir(name: &'static str, dir: Arc<dyn DirOps>) -> Result<(), FsError> {
+    let mut dirs = DIRS.lock();
+    if name == "sched" || dirs.iter().any(|(taken, _)| *taken == name) {
+        return Err(FsError::AlreadyExists);
+    }
+    dirs.push((name, dir));
+    Ok(())
+}
+
+/// `debugfs_remove` of a registered directory; nothing if it is absent.
+pub fn unregister_dir(name: &str) {
+    DIRS.lock().retain(|(taken, _)| *taken != name);
+}
+
+/// `/sys/kernel/debug` — `sched/`, then the registered directories.
 #[derive(Debug)]
 struct DebugRoot;
 
@@ -168,16 +220,24 @@ impl DirOps for DebugRoot {
         None
     }
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
-        (name == "sched").then(|| Arc::new(SchedDir) as Arc<dyn DirOps>)
+        if name == "sched" {
+            return Some(Arc::new(SchedDir) as Arc<dyn DirOps>);
+        }
+        DIRS.lock()
+            .iter()
+            .find(|(taken, _)| *taken == name)
+            .map(|(_, dir)| dir.clone())
     }
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        Box::new(
-            [DirEntry {
-                name: "sched".into(),
-                file_type: FileType::Dir,
-            }]
-            .into_iter(),
-        )
+        let mut entries = alloc::vec![DirEntry {
+            name: "sched".into(),
+            file_type: FileType::Dir,
+        }];
+        entries.extend(DIRS.lock().iter().map(|(name, _)| DirEntry {
+            name: (*name).into(),
+            file_type: FileType::Dir,
+        }));
+        Box::new(entries.into_iter())
     }
 }
 

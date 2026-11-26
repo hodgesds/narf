@@ -30,12 +30,19 @@ const REGISTERS: [u64; 12] = [
 const PLANE_COLOR_UNSUPPORTED: u32 =
     (1 << 21) | (1 << 20) | (7 << 17) | (1 << 15) | (1 << 14) | (3 << 4);
 
-fn pipeline(io: &impl MmioWindow, primary_control: u32) -> bool {
+/// The primary plane and its color control as this owner admits them.
+/// `black` is a plane the scanout owner armed for a stale PXP-protected
+/// surface (`check_protection`'s `force_black`): `glk_plane_color_ctl` then
+/// sets `PLANE_COLOR_PLANE_CSC_ENABLE` over `icl_plane_csc_load_black`'s
+/// all-zero plane CSC, which must be set; otherwise it must be clear.
+fn pipeline(io: &impl MmioWindow, primary_control: u32, black: bool) -> bool {
     let plane = io.read32(0x70180);
     let color = io.read32(0x701cc);
+    let csc = crate::intel_gpu_scanout::PLANE_COLOR_CSC_ENABLE;
     plane & 0xff800000 == primary_control
         && color != u32::MAX
-        && color & PLANE_COLOR_UNSUPPORTED == 0
+        && color & (PLANE_COLOR_UNSUPPORTED & !csc) == 0
+        && (color & csc != 0) == black
         && color & (1 << 13) != 0
         && io.read32(0x70034) == 0
         && io.read32(0x701c8) == 0
@@ -443,6 +450,9 @@ impl Palette {
 #[derive(Debug)]
 pub(crate) struct Update {
     primary_control: u32,
+    /// The primary plane's CSC is black after this update (a stale
+    /// PXP-protected target; see [`pipeline`]).
+    plane_black: bool,
     image: Image,
     gamma: u32,
     lut: Option<Arc<Lut>>,
@@ -503,6 +513,9 @@ pub(crate) struct Owner {
     pending: Option<Pending>,
     external_pending: bool,
     failed: bool,
+    /// The primary plane's CSC is black (a stale PXP-protected surface the
+    /// scanout owner armed).
+    plane_black: bool,
 }
 impl Owner {
     pub(crate) fn capture(io: &impl MmioWindow, generation: Generation) -> Result<Self, FsError> {
@@ -545,7 +558,7 @@ impl Owner {
         if mode != 0
             || gamma == u32::MAX
             || gamma & (3 << 30) != 0
-            || !pipeline(io, primary_control)
+            || !pipeline(io, primary_control, false)
         {
             return Err(FsError::Unsupported);
         }
@@ -580,6 +593,7 @@ impl Owner {
             pending: None,
             external_pending: false,
             failed: false,
+            plane_black: false,
         })
     }
     pub(crate) fn qualify_gen12(&mut self, profile: Profile) -> Result<(), FsError> {
@@ -676,7 +690,7 @@ impl Owner {
         {
             return Err(FsError::Unsupported);
         }
-        if !pipeline(io, self.primary_control)
+        if !pipeline(io, self.primary_control, self.plane_black)
             || !self.expected.matches(io)
             || io.read32(GAMMA) != self.expected_gamma
         {
@@ -773,7 +787,7 @@ impl Owner {
         if self.pending() {
             return Err(FsError::Busy);
         }
-        if !pipeline(io, self.primary_control)
+        if !pipeline(io, self.primary_control, self.plane_black)
             || !self.expected.matches(io)
             || io.read32(GAMMA) != self.expected_gamma
         {
@@ -819,6 +833,7 @@ impl Owner {
         let restore_pre = both_off && self.pre_dirty;
         Ok(Update {
             primary_control: self.primary_control,
+            plane_black: self.plane_black,
             image,
             gamma,
             lut,
@@ -846,12 +861,27 @@ impl Owner {
         update.primary_control = (self.original_primary_control & !(0x1f << 23)) | input.control();
         Ok(())
     }
+    /// The joint primary target scans out black (or no longer does) once
+    /// this update latches: the scanout owner's staged arm decided it.
+    pub(crate) fn target_black(&self, update: &mut Update, black: bool) {
+        update.plane_black = black;
+    }
+    /// A CPU-armed primary changed the plane CSC's black state (the
+    /// scanout owner's `force_black`, or its removal).
+    pub(crate) fn set_plane_black(&mut self, black: bool) {
+        self.plane_black = black;
+    }
+    /// The primary plane's CSC is black, as this owner admits it.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn plane_black(&self) -> bool {
+        self.plane_black
+    }
     /// A separately completed fresh console arm has restored the immutable
     /// original input. Keep any still-owned color image exactly as observed.
     pub(crate) fn console_restored(&mut self, io: &impl MmioWindow) -> Result<(), FsError> {
         if self.pending()
             || self.failed
-            || !pipeline(io, self.original_primary_control)
+            || !pipeline(io, self.original_primary_control, self.plane_black)
             || !self.expected.matches(io)
             || io.read32(GAMMA) != self.expected_gamma
         {
@@ -890,7 +920,7 @@ impl Owner {
     pub(crate) fn check_visible(&self, io: &impl MmioWindow) -> Result<(), FsError> {
         if self.failed
             || self.external_pending
-            || !pipeline(io, self.primary_control)
+            || !pipeline(io, self.primary_control, self.plane_black)
             || !self.expected.matches(io)
             || io.read32(GAMMA) != self.expected_gamma
         {
@@ -907,7 +937,7 @@ impl Owner {
             return Err(FsError::NoDevice);
         }
         self.failed = true;
-        if !pipeline(io, update.primary_control)
+        if !pipeline(io, update.primary_control, update.plane_black)
             || !update.image.matches(io)
             || io.read32(GAMMA) != update.gamma
         {
@@ -933,6 +963,7 @@ impl Owner {
             self.pre_dirty = false;
         }
         self.primary_control = update.primary_control;
+        self.plane_black = update.plane_black;
         self.expected = update.image;
         self.expected_gamma = update.gamma;
         self.lut = update.lut.clone();
@@ -952,7 +983,7 @@ impl Owner {
         self.failed = false;
         self.pending = None;
         self.external_pending = false;
-        if !pipeline(io, self.original_primary_control) {
+        if !pipeline(io, self.original_primary_control, self.plane_black) {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
@@ -1027,7 +1058,7 @@ impl Owner {
         let Some(pending) = self.pending else {
             return Ok(None);
         };
-        if !pipeline(io, self.primary_control)
+        if !pipeline(io, self.primary_control, self.plane_black)
             || !pending.image.matches(io)
             || io.read32(GAMMA) != pending.gamma
         {

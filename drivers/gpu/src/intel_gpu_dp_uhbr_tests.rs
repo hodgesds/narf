@@ -68,6 +68,8 @@ struct Dp20Sink<'a> {
     next_status: usize,
     intra_hop_reads: u32,
     nack_reads: Vec<u32>,
+    /// Native writes of (address, first byte) the sink NACKs.
+    nack_writes: Vec<(u32, u8)>,
 }
 
 impl<'a> Dp20Sink<'a> {
@@ -79,6 +81,7 @@ impl<'a> Dp20Sink<'a> {
             next_status: 0,
             intra_hop_reads: 0,
             nack_reads: Vec::new(),
+            nack_writes: Vec::new(),
         }
     }
     fn set(&mut self, addr: u32, bytes: &[u8]) {
@@ -107,6 +110,10 @@ impl AuxChannel for Dp20Sink<'_> {
                 self.log
                     .borrow_mut()
                     .push(Ev::Write(req.address, req.data.to_vec()));
+                if self.nack_writes.contains(&(req.address, req.data[0])) {
+                    // As the display AUX transport reports a NACK reply.
+                    return Err(AuxError::Nacked);
+                }
                 let data = req.data.to_vec();
                 self.set(req.address, &data);
                 if req.address == DP_PAYLOAD_TABLE_UPDATE_STATUS {
@@ -705,4 +712,284 @@ fn smoke_uhbr_link_choice_and_mn() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_dp_uhbr",
     smoke_uhbr_link_choice_and_mn
+);
+
+/// `intel_dp_init_lttpr_and_dprx_caps` and `drm_dp_lttpr_wake_timeout_setup`
+/// against scripted LTTPRs (`drm_dp_helper.c`, `intel_dp_link_training.c`):
+///
+/// - two repeaters (`DP_PHY_REPEATER_CNT` 0x40): the 0xf0000 probe, the
+///   receiver caps, the common caps, `DP_PHY_REPEATER_MODE` 0x55 then 0xaa,
+///   each repeater's three PHY cap bytes (0xf0020, 0xf0070), the receiver
+///   caps again; non-transparent, so the wake timeout reads
+///   `DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT` and grants 0x80;
+/// - a NACKed 0xaa rolls back to 0x55: transparent, no repeater, and the
+///   wake timeout takes the DPRX's 40 ms request (grant at 0x119); a 1 ms
+///   or unmapped request grants nothing;
+/// - a malformed count writes 0x55 only; no repeater writes nothing (and,
+///   with zeroed caps not reading 0x55, takes the non-transparent wake
+///   path as Linux does);
+/// - below DPCD 1.4 the common caps are read a byte at a time; caps below
+///   revision 1.4 are zeroed.
+fn smoke_uhbr_lttpr_non_transparent_init_and_wake_timeout() -> TestResult {
+    let caps = |count: u8| [0x20u8, 0x1e, count, 0x55, 4, 0x05, 1, 0x03];
+    fn sink_with(log: &RefCell<Vec<Ev>>, rev: u8, c: [u8; 8]) -> Dp20Sink<'_> {
+        let mut sink = Dp20Sink::new(log, vec![[0; 6]]);
+        sink.set(0x000, &[rev]);
+        sink.set(DP_LTTPR_COMMON_CAPS, &c);
+        sink
+    }
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x14, caps(0x40));
+    let init = init_lttpr_and_dprx_caps(&mut sink);
+    let mode = |v: u8| Ev::Write(DP_PHY_REPEATER_MODE, vec![v]);
+    let want = vec![
+        Ev::Read(DP_LTTPR_COMMON_CAPS, 1),
+        Ev::Read(0x000, 16),
+        Ev::Read(DP_LTTPR_COMMON_CAPS, 8),
+        mode(DP_PHY_REPEATER_MODE_TRANSPARENT),
+        mode(DP_PHY_REPEATER_MODE_NON_TRANSPARENT),
+        Ev::Read(0xf_0020, 3),
+        Ev::Read(0xf_0070, 3),
+        Ev::Read(0x000, 16),
+    ];
+    if *log.borrow() != want || init.count != 2 || init.transparent() {
+        return TestResult::Fail("two LTTPRs must go non-transparent with their PHY caps read");
+    }
+    log.borrow_mut().clear();
+    wake_timeout_setup(&mut sink, init.transparent());
+    if *log.borrow()
+        != vec![
+            Ev::Read(DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT, 1),
+            Ev::Write(
+                DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT,
+                vec![DP_EXTENDED_WAKE_TIMEOUT_GRANT],
+            ),
+        ]
+    {
+        return TestResult::Fail("a non-transparent repeater's wait request must be granted");
+    }
+    if lttpr_max_link_rate(&caps(0x40)) != 810_000 || lttpr_max_lanes(&caps(0x40)) != 4 {
+        return TestResult::Fail("drm_dp_lttpr_max_link_rate / _lane_count differ");
+    }
+    // Non-transparent NACKed: back to transparent.
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x14, caps(0x80));
+    sink.nack_writes
+        .push((DP_PHY_REPEATER_MODE, DP_PHY_REPEATER_MODE_NON_TRANSPARENT));
+    let init = init_lttpr_and_dprx_caps(&mut sink);
+    let writes: Vec<Ev> = log
+        .borrow()
+        .iter()
+        .filter(|e| matches!(e, Ev::Write(..)))
+        .cloned()
+        .collect();
+    if writes
+        != vec![
+            mode(DP_PHY_REPEATER_MODE_TRANSPARENT),
+            mode(DP_PHY_REPEATER_MODE_NON_TRANSPARENT),
+            mode(DP_PHY_REPEATER_MODE_TRANSPARENT),
+        ]
+        || init.count != 0
+        || !init.transparent()
+        || log.borrow().contains(&Ev::Read(0xf_0020, 3))
+    {
+        return TestResult::Fail("a refused non-transparent mode must roll back to transparent");
+    }
+    for (request, grant) in [(0x02u8, true), (0x00, false), (0x07, false)] {
+        log.borrow_mut().clear();
+        sink.set(DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST, &[request]);
+        wake_timeout_setup(&mut sink, true);
+        let granted = log.borrow().contains(&Ev::Write(
+            DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_GRANT,
+            vec![DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED],
+        ));
+        if granted != grant
+            || log.borrow()[0] != Ev::Read(DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST, 1)
+        {
+            return TestResult::Fail("the transparent wake timeout follows timeout_mapping");
+        }
+    }
+    // A malformed count: the transparent write only.
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x14, caps(0x03));
+    let init = init_lttpr_and_dprx_caps(&mut sink);
+    if init.count != 0
+        || !init.transparent()
+        || log
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, Ev::Write(..)))
+            .cloned()
+            .collect::<Vec<_>>()
+            != vec![mode(DP_PHY_REPEATER_MODE_TRANSPARENT)]
+    {
+        return TestResult::Fail("a malformed count must only write transparent mode");
+    }
+    // No repeater: nothing written; zeroed caps take the non-transparent
+    // wake path.
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x14, [0x14, 0, 0, 0, 0, 0, 0, 0]);
+    let init = init_lttpr_and_dprx_caps(&mut sink);
+    if init.count != 0 || log.borrow().iter().any(|e| matches!(e, Ev::Write(..))) {
+        return TestResult::Fail("no repeater must write no mode");
+    }
+    log.borrow_mut().clear();
+    wake_timeout_setup(&mut sink, init.transparent());
+    if *log.borrow() != vec![Ev::Read(DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT, 1)] {
+        return TestResult::Fail("no repeater reads the repeater wait timeout, grants nothing");
+    }
+    // DPCD 1.2: one byte per read; caps revision 1.3: zeroed.
+    let log = RefCell::new(Vec::new());
+    let mut sink = sink_with(&log, 0x12, caps(0x80));
+    if read_lttpr_caps(&mut sink, 0x12) != caps(0x80)
+        || *log.borrow()
+            != (0..8)
+                .map(|i| Ev::Read(DP_LTTPR_COMMON_CAPS + i, 1))
+                .collect::<Vec<_>>()
+    {
+        return TestResult::Fail("below DPCD 1.4 the LTTPR caps are read a byte at a time");
+    }
+    let mut old = sink_with(&log, 0x14, [0x13, 0x1e, 0x80, 0x55, 4, 0, 0, 0]);
+    if read_lttpr_caps(&mut old, 0x14) != [0; 8] {
+        return TestResult::Fail("LTTPR caps below revision 1.4 are zeroed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_lttpr_non_transparent_init_and_wake_timeout
+);
+
+/// `intel_dp_link_caps.c` and `intel_dp_get_link_train_fallback_values`
+/// over the common rates RBR..HBR3, UHBR10, UHBR20 and four lanes:
+///
+/// - SST falls back in descending `INTEL_DP_LINK_CAPS_ORDER_KEY_LANE_RATE`
+///   order: UHBR20 x4 -> UHBR10 x4 (the failed one disabled, the maximum
+///   limits 1000000 x 4), then -> HBR3 x4 past the disabled UHBR20 x4;
+///   RBR x4 -> UHBR20 x2; RBR x1 has nothing after it (limits unchanged);
+/// - MST falls back in descending `INTEL_DP_LINK_CAPS_ORDER_KEY_BW` order,
+///   equal bandwidths by descending rate (`link_config_cmp_by_bw`): UHBR20
+///   x4 -> UHBR20 x2 (both 4835500 kBps with UHBR10 x4), then -> UHBR10 x4;
+/// - `intel_dp_tunnel_uhbr_lanes_wa_apply` disables only UHBR configs;
+/// - the modeset retry: a 3840x2160 495 MHz stream on one lane takes
+///   UHBR20 x1 at 24 bpp (1485000 kBps; UHBR10 x1 carries 1208875), and
+///   after its failure UHBR10 x1 at 18 bpp (1113750).
+fn smoke_uhbr_link_caps_fallback_orders() -> TestResult {
+    let limits = dsc::LinkLimits::standard(810_000, 4);
+    let both = DP_UHBR10 | DP_UHBR20;
+    let mut caps = LinkCaps::new(&limits, both);
+    if caps.max_limits() != (2_000_000, 4) {
+        return TestResult::Fail("the maximum limits start at UHBR20 x4");
+    }
+    if caps.fallback(2_000_000, 4, false) != Some((1_000_000, 4))
+        || caps.max_limits() != (1_000_000, 4)
+        || caps.allowed(2_000_000, 4)
+        || caps.allowed(2_000_000, 2)
+        || !caps.allowed(1_000_000, 4)
+        || !caps.allowed(810_000, 4)
+    {
+        return TestResult::Fail("SST UHBR20 x4 falls back to UHBR10 x4");
+    }
+    if caps.fallback(1_000_000, 4, false) != Some((810_000, 4)) || caps.allowed(1_000_000, 4) {
+        return TestResult::Fail("the second SST fallback skips the disabled UHBR20 x4");
+    }
+    let mut caps = LinkCaps::new(&limits, both);
+    if caps.fallback(162_000, 4, false) != Some((2_000_000, 2)) {
+        return TestResult::Fail("SST RBR x4 falls back to the highest rate at two lanes");
+    }
+    let mut caps = LinkCaps::new(&limits, both);
+    if caps.fallback(162_000, 1, false).is_some() || caps.max_limits() != (2_000_000, 4) {
+        return TestResult::Fail("RBR x1 has no fallback and keeps the limits");
+    }
+    let mut caps = LinkCaps::new(&limits, both);
+    if caps.fallback(2_000_000, 4, true) != Some((2_000_000, 2))
+        || caps.fallback(2_000_000, 2, true) != Some((1_000_000, 4))
+    {
+        return TestResult::Fail("MST falls back by bandwidth, equal bandwidth by rate");
+    }
+    let mut caps = LinkCaps::new(&limits, both);
+    caps.disable_uhbr_lanes(0b11);
+    if caps.allowed(1_000_000, 1)
+        || caps.allowed(2_000_000, 2)
+        || !caps.allowed(1_000_000, 4)
+        || !caps.allowed(810_000, 1)
+    {
+        return TestResult::Fail("the tunnel workaround disables 1- and 2-lane UHBR only");
+    }
+    let mode = Mode {
+        pixel_clock_khz: 495_000,
+        h_active: 3840,
+        h_total: 4400,
+        h_sync_start: 3848,
+        h_sync_end: 3880,
+        v_active: 2160,
+        v_total: 2250,
+        v_sync_start: 2163,
+        v_sync_end: 2168,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let mut caps = LinkCaps::new(&dsc::LinkLimits::standard(540_000, 1), both);
+    let first = wide_search(&caps, &mode, 24, None);
+    if first.map(|l| (l.link_rate, l.lanes, l.pipe_bpp)) != Some((2_000_000, 1, 24)) {
+        return TestResult::Fail("495 MHz on one lane takes UHBR20 x1 at 24 bpp");
+    }
+    if caps.fallback(2_000_000, 1, false) != Some((1_000_000, 1))
+        || wide_search(&caps, &mode, 24, None).map(|l| (l.link_rate, l.lanes, l.pipe_bpp))
+            != Some((1_000_000, 1, 18))
+    {
+        return TestResult::Fail("the retry takes UHBR10 x1 at 18 bpp");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_link_caps_fallback_orders
+);
+
+/// `intel_dp_mtp_tu_compute_config(dsc = true)` for 128b/132b SST, from
+/// Linux 7.4's `drm_dp_bw_overhead` with DSC slices (per slice the MST-aligned
+/// data symbol cycles plus one EOC cycle of `4 / lanes`):
+///
+/// - 3840x2160 at 594 MHz on UHBR10 x1 in two slices: 259/16 bpp takes all
+///   64 slots (`DATA_M` = `TU_SIZE(64)` | 0x7fe2e3), 260/16 needs 65;
+/// - 4K120 (1188 MHz) on UHBR10 x4 in four slices at 383/16 bpp fits 48
+///   slots (`DATA_M` = `TU_SIZE(48)` | 0x5eddd2) but exceeds display 14's
+///   DSC->DPT limit (`312500 * 72 * 96.71% / (1188000 * 103%)` = 17 bpp);
+///   272/16 (17 bpp) passes it with 34 slots (`TU_SIZE(34)` | 0x439caa,
+///   the overhead 1011765 ppm);
+/// - no slice count, no MTP.
+fn smoke_uhbr_dsc_mtp_slices_and_dpt_limit() -> TestResult {
+    let uhd60 = mode(594_000, 3840, 4400, 2160, 2250);
+    let uhd120 = mode(1_188_000, 3840, 4400, 2160, 2250);
+    let r = UhbrRate::Uhbr10;
+    match dsc_mtp_tu(r, 1, &uhd60, 259, 2, true) {
+        Some(s)
+            if s.tu == 64 && s.m_n == [(63 << 25) | 0x7f_e2e3, 0x80_0000, 0xf_34d6, 0x8_0000] => {}
+        _ => return TestResult::Fail("259/16 bpp on UHBR10 x1 takes the 64 slots"),
+    }
+    if dsc_mtp_tu(r, 1, &uhd60, 260, 2, true).is_some() {
+        return TestResult::Fail("260/16 bpp needs 65 slots");
+    }
+    match dsc_mtp_tu(r, 4, &uhd120, 383, 4, false) {
+        Some(s) if s.tu == 48 && s.m_n[0] == (47 << 25) | 0x5e_ddd2 => {}
+        _ => return TestResult::Fail("display 20+ has no DPT limit: 48 slots"),
+    }
+    if dsc_mtp_tu(r, 4, &uhd120, 383, 4, true).is_some() {
+        return TestResult::Fail("display 14's DPT limit caps the compressed bpp at 17");
+    }
+    match dsc_mtp_tu(r, 4, &uhd120, 272, 4, true) {
+        Some(s) if s.tu == 34 && s.m_n[0] == (33 << 25) | 0x43_9caa && s.m_n[2] == 0x1e_69ad => {}
+        _ => return TestResult::Fail("17 bpp passes the DPT limit with 34 slots"),
+    }
+    if bw_overhead_with(4, 3840, 4, 272, true, false) != 1_011_765
+        || dsc_mtp_tu(r, 1, &uhd60, 259, 0, true).is_some()
+    {
+        return TestResult::Fail("the slice-aware overhead or the slice-count rule differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_dsc_mtp_slices_and_dpt_limit
 );

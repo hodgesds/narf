@@ -311,6 +311,7 @@ fn smoke_intel_x_tiled_layout_extent_metadata_test_only_and_arch_refusal() -> Te
         layout: Layout::X,
         origin: Default::default(),
         input: Default::default(),
+        ccs: None,
     };
     assert_eq!(
         view.footprint(Geometry {
@@ -501,4 +502,7 @@ mod panning {
 }
 mod tile4 {
     include!("intel_gpu_tile4_ioctl_tests.rs");
+}
+mod ccs {
+    include!("intel_gpu_ccs_ioctl_tests.rs");
 }

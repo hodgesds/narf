@@ -916,16 +916,24 @@ impl Plan {
                 let id = fb.ok_or(FsError::Unsupported)?;
                 let target = card.framebuffer(id).map_err(|_| FsError::NotFound)?;
                 let object = target.intel.as_ref().ok_or(FsError::Unsupported)?;
+                // narf.intel.ccs=1: a compressed Tile4 framebuffer ADDFB2
+                // admitted for this card's display carries its AUX plane in
+                // `offsets[1]`/`chroma_pitch`.
+                let compressed = object
+                    .ccs
+                    .filter(|_| card.intel_ccs.is_some() && card.intel_tile4);
                 if target.pitch != geometry.pitch
                     || !(target.format == PixelFormat::Xrgb8888
                         || (target.format == PixelFormat::Xrgb2101010
                             && card.intel_xr30
                             && target.modifier == 0))
                     || (target.modifier != 0
+                        && compressed.is_none()
                         && !(target.modifier == X_TILED_MODIFIER && card.intel_x_tiled
                             || target.modifier == TILE4_MODIFIER && card.intel_tile4))
-                    || target.offsets != [0, 0]
-                    || target.chroma_pitch != 0
+                    || (compressed.is_none()
+                        && (target.offsets != [0, 0] || target.chroma_pitch != 0))
+                    || (compressed.is_some() && target.format != PixelFormat::Xrgb8888)
                     || !object.object.scanout()
                     || object.object.is_userptr()
                     || !((card.intel_vram_scanout && object.object.is_vram())
@@ -941,9 +949,11 @@ impl Plan {
                 };
                 if target.modifier == X_TILED_MODIFIER {
                     view.layout = Layout::X;
-                } else if target.modifier == TILE4_MODIFIER {
+                } else if target.modifier == TILE4_MODIFIER || compressed.is_some() {
+                    // A compressed modifier is Tile4 with its CCS planes.
                     view.layout = Layout::Tile4;
                 }
+                view.ccs = compressed;
                 if viewport
                     .x
                     .checked_add(geometry.width)

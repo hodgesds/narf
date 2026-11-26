@@ -79,6 +79,8 @@ pub mod block {
     pub const LFP_POWER: u8 = 44;
     /// `BDB_MIPI_SEQUENCE` (its v3+ size field is a u32 at +4).
     pub const MIPI_SEQUENCE: u8 = 53;
+    /// `BDB_VSWING_PREEMPH` (218+).
+    pub const VSWING_PREEMPH: u8 = 57;
 }
 
 /// `sizeof` of each parsed block structure (the `bdb_blocks[].min_size`
@@ -100,6 +102,9 @@ pub mod block_size {
     pub const LFP_BACKLIGHT: usize = 305;
     /// `struct bdb_lfp_power`.
     pub const LFP_POWER: usize = 136;
+    /// `struct bdb_vswing_preemph` (`num_tables`, `num_columns`; the
+    /// `u32 tables[]` follow).
+    pub const VSWING_PREEMPH: usize = 2;
 }
 
 /// `sizeof(struct child_device_config)`.
@@ -354,6 +359,10 @@ impl ChildDevice {
     /// `lane_reversal` (184+, read unconditionally as Linux does).
     pub fn lane_reversal(&self) -> bool {
         self.raw[23] & (1 << 1) != 0
+    }
+    /// `intel_bios_encoder_requests_vspeo`: `use_vbt_vswing` (218+).
+    pub fn use_vbt_vswing(&self) -> bool {
+        self.version >= 218 && self.raw[23] & (1 << 5) != 0
     }
     /// `lspcon` (192+).
     pub fn lspcon(&self) -> bool {
@@ -853,6 +862,9 @@ pub struct VbtEncoder {
     pub dp_max_link_rate_khz: u32,
     /// `intel_bios_dp_max_lane_count` (0: no VBT limit).
     pub dp_max_lane_count: u8,
+    /// `intel_bios_encoder_requests_vspeo`: the child asks for the VBT's
+    /// vswing/pre-emphasis tables (`use_vbt_vswing`, 218+).
+    pub use_vbt_vswing: bool,
 }
 
 // ── Panel facts (intel_bios_init_panel) ─────────────────────────────
@@ -1025,7 +1037,11 @@ pub struct Vbt {
     lfp_options: Option<Vec<u8>>,
     lfp_backlight: Option<Vec<u8>>,
     lfp_power: Option<Vec<u8>>,
+    vswing_preemph: Option<Vec<u8>>,
 }
+
+/// `vswing_preemph_num_rows` on display 14+: sixteen levels per table.
+pub const VSPEO_ROWS_DISPLAY14: usize = 16;
 
 impl Vbt {
     /// Validate (`intel_bios_is_valid_vbt`) and parse a VBT image.
@@ -1049,7 +1065,49 @@ impl Vbt {
             lfp_options: padded_block(bdb, block::LFP_OPTIONS, block_size::LFP_OPTIONS),
             lfp_backlight: padded_block(bdb, block::LFP_BACKLIGHT, block_size::LFP_BACKLIGHT),
             lfp_power: padded_block(bdb, block::LFP_POWER, block_size::LFP_POWER),
+            // parse_vswing_preemph_override: only from version 218.
+            vswing_preemph: if version >= 218 {
+                padded_block(bdb, block::VSWING_PREEMPH, block_size::VSWING_PREEMPH)
+            } else {
+                None
+            },
         })
+    }
+
+    /// `intel_bios_get_c20_vspeo` for a DP output on display 14+: when the
+    /// encoder requests it ([`VbtEncoder::use_vbt_vswing`]) and the VBT
+    /// carries `BDB_VSWING_PREEMPH`, the sixteen (vswing, pre-cursor,
+    /// post-cursor) rows of table 5 for a UHBR link (`is_uhbr`), table 4
+    /// otherwise, at row stride `num_columns` (each value truncated to the
+    /// `snps` byte, as Linux's assignment does). Linux reads the rows
+    /// without a bound; `None` here for a block too short to hold them.
+    pub fn c20_vspeo(
+        &self,
+        encoder: &VbtEncoder,
+        is_uhbr: bool,
+    ) -> Option<[(u8, u8, u8); VSPEO_ROWS_DISPLAY14]> {
+        if !encoder.use_vbt_vswing {
+            return None;
+        }
+        let b = self.vswing_preemph.as_deref()?;
+        let columns = usize::from(b[1]);
+        let tables = &b[block_size::VSWING_PREEMPH..];
+        let at = |i: usize| -> Option<u32> {
+            let raw = tables.get(i * 4..i * 4 + 4)?;
+            Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        };
+        let idx = if is_uhbr { 5 } else { 4 };
+        let mut offset = idx * VSPEO_ROWS_DISPLAY14 * columns;
+        let mut rows = [(0u8, 0u8, 0u8); VSPEO_ROWS_DISPLAY14];
+        for row in rows.iter_mut() {
+            *row = (
+                at(offset)? as u8,
+                at(offset + 1)? as u8,
+                at(offset + 2)? as u8,
+            );
+            offset += columns;
+        }
+        Some(rows)
     }
 
     /// The BDB version (`display->vbt.version`).
@@ -1333,6 +1391,7 @@ impl Vbt {
                 hdmi_max_tmds_khz: child.hdmi_max_tmds_clock_khz(),
                 dp_max_link_rate_khz: child.dp_max_link_rate_khz(),
                 dp_max_lane_count: child.dp_max_lane_count(),
+                use_vbt_vswing: child.use_vbt_vswing(),
             };
             if child.supports_dsi() {
                 out.push(VbtEncoder { dsi: true, ..base });
@@ -1787,6 +1846,9 @@ pub struct Gen12DdcOverrides {
     family: Option<crate::intel_gpu_gt::Gen12Platform>,
     pins: [Option<PinPair>; 8],
     external_only: bool,
+    /// The VBT declares an eDP connector on port A
+    /// (`intel_bios_encoder_supports_edp` for `PORT_A`).
+    edp_a: bool,
 }
 
 impl Gen12DdcOverrides {
@@ -1795,18 +1857,22 @@ impl Gen12DdcOverrides {
         family: None,
         pins: [None; 8],
         external_only: false,
+        edp_a: false,
     };
 
     /// The overrides a VBT declares for `family`.
     pub fn from_vbt(vbt: &Vbt, family: crate::intel_gpu_gt::Gen12Platform) -> Self {
         let mut pins = [None; 8];
+        let mut edp_a = false;
         for encoder in vbt.encoders(VbtPlatform::from_gen12(family)) {
             if let Some(slot) = pins.get_mut(encoder.port as usize) {
                 *slot = encoder.hdmi_ddc;
             }
+            edp_a |= encoder.port == 0 && encoder.edp;
         }
         Self {
             family: Some(family),
+            edp_a,
             pins,
             external_only: !vbt.children().is_empty()
                 && vbt.children().iter().all(|child| {
@@ -1818,6 +1884,12 @@ impl Gen12DdcOverrides {
 
     pub(crate) fn external_only_for(&self, family: crate::intel_gpu_gt::Gen12Platform) -> bool {
         self.family == Some(family) && self.external_only
+    }
+
+    /// Whether the VBT resolved for `family` declares an eDP panel on port
+    /// A (`intel_ddi_init`'s `init_dp` with `intel_dp_is_port_edp`).
+    pub(crate) fn edp_on_a_for(&self, family: crate::intel_gpu_gt::Gen12Platform) -> bool {
+        self.family == Some(family) && self.edp_a
     }
 
     /// The HDMI DDC pin for `ddi` on `family`: the VBT pin when these
@@ -1881,6 +1953,10 @@ pub fn install_for_probe(
     let applicable = match generation {
         Generation::MeteorLake | Generation::LunarLake | Generation::PantherLake => true,
         Generation::TigerLake | Generation::AlderLake => gen12.is_some(),
+        // Rocket Lake only with its internal panel admitted
+        // (`narf.intel.rkl_edp=1`): the eDP signal bits and the port A
+        // eDP declaration the owned route needs, and the DDC overrides.
+        Generation::RocketLake => gen12.is_some() && crate::intel_gpu_modeset::rkl_edp(),
         // Gen11 (Lane 5): the VRR flag and the eDP
         // low-vswing bit install for the internal panel; the
         // Gen12 DDC overrides below are skipped for IceLake.
@@ -1895,7 +1971,6 @@ pub fn install_for_probe(
         // is ever computed from the installed flag; the Gen9
         // modeset (Lane 5) reads only the low-vswing bit.
         Generation::Skylake | Generation::Broxton => true,
-        _ => false,
     };
     if !applicable {
         return VbtInstall::NotApplicable;

@@ -813,3 +813,136 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_prime",
     smoke_xe_prime_pinned_vram_export_survives_suspend_in_place
 );
+
+/// `xe_dma_buf_begin_cpu_access` (DMA_BUF_IOCTL_SYNC START). The dma-buf
+/// core's direction (`dma_buf_ioctl`: SYNC_READ is DMA_FROM_DEVICE,
+/// SYNC_WRITE DMA_TO_DEVICE, SYNC_RW DMA_BIDIRECTIONAL, neither -EINVAL)
+/// decides: only a read migrates a VRAM|system export to system memory
+/// (`xe_bo_migrate(bo, XE_PL_TT)`) with its data, its dynamic importer
+/// notified first and its mmap offset then mapping the system pages; a
+/// second call finds it there. A live CPU mapping of the BAR, a pinned
+/// export (-EBUSY) and a VRAM-only one (-EINVAL) stay in VRAM, and the
+/// exporter hook still succeeds, as Linux's returns 0 ("cpu-access takes
+/// place in current placement").
+fn smoke_xe_prime_begin_cpu_access_migrates_vram_for_cpu_reads() -> TestResult {
+    use crate::intel_gpu_prime::{migrate_for_cpu_read, CpuAccess};
+    use narf_filesystem::dma_buf::{DmaBufCpuAccess, DmaDataDirection as D};
+    assert_eq!(D::from_sync_flags(1), Some(D::FromDevice));
+    assert_eq!(D::from_sync_flags(2), Some(D::ToDevice));
+    assert_eq!(D::from_sync_flags(3), Some(D::Bidirectional));
+    assert_eq!(D::from_sync_flags(3 | 4), Some(D::Bidirectional));
+    assert_eq!(D::from_sync_flags(0), None);
+    assert_eq!(D::from_sync_flags(4), None);
+    assert!(D::FromDevice.cpu_reads() && !D::FromDevice.cpu_writes());
+    assert!(!D::ToDevice.cpu_reads() && D::ToDevice.cpu_writes());
+    assert!(D::Bidirectional.cpu_reads() && D::Bidirectional.cpu_writes());
+
+    let (frame, pool, backend, info) = evict_fixture(GtPlatform::Battlemage, 0xdfc);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let handle = create_vram_bo(&file, &info, &user, BO, 3).unwrap();
+    let object = file.gem.object(handle).unwrap();
+    object.write(0, &pattern(23)).unwrap();
+    // A dynamic peer maps the export in place.
+    let peer = attach_dynamic(
+        file.gem.export_object(handle).unwrap(),
+        exporter(&backend),
+        &Fabric,
+        Some(EXPORTER),
+        Some(PEER),
+        true,
+    )
+    .unwrap();
+    let generation = block_on_spin(peer.map()).unwrap().generation;
+    assert!(object.is_vram() && peer.current(generation));
+    // A CPU write does not migrate.
+    assert_eq!(
+        block_on_spin(migrate_for_cpu_read(&object, backend.as_ref(), D::ToDevice)),
+        Ok(false)
+    );
+    assert!(object.is_vram() && peer.current(generation));
+    // A live CPU mapping of the BAR keeps the export where it is.
+    let offset = file.gem.mmap_offset(handle).unwrap();
+    let view = file.gem.mmap_backing(offset, 4096).unwrap();
+    assert_eq!(
+        block_on_spin(migrate_for_cpu_read(&object, backend.as_ref(), D::FromDevice)),
+        Err(FsError::Busy)
+    );
+    assert!(object.is_vram() && peer.current(generation));
+    drop(view);
+    // A read migrates it: the data moves, the importer is notified first,
+    // and the VRAM is free.
+    assert_eq!(
+        block_on_spin(migrate_for_cpu_read(&object, backend.as_ref(), D::FromDevice)),
+        Ok(true)
+    );
+    assert!(!object.is_vram() && !peer.current(generation));
+    assert_eq!(pool.used(), 0);
+    let mut back = alloc::vec![0; BO as usize];
+    object.read(0, &mut back).unwrap();
+    assert_eq!(back, pattern(23));
+    let view = file.gem.mmap_backing(offset, 4096).unwrap();
+    assert_eq!(view.frames[0], object.pages().next().unwrap());
+    assert_eq!(view.memory_type, narf_memory::MemoryType::WriteBack);
+    drop(view);
+    // Already in system memory: nothing to do.
+    assert_eq!(
+        block_on_spin(migrate_for_cpu_read(&object, backend.as_ref(), D::Bidirectional)),
+        Ok(false)
+    );
+
+    // A static peer's map pins its export in VRAM: -EBUSY.
+    let pinned = file
+        .gem
+        .object(create_vram_bo(&file, &info, &user, BO, 3).unwrap())
+        .unwrap();
+    let pin = attach(
+        pinned.clone(),
+        exporter(&backend),
+        &Fabric,
+        Some(EXPORTER),
+        Some(PEER),
+        true,
+    )
+    .unwrap();
+    assert!(block_on_spin(pin.map()).is_ok() && pinned.externally_pinned());
+    assert_eq!(
+        block_on_spin(migrate_for_cpu_read(&pinned, backend.as_ref(), D::FromDevice)),
+        Err(FsError::Busy)
+    );
+    assert!(pinned.is_vram());
+    // A VRAM-only placement has no system placement: -EINVAL.
+    let only = file
+        .gem
+        .object(create_vram_bo(&file, &info, &user, BO, 2).unwrap())
+        .unwrap();
+    assert_eq!(
+        block_on_spin(migrate_for_cpu_read(&only, backend.as_ref(), D::FromDevice)),
+        Err(FsError::InvalidData)
+    );
+    assert!(only.is_vram());
+    // The exporter hook succeeds whatever the migration did; on a card with
+    // no device behind it nothing moves.
+    assert_eq!(
+        block_on_spin(CpuAccess::new(u32::MAX, &only).begin_cpu_access(D::FromDevice)),
+        Ok(())
+    );
+    assert!(only.is_vram());
+
+    drop(pin);
+    drop(peer);
+    drop(only);
+    drop(pinned);
+    drop(object);
+    drop(file);
+    drop(info);
+    drop(backend);
+    drop(pool);
+    vram_clear::fixture_finish();
+    narf_memory::frame::free_pages(frame, 6);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_prime",
+    smoke_xe_prime_begin_cpu_access_migrates_vram_for_cpu_reads
+);

@@ -2127,6 +2127,19 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
     ) -> Result<(LinkRate, u8, LaneLevels), ModesetError> {
         use crate::dp_link_training::{train_link, LinkError, LinkRate as TrainRate};
         use crate::intel_gpu_modeset::training::{State, TrainingAux};
+        // intel_ddi_pre_enable_dp: "Panel replay has to be enabled in sink
+        // dpcd before link training" (`narf.intel.panel_replay=1`; display
+        // 20/30 eDP, nothing written otherwise).
+        if self.ip.ver() >= 20 && self.port.is_edp() {
+            let mut aux = IntelAux::with_base(self.mmio, self.port.aux_base());
+            crate::intel_gpu_psr::panel_replay::enable_before_training(
+                &mut aux,
+                self.ip.ver(),
+                true,
+                false,
+                crate::intel_gpu_psr::panel_replay::opted_in(),
+            );
+        }
         let tracked = Cell::new(*pll);
         let mut failure = None;
         let result = {

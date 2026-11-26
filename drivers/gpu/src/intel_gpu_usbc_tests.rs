@@ -177,6 +177,88 @@ kernel_test_in!(
     smoke_usbc_tbt_clock_rates_preserve_phy_and_timeout
 );
 
+/// `intel_mtl_tbt_clock_select` / `intel_mtl_tbt_pll_enable_clock` at the
+/// UHBR rates: display 30+ (the Panther Lake Cx0 and Nova Lake LT views)
+/// selects `XELPDP_DDI_CLOCK_SELECT_TBT_312_5` (0x18) for UHBR10 and
+/// `_TBT_625` (0x19) for UHBR20 in the five-bit field, with `DDI_CLK_VALFREQ`
+/// at `intel_ddi_link_symbol_clock` (1000000 * 10 / 32 = 312500, 2000000 * 10
+/// / 32 = 625000); `intel_mtl_tbt_calc_port_clock` reads both back. Display 14
+/// has no UHBR select (Linux WARNs and would program the 162 MHz one): it
+/// refuses before writing, and a 1350000 clock has no select anywhere.
+fn smoke_usbc_tbt_uhbr_clock_selects_need_display30() -> TestResult {
+    let port = XeLpgPort::Tc2;
+    let valfreq = port.clk_valfreq().unwrap();
+    struct Display30<'a>(&'a FakePhy, bool);
+    impl MmioWindow for Display30<'_> {
+        fn cx0_xe3(&self) -> bool {
+            !self.1
+        }
+        fn has_lt_phy(&self) -> bool {
+            self.1
+        }
+        fn read32(&self, off: u64) -> u32 {
+            self.0.read32(off)
+        }
+        fn write32(&self, off: u64, value: u32) {
+            self.0.write32(off, value)
+        }
+    }
+    for lt in [false, true] {
+        for (khz, select, symbol) in [(1_000_000, 0x18, 312_500), (2_000_000, 0x19, 625_000)] {
+            let io = FakePhy::new(port);
+            let view = Display30(&io, lt);
+            let ctl = |io: &FakePhy| io.read32(port.port_clock_ctl());
+            if enable_tbt_clock_khz(&view, port, khz).is_err()
+                || ctl(&io) & XE3_DDI_CLOCK_SELECT_MASK != select << 12
+                || ctl(&io) & (TBT_CLOCK_REQUEST | FORWARD_CLOCK_UNGATE)
+                    != TBT_CLOCK_REQUEST | FORWARD_CLOCK_UNGATE
+                || io.read32(valfreq) != symbol
+                || tbt_port_clock_khz(ctl(&io), true) != Some(khz)
+            {
+                return TestResult::Fail("display 30+ UHBR TBT select or VALFREQ differs");
+            }
+            if disable_tbt_clock(&view, port).is_err()
+                || ctl(&io) & (XE3_DDI_CLOCK_SELECT_MASK | FORWARD_CLOCK_UNGATE) != 0
+            {
+                return TestResult::Fail("the UHBR TBT clock must gate on disable");
+            }
+        }
+    }
+    let io = FakePhy::new(port);
+    for khz in [1_000_000, 2_000_000, 1_350_000] {
+        if enable_tbt_clock_khz(&io, port, khz) != Err(Cx0Error::UnsupportedRate) {
+            return TestResult::Fail("display 14 has no TBT UHBR select");
+        }
+    }
+    if !io.writes.borrow().is_empty() || tbt_clock_select(1_350_000, true).is_some() {
+        return TestResult::Fail("a refused TBT clock must precede every write");
+    }
+    // The DP 1.4 selects are unchanged and read back on both layouts.
+    for (khz, select) in [
+        (162_000, 0xC),
+        (270_000, 0xD),
+        (540_000, 0xE),
+        (810_000, 0xF),
+    ] {
+        if tbt_clock_select(khz, false) != Some(select)
+            || tbt_clock_select(khz, true) != Some(select)
+            || tbt_port_clock_khz(select << 12, false) != Some(khz)
+            || tbt_port_clock_khz(select << 12, true) != Some(khz)
+        {
+            return TestResult::Fail("DP 1.4 TBT selects differ from Linux");
+        }
+    }
+    // The four-bit display-14 field cannot hold 0x18.
+    if tbt_port_clock_khz(0x18 << 12, false).is_some() {
+        return TestResult::Fail("display 14 must not decode a five-bit select");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg",
+    smoke_usbc_tbt_uhbr_clock_selects_need_display30
+);
+
 fn smoke_usbc_pin_d_external_route_keeps_usb_clock_running() -> TestResult {
     let port = XeLpgPort::Tc1;
     let edid = edid_for(148_500, 1920, 280, 88, 44, 1080, 45, 4, 5);

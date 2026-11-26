@@ -180,6 +180,17 @@ pub const fn hdcp_transcoder(cpu_transcoder: u8) -> u8 {
     }
 }
 
+/// `intel_hdcp.c::intel_get_hdcp_ddi_index` (`enum hdcp_ddi`): port A is
+/// `HDCP_DDI_A` (7), ports B..F are themselves (1..5), anything else
+/// `HDCP_DDI_INVALID_PORT`. Display 9 to 11 name their port this way.
+pub const fn hdcp_ddi_index(port: u8) -> u8 {
+    match port {
+        0 => 7,
+        1..=5 => port,
+        _ => HDCP_DDI_INVALID_PORT,
+    }
+}
+
 /// `struct hdcp_port_data`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HdcpPortData {

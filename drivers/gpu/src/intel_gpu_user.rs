@@ -202,6 +202,12 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn native_xe(&self) -> bool {
         false
     }
+    /// `IS_ENABLED(CONFIG_DRM_XE_GPUSVM)`: native Xe CPU-address-mirror VMs,
+    /// published with `narf.intel.svm=1` (`xe->info.has_usm` is checked
+    /// separately). Default: off, so `CPU_ADDR_MIRROR` binds stay EINVAL.
+    fn cpu_addr_mirror(&self) -> bool {
+        false
+    }
     /// The Gen9/Gen11 SSEU layout the execlists owner read from the fuses,
     /// for the i915 topology query and SSEU GETPARAMs. Default: none (later
     /// generations publish a `GtTopology` instead).
@@ -825,6 +831,11 @@ impl UserContext {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn busy(&self) -> bool {
         self.state.lock().busy
+    }
+    /// [`Self::configure_run_alone`] ran: every claim's LRC runs alone.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn run_alone_requested(&self) -> bool {
+        self.state.lock().run_alone
     }
     /// One word of the context's saved register image, as `restore` copies
     /// it into a fresh LRC image at 4096 + index * 4: index 3 is the

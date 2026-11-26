@@ -13,6 +13,21 @@ pub(super) struct Path {
 impl IntelHda {
     pub(super) fn discover_paths(&mut self) {
         for (index, graph) in self.graphs.iter().enumerate() {
+            // An Intel HDMI/DP codec bound to the display's audio component:
+            // every connected digital port, each with its own converter.
+            // Unbound, it keeps the generic walk below, which finds nothing
+            // on a digital-only codec.
+            if super::intelhdmi::bound_graph_model(graph).is_some() {
+                if self.stream_counts().1 != 0 {
+                    for nodes in super::intelhdmi::intel_output_paths(graph) {
+                        self.outputs.push(Path {
+                            codec: index,
+                            nodes,
+                        });
+                    }
+                }
+                continue;
+            }
             // GPU HDMI/DP audio: every connected digital port, no analog.
             if hda_codec::is_ati_hdmi(graph) {
                 if self.stream_counts().1 != 0 {
@@ -190,6 +205,8 @@ impl IntelHda {
             .widget(path.nodes.converter_nid)
             .ok_or(HdaError::NoCodecs)?;
         let ati = hda_codec::is_ati_hdmi(graph);
+        let intel = super::intelhdmi::bound_graph_model(graph).is_some()
+            && self.hdmi_pcm_of_output(output).is_some();
         if !ati && converter.caps.channels() < params.channels.count() {
             return Err(HdaError::NoOutputStream);
         }
@@ -207,6 +224,9 @@ impl IntelHda {
             if pcm & (1 << 6) == 0 || pcm & bits == 0 || formats & 1 == 0 {
                 return Err(HdaError::NoOutputStream);
             }
+        }
+        if intel {
+            self.intel_before_d0(graph)?;
         }
         self.verb(cad, graph.afg_nid, 0x705 << 8)?;
         super::runtime::delay_us(1000);
@@ -283,6 +303,15 @@ impl IntelHda {
             let spk_alloc = self.hdmi_sink(output).map_or(0, |sink| sink.spk_alloc);
             let channels = params.channels.count();
             self.ati_hdmi_prepare(graph, &path.nodes, output, channels, spk_alloc)?;
+            if self
+                .hdmi_pcm_of_output(output)
+                .is_some_and(|pcm| self.hdmi_state(pcm).non_pcm)
+            {
+                format |= 0x8000;
+            }
+        } else if intel {
+            let channels = params.channels.count();
+            self.intel_hdmi_prepare(graph, &path.nodes, output, channels, params.rate.hz())?;
             if self
                 .hdmi_pcm_of_output(output)
                 .is_some_and(|pcm| self.hdmi_state(pcm).non_pcm)

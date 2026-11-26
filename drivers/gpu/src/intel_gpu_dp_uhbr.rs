@@ -27,12 +27,44 @@
 //!   VC payload (VCPID 1, slot 0, `tu` slots) of `mtl_ddi_pre_enable_dp` /
 //!   `intel_ddi_enable` and its clear in `intel_ddi_post_disable_hdmi_or_sst`.
 //!
+//! - **Thunderbolt alt mode** (display 30+): the DP tunnel's BW allocation
+//!   ([`super::tunnel`]) supplies the tunnelled DPRX's 128b/132b rates
+//!   ([`read_sink_rates`]) and caps every configuration
+//!   ([`wide_link_capped`]); the port clock is the fabric's UHBR select
+//!   (`crate::intel_gpu_xelpg::enable_tbt_clock_khz`).
+//!
+//! - **LTTPRs** ([`init_lttpr_and_dprx_caps`], [`wake_timeout_setup`]): the
+//!   LTTPR common capabilities cap the link (`drm_dp_lttpr_max_link_rate`,
+//!   `drm_dp_lttpr_max_lane_count`) and mask the UHBR rates; the 128b/132b
+//!   route switches the repeaters to non-transparent mode
+//!   (`intel_dp_init_lttpr_and_dprx_caps`, `drm_dp_lttpr_init`), grants their
+//!   extended wake timeout and trains with the repeater count (the CDS
+//!   budget). 128b/132b training has no per-hop phase: Linux trains the
+//!   whole path from the DPRX's status. The 8b/10b route keeps the repeaters
+//!   transparent (the per-hop `intel_dp_link_train_all_phys` is not
+//!   implemented), so a 128b/132b route hands them back to transparent mode
+//!   when it stops.
+//!
+//! - **Fallback** ([`LinkCaps`]): `intel_dp_link_caps.c`'s configuration
+//!   orders, `intel_dp_get_link_train_fallback_values` after a failed
+//!   128b/132b training (the failed configuration disabled, the maximum
+//!   limits reduced), and the modeset retry's
+//!   `intel_dp_compute_link_config_wide` over what is still allowed
+//!   ([`wide_search`]), which may land on 8b/10b.
+//!
+//! - **DSC** ([`dsc_mtp_tu`]): Linux 7.4's `dsc_compute_link_config` with
+//!   the 128b/132b configurations (`intel_dp_mtp_tu_compute_config` with
+//!   DSC: slice-aware overhead, implicit FEC, the display-14 DPT limit),
+//!   through `crate::intel_gpu_xelpg_dsc::compute_with`.
+//!
+//! - **MST** ([`mst_stream`]): the 64-slot MTP from slot 0 with
+//!   `drm_dp_get_vc_payload_bw`'s 128b/132b PBN divider, the remote PBN
+//!   with the SSC margin and the remote TU.
+//!
 //! Not implemented, refused typed ([`UhbrRefusal`]) instead of running a
-//! link Linux would not: 128b/132b MST, DSC on a link whose common rates
-//! include UHBR, Thunderbolt-alt UHBR (the TBT 312.5/625 MHz clock select and
-//! DP tunnel BW allocation), an LTTPR in the path (Linux trains through it
-//! in non-transparent mode), and the reduced-parameter retry after a failed
-//! 128b/132b training.
+//! link Linux would not: 128b/132b MST over Thunderbolt (the tunnel's
+//! per-stream bandwidth), and Thunderbolt-alt UHBR on display 14/20 (no TBT
+//! UHBR clock select).
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_modeset::Mode;
@@ -110,10 +142,33 @@ const DP_128B132B_TRAINING_AUX_RD_INTERVAL_MASK: u8 = 0x7f;
 /// `DP_LT_TUNABLE_PHY_REPEATER_FIELD_DATA_STRUCTURE_REV`: the eight-byte
 /// LTTPR common capabilities (`DP_LTTPR_COMMON_CAP_SIZE`).
 pub const DP_LTTPR_COMMON_CAPS: u32 = 0xf0000;
+const DP_MAX_LINK_RATE_PHY_REPEATER: usize = 1;
 const DP_PHY_REPEATER_CNT: usize = 2;
+/// `DP_PHY_REPEATER_MODE` (0xf0003) within the common capabilities.
+const DP_PHY_REPEATER_MODE_INDEX: usize = 3;
+const DP_MAX_LANE_COUNT_PHY_REPEATER: usize = 4;
 const DP_MAIN_LINK_CHANNEL_CODING_PHY_REPEATER: usize = 6;
 const DP_PHY_REPEATER_128B132B_SUPPORTED: u8 = 1 << 0;
 const DP_PHY_REPEATER_128B132B_RATES: usize = 7;
+/// `DP_PHY_REPEATER_MODE` and its two values.
+pub const DP_PHY_REPEATER_MODE: u32 = 0xf_0003;
+pub const DP_PHY_REPEATER_MODE_TRANSPARENT: u8 = 0x55;
+pub const DP_PHY_REPEATER_MODE_NON_TRANSPARENT: u8 = 0xaa;
+/// `DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT` and its request mask / grant.
+pub const DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT: u32 = 0xf_0005;
+const DP_EXTENDED_WAKE_TIMEOUT_REQUEST_MASK: u8 = 0x7f;
+pub const DP_EXTENDED_WAKE_TIMEOUT_GRANT: u8 = 1 << 7;
+/// `DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST` / `_GRANT` and
+/// `DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED`.
+pub const DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST: u32 = 0x2211;
+pub const DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_GRANT: u32 = 0x119;
+pub const DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED: u8 = 1 << 0;
+/// `DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1`, the first of the three
+/// `DP_LTTPR_PHY_CAP_SIZE` bytes, and the LTTPR register stride
+/// (`__DP_LTTPR2_BASE - __DP_LTTPR1_BASE`).
+pub const DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1: u32 = 0xf_0020;
+pub const DP_LTTPR_STRIDE: u32 = 0x50;
+const DP_LTTPR_PHY_CAP_SIZE: usize = 3;
 
 /// `DP_LINK_STATUS_SIZE`.
 pub const LINK_STATUS_SIZE: usize = 6;
@@ -205,8 +260,11 @@ pub struct UhbrSink {
     /// LTTPR that supports 128b/132b masks them with its own
     /// `DP_PHY_REPEATER_128B132B_RATES`, one that does not clears them.
     pub rates: u8,
-    /// `DP_PHY_REPEATER_CNT` reported an LTTPR (any non-zero count byte).
+    /// `drm_dp_lttpr_count` found one to eight repeaters (a malformed count
+    /// is none: Linux's LTTPR init resets it before the sink rates).
     pub lttpr: bool,
+    /// The LTTPR common capabilities ([`read_lttpr_caps`]).
+    pub lttpr_caps: [u8; 8],
     /// `drm_dp_post_lt_adj_req_supported`.
     pub post_lt_adj_req: bool,
 }
@@ -231,21 +289,45 @@ pub fn read_sink<A: AuxChannel + ?Sized>(
     aux: &mut A,
     raw: &[u8; 16],
 ) -> Result<UhbrSink, AuxError> {
+    read_sink_rates(aux, raw, None)
+}
+
+/// [`read_sink`] behind a DP tunnel with BW allocation enabled
+/// ([`super::tunnel`]): `dprx_supports_128b132b` and
+/// `dprx_128b132b_link_rates` take the tunnel's 128b/132b rates
+/// (`drm_dp_tunnel_128b132b_dprx_rates`, zero without 128b/132b support)
+/// instead of `DP_CAP_ANSI_128B132B` and `DP_128B132B_SUPPORTED_LINK_RATES`
+/// (which a tunnelled DPRX reports empty, DP 2.1 5.14.3); the LTTPR masking
+/// is unchanged. `None` is [`read_sink`].
+pub fn read_sink_rates<A: AuxChannel + ?Sized>(
+    aux: &mut A,
+    raw: &[u8; 16],
+    tunnel_rates: Option<u8>,
+) -> Result<UhbrSink, AuxError> {
     let post_lt_adj_req = raw[DP_MAX_LANE_COUNT] & DP_POST_LT_ADJ_REQ_SUPPORTED != 0;
-    if raw[DP_MAIN_LINK_CHANNEL_CODING] & DP_CAP_ANSI_128B132B == 0 {
+    let supported = match tunnel_rates {
+        Some(rates) => rates != 0,
+        None => raw[DP_MAIN_LINK_CHANNEL_CODING] & DP_CAP_ANSI_128B132B != 0,
+    };
+    if !supported {
         return Ok(UhbrSink {
             post_lt_adj_req,
             ..UhbrSink::default()
         });
     }
-    let mut rates = [0u8];
-    aux.dpcd_read(DP_128B132B_SUPPORTED_LINK_RATES, &mut rates)?;
-    let mut lttpr = [0u8; 8];
-    if aux.dpcd_read(DP_LTTPR_COMMON_CAPS, &mut lttpr).is_err() {
-        lttpr = [0; 8];
-    }
-    let mut rates = rates[0] & (DP_UHBR10 | DP_UHBR13_5 | DP_UHBR20);
-    let present = lttpr_count(&lttpr) != Some(0);
+    let rates = match tunnel_rates {
+        Some(rates) => rates,
+        None => {
+            let mut rates = [0u8];
+            aux.dpcd_read(DP_128B132B_SUPPORTED_LINK_RATES, &mut rates)?;
+            rates[0]
+        }
+    };
+    let lttpr = read_lttpr_caps(aux, raw[0]);
+    let mut rates = rates & (DP_UHBR10 | DP_UHBR13_5 | DP_UHBR20);
+    // intel_dp_init_lttpr_phys resets a malformed count before the sink
+    // rates are set: no repeater then.
+    let present = lttpr_count(&lttpr).is_some_and(|n| n > 0);
     if present {
         if lttpr[0] >= 0x20
             && lttpr[DP_MAIN_LINK_CHANNEL_CODING_PHY_REPEATER] & DP_PHY_REPEATER_128B132B_SUPPORTED
@@ -259,8 +341,174 @@ pub fn read_sink<A: AuxChannel + ?Sized>(
     Ok(UhbrSink {
         rates,
         lttpr: present,
+        lttpr_caps: lttpr,
         post_lt_adj_req,
     })
+}
+
+// ── LTTPRs ───────────────────────────────────────────────────────
+
+/// `drm_dp_read_lttpr_common_caps` and `intel_dp_read_lttpr_common_caps`:
+/// the eight bytes at 0xf0000, one byte per AUX read below DPCD 1.4
+/// (`drm_dp_read_lttpr_regs`: "the DELL P2715Q ... returns corrupted
+/// values"); a failed read or a revision below 1.4 is Linux's zeroed caps.
+pub fn read_lttpr_caps<A: AuxChannel + ?Sized>(aux: &mut A, dpcd_rev: u8) -> [u8; 8] {
+    let mut caps = [0u8; 8];
+    let ok = if dpcd_rev < 0x14 {
+        (0..caps.len()).all(|i| {
+            aux.dpcd_read(DP_LTTPR_COMMON_CAPS + i as u32, &mut caps[i..i + 1])
+                .is_ok()
+        })
+    } else {
+        aux.dpcd_read(DP_LTTPR_COMMON_CAPS, &mut caps).is_ok()
+    };
+    if !ok || caps[0] < 0x14 {
+        return [0; 8];
+    }
+    caps
+}
+
+/// `drm_dp_lttpr_max_link_rate` (`drm_dp_bw_code_to_link_rate` of
+/// `DP_MAX_LINK_RATE_PHY_REPEATER`; 0 for zeroed caps).
+pub const fn lttpr_max_link_rate(caps: &[u8; 8]) -> u32 {
+    caps[DP_MAX_LINK_RATE_PHY_REPEATER] as u32 * 27_000
+}
+
+/// `drm_dp_lttpr_max_lane_count`.
+pub const fn lttpr_max_lanes(caps: &[u8; 8]) -> u8 {
+    caps[DP_MAX_LANE_COUNT_PHY_REPEATER] & 0x1f
+}
+
+/// The LTTPR state of `intel_dp_init_lttpr_and_dprx_caps`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LttprInit {
+    /// The repeaters in non-transparent mode (0: none, or transparent).
+    pub count: u8,
+    /// `intel_dp->lttpr_common_caps` afterwards: its `DP_PHY_REPEATER_MODE`
+    /// byte holds the mode Linux set (`intel_dp_set_lttpr_transparent_mode`).
+    pub caps: [u8; 8],
+}
+
+impl LttprInit {
+    /// `intel_dp_lttpr_transparent_mode_enabled`.
+    pub fn transparent(&self) -> bool {
+        self.caps[DP_PHY_REPEATER_MODE_INDEX] == DP_PHY_REPEATER_MODE_TRANSPARENT
+    }
+}
+
+/// `intel_dp_init_lttpr_and_dprx_caps` on a link that is not active
+/// (non-eDP, display 10+): `intel_dp_read_dprx_caps` (the
+/// `drm_dp_dpcd_probe` of 0xf0000 and the receiver capabilities), then
+/// `intel_dp_init_lttpr`: the common caps, `drm_dp_lttpr_count` and
+/// `drm_dp_lttpr_init` — `DP_PHY_REPEATER_MODE` transparent, then
+/// non-transparent (DP 2.0 3.6.6.1), back to transparent when that fails;
+/// a malformed count stops after the transparent write — and each
+/// repeater's `drm_dp_read_lttpr_phy_caps`; then the receiver capabilities
+/// again ("The DPTX shall read the DPRX caps after LTTPR detection"). A
+/// failed DPRX read is Linux's `-EIO`, which `intel_dp_start_link_train`
+/// takes as no repeater.
+pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprInit {
+    let mut probe = [0u8];
+    let mut dpcd = [0u8; 16];
+    if aux.dpcd_read(DP_LTTPR_COMMON_CAPS, &mut probe).is_err()
+        || aux.dpcd_read(0x000, &mut dpcd).is_err()
+    {
+        return LttprInit::default();
+    }
+    let mut caps = read_lttpr_caps(aux, dpcd[0]);
+    let mut count = 0;
+    let found = lttpr_count(&caps);
+    if found != Some(0) {
+        // intel_dp_init_lttpr_phys with LTTPRs (or a malformed count).
+        let transparent = aux
+            .dpcd_write(DP_PHY_REPEATER_MODE, &[DP_PHY_REPEATER_MODE_TRANSPARENT])
+            .is_ok();
+        let non_transparent = match found {
+            Some(_) if transparent => {
+                if aux
+                    .dpcd_write(
+                        DP_PHY_REPEATER_MODE,
+                        &[DP_PHY_REPEATER_MODE_NON_TRANSPARENT],
+                    )
+                    .is_ok()
+                {
+                    true
+                } else {
+                    let _ =
+                        aux.dpcd_write(DP_PHY_REPEATER_MODE, &[DP_PHY_REPEATER_MODE_TRANSPARENT]);
+                    false
+                }
+            }
+            _ => false,
+        };
+        if non_transparent {
+            caps[DP_PHY_REPEATER_MODE_INDEX] = DP_PHY_REPEATER_MODE_NON_TRANSPARENT;
+            count = found.unwrap_or(0);
+            for i in 0..u32::from(count) {
+                let base = DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1 + i * DP_LTTPR_STRIDE;
+                let mut phy = [0u8; DP_LTTPR_PHY_CAP_SIZE];
+                if dpcd[0] < 0x14 {
+                    for (j, b) in phy.iter_mut().enumerate() {
+                        if aux
+                            .dpcd_read(base + j as u32, core::slice::from_mut(b))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                } else {
+                    let _ = aux.dpcd_read(base, &mut phy);
+                }
+            }
+        } else {
+            // intel_dp_set_lttpr_transparent_mode(true) and
+            // intel_dp_reset_lttpr_count.
+            caps[DP_PHY_REPEATER_MODE_INDEX] = DP_PHY_REPEATER_MODE_TRANSPARENT;
+            caps[DP_PHY_REPEATER_CNT] = 0;
+        }
+    }
+    if aux.dpcd_read(0x000, &mut dpcd).is_err() {
+        return LttprInit::default();
+    }
+    LttprInit { count, caps }
+}
+
+/// `drm_dp_lttpr_wake_timeout_setup`: in transparent mode the DPRX's
+/// `DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST` (1, 20, 40, 60, 80 or 100 ms;
+/// anything else is 1) is granted when above 1 ms; in non-transparent mode
+/// any `DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT` request (units of 10 ms) is
+/// granted. A failed read grants nothing.
+pub fn wake_timeout_setup<A: AuxChannel + ?Sized>(aux: &mut A, transparent: bool) {
+    let mut value = [0u8];
+    if transparent {
+        const MAPPING: [u8; 6] = [1, 20, 40, 60, 80, 100];
+        if aux
+            .dpcd_read(DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_REQUEST, &mut value)
+            .is_err()
+        {
+            return;
+        }
+        let ms = MAPPING.get(usize::from(value[0])).copied().unwrap_or(1);
+        if ms > 1 {
+            let _ = aux.dpcd_write(
+                DP_EXTENDED_DPRX_SLEEP_WAKE_TIMEOUT_GRANT,
+                &[DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED],
+            );
+        }
+    } else {
+        if aux
+            .dpcd_read(DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT, &mut value)
+            .is_err()
+        {
+            return;
+        }
+        if value[0] & DP_EXTENDED_WAKE_TIMEOUT_REQUEST_MASK != 0 {
+            let _ = aux.dpcd_write(
+                DP_PHY_REPEATER_EXTENDED_WAIT_TIMEOUT,
+                &[DP_EXTENDED_WAKE_TIMEOUT_GRANT],
+            );
+        }
+    }
 }
 
 // ── Bandwidth ────────────────────────────────────────────────────
@@ -271,23 +519,56 @@ pub fn max_link_data_rate(rate: UhbrRate, lanes: u32) -> u64 {
     u64::from(rate.link_rate()) * 10 * u64::from(lanes) * 967_100 / (1_000_000 * 8)
 }
 
-/// `drm_dp_bw_overhead` for an uncompressed 128b/132b stream (32-bit
-/// symbols; MST alignment of the symbol cycles to `4 / lanes` when `mst`,
-/// as `intel_dp_mtp_tu_compute_config` asks), at least 100%. ppm.
-fn bw_overhead(lanes: u32, hactive: u32, bpp_x16: u32, mst: bool) -> u64 {
+/// `drm_dp_link_symbol_cycles` with 32-bit symbols: per slice
+/// (`dsc_slices`, 0 for an uncompressed stream) the data symbol cycles of
+/// its pixels (`drm_dp_link_data_symbol_cycles`, aligned to `4 / lanes`
+/// when `mst`) and, compressed, one EOC cycle (`4 / lanes` when `mst`).
+pub fn symbol_cycles(lanes: u32, pixels: u32, dsc_slices: u32, bpp_x16: u32, mst: bool) -> u64 {
+    let slices = dsc_slices.max(1);
+    let slice_pixels = pixels.div_ceil(slices);
+    let align = if mst { u64::from(4 / lanes) } else { 1 };
+    let data = (u64::from(slice_pixels) * u64::from(bpp_x16)).div_ceil(16 * 32 * u64::from(lanes));
+    let data = data.div_ceil(align) * align;
+    let eoc = if dsc_slices == 0 {
+        0
+    } else if mst {
+        u64::from(4 / lanes)
+    } else {
+        1
+    };
+    u64::from(slices) * (data + eoc)
+}
+
+/// `intel_dp_link_bw_overhead` on 128b/132b (`DRM_DP_BW_OVERHEAD_UHBR`):
+/// `drm_dp_bw_overhead` with the MST symbol alignment when `mst` (as
+/// `intel_dp_mtp_tu_compute_config` asks, SST included), the 0.6% SSC /
+/// reference clock margin when `ssc` (the remote PBN of an MST stream) and
+/// the DSC slices, at least 100%. ppm.
+pub fn bw_overhead_with(
+    lanes: u32,
+    hactive: u32,
+    dsc_slices: u32,
+    bpp_x16: u32,
+    mst: bool,
+    ssc: bool,
+) -> u64 {
     if lanes == 0 || hactive == 0 || bpp_x16 == 0 {
         return 0;
     }
-    let cycles = (u64::from(hactive) * u64::from(bpp_x16)).div_ceil(16 * 32 * u64::from(lanes));
-    let align = if mst { u64::from(4 / lanes) } else { 1 };
-    let cycles = cycles.div_ceil(align) * align;
-    let overhead = (cycles * 32 * u64::from(lanes) * 1_000_000 * 16)
+    let base: u64 = if ssc { 1_006_000 } else { 1_000_000 };
+    let cycles = symbol_cycles(lanes, hactive, dsc_slices, bpp_x16, mst);
+    let overhead = (cycles * 32 * u64::from(lanes) * base * 16)
         .div_ceil(u64::from(hactive) * u64::from(bpp_x16));
     overhead.max(1_000_000)
 }
 
+/// [`bw_overhead_with`] for an uncompressed stream without SSC.
+fn bw_overhead(lanes: u32, hactive: u32, bpp_x16: u32, mst: bool) -> u64 {
+    bw_overhead_with(lanes, hactive, 0, bpp_x16, mst, false)
+}
+
 /// `intel_dp_effective_data_rate`, kBps.
-fn effective_data_rate(pixel_clock: u32, bpp_x16: u32, overhead: u64) -> u64 {
+pub fn effective_data_rate(pixel_clock: u32, bpp_x16: u32, overhead: u64) -> u64 {
     (u64::from(pixel_clock) * u64::from(bpp_x16) * overhead).div_ceil(1_000_000 * 16 * 8)
 }
 
@@ -330,42 +611,260 @@ pub enum WideLink {
 /// lowest (the 8b/10b rates of `limits`, then the UHBR rates in
 /// `uhbr_rates`) and every lane count from 1 to `limits.max_lanes`; the
 /// first that carries the mode wins.
+#[cfg(any(test, feature = "kernel-test"))]
 pub fn wide_link(limits: &dsc::LinkLimits, uhbr_rates: u8, mode: &Mode, max_bpp: u32) -> WideLink {
+    wide_link_caps(&LinkCaps::new(limits, uhbr_rates), mode, max_bpp, None)
+}
+
+/// [`wide_link`] over the allowed configurations of `caps` (the UHBR lane
+/// counts a DP tunnel's `intel_dp_tunnel_uhbr_lanes_wa_apply` disabled, a
+/// training fallback's disabled configuration and maximum limits) with
+/// `intel_dp_max_link_data_rate`'s DP tunnel cap (`cap`, kBps: the tunnel's
+/// available bandwidth while BW allocation is enabled).
+pub fn wide_link_caps(caps: &LinkCaps, mode: &Mode, max_bpp: u32, cap: Option<u64>) -> WideLink {
+    match wide_search(caps, mode, max_bpp, cap) {
+        Some(link) if link.link_rate >= 1_000_000 => match UhbrRate::from_link_rate(link.link_rate)
+        {
+            Some(rate) => WideLink::Uhbr(UhbrLink {
+                rate,
+                lanes: link.lanes,
+                pipe_bpp: link.pipe_bpp,
+            }),
+            None => WideLink::None,
+        },
+        Some(_) => WideLink::EightTenB,
+        None => WideLink::None,
+    }
+}
+
+/// `intel_dp_compute_link_config_wide` itself: for each pipe bpp from
+/// `max_bpp` down in steps of 6 to 18, the allowed configurations of `caps`
+/// in `INTEL_DP_LINK_CAPS_ORDER_KEY_RATE_LANE` ascending order
+/// (`intel_dp_link_caps_connector_compute_order` for SST); the first whose
+/// `intel_dp_link_required` fits `intel_dp_max_link_data_rate` wins.
+pub fn wide_search(
+    caps: &LinkCaps,
+    mode: &Mode,
+    max_bpp: u32,
+    cap: Option<u64>,
+) -> Option<dsc::UncompressedLink> {
+    let capped = |rate: u64| cap.map_or(rate, |cap| rate.min(cap));
     let max_bpp = max_bpp.min(dsc::PIPE_BPP);
-    let lanes = [1u8, 2, 4].into_iter().filter(|&l| l <= limits.max_lanes);
     let (clock, hdisplay) = (mode.pixel_clock_khz, u32::from(mode.h_active));
+    let (order, n) = caps.ordered(FallbackOrder::RateLane);
     let mut bpp = max_bpp - max_bpp % 6;
     while bpp >= dsc::MIN_PIPE_BPP {
         let bpp_x16 = bpp * 16;
+        for &(rate, lanes) in order[..n].iter().filter(|&&(r, l)| caps.allowed(r, l)) {
+            let l = u32::from(lanes);
+            let (need, avail) = if rate >= 1_000_000 {
+                (
+                    link_required(l, clock, hdisplay, bpp_x16),
+                    UhbrRate::from_link_rate(rate).map_or(0, |r| max_link_data_rate(r, l)),
+                )
+            } else {
+                (
+                    dsc::link_required(l, clock, hdisplay, bpp_x16, false),
+                    dsc::max_link_data_rate(rate, l),
+                )
+            };
+            if need <= capped(avail) {
+                return Some(dsc::UncompressedLink {
+                    pipe_bpp: bpp,
+                    link_rate: rate,
+                    lanes,
+                });
+            }
+        }
+        bpp -= 6;
+    }
+    None
+}
+
+// ── Link configurations and the training fallback ────────────────
+
+/// The orders of `enum intel_dp_link_caps_order_key`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FallbackOrder {
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_RATE_LANE`: rate, then lane count.
+    RateLane,
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_LANE_RATE`: lane count, then rate.
+    LaneRate,
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_BW`: `drm_dp_max_dprx_data_rate`, then
+    /// rate (`link_config_cmp_by_bw`).
+    Bw,
+}
+
+/// The most link configurations: four 8b/10b rates and three UHBR rates,
+/// with one, two and four lanes.
+const MAX_CONFIGS: usize = 7 * 3;
+
+/// `struct intel_dp_link_caps` for one sink: the common rates (the 8b/10b
+/// rates, then the UHBR rates, ascending), the lane counts 1, 2, 4 up to
+/// the common maximum, the configurations disabled for this sink
+/// (`enabled_configs`) and the maximum link limits (`max_limits`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LinkCaps {
+    rates: [u32; 7],
+    num_rates: u8,
+    max_lanes: u8,
+    /// Bit `rate index * 3 + ilog2(lanes)`.
+    disabled: u32,
+    max_rate: u32,
+    max_lane_count: u8,
+}
+
+impl LinkCaps {
+    /// `intel_dp_link_caps_update(reset = true)` from the 8b/10b common rates
+    /// and lane count of `limits` and the common UHBR rates.
+    pub fn new(limits: &dsc::LinkLimits, uhbr_rates: u8) -> Self {
+        let mut rates = [0u32; 7];
+        let mut n = 0;
         for rate in limits.rates.iter().copied().take_while(|&r| r != 0) {
-            for l in lanes.clone() {
-                let l = u32::from(l);
-                if dsc::link_required(l, clock, hdisplay, bpp_x16, false)
-                    <= dsc::max_link_data_rate(rate, l)
-                {
-                    return WideLink::EightTenB;
-                }
+            if n < 4 {
+                rates[n] = rate;
+                n += 1;
             }
         }
         for rate in UhbrRate::ALL
             .into_iter()
             .filter(|r| uhbr_rates & r.rate_bit() != 0)
         {
-            for l in lanes.clone() {
-                if link_required(u32::from(l), clock, hdisplay, bpp_x16)
-                    <= max_link_data_rate(rate, u32::from(l))
-                {
-                    return WideLink::Uhbr(UhbrLink {
-                        rate,
-                        lanes: l,
-                        pipe_bpp: bpp,
-                    });
+            rates[n] = rate.link_rate();
+            n += 1;
+        }
+        let max_lanes = limits.max_lanes;
+        Self {
+            rates,
+            num_rates: n as u8,
+            max_lanes,
+            disabled: 0,
+            max_rate: if n == 0 { 0 } else { rates[n - 1] },
+            max_lane_count: max_lanes,
+        }
+    }
+
+    fn index(&self, rate: u32, lanes: u8) -> Option<usize> {
+        let r = self.rates[..usize::from(self.num_rates)]
+            .iter()
+            .position(|&x| x == rate)?;
+        let l = match lanes {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => return None,
+        };
+        (lanes <= self.max_lanes).then_some(r * 3 + l)
+    }
+
+    /// Whether `rate` x `lanes` is an allowed configuration: supported, not
+    /// disabled, and within the maximum link limits.
+    pub fn allowed(&self, rate: u32, lanes: u8) -> bool {
+        self.index(rate, lanes)
+            .is_some_and(|i| self.disabled & (1 << i) == 0)
+            && rate <= self.max_rate
+            && lanes <= self.max_lane_count
+    }
+
+    /// `intel_dp_link_caps_disable_config`.
+    pub fn disable(&mut self, rate: u32, lanes: u8) {
+        if let Some(i) = self.index(rate, lanes) {
+            self.disabled |= 1 << i;
+        }
+    }
+
+    /// `intel_dp_tunnel_uhbr_lanes_wa_apply`: every UHBR configuration whose
+    /// lane count is in `mask` (bit `ilog2(lanes)`) disabled.
+    pub fn disable_uhbr_lanes(&mut self, mask: u8) {
+        for i in 0..usize::from(self.num_rates) {
+            let rate = self.rates[i];
+            for lanes in [1u8, 2, 4] {
+                if rate >= 1_000_000 && mask & (1 << lanes.trailing_zeros()) != 0 {
+                    self.disable(rate, lanes);
                 }
             }
         }
-        bpp -= 6;
     }
-    WideLink::None
+
+    /// The maximum link limits (`intel_dp_link_caps_get_max_limits`).
+    pub fn max_limits(&self) -> (u32, u8) {
+        (self.max_rate, self.max_lane_count)
+    }
+
+    /// Every supported configuration, ascending in `order`.
+    pub fn ordered(&self, order: FallbackOrder) -> ([(u32, u8); MAX_CONFIGS], usize) {
+        let mut all = [(0u32, 0u8); MAX_CONFIGS];
+        let mut n = 0;
+        for &rate in &self.rates[..usize::from(self.num_rates)] {
+            for lanes in [1u8, 2, 4].into_iter().filter(|&l| l <= self.max_lanes) {
+                all[n] = (rate, lanes);
+                n += 1;
+            }
+        }
+        let key = |&(rate, lanes): &(u32, u8)| -> (u64, u32) {
+            match order {
+                FallbackOrder::RateLane => (u64::from(rate), u32::from(lanes)),
+                FallbackOrder::LaneRate => (u64::from(lanes), rate),
+                FallbackOrder::Bw => (config_bw(rate, lanes), rate),
+            }
+        };
+        all[..n].sort_unstable_by_key(key);
+        (all, n)
+    }
+
+    /// `intel_dp_get_link_train_fallback_values` for a non-eDP sink after a
+    /// failed training at `rate` x `lanes`: the maximum limits reset, then
+    /// `reduce_link_params` walks the enabled configurations in
+    /// `intel_dp_link_caps_connector_fallback_order` (descending
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_LANE_RATE` for SST,
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_BW` for MST) to the failed one and takes
+    /// the next; the failed configuration is disabled and the maximum limits
+    /// become the new one's. `None` (limits unchanged) when nothing follows.
+    pub fn fallback(&mut self, rate: u32, lanes: u8, mst: bool) -> Option<(u32, u8)> {
+        let saved = (self.max_rate, self.max_lane_count);
+        self.max_rate = self.rates[..usize::from(self.num_rates)]
+            .last()
+            .copied()
+            .unwrap_or(0);
+        self.max_lane_count = self.max_lanes;
+        let order = if mst {
+            FallbackOrder::Bw
+        } else {
+            FallbackOrder::LaneRate
+        };
+        let (all, n) = self.ordered(order);
+        let mut old_found = false;
+        let mut next = None;
+        for &(r, l) in all[..n].iter().rev().filter(|&&(r, l)| self.allowed(r, l)) {
+            if !old_found {
+                old_found = r == rate && l == lanes;
+                continue;
+            }
+            next = Some((r, l));
+            break;
+        }
+        match next {
+            Some((r, l)) => {
+                self.disable(rate, lanes);
+                self.max_rate = r;
+                self.max_lane_count = l;
+                Some((r, l))
+            }
+            None => {
+                (self.max_rate, self.max_lane_count) = saved;
+                None
+            }
+        }
+    }
+}
+
+/// `intel_dp_link_config_bw`: `drm_dp_max_dprx_data_rate` of the
+/// configuration.
+fn config_bw(rate: u32, lanes: u8) -> u64 {
+    match UhbrRate::from_link_rate(rate) {
+        Some(r) => max_link_data_rate(r, u32::from(lanes)),
+        None => dsc::max_link_data_rate(rate, u32::from(lanes)),
+    }
 }
 
 /// `compute_m_n` with a constant N, then `intel_reduce_m_n_ratio`.
@@ -400,15 +899,60 @@ pub struct UhbrStream {
 /// aligned to `4 / lanes`; `None` when it exceeds the 64 slots (Linux then
 /// needs DSC).
 pub fn mtp_tu(link: &UhbrLink, mode: &Mode) -> Option<UhbrStream> {
-    let lanes = u32::from(link.lanes);
+    mtp(link.rate, link.lanes, mode, link.pipe_bpp * 16, 0)
+}
+
+/// `intel_dp_mtp_tu_compute_config(dsc = true)` for a 128b/132b SST stream
+/// compressed to `bpp_x16` in `dsc_slices` slices: no FEC
+/// (`intel_dp_needs_8b10b_fec`), display 14's DSC->DPT interface limit
+/// (`intel_dp_mst_max_dpt_bpp`: `symbol_clock * 72 * 96.71% / (pixel clock *
+/// 103%)` whole bpp, which a `display14` port checks; display 20+ has none),
+/// then the MTP of [`mtp_tu`] with the slice-aware overhead. `None` without
+/// a slice count, past the DPT limit or past 64 slots.
+pub fn dsc_mtp_tu(
+    rate: UhbrRate,
+    lanes: u8,
+    mode: &Mode,
+    bpp_x16: u32,
+    dsc_slices: u8,
+    display14: bool,
+) -> Option<UhbrStream> {
+    if dsc_slices == 0 {
+        return None;
+    }
+    if display14 {
+        let dpt = u64::from(rate.symbol_clock_khz()) * 72 * 967_100
+            / (u64::from(mode.pixel_clock_khz) * 1_030_000).max(1);
+        if dpt != 0 && u64::from(bpp_x16) > dpt * 16 {
+            return None;
+        }
+    }
+    mtp(rate, lanes, mode, bpp_x16, u32::from(dsc_slices))
+}
+
+/// The MTP time slots and M/N of `intel_dp_mtp_tu_compute_config` for SST.
+fn mtp(
+    rate: UhbrRate,
+    lanes: u8,
+    mode: &Mode,
+    bpp_x16: u32,
+    dsc_slices: u32,
+) -> Option<UhbrStream> {
+    let lanes = u32::from(lanes);
     if !matches!(lanes, 1 | 2 | 4) {
         return None;
     }
-    let bpp_x16 = link.pipe_bpp * 16;
     let clock = mode.pixel_clock_khz;
-    let overhead = bw_overhead(lanes, u32::from(mode.h_active), bpp_x16, true);
+    let overhead = bw_overhead_with(
+        lanes,
+        u32::from(mode.h_active),
+        dsc_slices,
+        bpp_x16,
+        true,
+        false,
+    );
     let data_m = effective_data_rate(clock, bpp_x16, overhead);
-    let data_n = max_link_data_rate(link.rate, lanes);
+    let data_n = max_link_data_rate(rate, lanes);
     if data_n == 0 {
         return None;
     }
@@ -420,7 +964,7 @@ pub fn mtp_tu(link: &UhbrLink, mode: &Mode) -> Option<UhbrStream> {
     let (dm, dn) = compute_m_n(data_m, data_n, 0x800_0000);
     let (lm, ln) = compute_m_n(
         u64::from(clock),
-        u64::from(link.rate.symbol_clock_khz()),
+        u64::from(rate.symbol_clock_khz()),
         0x8_0000,
     );
     Some(UhbrStream {
@@ -429,16 +973,112 @@ pub fn mtp_tu(link: &UhbrLink, mode: &Mode) -> Option<UhbrStream> {
     })
 }
 
+// ── 128b/132b MST ────────────────────────────────────────────────
+
+/// `drm_dp_get_vc_payload_bw` on 128b/132b: PBN per MTP time slot as 20.12
+/// fixed point, `link_rate * lanes * 96.71% / ((1000000 * 8 * 5400) >> 12)`.
+pub fn vc_payload_bw(rate: UhbrRate, lanes: u8) -> u64 {
+    u64::from(rate.link_rate()) * u64::from(lanes) * 967_100 / ((1_000_000u64 * 8 * 5400) >> 12)
+}
+
+/// `drm_dp_mst_update_slots(DP_CAP_ANSI_128B132B)`: the 64 slots from
+/// slot 0 (8b/10b reserves slot 0 for the MTP header and has 63).
+pub const MST_START_SLOT: u8 = 0;
+pub const MST_TOTAL_SLOTS: u32 = 64;
+
+/// One 128b/132b MST stream (`mst_stream_compute_link_config`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MstUhbrStream {
+    /// `crtc_state->pipe_bpp`: 24, or 18 when only that fits.
+    pub pipe_bpp: u32,
+    /// `payload->pbn`: the PBN the ALLOCATE_PAYLOAD sideband message and the
+    /// path bandwidth check carry (`remote_tu * pbn_div`, truncated).
+    pub pbn: u32,
+    /// `payload->time_slots` (`drm_dp_atomic_find_time_slots`), the DPCD
+    /// payload table's slot count.
+    pub slots: u8,
+    /// The stream's `TU_SIZE` (the remote TU) and M/N.
+    pub stream: UhbrStream,
+}
+
+/// `mst_stream_compute_link_config` -> `intel_dp_mtp_tu_compute_config`
+/// (`dsc` false) for a 128b/132b MST stream at `rate` x `lanes` (Linux's
+/// MST link is the highest-bandwidth common configuration): from the pipe
+/// maximum (at most 24, `intel_dp_compute_config_limits` for MST) down in
+/// steps of 6 to 18, the local M/N (`intel_dp_mst_bw_overhead` without
+/// SSC), the remote PBN (`intel_dp_mst_calc_pbn` with the SSC margin,
+/// `DIV_ROUND_UP(rate * 64, 54000)`), `remote_tu = DIV_ROUND_UP(pbn,
+/// pbn_div)` aligned to `4 / lanes` as the TU, the PBN realigned to it,
+/// and the time slots `drm_dp_atomic_find_time_slots` derives, at most 64.
+pub fn mst_stream(rate: UhbrRate, lanes: u8, mode: &Mode, max_bpp: u32) -> Option<MstUhbrStream> {
+    let l = u32::from(lanes);
+    if !matches!(l, 1 | 2 | 4) {
+        return None;
+    }
+    let div = vc_payload_bw(rate, lanes);
+    let data_n = max_link_data_rate(rate, l);
+    if div == 0 || data_n == 0 {
+        return None;
+    }
+    let (clock, hactive) = (mode.pixel_clock_khz, u32::from(mode.h_active));
+    let max_bpp = max_bpp.min(dsc::PIPE_BPP);
+    let mut bpp = max_bpp - max_bpp % 6;
+    while bpp >= dsc::MIN_PIPE_BPP {
+        let bpp_x16 = bpp * 16;
+        let local = bw_overhead_with(l, hactive, 0, bpp_x16, true, false);
+        let data_m = effective_data_rate(clock, bpp_x16, local);
+        let remote = bw_overhead_with(l, hactive, 0, bpp_x16, true, true);
+        let pbn = (effective_data_rate(clock, bpp_x16, remote) * 64).div_ceil(54 * 1000);
+        let align = u64::from(4 / l);
+        let tu = (pbn << 12).div_ceil(div).div_ceil(align) * align;
+        let pbn_alloc = (tu * div) >> 12;
+        let slots = (pbn_alloc << 12).div_ceil(div);
+        if tu != 0 && tu <= 64 && slots != 0 && slots <= u64::from(MST_TOTAL_SLOTS) {
+            let (dm, dn) = compute_m_n(data_m, data_n, 0x800_0000);
+            let (lm, ln) = compute_m_n(
+                u64::from(clock),
+                u64::from(rate.symbol_clock_khz()),
+                0x8_0000,
+            );
+            return Some(MstUhbrStream {
+                pipe_bpp: bpp,
+                pbn: pbn_alloc as u32,
+                slots: slots as u8,
+                stream: UhbrStream {
+                    tu: tu as u8,
+                    m_n: [((tu as u32 - 1) << 25) | dm, dn, lm, ln],
+                },
+            });
+        }
+        bpp -= 6;
+    }
+    None
+}
+
 /// `intel_dp_compute_min_hblank` for an uncompressed 128b/132b SST stream
 /// on display 30 (`DP_MIN_HBLANK_CTL`): the blanking symbol cycles at the
 /// fixed four-lane count, at least the 3 of BS/VBID/BE, minus 2 for the
 /// framing, at most the 3 the spec recommends.
 pub fn min_hblank(mode: &Mode, pipe_bpp: u32) -> u32 {
+    min_hblank_link(mode, pipe_bpp * 16, 0)
+}
+
+/// [`min_hblank`] for any 128b/132b stream: the link bpp (the compressed
+/// bpp under DSC) and the DSC slice count (`drm_dp_link_symbol_cycles` at
+/// four lanes; SST and MST agree there: the MST alignment and EOC are one
+/// cycle).
+pub fn min_hblank_link(mode: &Mode, link_bpp_x16: u32, dsc_slices: u8) -> u32 {
     let (hactive, htotal) = (u64::from(mode.h_active), u64::from(mode.h_total));
-    if hactive == 0 {
+    if hactive == 0 || link_bpp_x16 == 0 {
         return 0;
     }
-    let active = (hactive * u64::from(pipe_bpp * 16)).div_ceil(16 * 32 * 4);
+    let active = symbol_cycles(
+        4,
+        mode.h_active.into(),
+        dsc_slices.into(),
+        link_bpp_x16,
+        false,
+    );
     let total = htotal * active / hactive;
     let blank = total.saturating_sub(active).max(3) - 2;
     blank.min(3) as u32
@@ -876,23 +1516,22 @@ pub fn poll_act_handled<A: AuxChannel + ?Sized, C: Clock>(aux: &mut A, clock: &m
 /// (nothing was programmed unless noted).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UhbrRefusal {
-    /// The link is MST and its hub supports a common UHBR rate: Linux runs
-    /// 128b/132b MST (`intel_dp_mst_compute_link_config` takes the
-    /// highest-bandwidth link), which is not implemented.
+    /// A 128b/132b MST link over Thunderbolt alt mode: Linux accounts each
+    /// stream's bandwidth in the DP tunnel's group
+    /// (`drm_dp_tunnel_atomic_set_stream_bw`), which is not implemented.
     Mst,
-    /// The stream needs DSC and the common rates include UHBR: Linux's DSC
-    /// search would consider them; DSC over 128b/132b is not implemented.
-    Dsc,
-    /// The stream needs UHBR over Thunderbolt alt mode (TBT UHBR clocks and
-    /// DP tunnel BW allocation are not owned).
+    /// The stream needs UHBR over Thunderbolt alt mode on display 14 or 20:
+    /// `intel_mtl_tbt_clock_select` has no UHBR10/20 select below display
+    /// 30 (Linux WARNs and programs the 162 MHz one).
     Tbt,
-    /// The stream needs UHBR through an LTTPR (non-transparent mode is not
-    /// owned).
-    Lttpr,
+    /// The DP tunnel's bandwidth request for the 128b/132b stream failed
+    /// (`drm_dp_tunnel_alloc_bw`; nothing past the tunnel was programmed).
+    Tunnel(super::tunnel::TunnelError),
     /// No 64-slot MTP carries the stream (Linux then needs DSC).
     Slots,
-    /// The 128b/132b training failed; Linux's reduced-parameter retry is not
-    /// run (the route was stopped).
+    /// The 128b/132b training failed and the reduced-parameter retry either
+    /// had no configuration left that carries the stream or failed too (the
+    /// route was stopped).
     Training(TrainFailure),
     /// The sink's payload table or ACT did not acknowledge the 128b/132b
     /// SST payload (the route was stopped).

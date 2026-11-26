@@ -320,6 +320,16 @@ impl HpdProfile {
             _ => None,
         }
     }
+    /// `intel_pps_get_registers`: whether the panel power sequencer still
+    /// has `PP_DIVISOR` — a display-9 source on a pre-CNP south display
+    /// (SPT, SPT-LP, KBP, and CMP-V, which `intel_pch_type` reports as SPT:
+    /// "CMP-V is based on KBP"). Gen9 LP and every CNP-or-later PCH keep
+    /// the power-cycle delay in `PP_CONTROL`.
+    pub(crate) fn has_pp_divisor(&self) -> bool {
+        matches!(self.family, crate::intel_gpu_aux::SourceFamily::Gen9 { .. })
+            && self.bank() == HpdBank::Spt
+            && matches!(self.device & 0xff80, 0xa100 | 0x9d00 | 0xa280 | 0xa380)
+    }
     /// The GMBUS pin table of a Rocket Lake source's observed PCH:
     /// `gmbus_pins_icp` with TGP, `gmbus_pins_cnp` with CMP/CMP2 (CNP
     /// compatible). `None` for every other family.
@@ -647,34 +657,8 @@ impl HpdMonitor {
         self.pending |= captured; // retain before the first owned W1C
         if captured != 0 {
             io.write32(sde_iir, captured); // source ACK order: IIR before SHOTPLUG
-            for reg in CTL_REGS {
-                let in_reg = || {
-                    ports
-                        .iter()
-                        .filter(|p| p.ctl == reg && captured & p.owned != 0)
-                };
-                if in_reg().next().is_none() {
-                    continue;
-                }
-                let ctl = io.read32(reg);
-                if ctl == u32::MAX || !io.display_access_ok() {
-                    self.uncertain = true;
-                    return None;
-                }
-                let mut status = 0;
-                for port in in_reg() {
-                    let own = ctl & port.status;
-                    if own & port.long == port.long {
-                        self.long |= port.owned;
-                    }
-                    status |= own;
-                }
-                // Never carry another owner's read-one status into a W1C write.
-                io.write32(reg, (ctl & !bank.all_status(reg)) | status);
-                if !io.display_access_ok() {
-                    self.uncertain = true;
-                    return None;
-                }
+            if !self.latch(io, captured) {
+                return None;
             }
         }
         for (index, port) in ports.iter().enumerate() {
@@ -705,7 +689,145 @@ impl HpdMonitor {
     }
 }
 
+impl HpdMonitor {
+    /// The pins' long/short decode for the `captured` owned IIR bits
+    /// (`intel_get_hpd_pins` over `spt_port_hotplug_long_detect` /
+    /// `bxt_port_hotplug_long_detect`): read each control register the
+    /// pins live in, latch their long-pulse bits and write back only their
+    /// own status (`intel_de_rmw(PCH_PORT_HOTPLUG, 0, 0)` restricted to the
+    /// owned fields). `false` (uncertain) on lost access.
+    fn latch<M: MmioWindow + ?Sized>(&mut self, io: &M, captured: u32) -> bool {
+        let bank = self.bank();
+        let ports = self.ports();
+        for reg in CTL_REGS {
+            let in_reg = || {
+                ports
+                    .iter()
+                    .filter(|p| p.ctl == reg && captured & p.owned != 0)
+            };
+            if in_reg().next().is_none() {
+                continue;
+            }
+            let ctl = io.read32(reg);
+            if ctl == u32::MAX || !io.display_access_ok() {
+                self.uncertain = true;
+                return false;
+            }
+            let mut status = 0;
+            for port in in_reg() {
+                let own = ctl & port.status;
+                if own & port.long == port.long {
+                    self.long |= port.owned;
+                }
+                status |= own;
+            }
+            // Never carry another owner's read-one status into a W1C write.
+            io.write32(reg, (ctl & !bank.all_status(reg)) | status);
+            if !io.display_access_ok() {
+                self.uncertain = true;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether the monitor's owned sources are set up and trusted.
+    fn ready<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
+        self.qualify(io) && !self.uncertain && self.initialized
+    }
+
+    /// The Gen9 interrupt owner's half of a hotplug interrupt
+    /// (`gen8_read_and_ack_pch_irqs` + `spt_irq_handler`, or on Gen9 LP the
+    /// DE port IIR of `gen8_de_irq_handler` + `bxt_hpd_irq_handler`): read
+    /// `iir_reg`, acknowledge every set bit (the interrupt owner owns the
+    /// whole register, as Linux does), and latch the owned pins' long/short
+    /// status for the next [`Self::poll`]. Returns the IIR read and whether
+    /// an owned pin triggered; `None` for an all-ones read.
+    pub fn irq_ack<M: MmioWindow + ?Sized>(&mut self, io: &M, iir_reg: u64) -> Option<(u32, bool)> {
+        let iir = io.read32(iir_reg);
+        if iir == u32::MAX || !io.display_access_ok() {
+            if self.initialized {
+                self.uncertain = true;
+            }
+            return None;
+        }
+        if iir == 0 {
+            return Some((0, false));
+        }
+        let ready = self.ready(io) && self.bank().irq().2 == iir_reg;
+        let captured = if ready { iir & self.owned().0 } else { 0 };
+        self.pending |= captured; // retain before the W1C
+        io.write32(iir_reg, iir);
+        if captured != 0 && !self.latch(io, captured) {
+            return Some((iir, false));
+        }
+        Some((iir, captured != 0))
+    }
+
+    /// `ibx_display_interrupt_update` / `bdw_update_port_irq` for the
+    /// owned pins (`spt_hpd_irq_setup`, `bxt_hpd_irq_setup`): with the Gen9
+    /// interrupt owner installed, clear (`unmask`) or set the owned bits in
+    /// the bank's IMR and read them back. `false` when the monitor is not
+    /// set up or the readback disagrees; nothing is written then.
+    pub fn irq_unmask<M: MmioWindow + ?Sized>(&mut self, io: &M, unmask: bool) -> bool {
+        if !self.ready(io) {
+            return false;
+        }
+        let (_, imr, _, _) = self.bank().irq();
+        let owned = self.owned().0;
+        let current = io.read32(imr);
+        if current == u32::MAX || !io.display_access_ok() {
+            self.uncertain = true;
+            return false;
+        }
+        let want = if unmask {
+            current & !owned
+        } else {
+            current | owned
+        };
+        io.write32(imr, want);
+        let observed = io.read32(imr);
+        observed != u32::MAX && observed & owned == want & owned && io.display_access_ok()
+    }
+
+    /// `intel_hpd_init` after a power loss: set the owned sources up again
+    /// ([`Self::enable_interrupts`]); `true` when they are.
+    pub fn irq_reinit<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
+        if self.uncertain {
+            return false;
+        }
+        self.initialized = false;
+        self.enable_interrupts(io);
+        self.initialized && !self.uncertain
+    }
+}
+
 static HPD_MONITOR: IrqSafeSpinLock<HpdMonitor> = IrqSafeSpinLock::new(HpdMonitor::new());
+
+/// [`HpdMonitor::irq_ack`] on the shared monitor, for the Gen9 interrupt
+/// owner (`narf.intel.gen9_irq=1`). It runs under the owner's display
+/// `DC_off` reference, so it takes none of its own.
+pub(crate) fn hpd_irq_ack<M: MmioWindow + ?Sized>(mmio: &M, iir_reg: u64) -> Option<(u32, bool)> {
+    HPD_MONITOR.lock().irq_ack(mmio, iir_reg)
+}
+
+/// [`HpdMonitor::irq_unmask`] on the shared monitor.
+pub(crate) fn hpd_irq_unmask<M: MmioWindow + ?Sized>(mmio: &M, unmask: bool) -> bool {
+    HPD_MONITOR.lock().irq_unmask(mmio, unmask)
+}
+
+/// [`HpdMonitor::irq_reinit`] on the shared monitor, with DC states exited
+/// as for [`enable_hpd_interrupts`].
+pub(crate) fn hpd_irq_reinit<M: MmioWindow + ?Sized>(mmio: &M) -> bool {
+    let Ok(dc) =
+        crate::intel_gpu_gen9_dc_states::acquire(crate::intel_gpu_gen9_dc_states::Gen9DcUser::Hpd)
+    else {
+        return false;
+    };
+    let ok = HPD_MONITOR.lock().irq_reinit(mmio);
+    drop(dc);
+    ok
+}
 
 /// Poll the shared HPD monitor once (production entry point;
 /// see `intel_gpu::poll_dp_hpd_events`).
@@ -2788,6 +2910,53 @@ pub mod tests {
         }
     }
 
+    /// `intel_pps_get_registers`' `PP_DIVISOR` rule over `intel_pch_type`:
+    /// display 9 on SPT (0xA100), SPT-LP (0x9D00), KBP (0xA280) and CMP-V
+    /// (0xA380, "based on KBP, which is SPT compatible") keeps the divisor;
+    /// CNP, CNP-LP and CMP (CNP compatible), Gen9 LP and Rocket Lake on CMP
+    /// do not.
+    fn smoke_hpd_profile_pp_divisor_pchs() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gt::Gen9Platform;
+        let gen9 = SourceFamily::Gen9 {
+            platform: Gen9Platform::KabyLake,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        for (device, want) in [
+            (0xA143u16, true),
+            (0x9D4E, true),
+            (0xA2C8, true),
+            (0xA3C8, true),
+            (0xA305, false),
+            (0x9D84, false),
+            (0x0284, false),
+            (0x0687, false),
+        ] {
+            let Some(profile) = HpdProfile::for_source(gen9, 0x8086, device, 0x060100) else {
+                return TestResult::Fail("every SPT-class PCH pairs with display 9");
+            };
+            if profile.has_pp_divisor() != want {
+                return TestResult::Fail("PP_DIVISOR exists below PCH_CNP only");
+            }
+        }
+        let lp = SourceFamily::Gen9 {
+            platform: Gen9Platform::Broxton,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        let rkl = SourceFamily::Gen12(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+        if HpdProfile::observed_for_source(lp, 0, &[]).is_none_or(|p| p.has_pp_divisor())
+            || HpdProfile::for_source(rkl, 0x8086, 0x0284, 0x060100)
+                .is_none_or(|p| p.has_pp_divisor())
+        {
+            return TestResult::Fail("Gen9 LP and Rocket Lake have no PP_DIVISOR");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_hpd_profile_pp_divisor_pchs
+    );
+
     fn smoke_hpd_gen9_lp_de_port_bank() -> TestResult {
         use crate::intel_gpu_aux::SourceFamily;
         use crate::intel_gpu_gmbus::{gen9_ddc_pin, GmbusPinTable, PinPair};
@@ -2858,6 +3027,71 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_dp", smoke_hpd_gen9_lp_de_port_bank);
+
+    /// The Gen9 interrupt owner's half of a Gen9 LP hotplug interrupt
+    /// (`gen8_de_irq_handler`'s DE port IIR + `bxt_hpd_irq_handler`): before
+    /// the monitor is set up nothing is unmasked and an IIR is still
+    /// acknowledged without a latch; once set up, the owned DE port bits are
+    /// unmasked, the owner acknowledges the whole IIR (AUX A beside port C's
+    /// hotplug), the monitor latches C's long pulse and clears only its own
+    /// status, and the next poll reports the unplug from the latch alone.
+    fn smoke_hpd_gen9_lp_interrupt_owner_half() -> TestResult {
+        use crate::intel_gpu_aux::SourceFamily;
+        use crate::intel_gpu_gt::Gen9Platform;
+        let family = SourceFamily::Gen9 {
+            platform: Gen9Platform::Broxton,
+            sku: crate::intel_gpu_gen9_ddi::SkuFamily::Ult,
+        };
+        let Some(profile) = HpdProfile::observed_for_source(family, 0, &[]) else {
+            return TestResult::Fail("Gen9 LP hotplug profile");
+        };
+        let io = DePortHpd {
+            profile,
+            level: Default::default(),
+            iir: Default::default(),
+            regs: Default::default(),
+            writes: Default::default(),
+        };
+        let mut monitor = HpdMonitor::new();
+        io.iir.set(1);
+        if monitor.irq_unmask(&io, true)
+            || monitor.irq_ack(&io, super::DE_PORT_IIR) != Some((1, false))
+            || io.iir.get() != 0
+        {
+            return TestResult::Fail("an unready monitor unmasks nothing and latches nothing");
+        }
+        let _ = monitor.poll(&io);
+        io.level.set(1 << 5);
+        if monitor.poll(&io) != Some(HpdEvent::Connected(Ddi::C)) {
+            return TestResult::Fail("DE port bit 5 connects DDI C");
+        }
+        if !monitor.irq_unmask(&io, true) || io.read32(super::DE_PORT_IMR) & 0x30 != 0 {
+            return TestResult::Fail("the owned DE port bits are unmasked");
+        }
+        let enables = io.read32(super::SHOTPLUG) & !0x0303_0303;
+        io.level.set(0);
+        io.iir.set((1 << 5) | 1);
+        io.regs
+            .borrow_mut()
+            .insert(super::SHOTPLUG, enables | 0x200 | 0x1);
+        if monitor.irq_ack(&io, super::DE_PORT_IIR) != Some(((1 << 5) | 1, true))
+            || io.iir.get() != 0
+            || io.read32(super::SHOTPLUG) != enables | 0x1
+        {
+            return TestResult::Fail("one IIR ack, C's status cleared, B's kept");
+        }
+        if monitor.poll(&io) != Some(HpdEvent::Disconnected(Ddi::C)) {
+            return TestResult::Fail("the latched long pulse disconnects DDI C");
+        }
+        if !monitor.irq_unmask(&io, false) || io.read32(super::DE_PORT_IMR) & 0x30 != 0x30 {
+            return TestResult::Fail("the owned bits mask again");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_dp",
+        smoke_hpd_gen9_lp_interrupt_owner_half
+    );
 
     /// `bxt_hpd_detection_setup`: the VBT's invert bits replace firmware's.
     /// Firmware left DDI B inverted; the VBT inverts only DDI C.

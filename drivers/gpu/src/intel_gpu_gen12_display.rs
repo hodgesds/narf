@@ -320,6 +320,7 @@ pub(super) fn view_profile(
         origin: Default::default(),
         layout,
         input: Default::default(),
+        ccs: None,
     }
     .footprint_aligned(geometry, crate::intel_gpu_scanout::gen12_alignment(family))
     .map_err(scanout_error)?;

@@ -1001,6 +1001,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
+    // Rocket Lake's internal panel (`narf.intel.rkl_edp=1`, default off):
+    // recorded before the VBT install, which it makes applicable.
+    crate::intel_gpu_modeset::set_rkl_edp(
+        dev.chip.generation == Generation::RocketLake
+            && crate::intel_gpu_modeset::gen12_family_for_chip(dev.chip)
+                == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+            && crate::intel_gpu_modeset::rkl_edp_requested(narf_boot::args()),
+    );
     // VBT (`intel_bios_init`): the ACPI OpRegion named by ASLS, read-only.
     // Installed before any external hotplug pass so the MTL port policy,
     // its legacy Type-C hotplug sources, DP SSC and the HDMI DDC pins
@@ -1083,6 +1091,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // to the end of probe (`skl_display_core_init`'s DC_STATE_DISABLE,
         // `POWER_DOMAIN_INIT`). Without the option nothing is written.
         crate::intel_gpu_gen9_dc_states::install(platform, dev.gtt_mmadr, cap);
+        // Gen9 shared-DPLL arbitration between external outputs
+        // (`narf.intel.gen9_dpll=1`, default off: every external output
+        // takes DPLL1 without it).
+        crate::intel_gpu_gen9_dpll::set_arbitration(
+            !platform.is_lp()
+                && crate::intel_gpu_gen9_dpll::arbitration_requested(narf_boot::args()),
+        );
         let window = dev.mode_window();
         let authority: Option<Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>> =
             narf_firmware::trusted_loader_authority().and_then(|write| write.derive().ok());
@@ -1124,7 +1139,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             },
             &device,
         );
-    } else if dev.chip.generation.display_supported() {
+    } else if crate::intel_gpu_modeset::panel_route(dev.chip.generation)
+        && (dev.chip.generation != Generation::RocketLake || rkl_panel_declared())
+    {
         // eDP panel power sequencing (#1020): the panel must be
         // sequenced on before any AUX traffic (the EDID read
         // inside takeover), modeset, or backlight enable. A
@@ -1145,12 +1162,28 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             }
         }
         let pps_window = crate::intel_gpu_bxt_display::PpsWindow::new(&window, lp);
-        let mut pps = crate::intel_gpu_edp::PanelPowerSequencer::new(&pps_window);
+        // intel_pps_get_registers: a display-9 panel on a pre-CNP south
+        // display (SPT/KBP) keeps its power-cycle delay in PP_DIVISOR.
+        // Programmed only with narf.intel.pp_divisor=1.
+        let divisor = crate::intel_gpu_edp::pp_divisor_for(
+            dev.chip.generation == Generation::Skylake
+                && crate::intel_gpu_edp::pp_divisor_requested(narf_boot::args()),
+            {
+                use crate::intel_gpu_aux::MmioWindow as _;
+                dev.mode_window()
+                    .gen12_hpd_profile()
+                    .is_some_and(|profile| profile.has_pp_divisor())
+            },
+            &window,
+        );
+        let mut pps =
+            crate::intel_gpu_edp::PanelPowerSequencer::new_with_divisor(&pps_window, divisor);
         pps.init_registers();
         crate::intel_gpu_edp::runtime_install_panel(
             pps.delays(),
             crate::intel_gpu_edp::PsrLayout::from_generation(dev.chip.generation),
         );
+        crate::intel_gpu_edp::runtime_install_divisor(divisor);
         let panel_on = match pps.power_on() {
             Ok(()) => true,
             Err(e) => {
@@ -1178,7 +1211,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // Gen9 Skylake drives the SPT PWM layout, Gen11/Gen12
             // the BXT layout (Lane 8).
             // Gen9 LP's backlight controller is the BXT layout itself.
-            if dev.chip.generation.backlight_supported() {
+            // Rocket Lake's panel (`narf.intel.rkl_edp=1`) takes the CNP PWM
+            // (`cnp_pwm_funcs`, the BXT-layout block the Gen12 install drives).
+            if dev.chip.generation.backlight_supported()
+                || dev.chip.generation == Generation::RocketLake
+            {
                 if dev.chip.generation == Generation::Skylake {
                     narf_drivers_backlight::intel_bl::install_spt(dev.gtt_mmadr);
                 } else if dev.chip.generation == Generation::Broxton {
@@ -1604,6 +1641,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let gt_card = intel_card.clone();
     let gt_bar = dev.gtt_mmadr;
     *CONTROLLER.lock() = Some(dev);
+    // narf.intel.hdmi14_ext=1: bind the display-14+ audio component at
+    // probe, ahead of the HD-audio function (i915 binds it at display
+    // init, and snd_hdac_i915_init defers the HDA probe until it has).
+    if crate::intel_gpu_xelpg_external::color::opted_in() {
+        let _ = with_display_info(|gpu| {
+            if crate::intel_gpu_xelpg_hpd::hpd_generation_supported(gpu.chip.generation) {
+                crate::intel_gpu_xelpg_external::audio::bind_production_component(
+                    &gpu.mode_window(),
+                );
+            }
+        });
+    }
     let owns_scanout = scanout_mode.is_some();
     let card_index = match scanout_mode {
         Some(mode) => {
@@ -1777,6 +1826,22 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             panel_mode,
         );
     }
+    // Gen9 interrupts (`narf.intel.gen9_irq=1`, default off): the hard
+    // handler and service pass for the hotplug, display and GT interrupts,
+    // installed after the hotplug monitor and the display suspend owner (its
+    // system-sleep preparation runs before theirs). Without the option nothing
+    // is installed or written.
+    if let Some(platform) =
+        with_controller(|gpu| crate::intel_gpu_modeset::gen9_family_for_chip(gpu.chip)).flatten()
+    {
+        crate::intel_gpu_gen9_irq::install(
+            crate::intel_gpu_gen9_irq::requested(narf_boot::args()),
+            platform,
+            gt_bar,
+            device,
+            cap,
+        );
+    }
 
     // Power management (Q9, #1015): retain the PCI authority,
     // note the takeover mode for resume re-light, and register
@@ -1829,7 +1894,7 @@ pub(crate) fn relight_display_locked(
     let nova = kms.as_ref().and_then(|kms| kms.integrated_display_ip())
         == Some(crate::intel_gpu_xe2lpd::DisplayIp::NovaLakeS);
     drop(kms);
-    if !display.chip.generation.display_supported() && !xe_lpd_route {
+    if !crate::intel_gpu_modeset::panel_route(display.chip.generation) && !xe_lpd_route {
         return None;
     }
     // Its relight needs the probe's sequencer delays and the panel turned off
@@ -2246,6 +2311,22 @@ struct HdmiSessionState {
 }
 
 static HDMI_SESSION: IrqSafeSpinLock<Option<HdmiSessionState>> = IrqSafeSpinLock::new(None);
+
+/// Rocket Lake's owned panel route needs the VBT to declare eDP on port A
+/// (`intel_ddi_init` creates the eDP connector only then); without one the
+/// panel stays on the firmware route, with a log line.
+fn rkl_panel_declared() -> bool {
+    let declared = crate::intel_gpu_vbt::gen12_ddc_overrides()
+        .edp_on_a_for(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+    if !declared {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "intel-gpu: Rocket Lake panel refused: the VBT declares no eDP on port A"
+        );
+    }
+    declared
+}
 
 /// Drain pending combo-DDI hotplug events and act on them.
 /// Called once at the end of probe (a sink already attached at
@@ -2975,9 +3056,9 @@ fn legacy_external_routes_stopped(bar: &MmioRegion) -> bool {
 // the serial-matched publication. The GTT allocator has no free path, so
 // one allocation is retained per BAR and reused whenever the next mode
 // fits; it lives in the pipe-B console GGTT window so it can never remap
-// the internal panel's pipe-A window. An MST route's further streams take
-// Pipe C's and D's windows (`mtl_scanout_window`), so no two lit surfaces
-// share one. Gen12 never reaches this glue: every
+// the internal panel's pipe-A window. Every other concurrently lit surface
+// (MST streams, a second route) takes its own window
+// (`mtl_scanout_window`), never a shared one. Gen12 never reaches this glue: every
 // entry returns before register access unless the probed generation is
 // Meteor Lake.
 
@@ -2989,6 +3070,47 @@ static MTL_EXTRA_SCANOUTS: IrqSafeSpinLock<alloc::vec::Vec<(u64, u8, ScanoutAllo
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 /// Serial of the published MTL external image (0 = none published).
 static MTL_PUBLISHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Serial of the second concurrent route's image (`narf.intel.ext_routes=2`,
+/// route slot 1; 0 = none published).
+static MTL_PUBLISHED_SECOND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The image and pipe each route slot last published, so the sibling's
+/// image takes the console back when the active one is withdrawn.
+static MTL_SLOT_IMAGES: IrqSafeSpinLock<
+    [Option<(
+        narf_graphics_driver::generic::GenericFb,
+        crate::intel_gpu_pipes::Pipe,
+    )>; 2],
+> = IrqSafeSpinLock::new([None, None]);
+/// `MTL_EXTRA_SCANOUTS` key of the second route's surface (slot 1 never
+/// carries MST streams, which take keys 1..).
+const MTL_SECOND_SCANOUT_KEY: u8 = 0x80;
+
+/// The console GGTT window (`scanout_gtt_offset`) of stream `stream` of the
+/// route in slot `slot`. Every surface lit at the same time needs its own
+/// window: an allocation at a window's offset rewrites that window's PTEs,
+/// so two surfaces in one window would scan out the last one's pages. Slot
+/// 0's streams (one SST/HDMI route, or up to three MST streams) take Pipe
+/// B, C and D's windows in order; slot 1 (a second concurrent route, never
+/// beside MST) takes Pipe C's. `None` past the last window.
+fn mtl_scanout_window(slot: usize, stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
+    use crate::intel_gpu_pipes::Pipe;
+    match (slot, stream) {
+        (0, 0) => Some(Pipe::B),
+        (0, 1) => Some(Pipe::C),
+        (0, 2) => Some(Pipe::D),
+        (1, 0) => Some(Pipe::C),
+        _ => None,
+    }
+}
+
+/// The publication serial of route slot `slot`.
+fn mtl_slot_serial(slot: usize) -> &'static core::sync::atomic::AtomicU64 {
+    if slot == 0 {
+        &MTL_PUBLISHED
+    } else {
+        &MTL_PUBLISHED_SECOND
+    }
+}
 /// The pipe (CRTC) scanning out the published MTL external image, as
 /// `pipe + 1` (0 = none published).
 static MTL_PUBLISHED_PIPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -3000,7 +3122,10 @@ const MTL_EVENTS_PER_DRAIN: usize = 8;
 /// the internal console or when nothing external is published.
 pub fn active_external_pipe() -> Option<crate::intel_gpu_pipes::Pipe> {
     let serial = ACTIVE_GENERIC.lock().0;
-    if serial == 0 || serial != MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire) {
+    if serial == 0
+        || (serial != MTL_PUBLISHED.load(core::sync::atomic::Ordering::Acquire)
+            && serial != MTL_PUBLISHED_SECOND.load(core::sync::atomic::Ordering::Acquire))
+    {
         return None;
     }
     let pipe = MTL_PUBLISHED_PIPE
@@ -3022,19 +3147,20 @@ enum MtlPublication {
     Withdraw(u64),
 }
 
-/// The console GGTT window (`scanout_gtt_offset`) of the `stream`th surface
-/// a display-14+ external pass lights. Every surface lit at the same time
-/// needs its own window: an allocation at a window's offset rewrites that
-/// window's PTEs, so two surfaces in one window would both scan out the last
-/// one's pages. The SST/HDMI route's surface, or MST stream 0, takes Pipe
-/// B's window; MST streams 1 and 2 take Pipe C's and D's. `None` past the
-/// last window.
-fn mtl_scanout_window(stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
+/// The console GGTT window (`scanout_gtt_offset`) of stream `stream` of the
+/// route in slot `slot`. Every surface lit at the same time needs its own
+/// window: an allocation at a window's offset rewrites that window's PTEs,
+/// so two surfaces in one window would scan out the last one's pages. Slot
+/// 0's streams (one SST/HDMI route, or up to three MST streams) take Pipe
+/// B, C and D's windows in order; slot 1 (a second concurrent route, never
+/// beside MST) takes Pipe C's. `None` past the last window.
+fn mtl_scanout_window(slot: usize, stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
     use crate::intel_gpu_pipes::Pipe;
-    match stream {
-        0 => Some(Pipe::B),
-        1 => Some(Pipe::C),
-        2 => Some(Pipe::D),
+    match (slot, stream) {
+        (0, 0) => Some(Pipe::B),
+        (0, 1) => Some(Pipe::C),
+        (0, 2) => Some(Pipe::D),
+        (1, 0) => Some(Pipe::C),
         _ => None,
     }
 }
@@ -3065,11 +3191,21 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
         return false;
     };
     before_event();
-    let mut next_scanout = 0u8;
+    // The route slot this event lights (or relights) a route in: slot 1 is
+    // a second concurrent route (`narf.intel.ext_routes=2`) with its own
+    // retained surface in its own GGTT window.
+    let slot = crate::intel_gpu_xelpg_external::event_slot(event.pin.port());
+    let mut next_scanout = if slot == 0 {
+        0u8
+    } else {
+        MTL_SECOND_SCANOUT_KEY
+    };
+    let mut stream = 0u8;
     let mut alloc_fb = |mode: &crate::intel_gpu_modeset::Mode| {
         let index = next_scanout;
         next_scanout = next_scanout.checked_add(1)?;
-        let window = mtl_scanout_window(index)?;
+        let window = mtl_scanout_window(slot, stream)?;
+        stream += 1;
         let width = u32::from(mode.h_active);
         let size = scanout_size_bytes(width, u32::from(mode.v_active));
         let reuse = if index == 0 {
@@ -3120,34 +3256,70 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     );
     after_event();
     if let Some(ServiceOutcome::Activated { mode, fb, pipe, .. }) = outcome {
-        let phys = (*MTL_SCANOUT.lock())
-            .filter(|(owner, retained)| {
-                *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
-            })
-            .map(|(_, retained)| retained.phys_base);
+        let phys = if slot == 0 {
+            (*MTL_SCANOUT.lock())
+                .filter(|(owner, retained)| {
+                    *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
+                })
+                .map(|(_, retained)| retained.phys_base)
+        } else {
+            MTL_EXTRA_SCANOUTS
+                .lock()
+                .iter()
+                .find(|(owner, key, retained)| {
+                    *owner == bar
+                        && *key == MTL_SECOND_SCANOUT_KEY
+                        && u64::from(retained.gtt_offset) == fb.phys_addr
+                })
+                .map(|(_, _, retained)| retained.phys_base)
+        };
         let serial = next_external_scanout_serial();
         if let (Some(phys), Some(serial)) = (phys, serial) {
-            MTL_PUBLISHED.store(serial, core::sync::atomic::Ordering::Release);
-            publication(MtlPublication::Publish(
-                narf_graphics_driver::generic::GenericFb::new(
-                    phys,
-                    u32::from(mode.h_active),
-                    u32::from(mode.v_active),
-                    fb.stride_bytes,
-                    32,
-                ),
-                serial,
-                pipe,
-            ));
+            let image = narf_graphics_driver::generic::GenericFb::new(
+                phys,
+                u32::from(mode.h_active),
+                u32::from(mode.v_active),
+                fb.stride_bytes,
+                32,
+            );
+            mtl_slot_serial(slot).store(serial, core::sync::atomic::Ordering::Release);
+            MTL_SLOT_IMAGES.lock()[slot.min(1)] = Some((image, pipe));
+            publication(MtlPublication::Publish(image, serial, pipe));
         }
     }
-    if !crate::intel_gpu_xelpg_external::route_live() {
-        let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
-        if serial != 0 {
-            publication(MtlPublication::Withdraw(serial));
-        }
-    }
+    withdraw_dark_mtl_slots(publication);
     true
+}
+
+/// Withdraw the image of every route slot whose route is no longer live
+/// (serial-matched). When the withdrawn image was the active one and the
+/// sibling route still scans out, the sibling's image takes the console
+/// back under a fresh serial.
+fn withdraw_dark_mtl_slots(publication: &mut dyn FnMut(MtlPublication)) {
+    for slot in 0..2 {
+        if crate::intel_gpu_xelpg_external::slot_live(slot) {
+            continue;
+        }
+        let serial = mtl_slot_serial(slot).swap(0, core::sync::atomic::Ordering::AcqRel);
+        if serial == 0 {
+            continue;
+        }
+        MTL_SLOT_IMAGES.lock()[slot] = None;
+        let active = ACTIVE_GENERIC.lock().0 == serial;
+        publication(MtlPublication::Withdraw(serial));
+        let sibling = 1 - slot;
+        let image = MTL_SLOT_IMAGES.lock()[sibling];
+        if let (true, true, Some((image, pipe))) = (
+            active,
+            crate::intel_gpu_xelpg_external::slot_live(sibling),
+            image,
+        ) {
+            if let Some(serial) = next_external_scanout_serial() {
+                mtl_slot_serial(sibling).store(serial, core::sync::atomic::Ordering::Release);
+                publication(MtlPublication::Publish(image, serial, pipe));
+            }
+        }
+    }
 }
 
 /// Generation-only adapter retained for the native runtime-hook fixtures.
@@ -3229,6 +3401,11 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
         };
         let profile = crate::intel_gpu_xelpg_external::ExternalDisplayProfile::for_ip(display_ip);
         let window = gpu.mode_window();
+        // narf.intel.hdmi14_ext=1: the display-14+ audio component
+        // (intel_audio_component_init + _bind) for the HDA side.
+        if crate::intel_gpu_xelpg_external::color::opted_in() {
+            crate::intel_gpu_xelpg_external::audio::bind_production_component(&window);
+        }
         // The owned panel the route adopts next to it, and the display-14/20/30
         // DC service's pipe-DMC sink.
         let display = crate::intel_gpu_xelpg_external::MtlDisplay::production(
@@ -3406,12 +3583,7 @@ pub(crate) async fn retire_mtl_external(bar: &MmioRegion) -> Result<(), narf_fil
     } else {
         crate::intel_gpu_xelpg_external::teardown_mtl_external(&window, gpu.chip.generation)
     };
-    if !crate::intel_gpu_xelpg_external::route_live() {
-        let serial = MTL_PUBLISHED.swap(0, core::sync::atomic::Ordering::AcqRel);
-        if serial != 0 {
-            mtl_publish(MtlPublication::Withdraw(serial));
-        }
-    }
+    withdraw_dark_mtl_slots(&mut mtl_publish);
     if done {
         Ok(())
     } else {
@@ -4932,27 +5104,34 @@ pub mod tests {
         smoke_mtl_external_hook_pass_publishes_and_retires_hdmi_route
     );
 
-    /// Every surface an MTL external pass lights at the same time gets its
-    /// own console GGTT window: the route's (or MST stream 0's) in Pipe B's,
-    /// MST streams 1 and 2 in Pipe C's and D's, none past that. The windows
-    /// are one `CONSOLE_SCANOUT_WINDOW_BYTES` stride apart above Pipe A's,
-    /// so an allocation in one never rewrites another's PTEs.
+    /// Every concurrently lit MTL external surface gets its own console
+    /// GGTT window: an MST route's streams in slot 0 take Pipe B, C and D's
+    /// (`alloc_contiguous_scanout_with_format` maps at the window's offset,
+    /// so a shared window would remap the earlier stream's pages), and a
+    /// second concurrent route takes Pipe C's, which MST never shares with
+    /// it (MST is refused beside a sibling route).
     fn smoke_mtl_external_streams_take_distinct_ggtt_windows() -> TestResult {
         use crate::intel_gpu_multipipe::scanout_gtt_offset;
         use crate::intel_gpu_pipes::Pipe;
-        let windows: alloc::vec::Vec<_> = (0..4).map(mtl_scanout_window).collect();
-        if windows != [Some(Pipe::B), Some(Pipe::C), Some(Pipe::D), None] {
-            return TestResult::Fail("streams 0..2 take Pipe B, C, D; stream 3 none");
+        let windows: alloc::vec::Vec<_> = (0..4).map(|s| mtl_scanout_window(0, s)).collect();
+        if windows != [Some(Pipe::B), Some(Pipe::C), Some(Pipe::D), None]
+            || mtl_scanout_window(1, 0) != Some(Pipe::C)
+            || mtl_scanout_window(1, 1).is_some()
+        {
+            return TestResult::Fail("streams must take Pipe B, C, D windows; slot 1 Pipe C");
         }
-        let stride = crate::intel_gpu_gtt::CONSOLE_SCANOUT_WINDOW_BYTES;
-        let base = crate::intel_gpu_gtt::SCANOUT_GTT_OFFSET_PIPE_A;
-        let offsets: alloc::vec::Vec<u64> = windows
-            .iter()
-            .flatten()
-            .map(|p| scanout_gtt_offset(*p))
+        // 16 MiB + 32 MiB per pipe: B, C, D at 48, 80 and 112 MiB, each a
+        // whole 32 MiB console window below the GEM scanout arena (160 MiB).
+        let offsets: alloc::vec::Vec<u64> = [Pipe::B, Pipe::C, Pipe::D]
+            .into_iter()
+            .map(scanout_gtt_offset)
             .collect();
-        if offsets != [base + stride, base + 2 * stride, base + 3 * stride] {
-            return TestResult::Fail("each window sits one stride above the last, above Pipe A's");
+        if offsets != [48 << 20, 80 << 20, 112 << 20]
+            || offsets
+                .iter()
+                .any(|o| o + crate::intel_gpu_gtt::CONSOLE_SCANOUT_WINDOW_BYTES > 160 << 20)
+        {
+            return TestResult::Fail("each window must be its own 32 MiB console range");
         }
         TestResult::Pass
     }

@@ -36,8 +36,8 @@ use crate::intel_gpu_legacy_gt::{
     MCR_SELECTOR,
 };
 use crate::intel_gpu_legacy_power::{
-    rc6_disable, rc6_enable, rc6_park, rc6_supported, rc6_unpark, rps_enable, rps_request, Caps,
-    Governor, Step,
+    rc6_disable, rc6_enable, rc6_park, rc6_supported, rc6_unpark, rps_disable, rps_enable,
+    rps_request, Caps, Governor, Step,
 };
 use crate::intel_gpu_rcs::{BarWindow, ContextId, RcsEngine, SharedArena, SubmitError};
 use crate::intel_gpu_user::{UserBackend, UserBatch, UserContext, UserJob, UserStatus};
@@ -793,6 +793,11 @@ pub(crate) struct Owner {
     /// The published engine set's bits (RCS0 plus the lanes that came up).
     engines: core::sync::atomic::AtomicU32,
     topology: narf_lib::sync::IrqSafeSpinLock<Option<crate::intel_gpu_legacy_gt::LegacyTopology>>,
+    /// The system-sleep gate ([`SleepGate`], `narf.intel.execlists_suspend=1`).
+    sleep: narf_lib::sync::IrqSafeSpinLock<SleepGate>,
+    /// A runtime is installed (set after bring-up stores it, cleared when a
+    /// stop takes it): the device-PM late check refuses while it is.
+    live: core::sync::atomic::AtomicBool,
 }
 
 impl core::fmt::Debug for Owner {
@@ -1012,6 +1017,7 @@ impl Owner {
             // Bring-up leaves the GT awake: __gt_unpark's GT_IRQ is held.
             gt_irq: crate::intel_gpu_gen9_dc_states::gt_unparked(&self.bar),
         });
+        self.live.store(true, Ordering::Release);
         self.epoch.store(epoch, Ordering::Release);
         Ok(())
     }
@@ -1020,13 +1026,29 @@ impl Owner {
     /// then release it: every pending fence fails with a reset and every
     /// context involved is banned.
     async fn tear_down(&self) {
+        self.stop_gt(false).await;
+    }
+
+    /// [`Self::tear_down`]; for system sleep (`sleep`) in
+    /// `intel_gt_suspend_late`'s order: RPS and RC6 disabled
+    /// (`intel_rps_disable`, `intel_rc6_disable`) before the full-domain
+    /// reset (`gt_sanitize`). The `GT_IRQ` reference goes with the runtime,
+    /// also when the reset did not complete and the memory stays retained.
+    async fn stop_gt(&self, sleep: bool) {
         self.epoch.store(0, Ordering::Release);
         let Some(mut runtime) = self.state.lock().await.take() else {
             return;
         };
+        self.live.store(false, Ordering::Release);
         // The reset sequence needs the render well awake; a refused wake
         // still attempts it.
         let _ = runtime.unpark();
+        if sleep {
+            rps_disable(|r, v| runtime.window.write32(r, v));
+            if runtime.rc6.is_some() {
+                rc6_disable(|r, v| runtime.window.write32(r, v));
+            }
+        }
         let mut reset = Reset::new();
         let result = loop {
             match reset.poll(&runtime.window, narf_time::monotonic_ns()) {
@@ -1034,7 +1056,7 @@ impl Owner {
                 Poll::Ready(result) => break result,
             }
         };
-        if runtime.rc6.is_some() {
+        if !sleep && runtime.rc6.is_some() {
             rc6_disable(|r, v| runtime.window.write32(r, v));
         }
         runtime.release_media();
@@ -1043,6 +1065,9 @@ impl Owner {
         if result.is_err() {
             // The GT never confirmed the reset; its memory stays retained.
             log(self.index, "reset did not complete; GT closed");
+            // __gt_park's GT_IRQ put still happens: DC states (Gen9 LP DC9)
+            // must not stay refused behind a closed GT.
+            drop(runtime.gt_irq.take());
             core::mem::forget(runtime);
             return;
         }
@@ -1062,10 +1087,17 @@ impl Owner {
         let mut attempts = 0;
         // The card takes one render backend for the owner's life: publish it
         // after the first successful bring-up only. A bring-up after a full
-        // GT reset reuses it (a second install fails), and a bring-up that
-        // succeeds after a failed attempt still publishes it.
+        // GT reset or a system resume reuses it (a second install fails),
+        // and a bring-up that succeeds after a failed attempt still
+        // publishes it.
         let mut published = false;
         loop {
+            // System sleep: once the runtime is gone (stopped for the sleep,
+            // or reset while draining) the GT stays down until the resume
+            // reopens admission (`intel_gt_resume` is the bring-up below).
+            while !self.sleep.lock().admits() {
+                sleep_us(1000).await;
+            }
             if let Err(error) = self.bring_up().await {
                 let _ = error;
                 log(self.index, "bring-up failed");
@@ -1088,6 +1120,12 @@ impl Owner {
             }
             attempts = 0;
             loop {
+                // A sleep that began while this runtime was coming up: stop
+                // it here, as the preparation would have.
+                if self.sleep.lock().asleep() {
+                    self.stop_gt(true).await;
+                    break;
+                }
                 let (service, busy) = {
                     let mut state = self.state.lock().await;
                     let Some(runtime) = state.as_mut() else {
@@ -1119,8 +1157,23 @@ impl Owner {
                     self.tear_down().await;
                     break;
                 }
-                sleep_us(if busy { 50 } else { 1000 }).await;
+                self.pause(if busy { 50 } else { 1000 }).await;
             }
+        }
+    }
+
+    /// The run loop's pause between service passes. With the Gen9 interrupt
+    /// owner installed (`narf.intel.gen9_irq=1`) an interrupt on its vector
+    /// ends it early; completions are still proven by the CSB, never by the
+    /// interrupt.
+    async fn pause(&self, us: u64) {
+        match crate::intel_gpu_gen9_irq::vector_for_bar(&self.bar) {
+            Some(vector) => {
+                let _ =
+                    narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_us(us))
+                        .await;
+            }
+            None => sleep_us(us).await,
         }
     }
 
@@ -1196,6 +1249,11 @@ impl Owner {
         context: Arc<UserContext>,
         batch: UserBatch,
     ) -> Result<Arc<CompletionFence>, FsError> {
+        // intel_gt_suspend_prepare's unready: no new request once a system
+        // sleep began.
+        if !self.sleep.lock().admits() {
+            return Err(FsError::WouldBlock);
+        }
         let epoch = self.epoch.load(Ordering::Acquire);
         if epoch == 0 {
             return Err(FsError::NoDevice);
@@ -1323,14 +1381,234 @@ pub(crate) fn install(
         clock: AtomicU64::new(0),
         engines: core::sync::atomic::AtomicU32::new(0),
         topology: narf_lib::sync::IrqSafeSpinLock::new(None),
+        sleep: narf_lib::sync::IrqSafeSpinLock::new(SleepGate::new()),
+        live: core::sync::atomic::AtomicBool::new(false),
     }));
     true
 }
 
 pub(crate) fn start_pending() {
     let pending = core::mem::take(&mut *PENDING.lock());
+    let sleep_hooks = suspend_requested(narf_boot::args());
     for owner in pending {
+        // System sleep (`narf.intel.execlists_suspend=1`, default off).
+        if sleep_hooks {
+            let name = alloc::format!("intel-execlists-card{}", owner.index);
+            let pm = Arc::new(SleepPm(owner.clone()));
+            narf_power::system_pm::register_async_system_pm(&name, pm.clone());
+            narf_power::device_pm::register_device_pm_ops(&name, pm);
+        }
         narf_scheduler::spawn(async move { owner.run().await });
+    }
+}
+
+// ── System sleep (`i915_gem_suspend`, `intel_gt_suspend_late`,
+//    `intel_gt_resume`) ───────────────────────────────────────────────
+
+/// The boot option that gives the execlists owner its system-PM hooks
+/// (default off: without it nothing is registered and a system sleep finds
+/// the GT as it is).
+pub const SUSPEND_OPT_IN: &str = "narf.intel.execlists_suspend";
+
+/// `narf.intel.execlists_suspend=1`, with the strict grammar every Intel
+/// opt-in uses ([`crate::intel_gpu_gt::boot_opt_in`]).
+pub fn suspend_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, SUSPEND_OPT_IN)
+}
+
+/// `I915_GT_SUSPEND_IDLE_TIMEOUT` (`HZ / 2`): how long
+/// `intel_gt_suspend_prepare` waits for the GT to idle before wedging it.
+pub(crate) const SUSPEND_IDLE_TIMEOUT_NS: u64 = 500_000_000;
+
+/// Where a system-sleep transition is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SleepPhase {
+    /// No sleep: requests are admitted.
+    Awake,
+    /// `intel_gt_suspend_prepare`: admission closed (the context bind
+    /// unready), outstanding requests draining until `deadline`
+    /// (`wait_for_suspend`).
+    Draining { deadline: u64 },
+    /// `intel_gt_suspend_late` done: RPS and RC6 disabled, the full-domain
+    /// reset run (`gt_sanitize`), every engine's memory released and the
+    /// `GT_IRQ` reference dropped (`__gt_park`). The owner waits for the
+    /// resume.
+    Asleep,
+}
+
+/// One step of the suspend drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DrainStep {
+    /// Requests are outstanding and the timeout has not passed.
+    Wait,
+    /// The GT is idle.
+    Idle,
+    /// `wait_for_suspend`'s `-ETIME`: the GT is wedged and its outstanding
+    /// requests fail with the stop's reset.
+    Wedged,
+}
+
+/// The owner's system-sleep gate: admission, the drain decision, the late
+/// check and the resume, free of hardware so fixtures drive it directly.
+#[derive(Debug)]
+pub(crate) struct SleepGate {
+    phase: SleepPhase,
+}
+
+impl SleepGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            phase: SleepPhase::Awake,
+        }
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn phase(&self) -> SleepPhase {
+        self.phase
+    }
+
+    /// Whether a new request is admitted.
+    pub(crate) fn admits(&self) -> bool {
+        self.phase == SleepPhase::Awake
+    }
+
+    /// Whether the GT is stopped for the sleep.
+    pub(crate) fn asleep(&self) -> bool {
+        self.phase == SleepPhase::Asleep
+    }
+
+    /// `intel_gt_suspend_prepare`: close admission and start the drain.
+    /// `false` (nothing changed) when a sleep is already under way.
+    pub(crate) fn begin(&mut self, now: u64) -> bool {
+        if self.phase != SleepPhase::Awake {
+            return false;
+        }
+        self.phase = SleepPhase::Draining {
+            deadline: now.saturating_add(SUSPEND_IDLE_TIMEOUT_NS),
+        };
+        true
+    }
+
+    /// `wait_for_suspend`: `idle` ends the drain, the passed deadline wedges.
+    pub(crate) fn drain_step(&self, idle: bool, now: u64) -> DrainStep {
+        match self.phase {
+            SleepPhase::Draining { .. } if idle => DrainStep::Idle,
+            SleepPhase::Draining { deadline } if now >= deadline => DrainStep::Wedged,
+            SleepPhase::Draining { .. } => DrainStep::Wait,
+            _ => DrainStep::Idle,
+        }
+    }
+
+    /// The stop for the sleep completed.
+    pub(crate) fn sleep(&mut self) {
+        self.phase = SleepPhase::Asleep;
+    }
+
+    /// The device-PM late step (interrupts gated): only a GT the
+    /// asynchronous preparation stopped (`live` clear) may sleep.
+    pub(crate) fn late_ok(&self, live: bool) -> bool {
+        self.phase == SleepPhase::Asleep && !live
+    }
+
+    /// The resume: admission opens; `true` when the GT was stopped and the
+    /// owner brings it up again (`intel_gt_resume`).
+    pub(crate) fn resume(&mut self) -> bool {
+        let was = self.phase == SleepPhase::Asleep;
+        self.phase = SleepPhase::Awake;
+        was
+    }
+}
+
+impl Owner {
+    /// The idle the drain waits for: no outstanding job and every engine
+    /// idle (or no runtime at all).
+    async fn gt_idle(&self) -> bool {
+        let state = self.state.lock().await;
+        state.as_ref().is_none_or(|runtime| {
+            runtime.jobs.is_empty()
+                && runtime.engine.is_idle()
+                && runtime.xcs.iter().all(|lane| lane.engine.is_idle())
+        })
+    }
+
+    /// `i915_gem_suspend` → `intel_gt_suspend_prepare` (admission closed,
+    /// `wait_for_suspend` with its 500 ms idle timeout, wedging on expiry),
+    /// then `intel_gt_suspend_late`'s RPS/RC6 disable and `gt_sanitize`
+    /// ([`Self::stop_gt`]), run here while sleeping is still allowed. The
+    /// GT's `GT_IRQ` reference is gone afterwards, so the Gen9 `DC_off`
+    /// service may admit DC9 at the late step.
+    async fn prepare_sleep(&self) {
+        if !self.sleep.lock().begin(narf_time::monotonic_ns()) {
+            return;
+        }
+        loop {
+            let idle = self.gt_idle().await;
+            match self
+                .sleep
+                .lock()
+                .drain_step(idle, narf_time::monotonic_ns())
+            {
+                DrainStep::Wait => {}
+                DrainStep::Idle => break,
+                DrainStep::Wedged => {
+                    log(self.index, "GT busy at suspend; outstanding jobs fail");
+                    break;
+                }
+            }
+            sleep_us(1000).await;
+        }
+        self.stop_gt(true).await;
+        self.sleep.lock().sleep();
+        log(self.index, "GT stopped for system sleep");
+    }
+}
+
+/// The owner's system-sleep participant.
+struct SleepPm(Arc<Owner>);
+
+impl core::fmt::Debug for SleepPm {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("legacy::SleepPm").field(&self.0).finish()
+    }
+}
+
+impl narf_power::system_pm::AsyncSystemPm for SleepPm {
+    fn prepare_suspend(&self) -> narf_power::system_pm::SystemPmFuture<'_> {
+        alloc::boxed::Box::pin(async move {
+            self.0.prepare_sleep().await;
+            Ok(())
+        })
+    }
+    fn resume_from_suspend(&self) -> narf_power::system_pm::SystemPmFuture<'_> {
+        alloc::boxed::Box::pin(async move {
+            // The run loop brings the GT up again (`intel_gt_resume`: the
+            // reset, `intel_gt_init_hw`, RPS, the engines' resume, RC6).
+            if self.0.sleep.lock().resume() {
+                log(self.0.index, "GT resuming after system sleep");
+            }
+            Ok(())
+        })
+    }
+}
+
+impl narf_power::device_pm::DevicePmOps for SleepPm {
+    /// The late step, interrupts gated: refuses a GT the asynchronous
+    /// preparation did not stop.
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+        if self
+            .0
+            .sleep
+            .lock()
+            .late_ok(self.0.live.load(Ordering::Acquire))
+        {
+            Ok(())
+        } else {
+            Err(narf_power::device_pm::DeviceSuspendError::Busy)
+        }
+    }
+    /// The bring-up waits for the asynchronous resume.
+    fn resume(&self) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+        Ok(())
     }
 }
 
@@ -1724,5 +2002,74 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_legacy_owner",
         smoke_legacy_owner_engine_reset_domains
+    );
+
+    /// The system-sleep gate (`intel_gt_suspend_prepare` /
+    /// `wait_for_suspend` / `intel_gt_resume`): a sleep closes admission and
+    /// drains, idle ends the drain and the 500 ms `I915_GT_SUSPEND_IDLE_TIMEOUT`
+    /// wedges; the late step admits only a stopped GT with no live runtime;
+    /// the resume reopens admission and asks for the bring-up once.
+    fn smoke_legacy_owner_sleep_gate() -> TestResult {
+        use narf_boot::args::KernelCmdline;
+        if SUSPEND_IDLE_TIMEOUT_NS != 500_000_000
+            || SUSPEND_OPT_IN != "narf.intel.execlists_suspend"
+            || !suspend_requested(KernelCmdline::new("narf.intel.execlists_suspend=1"))
+            || suspend_requested(KernelCmdline::new(""))
+            || suspend_requested(KernelCmdline::new("narf.intel.execlists_suspend=2"))
+        {
+            return TestResult::Fail("I915_GT_SUSPEND_IDLE_TIMEOUT and the strict opt-in");
+        }
+        let mut gate = SleepGate::new();
+        if !gate.admits() || gate.asleep() || gate.late_ok(false) {
+            return TestResult::Fail("an awake GT admits and may not sleep");
+        }
+        if !gate.begin(1_000) || gate.begin(2_000) || gate.admits() {
+            return TestResult::Fail("one sleep at a time, admission closed at once");
+        }
+        if gate.phase()
+            != (SleepPhase::Draining {
+                deadline: 1_000 + 500_000_000,
+            })
+        {
+            return TestResult::Fail("the drain deadline is the idle timeout");
+        }
+        if gate.drain_step(false, 400_000_000) != DrainStep::Wait
+            || gate.drain_step(true, 400_000_000) != DrainStep::Idle
+            || gate.drain_step(false, 500_001_000) != DrainStep::Wedged
+        {
+            return TestResult::Fail("wait while busy, stop when idle, wedge at the timeout");
+        }
+        if gate.late_ok(false) {
+            return TestResult::Fail("a draining GT may not sleep");
+        }
+        gate.sleep();
+        if !gate.asleep() || gate.admits() || gate.late_ok(true) || !gate.late_ok(false) {
+            return TestResult::Fail("only a stopped GT with no live runtime may sleep");
+        }
+        if !gate.resume() || !gate.admits() || gate.resume() {
+            return TestResult::Fail("the resume brings the GT up once and reopens admission");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_owner",
+        smoke_legacy_owner_sleep_gate
+    );
+
+    /// `intel_gt_suspend_late`'s register half: `gen6_rps_disable` clears
+    /// `GEN6_RP_CONTROL` (0xA024), and `__intel_rc6_disable` clears
+    /// `GEN9_PG_ENABLE`, `GEN6_RC_CONTROL` and `GEN6_RC_STATE`, in that order.
+    fn smoke_legacy_owner_sleep_disables_rps_and_rc6() -> TestResult {
+        let mut writes = Vec::new();
+        rps_disable(|r, v| writes.push((r, v)));
+        rc6_disable(|r, v| writes.push((r, v)));
+        if writes != alloc::vec![(0xa024, 0), (0xa210, 0), (0xa090, 0), (0xa094, 0)] {
+            return TestResult::Fail("RP_CONTROL, then PG_ENABLE, RC_CONTROL and RC_STATE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_legacy_owner",
+        smoke_legacy_owner_sleep_disables_rps_and_rc6
     );
 }

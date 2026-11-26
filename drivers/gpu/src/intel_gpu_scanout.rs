@@ -50,6 +50,9 @@ const PLANE_FAULT: u32 = 1 << 7;
 const FIFO_UNDERRUN: u32 = 1 << 31;
 const CTL_FORMAT_MASK: u32 = 0x1f << 23;
 const CTL_TILED_MASK: u32 = 7 << 10;
+/// `PLANE_CTL_RENDER_DECOMPRESSION_ENABLE`, `PLANE_CTL_CLEAR_COLOR_DISABLE`
+/// and `PLANE_CTL_MEDIA_DECOMPRESSION_ENABLE`: set only by a compressed view.
+const CTL_DECOMPRESSION_MASK: u32 = (1 << 15) | (1 << 13) | (1 << 4);
 const CTL_RGB_ORDER: u32 = 1 << 20;
 const CTL_XRGB8888: u32 = 8 << 23;
 pub(crate) const X_TILED_MODIFIER: u64 = 0x0100_0000_0000_0001;
@@ -245,6 +248,9 @@ pub(crate) struct View {
     pub(crate) origin: Viewport,
     pub(crate) layout: Layout,
     pub(crate) input: InputFormat,
+    /// A compressed Tile4 layout (`narf.intel.ccs=1`, [`ccs`]): its AUX and
+    /// clear-colour planes, `skl_plane_ctl_tiling`'s decompression bits.
+    pub(crate) ccs: Option<ccs::CcsPlanes>,
 }
 impl From<Viewport> for View {
     fn from(origin: Viewport) -> Self {
@@ -252,6 +258,7 @@ impl From<Viewport> for View {
             origin,
             layout: Layout::Linear,
             input: InputFormat::Xrgb8888,
+            ccs: None,
         }
     }
 }
@@ -259,6 +266,18 @@ impl View {
     pub(crate) fn footprint(self, geometry: Geometry) -> Result<(u32, u32, u64), ScanoutError> {
         if self.input == InputFormat::Xrgb2101010 && self.layout != Layout::Linear {
             return Err(ScanoutError::Unsupported);
+        }
+        if let Some(ccs) = self.ccs {
+            // A compressed primary is Tile4 at origin zero: the AUX plane's
+            // x/y must follow the main plane's (`intel_fb_check_ccs_xy`),
+            // which a panned view would move. The mapping then covers the
+            // AUX plane the display fetches at PLANE_AUX_DIST.
+            if self.layout != Layout::Tile4 || self.origin != Viewport::default() {
+                return Err(ScanoutError::Unsupported);
+            }
+            let view = View { ccs: None, ..self };
+            let (base, offset, bytes) = view.footprint(geometry)?;
+            return Ok((base, offset, bytes.max(ccs.fetch_end)));
         }
         if self.layout == Layout::Linear {
             return self.origin.layout(geometry);
@@ -349,6 +368,9 @@ impl View {
             }
     }
     pub(crate) fn tiled(self) -> u32 {
+        if let Some(ccs) = self.ccs {
+            return ccs.ccs.plane_ctl();
+        }
         match self.layout {
             Layout::Linear => 0,
             Layout::X => 1 << 10,
@@ -405,6 +427,18 @@ impl DptLayout {
         layout: Layout,
         origin: Viewport,
     ) -> Option<(Self, u32, u32, u32)> {
+        Self::with_origin_for(geometry, layout, origin, false)
+    }
+    /// [`Self::with_origin`]; a compressed framebuffer (`ccs`) remaps at
+    /// its whole source stride (`calc_plane_remap_info`: "The hardware
+    /// automagically calculates the CCS AUX surface stride from the main
+    /// surface stride", so `dst = roundup_pow_of_two(max(src, 8))`).
+    pub(crate) fn with_origin_for(
+        geometry: Geometry,
+        layout: Layout,
+        origin: Viewport,
+        ccs: bool,
+    ) -> Option<(Self, u32, u32, u32)> {
         let view = View {
             origin,
             layout,
@@ -426,7 +460,7 @@ impl DptLayout {
         let res_y = origin.y % tile_rows;
         let src = geometry.pitch / tile_bytes;
         let width = (res_x + geometry.width).div_ceil(tile_pixels);
-        let dst = width.max(8).next_power_of_two();
+        let dst = if ccs { src } else { width }.max(8).next_power_of_two();
         let rows = (res_y + geometry.height).div_ceil(tile_rows);
         let plane_offset = (res_y << 16) | res_x;
         (src <= dst).then_some((
@@ -494,6 +528,9 @@ struct Pending {
     frame: u32,
     deadline: u64,
     deferred: bool,
+    /// Whether the plane CSC was black before this arm: a staged DSB arm
+    /// that is cancelled unarmed leaves it so.
+    black_before: bool,
 }
 #[derive(Clone, Copy)]
 struct Target {
@@ -647,7 +684,7 @@ impl<M: ScanoutIo> Presenter<M> {
         self.console_ctl
     }
     fn control(&self, view: View) -> u32 {
-        (self.console_ctl & !(CTL_FORMAT_MASK | CTL_TILED_MASK))
+        (self.console_ctl & !(CTL_FORMAT_MASK | CTL_TILED_MASK | CTL_DECOMPRESSION_MASK))
             | view.input.control()
             | view.tiled()
     }
@@ -864,6 +901,9 @@ impl<M: ScanoutIo> Presenter<M> {
     fn plane(&self) -> u64 {
         self.pipe.base() + PLANE_PRIMARY_OFFSET
     }
+    fn pipe_index(&self) -> u8 {
+        self.pipe as u8
+    }
     fn iir(&self) -> u64 {
         PIPE_IIR_BASE + self.pipe as u64 * 0x10
     }
@@ -937,7 +977,7 @@ impl<M: ScanoutIo> Presenter<M> {
             return Err(ScanoutError::Bounds);
         }
         let (layout, start_col, start_row, plane_offset) =
-            DptLayout::with_origin(geometry, view.layout, view.origin)
+            DptLayout::with_origin_for(geometry, view.layout, view.origin, view.ccs.is_some())
                 .ok_or(ScanoutError::Unsupported)?;
         if !object.idle(false) {
             return Err(ScanoutError::Busy);
@@ -1159,16 +1199,30 @@ impl<M: ScanoutIo> Presenter<M> {
         let ctl = self.io().read32(self.plane() + PLANE_CTL_OFFSET);
         let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
 
+        // A compressed view's decompression bits and AUX distance are part
+        // of what it armed (skl_program_plane_noarm / _arm); any other view
+        // owns neither.
+        let decompression = if view.ccs.is_some() {
+            CTL_DECOMPRESSION_MASK
+        } else {
+            0
+        };
+        let aux_dist = view.ccs.and_then(|c| c.aux_dist()).unwrap_or(0);
         ctl != u32::MAX
-            && ctl & !(ALLOWED_CTL | CTL_TILED_MASK) == 0
-            && ctl & (PLANE_CTL_ENABLE | CTL_FORMAT_MASK | CTL_TILED_MASK | CTL_RGB_ORDER)
+            && ctl & !(ALLOWED_CTL | CTL_TILED_MASK | decompression) == 0
+            && ctl
+                & (PLANE_CTL_ENABLE
+                    | CTL_FORMAT_MASK
+                    | CTL_TILED_MASK
+                    | CTL_RGB_ORDER
+                    | CTL_DECOMPRESSION_MASK)
                 == PLANE_CTL_ENABLE | view.input.control() | view.tiled()
             && ctl == self.control(view)
             && self.tiling_addressable(view.layout)
             && self.io().read32(self.plane() + PLANE_STRIDE_OFFSET) == stride
             && self.io().read32(self.plane() + PLANE_SIZE_OFFSET)
                 == ((geometry.height - 1) << 16) | (geometry.width - 1)
-            && self.io().read32(self.plane() + AUX_DIST_OFFSET) == 0
+            && self.io().read32(self.plane() + AUX_DIST_OFFSET) == aux_dist
             && self.io().read32(self.plane() + AUX_OFFSET_OFFSET) == 0
             && self.io().read32(self.plane() + CUS_CTL_OFFSET) == 0
             && color != u32::MAX
@@ -1238,6 +1292,12 @@ impl<M: ScanoutIo> Presenter<M> {
     /// Retain a pending target and fresh primary completion status without
     /// writing SURF. The exclusive KMS owner emits the returned arm in its
     /// source-qualified DSB safe window, after color arm registers.
+    ///
+    /// `check_protection` runs here too, at each commit: a protected
+    /// surface whose key is current is armed with `PLANE_SURF_DECRYPT`, and
+    /// one whose key is stale (or that has no PXP) scans out black, with
+    /// `icl_plane_csc_load_black`'s twelve zeroes and the plane CSC enable
+    /// of `glk_plane_color_ctl` ahead of the SURF write that latches them.
     pub(crate) fn stage_dsb(
         &mut self,
         id: SurfaceId,
@@ -1246,10 +1306,6 @@ impl<M: ScanoutIo> Presenter<M> {
     ) -> Result<Vec<(u64, u32)>, ScanoutError> {
         self.ready()?;
         let surface = self.surfaces.get(&id).ok_or(ScanoutError::UnknownSurface)?;
-        // The DSB arm carries neither the decrypt bit nor the black CSC.
-        if surface.object.pxp_key() != 0 {
-            return Err(ScanoutError::Unsupported);
-        }
         if !surface.object.idle(false) {
             return Err(ScanoutError::Busy);
         }
@@ -1265,7 +1321,22 @@ impl<M: ScanoutIo> Presenter<M> {
             (base, plane_offset)
         };
         let view = surface.view;
+        // intel_atomic_prepare_plane_clear_colors: the CC plane's native
+        // value, read by the CPU before the commit's plane programming.
+        let ccval = match view.ccs.and_then(|c| c.cc_native_offset()) {
+            Some(at) => {
+                let mut native = [0u8; 8];
+                surface
+                    .object
+                    .read(at, &mut native)
+                    .map_err(|_| ScanoutError::Unavailable)?;
+                Some(u64::from_le_bytes(native))
+            }
+            None => None,
+        };
         let (offset, geometry) = (surface.offset + base, surface.geometry);
+        let protection =
+            crate::intel_gpu_gt::media::pxp::plane_protection(surface.object.pxp_key());
         self.arm_target(
             id,
             Target {
@@ -1273,19 +1344,40 @@ impl<M: ScanoutIo> Presenter<M> {
                 geometry,
                 view,
                 plane_offset,
-                protection: Default::default(),
+                protection,
             },
             ticket,
             now,
             true,
         )?;
+        let surf = if protection.decrypt {
+            offset | PLANE_SURF_DECRYPT
+        } else {
+            offset
+        };
         let mut registers = alloc::vec![
             (self.plane() + PLANE_OFFSET_OFFSET, plane_offset),
-            (self.plane() + PLANE_SURF_OFFSET, offset),
+            (self.plane() + PLANE_SURF_OFFSET, surf),
         ];
-        // A plane left black by a stale protected surface gets its CSC
-        // back with this arm.
-        if self.black {
+        if protection.force_black {
+            // A stale protected surface: the all-zero plane CSC, enabled.
+            let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
+            let mut black: Vec<(u64, u32)> = PLANE_CSC_BLACK
+                .iter()
+                .map(|reg| (self.plane() + reg, 0))
+                .collect();
+            black.push((
+                self.plane() + COLOR_CTL_OFFSET,
+                color | PLANE_COLOR_CSC_ENABLE,
+            ));
+            // After PLANE_OFFSET, before the SURF write that latches them.
+            let tail = registers.split_off(1);
+            registers.extend(black);
+            registers.extend(tail);
+            self.black = true;
+        } else if self.black {
+            // A plane left black by a stale protected surface gets its CSC
+            // back with this arm.
             let color = self.io().read32(self.plane() + COLOR_CTL_OFFSET);
             registers.insert(
                 0,
@@ -1304,6 +1396,20 @@ impl<M: ScanoutIo> Presenter<M> {
                 (self.plane() + PLANE_STRIDE_OFFSET, view.stride(geometry)),
             );
             registers.insert(2, (self.plane() + PLANE_CTL_OFFSET, self.control(view)));
+        }
+        // skl_program_plane_noarm's PLANE_CC_VAL and PLANE_AUX_DIST (display
+        // 14) precede the arm; a view leaving a compressed one clears the
+        // AUX distance it no longer fetches.
+        let noarm = match view.ccs {
+            Some(ccs) => ccs.noarm_registers(self.pipe_index(), ccval),
+            None if self.io().read32(self.plane() + AUX_DIST_OFFSET) != 0 => alloc::vec![
+                (self.plane() + AUX_DIST_OFFSET, 0),
+                (self.plane() + AUX_OFFSET_OFFSET, 0),
+            ],
+            None => alloc::vec::Vec::new(),
+        };
+        for (index, register) in noarm.into_iter().enumerate() {
+            registers.insert(index, register);
         }
         Ok(registers)
     }
@@ -1328,7 +1434,10 @@ impl<M: ScanoutIo> Presenter<M> {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }
-        self.pending = None;
+        // The black CSC (or its removal) was never armed either.
+        if let Some(pending) = self.pending.take() {
+            self.black = pending.black_before;
+        }
         self.retain_controls(None)?;
         Ok(())
     }
@@ -1435,6 +1544,7 @@ impl<M: ScanoutIo> Presenter<M> {
             frame,
             deadline: now.saturating_add(FLIP_TIMEOUT_NS),
             deferred,
+            black_before: self.black,
         });
         if deferred {
             return Ok(());
@@ -1510,8 +1620,7 @@ impl<M: ScanoutIo> Presenter<M> {
     }
 
     /// Whether the plane CSC was last programmed black (a stale protected
-    /// surface, `force_black`).
-    #[cfg(any(test, feature = "kernel-test"))]
+    /// surface, `force_black`), or is staged so in a DSB arm.
     pub(crate) fn forced_black(&self) -> bool {
         self.black
     }
@@ -1766,3 +1875,6 @@ impl<M: ScanoutIo> Drop for Presenter<M> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_scanout_tests.rs"]
 mod tests;
+
+#[path = "intel_gpu_ccs_scanout.rs"]
+pub(crate) mod ccs;

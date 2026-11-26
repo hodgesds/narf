@@ -849,6 +849,55 @@ kernel_test_in!(
     smoke_gen9_dc_gt_irq_hold_while_unparked
 );
 
+/// The execlists GT across system sleep (`narf.intel.execlists_suspend=1`)
+/// on Gen9 LP: while the GT holds its `GT_IRQ` reference (`__gt_unpark`)
+/// DC9 refuses as a busy holder; the GT's sleep stop drops it
+/// (`__gt_park`, its 100 ms async put moot under the Suspend reference) and
+/// DC9 is admitted. After the resume the GT's next unpark takes `GT_IRQ`
+/// again and DC states stay off while it is held.
+fn smoke_gen9_lp_dc9_waits_for_the_gt() -> TestResult {
+    let fake = Fake::default();
+    let mut core = armed(&fake, Gen9Platform::Broxton);
+    fake.write32(HSW_PWR_WELL_CTL2, 1 << 29);
+    fake.write32(DBUF_CTL_S1, 1 << 31);
+    fake.set(DE_PLL_ENABLE, DE_PLL_ON | DE_PLL_LOCK);
+    fake.set(0x6d000, 65);
+    if core.get(&fake, Gen9DcUser::GtIrq) != Ok(true) || core.suspend_begin(&fake).is_err() {
+        return TestResult::Fail("the unparked GT and the suspend both hold DC_off");
+    }
+    if core.dc9_admit(&fake) != Err(Dc9Block::Busy) {
+        return TestResult::Fail("DC9 must refuse while the GT holds GT_IRQ");
+    }
+    core.dc9_abort();
+    if core.put(Gen9DcUser::GtIrq, 5 * MS).is_some() || core.refs(Gen9DcUser::GtIrq) != 0 {
+        return TestResult::Fail("the GT's park schedules nothing under the Suspend reference");
+    }
+    if core.dc9_admit(&fake).is_err() {
+        return TestResult::Fail("DC9 must be admitted once the GT stopped");
+    }
+    if display_core_uninit_lp(&fake, core.glk()).is_err() || core.enter_dc9(&fake).is_err() {
+        return TestResult::Fail("the late step must reach DC9");
+    }
+    if core.get(&fake, Gen9DcUser::GtIrq) != Err(DcError::Unavailable) {
+        return TestResult::Fail("no GT_IRQ reference may be granted in DC9");
+    }
+    fake.power_loss();
+    fake.set(DC_STATE_EN, 1 << 3);
+    let Ok(Some(_)) = core.resume(&fake, 50 * MS) else {
+        return TestResult::Fail("the resume must release the Suspend reference");
+    };
+    if core.get(&fake, Gen9DcUser::GtIrq) != Ok(true)
+        || core.put(Gen9DcUser::GtIrq, 60 * MS) != Some(160 * MS)
+    {
+        return TestResult::Fail("the resumed GT holds GT_IRQ again, with its 100 ms put");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gen9_dc_states",
+    smoke_gen9_lp_dc9_waits_for_the_gt
+);
+
 /// A program that stops verifying is never re-entered; an all-ones
 /// `DC_STATE_EN` refuses the reference with nothing counted.
 fn smoke_gen9_dc_lost_program_and_faults() -> TestResult {

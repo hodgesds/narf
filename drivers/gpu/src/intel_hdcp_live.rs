@@ -141,8 +141,12 @@ pub struct RouteDesc {
     /// The CPU transcoder, A–D (0..=3).
     pub transcoder: u8,
     pub link: RouteLink,
-    /// Display IP major version (12, 13, 14, 20, 30, 35).
+    /// Display IP major version (9, 10, 11, 12, 13, 14, 20, 30, 35).
     pub display_ver: u8,
+    /// The port's HDCP registers, key load and PW_1 by display version.
+    pub hw: hdcp::HdcpHw,
+    /// `is_hdcp2_supported`: the platform may use the HDCP 2.2 firmware.
+    pub hdcp2: bool,
     pub rekey: LineRekey,
     /// The route's short pulses reach [`short_pulse`] (a hotplug owner
     /// polls its port), so the sink's CP_IRQ ends the message waits.
@@ -240,6 +244,8 @@ pub fn inherited_gen12_route<M: MmioWindow + Sync + ?Sized>(
             transcoder: t,
             link: route.1,
             display_ver: 12,
+            hw: hdcp::HdcpHw::TRANSCODER,
+            hdcp2: true,
             rekey: LineRekey::None,
             cp_irq: false,
             mst: MstStreams::default(),
@@ -287,11 +293,74 @@ fn display_rekey<M: MmioWindow + ?Sized>(io: &M) -> (u8, LineRekey) {
     (ver, LineRekey::for_display(ver, rel, step))
 }
 
-/// The function's live HDCP-capable routes on `bar`.
+/// The display of a pre-Gen12 Intel function as HDCP needs it: the
+/// display version (Gemini Lake is 10), Gen9 big core (the pcode key
+/// load), and `is_hdcp2_supported` with the MEI client
+/// (`DISPLAY_VER >= 10 || kabylake || coffeelake || cometlake`; NARF's
+/// `KabyLake` covers Coffee and Whiskey Lake). `None` on any other
+/// platform.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LegacyDisplay {
+    pub display_ver: u8,
+    pub big_core: bool,
+    pub hdcp2: bool,
+}
+
+impl LegacyDisplay {
+    pub const fn of(platform: crate::intel_gpu_gt::GtPlatform) -> Option<Self> {
+        use crate::intel_gpu_gt::{Gen9Platform as G9, GtPlatform};
+        match platform {
+            GtPlatform::Gen9(p) => Some(Self {
+                display_ver: if matches!(p, G9::GeminiLake) { 10 } else { 9 },
+                big_core: !p.is_lp(),
+                hdcp2: matches!(p, G9::KabyLake | G9::CometLake | G9::GeminiLake),
+            }),
+            GtPlatform::Gen11(_) => Some(Self {
+                display_ver: 11,
+                big_core: false,
+                hdcp2: true,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The route of a display 9-11 session on `ddi`, CPU transcoder `t`:
+    /// the port-indexed registers of DDI A–D (`is_hdcp_supported`), no
+    /// line rekeying (display 14+ only); `None` for any other port.
+    pub fn route(
+        self,
+        ddi: Ddi,
+        transcoder: u8,
+        protocol: Protocol,
+        link: RouteLink,
+        mst: MstStreams,
+    ) -> Option<RouteDesc> {
+        let hw = hdcp::HdcpHw::legacy(self.display_ver, self.big_core, ddi as u8)?;
+        Some(RouteDesc {
+            key: gen12_key(ddi),
+            protocol,
+            transcoder,
+            link,
+            display_ver: self.display_ver,
+            hw,
+            hdcp2: self.hdcp2,
+            rekey: LineRekey::None,
+            cp_irq: true,
+            mst,
+        })
+    }
+}
+
+/// The function's live HDCP-capable routes on `bar`. The external DP, HDMI
+/// and MST sessions take the port-indexed registers on Gen9 and Gen11
+/// ([`LegacyDisplay`]) and the transcoder ones everywhere else.
 fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
     let Some(io) = crate::intel_gpu::with_display_info(|g| g.mode_window()) else {
         return Ok(Vec::new());
     };
+    let platform = crate::intel_gpu::with_display_info(|g| g.pci_id())
+        .and_then(|(vendor, device)| crate::intel_gpu_gt::GtPlatform::from_pci(vendor, device));
+    let legacy = platform.and_then(LegacyDisplay::of);
     let mut out = Vec::new();
     for (ddi, transcoder, pin) in crate::intel_gpu::hdcp_gen12_sessions(bar) {
         if transcoder > 3 {
@@ -301,12 +370,23 @@ fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
             Some(pin) => (Protocol::Hdmi, RouteLink::Hdmi(pin)),
             None => (Protocol::Dp, RouteLink::Dp(AuxPort::Gen12(ddi))),
         };
+        if let Some(legacy) = legacy {
+            // is_hdcp_supported: no HDCP on DDI E or later below display 12.
+            out.push(
+                legacy
+                    .route(ddi, transcoder, protocol, link, MstStreams::default())
+                    .ok_or(HdcpError::Unsupported)?,
+            );
+            continue;
+        }
         out.push(RouteDesc {
             key: gen12_key(ddi),
             protocol,
             transcoder,
             link,
             display_ver: 12,
+            hw: hdcp::HdcpHw::TRANSCODER,
+            hdcp2: true,
             rekey: LineRekey::None,
             cp_irq: true,
             mst: MstStreams::default(),
@@ -315,16 +395,27 @@ fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
     if let Some((ddi, streams)) = crate::intel_gpu::hdcp_gen12_mst(bar) {
         let mst = MstStreams::new(&streams).ok_or(HdcpError::Unsupported)?;
         let master = mst.as_slice().first().ok_or(HdcpError::NoRoute)?.0;
-        out.push(RouteDesc {
-            key: gen12_key(ddi),
-            protocol: Protocol::Dp,
-            transcoder: master,
-            link: RouteLink::Dp(AuxPort::Gen12(ddi)),
-            display_ver: 12,
-            rekey: LineRekey::None,
-            cp_irq: true,
-            mst,
-        });
+        let link = RouteLink::Dp(AuxPort::Gen12(ddi));
+        if let Some(legacy) = legacy {
+            out.push(
+                legacy
+                    .route(ddi, master, Protocol::Dp, link, mst)
+                    .ok_or(HdcpError::Unsupported)?,
+            );
+        } else {
+            out.push(RouteDesc {
+                key: gen12_key(ddi),
+                protocol: Protocol::Dp,
+                transcoder: master,
+                link,
+                display_ver: 12,
+                hw: hdcp::HdcpHw::TRANSCODER,
+                hdcp2: true,
+                rekey: LineRekey::None,
+                cp_irq: true,
+                mst,
+            });
+        }
     }
     if let Some(r) = crate::intel_gpu_xelpg_external::hdcp_route() {
         let (ver, rekey) = display_rekey(&io);
@@ -334,6 +425,8 @@ fn routes(bar: &narf_bus::MmioRegion) -> Result<Vec<RouteDesc>, HdcpError> {
             transcoder: r.transcoder,
             link: r.link,
             display_ver: ver,
+            hw: hdcp::HdcpHw::TRANSCODER,
+            hdcp2: true,
             rekey,
             cp_irq: true,
             mst: r.mst,
@@ -603,8 +696,9 @@ impl GscPacketPort for LiveGsc {
     }
 }
 
-/// The HDCP 2.2 firmware for a route, when it is there: MEI on display
-/// 12/13, the GSC on 14+.
+/// The HDCP 2.2 firmware for a route, when it is there: MEI below display
+/// 14 (on the platforms `is_hdcp2_supported` admits; the link checks
+/// that), the GSC on 14+.
 fn firmware(display_ver: u8) -> Option<Box<dyn HdcpTransport>> {
     if display_ver < 14 {
         let me = crate::intel_gpu_gt::media::gsc::load::INTEL_DISPLAY_COMPONENT;
@@ -634,9 +728,9 @@ impl Engine {
     /// `intel_hdcp_init` for the route's connector(s).
     fn for_route(r: &RouteDesc) -> Self {
         if r.mst.is_empty() {
-            Self::Sst(HdcpLink::new(r.protocol, r.transcoder, r.rekey, true))
+            Self::Sst(HdcpLink::new(r.protocol, r.transcoder, r.rekey, r.hdcp2).with_hw(r.hw))
         } else {
-            Self::Mst(MstHdcp::new(r.transcoder, r.mst.as_slice(), r.rekey, true))
+            Self::Mst(MstHdcp::new(r.transcoder, r.mst.as_slice(), r.rekey, r.hdcp2).with_hw(r.hw))
         }
     }
     fn value(&self) -> CpValue {
@@ -663,6 +757,36 @@ impl Engine {
             Self::Mst(m) => m.force_off(io),
         }
     }
+    /// The port's link (the MST master's for a DP MST route).
+    fn link(&self) -> &HdcpLink {
+        match self {
+            Self::Sst(l) => l,
+            Self::Mst(m) => &m.link,
+        }
+    }
+    /// `hdcp->force_hdcp14` (`i915_force_hdcp14`).
+    fn set_force_hdcp14(&mut self, force: bool) {
+        match self {
+            Self::Sst(l) => l.force_hdcp14 = force,
+            Self::Mst(m) => m.link.force_hdcp14 = force,
+        }
+    }
+}
+
+/// `intel_hdcp_get_capability` and `intel_hdcp2_get_capability` of the
+/// route's sink, for `i915_hdcp_sink_capability`: HDCP 1.4 (DP BCAPS, or an
+/// HDMI sink's valid Bksv) and HDCP 2.2 (the platform's firmware and the
+/// sink's `hdcp_2_2_get_capability`). Sink reads only; no register write.
+fn sink_capability<M, S, T, E>(engine: &Engine, cx: &mut Ctx<'_, M, S, T, E>) -> (bool, bool)
+where
+    M: MmioWindow + Sync + ?Sized,
+    S: hdcp::HdcpShim,
+    T: HdcpTransport + ?Sized,
+    E: HdcpEnv,
+{
+    let hdcp1 = HdcpLink::hdcp1_capable(cx.shim);
+    let hdcp2 = engine.link().hdcp2_capable(cx);
+    (hdcp1, hdcp2)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -672,6 +796,8 @@ enum OpKind {
     /// `intel_hdcp_update_pipe`'s type change: disable, DESIRED, enable.
     Retype,
     Check,
+    /// The sink's HDCP versions for `i915_hdcp_sink_capability`.
+    Capability,
 }
 
 #[derive(Debug)]
@@ -679,6 +805,16 @@ struct OpDone {
     link: Engine,
     kind: OpKind,
     result: Result<(), HdcpError>,
+    /// (HDCP 1.4, HDCP 2.2) of a [`OpKind::Capability`] query.
+    capability: Option<(bool, bool)>,
+}
+
+/// A debugfs read's sink capability query on one connector.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CapQuery {
+    Idle,
+    Asked(u64),
+    Answered(u64, Result<(bool, bool), HdcpError>),
 }
 
 type Op = Pin<Box<dyn Future<Output = OpDone> + Send>>;
@@ -694,6 +830,10 @@ struct Slot {
     op: Option<Op>,
     next_check_ns: u64,
     last: Option<HdcpError>,
+    /// `i915_hdcp_sink_capability`'s pending or answered query.
+    cap: CapQuery,
+    /// `hdcp->force_hdcp14`, kept across the connector's links.
+    force_hdcp14: bool,
 }
 
 impl core::fmt::Debug for Slot {
@@ -777,8 +917,12 @@ fn attach(card: u32) {
             op: None,
             next_check_ns: 0,
             last: None,
+            cap: CapQuery::Idle,
+            force_hdcp14: false,
         });
     }
+    drop(slots);
+    crate::intel_hdcp_debugfs::register();
 }
 
 /// The DRM side changed a connector's uAPI values (legacy SETPROPERTY or
@@ -827,10 +971,12 @@ fn start(kind: OpKind, mut link: Engine, route: RouteDesc, content_type: u8) -> 
                 link,
                 kind,
                 result: Err(HdcpError::NoRoute),
+                capability: None,
             };
         };
         let mut env = LiveEnv { srm: load_srm() };
         let mut fw = firmware(route.display_ver);
+        let mut capability = None;
         let result = match route.link {
             RouteLink::Dp(port) => {
                 let mut shim = DpShim::new(LiveDpcd {
@@ -843,7 +989,12 @@ fn start(kind: OpKind, mut link: Engine, route: RouteDesc, content_type: u8) -> 
                     fw: fw.as_deref_mut(),
                     env: &mut env,
                 };
-                run(kind, &mut link, &mut cx, content_type).await
+                if kind == OpKind::Capability {
+                    capability = Some(sink_capability(&link, &mut cx));
+                    Ok(())
+                } else {
+                    run(kind, &mut link, &mut cx, content_type).await
+                }
             }
             RouteLink::Hdmi(pin) => {
                 let mut shim = HdmiShim::new(GmbusDdc { io: &io, pin });
@@ -853,10 +1004,20 @@ fn start(kind: OpKind, mut link: Engine, route: RouteDesc, content_type: u8) -> 
                     fw: fw.as_deref_mut(),
                     env: &mut env,
                 };
-                run(kind, &mut link, &mut cx, content_type).await
+                if kind == OpKind::Capability {
+                    capability = Some(sink_capability(&link, &mut cx));
+                    Ok(())
+                } else {
+                    run(kind, &mut link, &mut cx, content_type).await
+                }
             }
         };
-        OpDone { link, kind, result }
+        OpDone {
+            link,
+            kind,
+            result,
+            capability,
+        }
     })
 }
 
@@ -885,6 +1046,7 @@ where
                     mst.enable(cx, content_type).await
                 }
                 OpKind::Check => mst.check_link(cx).await,
+                OpKind::Capability => Ok(()),
             };
         }
     };
@@ -897,6 +1059,7 @@ where
             link.enable(cx, content_type).await
         }
         OpKind::Check => link.check_link(cx).await,
+        OpKind::Capability => Ok(()),
     }
 }
 
@@ -973,6 +1136,7 @@ pub fn service(bar: &narf_bus::MmioRegion) {
         s.card == card
             && (s.uapi.cp != CpValue::Undesired
                 || s.op.is_some()
+                || matches!(s.cap, CapQuery::Asked(_))
                 || s.link
                     .as_ref()
                     .is_some_and(|l| l.value() != CpValue::Undesired))
@@ -1032,7 +1196,8 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
             s.last = error;
             match current {
                 Some(r) => {
-                    let link = Engine::for_route(&r);
+                    let mut link = Engine::for_route(&r);
+                    link.set_force_hdcp14(s.force_hdcp14);
                     // intel_hdcp_enable at the route's encoder enable.
                     let enable = hdcp::enable_on_route_for(link.value(), s.uapi);
                     s.link = Some(link);
@@ -1058,6 +1223,8 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
                     } => Some((OpKind::Retype, r)),
                     Commit::Enable { .. } => Some((OpKind::Enable, r)),
                 }
+            } else if matches!(s.cap, CapQuery::Asked(_)) {
+                Some((OpKind::Capability, r))
             } else if link.value() == CpValue::Enabled
                 && narf_time::monotonic_ns() >= s.next_check_ns
             {
@@ -1068,6 +1235,11 @@ fn service_slot(i: usize, card: u32, route: Result<Option<RouteDesc>, HdcpError>
         } else {
             None
         };
+        // intel_hdcp_sink_capability_show: -ENODEV without a connected,
+        // routed connector.
+        if let (None, CapQuery::Asked(ticket)) = (s.route, s.cap) {
+            s.cap = CapQuery::Answered(ticket, Err(error.unwrap_or(HdcpError::NoRoute)));
+        }
         if let Some((kind, r)) = next {
             if let Some(link) = s.link.take() {
                 if kind == OpKind::Retype && hdcp::report(&mut s.uapi, CpValue::Desired) {
@@ -1097,14 +1269,120 @@ fn finish(i: usize, done: OpDone) {
         {
             s.next_check_ns = now + done.link.check_period_ms() * 1_000_000;
         }
-        s.last = done.result.err();
+        if done.kind == OpKind::Capability {
+            if let CapQuery::Asked(ticket) = s.cap {
+                let answer = done
+                    .result
+                    .map(|()| done.capability.unwrap_or((false, false)));
+                s.cap = CapQuery::Answered(ticket, answer);
+            }
+        } else {
+            s.last = done.result.err();
+        }
         let changed = hdcp::report(&mut s.uapi, done.link.value());
-        s.link = Some(done.link);
+        let mut link = done.link;
+        // A write to i915_force_hdcp14 while the operation held the link.
+        link.set_force_hdcp14(s.force_hdcp14);
+        s.link = Some(link);
         changed.then_some((s.card, s.connector, s.uapi.cp))
     };
     if let Some((card, connector, value)) = flip {
         publish(card, connector, value);
     }
+}
+
+// ── debugfs (crate::intel_hdcp_debugfs) ──────────────────────────────
+
+static CAP_TICKET: AtomicU64 = AtomicU64::new(1);
+
+/// The connectors of `card` with HDCP debugfs files: the DP and HDMI ones
+/// HDCP attached (`intel_hdcp_connector_debugfs_add`'s connector types),
+/// as (uAPI id, connector type, type index).
+pub fn debugfs_connectors(card: u32) -> Vec<(u32, ConnectorType, u32)> {
+    let ids: Vec<u32> = SLOTS
+        .lock()
+        .iter()
+        .filter(|s| s.card == card)
+        .map(|s| s.connector)
+        .collect();
+    let Some(mode) = crate::drm_registry::mode_state(card) else {
+        return Vec::new();
+    };
+    let kms = mode.lock();
+    ids.into_iter()
+        .filter_map(|id| {
+            let c = kms.connector(id).ok()?;
+            matches!(
+                c.connector_type,
+                ConnectorType::DisplayPort | ConnectorType::HdmiA | ConnectorType::HdmiB
+            )
+            .then_some((id, c.connector_type, c.connector_type_id))
+        })
+        .collect()
+}
+
+/// Ask the next service pass for the sink capability of `connector` of
+/// `card` (`i915_hdcp_sink_capability`); the ticket to read the answer
+/// with. A query already asked is shared.
+pub fn ask_capability(card: u32, connector: u32) -> Result<u64, HdcpError> {
+    let mut slots = SLOTS.lock();
+    let s = slots
+        .iter_mut()
+        .find(|s| s.card == card && s.connector == connector)
+        .ok_or(HdcpError::NoRoute)?;
+    if let CapQuery::Asked(ticket) = s.cap {
+        return Ok(ticket);
+    }
+    let ticket = CAP_TICKET.fetch_add(1, Ordering::Relaxed);
+    s.cap = CapQuery::Asked(ticket);
+    Ok(ticket)
+}
+
+/// The answer to `ticket`, once a service pass gave it: (HDCP 1.4, HDCP
+/// 2.2), or `NoRoute` (-ENODEV) without a connected, routed connector.
+pub fn capability_answer(
+    card: u32,
+    connector: u32,
+    ticket: u64,
+) -> Option<Result<(bool, bool), HdcpError>> {
+    let slots = SLOTS.lock();
+    let s = slots
+        .iter()
+        .find(|s| s.card == card && s.connector == connector)?;
+    match s.cap {
+        CapQuery::Answered(t, answer) if t == ticket => Some(answer),
+        CapQuery::Asked(t) if t == ticket => None,
+        // Overtaken by a later query: this one's answer is gone.
+        _ => Some(Err(HdcpError::Timeout)),
+    }
+}
+
+/// `intel_hdcp_force_14_show`'s value: -ENODEV unless the connector has a
+/// live route (an attached encoder, connected, on a CRTC).
+pub fn force_hdcp14(card: u32, connector: u32) -> Result<bool, HdcpError> {
+    SLOTS
+        .lock()
+        .iter()
+        .find(|s| s.card == card && s.connector == connector)
+        .filter(|s| s.route.is_some())
+        .map(|s| s.force_hdcp14)
+        .ok_or(HdcpError::NoRoute)
+}
+
+/// `intel_hdcp_force_14_write`: the next enable and link check use only
+/// HDCP 1.4 (`force` true) or may use HDCP 2.2 again. It never changes an
+/// enabled link's version by itself, as in Linux.
+pub fn set_force_hdcp14(card: u32, connector: u32, force: bool) -> Result<(), HdcpError> {
+    let mut slots = SLOTS.lock();
+    let s = slots
+        .iter_mut()
+        .find(|s| s.card == card && s.connector == connector)
+        .ok_or(HdcpError::NoRoute)?;
+    s.force_hdcp14 = force;
+    if let Some(link) = s.link.as_mut() {
+        link.set_force_hdcp14(force);
+    }
+    Ok(())
 }
 
 /// The last refusal or failure on `connector` of `card`, for diagnostics.
@@ -1114,6 +1392,50 @@ pub fn last_error(card: u32, connector: u32) -> Option<HdcpError> {
         .iter()
         .find(|s| s.card == card && s.connector == connector)
         .and_then(|s| s.last)
+}
+
+/// Test-only: a connector slot of `card` as `attach` makes one.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __attach_slot_for_test(card: u32, connector: u32) {
+    SLOTS.lock().push(Slot {
+        card,
+        connector,
+        uapi: Uapi {
+            cp: CpValue::Undesired,
+            content_type: 0,
+        },
+        dirty: false,
+        route: None,
+        link: None,
+        op: None,
+        next_check_ns: 0,
+        last: None,
+        cap: CapQuery::Idle,
+        force_hdcp14: false,
+    });
+}
+
+/// Test-only: one service pass of `card`'s slot for `connector` over
+/// `route`, as [`service`] runs it.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __service_slot_for_test(
+    card: u32,
+    connector: u32,
+    route: Result<Option<RouteDesc>, HdcpError>,
+) {
+    let index = SLOTS
+        .lock()
+        .iter()
+        .position(|s| s.card == card && s.connector == connector);
+    if let Some(index) = index {
+        service_slot(index, card, route);
+    }
+}
+
+/// Test-only: drop every slot of `card`.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn __detach_card_for_test(card: u32) {
+    SLOTS.lock().retain(|s| s.card != card);
 }
 
 /// Test-only: queue a framed command for the GSC worker as the GSC

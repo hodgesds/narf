@@ -520,6 +520,17 @@ impl IntelHda {
             if let Some(quirk) = quirk {
                 dev.apply_quirk_seq(cad, quirk)?;
             }
+            // An Intel HDMI/DP codec bound to the display's audio component
+            // (`alloc_intel_hdmi`): `intel_haswell_enable_all_pins` and the
+            // DP 1.2 fixup before the widget graph is built, so the graph
+            // holds every pin and converter (`snd_hda_codec_update_widgets`).
+            // Without the component nothing is sent.
+            if let Some(model) = super::intelhdmi::bound_model(vendor) {
+                super::intelhdmi::vendor_verbs(cad, model, |command| {
+                    // SAFETY: The live controller owns the command rings; its command lease serializes access.
+                    unsafe { dev.send_verb(command) }
+                })?;
+            }
             let mut error = None;
             let mut graph = crate::hda_codec::enumerate(cad, |command| {
                 if error.is_some() {
@@ -2057,6 +2068,9 @@ impl IntelHda {
             let _ = self.pm_verb(cad, nid, VERB_SET_CONVERTER_STREAM);
             let _ = self.pm_verb(cad, nid, VERB_SET_CONVERTER_FORMAT);
         }
+        // An Intel display codec's suspend returns the display power its
+        // stream took (`hda_codec_runtime_suspend`).
+        self.intel_display_power_off();
     }
 
     /// Whether a codec signalled a state change the park armed a wake for
@@ -2539,6 +2553,9 @@ fn register_controller(device: &BusDevice, dev: IntelHda) -> Result<(), narf_bus
     );
     dev.card.store(card, Ordering::Release);
     CONTROLLERS.lock().push((device.addr, dev.clone(), card));
+    // `register_i915_notifier`: an Intel HDMI codec bound to the display's
+    // audio component follows its `pin_eld_notify`.
+    super::intelhdmi::register_notifier(&dev);
     // Stream service: position tracking and xrun detection, every 2 ms
     // while a stream runs. With no stream running there is nothing to track
     // and the interrupt handler acknowledges controller status itself, so

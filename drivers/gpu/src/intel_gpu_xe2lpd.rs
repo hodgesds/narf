@@ -204,11 +204,16 @@ impl DisplayIdentityProfile {
     }
 }
 
-/// Discrete Arc display IP families:
+/// Discrete display IP families:
+/// - `Dg1`: DG1 pre-GMD Display 12 (`dg1_display`: `XE_D_DISPLAY`, the
+///   Tiger Lake display with Rocket Lake's port set), admitted only with
+///   `narf.intel.dg1_kms=1`.
 /// - `Dg2`: Alchemist pre-GMD Display 13.
 /// - `Xe2Hpd`: Battlemage `GMD_ID_DISPLAY` 14.01 (`xe2_hpd_display`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DiscreteDisplayIp {
+    /// Display 12 (pre-GMD DG1 discrete display).
+    Dg1,
     /// Display 13 (pre-GMD DG2 / Alchemist discrete display).
     Dg2,
     /// Display 14.01 (`xe2_hpd_display`: Battlemage discrete display).
@@ -219,6 +224,7 @@ impl DiscreteDisplayIp {
     /// Major display version (`13` for DG2, `14` for BMG `Xe2_HPD`).
     pub(crate) const fn ver(self) -> u8 {
         match self {
+            Self::Dg1 => 12,
             Self::Dg2 => 13,
             Self::Xe2Hpd => 14,
         }
@@ -227,15 +233,17 @@ impl DiscreteDisplayIp {
     /// Minor release (`0` for DG2, `1` for BMG `Xe2_HPD`).
     pub(crate) const fn rel(self) -> u8 {
         match self {
-            Self::Dg2 => 0,
+            Self::Dg1 | Self::Dg2 => 0,
             Self::Xe2Hpd => 1,
         }
     }
 
     /// GGTT PTE codec matching the discrete display's page table format.
+    /// DG1 and DG2 take `gen8_ggtt_pte_encode` with `GEN12_GGTT_PTE_LM`
+    /// for local memory ([`crate::intel_gpu_gtt::PTE_DM`]).
     pub(crate) const fn pte_format(self) -> crate::intel_gpu_gtt::PteFormat {
         match self {
-            Self::Dg2 => crate::intel_gpu_gtt::PteFormat::Gen12,
+            Self::Dg1 | Self::Dg2 => crate::intel_gpu_gtt::PteFormat::Gen12,
             Self::Xe2Hpd => crate::intel_gpu_gtt::PteFormat::XeLpg,
         }
     }
@@ -255,12 +263,17 @@ impl DiscreteDisplayIp {
     }
 
     /// Read-only discrete display identification and Pipe-A fuse admission.
+    /// DG1 (display 12) is identified like DG2, from its PCI identity; its
+    /// probe admits it only with `narf.intel.dg1_kms=1`.
     pub(crate) fn identify(
         io: &(impl MmioWindow + ?Sized),
         platform: crate::intel_gpu_gt::GtPlatform,
     ) -> Result<Self, IpError> {
-        use crate::intel_gpu_gt::GtPlatform;
-        if !matches!(platform, GtPlatform::Alchemist | GtPlatform::Battlemage) {
+        use crate::intel_gpu_gt::{Gen12Platform, GtPlatform};
+        if !matches!(
+            platform,
+            GtPlatform::Alchemist | GtPlatform::Battlemage | GtPlatform::Gen12(Gen12Platform::Dg1)
+        ) {
             return Err(IpError::Unqualified { ver: 0, rel: 0 });
         }
         let dfsm = io.read32(SKL_DFSM);
@@ -268,6 +281,7 @@ impl DiscreteDisplayIp {
             return Err(IpError::NoDevice);
         }
         let ip = match platform {
+            GtPlatform::Gen12(Gen12Platform::Dg1) => Self::Dg1,
             GtPlatform::Alchemist => Self::Dg2,
             GtPlatform::Battlemage => {
                 let a = io.read32(GMD_ID_DISPLAY);

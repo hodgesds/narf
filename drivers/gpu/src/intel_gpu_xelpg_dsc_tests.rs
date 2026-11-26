@@ -1,5 +1,7 @@
 //! Display-14 DSC decision, VDSC image, PPS SDP and FEC. Expected values
-//! come from Linux b90c984d: the rate-control parameters, register values,
+//! come from Linux (b90c984d, rechecked against 7.4-rc4, whose search picks
+//! the same configurations for every sink here; the 7.4-only bpp delta has
+//! its own fixture): the rate-control parameters, register values,
 //! SDP dwords, M/N and minimum CDCLK were produced by drm_dsc_helper.c's
 //! drm_dsc_compute_rc_parameters / drm_dsc_pps_payload_pack /
 //! drm_dsc_set_rc_buf_thresh, intel_vdsc.c's calculate_rc_params with
@@ -1193,4 +1195,49 @@ fn smoke_xelpg_dsc_sink_caps_decompression_and_fec_ready() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_dsc",
     smoke_xelpg_dsc_sink_caps_decompression_and_fec_ready
+);
+
+/// Linux 7.4's `intel_dp_dsc_max_delta_bppx16` ahead of
+/// `drm_edp_dsc_sink_output_bpp` in `intel_dp_dsc_max_sink_compressed_bppx16`:
+/// a DP 2.0 sink that sets `DP_DSC_MAX_BPP_DELTA_AVAILABILITY` (0x068 bit
+/// 7) with a version-1 RGB delta of 4 (0x06e) allows 4 + 16 - 1 = 19 bpp, so
+/// 4K60 on HBR3 x4, which otherwise compresses at the source's 383/16 bpp
+/// (`align_max_compressed_bpp_x16`: 24 bpp - 1/16), compresses at 19 bpp
+/// (304); a delta of 22 is outside 1..=21 and leaves the 3 * bpc maximum.
+fn smoke_xelpg_dsc_max_bpp_delta_caps_the_compressed_bpp() -> TestResult {
+    let uhd60 = mode(594_000, 3840, 4400, 2160, 2250);
+    let limits = LinkLimits::standard(810_000, 4);
+    let sink = |delta: Option<u8>| {
+        let mut dpcd = D1_DSC;
+        if let Some(d) = delta {
+            dpcd[0x08] |= 1 << 7;
+            dpcd[0x0e] = d;
+        }
+        DscSink {
+            dpcd: DscDpcd(dpcd),
+            is_edp: false,
+            fec_capable: true,
+        }
+    };
+    let bpp = |delta| compute(&sink(delta), &limits, &uhd60, 24).map(|p| p.compressed_bpp_x16);
+    if DscDpcd(sink(Some(4)).dpcd.0).max_bpp_delta_x16() != 19 * 16
+        || DscDpcd(sink(Some(22)).dpcd.0).max_bpp_delta_x16() != 0
+        || DscDpcd(D1_DSC).max_bpp_delta_x16() != 0
+    {
+        return TestResult::Fail("intel_dp_dsc_max_delta_bppx16 decode differs");
+    }
+    if bpp(None) != Ok(383) || bpp(Some(4)) != Ok(304) || bpp(Some(22)) != Ok(383) {
+        return TestResult::Fail("the bpp delta must cap the compressed bpp at 19");
+    }
+    match compute(&sink(Some(4)), &limits, &uhd60, 24) {
+        // RATE_LANE order: HBR2 x4 (2160000 kBps) is the first to carry
+        // 1450999 kBps.
+        Ok(p) if p.link_rate == 540_000 && p.lanes == 4 && p.fec && p.slice_count == 2 => {}
+        _ => return TestResult::Fail("4K60 at 19 bpp compresses on HBR2 x4 with FEC, two slices"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_dsc",
+    smoke_xelpg_dsc_max_bpp_delta_caps_the_compressed_bpp
 );

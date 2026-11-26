@@ -141,6 +141,22 @@ with no sink the converter's own limits apply. Queried with no PCM named
 (`PcmDevice::capabilities` with nothing open) the limits intersect every
 attached sink. Analog codecs stay at 48 kHz.
 
+Intel HDMI/DP display codecs (Linux `intelhdmi.c`'s ids and models; the TGL
+pin/port map that ADL-P through Nova Lake share) bind only when the Intel
+display bound its audio component (`narf_drivers_sound::display_audio`,
+`narf.intel.hdmi14_ext=1`), as `alloc_intel_hdmi` requires the i915 binding;
+unbound, such a codec gets no verb, path or port. A bound codec gets
+`intel_haswell_enable_all_pins` and the DP 1.2 fixup before its widget walk
+and before the AFG's D0, one output path per connected digital pin with its
+own converter (assigned once, where Linux assigns at PCM open; device entry
+0 only), presence and ELD through `snd_hdac_acomp_get_eld` (no pin sense),
+and the codec half of the component (`intel_pin2port`, `pin_eld_notify`
+marking the jack dirty). Stream setup takes display power with its
+codec-wake pulse, `i915_pin_cvt_fixup`, `snd_hdac_sync_audio_rate`, the
+standard slot map through `SET_HDMI_CHAN_SLOT`, the audio InfoFrame through
+the DIP verbs, HBR and the IEC coding type; display power is returned at
+codec suspend.
+
 The PCM layout is Linux patch_hdmi's with atihdmi's `static_pcm_mapping`:
 one playback PCM per HDMI pin (`min(num_cvts, num_pins)`, pin i on PCM i) at
 the device numbers `get_empty_pcm_device` gives HDMI PCMs (3, 7, 8, 9, then

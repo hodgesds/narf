@@ -2672,6 +2672,9 @@ mod bmg_smallbar {
 mod lr {
     include!("intel_gpu_xe_lr_tests.rs");
 }
+mod svm_mirror {
+    include!("intel_gpu_xe_svm_tests.rs");
+}
 mod vram_evict {
     include!("intel_gpu_vram_evict_tests.rs");
 }

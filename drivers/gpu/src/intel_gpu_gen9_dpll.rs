@@ -66,7 +66,7 @@
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_gen11_dpll::{
-    ctrl1_hdmi_mode, ctrl1_override, dp_ctrl1, read_ctrl1, write_ctrl1,
+    ctrl1_hdmi_mode, ctrl1_override, dp_ctrl1, read_ctrl1, write_ctrl1, DPLL_CTRL1,
 };
 
 /// SKL shared DPLL identifiers (`DPLL_ID_SKL_DPLL0..3`,
@@ -496,6 +496,125 @@ pub fn dpll_pool(is_edp: bool) -> &'static [SklDpllId] {
     }
 }
 
+// ── Shared-DPLL arbitration (`intel_find_dpll`) ──────────────
+
+/// The boot option that arbitrates DPLL1-3 between Gen9 external outputs
+/// (default off: without it every external output takes DPLL1, the first of
+/// the pool, as before).
+pub const ARBITRATION_OPT_IN: &str = "narf.intel.gen9_dpll";
+
+static ARBITRATION: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `narf.intel.gen9_dpll=1`, with the strict grammar every Intel opt-in
+/// uses ([`crate::intel_gpu_gt::boot_opt_in`]).
+pub fn arbitration_requested(args: narf_boot::args::KernelCmdline<'_>) -> bool {
+    crate::intel_gpu_gt::boot_opt_in(args, ARBITRATION_OPT_IN)
+}
+
+/// Probe: record the boot option for every later Gen9 modeset.
+pub fn set_arbitration(enabled: bool) {
+    ARBITRATION.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether Gen9 external outputs arbitrate DPLL1-3 ([`find_dpll`]).
+pub fn arbitration() -> bool {
+    ARBITRATION.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// `skl_ddi_pll_get_hw_state` / `skl_ddi_dpll0_get_hw_state`: the state a
+/// DPLL runs, `None` when its CTL enable is clear (or the register reads
+/// all-ones). The CFGCR pair is read only in HDMI mode ("avoid reading back
+/// stale values if HDMI mode is not enabled").
+pub fn read_hw_state(io: &(impl MmioWindow + ?Sized), id: SklDpllId) -> Option<SklDpllState> {
+    let ctl = io.read32(ctl_reg(id));
+    // DPLL0 is always on (it drives CDCLK); only DPLL1-3 gate on the CTL.
+    if ctl == u32::MAX || (id != SklDpllId::Dpll0 && ctl & PLL_ENABLE == 0) {
+        return None;
+    }
+    let ctrl1 = io.read32(DPLL_CTRL1);
+    if ctrl1 == u32::MAX {
+        return None;
+    }
+    let field = (ctrl1 >> (id.id() * 6)) & 0x3f;
+    let hdmi = ctrl1 & ctrl1_hdmi_mode(id.id()) != 0;
+    let (cfgcr1, cfgcr2) = match (hdmi, cfgcr1_reg(id), cfgcr2_reg(id)) {
+        (true, Some(r1), Some(r2)) => (Some(io.read32(r1)), Some(io.read32(r2))),
+        _ => (None, None),
+    };
+    Some(SklDpllState {
+        ctrl1: field,
+        cfgcr1,
+        cfgcr2,
+    })
+}
+
+/// The Gen9 DDIs that can hold a DPLL (`skl_ddi_get_pll`'s ports A-E).
+const PORTS: [Ddi; 5] = [Ddi::A, Ddi::B, Ddi::C, Ddi::D, Ddi::E];
+
+/// The DPLL `port` is live on: its clock routed and on in `DPLL_CTRL2`
+/// (`skl_ddi_is_clock_enabled`, then `skl_ddi_get_pll`'s `CLK_SEL`) and its
+/// DDI buffer enabled. A port whose buffer is off (a stopped external
+/// output keeps its clock routed) holds nothing: Linux's software state
+/// drops a disabled crtc's reference (`intel_unreference_dpll`).
+pub fn port_dpll(io: &(impl MmioWindow + ?Sized), port: Ddi) -> Option<SklDpllId> {
+    let ctrl2 = io.read32(DPLL_CTRL2);
+    let buf = io.read32(port.base() + crate::intel_gpu_ddi::DDI_BUF_CTL_OFFSET);
+    if ctrl2 == u32::MAX
+        || buf == u32::MAX
+        || ctrl2 & ctrl2_clk_off(port) != 0
+        || buf & crate::intel_gpu_ddi::DDI_BUF_CTL_ENABLE == 0
+    {
+        return None;
+    }
+    Some(
+        match (ctrl2 & ctrl2_clk_sel_mask(port)) >> ((port as u32) * 3 + 1) {
+            0 => SklDpllId::Dpll0,
+            1 => SklDpllId::Dpll1,
+            2 => SklDpllId::Dpll2,
+            _ => SklDpllId::Dpll3,
+        },
+    )
+}
+
+/// `skl_get_dpll` → `intel_find_dpll` over this output's pool
+/// ([`dpll_pool`]) for `port` at `want`, from the hardware: a DPLL another
+/// live port ([`port_dpll`]) holds is shared when it runs `want`
+/// (`skl_compare_hw_state`: CTRL1 field and CFGCR pair), and otherwise the
+/// first DPLL of the pool no other port holds is taken, in id order
+/// (DPLL1, DPLL2, DPLL3). Returns `(id, shared)`; [`DpllError::Busy`] when
+/// every DPLL of the pool is held at another state (Linux's `-EINVAL`).
+/// eDP (port A) keeps DPLL0, which drives CDCLK and is never shared out.
+pub fn find_dpll(
+    io: &(impl MmioWindow + ?Sized),
+    port: Ddi,
+    want: &SklDpllState,
+) -> Result<(SklDpllId, bool), DpllError> {
+    let pool = dpll_pool(port == Ddi::A);
+    if port == Ddi::A {
+        return Ok((SklDpllId::Dpll0, false));
+    }
+    if io.read32(DPLL_CTRL2) == u32::MAX || !io.display_access_ok() {
+        return Err(DpllError::NoDevice);
+    }
+    let held = |id: SklDpllId| {
+        PORTS
+            .iter()
+            .filter(|&&other| other != port)
+            .any(|&other| port_dpll(io, other) == Some(id))
+    };
+    let mut unused = None;
+    for &id in pool {
+        if !held(id) {
+            unused = unused.or(Some(id));
+            continue;
+        }
+        if read_hw_state(io, id).as_ref() == Some(want) {
+            return Ok((id, true));
+        }
+    }
+    unused.map(|id| (id, false)).ok_or(DpllError::Busy)
+}
+
 // ── Enable / disable ─────────────────────────────────────────
 
 /// DPLL sequencing failure modes.
@@ -505,6 +624,9 @@ pub enum DpllError {
     NoDevice,
     /// A lock transition did not arrive inside 5 ms.
     Timeout,
+    /// Every DPLL of the pool is held by another live output at another
+    /// state ([`find_dpll`]).
+    Busy,
 }
 
 fn wait_lock(io: &(impl MmioWindow + ?Sized), id: SklDpllId) -> Result<(), DpllError> {
@@ -623,6 +745,8 @@ pub mod tests {
         cfgcr2: RefCell<[u32; 3]>,
         ctrl1: RefCell<u32>,
         ctrl2: RefCell<u32>,
+        /// `DDI_BUF_CTL(A..E)`.
+        bufs: RefCell<[u32; 5]>,
         grant_lock: bool,
         writes: RefCell<Vec<(u64, u32)>>,
     }
@@ -635,6 +759,7 @@ pub mod tests {
                 cfgcr2: RefCell::new([0; 3]),
                 ctrl1: RefCell::new(0),
                 ctrl2: RefCell::new(0),
+                bufs: RefCell::new([0; 5]),
                 grant_lock: true,
                 writes: RefCell::new(Vec::new()),
             }
@@ -682,6 +807,9 @@ pub mod tests {
                 o if o == DPLL_CTRL1 => *self.ctrl1.borrow(),
                 o if o == DPLL_CTRL2 => *self.ctrl2.borrow(),
                 o if o == DPLL_STATUS => self.status(),
+                o if (0x64000..0x64500).contains(&o) && o % 0x100 == 0 => {
+                    self.bufs.borrow()[((o - 0x64000) / 0x100) as usize]
+                }
                 _ => 0,
             }
         }
@@ -701,8 +829,33 @@ pub mod tests {
                 0x6C054 => self.cfgcr2.borrow_mut()[2] = val,
                 o if o == DPLL_CTRL1 => *self.ctrl1.borrow_mut() = val,
                 o if o == DPLL_CTRL2 => *self.ctrl2.borrow_mut() = val,
+                o if (0x64000..0x64500).contains(&o) && o % 0x100 == 0 => {
+                    self.bufs.borrow_mut()[((o - 0x64000) / 0x100) as usize] = val
+                }
                 _ => {}
             }
+        }
+    }
+
+    impl DpllMmio {
+        /// Port `port` live on DPLL `id` at `state`, as a lit output leaves
+        /// the hardware: the DPLL enabled with its CTRL1 field (and CFGCR
+        /// pair), the port clock routed and on, the DDI buffer enabled.
+        fn live(&self, port: Ddi, id: SklDpllId, state: &SklDpllState) {
+            let index = id.id() as usize;
+            self.ctl.borrow_mut()[index] |= PLL_ENABLE;
+            let shift = id.id() * 6;
+            let ctrl1 = *self.ctrl1.borrow();
+            *self.ctrl1.borrow_mut() = (ctrl1 & !(0x3f << shift)) | (state.ctrl1 << shift);
+            if let (Some(c1), Some(c2)) = (state.cfgcr1, state.cfgcr2) {
+                self.cfgcr1.borrow_mut()[index - 1] = c1;
+                self.cfgcr2.borrow_mut()[index - 1] = c2;
+            }
+            let ctrl2 = *self.ctrl2.borrow();
+            *self.ctrl2.borrow_mut() = (ctrl2 & !(ctrl2_clk_off(port) | ctrl2_clk_sel_mask(port)))
+                | ctrl2_clk_sel(port, id)
+                | ctrl2_sel_override(port);
+            self.bufs.borrow_mut()[port as usize] |= crate::intel_gpu_ddi::DDI_BUF_CTL_ENABLE;
         }
     }
 
@@ -978,4 +1131,92 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_gen9_dpll", smoke_skl_dpll_clock_mux);
+
+    /// `skl_ddi_pll_get_hw_state`: a disabled DPLL1-3 reads no state; DP
+    /// mode reads the CTRL1 field alone, leaving stale CFGCR values unread;
+    /// HDMI mode reads the CFGCR pair; DPLL0 needs no CTL enable.
+    fn smoke_skl_dpll_hw_state_readout() -> TestResult {
+        let mmio = DpllMmio::new();
+        mmio.cfgcr1.borrow_mut()[0] = 0xdead;
+        if read_hw_state(&mmio, SklDpllId::Dpll1).is_some() {
+            return TestResult::Fail("a disabled DPLL1 has no hardware state");
+        }
+        let dp = dp_state(270_000).unwrap();
+        mmio.live(Ddi::B, SklDpllId::Dpll1, &dp);
+        if read_hw_state(&mmio, SklDpllId::Dpll1) != Some(dp) {
+            return TestResult::Fail("a DP DPLL reads its CTRL1 field without the CFGCR pair");
+        }
+        let (hdmi, _) = hdmi_state(148_500, 24_000).unwrap();
+        mmio.live(Ddi::C, SklDpllId::Dpll3, &hdmi);
+        if read_hw_state(&mmio, SklDpllId::Dpll3) != Some(hdmi) {
+            return TestResult::Fail("an HDMI DPLL reads CTRL1 and its CFGCR pair");
+        }
+        if read_hw_state(&mmio, SklDpllId::Dpll0).is_none_or(|s| s.ctrl1 != 0) {
+            return TestResult::Fail("DPLL0 is always on (it drives CDCLK)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen9_dpll",
+        smoke_skl_dpll_hw_state_readout
+    );
+
+    /// `intel_find_dpll` over `skl_get_dpll`'s DPLL1-3 pool, from the
+    /// hardware: a live port's DPLL running the wanted state is shared,
+    /// otherwise the first DPLL no other live port holds is taken in id
+    /// order, and with all three held at other states the output refuses.
+    /// A port whose DDI buffer is off holds nothing, a port's own routing
+    /// never blocks it, and eDP keeps DPLL0.
+    fn smoke_skl_find_dpll_arbitration() -> TestResult {
+        let hbr2 = dp_state(540_000).unwrap();
+        let rbr = dp_state(162_000).unwrap();
+        let hbr = dp_state(270_000).unwrap();
+        let (hdmi, _) = hdmi_state(148_500, 24_000).unwrap();
+        let mmio = DpllMmio::new();
+        if find_dpll(&mmio, Ddi::B, &hbr2) != Ok((SklDpllId::Dpll1, false)) {
+            return TestResult::Fail("the first external output takes DPLL1");
+        }
+        mmio.live(Ddi::B, SklDpllId::Dpll1, &hbr2);
+        if find_dpll(&mmio, Ddi::C, &hdmi) != Ok((SklDpllId::Dpll2, false)) {
+            return TestResult::Fail("a second output at another state takes DPLL2");
+        }
+        if find_dpll(&mmio, Ddi::C, &hbr2) != Ok((SklDpllId::Dpll1, true)) {
+            return TestResult::Fail("a second output at the same state shares DPLL1");
+        }
+        if find_dpll(&mmio, Ddi::B, &hdmi) != Ok((SklDpllId::Dpll1, false)) {
+            return TestResult::Fail("a port's own DPLL never blocks its new state");
+        }
+        mmio.live(Ddi::C, SklDpllId::Dpll2, &hdmi);
+        if find_dpll(&mmio, Ddi::D, &rbr) != Ok((SklDpllId::Dpll3, false)) {
+            return TestResult::Fail("a third output at a third state takes DPLL3");
+        }
+        mmio.live(Ddi::D, SklDpllId::Dpll3, &rbr);
+        if find_dpll(&mmio, Ddi::E, &hbr) != Err(DpllError::Busy) {
+            return TestResult::Fail("every DPLL held at another state refuses");
+        }
+        if find_dpll(&mmio, Ddi::E, &hdmi) != Ok((SklDpllId::Dpll2, true)) {
+            return TestResult::Fail("a held DPLL at the wanted state is still shared");
+        }
+        // Port C stops: its buffer goes off, its clock stays routed.
+        mmio.bufs.borrow_mut()[Ddi::C as usize] = 0;
+        if find_dpll(&mmio, Ddi::E, &hbr) != Ok((SklDpllId::Dpll2, false)) {
+            return TestResult::Fail("a stopped output's DPLL is free again");
+        }
+        if find_dpll(&mmio, Ddi::A, &hbr) != Ok((SklDpllId::Dpll0, false)) {
+            return TestResult::Fail("eDP keeps DPLL0");
+        }
+        if ARBITRATION_OPT_IN != "narf.intel.gen9_dpll"
+            || !arbitration_requested(narf_boot::args::KernelCmdline::new(
+                "narf.intel.gen9_dpll=1",
+            ))
+            || arbitration_requested(narf_boot::args::KernelCmdline::new("narf.intel.gen9_dpll"))
+        {
+            return TestResult::Fail("strict opt-in grammar");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen9_dpll",
+        smoke_skl_find_dpll_arbitration
+    );
 }
