@@ -1173,6 +1173,40 @@ pub(crate) fn nbio_bank_ungated(gpu: &AmdGpu) -> Result<u64, Error> {
     }
     Ok(base)
 }
+
+/// Build the whole `[Image; 11]` set straight into its heap allocation,
+/// one image at a time: no `[Image; 11]` value is ever constructed on any
+/// stack. `Box::new(firmware.images()...)` inside the async
+/// `load_gfx_navi48` builds the 3872-byte array on the poll function's own
+/// frame first and only then moves it into the box (8568 -> 12408 in
+/// #2521); moving the boxing into a `#[inline(never)]` helper was not
+/// enough either (7744 bytes, measured — `images()` inlines and leaves
+/// the array twice there). Same `Box::new_uninit` species as
+/// `after_reset_boxed` in `amdgpu_navi48_platform.rs`.
+#[inline(never)]
+fn boxed_navi48_images(
+    firmware: &crate::amdgpu_navi48_firmware::Firmware,
+) -> Result<alloc::boxed::Box<[crate::amdgpu_navi48_firmware::Image<'_>; 11]>, Error> {
+    let mut slot =
+        alloc::boxed::Box::<[crate::amdgpu_navi48_firmware::Image<'_>; 11]>::new_uninit();
+    for (index, source) in crate::amdgpu_navi48_firmware::Source::ALL
+        .iter()
+        .enumerate()
+    {
+        let image = firmware.image(*source).map_err(|_| Error::Invalid)?;
+        let base = core::ptr::addr_of_mut!(*slot) as *mut crate::amdgpu_navi48_firmware::Image<'_>;
+        // SAFETY: `index` counts 0..11 over `Source::ALL`'s exactly 11
+        // entries, so each heap slot is written exactly once before
+        // `assume_init` below. An early `?` drops the box with some
+        // slots unwritten; that leaks nothing, because `Image` owns no
+        // allocation and has no `Drop` impl.
+        unsafe {
+            base.add(index).write(image);
+        }
+    }
+    // SAFETY: every slot was written by the loop just above.
+    Ok(unsafe { slot.assume_init() })
+}
 impl Psp {
     /// Claim an APU PSP13 ring (Phoenix, Raphael or Rembrandt). Navi22 uses
     /// `new_navi22` instead.
@@ -1642,8 +1676,14 @@ impl Psp {
         firmware: &crate::amdgpu_navi48_firmware::Firmware,
     ) -> Result<(), Error> {
         self.check_navi48_firmware(firmware)?;
-        let images = firmware.images().map_err(|_| Error::Invalid)?;
-        let smc = images[0].payloads().next().ok_or(Error::Invalid)?;
+        // Only the SMC image is needed (`Source::ALL[0]`); parsing one
+        // 352-byte `Image` instead of the whole `[Image; 11]` set (3872
+        // bytes) keeps this future under the 8 KiB frame budget. Same
+        // species as #2163's `Starts::from_firmware` fix.
+        let image = firmware
+            .image(crate::amdgpu_navi48_firmware::Source::Smc)
+            .map_err(|_| Error::Invalid)?;
+        let smc = image.payloads().next().ok_or(Error::Invalid)?;
         self.session.load_smc(smc.bytes()).await
     }
     /// Load GC12 RS64, MES12, IMU, RLC, SDMA7 and media payloads in UCODE_ID
@@ -1654,7 +1694,14 @@ impl Psp {
         firmware: &crate::amdgpu_navi48_firmware::Firmware,
     ) -> Result<(), Error> {
         self.check_navi48_firmware(firmware)?;
-        let images = firmware.images().map_err(|_| Error::Invalid)?;
+        // `load_gfx12` needs the whole `[Image; 11]` set (3872 bytes), so
+        // it lives on the heap: holding the array in this future put its
+        // frame over the 8 KiB budget (8568 bytes). The box holds only a
+        // pointer across the await; the array is borrowed, never copied.
+        // The boxing itself must happen out of line (`boxed_navi48_images`
+        // above): boxing here built the array on this poll frame first
+        // (12408 bytes, #2521 round 2).
+        let images = boxed_navi48_images(firmware)?;
         self.session.load_gfx12(&images).await
     }
     /// Check GC12's own RLC status register after the accepted autoload.

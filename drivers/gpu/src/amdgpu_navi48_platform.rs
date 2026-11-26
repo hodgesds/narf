@@ -290,27 +290,30 @@ fn framebuffer_range(
 /// What AMDGPU_INFO_FW_VERSION reports for the CP firmware (ME, PFP, MEC),
 /// after every IP image validates.
 ///
-/// Out of line: the eleven validated images (3.8 KiB, and a second copy
-/// when `boot::Firmware::images` inlines) would otherwise sit in
-/// `amdgpu::claim_navi48`'s frame beside the cold-boot owner it boxes.
+/// Out of line so none of this lands in `amdgpu::claim_navi48`'s frame
+/// beside the cold-boot owner it boxes — and one image at a time:
+/// `boot::Firmware::images()` returns `[Image; 11]` by value (3872 bytes,
+/// measured), and building that array here put this frame over the 8 KiB
+/// budget (12408 bytes). Same species as #2163's `Starts::from_firmware`
+/// fix. Each `image()` call parses a single 352-byte `Image` and only its
+/// (type, version, feature) triple survives. `Firmware::open` already
+/// validated every image, so parsing only the three published here cannot
+/// miss a corrupt image; a parse error still fails with `Error::Firmware`.
 #[inline(never)]
 fn publish_cp_firmware(firmware: &boot::Firmware) -> Result<(), Error> {
     use crate::amdgpu_navi48_firmware::Source;
     use crate::amdgpu_uapi as u;
-    let images = firmware.images().map_err(Error::Firmware)?;
     let cp = |source, fw_type| {
-        images
-            .iter()
-            .find(|i| i.source() == source)
+        firmware
+            .image(source)
             .map(|i| (fw_type, i.version(), i.feature()))
+            .map_err(Error::Firmware)
     };
-    if let (Some(me), Some(pfp), Some(mec)) = (
-        cp(Source::Me, u::AMDGPU_INFO_FW_GFX_ME),
-        cp(Source::Pfp, u::AMDGPU_INFO_FW_GFX_PFP),
-        cp(Source::Mec, u::AMDGPU_INFO_FW_GFX_MEC),
-    ) {
-        crate::amdgpu_info::publish_navi48_firmware([me, pfp, mec]);
-    }
+    crate::amdgpu_info::publish_navi48_firmware([
+        cp(Source::Me, u::AMDGPU_INFO_FW_GFX_ME)?,
+        cp(Source::Pfp, u::AMDGPU_INFO_FW_GFX_PFP)?,
+        cp(Source::Mec, u::AMDGPU_INFO_FW_GFX_MEC)?,
+    ]);
     Ok(())
 }
 
