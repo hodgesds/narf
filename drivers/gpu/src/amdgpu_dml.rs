@@ -138,7 +138,7 @@ fn dfs_down(clock_khz: Fx, vco_khz: Fx) -> Fx {
     quad.over(Fx::int(steps))
 }
 
-// ── dcn3_14_ip / dcn3_14_soc, and where dcn3_15 differs ([`Dcn`]) ──────
+// ── dcn3_14_ip / dcn3_14_soc, and where dcn3_15 / dcn3_2 differ ([`Dcn`]) ──────
 /// Which DCN's IP and SoC parameters, and which DML, the mode math follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dcn {
@@ -146,21 +146,29 @@ pub enum Dcn {
     Dcn314,
     /// Raphael: `dcn3_15_ip` / `dcn3_15_soc`, `display_mode_vba_31.c`.
     Dcn315,
+    /// Navi31 / Navi32: `dcn3_2_ip` / `dcn3_2_soc`, `display_mode_vba_32.c`.
+    Dcn320,
+    /// Navi33: same `dcn3_2_ip` / `dcn3_2_soc` as 3.2.0 (`dcn321_fpu.c`
+    /// reuses `DCN3_2_DEFAULT_DET_SIZE`; 3.2.1 differs only in the DIO
+    /// link-encoder instance, not the mode math).
+    Dcn321,
 }
 impl Dcn {
-    /// `det_buffer_size_kbytes`: `DCN3_14_DEFAULT_DET_SIZE` (384) or
-    /// `DCN3_15_DEFAULT_DET_SIZE` (192).
+    /// `det_buffer_size_kbytes`: `DCN3_14_DEFAULT_DET_SIZE` (384),
+    /// `DCN3_15_DEFAULT_DET_SIZE` (192) or `DCN3_2_DEFAULT_DET_SIZE` (256).
     pub const fn det_buffer_kbytes(self) -> u64 {
         match self {
             Self::Dcn314 => 384, // linux: n/a (dcn314_fpu.h DCN3_14_DEFAULT_DET_SIZE)
             Self::Dcn315 => 192, // linux: n/a (dcn31_fpu.h DCN3_15_DEFAULT_DET_SIZE)
+            Self::Dcn320 | Self::Dcn321 => 256, // linux: n/a (dcn321_fpu.c DCN3_2_DEFAULT_DET_SIZE)
         }
     }
-    /// `dcn_downspread_percent`: 0.5 or 0.38, in hundredths of a percent.
+    /// `dcn_downspread_percent`: 0.5, 0.38 or 0.5, in hundredths of a percent.
     const fn downspread_hundredths(self) -> i64 {
         match self {
             Self::Dcn314 => 50,
             Self::Dcn315 => 38,
+            Self::Dcn320 | Self::Dcn321 => 50, // linux: n/a (dcn3_2_soc.dcn_downspread_percent)
         }
     }
     /// `max_inter_dcn_tile_repeaters`.
@@ -168,6 +176,7 @@ impl Dcn {
         match self {
             Self::Dcn314 => 8,
             Self::Dcn315 => 9,
+            Self::Dcn320 | Self::Dcn321 => 8, // linux: n/a (dcn3_2_ip.max_inter_dcn_tile_repeaters)
         }
     }
     /// `sr_exit_z8_time_us` and `sr_enter_plus_exit_z8_time_us`, which the
@@ -176,11 +185,77 @@ impl Dcn {
         match self {
             Self::Dcn314 => (268, 393),
             Self::Dcn315 => (50, 50),
+            Self::Dcn320 | Self::Dcn321 => (285, 320), // linux: n/a (dcn3_2_soc.sr_exit_z8_time_us)
+        }
+    }
+    /// `line_buffer_size_bits` and `line_buffer_fixed_bpp`
+    /// (`is_line_buffer_bpp_fixed` is true on all three).
+    const fn line_buffer(self) -> (u64, u64) {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => (789_504, 48), // linux: n/a (dcn31_fpu.c dcn3_1_ip)
+            Self::Dcn320 | Self::Dcn321 => (1_171_920, 57), // linux: n/a (dcn3_2_ip)
+        }
+    }
+    /// `max_line_buffer_lines`.
+    const fn max_line_buffer_lines(self) -> i64 {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => 12, // linux: n/a (dcn31_fpu.c dcn3_1_ip)
+            Self::Dcn320 | Self::Dcn321 => 32, // linux: n/a (dcn3_2_ip.max_line_buffer_lines)
+        }
+    }
+    /// `round_trip_ping_latency_dcfclk_cycles` (`dcn3_1_soc`: 106;
+    /// `dcn3_2_soc`: 263).
+    const fn round_trip_ping_latency_dcfclk_cycles(self) -> i64 {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => 106,
+            Self::Dcn320 | Self::Dcn321 => 263,
+        }
+    }
+    /// `fabric_datapath_to_dcn_data_return_bytes` (`dcn3_1_soc`: 32;
+    /// `dcn3_2_soc`: 64).
+    const fn fabric_datapath_to_dcn_return_bytes(self) -> i64 {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => 32,
+            Self::Dcn320 | Self::Dcn321 => 64,
+        }
+    }
+    /// `pct_ideal_sdp_bw_after_urgent` (`dcn3_1_soc`: 80; `dcn3_2_soc`: 90).
+    const fn pct_ideal_sdp_after_urgent(self) -> i64 {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => 80,
+            Self::Dcn320 | Self::Dcn321 => 90,
+        }
+    }
+    /// `pct_ideal_dram_sdp_bw_after_urgent_pixel_only` (`dcn3_1_soc`: 65;
+    /// `dcn3_2_soc`: 20).
+    const fn pct_ideal_dram_after_urgent_pixel_only(self) -> i64 {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => 65,
+            Self::Dcn320 | Self::Dcn321 => 20,
+        }
+    }
+    /// `dppclk_delay_subtotal` (`dcn3_1_ip`: 46; `dcn3_2_ip`: 47).
+    const fn dppclk_delay_subtotal(self) -> i64 {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => 46,
+            Self::Dcn320 | Self::Dcn321 => 47,
+        }
+    }
+    /// `dppclk_delay_cnvc_formatter` (`dcn3_1_ip`: 27; `dcn3_2_ip`: 28).
+    const fn dppclk_delay_cnvc_formatter(self) -> i64 {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => 27,
+            Self::Dcn320 | Self::Dcn321 => 28,
+        }
+    }
+    /// `dispclk_delay_subtotal` (`dcn3_1_ip`: 119; `dcn3_2_ip`: 125).
+    const fn dispclk_delay_subtotal(self) -> i64 {
+        match self {
+            Self::Dcn314 | Self::Dcn315 => 119,
+            Self::Dcn320 | Self::Dcn321 => 125,
         }
     }
 }
-const LINE_BUFFER_SIZE_BITS: u64 = 789_504;
-const LINE_BUFFER_BPP: u64 = 48;
 const MAX_DCHUB_TO_PSCL_PIX_PER_CLK: i64 = 4;
 const MAX_PSCL_TO_LB_PIX_PER_CLK: i64 = 2;
 const MAX_SCL_RATIO: u32 = 6;
@@ -417,8 +492,9 @@ impl Config {
         if swath_bytes > det_bytes / 2 {
             return Err(Error::ViewportTooLarge);
         }
-        let line_buffer_limit = (LINE_BUFFER_SIZE_BITS * h_ratio.max(Fx::ONE).ceil() as u64)
-            / LINE_BUFFER_BPP
+        let (lb_bits, lb_bpp) = self.dcn.line_buffer();
+        let line_buffer_limit = (lb_bits * h_ratio.max(Fx::ONE).ceil() as u64)
+            / lb_bpp
             / (self.plane.v_taps as u64 + (v_ratio.ceil() as u64).saturating_sub(2));
         if swath_width > MAX_SWATH_WIDTH_LINEAR.min(line_buffer_limit) {
             return Err(Error::ViewportTooLarge);
@@ -525,25 +601,21 @@ impl Config {
 /// `pixel_chunk_size_kbytes`, `round_trip_ping_latency_dcfclk_cycles` and the
 /// `__DML_ARB_TO_RET_DELAY__` pair, plus the fabric/DRAM efficiency percentages.
 const PIXEL_CHUNK_KBYTES: i64 = 8;
-const ROUND_TRIP_PING_LATENCY_DCFCLK_CYCLES: i64 = 106;
 const ARB_TO_RET_DELAY_CYCLES: i64 = 7 + 95;
 const URGENT_OUT_OF_ORDER_BYTES_PER_CHANNEL: i64 = 4096;
-const FABRIC_DATAPATH_TO_DCN_RETURN_BYTES: i64 = 32;
-const PCT_IDEAL_SDP_AFTER_URGENT: i64 = 80;
-const PCT_IDEAL_DRAM_AFTER_URGENT_PIXEL_ONLY: i64 = 65;
 /// `urgent_latency_pixel_data_only_us`; the mixed and VM-only values match it,
 /// and `do_urgent_latency_adjustment` is false, so the max3 collapses.
+/// 4.0 µs on both the 3.1 and 3.2 SoCs.
 const URGENT_LATENCY_US_TENTHS: i64 = 40;
 /// Z8 self-refresh times stay from the SOC bounding box ([`Dcn::z8_us`]); only
 /// the three non-Z8 latencies are overridden per memory type.
-/// DPP and DISPCLK pipeline delays in clocks (`dppclk_delay_*`,
-/// `dispclk_delay_subtotal`), and `max_inter_dcn_tile_repeaters`.
-const DPPCLK_DELAY_SUBTOTAL: i64 = 46;
+/// The shared DPP/DISPCLK pipeline delays in clocks
+/// (`dppclk_delay_scl`, `dppclk_delay_scl_lb_only`,
+/// `dppclk_delay_cnvc_cursor` — 50 / 16 / 6 on both 3.1 and 3.2); the
+/// per-DCN subtotals live on [`Dcn`].
 const DPPCLK_DELAY_SCL: i64 = 50;
 const DPPCLK_DELAY_SCL_LB_ONLY: i64 = 16;
-const DPPCLK_DELAY_CNVC_FORMATTER: i64 = 27;
 const DPPCLK_DELAY_CNVC_CURSOR: i64 = 6;
-const DISPCLK_DELAY_SUBTOTAL: i64 = 119;
 /// `VBlankNomDefaultUS`, which only dml314's `CalculateMaxVStartup` reads.
 const VBLANK_NOM_DEFAULT_US: i64 = 668;
 /// `__DML_VBA_MIN_VSTARTUP__`, and the clamp
@@ -567,8 +639,6 @@ fn quarter_lines(value: Fx, line_time: Fx) -> Fx {
 /// computes with once the change cannot happen in vactive and p-state is
 /// locked.
 pub const DUMMY_PSTATE_LATENCY_US: i64 = 10;
-/// `max_line_buffer_lines`, 12 on both DCNs.
-const MAX_LINE_BUFFER_LINES: i64 = 12;
 
 /// `DRAMClockChangeSupport`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -622,11 +692,21 @@ impl Memory {
                 (Fx::ratio(1_165_333, 100_000), Fx::int(30), Fx::int(32))
             }
             (Dcn::Dcn315, _) => (Fx::int(129), Fx::ratio(115, 10), Fx::ratio(145, 10)),
+            // DCN 3.2's WM_A row (`dcn32_build_wm_range_table_fpu`): the
+            // p-state latency is the SoC bounding box's
+            // `dram_clock_change_latency_us` (400) and the self-refresh times
+            // are the box's own (42.97 / 49.94), for both memory kinds.
+            (Dcn::Dcn320 | Dcn::Dcn321, _) => {
+                (Fx::int(400), Fx::ratio(4297, 100), Fx::ratio(4994, 100))
+            }
         }
     }
     fn valid(&self) -> bool {
         self.channels > 0
-            && self.channels <= 16
+            // The cap is the largest channel count across the supported DCNs:
+            // `dcn3_2_soc.num_chans` is 24 (Navi31/32/33 GDDR6); 3.1 parts
+            // have fewer.
+            && self.channels <= 24
             && matches!(self.channel_width_bytes, 2 | 4 | 8)
             && self.speed_mts > 0
     }
@@ -705,17 +785,19 @@ impl Config {
     fn return_bandwidth(&self, memory: &Memory, clocks: &ClockState) -> Fx {
         let fabric_sdp = Fx::int(RETURN_BUS_WIDTH_BYTES)
             .times(mhz(clocks.dcfclk_khz))
-            .min(mhz(clocks.fclk_khz).times(Fx::int(FABRIC_DATAPATH_TO_DCN_RETURN_BYTES)));
+            .min(
+                mhz(clocks.fclk_khz).times(Fx::int(self.dcn.fabric_datapath_to_dcn_return_bytes())),
+            );
         let dram = Fx::int(memory.speed_mts as i64)
             .times(Fx::int(memory.channels as i64))
             .times(Fx::int(memory.channel_width_bytes as i64));
         // Scale by the integer percentage before dividing, as DML writes it: a
         // pre-rounded 0.80 multiplier is not exact in binary fixed point.
         fabric_sdp
-            .times(Fx::int(PCT_IDEAL_SDP_AFTER_URGENT))
+            .times(Fx::int(self.dcn.pct_ideal_sdp_after_urgent()))
             .over(Fx::int(100))
             .min(
-                dram.times(Fx::int(PCT_IDEAL_DRAM_AFTER_URGENT_PIXEL_ONLY))
+                dram.times(Fx::int(self.dcn.pct_ideal_dram_after_urgent_pixel_only()))
                     .over(Fx::int(100)),
             )
     }
@@ -726,7 +808,7 @@ impl Config {
         let reordering_bytes =
             Fx::int(memory.channels as i64).times(Fx::int(URGENT_OUT_OF_ORDER_BYTES_PER_CHANNEL));
         let bytes = reordering_bytes.plus(Fx::int(PIXEL_CHUNK_KBYTES * 1024));
-        Fx::int(ROUND_TRIP_PING_LATENCY_DCFCLK_CYCLES + ARB_TO_RET_DELAY_CYCLES)
+        Fx::int(self.dcn.round_trip_ping_latency_dcfclk_cycles() + ARB_TO_RET_DELAY_CYCLES)
             .over(mhz(clocks.dcfclk_khz))
             .plus(bytes.over(return_bw))
     }
@@ -796,11 +878,12 @@ impl Config {
         let v_ratio = geometry.v_ratio;
         let swath_width = Fx::int(geometry.swath_width.max(1) as i64);
         // LBLatencyHidingSourceLinesY.
-        let lb_lines = Fx::int(LINE_BUFFER_SIZE_BITS as i64)
-            .over(Fx::int(LINE_BUFFER_BPP as i64))
+        let (lb_bits, lb_bpp) = self.dcn.line_buffer();
+        let lb_lines = Fx::int(lb_bits as i64)
+            .over(Fx::int(lb_bpp as i64))
             .over(swath_width.over(geometry.h_ratio.max(Fx::ONE)))
             .floor()
-            .min(MAX_LINE_BUFFER_LINES)
+            .min(self.dcn.max_line_buffer_lines())
             - (self.plane.v_taps as i64 - 1);
         let lb_hiding = Fx::int(lb_lines.max(0)).over(v_ratio).times(line_time);
         let effective_det =
@@ -843,7 +926,10 @@ impl Config {
                     Fx::int(VBLANK_NOM_DEFAULT_US).over(line_time).floor() as u32;
                 vblank_actual.min(vblank_nom_default)
             }
-            Dcn::Dcn315 => vblank_actual,
+            // DCN 3.1.5 and 3.2 use the whole vblank:
+            // `display_mode_vba_31.c` and `display_mode_vba_32.c` have no
+            // `VBlankNomDefaultUS` bound (only `display_mode_vba_314.c` does).
+            Dcn::Dcn315 | Dcn::Dcn320 | Dcn::Dcn321 => vblank_actual,
         };
         vblank_size.saturating_sub(1).min(MAX_VSTARTUP)
     }
@@ -944,8 +1030,8 @@ impl Config {
         // DSTXAfterScaler: pipeline delay from the scaler to the OPTC, in
         // pixels. One DPP, no ODM and no DSC, so only the clock delays apply.
         let scaler_enabled = self.plane.h_taps > 1 || self.plane.v_taps > 1;
-        let dpp_cycles = DPPCLK_DELAY_SUBTOTAL
-            + DPPCLK_DELAY_CNVC_FORMATTER
+        let dpp_cycles = self.dcn.dppclk_delay_subtotal()
+            + self.dcn.dppclk_delay_cnvc_formatter()
             + if scaler_enabled {
                 DPPCLK_DELAY_SCL
             } else {
@@ -956,7 +1042,7 @@ impl Config {
             .times(pixel_clock)
             .over(mhz(clocks.dppclk_khz))
             .plus(
-                Fx::int(DISPCLK_DELAY_SUBTOTAL)
+                Fx::int(self.dcn.dispclk_delay_subtotal())
                     .times(pixel_clock)
                     .over(mhz(clocks.dispclk_khz)),
             );

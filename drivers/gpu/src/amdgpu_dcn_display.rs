@@ -538,6 +538,8 @@ impl Pipeline {
             match self.dcn {
                 crate::amdgpu_dml::Dcn::Dcn314 => crate::amdgpu_dcn_profile::Profile::Dcn314,
                 crate::amdgpu_dml::Dcn::Dcn315 => crate::amdgpu_dcn_profile::Profile::Dcn315,
+                crate::amdgpu_dml::Dcn::Dcn320 => crate::amdgpu_dcn_profile::Profile::Dcn320,
+                crate::amdgpu_dml::Dcn::Dcn321 => crate::amdgpu_dcn_profile::Profile::Dcn321,
             },
             &watermarks,
             frac_urg_bw_nom,

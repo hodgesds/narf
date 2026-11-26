@@ -57,6 +57,23 @@ pub struct Allocation {
     pub slots: u8,
 }
 
+/// The source half of a payload change: the link's allocation table with
+/// ACT, and a stream's VC rate. The DIO (`Source`) and HPO (`HpoSource`)
+/// owners both implement it, so the session ([`Link`]) drives either link
+/// type with the same sink-side flow.
+pub trait MstSource {
+    fn allocation(
+        &mut self,
+        transmitter: u8,
+        table: &[Allocation],
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send;
+    fn vc_rate(
+        &mut self,
+        fe: u8,
+        rate: (u32, u32),
+    ) -> impl core::future::Future<Output = Result<(), Error>> + Send;
+}
+
 /// The MST registers of the DIO blocks.
 #[derive(Clone, Copy, Debug)]
 pub struct Source {
@@ -70,12 +87,14 @@ impl Source {
     fn reg(&self, block: u8, r: u64) -> u64 {
         self.dcn2 + (r + u64::from(block) * STRIDE) * 4
     }
+}
+impl MstSource for Source {
     /// `dcn10_link_encoder_update_mst_stream_allocation_table` on
     /// `transmitter`'s link: rows 0..3 (unused rows source 0, no slots),
     /// the update with trigger, then up to 50 polls 10 us apart for the
     /// update to land and the 16-MTP keepout to pass. Linux carries on
     /// after the polls; so does this.
-    pub async fn allocation(&mut self, transmitter: u8, table: &[Allocation]) -> Result<(), Error> {
+    async fn allocation(&mut self, transmitter: u8, table: &[Allocation]) -> Result<(), Error> {
         if transmitter >= 6 || table.len() > MAX_STREAMS {
             return Err(Error::Invalid);
         }
@@ -106,7 +125,7 @@ impl Source {
     /// `enc1_stream_encoder_set_throttled_vcp_size` on frontend `fe`: X.Y
     /// time slots per MTP (Y in 1/2^26), then up to 50 polls 10 us apart
     /// for the rate to reach the link.
-    pub async fn vc_rate(&mut self, fe: u8, rate: (u32, u32)) -> Result<(), Error> {
+    async fn vc_rate(&mut self, fe: u8, rate: (u32, u32)) -> Result<(), Error> {
         let (x, y) = rate;
         if fe >= 6 || x > 0x3f || y > DP_MSE_RATE_Y {
             return Err(Error::Invalid);
@@ -267,7 +286,7 @@ impl Link {
     pub async fn add<A: MstAux<Error = Error>>(
         &mut self,
         aux: &mut A,
-        source: &mut Source,
+        source: &mut impl MstSource,
         transmitter: u8,
         sink: dp_mst_mgr::Sink,
         stream: u8,
@@ -346,7 +365,7 @@ impl Link {
     pub async fn remove<A: MstAux<Error = Error>>(
         &mut self,
         aux: &mut A,
-        source: &mut Source,
+        source: &mut impl MstSource,
         transmitter: u8,
         stream: u8,
         connected: bool,
