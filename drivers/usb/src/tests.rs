@@ -11170,6 +11170,10 @@ fn smoke_usb_uvc_stream_based_streamon_mpeg_e2e() -> TestResult {
     narf_drivers_video::devfs_bridge::__reset_for_test();
     crate::uvc::__reset_uvc_for_test();
     let transport = Arc::new(FixtureTransport::new(false, false, alloc::vec![]));
+    // The modelled 1.5 device's VC HEADER clock (48 MHz): GET_CUR answers it
+    // and COMMIT carries it — without this the fixture defaults to 0 and the
+    // byte-exact commit check fails on the clock bytes (26..30).
+    transport.set_clock(48_000_000);
     transport.set_max_video_frame_size(16);
     transport.set_framing_info(0);
     *UVC_FIXTURE_TRANSPORT.lock() = Some(transport.clone());
