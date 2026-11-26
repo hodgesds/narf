@@ -378,6 +378,73 @@ kernel_test_in!(
     "drivers/gpu/psp-boot",
     psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads
 );
+fn psp13_gpu() -> crate::amdgpu::AmdGpu {
+    crate::amdgpu_rdna3::tests::gpu()
+}
+fn psp13_profile_selects_navi31_sos_and_refuses_navi32_33() -> TestResult {
+    let gpu = psp13_gpu();
+    let (target, base) = profile(&gpu).unwrap();
+    if target != Target::Psp13_0_0 || base != 0 || target.name() != "amdgpu/psp_13_0_0_sos.bin" {
+        return TestResult::Fail("PSP13 firmware selection or mailbox base index");
+    }
+    // The 13.0.0 container parses under the new target and carries a TOC.
+    let mut bytes = container(3);
+    bytes[12] = 13;
+    let image = match target.parse(&bytes) {
+        Ok(image) => image,
+        Err(_) => return TestResult::Fail("PSP13 container did not parse"),
+    };
+    if image.toc().is_none() {
+        return TestResult::Fail("PSP13 container lost its TOC");
+    }
+    if !(Firmware {
+        target,
+        bytes: bytes.clone(),
+    })
+    .is_psp13()
+    {
+        return TestResult::Fail("PSP13 firmware not recognised as PSP13");
+    }
+    // Navi31 selects the 13.0.0 SOS; Navi32 and Navi33 are refused.
+    for profile_ in crate::amdgpu_rdna3::tests::Profile::ALL {
+        let mut g = psp13_gpu();
+        profile_.apply(&mut g);
+        match profile_.chip() {
+            crate::amdgpu_rdna3::Rdna3Chip::Navi31 => {
+                if profile(&g) != Ok((Target::Psp13_0_0, 0)) {
+                    return TestResult::Fail("Navi31 did not select the PSP13 SOS");
+                }
+            }
+            _ => {
+                if profile(&g).is_ok() {
+                    return TestResult::Fail("Navi32/33 accepted the PSP13 profile");
+                }
+            }
+        }
+    }
+    // Cross-target load refused: a PSP13 Bootloader rejects PSP14 firmware.
+    let mut gpu = psp13_gpu();
+    gpu.fb_bar = map();
+    gpu.vram.visible_size = map().len;
+    // SAFETY: bookkeeping only; profile and firmware mismatch reject all MMIO.
+    let pool = unsafe { Pool::from_owned_range(map(), 0x2_0000_0000) }.unwrap();
+    let cap = Cap::bootstrap();
+    cap.revoke();
+    // SAFETY: permanent inert maps; revoked cap prevents device accesses.
+    let mut boot = unsafe { Bootloader::new(&gpu, cap, &pool) }.unwrap();
+    let other = Firmware {
+        target: Target::Psp14_0_3,
+        bytes: container14(),
+    };
+    if run(boot.load(&other)) != Err(Error::Unsupported) || boot.state() != State::Prepared {
+        return TestResult::Fail("PSP13 accepted different-target firmware or started on mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-boot",
+    psp13_profile_selects_navi31_sos_and_refuses_navi32_33
+);
 fn psp_sos_container_versions_and_boundaries() -> TestResult {
     for minor in 0..=3 {
         let bytes = container(minor);

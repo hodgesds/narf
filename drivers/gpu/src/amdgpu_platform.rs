@@ -149,13 +149,35 @@ impl crate::amdgpu_psp_ring::RegWindow for VmWindow {
 
 /// `gc/gc_11_0_0_offset.h` serves every GC 11.0.x — `gfx_v11_0.c` includes it
 /// unconditionally — and puts `regGCVM_CONTEXT0_CNTL` at 0x1688 on
-/// `_BASE_IDX 0`, running to `regGCVM_CONTEXT15_CNTL` 0x1697.
+/// `_BASE_IDX 0`, running to `regGCVM_CONTEXT15_CNTL` 0x1697. Navi32's
+/// GC 11.0.3 is the exception: `gc_11_0_3_offset.h` puts the whole
+/// GCMC/GCVM block 0x10 higher (`amdgpu_gmc_navi31_regs`), so its
+/// CONTEXT0 sits at 0x1698.
 const GFXHUB_WINDOWS: &[VmWindow] = &[
     // gc_12_0_0_offset.h, GC12.0.1 (Navi48); GC12.0.0 (Navi44) is last.
     VmWindow {
         version: (12, 0, 1),
         base_idx: 0,
         ctx0_cntl: 0x1624,
+    },
+    // Navi31 (RX 7900), GC 11.0.0.
+    VmWindow {
+        version: (11, 0, 0),
+        base_idx: 0,
+        ctx0_cntl: 0x1688,
+    },
+    // Navi33 (RX 7600), GC 11.0.2: Linux drives it with the 11.0.0
+    // function table (`gmc_v11_0_set_gfxhub_funcs`).
+    VmWindow {
+        version: (11, 0, 2),
+        base_idx: 0,
+        ctx0_cntl: 0x1688,
+    },
+    // Navi32 (RX 7800 XT), GC 11.0.3: the block sits 0x10 higher.
+    VmWindow {
+        version: (11, 0, 3),
+        base_idx: 0,
+        ctx0_cntl: 0x1698,
     },
     // Phoenix1 (780M).
     VmWindow {
@@ -488,9 +510,22 @@ const DCN_2_1_0: SurfaceWindow = SurfaceWindow {
     version: (2, 1, 0),
     ..DCN_3_1_4
 };
+/// `dcn/dcn_3_2_0_offset.h` and `dcn_3_2_1_offset.h` agree with 3.1.4 on
+/// every register this scan reads (`amdgpu_dcn_inventory` groups
+/// Dcn320/Dcn321 with Dcn314; the Navi31 modeset fixture reads
+/// OTG_CONTROL at 0x1b41 with the 3.1.4 stride 0x80). Four pipes, as on
+/// 3.1.4.
+const DCN_3_2_0: SurfaceWindow = SurfaceWindow {
+    version: (3, 2, 0),
+    ..DCN_3_1_4
+};
+const DCN_3_2_1: SurfaceWindow = SurfaceWindow {
+    version: (3, 2, 1),
+    ..DCN_3_1_4
+};
 const SURFACE_WINDOWS: &[SurfaceWindow] = &[
-    DCN_3_0_2, DCN_3_0_3, DCN_3_1_4, DCN_3_1_5, DCN_3_5_0, DCN_3_0_0, DCN_4_0_1, DCN_4_1_0,
-    DCN_2_1_0,
+    DCN_3_0_2, DCN_3_0_3, DCN_3_1_4, DCN_3_1_5, DCN_3_2_0, DCN_3_2_1, DCN_3_5_0, DCN_3_0_0,
+    DCN_4_0_1, DCN_4_1_0, DCN_2_1_0,
 ];
 
 // Field masks. `dcn_3_1_4_sh_mask.h` and `dcn_3_5_0_sh_mask.h` agree on every
@@ -2938,13 +2973,35 @@ mod tests {
     /// row with no case is a window nothing has verified.
     fn platform_register_windows_match_the_amd_headers() -> TestResult {
         // `gc/gc_11_0_0_offset.h`: regGCVM_CONTEXT0_CNTL 0x1688 _BASE_IDX 0,
-        // regGCVM_CONTEXT15_CNTL 0x1697. Both GC 11.0.x revisions use it.
+        // regGCVM_CONTEXT15_CNTL 0x1697. Every GC 11.0.x revision uses it
+        // except 11.0.3: `gc/gc_11_0_3_offset.h` puts the whole GCMC/GCVM
+        // block 0x10 higher, CONTEXT0 at 0x1698 (CONTEXT15 0x16a7). No
+        // gc_11_0_2 header exists; Linux drives 11.0.2 with the 11.0.0
+        // function table (`gmc_v11_0_set_gfxhub_funcs` default).
         let gfxhub_expected = [
             // gc_12_0_0_offset.h: regGCVM_CONTEXT0_CNTL 0x1624 _BASE_IDX 0.
             VmWindow {
                 version: (12, 0, 1),
                 base_idx: 0,
                 ctx0_cntl: 0x1624,
+            },
+            // Navi31 (RX 7900), GC 11.0.0.
+            VmWindow {
+                version: (11, 0, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x1688,
+            },
+            // Navi33 (RX 7600), GC 11.0.2: same 11.0.0 table as Navi31.
+            VmWindow {
+                version: (11, 0, 2),
+                base_idx: 0,
+                ctx0_cntl: 0x1688,
+            },
+            // Navi32 (RX 7800 XT), GC 11.0.3: the block sits 0x10 higher.
+            VmWindow {
+                version: (11, 0, 3),
+                base_idx: 0,
+                ctx0_cntl: 0x1698,
             },
             VmWindow {
                 version: (11, 0, 1),
@@ -3173,6 +3230,21 @@ mod tests {
                 // _BASE_IDX 2 (HUBP1 0x6c1, OTG1/3_OTG_CONTROL 0x1bc1/0x1cc1).
                 SurfaceWindow {
                     version: (3, 1, 5),
+                    ..dcn314_expected
+                },
+                // dcn/dcn_3_2_0_offset.h and dcn_3_2_1_offset.h: every
+                // register this scan reads sits at the 3.1.4 offset on
+                // _BASE_IDX 2 (HUBP1_DCHUBP_CNTL 0x06cf, OTG1_OTG_CONTROL
+                // 0x1bc1), and both run 4 pipes (dcn32_resource.c and
+                // dcn321_resource.c both start `num_pipes = 4`). The two
+                // headers do move other blocks (ADR_CFG VUPDATE locks,
+                // HUBPREQ_DEBUG, MALL regs) — none of them is read here.
+                SurfaceWindow {
+                    version: (3, 2, 0),
+                    ..dcn314_expected
+                },
+                SurfaceWindow {
+                    version: (3, 2, 1),
                     ..dcn314_expected
                 },
                 dcn350_expected,

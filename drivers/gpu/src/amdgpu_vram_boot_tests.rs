@@ -964,6 +964,342 @@ fn navi48_vram_checks_gmc12_dcn4_and_training() -> TestResult {
     }
     TestResult::Pass
 }
+#[test]
+fn navi31_vram_checks_gmc11_dcn32_and_training() -> TestResult {
+    use crate::amdgpu::{ChipInfo, Family, VramInfo, NAVI31};
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, HW_ID_GC, HW_ID_MMHUB, MAX_BASE_ADDRS};
+    let mut regs = vec![0; 0x2000];
+    regs[0x1678] = (GPU_BASE >> 24) as u32;
+    regs[0x1679] = ((GPU_BASE + (16 << 30)) >> 24) as u32 - 1;
+    regs[0x15a7] = 0x80;
+    // DCN 3.2.0 copies the same triplet at 0x475..0x477.
+    regs[0x475] = regs[0x1678];
+    regs[0x476] = regs[0x1679];
+    regs[0x477] = regs[0x15a7];
+    for pipe in 0..4 {
+        // DCN 3.1.4 window: HUBP blank at 0x05f3, OTG_CONTROL at 0x1b41.
+        regs[0x05f3 + pipe * 0xdc] = 1;
+        regs[0x1b41 + pipe * 0x80] = 1;
+    }
+    // Region5 alias to the DMUB image: offset 40 MiB, 16 KiB shared state.
+    // (Region6 is RDNA4-only; Navi31 must not enable it.)
+    regs[0x1a2] = (1 << 31) | 0x3fff;
+    regs[0x198] = (40 * MIB) as u32;
+    regs[0x199] = (GPU_BASE >> 32) as u32;
+    let before = regs.clone();
+    let mut gpu = AmdGpu {
+        fb_bar: mapping(256 * MIB),
+        regs: MmioRegion {
+            virt: regs.as_mut_ptr() as u64,
+            len: regs.len() as u64 * 4,
+            ..mapping(0)
+        },
+        chip: ChipInfo {
+            vid: 0x1002,
+            did: NAVI31,
+            family: Family::Navi3,
+            asic: "navi31",
+            fw_name: "",
+            fw_list: &[],
+            revision: 0,
+            rev_id: 0,
+            mall_size: 0,
+        },
+        vram: VramInfo {
+            base: BAR_BASE,
+            size: 16 << 30,
+            visible_size: 256 * MIB,
+        },
+        mode: None,
+        backlight_percent: None,
+        fw_loaded: false,
+        gc_info: None,
+        ip_blocks: [
+            (HW_ID_GC, 11, 0, 0),
+            (HW_ID_DCN, 3, 2, 0),
+            (HW_ID_MMHUB, 3, 0, 0),
+        ]
+        .iter()
+        .map(|&(hw_id, major, minor, revision)| IpBlock {
+            hw_id,
+            instance: 0,
+            major,
+            minor,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: {
+                let mut bases = [0; MAX_BASE_ADDRS];
+                if hw_id == HW_ID_MMHUB {
+                    bases[0] = 0x1000;
+                }
+                bases
+            },
+            num_bases: 3,
+        })
+        .collect(),
+        vbios: Some(crate::amdgpu_vbios::tests::with_image(bios())),
+    };
+    let cap = Cap::bootstrap();
+    // SAFETY: owned RAM registers; BAR0 is never dereferenced by inventory.
+    if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.is_err() || regs != before {
+        return TestResult::Fail("GMC11/DCN32 inventory modified hardware or rejected a valid map");
+    }
+    // A live VM context in either hub is inherited state, not a free pool:
+    // GFX 0x1688..0x1697 at base 0, MMHUB 0x0740..0x074f at base 0x1000 dwords.
+    for reg in [0x1688, 0x1697, 0x1740, 0x174f] {
+        regs[reg] = 1;
+        // SAFETY: private RAM model; an active inherited VM must prevent allocation.
+        if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.err() != Some(Error::Busy) {
+            return TestResult::Fail("Navi31 plan accepted a live VM context");
+        }
+        regs[reg] = 0;
+    }
+    // The GMC and DCN triplets must agree, and the bar must cover the plan.
+    regs[0x477] += 1;
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
+        return TestResult::Fail("Navi31 plan accepted mismatched FB geometry");
+    }
+    regs[0x477] -= 1;
+    gpu.vram.size = 8 << 30;
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
+        return TestResult::Fail("Navi31 plan accepted a bar smaller than the framebuffer");
+    }
+    gpu.vram.size = 16 << 30;
+    // A fourth-pipe cursor is a protected client, not a free page. DCN 3.1.4
+    // window: cursor_control 0x0678, address 0x0679, size 0x067b; pipe 3
+    // strides by 3 * 0xdc.
+    regs[0x090c] = 1 | (2 << 8);
+    regs[0x090d] = (24 * MIB) as u32;
+    regs[0x090e] = (GPU_BASE >> 32) as u32;
+    regs[0x090f] = (64 << 16) | 64;
+    // SAFETY: same RAM-only read fixture.
+    let plan = match unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) } {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("Navi31 plan rejected a live cursor"),
+    };
+    if !plan
+        .protected()
+        .iter()
+        .any(|r| r.range == (24 * MIB..24 * MIB + 16384))
+    {
+        return TestResult::Fail("Navi31 plan dropped the fourth-pipe cursor");
+    }
+    // A live surface on pipe 0 is protected at its 14-bit viewport pitch:
+    // 4097-byte pitch, 100 rows, 4 bytes per pixel.
+    regs[0x05f3] = 0;
+    regs[0x05e5] = 8;
+    regs[0x05e7] = 0;
+    regs[0x05e9] = 0;
+    regs[0x05ea] = (100 << 16) | 1920;
+    regs[0x0607] = 0x1000;
+    regs[0x0609] = 0;
+    regs[0x060a] = (32 * MIB) as u32;
+    regs[0x060b] = (GPU_BASE >> 32) as u32;
+    regs[0x060e] = 0;
+    regs[0x060f] = 0;
+    regs[0x061a] = 0;
+    regs[0x0621] = 0;
+    regs[0x0622] = 0;
+    regs[0x0625] = 0;
+    regs[0x0626] = 0;
+    // SAFETY: same RAM-only read fixture.
+    let plan = match unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) } {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("Navi31 plan rejected a live surface"),
+    };
+    let size = 0x1001u64 * 100 * 4;
+    if !plan
+        .protected()
+        .iter()
+        .any(|r| r.range == (32 * MIB..32 * MIB + size))
+    {
+        return TestResult::Fail("Navi31 plan mismeasured the pipe-0 surface");
+    }
+    if plan.map().dmub != Some((40 * MIB, 0x4000)) {
+        return TestResult::Fail("Navi31 plan misplaced the DMUB Region5 window");
+    }
+    // Revoked authority refuses the plan before any register is read.
+    crate::amdgpu::revoke_authority();
+    // SAFETY: revoked authority must reject before dereferencing MMIO.
+    if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.err() != Some(Error::Revoked) {
+        return TestResult::Fail("Navi31 inventory bypassed capability invocation");
+    }
+    crate::amdgpu::grant_authority();
+    TestResult::Pass
+}
+
+/// Each Navi3 die carries its own GC framebuffer triplet: Navi31/33 at
+/// 0x1678/0x1679 (GC 11.0.0/11.0.2), Navi32 at 0x1688/0x1689 (GC 11.0.3,
+/// whose whole GCMC block sits 0x10 higher). A die driven with another
+/// die's triplet must fail closed.
+#[test]
+fn navi31_vram_per_die_fb_triplets() -> TestResult {
+    use crate::amdgpu::{ChipInfo, Family, VramInfo};
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, HW_ID_GC, HW_ID_MMHUB, MAX_BASE_ADDRS};
+    // DIDs from the KNOWN_DEVICES table (`amdgpu.rs`: Navi32 0x747E,
+    // Navi33 0x7480).
+    for (did, asic, gc, triplet) in [
+        (NAVI31, "navi31", (11u8, 0u8, 0u8), (0x1678u32, 0x1679u32)),
+        (
+            0x747Eu16,
+            "navi32",
+            (11u8, 0u8, 3u8),
+            (0x1688u32, 0x1689u32),
+        ),
+        (
+            0x7480u16,
+            "navi33",
+            (11u8, 0u8, 2u8),
+            (0x1678u32, 0x1679u32),
+        ),
+    ] {
+        let mut regs = vec![0; 0x2000];
+        regs[triplet.0 as usize] = (GPU_BASE >> 24) as u32;
+        regs[triplet.1 as usize] = ((GPU_BASE + (16 << 30)) >> 24) as u32 - 1;
+        regs[0x15a7] = 0x80;
+        regs[0x475] = regs[triplet.0 as usize];
+        regs[0x476] = regs[triplet.1 as usize];
+        regs[0x477] = regs[0x15a7];
+        for pipe in 0..4 {
+            regs[0x05f3 + pipe * 0xdc] = 1;
+            regs[0x1b41 + pipe * 0x80] = 1;
+        }
+        let gpu = AmdGpu {
+            fb_bar: mapping(256 * MIB),
+            regs: MmioRegion {
+                virt: regs.as_mut_ptr() as u64,
+                len: regs.len() as u64 * 4,
+                ..mapping(0)
+            },
+            chip: ChipInfo {
+                vid: 0x1002,
+                did,
+                family: Family::Navi3,
+                asic,
+                fw_name: "",
+                fw_list: &[],
+                revision: 0,
+                rev_id: 0,
+                mall_size: 0,
+            },
+            vram: VramInfo {
+                base: BAR_BASE,
+                size: 16 << 30,
+                visible_size: 256 * MIB,
+            },
+            mode: None,
+            backlight_percent: None,
+            fw_loaded: false,
+            gc_info: None,
+            ip_blocks: [
+                (HW_ID_GC, gc.0, gc.1, gc.2),
+                (HW_ID_DCN, 3, 2, 0),
+                (HW_ID_MMHUB, 3, 0, 0),
+            ]
+            .iter()
+            .map(|&(hw_id, major, minor, revision)| IpBlock {
+                hw_id,
+                instance: 0,
+                major,
+                minor,
+                revision,
+                sub_revision: 0,
+                variant: 0,
+                base_addrs: {
+                    let mut bases = [0; MAX_BASE_ADDRS];
+                    if hw_id == HW_ID_MMHUB {
+                        bases[0] = 0x1000;
+                    }
+                    bases
+                },
+                num_bases: 3,
+            })
+            .collect(),
+            vbios: Some(crate::amdgpu_vbios::tests::with_image(bios())),
+        };
+        let cap = Cap::bootstrap();
+        // SAFETY: owned RAM registers; BAR0 is never dereferenced by inventory.
+        if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.is_err() {
+            return TestResult::Fail("Navi3 die rejected its own framebuffer triplet");
+        }
+    }
+    // Navi32 driven with the Navi31 triplet: the GC bank reads zeros at
+    // 0x1688/0x1689 while DCN reports the Navi31 geometry.
+    let mut regs = vec![0; 0x2000];
+    regs[0x1678] = (GPU_BASE >> 24) as u32;
+    regs[0x1679] = ((GPU_BASE + (16 << 30)) >> 24) as u32 - 1;
+    regs[0x15a7] = 0x80;
+    regs[0x475] = regs[0x1678];
+    regs[0x476] = regs[0x1679];
+    regs[0x477] = regs[0x15a7];
+    for pipe in 0..4 {
+        regs[0x05f3 + pipe * 0xdc] = 1;
+        regs[0x1b41 + pipe * 0x80] = 1;
+    }
+    let gpu = AmdGpu {
+        fb_bar: mapping(256 * MIB),
+        regs: MmioRegion {
+            virt: regs.as_mut_ptr() as u64,
+            len: regs.len() as u64 * 4,
+            ..mapping(0)
+        },
+        chip: ChipInfo {
+            vid: 0x1002,
+            did: 0x747E,
+            family: Family::Navi3,
+            asic: "navi32",
+            fw_name: "",
+            fw_list: &[],
+            revision: 0,
+            rev_id: 0,
+            mall_size: 0,
+        },
+        vram: VramInfo {
+            base: BAR_BASE,
+            size: 16 << 30,
+            visible_size: 256 * MIB,
+        },
+        mode: None,
+        backlight_percent: None,
+        fw_loaded: false,
+        gc_info: None,
+        ip_blocks: [
+            (HW_ID_GC, 11, 0, 3),
+            (HW_ID_DCN, 3, 2, 0),
+            (HW_ID_MMHUB, 3, 0, 0),
+        ]
+        .iter()
+        .map(|&(hw_id, major, minor, revision)| IpBlock {
+            hw_id,
+            instance: 0,
+            major,
+            minor,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: {
+                let mut bases = [0; MAX_BASE_ADDRS];
+                if hw_id == HW_ID_MMHUB {
+                    bases[0] = 0x1000;
+                }
+                bases
+            },
+            num_bases: 3,
+        })
+        .collect(),
+        vbios: Some(crate::amdgpu_vbios::tests::with_image(bios())),
+    };
+    let cap = Cap::bootstrap();
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
+        return TestResult::Fail("Navi32 accepted the Navi31 framebuffer triplet");
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!(
     "drivers/gpu/vram",
     navi48_vram_checks_gmc12_dcn4_and_training

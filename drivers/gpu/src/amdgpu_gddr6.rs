@@ -597,6 +597,45 @@ impl Trainer {
             },
         })
     }
+    /// Allocate Navi31's PSP13 cold-training owner before any memory access.
+    ///
+    /// # Safety
+    /// Same exclusive GPU/PSP/HDP/index/reset ownership, client quiescence and
+    /// permanent exchange reservations as `new`, for a physical Navi31
+    /// instead. Navi32/33 are refused by the layout resolution itself
+    /// (`Kind::Navi31` admits only GC 11.0.0 / MP0 13.0.0). The bottom
+    /// 32 MiB preimage remains owned on cancellation or failure.
+    pub unsafe fn new_navi31(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        exchange: Training,
+    ) -> Result<Self, Error> {
+        let layout = crate::amdgpu_psp_ring::navi31_layout(gpu).map_err(|_| Error::Unsupported)?;
+        validate_exchange(
+            gpu.vram.size,
+            gpu.fb_bar.len.min(gpu.vram.visible_size),
+            exchange,
+        )?;
+        authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
+        Ok(Self {
+            engine: Engine {
+                io: Mmio {
+                    regs: gpu.regs,
+                    vram: gpu.fb_bar,
+                    size: gpu.vram.size,
+                    mp0: layout.mp0,
+                    nbio: layout.nbio,
+                    invalidate_reg: layout.invalidate_reg,
+                },
+                authority,
+                exchange,
+                backup_step: BACKUP_CHUNK,
+                backup: buffer(ENCROACHED)?,
+                cache: buffer(4096)?,
+                state: State::Prepared,
+            },
+        })
+    }
     pub fn state(&self) -> State {
         self.engine.state
     }

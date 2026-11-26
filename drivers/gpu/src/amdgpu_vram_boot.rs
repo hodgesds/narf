@@ -1,6 +1,6 @@
-//! Phoenix, Navi22 and Navi48 boot VRAM inventory. References: Linux
+//! Phoenix, Navi22, Navi31 and Navi48 boot VRAM inventory. References: Linux
 //! amdgpu_ttm.c, amdgpu_atomfirmware.c, atomfirmware.h and the DCN 3.1.4,
-//! 3.0.0 and 4.1.0 register headers.
+//! 3.0.0, 3.2.0 and 4.1.0 register headers.
 //! Firmware metadata and explicit boot/client ranges precede allocation.
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -145,6 +145,27 @@ impl Plan {
         // SAFETY: caller supplies the complete exclusive GPU/client contract.
         unsafe { Self::read_discrete(gpu, authority, boot_framebuffer, other_clients) }
     }
+    /// Inventory a Navi31/32/33 GMC11 aperture, four DCN 3.2 scanouts/cursors
+    /// and inherited DMUB windows. Both VM hubs must have no enabled contexts.
+    /// The per-die GC FB triplet resolves in `read_discrete` (Navi32's GCMC
+    /// block sits 0x10 higher); the DCN copy is 0x475..0x477 on all three
+    /// dies, as on DCN 3.1.4 (`amdgpu_dmub::Regs::DCN314`).
+    ///
+    /// # Safety
+    /// Same stable mappings, exclusive GPU and complete client inventory
+    /// contract as `read_navi22`. No hardware writes are performed.
+    pub unsafe fn read_navi31(
+        gpu: &AmdGpu,
+        authority: &Cap<BusDeviceCap, Write>,
+        boot_framebuffer: Option<Range<u64>>,
+        other_clients: &[Range<u64>],
+    ) -> Result<Self, Error> {
+        if crate::amdgpu_rdna3::Rdna3Chip::of(gpu).is_none() {
+            return Err(Error::Unsupported);
+        }
+        // SAFETY: caller supplies the complete exclusive GPU/client contract.
+        unsafe { Self::read_discrete(gpu, authority, boot_framebuffer, other_clients) }
+    }
     unsafe fn read_discrete(
         gpu: &AmdGpu,
         authority: &Cap<BusDeviceCap, Write>,
@@ -157,6 +178,7 @@ impl Plan {
         }
         let rdna2 = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did);
         let navi22 = rdna2.is_some();
+        let rdna3 = crate::amdgpu_rdna3::Rdna3Chip::of(gpu);
         let rdna4 = crate::amdgpu_rdna4::Rdna4Chip::of(gpu);
         // GC MC_VM_FB_LOCATION_BASE/TOP and MC_VM_FB_OFFSET, then DCN's copy
         // DCN_VM_FB_LOCATION_BASE/TOP and DCN_VM_FB_OFFSET (BASE_IDX 2):
@@ -171,6 +193,22 @@ impl Plan {
                     // linux: mmGCMC_VM_FB_LOCATION_BASE@gc; mmGCMC_VM_FB_LOCATION_TOP@gc; mmGCMC_VM_FB_OFFSET@gc
                     [0x16fc, 0x16fd, 0x16e7],
                     0x493, // linux-lit: 0x493=mmDCN_VM_FB_LOCATION_BASE@dcn
+                )
+            }
+            _ if rdna3.is_some() => {
+                let chip = rdna3.unwrap();
+                (
+                    chip.gc_version(),
+                    &[(3, 2, 0), (3, 2, 1)],
+                    // gc_11_0_0_offset.h serves Navi31 and Navi33; Navi32's
+                    // GCMC block sits 0x10 higher (amdgpu_gmc_navi31_regs
+                    // GFX_11_0_3). DCN 3.2 shares DCN 3.1.4's FB offsets
+                    // (amdgpu_dmub Regs::DCN314 covers 3.1.5/3.2.0/3.2.1).
+                    match chip {
+                        crate::amdgpu_rdna3::Rdna3Chip::Navi32 => [0x1688, 0x1689, 0x15a7],
+                        _ => [0x1678, 0x1679, 0x15a7],
+                    },
+                    0x475,
                 )
             }
             // gc_12_0_0_offset.h serves both RDNA4 dies.
@@ -234,7 +272,11 @@ impl Plan {
                         dcn30: navi22,
                         // amdgpu_gmc_vram_location: fb_end = fb_start +
                         // mc_vram_size - 1, mc_vram_size from MEMSIZE.
-                        size: navi22.then_some(gpu.vram.size),
+                        // GMC v11 derives the end from MEMSIZE exactly as
+                        // GMC v10 does (its FB TOP is never consulted;
+                        // amdgpu_gmc_navi31_regs HubRegs.fb_top), so the
+                        // Navi3 arm takes the size like the Navi22 one.
+                        size: (navi22 || rdna3.is_some()).then_some(gpu.vram.size),
                     },
                     // SAFETY: DCN bank bounds every window register read.
                     |reg| unsafe { gpu.regs.read32(dcn + reg as u64 * 4) },
