@@ -4,6 +4,19 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
 const OWN: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 2];
+
+/// WMM Parameter element (subtype 1), copied from
+/// `wmm_tests::PARAMETERS` (that module is private to
+/// `firmware_transport_tests`). The WMM Information element
+/// (`wmm::INFORMATION`, subtype 0) does NOT engage the native
+/// path: `wmm::Parameters::parse` returns `None` for an
+/// Information-only stream, so `prepare_native` sees
+/// `wmm_present == false` and builds the plan with no local PHY —
+/// no HT profile. A real AP beacon carries the Parameter element.
+const WMM_PARAMETERS: [u8; 26] = [
+    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 0x03, 0xa4, 0, 0, 0x42, 0x43, 94,
+    0, 0x27, 0xa4, 0, 0,
+];
 fn bss(wpa2: bool) -> ScanBss {
     let mut information_elements = vec![
         0, 4, b'n', b'a', b'r', b'f', 1, 4, 0x82, 0x84, 0x8b, 0x96, 3, 1, 6,
@@ -698,13 +711,14 @@ fn mt76_uni_station_join_caps_mirror() -> TestResult {
     // the test-facing `JoinPlan::prepare` never negotiates PHY
     // (local PHY is `None`), so a plan built on it carries no HT
     // profile and both records lack the HT TLV. The BSS carries a
-    // WMM Information element: without it the HT branch never
+    // WMM Parameter element: without it the HT branch never
     // engages (`prepare_native_common` and `offer_ht20` both
-    // require `wmm_present`); the association response carries one
-    // too (the response re-parses WMM and cancels without it).
+    // require `wmm_present`, and an Information IE alone parses
+    // to `None`); the association response carries one too (the
+    // response re-parses WMM and cancels without it).
     let mut ies = bss(false).information_elements;
     ies.extend_from_slice(&ht_elements(6));
-    ies.extend_from_slice(&narf_wireless::wmm::INFORMATION);
+    ies.extend_from_slice(&WMM_PARAMETERS);
     let bss = ScanBss {
         information_elements: ies,
         ..bss(false)
@@ -729,7 +743,7 @@ fn mt76_uni_station_join_caps_mirror() -> TestResult {
     plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
         .unwrap();
     let mut body = vec![1, 0, 0, 0, 42, 0xc0, 1, 4, 0x82, 0x84, 0x8b, 0x96];
-    body.extend_from_slice(&narf_wireless::wmm::INFORMATION);
+    body.extend_from_slice(&WMM_PARAMETERS);
     body.extend_from_slice(&ht_elements(6));
     if plan.association_response(&reply(0x10, &body)) != Ok(Some(42)) {
         return TestResult::Fail("HT association response rejected");
