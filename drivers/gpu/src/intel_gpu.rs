@@ -3147,24 +3147,6 @@ enum MtlPublication {
     Withdraw(u64),
 }
 
-/// The console GGTT window (`scanout_gtt_offset`) of stream `stream` of the
-/// route in slot `slot`. Every surface lit at the same time needs its own
-/// window: an allocation at a window's offset rewrites that window's PTEs,
-/// so two surfaces in one window would scan out the last one's pages. Slot
-/// 0's streams (one SST/HDMI route, or up to three MST streams) take Pipe
-/// B, C and D's windows in order; slot 1 (a second concurrent route, never
-/// beside MST) takes Pipe C's. `None` past the last window.
-fn mtl_scanout_window(slot: usize, stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
-    use crate::intel_gpu_pipes::Pipe;
-    match (slot, stream) {
-        (0, 0) => Some(Pipe::B),
-        (0, 1) => Some(Pipe::C),
-        (0, 2) => Some(Pipe::D),
-        (1, 0) => Some(Pipe::C),
-        _ => None,
-    }
-}
-
 /// One MTL external hotplug pass: poll the owned hotplug source; when an
 /// event arrives run `before_event` (the panel's KMS pre-update: FBC and
 /// PSR leave Pipe A before it may be repartitioned), let the route owner
