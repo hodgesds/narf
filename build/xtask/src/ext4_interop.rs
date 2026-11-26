@@ -7,7 +7,9 @@
 //!    filesystem with the host's default features, its directories indexed
 //!    by `e2fsck -fyD`. `cryptsetup luksFormat` takes a volume key xtask
 //!    chose, so the host can encrypt the payload itself (AES-XTS, plain64)
-//!    with no device mapper.
+//!    with no device mapper. The keyslots are the 21ME's too: the
+//!    passphrase in slot 0 and a keyfile in slot 1, with the iteration
+//!    counts its installer's cryptsetup chose.
 //! 2. Boot NARF on it under `narf.disks=root-rw root=UUID=<container>
 //!    rd.luks.uuid=<container> rd.luks.prompt=console`. When the prompt
 //!    appears, type the passphrase on the emulated PS/2 keyboard through the
@@ -45,6 +47,11 @@ const ESP_MIB: u64 = 32;
 const EXT4_MIB: u64 = 192;
 /// LUKS1's payload offset for a 512-bit key (4096 sectors).
 const PAYLOAD_SECTORS: u64 = 4096;
+/// The 21ME's keyslot iterations (`cryptsetup luksDump`): its installer's
+/// 2-second default on a Ryzen 7 PRO 8840HS. Slot 0 is over the 10M bound
+/// NARF used to apply.
+const SLOT0_ITERATIONS: &str = "10880166";
+const SLOT1_ITERATIONS: &str = "9686614";
 const ESP_START: u64 = 2048;
 
 // Must match `narf_drivers_fs_ext2::interop`.
@@ -222,13 +229,27 @@ fn build_luks(work: &Path, ext4: &Path, key: &[u8; 64], out: &Path) -> Result<()
                 "--hash",
                 "sha256",
             ])
-            .args(["--pbkdf-force-iterations", "1000", "--uuid", LUKS_UUID])
+            .args(["--pbkdf-force-iterations", SLOT0_ITERATIONS])
+            .args(["--uuid", LUKS_UUID])
             .arg("--volume-key-file")
             .arg(&key_file)
             .arg("--key-file")
             .arg(&pass_file)
             .arg(out),
         "cryptsetup luksFormat",
+    )?;
+    // The second slot CachyOS's installer adds for GRUB's keyfile.
+    let keyfile = work.join("crypto_keyfile.bin");
+    std::fs::write(&keyfile, pattern(0x4b46_494c, 64))?;
+    run(
+        Command::new("cryptsetup")
+            .args(["luksAddKey", "--batch-mode"])
+            .args(["--pbkdf-force-iterations", SLOT1_ITERATIONS])
+            .arg("--key-file")
+            .arg(&pass_file)
+            .arg(out)
+            .arg(&keyfile),
+        "cryptsetup luksAddKey",
     )?;
     let dump = run(
         Command::new("cryptsetup").arg("luksDump").arg(out),

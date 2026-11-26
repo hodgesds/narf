@@ -93,8 +93,8 @@ pub struct Luks2UnlockPolicy {
 impl Default for Luks2UnlockPolicy {
     fn default() -> Self {
         Self {
-            max_pbkdf2_iterations: 10_000_000,
-            max_total_pbkdf2_iterations: 25_000_000,
+            max_pbkdf2_iterations: crate::luks1::DEFAULT_MAX_PBKDF2_ITERATIONS,
+            max_total_pbkdf2_iterations: crate::luks1::DEFAULT_MAX_TOTAL_PBKDF2_ITERATIONS,
             max_argon2_memory_kib: 1024 * 1024,
             max_argon2_time: 16,
             max_argon2_cpus: 64,

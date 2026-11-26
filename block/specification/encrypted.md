@@ -92,10 +92,17 @@ material is decrypted with a relative sector tweak beginning at zero, merged
 with the LUKS anti-forensic diffuser, then authenticated against `mkDigest`
 before the payload mapping becomes visible.
 
-The default policy rejects any single PBKDF2 invocation over 10,000,000
-iterations, more than 25,000,000 aggregate iterations across enabled slots,
-or any keyslot allocation over 16 MiB. Callers may lower the work bounds, but
-raising them is an explicit availability tradeoff. Parsing and open are
+The default policy rejects any single PBKDF2 invocation over 50,000,000
+iterations, more than 125,000,000 aggregate iterations across the keyslots
+actually tried, and any keyslot allocation over 16 MiB. Keyslots are tried in
+order and the first that opens wins, as cryptsetup's `LUKS_open_key_with_hdr`
+does; each attempt, its keyslot PBKDF2 plus the master-key digest check, is
+charged before it runs. cryptsetup itself sets no upper bound. It sizes a
+keyslot to its 2-second default on the machine that formats it: a ThinkPad
+P14s Gen 5 AMD installer header has 10,880,166 iterations in slot 0, which
+the earlier 10,000,000 bound refused. The LUKS2 PBKDF2 bounds are the same.
+Callers may lower the work bounds, but raising them is an explicit
+availability tradeoff. Parsing and open are
 read-only with respect to LUKS metadata.
 
 ### 3.2 Existing LUKS2 volumes

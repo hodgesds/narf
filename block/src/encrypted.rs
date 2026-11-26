@@ -137,8 +137,17 @@ pub fn open_luks_with_provider(
     let info = probe_luks_volume(inner.as_ref())?.ok_or(LuksOpenError::NotLuks)?;
     let (provider, attempts) = (*LUKS_PASSPHRASE_PROVIDER.lock())
         .ok_or(LuksOpenError::Credential(LuksCredentialError::Unavailable))?;
+    use core::fmt::Write as _;
     for attempt in 0..attempts {
         let passphrase = provider(&info).map_err(LuksOpenError::Credential)?;
+        // Deriving the key is software PBKDF2 sized for cryptsetup's
+        // 2 seconds; here it takes several times that, so say what the
+        // pause is.
+        let _ = writeln!(
+            narf_console::PriorityWriter::<1>,
+            "Unlocking LUKS {}...",
+            info.uuid
+        );
         let result = match info.version {
             LuksVersion::Luks1 => EncryptedBlockDevice::open_luks1(inner.clone(), &passphrase)
                 .map_err(LuksOpenError::Luks1),
@@ -157,7 +166,6 @@ pub fn open_luks_with_provider(
         }
         // cryptsetup's wording, at the boot prompt's KERN_ALERT level so it
         // shows wherever the prompt does.
-        use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::PriorityWriter::<1>,
             "No key available with this passphrase."
