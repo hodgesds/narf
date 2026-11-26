@@ -133,8 +133,8 @@
 //! the main program no longer verifies. A pipe program that does not
 //! verify is not enabled. DC3CO and DC9 are never targeted. Program
 //! loss found at re-entry is repaired by a reload before the next
-//! attempt. The DMC wakelock (`intel_dmc_wl`, on by default on display
-//! >= 30) is not used: every display access holds `DC_off` instead. The
+//! attempt. The DMC wakelock (`intel_dmc_wl`, on by default from display
+//! 30) is not used: every display access holds `DC_off` instead. The
 //! wakelock is only required once its mode is enabled in `DMC_WAKELOCK_CFG`
 //! (Linux's DOC comment), which only the driver does when it enables
 //! DC5/DC6, so with the mode off a `DC_STATE_EN` write still exits the DC

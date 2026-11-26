@@ -1060,6 +1060,11 @@ impl Owner {
 
     async fn run(self: Arc<Self>) {
         let mut attempts = 0;
+        // The card takes one render backend for the owner's life: publish it
+        // after the first successful bring-up only. A bring-up after a full
+        // GT reset reuses it (a second install fails), and a bring-up that
+        // succeeds after a failed attempt still publishes it.
+        let mut published = false;
         loop {
             if let Err(error) = self.bring_up().await {
                 let _ = error;
@@ -1072,12 +1077,13 @@ impl Owner {
                 self.tear_down().await;
                 continue;
             }
-            if attempts == 0 {
+            if !published {
                 let backend = Arc::new(Backend(self.clone()));
                 if self.card.install_user_backend(backend).is_err() {
                     log(self.index, "render backend already installed");
                     return;
                 }
+                published = true;
                 log(self.index, "engines published");
             }
             attempts = 0;

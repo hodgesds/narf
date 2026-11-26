@@ -2975,9 +2975,9 @@ fn legacy_external_routes_stopped(bar: &MmioRegion) -> bool {
 // the serial-matched publication. The GTT allocator has no free path, so
 // one allocation is retained per BAR and reused whenever the next mode
 // fits; it lives in the pipe-B console GGTT window so it can never remap
-// the internal panel's pipe-A window (the route runs on Pipe B, C or D next
-// to the lit panel; only it uses those pipes on display 14, so the one
-// retained window is never shared). Gen12 never reaches this glue: every
+// the internal panel's pipe-A window. An MST route's further streams take
+// Pipe C's and D's windows (`mtl_scanout_window`), so no two lit surfaces
+// share one. Gen12 never reaches this glue: every
 // entry returns before register access unless the probed generation is
 // Meteor Lake.
 
@@ -3022,6 +3022,23 @@ enum MtlPublication {
     Withdraw(u64),
 }
 
+/// The console GGTT window (`scanout_gtt_offset`) of the `stream`th surface
+/// a display-14+ external pass lights. Every surface lit at the same time
+/// needs its own window: an allocation at a window's offset rewrites that
+/// window's PTEs, so two surfaces in one window would both scan out the last
+/// one's pages. The SST/HDMI route's surface, or MST stream 0, takes Pipe
+/// B's window; MST streams 1 and 2 take Pipe C's and D's. `None` past the
+/// last window.
+fn mtl_scanout_window(stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
+    use crate::intel_gpu_pipes::Pipe;
+    match stream {
+        0 => Some(Pipe::B),
+        1 => Some(Pipe::C),
+        2 => Some(Pipe::D),
+        _ => None,
+    }
+}
+
 /// One MTL external hotplug pass: poll the owned hotplug source; when an
 /// event arrives run `before_event` (the panel's KMS pre-update: FBC and
 /// PSR leave Pipe A before it may be repartitioned), let the route owner
@@ -3039,7 +3056,7 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     display: &crate::intel_gpu_xelpg_external::MtlDisplay,
     before_event: &mut dyn FnMut(),
     after_event: &mut dyn FnMut(),
-    alloc: &mut dyn FnMut(u64) -> Option<ScanoutAllocation>,
+    alloc: &mut dyn FnMut(crate::intel_gpu_pipes::Pipe, u64) -> Option<ScanoutAllocation>,
     publication: &mut dyn FnMut(MtlPublication),
 ) -> bool {
     use crate::intel_gpu_xelpg_external::ServiceOutcome;
@@ -3052,6 +3069,7 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     let mut alloc_fb = |mode: &crate::intel_gpu_modeset::Mode| {
         let index = next_scanout;
         next_scanout = next_scanout.checked_add(1)?;
+        let window = mtl_scanout_window(index)?;
         let width = u32::from(mode.h_active);
         let size = scanout_size_bytes(width, u32::from(mode.v_active));
         let reuse = if index == 0 {
@@ -3070,7 +3088,7 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
         let allocation = match reuse {
             Some(retained) => retained,
             None => {
-                let fresh = alloc(size)?;
+                let fresh = alloc(window, size)?;
                 if index == 0 {
                     *MTL_SCANOUT.lock() = Some((bar, fresh));
                 } else {
@@ -3144,7 +3162,7 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     display: &crate::intel_gpu_xelpg_external::MtlDisplay,
     before_event: &mut dyn FnMut(),
     after_event: &mut dyn FnMut(),
-    alloc: &mut dyn FnMut(u64) -> Option<ScanoutAllocation>,
+    alloc: &mut dyn FnMut(crate::intel_gpu_pipes::Pipe, u64) -> Option<ScanoutAllocation>,
     publication: &mut dyn FnMut(MtlPublication),
 ) -> bool {
     let Some(profile) =
@@ -3220,9 +3238,10 @@ fn service_mtl_display(before_event: &mut dyn FnMut(), after_event: &mut dyn FnM
             gpu.chip.generation,
             Generation::LunarLake | Generation::PantherLake
         );
-        let mut alloc_fn = |size| {
-            let offset =
-                crate::intel_gpu_multipipe::scanout_gtt_offset(crate::intel_gpu_pipes::Pipe::B);
+        // Each concurrently lit surface takes its own console GGTT window
+        // (`mtl_scanout_window`).
+        let mut alloc_fn = |window: crate::intel_gpu_pipes::Pipe, size| {
+            let offset = crate::intel_gpu_multipipe::scanout_gtt_offset(window);
             let alloc = if xe2_scanout {
                 crate::intel_gpu_gtt::alloc_contiguous_scanout_with_format(
                     &gtt,
@@ -4696,7 +4715,7 @@ pub mod tests {
         // stays refused for the contended pass.
         let mid_pass: core::cell::RefCell<Vec<(bool, bool)>> = core::cell::RefCell::new(Vec::new());
         let mut published: Vec<MtlPublication> = Vec::new();
-        let mut alloc = |size: u64| {
+        let mut alloc = |_window: crate::intel_gpu_pipes::Pipe, size: u64| {
             sizes.borrow_mut().push(size);
             mid_pass.borrow_mut().push((
                 crate::intel_gpu_xelpg_external::routes_stopped(),
@@ -4855,7 +4874,7 @@ pub mod tests {
             return TestResult::Fail("HDMI hook test needs fresh MTL owners");
         }
         let mut published: Vec<MtlPublication> = Vec::new();
-        let mut alloc = |size: u64| {
+        let mut alloc = |_window: crate::intel_gpu_pipes::Pipe, size: u64| {
             Some(ScanoutAllocation {
                 gtt_offset: 0x100_0000,
                 phys_base: 0x7_1000_0000,
@@ -4911,5 +4930,34 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu",
         smoke_mtl_external_hook_pass_publishes_and_retires_hdmi_route
+    );
+
+    /// Every surface an MTL external pass lights at the same time gets its
+    /// own console GGTT window: the route's (or MST stream 0's) in Pipe B's,
+    /// MST streams 1 and 2 in Pipe C's and D's, none past that. The windows
+    /// are one `CONSOLE_SCANOUT_WINDOW_BYTES` stride apart above Pipe A's,
+    /// so an allocation in one never rewrites another's PTEs.
+    fn smoke_mtl_external_streams_take_distinct_ggtt_windows() -> TestResult {
+        use crate::intel_gpu_multipipe::scanout_gtt_offset;
+        use crate::intel_gpu_pipes::Pipe;
+        let windows: alloc::vec::Vec<_> = (0..4).map(mtl_scanout_window).collect();
+        if windows != [Some(Pipe::B), Some(Pipe::C), Some(Pipe::D), None] {
+            return TestResult::Fail("streams 0..2 take Pipe B, C, D; stream 3 none");
+        }
+        let stride = crate::intel_gpu_gtt::CONSOLE_SCANOUT_WINDOW_BYTES;
+        let base = crate::intel_gpu_gtt::SCANOUT_GTT_OFFSET_PIPE_A;
+        let offsets: alloc::vec::Vec<u64> = windows
+            .iter()
+            .flatten()
+            .map(|p| scanout_gtt_offset(*p))
+            .collect();
+        if offsets != [base + stride, base + 2 * stride, base + 3 * stride] {
+            return TestResult::Fail("each window sits one stride above the last, above Pipe A's");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_mtl_external_streams_take_distinct_ggtt_windows
     );
 }
