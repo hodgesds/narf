@@ -38,6 +38,12 @@ pub struct Dsc32 {
 impl Dsc32 {
     /// Bind the DSC engines at DCN base index 2. Refuses any profile that
     /// is not DCN 3.2 — the power registers differ on every other DCN.
+    ///
+    /// Consumed only by the kernel-test suite below, which clippy's
+    /// lib/test configs do not enable; do not delete — this is the
+    /// owner's constructor, wired by the modeset lane that lands the
+    /// 3.2 DSC path.
+    #[allow(dead_code)]
     pub(crate) fn bind(regs: Regs, dcn2: u64, profile: Profile) -> Result<Self, Error> {
         if !matches!(profile, Profile::Dcn320 | Profile::Dcn321) {
             return Err(Error::Unsupported);

@@ -693,7 +693,10 @@ pub(crate) mod tests {
         {
             return TestResult::Fail("OTG2 divider rejected");
         }
-        if dccg.io.bank1[OTG_PIXEL_RATE_DIV as usize] != 0b110 | (0b011 << 6) {
+        // OTG2's three-bit field is K1 at bit 6, K2 at bits 7-8: By1
+        // codes 0, By2 codes 1, so the field is 0 | (1 << 1) = 0b010 —
+        // not 0b011, which would wrongly set the K1 bit (By1 codes 0).
+        if dccg.io.bank1[OTG_PIXEL_RATE_DIV as usize] != 0b110 | (0b010 << 6) {
             return TestResult::Fail("OTG2 divider clobbered OTG0");
         }
         // Reprogramming the same dividers is a no-op: Linux reads back first.

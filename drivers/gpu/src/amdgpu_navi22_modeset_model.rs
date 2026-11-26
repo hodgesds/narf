@@ -163,6 +163,19 @@ impl Model {
             let gated = s.get(d2(0x80 + 2 * domain)) & 1 << 8 != 0;
             return if gated { 2 << 30 } else { 0 };
         }
+        if let Some(k) = instance(dword, d2(0x8a), 2, 4) {
+            // DOMAIN16-19_PG_STATUS (dcn_3_2_0_offset.h: 0x8a + 2k):
+            // off (2) while POWER_GATE is set in the matching CONFIG at
+            // 0x89 + 2k. The 0x81-based branch above does not cover these
+            // — DOMAIN16_PG_STATUS is 0x8a, not 0x81 + 2*16 — so a DCN
+            // 3.2 DSC power-off wait would read a stored 0 and time out.
+            // The first branch is left untouched: it also matches the
+            // DSC config dwords (0x89 + 2k read as domain 4 + k), but
+            // only the status reads gate the wait, and those never match
+            // it (odd offsets from 0x81).
+            let gated = s.get(d2(0x89 + 2 * k)) & 1 << 8 != 0;
+            return if gated { 2 << 30 } else { 0 };
+        }
         if instance(dword, d3(0x0d), 0x20, 6).is_some() {
             return 1; // MPCC_IDLE
         }

@@ -18,15 +18,16 @@
 //! WritebackDelay/TSetup (`display_mode_vba_32.c`) are likewise a remainder
 //! — see `amdgpu_dml_regs.rs`.
 //!
-//! Memory: Navi31/32/33 carry GDDR6, which the shared [`MemoryKind`] has no
+//! Memory: Navi31/32/33 carry GDDR6, which the shared
+//! [`crate::amdgpu_dml::MemoryKind`] has no
 //! variant for. On DCN 3.2 the WM_A latencies are identical for both kinds,
-//! so the caller passes [`MemoryKind::Ddr5`] as the stand-in; the channel
+//! so the caller passes [`crate::amdgpu_dml::MemoryKind::Ddr5`] as the stand-in; the channel
 //! count (24) and width (2 bytes) are the binding platform values from
 //! `dcn3_2_soc` and are checked here.
 
 use crate::amdgpu_dml::{
-    ClockState, Config, Dcn, DramChangeSupport, Error, Geometry, Memory, MemoryKind, Prefetch,
-    Requirements, Watermarks,
+    ClockState, Config, Dcn, DramChangeSupport, Error, Geometry, Memory, Prefetch, Requirements,
+    Watermarks,
 };
 
 /// `dcn3_2_soc` clock ceilings, in kHz (`dcn32_fpu.c`).
@@ -127,7 +128,7 @@ impl Dml32 {
 #[cfg(feature = "kernel-test")]
 pub(crate) mod tests {
     use super::*;
-    use crate::amdgpu_dml::{Format, Plane, Timing};
+    use crate::amdgpu_dml::{Format, MemoryKind, Plane, Timing};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn mode_4k60() -> (Config, Memory, ClockState) {
