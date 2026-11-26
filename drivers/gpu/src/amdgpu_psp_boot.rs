@@ -1,6 +1,8 @@
-//! Discrete RDNA2/PSP11 and Navi48/PSP14 secure-OS bootstrap. Protocol follows Linux
-//! `psp_v11_0.c` and `psp_v14_0.c`: C2PMSG35 command/status, C2PMSG36 GPU address in MiB,
-//! C2PMSG81 SOS heartbeat, all at MP0 base index **0** (not PSP13's index 1).
+//! Discrete RDNA2/PSP11, Navi31/PSP13 and Navi48/PSP14 secure-OS bootstrap.
+//! Protocol follows Linux `psp_v11_0.c`, `psp_v13_0.c` and `psp_v14_0.c`:
+//! C2PMSG35 command/status, C2PMSG36 GPU address in MiB, C2PMSG81 SOS
+//! heartbeat, all at MP0 base index **0** (not Phoenix PSP13's index 1;
+//! Navi31's MP0 13.0.0 is index 0, `soc21.c`).
 //! This requires initialized VRAM; it does not perform memory training,
 //! create a GPCOM ring, allocate a TMR, or load graphics/SMC firmware.
 use crate::{
@@ -54,6 +56,13 @@ pub struct Firmware {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
     Rdna2(&'static crate::amdgpu_rdna2::Profile),
+    /// Navi31 only (GC 11.0.0, MP0 13.0.0). Navi32/33 are refused by the
+    /// `profile` guard: per-die scoping, their bring-up is a follow-up
+    /// lane, not a silent extension. The kicker variant is deliberately
+    /// absent: the `amdgpu_is_kicker_fw` rule for a Navi31 board is
+    /// unresolved (`amdgpu_psp13`), so no board is wired to the kicker
+    /// set until a later lane grounds the rule.
+    Psp13_0_0,
     Psp14_0_2,
     Psp14_0_3,
     /// MP0 14.0.3 on a kicker board (`amdgpu_is_kicker_fw`: AI PRO R9700
@@ -64,6 +73,7 @@ impl Target {
     fn name(self) -> &'static str {
         match self {
             Self::Rdna2(chip) => chip.firmware.sos,
+            Self::Psp13_0_0 => firmware::PSP13_0_0_SOS,
             Self::Psp14_0_2 => firmware::PSP14_0_2_SOS,
             Self::Psp14_0_3 => firmware::PSP14_0_3_SOS,
             Self::Psp14_0_3Kicker => firmware::PSP14_0_3_SOS_KICKER,
@@ -72,6 +82,7 @@ impl Target {
     fn parse(self, bytes: &[u8]) -> Result<Image<'_>, Error> {
         match self {
             Self::Rdna2(_) => Image::parse(bytes),
+            Self::Psp13_0_0 => Image::parse_psp13(bytes),
             Self::Psp14_0_2 | Self::Psp14_0_3 | Self::Psp14_0_3Kicker => Image::parse_psp14(bytes),
         }
         .map_err(Error::Image)
@@ -125,12 +136,24 @@ fn profile(gpu: &AmdGpu) -> Result<(Target, u64), Error> {
     let rdna2 = crate::amdgpu_rdna2::for_pci_id(gpu.chip.vid, gpu.chip.did);
     let version = (ip.major, ip.minor, ip.revision);
     let rdna2_psp;
+    let navi31_mp0;
     let versions: &[(u8, u8, u8)] = if let Some(chip) = rdna2 {
         if version != chip.gc_version {
             return Err(Error::Unsupported);
         }
         rdna2_psp = [chip.psp_version];
         &rdna2_psp
+    } else if crate::amdgpu_rdna3::Rdna3Chip::of(gpu)
+        == Some(crate::amdgpu_rdna3::Rdna3Chip::Navi31)
+    {
+        // Navi31 only: GC 11.0.0 with MP0 13.0.0. Navi32/33 never reach
+        // this arm (`Rdna3Chip::of` must be exactly Navi31) and are
+        // refused by the match below, not admitted to the 13.0.0 target.
+        if version != (11, 0, 0) {
+            return Err(Error::Unsupported);
+        }
+        navi31_mp0 = [(13, 0, 0)];
+        &navi31_mp0
     } else if crate::amdgpu_rdna4::Rdna4Chip::from_gc(version).is_some()
         && crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_some()
     {
@@ -150,6 +173,12 @@ fn profile(gpu: &AmdGpu) -> Result<(Target, u64), Error> {
         discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
     let target = match (rdna2, mp0.major, mp0.minor, mp0.revision) {
         (Some(chip), 11, 0, _) => Target::Rdna2(chip),
+        (None, 13, 0, 0)
+            if crate::amdgpu_rdna3::Rdna3Chip::of(gpu)
+                == Some(crate::amdgpu_rdna3::Rdna3Chip::Navi31) =>
+        {
+            Target::Psp13_0_0
+        }
         (None, 14, 0, 2) => Target::Psp14_0_2,
         (None, 14, 0, 3) if crate::amdgpu_rdna4::is_kicker(gpu.chip.did, gpu.chip.revision) => {
             Target::Psp14_0_3Kicker
@@ -175,6 +204,9 @@ impl Firmware {
             (self.target, revision),
             (Target::Psp14_0_2, 2) | (Target::Psp14_0_3 | Target::Psp14_0_3Kicker, 3)
         )
+    }
+    pub(crate) fn is_psp13(&self) -> bool {
+        self.target == Target::Psp13_0_0
     }
     pub(crate) fn is_navi22(&self) -> bool {
         self.target == Target::Rdna2(&crate::amdgpu_rdna2::NAVI22)

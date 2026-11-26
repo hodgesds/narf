@@ -309,6 +309,12 @@ impl Firmware {
     pub fn image(&self) -> Result<firmware::Image<'_>, FirmwareError> {
         firmware::Image::parse(&self.bytes).map_err(FirmwareError::Image)
     }
+    /// The validated DMCUB blob bytes, for an owner that retains them
+    /// (the shared `Prepared` borrows its image and VBIOS, so a retained
+    /// owner keeps the bytes and prepares later, in its own stage).
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
     pub fn prepare<'a>(&'a self, vbios: &'a [u8]) -> Result<firmware::Prepared<'a>, FirmwareError> {
         self.image()?
             .prepare_dcn314(vbios)

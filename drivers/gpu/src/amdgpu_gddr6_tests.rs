@@ -315,6 +315,56 @@ fn gddr6_training_exchange_validation() -> TestResult {
     }
     TestResult::Pass
 }
+/// `Trainer::new_navi31` resolves the Navi31 PSP13 layout (MP0 13.0.0,
+/// GC 11.0.0, ungated NBIO, HDP 5.0.x) and validates the training
+/// exchange; Navi32's GC 11.0.3 is refused by the layout itself.
+fn gddr6_trainer_navi31_resolves_navi31_layout_and_refuses_navi32() -> TestResult {
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_HDP, HW_ID_NBIF, MAX_BASE_ADDRS};
+    let blocks = |gpu: &mut crate::amdgpu::AmdGpu| {
+        // The base fixture's BAR0 is a 64 KiB register map; the layout's
+        // HDP-hole check needs 0x80000 bytes, and the exchange needs a BAR
+        // that covers the 32 MiB preimage.
+        gpu.regs.len = 0x80000;
+        gpu.fb_bar.len = 256 << 20;
+        for (hw_id, major, minor, revision) in [(HW_ID_NBIF, 4, 3, 0), (HW_ID_HDP, 5, 0, 0)] {
+            gpu.ip_blocks.push(IpBlock {
+                hw_id,
+                instance: 0,
+                major,
+                minor,
+                revision,
+                sub_revision: 0,
+                variant: 0,
+                base_addrs: [0; MAX_BASE_ADDRS],
+                num_bases: 3,
+            });
+        }
+    };
+    let exchange = Training {
+        c2p: (12 << 30) - (9 << 20),
+        p2c: (12 << 30) - 0x8000,
+        size: 4096,
+    };
+    let mut gpu = crate::amdgpu_rdna3::tests::gpu();
+    blocks(&mut gpu);
+    // SAFETY: RAM-only fixture; construction performs no device access.
+    if unsafe { Trainer::new_navi31(&gpu, Cap::bootstrap(), exchange) }.is_err() {
+        return TestResult::Fail("Navi31 trainer refused a valid layout and exchange");
+    }
+    let mut other = crate::amdgpu_rdna3::tests::gpu();
+    crate::amdgpu_rdna3::tests::Profile::Navi32.apply(&mut other);
+    blocks(&mut other);
+    // SAFETY: same RAM-only fixture.
+    if unsafe { Trainer::new_navi31(&other, Cap::bootstrap(), exchange) }.is_ok() {
+        return TestResult::Fail("Navi31 trainer accepted a Navi32 layout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gddr6",
+    gddr6_trainer_navi31_resolves_navi31_layout_and_refuses_navi32
+);
+
 kernel_test_in!("drivers/gpu/gddr6", gddr6_training_exchange_validation);
 
 fn gddr6_runtime_training_policy_is_bounded() -> TestResult {

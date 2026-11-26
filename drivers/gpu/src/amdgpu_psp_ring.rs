@@ -1071,6 +1071,13 @@ pub(crate) fn navi48_layout(gpu: &AmdGpu) -> Result<Layout, Error> {
         discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
     Layout::resolve(gpu, Kind::Navi48(ip.revision))
 }
+/// Navi31's PSP13.0.0 layout (MP0 13.0.0, ungated NBIO, GC 11.0.0 FB
+/// triplet, HDP5 invalidate rule): the bank set `Trainer::new_navi31`
+/// and the Navi31 ColdBoot constructor validate before any device
+/// access. Navi32/33 are refused by the `Kind::Navi31` arm itself.
+pub(crate) fn navi31_layout(gpu: &AmdGpu) -> Result<Layout, Error> {
+    Layout::resolve(gpu, Kind::Navi31)
+}
 /// One IP version's register window, for a caller whose register ids are only
 /// valid on some of the versions an IP reports.
 ///
@@ -1286,9 +1293,9 @@ impl Psp {
     /// `new`'s exclusive GPU, PSP/HDP/reset/PM ownership, trained VRAM,
     /// permanent mapping and excluded pool contract applies. SOS must
     /// already be running: `Engine::start` fails closed (`DeviceGone`)
-    /// on a zero sign-of-life register, and the 13.0.0 SOS bootstrap
-    /// itself is the follow-up to lane 2's PSP13 firmware set (no
-    /// `amdgpu_psp_boot` target for 13.0.0 exists yet).
+    /// on a zero sign-of-life register. The SOS bootstrap is
+    /// `amdgpu_psp_boot`'s `Psp13_0_0` target (Navi31-only, base set;
+    /// the kicker rule is still unresolved).
     pub unsafe fn new_navi31(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,

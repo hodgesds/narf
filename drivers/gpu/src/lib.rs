@@ -551,6 +551,8 @@ pub mod amdgpu_rdna2_thermal;
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_thermal as amdgpu_navi22_thermal;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_navi31_boot;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi31_modeset;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi31_platform;
