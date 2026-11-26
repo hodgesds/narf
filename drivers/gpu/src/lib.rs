@@ -377,6 +377,8 @@ pub mod amdgpu_ih7;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_ih_drainer;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_ih_navi31;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_ih_phoenix;
 #[path = "amdgpu_ih_navi22.rs"]
 #[cfg(feature = "amdgpu")]
