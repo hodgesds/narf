@@ -7,10 +7,11 @@ use crate::mt7921::association::{JoinPlan, Security};
 use crate::mt7921::firmware_transport::{NicCapabilities, PhyCapabilities, Report};
 use crate::mt7921::vif_slots::Vif;
 use crate::mt7925::mcu::{
-    UniBssHe, UniBssRlm, UniBssSec, BSS_SEC_MODE_WPA2_PSK, CONNAC3_CIPHER_AES_CCMP, RLM_BAND_5G,
-    RLM_BW_160, RLM_BW_320, STA_REC_BA, STA_REC_BASIC_TLV_SIZE, STA_REC_EHT, STA_REC_EHT_MLD,
-    STA_REC_EHT_MLD_TLV_SIZE, STA_REC_EHT_TLV_SIZE, STA_REC_MLD, STA_REC_MLD_TLV_SIZE,
-    STA_REC_STATE_TLV_SIZE, STA_REQ_HDR_SIZE, UNI_BSS_MLD_TLV_SIZE, UNI_BSS_UPDATE_BOUND,
+    UniBssHe, UniBssRlm, UniBssSec, BA_TYPE_RECIPIENT, BSS_SEC_MODE_WPA2_PSK,
+    CONNAC3_CIPHER_AES_CCMP, RLM_BAND_5G, RLM_BW_160, RLM_BW_320, STA_REC_BA,
+    STA_REC_BASIC_TLV_SIZE, STA_REC_EHT, STA_REC_EHT_MLD, STA_REC_EHT_MLD_TLV_SIZE,
+    STA_REC_EHT_TLV_SIZE, STA_REC_MLD, STA_REC_MLD_TLV_SIZE, STA_REC_STATE_TLV_SIZE,
+    STA_REQ_HDR_SIZE, UNI_BSS_MLD_TLV_SIZE, UNI_BSS_UPDATE_BOUND,
 };
 use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -20,6 +21,20 @@ const OWN: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const AP: [u8; 6] = [2, 0, 0, 0, 0, 2];
 const AID: u16 = 42;
 const CHANNEL: u8 = 36;
+
+/// WMM Parameter element (subtype 1), copied from
+/// `wmm_tests::PARAMETERS` (that module is private to
+/// `firmware_transport_tests`). The WMM Information element
+/// (`wmm::INFORMATION`, subtype 0) does NOT engage the native
+/// path: `wmm::Parameters::parse` returns `None` for an
+/// Information-only stream, so `prepare_native` sees
+/// `wmm_present == false` and builds the plan with no local PHY —
+/// no HT/VHT/HE/EHT profile. A real AP beacon carries the
+/// Parameter element.
+const WMM_PARAMETERS: [u8; 26] = [
+    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 0x03, 0xa4, 0, 0, 0x42, 0x43, 94,
+    0, 0x27, 0xa4, 0, 0,
+];
 
 fn info(chip_id: u16) -> RadioInfo {
     RadioInfo {
@@ -127,12 +142,17 @@ fn eht_elements(wide: bool) -> Vec<u8> {
 }
 
 fn bss() -> ScanBss {
+    // OFDM basic rates (6/12/24 Mbps): a 5 GHz AP never advertises
+    // DSSS 1/2/5.5/11, and `prepare_inner` refuses those off
+    // 2.4 GHz. The WMM Parameter element is what lets the native
+    // path engage the VHT/HE/EHT branch.
     let mut ies = vec![
-        0, 4, b'n', b'a', b'r', b'f', 1, 4, 0x82, 0x84, 0x8b, 0x96, 3, 1, CHANNEL,
+        0, 4, b'n', b'a', b'r', b'f', 1, 3, 0x8c, 0x98, 0xb0, 3, 1, CHANNEL,
     ];
     let rsn = RsnIe::wpa2_psk_ccmp().encode_body();
     ies.extend_from_slice(&[48, rsn.len() as u8]);
     ies.extend_from_slice(&rsn);
+    ies.extend_from_slice(&WMM_PARAMETERS);
     let (ht, vht) = vht_elements(2, CHANNEL);
     ies.extend_from_slice(&ht);
     ies.extend_from_slice(&vht);
@@ -160,15 +180,52 @@ fn reply(subtype: u8, body: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// 5 GHz regulatory domain (US, 5170-5895 @ 160 MHz), copied from
+/// `vht160_tests::domain` (that module is private to
+/// `firmware_transport_tests.rs`).
+fn domain() -> narf_wireless::reg::RegulatoryDomain {
+    narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 5170,
+            freq_end_mhz: 5895,
+            max_bandwidth_mhz: 160,
+            max_power_dbm: 17,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    }
+}
+
 /// A plan associated on the wide BSS: HT/VHT/HE/EHT negotiated,
 /// aid 42.
+///
+/// Built through the production native path (`prepare_native`):
+/// the test-facing `JoinPlan::prepare` never negotiates PHY
+/// (local PHY is `None`), so a plan built on it carries no
+/// HT/VHT/HE/EHT profile — and the single-link STA record would
+/// have no EHT TLV. It also never got this far: the wide BSS
+/// advertised DSSS basic rates, which `prepare_inner` refuses off
+/// 2.4 GHz, so the old helper panicked at prepare.
 fn associated_plan() -> JoinPlan {
-    let mut plan = JoinPlan::prepare(&bss(), OWN, b"narf", Security::Wpa2Psk { psk: [0x55; 32] })
-        .expect("wide BSS prepares");
+    let bss = bss();
+    let info = info(0x7925);
+    let permission =
+        TxPermission::from_ap(&domain(), info, &bss).expect("wide BSS grants a 160 MHz permission");
+    let mut plan = JoinPlan::prepare_native(
+        &bss,
+        OWN,
+        b"narf",
+        Security::Wpa2Psk { psk: [0x55; 32] },
+        info,
+        permission,
+        None,
+    )
+    .expect("wide BSS prepares");
     plan.start_authentication().expect("auth starts");
     plan.authentication_response(&reply(0xb0, &[0, 0, 2, 0, 0, 0]))
         .expect("auth response");
-    let mut body = vec![0x11, 0, 0, 0, 42, 0xc0, 1, 4, 0x82, 0x84, 0x8b, 0x96];
+    let mut body = vec![0x11, 0, 0, 0, 42, 0xc0, 1, 3, 0x8c, 0x98, 0xb0];
+    body.extend_from_slice(&WMM_PARAMETERS);
     let (ht, vht) = vht_elements(2, CHANNEL);
     body.extend_from_slice(&ht);
     body.extend_from_slice(&vht);
@@ -450,11 +507,14 @@ fn mt76_mlo_join_guards() -> TestResult {
     {
         return TestResult::Fail("secondary joined before the primary associated");
     }
+    // Pre-association the station has no AID yet: production passes
+    // aid 0 here (station_join.rs), and `peer_record_uni_on`
+    // refuses a nonzero AID on a pre-association record.
     station
         .add_link(
             &plan,
             Link::HOME,
-            AID,
+            0,
             false,
             &bss(),
             sec(),
@@ -588,7 +648,7 @@ fn mt76_mlo_per_link_ba() -> TestResult {
         return TestResult::Fail("RX BA has no BA TLV");
     };
     if ba[4] != 5
-        || ba[5] != 0
+        || ba[5] != BA_TYPE_RECIPIENT
         || ba[6] != 0
         || ba[7] != 1 << 5
         || u16::from_le_bytes([ba[8], ba[9]]) != 100
