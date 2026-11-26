@@ -24,6 +24,7 @@
 //!     completion as safety net; legacy `new()` unbounded
 //!     9g. Stream-based format descriptor parse + walker
 //!     9h. StreamHandle with a stream-based config completes on length
+//!     9i. Stream-based V4L2 mapping (#2503): 'MPEG' fourcc, empty sizes
 //! 10. Brightness control GET_MIN/MAX/RES round-trip
 //! 11. Format negotiation: 1280×720 MJPEG @ 30 fps → nearest supported
 //! 12. Probe UVC: config blob with VC + VS interfaces
@@ -795,6 +796,62 @@ fn smoke_uvc_stream_based_format_descriptor() -> TestResult {
 kernel_test_in!(
     "drivers/video/uvc",
     smoke_uvc_stream_based_format_descriptor
+);
+
+// ── Smoke 9i: Stream-based V4L2 mapping (#2503) ──────────────────────
+// A `StreamBased` format maps to the V4L2 multiplexed-stream fourcc
+// ('MPEG', `V4L2_PIX_FMT_MPEG`) and is advertised with an empty size
+// list — there are no frame modes to advertise, and the segment size
+// is negotiated, not described.
+
+fn smoke_uvc_stream_based_v4l2_mpeg_mapping() -> TestResult {
+    use crate::uvc::{PixelFmt, StreamFormat};
+    use crate::v4l2_ioctl::uvc_to_v4l2_formats;
+
+    let formats = alloc::vec![StreamFormat {
+        format_index: 1,
+        pixel_fmt: PixelFmt::StreamBased,
+        default_frame_index: 0,
+        frames: alloc::vec![],
+    }];
+    let table = uvc_to_v4l2_formats(&formats);
+    if table.len() != 1 {
+        return TestResult::Fail("stream-based format must be advertised");
+    }
+    if table[0].fourcc != u32::from_le_bytes(*b"MPEG") {
+        return TestResult::Fail("stream-based format must map to the 'MPEG' fourcc");
+    }
+    if !table[0].compressed {
+        return TestResult::Fail("'MPEG' is a compressed (passthrough) format");
+    }
+    if !table[0].sizes.is_empty() {
+        return TestResult::Fail("stream-based format must advertise no frame sizes");
+    }
+    // Masking-defeating: a frame-based format still maps with sizes.
+    let yuyv = alloc::vec![StreamFormat {
+        format_index: 1,
+        pixel_fmt: PixelFmt::Yuyv,
+        default_frame_index: 1,
+        frames: alloc::vec![crate::uvc::FrameMode {
+            frame_index: 1,
+            width: 640,
+            height: 480,
+            frame_intervals: alloc::vec![333_333],
+            continuous_min: None,
+            continuous_max: None,
+            continuous_step: None,
+            default_frame_interval: 333_333,
+        }],
+    }];
+    let yuyv_table = uvc_to_v4l2_formats(&yuyv);
+    if yuyv_table.len() != 1 || yuyv_table[0].sizes.len() != 1 {
+        return TestResult::Fail("YUYV must still map with its frame size");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/video/uvc",
+    smoke_uvc_stream_based_v4l2_mpeg_mapping
 );
 
 // ── Smoke 9h: StreamHandle with a stream-based config (#1334) ───────

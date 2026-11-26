@@ -1930,6 +1930,32 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
     if accepted_len >= VsProbeCommit::LEN_V15 && !accepted.accepted_versions_valid() {
         return Err(UvcError::ProbeFailed);
     }
+    // GET_CUR framing validation (#2503, UVC 1.5 §4.3.1.1 Table
+    // 4-47): a stream-based device answering D1 (EOF) without D0
+    // (FID), or any reserved framing bit, is a device error — fail
+    // negotiation instead of committing a combination the
+    // reassembler would silently honour. Scoped to stream-based
+    // formats: for known frame-based formats the table says this
+    // control "is ignored". 26-byte (1.0) responses carry no
+    // framing byte and skip this check.
+    if accepted_len >= VsProbeCommit::LEN_V15 && !accepted.accepted_framing_valid() {
+        let stream_based = {
+            let devices = UVC_DEVICES.lock();
+            devices
+                .get(idx)
+                .filter(|device| !device.detached)
+                .map(|device| {
+                    device.formats.iter().any(|f| {
+                        f.format_index == accepted.format_index
+                            && f.pixel_fmt == narf_drivers_video::uvc::PixelFmt::StreamBased
+                    })
+                })
+                .unwrap_or(false)
+        };
+        if stream_based {
+            return Err(UvcError::ProbeFailed);
+        }
+    }
     // COMMIT carries the device-accepted values at the same version
     // length — including the device's 1.1+ clock and version fields.
     let accepted_encoded = accepted.encode_for(uvc_version);
@@ -2550,6 +2576,15 @@ pub fn uvc_index_for_video_node(node: usize) -> Option<usize> {
 /// header for every format class, including frame-based
 /// (temporally-encoded) streams, so the declaration no longer gates
 /// which streams the driver can reassemble.
+///
+/// A stream-based format (`V4L2_PIX_FMT_MPEG`, #2503) has no frame
+/// descriptors, so there is no frame mode to look up: it is probed
+/// with frame index 0 — UVC 1.5 §4.3.1.1: "For video payloads with
+/// no defined frame descriptor, this field shall be set to zero (0)"
+/// — and the nominal 30 fps interval. Its segment size is
+/// negotiated, not picked from a frame descriptor; the device
+/// returns its accepted values in GET_CUR, and the pump uses only
+/// the negotiated `dwMaxVideoFrameSize` + `bmFramingInfo`.
 /// `pub(crate)` so the negotiation fixture drives the production
 /// desired-construction path instead of hand-building a payload.
 pub(crate) fn desired_probe_commit(
@@ -2565,6 +2600,12 @@ pub(crate) fn desired_probe_commit(
         PixelFmt::Mjpeg
     } else if format.fourcc == u32::from_le_bytes(*b"H264") {
         PixelFmt::FrameBased
+    } else if format.fourcc == u32::from_le_bytes(*b"MPEG") {
+        // `V4L2_PIX_FMT_MPEG` ('MPEG', "MPEG-1/2/4 Multiplexed",
+        // videodev2.h) is the V4L2 fourcc for a multiplexed stream —
+        // the fourcc a UVC stream-based format (`VS_FORMAT_STREAM_BASED`,
+        // e.g. MPEG-2 TS) is selected under (#2503).
+        PixelFmt::StreamBased
     } else {
         return None;
     };
@@ -2572,8 +2613,11 @@ pub(crate) fn desired_probe_commit(
         .formats
         .iter()
         .find(|candidate| candidate.pixel_fmt == pixel)?;
-    let (frame_index, frame_interval) =
-        stream_format.find_frame(format.width as u16, format.height as u16, 30)?;
+    let (frame_index, frame_interval) = if pixel == PixelFmt::StreamBased {
+        (0, 333_333)
+    } else {
+        stream_format.find_frame(format.width as u16, format.height as u16, 30)?
+    };
     let v15 = device.uvc_version >= 0x0110;
     Some(VsProbeCommit {
         hint: 1,
@@ -3313,6 +3357,27 @@ impl VsProbeCommit {
             && self.min_version <= self.preferred_version
             && self.preferred_version <= self.max_version
     }
+
+    /// Validate a device's GET_CUR(PROBE) `bmFramingInfo` (UVC 1.5
+    /// §4.3.1.1 Table 4-47, #2503): D1 (EOF may be present) without
+    /// D0 (FID required) is a device error — "It is an error to
+    /// specify this bit without also specifying D0" — and D7..2 are
+    /// reserved (0), so any reserved bit set is likewise malformed.
+    /// A combination violating that must fail negotiation rather
+    /// than be committed and silently honoured by the reassembler.
+    ///
+    /// Applies only when the negotiated format is stream-based: for
+    /// known frame-based formats the table says this control "is
+    /// ignored", so a stray bit there is not the driver's business.
+    /// Callers must apply it only to 34-byte (1.1+) responses,
+    /// which are the only ones carrying a framing byte, and only
+    /// for a stream-based `format_index`.
+    pub fn accepted_framing_valid(&self) -> bool {
+        let eof_without_fid =
+            self.framing_info & FRAMING_EOF != 0 && self.framing_info & FRAMING_FID == 0;
+        let reserved_set = self.framing_info & FRAMING_RESERVED_MASK != 0;
+        !eof_without_fid && !reserved_set
+    }
 }
 
 /// `bmFramingInfo` D0 (UVC 1.5 §4.3.1.1 Table 4-47): the FID field is
@@ -3320,10 +3385,15 @@ impl VsProbeCommit {
 /// least every `dwMaxVideoFrameSize` bytes.
 pub const FRAMING_FID: u8 = 0x01;
 /// `bmFramingInfo` D1: the EOF field may be present in the payload
-/// header. It is a device error to specify D1 without D0; the
-/// reassembler tolerates it (EOF is still honoured) rather than
-/// failing the stream.
+/// header. It is a device error to specify D1 without D0 (see
+/// [`VsProbeCommit::accepted_framing_valid`]); negotiation fails a
+/// stream-based stream that answers such a combination instead of
+/// committing it.
 pub const FRAMING_EOF: u8 = 0x02;
+/// `bmFramingInfo` D7..2: reserved (0) per UVC 1.5 §4.3.1.1 Table
+/// 4-47. Any of these bits set in a device answer is malformed
+/// (see [`VsProbeCommit::accepted_framing_valid`]).
+pub const FRAMING_RESERVED_MASK: u8 = 0xFC;
 
 /// How a reassembler completes frames and bounds its buffer.
 ///

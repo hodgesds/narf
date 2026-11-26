@@ -1011,9 +1011,24 @@ also consult upstream Linux GPL sources.
   descriptors are parsed into `PixelFmt::StreamBased` with no frame
   modes — frame size comes from Probe/Commit). Short or empty
   transfers are NOT boundaries: §2.2.1 allows empty (micro)frames
-  mid-stream. Not yet wired: STREAMON selection of stream-based
-  formats (no V4L2 fourcc mapping) and `bmFramingInfo` validation
-  (D1/D2 without D0 is a device error per Table 4-47).
+  mid-stream. STREAMON selection (#2503) maps the V4L2 multiplexed-
+  stream fourcc `V4L2_PIX_FMT_MPEG` ('MPEG', "MPEG-1/2/4
+  Multiplexed", videodev2.h) to `PixelFmt::StreamBased` in
+  `desired_probe_commit` and advertises it in `ENUM_FMT` with an
+  empty size list (no frame modes to advertise); the probe carries
+  frame index 0 — §4.3.1.1: "For video payloads with no defined
+  frame descriptor, this field shall be set to zero (0)" — and the
+  nominal 30 fps interval, and `S_FMT` keeps the requested
+  dimensions. `bmFramingInfo` validation (#2503,
+  `VsProbeCommit::accepted_framing_valid`): a stream-based device
+  answering D1 (EOF may be present) without D0 (FID required), or
+  any reserved bit D7..2, fails negotiation (`ProbeFailed`) instead
+  of being committed; for known frame-based formats the table says
+  the control "is ignored", so the check is scoped to stream-based
+  formats. Caveat: `StreamFormat` retains no GUID, so the 'MPEG'
+  mapping covers the multiplexed-stream case (MPEG-2 TS, the
+  payload specs' stream-based example); GUID-qualified
+  discrimination is a follow-up.
 - GET_CUR(PROBE) version validation (#1244, 1.5 §4.3.1.1): on a
   34-byte (1.1+) response the device's preferred version must lie
   inside its own declared [min, max] range (device resets min/max
