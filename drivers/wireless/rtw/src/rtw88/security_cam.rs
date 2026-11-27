@@ -19,23 +19,15 @@ use alloc::vec::Vec;
 use narf_wireless::station_security::SuspendKeys;
 use zeroize::Zeroizing;
 
-// sec.h
-pub(super) const SEC_CMD: u16 = 0x0670;
-pub(super) const SEC_WRITE: u16 = 0x0674;
-pub(super) const SEC_CONFIG: u16 = 0x0680;
-pub(super) const CMD_WRITE_ENABLE: u32 = 1 << 16;
-pub(super) const CMD_POLLING: u32 = 1 << 31;
-const ENTRY_SHIFT: u32 = 3;
-/// `RTW_SEC_DEFAULT_KEY_NUM`: with default key search the first four entries
-/// map directly to group key ids.
-const DEFAULT_KEY_NUM: u8 = 4;
-/// `RTW_MAX_SEC_CAM_NUM`.
-const MAX_CAM: u8 = 32;
-/// `RTW_SEC_{TX,RX}_UNI_USE_DK | RTW_SEC_{TX,RX}_DEC_EN | RTW_SEC_{TX,RX}_BC_USE_DK`.
-pub(super) const CONFIG_WOW: u8 = 0xcf;
-/// `RTW_SEC_ENGINE_EN` (REG_CR bit 9) as its byte at `REG_CR + 1`.
-pub(super) const CR_HIGH: u16 = 0x0101;
-pub(super) const ENGINE_EN: u8 = 1 << 1;
+// sec.h — the register map lives in the shared chip core
+// (`narf-drivers-wireless-rtl-chip::security_cam`), single-sourced so the
+// builtin driver and the loadable `.ko` program the same CAM.
+use narf_drivers_wireless_rtl_chip::security_cam::{
+    self as chip_cam, DEFAULT_KEY_NUM, ENTRY_SHIFT, MAX_CAM,
+};
+pub(super) use narf_drivers_wireless_rtl_chip::security_cam::{
+    CMD_POLLING, CMD_WRITE_ENABLE, CONFIG_WOW, CR_HIGH, ENGINE_EN, SEC_CMD, SEC_CONFIG, SEC_WRITE,
+};
 
 /// One `struct rtw_cam_entry` as `rtw_sec_write_cam` programs it.
 pub(super) struct Entry {
@@ -95,31 +87,17 @@ pub(super) fn entries(keys: &SuspendKeys, peer: [u8; 6]) -> Result<Vec<Entry>, E
 /// `rtw_sec_write_cam`: eight words, written from word 7 down to word 0
 /// (the valid bit lives in word 0, so the entry turns valid last). Returns
 /// `(RTW_SEC_CMD_REG value, RTW_SEC_WRITE_REG value)` in write order.
+/// The layout lives in the shared chip core; this only lends the entry's
+/// key bytes to it.
 pub(super) fn words(entry: &Entry) -> [(u32, u32); 8] {
-    let base = u32::from(entry.index) << ENTRY_SHIFT;
-    let a = entry.addr.map(u32::from);
-    let k = &entry.key;
-    let mut out = [(0, 0); 8];
-    for (slot, i) in out.iter_mut().zip((0..8u32).rev()) {
-        let content = match i {
-            0 => {
-                u32::from(entry.key_id & 3)
-                    | (entry.kind as u32 & 7) << 2
-                    | u32::from(entry.group) << 6
-                    | 1 << 15
-                    | a[0] << 16
-                    | a[1] << 24
-            }
-            1 => a[2] | a[3] << 8 | a[4] << 16 | a[5] << 24,
-            6 | 7 => 0,
-            _ => {
-                let j = ((i - 2) << 2) as usize;
-                u32::from_le_bytes([k[j], k[j + 1], k[j + 2], k[j + 3]])
-            }
-        };
-        *slot = (CMD_WRITE_ENABLE | CMD_POLLING | (base + i), content);
-    }
-    out
+    chip_cam::words(&chip_cam::CamEntry {
+        index: entry.index,
+        key_id: entry.key_id,
+        kind: entry.kind as u8,
+        group: entry.group,
+        addr: entry.addr,
+        key: &entry.key,
+    })
 }
 
 /// Linux writes CAM commands back to back; NARF bounds each on the command

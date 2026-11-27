@@ -101,3 +101,83 @@ impl<T: Io> RegIo for IoReg<'_, T> {
         self.io.delay_us(u64::from(us)).await
     }
 }
+
+/// [`IoReg`] that also enforces the native station gate before each access.
+/// `station_allowed` is a cheap state/capability check (no register I/O),
+/// so the gate adds no register traffic — it only fails a core call at the
+/// point a register access would have happened, matching the per-operation
+/// `station_allowed` checks the native station code makes. Use for the
+/// station port/MAC/DCF core; the plain [`bridge`] stays for the MAC/PHY/RF
+/// core and for teardown (which runs after admission close). Build with
+/// [`gated`]; map the core result with [`GatedIoReg::err`].
+pub(super) struct GatedIoReg<'a, T: Io> {
+    io: &'a mut T,
+    err: Option<Error>,
+}
+
+/// Wrap `io` for a gated chip-core call.
+pub(super) fn gated<T: Io>(io: &mut T) -> GatedIoReg<'_, T> {
+    GatedIoReg { io, err: None }
+}
+
+impl<T: Io> GatedIoReg<'_, T> {
+    /// Map a chip-core error back into the native error set, preferring the
+    /// exact native error captured during the run (see [`IoReg::err`]).
+    pub(super) fn err(&mut self, chip: ChipError) -> Error {
+        self.err.take().unwrap_or_else(|| from_chip(chip))
+    }
+    fn gate(&mut self) -> Result<(), ChipError> {
+        self.io.station_allowed().map_err(|e| {
+            self.err = Some(e);
+            to_chip(e)
+        })
+    }
+}
+
+impl<T: Io> RegIo for GatedIoReg<'_, T> {
+    async fn read8(&mut self, reg: u16) -> Result<u8, ChipError> {
+        self.gate()?;
+        self.io.read8(reg).await.map_err(|e| {
+            self.err = Some(e);
+            to_chip(e)
+        })
+    }
+    async fn read16(&mut self, reg: u16) -> Result<u16, ChipError> {
+        self.gate()?;
+        self.io.read16(reg).await.map_err(|e| {
+            self.err = Some(e);
+            to_chip(e)
+        })
+    }
+    async fn read32(&mut self, reg: u16) -> Result<u32, ChipError> {
+        self.gate()?;
+        self.io.read32(reg).await.map_err(|e| {
+            self.err = Some(e);
+            to_chip(e)
+        })
+    }
+    async fn write8(&mut self, reg: u16, value: u8) -> Result<(), ChipError> {
+        self.gate()?;
+        self.io.write8(reg, value).await.map_err(|e| {
+            self.err = Some(e);
+            to_chip(e)
+        })
+    }
+    async fn write16(&mut self, reg: u16, value: u16) -> Result<(), ChipError> {
+        self.gate()?;
+        self.io.write16(reg, value).await.map_err(|e| {
+            self.err = Some(e);
+            to_chip(e)
+        })
+    }
+    async fn write32(&mut self, reg: u16, value: u32) -> Result<(), ChipError> {
+        self.gate()?;
+        self.io.write32(reg, value).await.map_err(|e| {
+            self.err = Some(e);
+            to_chip(e)
+        })
+    }
+    async fn delay_us(&mut self, us: u32) {
+        self.io.delay_us(u64::from(us)).await
+    }
+}
