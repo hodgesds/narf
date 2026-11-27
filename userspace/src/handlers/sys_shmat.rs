@@ -121,19 +121,29 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         None => {
             // Nowhere to place the attachment. -ENOMEM is already this
             // function's answer for that, two arms up, where
-            // `reserve_mmap_va_aligned` comes back empty.
+            // `place_mmap_va` comes back empty.
             shm_cancel_attach(object);
             ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
-    if base == 0 {
-        base = as_ref.reserve_mmap_va_aligned(reserve_len, SHMLBA);
-        if base == 0 {
-            shm_cancel_attach(object);
-            ctx.set_return(errno_ret(ENOMEM));
-            return;
+    // `do_shmat` with no address takes `get_unmapped_area`'s SHMLBA-aligned
+    // gap, reusing address space earlier detaches and munmaps returned; the
+    // interval stays held until the attachment below is published or fails.
+    let placement = if base == 0 {
+        match as_ref.place_mmap_va(reserve_len, SHMLBA) {
+            Some(placement) => Some(placement),
+            None => {
+                shm_cancel_attach(object);
+                ctx.set_return(errno_ret(ENOMEM));
+                return;
+            }
         }
+    } else {
+        None
+    };
+    if let Some(placement) = placement.as_ref() {
+        base = placement.base();
     }
 
     let caller = current_task_id();

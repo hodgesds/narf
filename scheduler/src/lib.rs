@@ -571,12 +571,75 @@ static TOTAL_TASKS: AtomicUsize = AtomicUsize::new(0);
 /// `/proc/loadavg` and `/proc/stat` render without scanning queues.
 static PARKED_TASKS: AtomicUsize = AtomicUsize::new(0);
 
-/// Hard cap on concurrent user tasks. `fork`/`clone` return `EAGAIN` at the
-/// cap, containing a fork bomb before it exhausts kernel memory and the
-/// per-CPU scheduler-owned slot collections. Generous for real workloads;
-/// far below where that many forked address spaces would OOM. SMP makes an
-/// uncapped bomb worse — more cores to flood and more concurrent shootdowns.
-pub const MAX_USER_TASKS: usize = 1024;
+/// Linux `MAX_THREADS` (`kernel/fork.c`, `FUTEX_TID_MASK`): the largest
+/// value `kernel.threads-max` may take — a tid must fit the futex tid field.
+pub const MAX_THREADS: usize = 0x3fff_ffff;
+
+/// Linux `MIN_THREADS`: the floor `set_max_threads` clamps a tiny machine's
+/// RAM-derived count to.
+pub const MIN_THREADS: usize = 20;
+
+/// Linux `max_threads`: the system-wide task bound `fork`/`clone` refuse at
+/// (`copy_process`: `nr_threads >= max_threads` → -EAGAIN), which is also the
+/// `kernel.threads-max` sysctl. Sized from RAM by [`fork_init`]; until then
+/// only the type's ceiling applies.
+static MAX_THREADS_LIMIT: AtomicUsize = AtomicUsize::new(MAX_THREADS);
+
+/// The value [`fork_init`] derived from RAM — what init's RLIMIT_NPROC is
+/// half of. A later `threads-max` write changes [`max_threads`], not this,
+/// as on Linux, where `fork_init` sets init's limit once.
+static BOOT_MAX_THREADS: AtomicUsize = AtomicUsize::new(MAX_THREADS);
+
+/// Linux `set_max_threads`: the task count whose kernel stacks fit in an
+/// eighth of `ram_bytes`, clamped to `[MIN_THREADS, MAX_THREADS]`. Linux's
+/// `THREAD_SIZE` is the per-task kernel stack; NARF's is
+/// [`stackful::DEFAULT_KERNEL_STACK_BYTES`], so the same eighth of RAM holds
+/// the same share of stacks.
+pub fn threads_for_ram(ram_bytes: u64) -> usize {
+    let per_task = (stackful::DEFAULT_KERNEL_STACK_BYTES as u64).saturating_mul(8);
+    let threads = (ram_bytes / per_task).min(MAX_THREADS as u64) as usize;
+    threads.clamp(MIN_THREADS, MAX_THREADS)
+}
+
+/// Linux `fork_init`'s `set_max_threads(MAX_THREADS)`: size `max_threads`
+/// from the RAM the frame allocator manages. Called by [`init`], after the
+/// frame allocator is up; a boot without one keeps the ceiling.
+pub fn fork_init() {
+    let stats = narf_memory::frame::stats();
+    let pages = stats.total.saturating_sub(stats.reserved) as u64;
+    if pages == 0 {
+        return;
+    }
+    let threads = threads_for_ram(pages.saturating_mul(narf_memory::PAGE_SIZE));
+    BOOT_MAX_THREADS.store(threads, Ordering::Relaxed);
+    MAX_THREADS_LIMIT.store(threads, Ordering::Relaxed);
+}
+
+/// The live `kernel.threads-max`.
+pub fn max_threads() -> usize {
+    MAX_THREADS_LIMIT.load(Ordering::Relaxed)
+}
+
+/// The RAM-derived `max_threads` [`fork_init`] computed (init's
+/// RLIMIT_NPROC is half of it).
+pub fn boot_max_threads() -> usize {
+    BOOT_MAX_THREADS.load(Ordering::Relaxed)
+}
+
+/// `kernel.threads-max` was written outside `[1, MAX_THREADS]`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ThreadsMaxOutOfRange;
+
+/// Linux `sysctl_max_threads`: set `max_threads` to `threads`, which must
+/// lie in `[1, MAX_THREADS]`. Live tasks above a lowered bound keep running;
+/// only new ones are refused.
+pub fn set_max_threads(threads: usize) -> Result<(), ThreadsMaxOutOfRange> {
+    if !(1..=MAX_THREADS).contains(&threads) {
+        return Err(ThreadsMaxOutOfRange);
+    }
+    MAX_THREADS_LIMIT.store(threads, Ordering::Relaxed);
+    Ok(())
+}
 
 /// RAII decrement for a live user task, stored in the slot by `spawn_user`.
 /// Fires on the slot's final drop (completion / kill / budget-drop), so the
@@ -794,12 +857,14 @@ pub fn unparked_task_count() -> usize {
     total_task_count().saturating_sub(parked_task_count())
 }
 
-/// Whether another user task may be spawned under [`MAX_USER_TASKS`]. `fork`
-/// and `clone` consult this and return `EAGAIN` when it is false — the
-/// fork-bomb guard. A slight TOCTOU overshoot (bounded by concurrent forks)
-/// is harmless: this contains a runaway, it isn't a hard security boundary.
+/// Linux `copy_process`'s `nr_threads >= max_threads` test, inverted:
+/// whether another user task (process or thread) may be created under
+/// [`max_threads`]. `fork` and `clone` return `EAGAIN` when it is false. It
+/// binds every uid, root included — Linux: "the check is only there to stop
+/// root fork bombs"; per-user bombs are RLIMIT_NPROC's. Like Linux's
+/// `data_race` read, concurrent forks may overshoot by at most their number.
 pub fn user_nproc_available() -> bool {
-    live_user_task_count() < MAX_USER_TASKS
+    live_user_task_count() < max_threads()
 }
 
 /// Master switch for cross-CPU work stealing. Off by default so the
@@ -3811,6 +3876,7 @@ pub fn init() {
         // call `__reset_queues_for_test` explicitly.
         panic!("narf_scheduler::init() called twice — would wipe spawned tasks; use __reset_queues_for_test in tests");
     }
+    fork_init();
     steal::register_current_cpu();
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();

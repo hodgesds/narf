@@ -2611,6 +2611,10 @@ pub struct KernelTask {
     /// other path — a stack that may still be referenced), `Drop` frees `stack`
     /// straight to the buddy. See the stack-cache security note.
     recyclable_stack: AtomicBool,
+    /// The wait-queue entry this task has linked from its own stack, if any
+    /// ([`record_stack_wait`]). Detached by `StackfulAdapter::drop` when the
+    /// task is dropped without resuming, before the stack is retired.
+    stack_wait: AtomicPtr<StackWait>,
     /// Saved register state. Initialised by `KernelContext::fresh`
     /// to land the first kernel_switch on `trampoline_entry`.
     ctx: KernelContext,
@@ -2888,6 +2892,7 @@ impl KernelTask {
             // the RCU reclaim path, which is the sole point the stack is
             // provably unreferenced and thus safe to recycle.
             recyclable_stack: AtomicBool::new(false),
+            stack_wait: AtomicPtr::new(core::ptr::null_mut()),
             // A fresh task has no scope open, so it reports FRAME.
             #[cfg(feature = "native-ring")]
             domain_byte: Arc::new(crate::authority::DomainState::new(
@@ -3727,6 +3732,91 @@ impl core::fmt::Display for OverflowEvidence<'_> {
     }
 }
 
+/// A wait-queue entry a stackful task links from its own kernel stack while
+/// it parks (Linux's on-stack `wait_queue_entry`), described so the
+/// scheduler can unlink it if the task never resumes.
+///
+/// A Linux task always resumes to `finish_wait` before its stack goes. A
+/// NARF stackful task need not: a budget `Kill` or a revoked budget cap drops
+/// the slot, and the stack is retired without its frames unwinding. Without
+/// this record a queue would keep a pointer into that retired stack.
+#[derive(Debug)]
+pub struct StackWait {
+    data: *const (),
+    detach: unsafe fn(*const ()),
+}
+
+impl StackWait {
+    /// # Safety
+    /// `detach(data)` must unlink the entry `data` names from every queue,
+    /// so that afterwards no queue holds a pointer into this stack. It may
+    /// run on any CPU, once, after the owning task has stopped running and
+    /// while its stack is still mapped, and must not block on the task.
+    pub const unsafe fn new(data: *const (), detach: unsafe fn(*const ())) -> Self {
+        Self { data, detach }
+    }
+}
+
+/// While alive, the current stackful task's linked on-stack wait is the
+/// [`StackWait`] it was made from; dropping it clears the record.
+#[derive(Debug)]
+pub struct StackWaitRecord<'a> {
+    task: *const KernelTask,
+    _wait: PhantomData<&'a StackWait>,
+}
+
+impl Drop for StackWaitRecord<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the record was made on, and is dropped on, this running
+        // task, which is therefore alive.
+        unsafe {
+            (*self.task)
+                .stack_wait
+                .store(core::ptr::null_mut(), Ordering::Release)
+        };
+    }
+}
+
+/// Record `wait`, which lives on the current stackful task's own stack, as
+/// that task's linked on-stack wait until the returned record drops. `None`
+/// (nothing recorded) outside a stackful task. A task has one at a time.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn record_stack_wait(wait: Pin<&StackWait>) -> Option<StackWaitRecord<'_>> {
+    let task = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+    if task.is_null() {
+        return None;
+    }
+    let raw = core::ptr::from_ref(wait.get_ref()).cast_mut();
+    // SAFETY: `task` is this CPU's in-flight task, so it is alive.
+    let previous = unsafe { (*task).stack_wait.swap(raw, Ordering::AcqRel) };
+    debug_assert!(previous.is_null(), "nested on-stack waits");
+    Some(StackWaitRecord {
+        task,
+        _wait: PhantomData,
+    })
+}
+
+/// No stackful executor: nothing parks on its own stack.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn record_stack_wait(_wait: Pin<&StackWait>) -> Option<StackWaitRecord<'_>> {
+    None
+}
+
+impl KernelTask {
+    /// Unlink a wait entry still linked from this task's stack. Runs only
+    /// once the task has stopped running for good, before the stack goes.
+    fn detach_stack_wait(&self) {
+        let wait = self
+            .stack_wait
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !wait.is_null() {
+            // SAFETY: a recorded `StackWait` lives on this task's stack,
+            // which is still mapped; its contract allows exactly this call.
+            unsafe { ((*wait).detach)((*wait).data) };
+        }
+    }
+}
+
 impl Drop for KernelTask {
     /// Backstop: guarantee no per-CPU `CURRENT_STACKFUL_TASK` slot outlives
     /// this task pointing at it. The reclaim path (`StackfulAdapter::drop`)
@@ -3734,6 +3824,7 @@ impl Drop for KernelTask {
     /// RCU, so by the time this runs the slots are already clear; re-clear
     /// here in case a `KernelTask` is ever freed by some other path.
     fn drop(&mut self) {
+        self.detach_stack_wait();
         self.unbind_wake_cell();
         self.drop_active_poll_waker();
         self.clear_current_slots();
@@ -5407,6 +5498,9 @@ impl Drop for StackfulAdapter {
         // SAFETY: `inner` is live here and never touched after this take
         // (the field's own drop glue is a no-op under `ManuallyDrop`).
         let task = unsafe { core::mem::ManuallyDrop::take(&mut self.inner) };
+        // A task dropped mid-park (budget kill, revoked cap) never unwinds:
+        // unlink its on-stack wait entry while the stack is still mapped.
+        task.detach_stack_wait();
         task.unbind_wake_cell();
         task.clear_current_slots();
         // This is the RCU-deferred reclaim: after the grace period below the
@@ -10758,4 +10852,93 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/ia32-tls", smoke_ia32_tls_survives_nested_poll);
+
+    static STACK_WAIT_DETACHES: AtomicU32 = AtomicU32::new(0);
+
+    unsafe fn count_stack_wait_detach(_data: *const ()) {
+        STACK_WAIT_DETACHES.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Parks with an on-stack wait recorded and never resumes: the record
+    /// is leaked exactly as a dropped-mid-park task leaks its frames.
+    /// `keep` false releases the record before parking (the resumed case).
+    struct ParkWithStackWait {
+        keep: bool,
+        parked: bool,
+    }
+
+    impl Future for ParkWithStackWait {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            if !self.parked {
+                self.parked = true;
+                // SAFETY: the counter neither dereferences `data` nor blocks.
+                let wait: &'static StackWait = Box::leak(Box::new(unsafe {
+                    StackWait::new(core::ptr::null(), count_stack_wait_detach)
+                }));
+                match record_stack_wait(Pin::static_ref(wait)) {
+                    Some(record) if self.keep => core::mem::forget(record),
+                    Some(record) => drop(record),
+                    None => STACK_WAIT_DETACHES.store(u32::MAX, Ordering::Release),
+                }
+            }
+            Poll::Pending
+        }
+    }
+
+    /// A stackful task dropped while parked with a linked on-stack wait —
+    /// a budget `Kill` or a revoked cap never resumes it — has that wait
+    /// detached exactly once, on both drop paths, and a released record
+    /// leaves nothing to detach.
+    fn smoke_stack_wait_detached_when_task_dropped_mid_park() -> TestResult {
+        let saved_own_stack = USE_OWN_STACK.load(Ordering::Acquire);
+        USE_OWN_STACK.store(true, Ordering::Release);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        let mut counts = [0u32; 3];
+        for (case, keep) in [true, false].into_iter().enumerate() {
+            STACK_WAIT_DETACHES.store(0, Ordering::Release);
+            let mut task = KernelTask::new(ParkWithStackWait {
+                keep,
+                parked: false,
+            });
+            // SAFETY: standard stackful poll; the task is exclusively owned.
+            let parked = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+            drop(task);
+            counts[case] = if parked == Poll::Pending {
+                STACK_WAIT_DETACHES.load(Ordering::Acquire)
+            } else {
+                u32::MAX - 1
+            };
+        }
+        // The executor's own drop path: StackfulAdapter, RCU-deferred free.
+        STACK_WAIT_DETACHES.store(0, Ordering::Release);
+        let mut adapter = Box::pin(StackfulAdapter::new(ParkWithStackWait {
+            keep: true,
+            parked: false,
+        }));
+        let parked = adapter.as_mut().poll(&mut Context::from_waker(&waker));
+        drop(adapter);
+        counts[2] = if parked == Poll::Pending {
+            STACK_WAIT_DETACHES.load(Ordering::Acquire)
+        } else {
+            u32::MAX - 1
+        };
+        USE_OWN_STACK.store(saved_own_stack, Ordering::Release);
+        match counts {
+            [1, 0, 1] => TestResult::Pass,
+            [u32::MAX, ..] | [_, u32::MAX, _] | [.., u32::MAX] => {
+                TestResult::Fail("a stackful task's poll was not current for record_stack_wait")
+            }
+            [0, ..] | [.., 0] => {
+                TestResult::Fail("a task dropped mid-park left its on-stack wait linked")
+            }
+            [_, n, _] if n != 0 => TestResult::Fail("a released stack-wait record was detached"),
+            _ => TestResult::Fail("an on-stack wait was not detached exactly once"),
+        }
+    }
+    kernel_test_in!(
+        "scheduler/stackful/stack_wait",
+        smoke_stack_wait_detached_when_task_dropped_mid_park
+    );
 }

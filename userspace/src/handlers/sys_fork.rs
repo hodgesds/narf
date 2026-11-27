@@ -93,9 +93,9 @@ pub(crate) fn sys_vfork(ctx: &mut dyn TrapContext) {
 }
 
 fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
-    // Per-uid RLIMIT_NPROC. The global live-task cap below bounds the whole
+    // Per-uid RLIMIT_NPROC. kernel.threads-max below bounds the whole
     // MACHINE; this bounds ONE user, so a single unprivileged account cannot
-    // consume every slot that cap allows.
+    // consume every task that bound allows.
     //
     // Ahead of the address-space work on purpose: `copy_process` runs
     // `copy_creds` — and this check — long before `copy_mm`, so a process
@@ -105,6 +105,24 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     if nproc_fork_would_exceed(current_task_id()) {
         ctx.set_return(errno_ret(EAGAIN));
         return;
+    }
+    // `copy_process`: `if (data_race(nr_threads >= max_threads)) return
+    // -EAGAIN;` — kernel.threads-max, binding every uid (root included),
+    // right after the RLIMIT_NPROC check and, like it, before any
+    // address-space work.
+    if !narf_scheduler::user_nproc_available() {
+        ctx.set_return(errno_ret(EAGAIN));
+        return;
+    }
+    // `cgroup_can_fork` → `pids_can_fork`: the child would take a level of
+    // the parent's cgroup past pids.max. The child joins that cgroup below.
+    #[cfg(feature = "cgroup")]
+    {
+        let task = current_task_id();
+        if !narf_filesystem::cgroupfs::can_fork(task_to_pid_raw(task).unwrap_or(task), task) {
+            ctx.set_return(errno_ret(EAGAIN));
+            return;
+        }
     }
     // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — a
     // SCHED_DEADLINE reservation cannot be duplicated into a child.
@@ -121,15 +139,6 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
             return;
         }
     };
-
-    // Fork-bomb guard: refuse before the COW copy when we're at the live
-    // user-task cap. POSIX: fork(2) returns EAGAIN when RLIMIT_NPROC would be
-    // exceeded. Without this an uncapped fork loop floods the per-CPU ready
-    // queues + kernel heap (and, under SMP, every core + the shootdown path).
-    if !narf_scheduler::user_nproc_available() {
-        ctx.set_return(errno_ret(EAGAIN));
-        return;
-    }
 
     // SAFETY: clone_for_fork's contract — paging is live; the
     // frame allocator was initialised at boot.

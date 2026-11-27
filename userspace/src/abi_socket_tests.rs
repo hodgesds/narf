@@ -12976,6 +12976,126 @@ kernel_test_in!(
     smoke_abi_socket_pktinfo_reports_the_delivering_device
 );
 
+/// IP_PKTINFO of a group datagram from the wire: `ipi_ifindex` is the
+/// arrival device, `ipi_addr` the group, and `ipi_spec_dst` the address
+/// `fib_compute_spec_dst` picks for replying to the sender. That is the
+/// preferred source of the route back to it, found by `fib_lookup` with no
+/// output device (`flowi4_iif = LOOPBACK_IFINDEX`), not the arrival
+/// device's address.
+///
+/// Linux 7.3 on the desktop, whose enp14s0 (192.168.3.165) and wlan0
+/// (192.168.1.211) share 192.168.0.0/22 with enp14s0's route preferred:
+/// mDNS from 192.168.3.241 to 224.0.0.251 arriving on wlan0 reports
+/// ifindex 3 with ipi_spec_dst 192.168.3.165. NARF reported wlan0's own
+/// 192.168.1.211.
+fn smoke_abi_socket_pktinfo_spec_dst_is_the_route_back() -> TestResult {
+    const A: &str = "abi-spd-a";
+    const B: &str = "abi-spd-b";
+    const A_IP: [u8; 4] = [10, 76, 3, 165];
+    const B_IP: [u8; 4] = [10, 76, 1, 211];
+    const SENDER: [u8; 4] = [10, 76, 3, 241];
+    const PORT: u16 = 47_531;
+    const SOL_IP: i32 = 0;
+    fn discard(_: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    /// recvmsg one datagram: its IP_PKTINFO `(ifindex, spec_dst, addr)`.
+    fn recv_pktinfo(fd: u64) -> Result<(u32, [u8; 4], [u8; 4]), &'static str> {
+        let mut data = [0u8; 64];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 256];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        match call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd, msg.as_mut_ptr() as u64, MSG_DONTWAIT),
+        ) {
+            Some(n) if n >= 0 => {}
+            _ => return Err("the group datagram did not arrive"),
+        }
+        let controllen = u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize;
+        let mut off = 0usize;
+        while off + 16 <= controllen {
+            let len = u64::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
+            let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
+            let kind = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
+            if len < 16 || off + len > controllen {
+                return Err("recvmsg returned a malformed cmsghdr");
+            }
+            if level == SOL_IP && kind == so::IP_PKTINFO as i32 && len >= 28 {
+                let p = &ctrl[off + 16..off + 28];
+                let ifindex = u32::from_ne_bytes(p[0..4].try_into().unwrap());
+                return Ok((
+                    ifindex,
+                    [p[4], p[5], p[6], p[7]],
+                    [p[8], p[9], p[10], p[11]],
+                ));
+            }
+            off += (len + 7) & !7;
+        }
+        Err("the group datagram carried no IP_PKTINFO")
+    }
+    with_setup(|| {
+        // A's connected /22 is installed first, so it is the route back.
+        for (name, mac, ip) in [(A, 0xa1, A_IP), (B, 0xb1, B_IP)] {
+            narf_net::iface::register(name, [0x02, 0, 0, 0, 0x4c, mac], discard);
+            narf_net::iface::set_link_state(name, true);
+            narf_net::iface::set_iface_ipv4_fields(name, ip, [0; 4]);
+            narf_net::iface::add_addr(name, ip, 22);
+        }
+        let rx = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let result = (|| -> Result<(), &'static str> {
+            let b = narf_net::iface::ifindex_of(B).ok_or("B has no ifindex")?;
+            sockopt_bind(rx, &sockaddr_in(0, PORT))?;
+            if sockopt_set_int(rx, so::IPPROTO_IP, so::IP_PKTINFO, 1)? != 0 {
+                return Err("IP_PKTINFO failed");
+            }
+            let mreqn = ip_mreqn(so::MDNS_V4, 0, b);
+            if sockopt_set(rx, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &mreqn)? != 0 {
+                return Err("IP_ADD_MEMBERSHIP(224.0.0.251) on B failed");
+            }
+            if narf_net::route::route_lookup(narf_net::ipv4::Ipv4Addr(SENDER))
+                .is_none_or(|r| r.iface != A)
+            {
+                return Err("fixture: the route back to the sender is not A's");
+            }
+            if !crate::socket::deliver_wire_datagram(
+                0,
+                &SENDER,
+                5353,
+                &so::MDNS_V4.to_be_bytes(),
+                PORT,
+                b"mdns",
+                b,
+                narf_net::udp_sock::RxIpMeta { ttl: 255, tos: 0 },
+            ) {
+                return Err("the group datagram arriving on B reached no socket");
+            }
+            let (ifindex, spec_dst, addr) = recv_pktinfo(rx)?;
+            if ifindex != b || addr != so::MDNS_V4.to_be_bytes() {
+                return Err("IP_PKTINFO did not report the arrival device and the group");
+            }
+            if spec_dst != A_IP {
+                return Err("ipi_spec_dst was not the source of the route back to the sender");
+            }
+            Ok(())
+        })();
+        sockopt_close(&[rx]);
+        narf_net::iface::del_addr(A, A_IP, 22);
+        narf_net::iface::del_addr(B, B_IP, 22);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/pktinfo-spec-dst",
+    smoke_abi_socket_pktinfo_spec_dst_is_the_route_back
+);
+
 /// The desktop's IPv6 state: a link-local address only, and a route to the
 /// world via the router's link-local address. Linux `ip6_datagram_connect`
 /// → `ip6_dst_lookup_flow` takes the route and `ipv6_dev_get_saddr` picks

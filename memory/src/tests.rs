@@ -4299,6 +4299,95 @@ fn smoke_memory_mmap_arena_fails_closed_at_ceiling() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_mmap_arena_fails_closed_at_ceiling);
 
+/// `place_mmap_va` is Linux's `get_unmapped_area` for a no-hint mapping: the
+/// high-water candidate while it is free, else the first aligned hole above
+/// the floor, skipping intervals other placements still hold; a released
+/// placement's interval is chosen again, and only a request no gap can take
+/// fails. The monotonic bump it replaces returned nothing once the cursor
+/// reached the window top, which in the 2.6 GiB IA-32 window took no more
+/// than that much mapping and unmapping.
+fn smoke_memory_mmap_placement_reuses_released_intervals() -> TestResult {
+    use crate::AddressSpace;
+
+    let a = AddressSpace::empty();
+    let floor = a.mmap_floor();
+    let Some(first) = a.place_mmap_va(0x2000, 0x1000) else {
+        return TestResult::Fail("first placement in a fresh space failed");
+    };
+    let Some(second) = a.place_mmap_va(0x2000, 0x1000) else {
+        return TestResult::Fail("second placement in a fresh space failed");
+    };
+    if first.base() != floor || second.base() != floor + 0x2000 {
+        return TestResult::Fail("placements in a fresh space must follow the high-water cursor");
+    }
+    // Park the cursor one page below the top with a bump that is never
+    // mapped: from here the high-water candidate cannot take two pages.
+    let window = AddressSpace::MMAP_WINDOW_TOP - a.__test_mmap_cursor();
+    if a.reserve_mmap_va(window - 0x1000) == 0 {
+        return TestResult::Fail("parking the cursor below the window top failed");
+    }
+    let Some(third) = a.place_mmap_va(0x2000, 0x1000) else {
+        return TestResult::Fail("a placement gave up at the window top with the window free");
+    };
+    if third.base() != floor + 0x4000 {
+        return TestResult::Fail("a placement overlapped an interval another placement holds");
+    }
+    drop(first);
+    let Some(reused) = a.place_mmap_va(0x2000, 0x1000) else {
+        return TestResult::Fail("a placement after a release failed");
+    };
+    if reused.base() != floor {
+        return TestResult::Fail("a released placement's interval was not chosen again");
+    }
+    let Some(top) = a.place_mmap_va(0x1000, 0x1000) else {
+        return TestResult::Fail("a placement that fits at the high-water mark failed");
+    };
+    if top.base() != AddressSpace::MMAP_WINDOW_TOP - 0x1000 {
+        return TestResult::Fail("a free high-water candidate must win over a lower hole");
+    }
+    if a.place_mmap_va(AddressSpace::MMAP_WINDOW_TOP, 0x1000)
+        .is_some()
+    {
+        return TestResult::Fail("a placement larger than the window succeeded");
+    }
+    drop((second, third, reused, top));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_mmap_placement_reuses_released_intervals
+);
+
+/// The default destination of a moving mremap / DONTUNMAP (the cursor
+/// candidate) falls back to the first free hole once the high-water mark
+/// can no longer take the request, instead of failing with a free window.
+fn smoke_memory_mmap_cursor_candidate_reuses_holes_at_the_top() -> TestResult {
+    use crate::AddressSpace;
+
+    let a = AddressSpace::empty();
+    let floor = a.mmap_floor();
+    let window = AddressSpace::MMAP_WINDOW_TOP - a.__test_mmap_cursor();
+    if a.reserve_mmap_va(window - 0x1000) == 0 {
+        return TestResult::Fail("parking the cursor below the window top failed");
+    }
+    let candidate = a.with_vma_transaction(|| {
+        // SAFETY: the VMA transaction is held for the whole read and nothing
+        // is published from the answer.
+        unsafe { a.mmap_cursor_candidate_locked(0x2000) }
+    });
+    match candidate {
+        Ok(va) if va.as_u64() == floor => TestResult::Pass,
+        Ok(_) => TestResult::Fail("the fallback candidate is not the first hole above the floor"),
+        Err(_) => {
+            TestResult::Fail("the cursor candidate gave up at the window top with the window free")
+        }
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_mmap_cursor_candidate_reuses_holes_at_the_top
+);
+
 /// Linux get_unmapped_area treats its cached high-water address as a hint, not
 /// authority: a no-hint mapping normally advances above the live high-water,
 /// an empty/fallback search can reuse a released hole, and a usable caller

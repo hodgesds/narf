@@ -48,7 +48,6 @@ static POWEROFF_CMD: IrqSafeSpinLock<Option<String>> = IrqSafeSpinLock::new(None
 static CORE_PIPE_LIMIT: AtomicU32 = AtomicU32::new(0);
 
 static PID_MAX: AtomicU32 = AtomicU32::new(32768);
-static THREADS_MAX: AtomicU32 = AtomicU32::new(65536);
 static RANDOMIZE_VA_SPACE: AtomicU32 = AtomicU32::new(2);
 static PANIC_SECS: AtomicI32 = AtomicI32::new(0);
 static PANIC_ON_OOPS: AtomicU32 = AtomicU32::new(0);
@@ -476,16 +475,18 @@ fn read_pty_nr() -> String {
     format!("{}\n", crate::devfs_pty::pty_nr())
 }
 
+// ── kernel.threads-max ───────────────────────────────────────────
+//
+// Linux `kernel/fork.c::sysctl_max_threads`: the file IS `max_threads`, the
+// bound `copy_process` refuses at, read and written through
+// `proc_dointvec_minmax` over `[1, MAX_THREADS]`. Its boot value is
+// `set_max_threads`' RAM-derived count, not a constant.
 fn read_threads_max() -> String {
-    format!("{}\n", THREADS_MAX.load(Ordering::Relaxed))
+    format!("{}\n", narf_scheduler::max_threads())
 }
 fn write_threads_max(v: &str) -> Result<(), FsError> {
-    let n: u32 = v.parse().map_err(|_| FsError::InvalidData)?;
-    if n == 0 {
-        return Err(FsError::InvalidData);
-    }
-    THREADS_MAX.store(n, Ordering::Relaxed);
-    Ok(())
+    let n = parse_dointvec_minmax(v, 1, narf_scheduler::MAX_THREADS as i64)?;
+    narf_scheduler::set_max_threads(n as usize).map_err(|_| FsError::InvalidData)
 }
 
 fn read_randomize_va_space() -> String {
@@ -1445,15 +1446,67 @@ kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_version_format);
 
 fn smoke_kernel_threads_max_default() -> TestResult {
     register_all();
-    THREADS_MAX.store(65536, Ordering::Relaxed);
     match read_sys("kernel/threads-max") {
-        Some(s) if s == "65536\n" => TestResult::Pass,
+        Some(s) if s == format!("{}\n", narf_scheduler::max_threads()) => TestResult::Pass,
         _ => TestResult::Fail("kernel/threads-max mismatch"),
     }
 }
 kernel_test_in!(
     "filesystem/procfs/sys_kernel",
     smoke_kernel_threads_max_default
+);
+
+/// `kernel.threads-max` is Linux's `max_threads` (`kernel/fork.c`): sized
+/// at boot by `set_max_threads` so the tasks' kernel stacks take at most an
+/// eighth of RAM, clamped to `[MIN_THREADS, MAX_THREADS]`; written through
+/// `sysctl_max_threads`, which takes `[1, MAX_THREADS]`. (That
+/// `copy_process` refuses at it is `verification/threads-max`.)
+fn smoke_kernel_threads_max_is_ram_derived_and_writable() -> TestResult {
+    const MAX_THREADS: u64 = 0x3fff_ffff;
+    register_all();
+    let stats = narf_memory::frame::stats();
+    let pages = stats.total.saturating_sub(stats.reserved) as u64;
+    let stack = narf_scheduler::stackful::DEFAULT_KERNEL_STACK_BYTES as u64;
+    let expect = (pages * 4096 / (8 * stack)).clamp(20, MAX_THREADS);
+    let Some(current) = read_sys("kernel/threads-max") else {
+        return TestResult::Fail("kernel/threads-max not found");
+    };
+    if current.trim().parse::<u64>() != Ok(expect) {
+        return TestResult::Fail("threads-max is not Linux's RAM-derived max_threads");
+    }
+    let write = |v: u64| {
+        lookup_sys("kernel/threads-max")
+            .is_some_and(|f| f.write(alloc::format!("{v}").as_bytes()).is_ok())
+    };
+    let restore = || {
+        let _ = write(expect);
+    };
+    if write(0) {
+        restore();
+        return TestResult::Fail("threads-max accepted 0");
+    }
+    if write(MAX_THREADS + 1) {
+        restore();
+        return TestResult::Fail("threads-max accepted a value above MAX_THREADS");
+    }
+    // An in-range write reads back and is the bound fork admission uses:
+    // one above the live task count still admits a task.
+    let live = narf_scheduler::live_user_task_count() as u64;
+    let written = write(live + 1)
+        && read_sys("kernel/threads-max").map(|s| s.trim().parse::<u64>()) == Some(Ok(live + 1));
+    let admitted = narf_scheduler::user_nproc_available();
+    restore();
+    if !written {
+        return TestResult::Fail("threads-max did not read back an in-range write");
+    }
+    if !admitted {
+        return TestResult::Fail("fork admission refused below threads-max");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel/threads-max",
+    smoke_kernel_threads_max_is_ram_derived_and_writable
 );
 
 fn smoke_kernel_panic_default() -> TestResult {

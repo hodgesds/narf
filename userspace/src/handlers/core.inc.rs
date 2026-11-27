@@ -1414,11 +1414,23 @@ impl narf_filesystem::procfs::ProcFile for NarfMmOrphansFile {
 /// Linux's killable folio wait: competitors sleep while one fault owns the
 /// page, and SIGKILL can end that sleep without cancelling the owner's I/O.
 fn wait_for_demand_owner(
-    mut wait: narf_memory::address_space::DemandPageWait<'_>,
+    wait: narf_memory::address_space::DemandPageWait<'_>,
 ) -> Result<(), narf_memory::AddressSpaceError> {
     use core::future::Future;
-    const _: () =
-        assert!(narf_memory::address_space::MAX_DEMAND_WAITERS >= narf_scheduler::MAX_USER_TASKS);
+    // The wait links its own queue entry once polled: pinned from here on,
+    // and recorded so a task dropped while parked here has it unlinked
+    // before its stack is retired. The record drops first, the wait last.
+    let mut wait = core::pin::pin!(wait);
+    // SAFETY: `detach_raw` unlinks exactly this pinned wait's entry and
+    // does not block; the scheduler calls it only once this task has
+    // stopped for good, while its stack (and so `wait`) is still mapped.
+    let stack_wait = core::pin::pin!(unsafe {
+        narf_scheduler::stackful::StackWait::new(
+            core::ptr::from_ref(&*wait).cast(),
+            narf_memory::address_space::DemandPageWait::detach_raw,
+        )
+    });
+    let _record = narf_scheduler::stackful::record_stack_wait(stack_wait.as_ref());
     // No fallback spin inside an executor poll or an IRQ handler. A synchronous
     // caller without its own stack cannot wait for another task to run.
     if narf_scheduler::stackful::current_stackful_waker().is_none() {
@@ -1437,7 +1449,7 @@ fn wait_for_demand_owner(
     }
     let mut signal = SignalWait { task: current_task_id(), armed: false };
     poll_blocking(core::future::poll_fn(|cx| {
-        let result = core::pin::Pin::new(&mut wait).poll(cx);
+        let result = wait.as_mut().poll(cx);
         if result.is_ready() {
             return result;
         }
@@ -5621,7 +5633,7 @@ fn readlink_node(
 // Legacy global mmap cursor — kept until every internal caller of
 // `MMAP_CURSOR.fetch_add(...)` (FB shmem ring, NVMe queue maps, etc.
 // inside this crate) is migrated to the per-AS variant. New code
-// should always use `as_ref.reserve_mmap_va(...)` for the active
+// should always use `as_ref.place_mmap_va(...)` for the active
 // AS.
 static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 
@@ -12620,9 +12632,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         }
     };
 
-    // Per-uid RLIMIT_NPROC. The global live-task cap below bounds the whole
+    // Per-uid RLIMIT_NPROC. kernel.threads-max below bounds the whole
     // MACHINE; this bounds ONE user, so a single unprivileged account cannot
-    // consume every slot that cap allows.
+    // consume every task that bound allows.
     //
     // Ahead of the address-space work on purpose: `copy_process` runs
     // `copy_creds` — and this check — long before `copy_mm`, so a process
@@ -12633,16 +12645,27 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
-    // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — threads
-    // included; a SCHED_DEADLINE reservation cannot be duplicated.
-    if sched_fork_denied(current_task_id()) {
+    // `copy_process`: `if (data_race(nr_threads >= max_threads)) return
+    // -EAGAIN;` — kernel.threads-max, threads included (every clone mints a
+    // user task), binding every uid, root included.
+    if !narf_scheduler::user_nproc_available() {
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
-
-    // Fork-bomb guard (also covers pthread/thread storms — every clone mints a
-    // user task). EAGAIN at the live-task cap, matching clone(2)/fork(2).
-    if !narf_scheduler::user_nproc_available() {
+    // `cgroup_can_fork` → `pids_can_fork`, threads included: the child would
+    // take a level of the parent's cgroup past pids.max. A CLONE_INTO_CGROUP
+    // child joins its target instead, whose controllers decide at placement.
+    #[cfg(feature = "cgroup")]
+    if flags & CLONE_INTO_CGROUP == 0 {
+        let task = current_task_id();
+        if !narf_filesystem::cgroupfs::can_fork(task_to_pid_raw(task).unwrap_or(task), task) {
+            ctx.set_return(errno_ret(EAGAIN));
+            return;
+        }
+    }
+    // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — threads
+    // included; a SCHED_DEADLINE reservation cannot be duplicated.
+    if sched_fork_denied(current_task_id()) {
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
@@ -15859,7 +15882,9 @@ fn release_task_tables(tid: u64) {
     // Identity / credentials / per-task knobs.
     let credential_shard = credential_shard(tid);
     if let Some(m) = CREDENTIAL_TABLES[credential_shard].uidgid.lock().as_mut() {
-        m.remove(&tid);
+        if let Some(row) = m.remove(&tid) {
+            nproc_ucount_adjust(row.uid, false);
+        }
     }
     if let Some(m) = CREDENTIAL_TABLES[credential_shard].groups.lock().as_mut() {
         m.remove(&tid);
@@ -17878,6 +17903,10 @@ pub fn uidgid_init() {
         *shard.uidgid.lock() = Some(BTreeMap::new());
         *shard.groups.lock() = Some(BTreeMap::new());
     }
+    // The rows are gone, so are the per-uid counts that summarize them.
+    for counts in NPROC_UCOUNTS.iter() {
+        *counts.lock() = BTreeMap::new();
+    }
     crate::task::reset_effective_ids();
 }
 
@@ -18787,8 +18816,17 @@ fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
         let Some(m) = g.as_mut() else {
             return false;
         };
+        let before = m.get(&task).map(|row| row.uid);
         let entry = m.entry(task).or_default();
         f(entry);
+        // The count moves with the row, under the row's shard lock: a new
+        // row joins its uid, a real-uid change leaves one uid for another.
+        if before != Some(entry.uid) {
+            if let Some(old) = before {
+                nproc_ucount_adjust(old, false);
+            }
+            nproc_ucount_adjust(entry.uid, true);
+        }
         (entry.euid, entry.egid)
     };
     // Do not nest the task registry lock under the credential shard lock.
@@ -18894,6 +18932,15 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
     t[8] = RLimitPair {
         cur: 8 * 1024 * 1024,
         max: 8 * 1024 * 1024,
+    };
+    // RLIMIT_NPROC = 6. `kernel/fork.c::fork_init` gives init
+    // `max_threads / 2`, soft and hard, from the RAM-derived `max_threads`:
+    // one user may hold at most half the tasks the machine is sized for.
+    // Infinity left every non-root fork bomb to the system-wide bound.
+    let nproc = (narf_scheduler::boot_max_threads() / 2) as u64;
+    t[RLIMIT_NPROC] = RLimitPair {
+        cur: nproc,
+        max: nproc,
     };
     t
 }
@@ -19303,21 +19350,57 @@ fn rlimit_cpu_tick(task: u64) {
 /// CAP_SYS_ADMIN exempts a task from RLIMIT_NPROC.
 pub(crate) const CAP_SYS_RESOURCE: u32 = 24;
 
-/// Live tasks whose REAL uid is `uid`.
+/// Linux's `UCOUNT_RLIMIT_NPROC` ucounts: credential rows per REAL uid.
 ///
-/// Counted from the credential rows rather than from a maintained counter,
-/// on purpose. A per-uid counter has to be incremented at every task
-/// creation, decremented at every exit, and MOVED on every set*uid — and a
-/// single missed decrement wedges that uid's ability to fork for the rest
-/// of the boot, silently and permanently. The rows are removed at reap
-/// (see the teardown block), so each live or zombie task contributes
-/// exactly one, and counting them cannot drift from the truth it is
-/// supposed to describe.
+/// The count is not a separate truth that task creation, exit and set*uid
+/// must each remember to update — a missed decrement would wedge that uid's
+/// forks for the rest of the boot. It is a summary of the credential rows,
+/// changed only where a row is inserted, removed or given a new real uid,
+/// and inside that row's shard lock, so it always equals the number of rows
+/// with that uid. The rows are removed at reap (see the teardown block), so
+/// each live or zombie task contributes exactly one.
 ///
 /// Zombies count, matching Linux: the ucount is released in
 /// `release_task`, not at exit, so a process that has exited but not been
 /// reaped still occupies a slot.
+///
+/// Sharded by uid; a fork's limit check takes one shard lock, never a scan
+/// of every task (with RLIMIT_NPROC finite by default, every unprivileged
+/// fork and clone checks it).
+const NPROC_UCOUNT_SHARDS: usize = 32;
+
+static NPROC_UCOUNTS: [narf_lib::sync::IrqSafeSpinLock<BTreeMap<u32, u64>>; NPROC_UCOUNT_SHARDS] =
+    [const { narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new()) }; NPROC_UCOUNT_SHARDS];
+
+fn nproc_ucount_shard(uid: u32) -> &'static narf_lib::sync::IrqSafeSpinLock<BTreeMap<u32, u64>> {
+    let hash = u64::from(uid).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59;
+    &NPROC_UCOUNTS[hash as usize & (NPROC_UCOUNT_SHARDS - 1)]
+}
+
+/// One row joined (`inc`) or left `uid`. Called with that row's credential
+/// shard lock held; the ucount shard lock nests inside it and is never held
+/// while taking a credential lock.
+fn nproc_ucount_adjust(uid: u32, inc: bool) {
+    let mut counts = nproc_ucount_shard(uid).lock();
+    if inc {
+        *counts.entry(uid).or_insert(0) += 1;
+    } else if let Some(count) = counts.get_mut(&uid) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&uid);
+        }
+    }
+}
+
+/// Live tasks whose REAL uid is `uid`.
 fn nproc_count_for_uid(uid: u32) -> u64 {
+    nproc_ucount_shard(uid).lock().get(&uid).copied().unwrap_or(0)
+}
+
+/// Every credential row's real uid, counted by scanning — the definition
+/// the maintained ucounts must agree with.
+#[doc(hidden)]
+pub(crate) fn __test_nproc_scan_count(uid: u32) -> u64 {
     CREDENTIAL_TABLES.iter().fold(0u64, |total, shard| {
         let guard = shard.uidgid.lock();
         let n = guard
@@ -19325,6 +19408,11 @@ fn nproc_count_for_uid(uid: u32) -> u64 {
             .map_or(0, |m| m.values().filter(|ids| ids.uid == uid).count());
         total.saturating_add(n as u64)
     })
+}
+
+#[doc(hidden)]
+pub(crate) fn __test_nproc_count(uid: u32) -> u64 {
+    nproc_count_for_uid(uid)
 }
 
 /// Whether `uid` is at or over its RLIMIT_NPROC, as
@@ -19357,8 +19445,8 @@ fn nproc_over_limit(task: u64, uid: u32, extra: u64) -> bool {
 ///
 /// The exemptions are the whole reason a fork bomb from root is a
 /// different problem from one by a user: uid 0 (`INIT_USER`) is never
-/// refused here, and neither is a task holding either capability. The
-/// global live-task cap, which this sits beside, is what covers root.
+/// refused here, and neither is a task holding either capability.
+/// kernel.threads-max, which this sits beside, is what covers root.
 pub(crate) fn nproc_fork_would_exceed(task: u64) -> bool {
     let uid = read_uidgid(task).uid;
     if uid == 0 {

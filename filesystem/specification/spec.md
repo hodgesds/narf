@@ -1031,6 +1031,16 @@ removes per-thread membership and controller charges. General migration of an
 existing process's complete thread group and automatic threaded-subtree type
 propagation are not yet provided.
 
+`can_fork(parent_pid, parent_tid) -> bool` is Linux `cgroup_can_fork`: fork
+and clone ask it, after the RLIMIT_NPROC and `kernel.threads-max` checks and
+before creating anything, and fail with `EAGAIN` when it is false. It asks
+`ControllerState::can_fork()` of every active controller on every level of the
+creating thread's cgroup up to the root; the pids controller refuses when one
+more task would exceed `pids.max` and counts a `max` event there. The child is
+charged when it joins its cgroup, so concurrent forks may overshoot by at most
+their number. A `CLONE_INTO_CGROUP` child is decided by its target's
+controllers at placement instead.
+
 Pressure Stall Information is optional. The `cgroup-psi` feature exposes
 `cgroup.pressure` plus `cpu.pressure`, `memory.pressure`, and `io.pressure`;
 without it, no PSI cgroup ABI is present. The current PSI implementation

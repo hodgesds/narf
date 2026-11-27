@@ -589,24 +589,30 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         && !(flags & MAP_POPULATE != 0
             && flags & MAP_NONBLOCK == 0
             && (prot & 0b111) != 0);
-    let mut base = if fixed {
-        hint
-    } else if defer_private_anonymous_placement {
-        // The ordinary lazy private-anonymous path selects and publishes a
-        // reusable Linux-style VMA gap atomically after its fallible backing
-        // metadata has been prepared.
-        0
+    // The ordinary lazy private-anonymous path selects and publishes a
+    // reusable Linux-style VMA gap atomically after its fallible backing
+    // metadata has been prepared. Every other no-hint mapping (file, shared,
+    // device, huge) prepares its backing for an exact base first, so it takes
+    // `get_unmapped_area`'s answer now and holds it until this call returns:
+    // published by then, or given back on any failure. The only ENOMEM is
+    // Linux's — no free gap of `len` in the window — however much the process
+    // mapped and unmapped before.
+    let placement = if fixed || defer_private_anonymous_placement {
+        None
     } else {
-        as_ref.reserve_mmap_va_aligned(len, page_size)
+        match as_ref.place_mmap_va(len, page_size) {
+            Some(placement) => Some(placement),
+            None => {
+                ctx.set_return(errno_ret(ENOMEM));
+                return;
+            }
+        }
     };
-    // reserve_mmap_va returns 0 when the no-hint mmap arena is exhausted
-    // (the bump cursor would cross MMAP_WINDOW_TOP into the stack reserve).
-    // Fail closed with -ENOMEM rather than mapping at a bogus base.
-    // (MAP_FIXED takes the `hint` arm above, which is non-zero.)
-    if base == 0 && !defer_private_anonymous_placement {
-        ctx.set_return(errno_ret(ENOMEM));
-        return;
-    }
+    let mut base = match placement.as_ref() {
+        Some(placement) => placement.base(),
+        None if fixed => hint,
+        None => 0,
+    };
 
     macro_rules! record_fixed_replacement_owner_committed {
         () => {

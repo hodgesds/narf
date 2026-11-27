@@ -3400,6 +3400,60 @@ kernel_test_in!(
     smoke_abi_ipc_msg_wait_waker_handoff_and_rmid
 );
 
+/// More blocked receivers than the old fixed wait pool held (two records per
+/// task the scheduler could admit) all park on one queue, and all see EIDRM
+/// when it is removed. Linux links each blocked `msgrcv`'s `msg_receiver`
+/// from the receiver's own stack (`do_msgrcv`), so it has no pool to run out
+/// of; with task admission sized from RAM neither may this.
+fn smoke_abi_ipc_msg_waits_have_no_pool_capacity() -> TestResult {
+    const RECEIVERS: u64 = 2100;
+    const FIRST: u64 = FAKE_TASK + 0x10_0000;
+    with_setup(|| {
+        let id = make_msgq()?;
+        let mut out = [0u8; 9];
+        let recv_args = SyscallArgs {
+            arg0: id,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        let mut blocked = 0;
+        for receiver in FIRST..FIRST + RECEIVERS {
+            set_task(receiver);
+            if call_raw(Syscall::Msgrcv.raw(), recv_args).value != 0xDEAD {
+                break;
+            }
+            blocked += 1;
+        }
+        set_task(FAKE_TASK);
+        let removed = call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) == Some(0);
+        let mut eidrm = 0;
+        for receiver in FIRST..FIRST + blocked {
+            set_task(receiver);
+            if call_raw(Syscall::Msgrcv.raw(), recv_args).value as i64 == EIDRM {
+                eidrm += 1;
+            }
+        }
+        set_task(FAKE_TASK);
+        if blocked != RECEIVERS {
+            return Err("a blocked msgrcv past the old wait pool was not published");
+        }
+        if !removed {
+            return Err("message queue removal failed");
+        }
+        if eidrm != RECEIVERS {
+            return Err("a blocked receiver did not see EIDRM after removal");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_capacity",
+    smoke_abi_ipc_msg_waits_have_no_pool_capacity
+);
+
 /// Full-queue senders use the same queue-local publication protocol as
 /// receivers: one retained waker, EIDRM on removal, and a reusable task slot
 /// after the terminal result is consumed.
@@ -4424,7 +4478,7 @@ fn smoke_abi_ipc_shmat_neg() -> TestResult {
         // `invalid_op` leaves `value` at 0 though, and 0 is a legitimate
         // shmat return — an attachment at address 0 — so the guard now
         // answers -ENOMEM, the same thing this function already returns two
-        // arms up when `reserve_mmap_va_aligned` comes back empty. Asserting
+        // arms up when `place_mmap_va` comes back empty. Asserting
         // that specific value is strictly better than asserting a
         // non-answer: -EINVAL still means the flag was rejected, but so did
         // every other non-Ok status before.

@@ -137,10 +137,37 @@ pub fn spawn_user(
     spec: TaskSpec,
     address_space: Arc<AddressSpace>,
 ) -> TaskId;
+/// System-wide task admission (Linux `kernel/fork.c` `max_threads`, the
+/// `kernel.threads-max` sysctl). `init` calls `fork_init`, which sizes it
+/// from managed RAM as `set_max_threads` does: the tasks' kernel stacks
+/// (`stackful::DEFAULT_KERNEL_STACK_BYTES` each) take at most an eighth of
+/// it, clamped to [MIN_THREADS, MAX_THREADS]. fork/clone refuse with EAGAIN
+/// while `live_user_task_count() >= max_threads()`, for every uid. There is
+/// no fixed task count; init's RLIMIT_NPROC is `boot_max_threads() / 2`.
+pub const MAX_THREADS: usize = 0x3fff_ffff; // FUTEX_TID_MASK
+pub const MIN_THREADS: usize = 20;
+pub fn threads_for_ram(ram_bytes: u64) -> usize;
+pub fn fork_init();
+pub fn max_threads() -> usize;
+pub fn boot_max_threads() -> usize;
+pub fn set_max_threads(threads: usize) -> Result<(), ThreadsMaxOutOfRange>; // [1, MAX_THREADS]
+pub fn live_user_task_count() -> usize;
+pub fn user_nproc_available() -> bool; // live_user_task_count() < max_threads()
 pub fn yield_now() -> impl Future<Output=()>;
 /// Handle sched_yield for the current own-stack task; an eligible local peer
 /// may use the bounded direct-transfer path; false selects fallback.
 pub fn stackful::sched_yield_current() -> bool;
+/// An intrusive wait-queue entry a stackful task links from its own stack
+/// while it parks (Linux's on-stack wait_queue_entry). A slot dropped
+/// without resuming (budget Kill, revoked cap) never unwinds its frames, so
+/// the task records the entry; StackfulAdapter::drop (and the KernelTask
+/// backstop) call its detach once, while the stack is still mapped, before
+/// the stack is retired. One record per task at a time.
+pub struct stackful::StackWait;
+impl stackful::StackWait {
+    pub const unsafe fn new(data: *const (), detach: unsafe fn(*const ())) -> Self;
+}
+pub fn stackful::record_stack_wait(wait: Pin<&StackWait>) -> Option<StackWaitRecord<'_>>;
 /// Conservative current-CPU probe: false only when no runnable peer,
 /// deferred wake, due timer, or staged cross-CPU wake can use a yield.
 pub fn has_other_runnable_work(current: u64) -> bool;

@@ -138,6 +138,16 @@ is a `build/` decision.
 
 ```rust
 pub struct IntrusiveList<T: Linked>;     // doubly-linked, O(1) unlink
+impl<T> IntrusiveList<T> {
+    pub fn push_back(&self, node: Pin<&mut Node<T>>);
+    pub fn push_front(&self, node: Pin<&mut Node<T>>);
+    pub fn pop_front(&self) -> Option<NonNull<Node<T>>>;
+    pub unsafe fn unlink(&self, node: NonNull<Node<T>>);   // node in this list
+    // Walk without unlinking: read `next` before unlinking the current
+    // node (Linux `list_for_each_entry_safe`).
+    pub fn front(&self) -> Option<NonNull<Node<T>>>;
+    pub unsafe fn next(&self, node: NonNull<Node<T>>) -> Option<NonNull<Node<T>>>;
+}
 pub trait Linked { fn link(&self) -> &ListLink<Self>; }
 
 pub struct RbTree<K, T: RbNode<K>>;

@@ -3583,8 +3583,19 @@ const RLIMIT_NPROC_RES: u64 = 6;
 #[cfg(target_arch = "x86_64")]
 const NOCHANGE_ID: u64 = u64::MAX;
 
+/// Set the RLIMIT_NPROC soft limit, keeping the hard one: the default hard
+/// limit is finite (`max_threads / 2`), and a task that dropped privilege
+/// may not raise it.
 fn set_nproc_limit(cur: u64) -> Result<(), &'static str> {
-    let pair = [cur, u64::MAX];
+    let mut pair = [0u64; 2];
+    if call(
+        Syscall::Getrlimit.raw(),
+        a1(RLIMIT_NPROC_RES, pair.as_mut_ptr() as u64),
+    ) != Some(0)
+    {
+        return Err("could not read RLIMIT_NPROC");
+    }
+    pair[0] = cur;
     match call(
         Syscall::Setrlimit.raw(),
         a1(RLIMIT_NPROC_RES, pair.as_ptr() as u64),
@@ -3593,6 +3604,180 @@ fn set_nproc_limit(cur: u64) -> Result<(), &'static str> {
         _ => Err("could not set RLIMIT_NPROC"),
     }
 }
+
+/// `kernel/fork.c::fork_init`: init's RLIMIT_NPROC is `max_threads / 2`,
+/// soft and hard, so a single user can hold at most half the tasks the
+/// machine is sized for; every task inherits it. `max_threads` is
+/// `set_max_threads`' RAM-derived count (kernel stacks at most an eighth of
+/// RAM), which a later `threads-max` write does not change.
+fn smoke_abi_proc_rlimit_nproc_default_is_half_max_threads() -> TestResult {
+    with_setup(|| {
+        let stats = narf_memory::frame::stats();
+        let pages = stats.total.saturating_sub(stats.reserved) as u64;
+        let stack = narf_scheduler::stackful::DEFAULT_KERNEL_STACK_BYTES as u64;
+        let half = (pages * 4096 / (8 * stack)).clamp(20, 0x3fff_ffff) / 2;
+        let mut buf = [0u8; 16];
+        if call(
+            Syscall::Getrlimit.raw(),
+            a1(RLIMIT_NPROC_RES, buf.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("getrlimit(RLIMIT_NPROC) failed");
+        }
+        let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+        let max = u64::from_ne_bytes(buf[8..].try_into().unwrap());
+        if cur == u64::MAX || max == u64::MAX {
+            return Err("the default RLIMIT_NPROC is unlimited, not max_threads / 2");
+        }
+        if cur != half || max != half {
+            return Err("the default RLIMIT_NPROC is not max_threads / 2");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit_nproc",
+    smoke_abi_proc_rlimit_nproc_default_is_half_max_threads
+);
+
+/// RLIMIT_NPROC's per-uid count (Linux `UCOUNT_RLIMIT_NPROC`) is the number
+/// of credential rows with that real uid: it follows a row into its uid,
+/// across a real-uid change, not on a same-uid write, and out at reap.
+fn smoke_abi_proc_nproc_ucount_follows_credential_rows() -> TestResult {
+    use crate::handlers::{
+        __test_nproc_count as count, __test_nproc_scan_count as scan,
+        __test_release_task_tables as reap, __test_set_fsids as set_ids,
+    };
+    const A: u32 = 4321;
+    const B: u32 = 4322;
+    const TASKS: [u64; 3] = [0x7100_0001, 0x7100_0002, 0x7100_0003];
+    with_setup(|| {
+        let (a0, b0) = (count(A), count(B));
+        for task in TASKS {
+            set_ids(task, A, A);
+        }
+        let joined = count(A) == a0 + 3 && count(A) == scan(A);
+        set_ids(TASKS[0], B, B);
+        let moved = count(A) == a0 + 2 && count(B) == b0 + 1 && count(B) == scan(B);
+        set_ids(TASKS[1], A, A);
+        let kept = count(A) == a0 + 2;
+        for task in TASKS {
+            reap(task);
+        }
+        let left = count(A) == a0 && count(B) == b0 && count(A) == scan(A) && count(B) == scan(B);
+        if !joined {
+            return Err("the per-uid count did not follow new rows into their uid");
+        }
+        if !moved {
+            return Err("the per-uid count did not follow a real-uid change");
+        }
+        if !kept {
+            return Err("a same-uid credential write changed the per-uid count");
+        }
+        if !left {
+            return Err("reaped rows stayed in the per-uid count");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit_nproc",
+    smoke_abi_proc_nproc_ucount_follows_credential_rows
+);
+
+/// Write `v` to `path` (NUL-terminated): `write(2)`'s return, or the open's
+/// -errno.
+#[cfg(feature = "cgroup")]
+fn cgroup_file_write(path: &[u8], v: &[u8]) -> i64 {
+    let fd = match call_open(path.as_ptr() as u64, 1) {
+        Some(fd) if fd >= 0 => fd,
+        Some(errno) => return errno,
+        None => return i64::MIN,
+    };
+    let n = call(
+        Syscall::Write.raw(),
+        a2(fd as u64, v.as_ptr() as u64, v.len() as u64),
+    )
+    .unwrap_or(i64::MIN);
+    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+    n
+}
+
+#[cfg(feature = "cgroup")]
+fn cgroup_file_read(path: &[u8]) -> alloc::string::String {
+    let Some(fd) = call_open(path.as_ptr() as u64, 0).filter(|fd| *fd >= 0) else {
+        return alloc::string::String::new();
+    };
+    let mut buf = [0u8; 64];
+    let n = call(
+        Syscall::Read.raw(),
+        a2(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+    )
+    .unwrap_or(0)
+    .max(0) as usize;
+    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+    alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// `kernel/cgroup/pids.c::pids_can_fork`: a fork that would take its cgroup
+/// past `pids.max` fails with -EAGAIN and counts a `max` event — how Linux
+/// contains a fork bomb confined to a cgroup — checked with the other
+/// copy_process admission checks, before any address-space work.
+#[cfg(feature = "cgroup")]
+fn smoke_abi_proc_pids_max_refuses_fork() -> TestResult {
+    const ROOT_CONTROL: &[u8] = b"/sys/fs/cgroup/cgroup.subtree_control\0";
+    const DIR: &[u8] = b"/sys/fs/cgroup/t_pids_fork\0";
+    const MAX: &[u8] = b"/sys/fs/cgroup/t_pids_fork/pids.max\0";
+    const EVENTS: &[u8] = b"/sys/fs/cgroup/t_pids_fork/pids.events\0";
+    let mut built_in = true;
+    let result = with_setup(|| {
+        if cgroup_file_write(ROOT_CONTROL, b"+pids") < 0 {
+            built_in = false;
+            return Ok(());
+        }
+        let me = crate::handlers::task_to_pid_raw(FAKE_TASK).unwrap_or(FAKE_TASK);
+        let _ = call_rmdir(DIR.as_ptr() as u64);
+        let outcome = (|| {
+            if call_mkdir(DIR.as_ptr() as u64, 0o755) != Some(0) {
+                return Err("mkdir of the pids test cgroup failed");
+            }
+            if cgroup_file_write(MAX, b"1") != 1 {
+                return Err("setting pids.max failed");
+            }
+            narf_filesystem::cgroupfs::attach_by_path("/t_pids_fork", me)
+                .map_err(|_| "attaching the harness task to the pids cgroup failed")?;
+            // pids.current == pids.max: one more task would exceed it.
+            match call(Syscall::Fork.raw(), a0(0)) {
+                Some(v) if v == EAGAIN => {}
+                Some(v) if v == ENOMEM => {
+                    return Err("a fork past pids.max reached the address-space path")
+                }
+                _ => return Err("a fork past pids.max was not -EAGAIN"),
+            }
+            if cgroup_file_read(EVENTS).trim() != "max 1" {
+                return Err("a fork refused by pids.max did not count a max event");
+            }
+            if cgroup_file_write(MAX, b"2") != 1 {
+                return Err("raising pids.max failed");
+            }
+            match call(Syscall::Fork.raw(), a0(0)) {
+                Some(v) if v == ENOMEM => Ok(()),
+                _ => Err("a fork under pids.max did not reach the address-space path"),
+            }
+        })();
+        narf_filesystem::cgroupfs::task_exited(me);
+        let _ = call_rmdir(DIR.as_ptr() as u64);
+        let _ = cgroup_file_write(ROOT_CONTROL, b"-pids");
+        outcome
+    });
+    if built_in {
+        result
+    } else {
+        TestResult::Skip("the pids controller is not built in")
+    }
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!("syscall_abi/pids_max", smoke_abi_proc_pids_max_refuses_fork);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_rlimit_nproc_refuses_fork() -> TestResult {

@@ -116,6 +116,19 @@ impl ControllerState for PidsState {
         Ok(())
     }
 
+    /// `pids_can_fork` → `pids_try_charge`: one more task must not take this
+    /// level past `pids.max`; a refusal counts a `max` event. The task is
+    /// charged when the child joins (`on_attach`), so concurrent forks may
+    /// overshoot by at most their number.
+    fn can_fork(&self) -> bool {
+        let limit = *self.limit.lock();
+        if limit.is_some_and(|max| self.current.load(Ordering::Acquire) + 1 > max) {
+            self.events_max.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
     fn on_attach(&self, _pid: u64) {
         let now = self.current.fetch_add(1, Ordering::AcqRel) + 1;
         self.peak.fetch_max(now, Ordering::AcqRel);

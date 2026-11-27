@@ -2366,6 +2366,13 @@ fn rx_napi_poll(
         // frame and byte counts are folded in when the batch ends.
         let name = rx.name();
         let mirrored = state.mirror.attached(name);
+        // The pumps start while the controller is built, before probe
+        // publishes the netdev: a handle made then holds the empty
+        // unpublished name. Follow the name the driver has now, so frames
+        // reach the stack with their device (`skb->dev`).
+        if state.iface.name() != name {
+            state.iface = narf_net::iface::RxHandle::new(name);
+        }
         let mut batch = state.iface.batch();
         for mut frame in frames {
             use narf_net::bypass::classifier::XdpAction;

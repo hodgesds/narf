@@ -1331,12 +1331,12 @@ struct MsgWaitNode {
     task: u64,
     queue: MsgQueueRef,
     wait: IpcWait,
-    hash_prev: Option<usize>,
-    hash_next: Option<usize>,
-    list_prev: Option<usize>,
-    list_next: Option<usize>,
-    wake_prev: Option<usize>,
-    wake_next: Option<usize>,
+    hash_prev: Option<MsgWaitId>,
+    hash_next: Option<MsgWaitId>,
+    list_prev: Option<MsgWaitId>,
+    list_next: Option<MsgWaitId>,
+    wake_prev: Option<MsgWaitId>,
+    wake_next: Option<MsgWaitId>,
 }
 
 enum MsgWaitSlot {
@@ -1346,21 +1346,92 @@ enum MsgWaitSlot {
 
 #[derive(Clone)]
 struct MsgWaitHandle {
-    slot: usize,
+    slot: MsgWaitId,
     task: u64,
     queue: MsgQueueRef,
 }
 
-// The executor admits at most 1024 simultaneous user tasks. Two slots per
-// admitted task keep allocation-free slot acquisition at or below 50%
-// occupancy even when every task is blocked in SysV message IPC. Stable
-// bucket chains make lookup proportional to live hash collisions rather than
-// accumulating tombstones over the kernel's lifetime.
-const MSG_WAIT_SLOT_COUNT: usize = narf_scheduler::MAX_USER_TASKS * 2;
+/// One wait record's storage. Cells come from a pool that grows by one cell
+/// whenever a blocking operation finds it empty — outside every queue lock,
+/// so the IRQ-safe state lock never allocates — and are recycled, never
+/// freed. The pool is therefore as large as the most waiters ever blocked
+/// at once, with no fixed capacity (Linux links each blocked sender's and
+/// receiver's record from its own stack), and a stale [`MsgWaitId`] always
+/// names a live cell, which the `task`/`queue` identity checks then reject.
+struct MsgWaitCell {
+    slot: IrqSafeSpinLock<MsgWaitSlot>,
+    /// Next free cell; read and written only under [`MSG_WAIT_FREE`].
+    next_free: core::sync::atomic::AtomicPtr<MsgWaitCell>,
+}
+
+/// A wait record's cell: stable for the kernel's lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MsgWaitId(core::ptr::NonNull<MsgWaitCell>);
+
+// SAFETY: cells are leaked, never freed, and internally locked.
+unsafe impl Send for MsgWaitId {}
+// SAFETY: as above.
+unsafe impl Sync for MsgWaitId {}
+
+impl MsgWaitId {
+    fn slot(self) -> &'static IrqSafeSpinLock<MsgWaitSlot> {
+        // SAFETY: every `MsgWaitId` names a leaked, never-freed cell.
+        unsafe { &(*self.0.as_ptr()).slot }
+    }
+}
+
+/// Head of the free-cell list.
+static MSG_WAIT_FREE: IrqSafeSpinLock<Option<MsgWaitId>> = IrqSafeSpinLock::new(None);
+
+/// A free cell owned by one blocking operation until `insert_msg_wait` links
+/// it; returned to the pool if it is not used.
+struct SpareMsgWait(Option<MsgWaitId>);
+
+impl SpareMsgWait {
+    /// Take a recycled cell or allocate one. Call with no queue lock held.
+    fn take() -> Self {
+        let recycled = {
+            let mut head = MSG_WAIT_FREE.lock();
+            let cell = *head;
+            if let Some(cell) = cell {
+                // SAFETY: a listed cell is live; `next_free` is guarded by
+                // the free-list lock held here.
+                let next = unsafe { (*cell.0.as_ptr()).next_free.load(Ordering::Relaxed) };
+                *head = core::ptr::NonNull::new(next).map(MsgWaitId);
+            }
+            cell
+        };
+        Self(Some(recycled.unwrap_or_else(|| {
+            let cell = alloc::boxed::Box::leak(alloc::boxed::Box::new(MsgWaitCell {
+                slot: IrqSafeSpinLock::new(MsgWaitSlot::Free),
+                next_free: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            }));
+            MsgWaitId(core::ptr::NonNull::from(cell))
+        })))
+    }
+}
+
+impl Drop for SpareMsgWait {
+    fn drop(&mut self) {
+        if let Some(cell) = self.0.take() {
+            release_msg_wait_cell(cell);
+        }
+    }
+}
+
+/// Put a free cell back on the pool. Never allocates; callable under the
+/// queue and bucket locks.
+fn release_msg_wait_cell(cell: MsgWaitId) {
+    let mut head = MSG_WAIT_FREE.lock();
+    let next = head.map_or(core::ptr::null_mut(), |next| next.0.as_ptr());
+    // SAFETY: the cell is live and off every list; `next_free` is guarded by
+    // the free-list lock held here.
+    unsafe { (*cell.0.as_ptr()).next_free.store(next, Ordering::Relaxed) };
+    *head = Some(cell);
+}
+
 const MSG_WAIT_BUCKET_COUNT: usize = 256;
-static MSG_WAIT_SLOTS: [IrqSafeSpinLock<MsgWaitSlot>; MSG_WAIT_SLOT_COUNT] =
-    [const { IrqSafeSpinLock::new(MsgWaitSlot::Free) }; MSG_WAIT_SLOT_COUNT];
-static MSG_WAIT_BUCKETS: [IrqSafeSpinLock<Option<usize>>; MSG_WAIT_BUCKET_COUNT] =
+static MSG_WAIT_BUCKETS: [IrqSafeSpinLock<Option<MsgWaitId>>; MSG_WAIT_BUCKET_COUNT] =
     [const { IrqSafeSpinLock::new(None) }; MSG_WAIT_BUCKET_COUNT];
 
 #[inline]
@@ -1369,20 +1440,11 @@ fn msg_wait_hash(task: u64) -> usize {
     (task as usize).wrapping_mul(0x9e37_79b9_7f4a_7c15usize) & (MSG_WAIT_BUCKET_COUNT - 1)
 }
 
-#[inline]
-fn msg_wait_slot_candidate(task: u64, probe: usize) -> usize {
-    debug_assert!(MSG_WAIT_SLOT_COUNT.is_power_of_two());
-    (task as usize)
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15usize)
-        .wrapping_add(probe)
-        & (MSG_WAIT_SLOT_COUNT - 1)
-}
-
 fn msg_wait_handle(task: u64) -> Option<MsgWaitHandle> {
     let bucket = MSG_WAIT_BUCKETS[msg_wait_hash(task)].lock();
     let mut current = *bucket;
     while let Some(index) = current {
-        let slot = MSG_WAIT_SLOTS[index].lock();
+        let slot = index.slot().lock();
         match &*slot {
             MsgWaitSlot::Occupied(node) if node.task == task => {
                 return Some(MsgWaitHandle {
@@ -1398,7 +1460,7 @@ fn msg_wait_handle(task: u64) -> Option<MsgWaitHandle> {
     None
 }
 
-fn wait_list_ends(queue: &MsgQueue, kind: WaitKind) -> (Option<usize>, Option<usize>) {
+fn wait_list_ends(queue: &MsgQueue, kind: WaitKind) -> (Option<MsgWaitId>, Option<MsgWaitId>) {
     match kind {
         WaitKind::MsgSend => (queue.send_wait_head, queue.send_wait_tail),
         WaitKind::MsgRecv => (queue.recv_wait_head, queue.recv_wait_tail),
@@ -1406,7 +1468,7 @@ fn wait_list_ends(queue: &MsgQueue, kind: WaitKind) -> (Option<usize>, Option<us
     }
 }
 
-fn set_wait_list_head(queue: &mut MsgQueue, kind: WaitKind, head: Option<usize>) {
+fn set_wait_list_head(queue: &mut MsgQueue, kind: WaitKind, head: Option<MsgWaitId>) {
     match kind {
         WaitKind::MsgSend => queue.send_wait_head = head,
         WaitKind::MsgRecv => queue.recv_wait_head = head,
@@ -1414,7 +1476,7 @@ fn set_wait_list_head(queue: &mut MsgQueue, kind: WaitKind, head: Option<usize>)
     }
 }
 
-fn set_wait_list_tail(queue: &mut MsgQueue, kind: WaitKind, tail: Option<usize>) {
+fn set_wait_list_tail(queue: &mut MsgQueue, kind: WaitKind, tail: Option<MsgWaitId>) {
     match kind {
         WaitKind::MsgSend => queue.send_wait_tail = tail,
         WaitKind::MsgRecv => queue.recv_wait_tail = tail,
@@ -1422,10 +1484,10 @@ fn set_wait_list_tail(queue: &mut MsgQueue, kind: WaitKind, tail: Option<usize>)
     }
 }
 
-fn link_msg_wait(queue: &mut MsgQueue, index: usize, kind: WaitKind) {
+fn link_msg_wait(queue: &mut MsgQueue, index: MsgWaitId, kind: WaitKind) {
     let (_, tail) = wait_list_ends(queue, kind);
     {
-        let mut slot = MSG_WAIT_SLOTS[index].lock();
+        let mut slot = index.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("new SysV message wait slot disappeared");
         };
@@ -1433,7 +1495,7 @@ fn link_msg_wait(queue: &mut MsgQueue, index: usize, kind: WaitKind) {
         node.list_next = None;
     }
     if let Some(tail) = tail {
-        let mut slot = MSG_WAIT_SLOTS[tail].lock();
+        let mut slot = tail.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("SysV message wait-list tail disappeared");
         };
@@ -1449,65 +1511,67 @@ fn insert_msg_wait(
     queue: &mut MsgQueue,
     task: u64,
     wait: IpcWait,
+    spare: &mut SpareMsgWait,
 ) -> MsgWaitHandle {
     assert!(
         msg_wait_handle(task).is_none(),
         "task linked to two SysV message waits"
     );
     let kind = wait.kind;
-    let mut node = Some(MsgWaitNode {
+    let index = spare
+        .0
+        .take()
+        .expect("SysV message wait without a spare cell");
+    {
+        let mut slot = index.slot().lock();
+        assert!(
+            matches!(*slot, MsgWaitSlot::Free),
+            "occupied SysV message wait cell was spare"
+        );
+        *slot = MsgWaitSlot::Occupied(MsgWaitNode {
+            task,
+            queue: Arc::clone(queue_ref),
+            wait,
+            hash_prev: None,
+            hash_next: None,
+            list_prev: None,
+            list_next: None,
+            wake_prev: None,
+            wake_next: None,
+        });
+    }
+
+    let mut bucket = MSG_WAIT_BUCKETS[msg_wait_hash(task)].lock();
+    let old_head = *bucket;
+    {
+        let mut slot = index.slot().lock();
+        let MsgWaitSlot::Occupied(node) = &mut *slot else {
+            panic!("new SysV message wait slot disappeared");
+        };
+        node.hash_next = old_head;
+    }
+    if let Some(old_head) = old_head {
+        let mut slot = old_head.slot().lock();
+        let MsgWaitSlot::Occupied(node) = &mut *slot else {
+            panic!("SysV message wait hash head disappeared");
+        };
+        node.hash_prev = Some(index);
+    }
+    *bucket = Some(index);
+    drop(bucket);
+
+    link_msg_wait(queue, index, kind);
+    MsgWaitHandle {
+        slot: index,
         task,
         queue: Arc::clone(queue_ref),
-        wait,
-        hash_prev: None,
-        hash_next: None,
-        list_prev: None,
-        list_next: None,
-        wake_prev: None,
-        wake_next: None,
-    });
-
-    for probe in 0..MSG_WAIT_SLOT_COUNT {
-        let index = msg_wait_slot_candidate(task, probe);
-        let mut slot = MSG_WAIT_SLOTS[index].lock();
-        if matches!(*slot, MsgWaitSlot::Free) {
-            *slot = MsgWaitSlot::Occupied(node.take().expect("SysV message wait inserted twice"));
-            drop(slot);
-
-            let mut bucket = MSG_WAIT_BUCKETS[msg_wait_hash(task)].lock();
-            let old_head = *bucket;
-            {
-                let mut slot = MSG_WAIT_SLOTS[index].lock();
-                let MsgWaitSlot::Occupied(node) = &mut *slot else {
-                    panic!("new SysV message wait slot disappeared");
-                };
-                node.hash_next = old_head;
-            }
-            if let Some(old_head) = old_head {
-                let mut slot = MSG_WAIT_SLOTS[old_head].lock();
-                let MsgWaitSlot::Occupied(node) = &mut *slot else {
-                    panic!("SysV message wait hash head disappeared");
-                };
-                node.hash_prev = Some(index);
-            }
-            *bucket = Some(index);
-            drop(bucket);
-
-            link_msg_wait(queue, index, kind);
-            return MsgWaitHandle {
-                slot: index,
-                task,
-                queue: Arc::clone(queue_ref),
-            };
-        }
     }
-    panic!("SysV message wait pool exceeds scheduler task admission limit");
 }
 
-fn queue_msg_wake(queue: &mut MsgQueue, index: usize) {
+fn queue_msg_wake(queue: &mut MsgQueue, index: MsgWaitId) {
     let tail = queue.wake_tail;
     {
-        let mut slot = MSG_WAIT_SLOTS[index].lock();
+        let mut slot = index.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("ready SysV message wait disappeared");
         };
@@ -1518,7 +1582,7 @@ fn queue_msg_wake(queue: &mut MsgQueue, index: usize) {
         node.wake_next = None;
     }
     if let Some(tail) = tail {
-        let mut slot = MSG_WAIT_SLOTS[tail].lock();
+        let mut slot = tail.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("SysV message wake-list tail disappeared");
         };
@@ -1529,12 +1593,17 @@ fn queue_msg_wake(queue: &mut MsgQueue, index: usize) {
     queue.wake_tail = Some(index);
 }
 
-fn unlink_msg_wake(queue: &mut MsgQueue, index: usize, prev: Option<usize>, next: Option<usize>) {
+fn unlink_msg_wake(
+    queue: &mut MsgQueue,
+    index: MsgWaitId,
+    prev: Option<MsgWaitId>,
+    next: Option<MsgWaitId>,
+) {
     if queue.wake_head != Some(index) && prev.is_none() && next.is_none() {
         return;
     }
     if let Some(prev) = prev {
-        let mut slot = MSG_WAIT_SLOTS[prev].lock();
+        let mut slot = prev.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("SysV message wake predecessor disappeared");
         };
@@ -1543,7 +1612,7 @@ fn unlink_msg_wake(queue: &mut MsgQueue, index: usize, prev: Option<usize>, next
         queue.wake_head = next;
     }
     if let Some(next) = next {
-        let mut slot = MSG_WAIT_SLOTS[next].lock();
+        let mut slot = next.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("SysV message wake successor disappeared");
         };
@@ -1555,7 +1624,7 @@ fn unlink_msg_wake(queue: &mut MsgQueue, index: usize, prev: Option<usize>, next
 
 fn remove_msg_wait(queue: &mut MsgQueue, handle: &MsgWaitHandle) -> Option<MsgWaitNode> {
     let (kind, hash_prev, hash_next, list_prev, list_next, wake_prev, wake_next) = {
-        let slot = MSG_WAIT_SLOTS[handle.slot].lock();
+        let slot = handle.slot.slot().lock();
         let MsgWaitSlot::Occupied(node) = &*slot else {
             return None;
         };
@@ -1574,7 +1643,7 @@ fn remove_msg_wait(queue: &mut MsgQueue, handle: &MsgWaitHandle) -> Option<MsgWa
     };
 
     if let Some(prev) = list_prev {
-        let mut slot = MSG_WAIT_SLOTS[prev].lock();
+        let mut slot = prev.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("SysV message wait predecessor disappeared");
         };
@@ -1583,7 +1652,7 @@ fn remove_msg_wait(queue: &mut MsgQueue, handle: &MsgWaitHandle) -> Option<MsgWa
         set_wait_list_head(queue, kind, list_next);
     }
     if let Some(next) = list_next {
-        let mut slot = MSG_WAIT_SLOTS[next].lock();
+        let mut slot = next.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("SysV message wait successor disappeared");
         };
@@ -1595,7 +1664,7 @@ fn remove_msg_wait(queue: &mut MsgQueue, handle: &MsgWaitHandle) -> Option<MsgWa
 
     let mut bucket = MSG_WAIT_BUCKETS[msg_wait_hash(handle.task)].lock();
     if let Some(prev) = hash_prev {
-        let mut slot = MSG_WAIT_SLOTS[prev].lock();
+        let mut slot = prev.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("SysV message wait hash predecessor disappeared");
         };
@@ -1609,19 +1678,20 @@ fn remove_msg_wait(queue: &mut MsgQueue, handle: &MsgWaitHandle) -> Option<MsgWa
         *bucket = hash_next;
     }
     if let Some(next) = hash_next {
-        let mut slot = MSG_WAIT_SLOTS[next].lock();
+        let mut slot = next.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("SysV message wait hash successor disappeared");
         };
         node.hash_prev = hash_prev;
     }
-    let mut slot = MSG_WAIT_SLOTS[handle.slot].lock();
+    let mut slot = handle.slot.slot().lock();
     let old = core::mem::replace(&mut *slot, MsgWaitSlot::Free);
     let MsgWaitSlot::Occupied(node) = old else {
         panic!("SysV message wait disappeared during unlink");
     };
     drop(slot);
     drop(bucket);
+    release_msg_wait_cell(handle.slot);
     Some(node)
 }
 
@@ -1633,6 +1703,7 @@ fn begin_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
     let Some(queue) = lookup_msg_queue((ipc_ns, id)) else {
         return;
     };
+    let mut spare = SpareMsgWait::take();
     {
         let mut q = queue.lock();
         if msg_wait_handle(task).is_none() {
@@ -1649,6 +1720,7 @@ fn begin_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
                     waker: None,
                     data: WaitData::None,
                 },
+                &mut spare,
             );
         }
     }
@@ -1658,6 +1730,7 @@ fn begin_msg_send_wait(task: u64, ipc_ns: u64, id: u64, mtype: i64, payload: Vec
     let Some(queue) = lookup_msg_queue((ipc_ns, id)) else {
         return;
     };
+    let mut spare = SpareMsgWait::take();
     {
         let mut q = queue.lock();
         if msg_wait_handle(task).is_none() {
@@ -1678,6 +1751,7 @@ fn begin_msg_send_wait(task: u64, ipc_ns: u64, id: u64, mtype: i64, payload: Vec
                         msgflg,
                     },
                 },
+                &mut spare,
             );
         }
     }
@@ -1724,7 +1798,7 @@ fn take_msg_send_resume(task: u64, ipc_ns: u64, id: u64) -> MsgSendResume {
     };
     let mut q = handle.queue.lock();
     let (resume, remove) = {
-        let mut slot = MSG_WAIT_SLOTS[handle.slot].lock();
+        let mut slot = handle.slot.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             return MsgSendResume::Fresh;
         };
@@ -1776,13 +1850,14 @@ fn restore_msg_send_wait(
     mtype: i64,
     payload: Vec<u8>,
     msgflg: u64,
+    spare: &mut SpareMsgWait,
 ) {
     if let Some(handle) = msg_wait_handle(task) {
         assert!(
             Arc::ptr_eq(&handle.queue, queue_ref),
             "staged SysV sender changed queues while rechecking"
         );
-        let mut slot = MSG_WAIT_SLOTS[handle.slot].lock();
+        let mut slot = handle.slot.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("staged SysV sender wait disappeared");
         };
@@ -1825,6 +1900,7 @@ fn restore_msg_send_wait(
                     msgflg,
                 },
             },
+            spare,
         );
     }
 }
@@ -1835,13 +1911,14 @@ fn restore_msg_recv_wait(
     task: u64,
     ipc_ns: u64,
     id: u64,
+    spare: &mut SpareMsgWait,
 ) {
     if let Some(handle) = msg_wait_handle(task) {
         assert!(
             Arc::ptr_eq(&handle.queue, queue_ref),
             "blocked SysV receiver changed queues while rechecking"
         );
-        let mut slot = MSG_WAIT_SLOTS[handle.slot].lock();
+        let mut slot = handle.slot.slot().lock();
         let MsgWaitSlot::Occupied(node) = &mut *slot else {
             panic!("blocked SysV receiver wait disappeared");
         };
@@ -1865,6 +1942,7 @@ fn restore_msg_recv_wait(
                 waker: None,
                 data: WaitData::None,
             },
+            spare,
         );
     }
 }
@@ -1887,7 +1965,7 @@ pub(crate) fn register_msg_wait_waker(task: u64, waker: Waker) -> MsgParkState {
     let q = handle.queue.lock();
     let (state, replaced) =
         {
-            let mut slot = MSG_WAIT_SLOTS[handle.slot].lock();
+            let mut slot = handle.slot.slot().lock();
             match &mut *slot {
                 MsgWaitSlot::Occupied(node)
                     if node.task == task && Arc::ptr_eq(&node.queue, &handle.queue) =>
@@ -1921,7 +1999,7 @@ fn notify_msg_waiters(queue: &mut MsgQueue, kind: WaitKind) {
     let (mut current, _) = wait_list_ends(queue, kind);
     while let Some(index) = current {
         let (next, should_queue) = {
-            let mut slot = MSG_WAIT_SLOTS[index].lock();
+            let mut slot = index.slot().lock();
             let MsgWaitSlot::Occupied(node) = &mut *slot else {
                 panic!("SysV message wait disappeared during notification");
             };
@@ -1968,7 +2046,7 @@ fn retire_msg_waiters(queue: &mut MsgQueue) {
         let (mut current, _) = wait_list_ends(queue, kind);
         while let Some(index) = current {
             let (next, should_queue) = {
-                let mut slot = MSG_WAIT_SLOTS[index].lock();
+                let mut slot = index.slot().lock();
                 let MsgWaitSlot::Occupied(node) = &mut *slot else {
                     panic!("SysV message wait disappeared during queue removal");
                 };
@@ -1996,7 +2074,7 @@ fn missing_msg_queue_errno(task: u64, kind: WaitKind, object: IpcObjectKey) -> i
         return EINVAL;
     };
     let _q = handle.queue.lock();
-    let slot = MSG_WAIT_SLOTS[handle.slot].lock();
+    let slot = handle.slot.slot().lock();
     let MsgWaitSlot::Occupied(node) = &*slot else {
         return EINVAL;
     };
@@ -2022,7 +2100,7 @@ fn drain_msg_wakes(queue: &MsgQueueRef) {
                 break;
             };
             let (next, waker) = {
-                let mut slot = MSG_WAIT_SLOTS[index].lock();
+                let mut slot = index.slot().lock();
                 let MsgWaitSlot::Occupied(node) = &mut *slot else {
                     panic!("queued SysV message waker disappeared");
                 };
@@ -2039,7 +2117,7 @@ fn drain_msg_wakes(queue: &MsgQueueRef) {
             };
             q.wake_head = next;
             if let Some(next) = next {
-                let mut slot = MSG_WAIT_SLOTS[next].lock();
+                let mut slot = next.slot().lock();
                 let MsgWaitSlot::Occupied(node) = &mut *slot else {
                     panic!("SysV message wake successor disappeared");
                 };
@@ -2059,7 +2137,7 @@ fn clear_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
     };
     let mut q = handle.queue.lock();
     let matches = {
-        let slot = MSG_WAIT_SLOTS[handle.slot].lock();
+        let slot = handle.slot.slot().lock();
         matches!(&*slot, MsgWaitSlot::Occupied(node) if node.task == task
             && Arc::ptr_eq(&node.queue, &handle.queue)
             && msg_wait_matches(&node.wait, kind, ipc_ns, id))
@@ -2073,7 +2151,7 @@ fn take_wait_error(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> Option<i6
     let handle = msg_wait_handle(task)?;
     let mut q = handle.queue.lock();
     let (errno, remove) = {
-        let slot = MSG_WAIT_SLOTS[handle.slot].lock();
+        let slot = handle.slot.slot().lock();
         let MsgWaitSlot::Occupied(node) = &*slot else {
             return None;
         };
@@ -2102,7 +2180,7 @@ fn finish_interrupted_msg_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) 
     let handle = msg_wait_handle(task)?;
     let mut q = handle.queue.lock();
     let result = {
-        let slot = MSG_WAIT_SLOTS[handle.slot].lock();
+        let slot = handle.slot.slot().lock();
         let MsgWaitSlot::Occupied(node) = &*slot else {
             return None;
         };
@@ -2224,6 +2302,7 @@ pub(crate) fn __test_reblock_staged_msg_send(id: u64) -> bool {
     let Some(handle) = msg_wait_handle(task) else {
         return false;
     };
+    let mut spare = SpareMsgWait::take();
     {
         let mut q = handle.queue.lock();
         restore_msg_send_wait(
@@ -2235,6 +2314,7 @@ pub(crate) fn __test_reblock_staged_msg_send(id: u64) -> bool {
             mtype,
             payload,
             msgflg,
+            &mut spare,
         );
     }
     true
@@ -2251,6 +2331,7 @@ pub(crate) fn __test_notify_while_msg_send_rechecks(id: u64) -> bool {
     let Some(handle) = msg_wait_handle(task) else {
         return false;
     };
+    let mut spare = SpareMsgWait::take();
     {
         let mut q = handle.queue.lock();
         notify_msg_waiters(&mut q, WaitKind::MsgSend);
@@ -2263,6 +2344,7 @@ pub(crate) fn __test_notify_while_msg_send_rechecks(id: u64) -> bool {
             mtype,
             payload,
             msgflg,
+            &mut spare,
         );
     }
     true
@@ -4049,12 +4131,12 @@ struct MsgQueue {
     /// Blocked operations belong to the queue whose condition they observe.
     /// Keeping them under the same per-queue lock closes check-to-park and
     /// IPC_RMID races without serializing unrelated queues.
-    send_wait_head: Option<usize>,
-    send_wait_tail: Option<usize>,
-    recv_wait_head: Option<usize>,
-    recv_wait_tail: Option<usize>,
-    wake_head: Option<usize>,
-    wake_tail: Option<usize>,
+    send_wait_head: Option<MsgWaitId>,
+    send_wait_tail: Option<MsgWaitId>,
+    recv_wait_head: Option<MsgWaitId>,
+    recv_wait_tail: Option<MsgWaitId>,
+    wake_head: Option<MsgWaitId>,
+    wake_tail: Option<MsgWaitId>,
     counters: Arc<MsgNamespaceCounters>,
 }
 
@@ -4470,6 +4552,13 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         )));
         return;
     };
+    // A blocking send may need a wait record: take its cell before the
+    // IRQ-safe queue lock, which never allocates.
+    let mut spare = if msgflg & IPC_NOWAIT as u64 == 0 {
+        SpareMsgWait::take()
+    } else {
+        SpareMsgWait(None)
+    };
     let r: Result<bool, i64> = {
         let mut q = queue.lock();
         if !ipc_allowed(
@@ -4503,6 +4592,7 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
                         mtype,
                         pending_payload.take().expect("blocked SysV message"),
                         msgflg,
+                        &mut spare,
                     );
                 }
                 Ok(false)
@@ -4617,6 +4707,13 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
         )));
         return;
     };
+    // A blocking receive may need a wait record: take its cell before the
+    // IRQ-safe queue lock, which never allocates.
+    let mut spare = if flg & IPC_NOWAIT as i64 == 0 {
+        SpareMsgWait::take()
+    } else {
+        SpareMsgWait(None)
+    };
     let picked = {
         let mut q = queue.lock();
         if !ipc_allowed(
@@ -4699,7 +4796,7 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
                         notify_msg_waiters(&mut q, WaitKind::MsgSend);
                     }
                 } else if flg & IPC_NOWAIT as i64 == 0 {
-                    restore_msg_recv_wait(&queue, &mut q, task, ipc_ns, msqid);
+                    restore_msg_recv_wait(&queue, &mut q, task, ipc_ns, msqid, &mut spare);
                 }
                 Ok(selected)
             }

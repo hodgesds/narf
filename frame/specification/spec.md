@@ -316,13 +316,17 @@ pub unsafe fn reload_selector_users(modified: u16, &[u64; 3]);
 - Anonymous user demand faults that hit the protected memory reserve may yield
   only after memory has retired the page claim, released address-space and
   allocator locks, and frame has cleared the active per-CPU mempolicy slot.
-  The waiter registry is a fixed `MAX_USER_TASKS`-entry array; registration and
-  notification are bounded, allocate nothing, and use the task-owned scheduler
+  Each waiting fault links an entry from its own kernel stack into its NUMA
+  node's wait queue (Linux `reclaim_throttle` on `pgdat->reclaim_wait`), so the
+  registry has no capacity; registration and notification allocate nothing,
+  completions wake in bounded batches outside the queue lock, the entry is
+  recorded as the task's `stackful::StackWait` so a task dropped mid-park is
+  unlinked before its stack is retired, and waits use the task-owned scheduler
   waker so CPU migration/hotplug do not invalidate a wait. Exact reclaim-cycle
   completion wakes matching waiters through a generation-ordered handshake. A
   task retries only after such completion, for at most Linux's sixteen-cycle
-  reclaim bound; no stackful task or table exhaustion fails without another
-  park, and no path busy-yields.
+  reclaim bound; no stackful task fails without another park, and no path
+  busy-yields.
 - A kernel/current-EL fault inside guarded uaccess never enters that reclaim
   wait. The trap may make one non-parking demand-allocation attempt; reserve
   pressure falls through to the architecture probe fixup and becomes `EFAULT`.

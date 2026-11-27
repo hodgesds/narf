@@ -20,14 +20,14 @@ use narf_userspace::{install_core_syscalls, install_global, SyscallTable, UserPr
 
 const CODE_VADDR: u64 = 0x0040_0000;
 const STACK_VADDR: u64 = 0x0041_0000;
-const DATA_VADDR: u64 = 0x0042_0000;
+pub(crate) const DATA_VADDR: u64 = 0x0042_0000;
 const PAGE_BYTES: u64 = 4096;
 /// Data-page offset where the inputs a test plants begin.
 const INPUT: usize = 0x100;
 
 /// One hand-built program, its address space, and the data page it
 /// reported through, as [`run`] copied it out.
-struct Program {
+pub(crate) struct Program {
     process: Option<UserProcess>,
     space: Arc<AddressSpace>,
     results: Vec<u8>,
@@ -42,7 +42,11 @@ fn alloc_page() -> Result<PhysAddr, &'static str> {
 
 /// Build `code` as a program entered in compatibility mode (`ia32`) or in
 /// 64-bit mode, with `inputs` (offset, bytes) planted in its data page.
-fn build(code: &[u8], ia32: bool, inputs: &[(usize, &[u8])]) -> Result<Program, &'static str> {
+pub(crate) fn build(
+    code: &[u8],
+    ia32: bool,
+    inputs: &[(usize, &[u8])],
+) -> Result<Program, &'static str> {
     if code.len() > PAGE_BYTES as usize {
         return Err("program larger than a page");
     }
@@ -132,7 +136,7 @@ impl Program {
         u32::from_le_bytes(self.bytes_at(off))
     }
 
-    fn u64_at(&self, off: usize) -> u64 {
+    pub(crate) fn u64_at(&self, off: usize) -> u64 {
         u64::from_le_bytes(self.bytes_at(off))
     }
 }
@@ -194,7 +198,7 @@ fn reset_cpu_segments() {
 /// forked may have moved its data page off the frame `build` planted, by a
 /// copy-on-write store. So the reference is taken before the run and the
 /// page is read through the mapping, then the reference is dropped.
-fn run(programs: &mut [Program], fast_timer: bool) -> Result<(), &'static str> {
+pub(crate) fn run(programs: &mut [Program], fast_timer: bool) -> Result<(), &'static str> {
     // SAFETY: privileged harness context; the root stays live throughout.
     let original_root = unsafe { narf_arch::x86_64::cr::read_cr3() };
     narf_userspace::syscall::__test_clear_global();
@@ -435,40 +439,40 @@ kernel_test_in!(
 // ── TLS: set_thread_area / get_thread_area and the switch ───────────
 
 /// Little assembler for the TLS programs: bytes plus 8-bit branches.
-struct Asm(Vec<u8>);
+pub(crate) struct Asm(pub(crate) Vec<u8>);
 
 impl Asm {
-    fn op(&mut self, bytes: &[u8]) -> &mut Self {
+    pub(crate) fn op(&mut self, bytes: &[u8]) -> &mut Self {
         self.0.extend_from_slice(bytes);
         self
     }
 
     /// `op imm32` (B8+r forms and friends).
-    fn op_imm(&mut self, bytes: &[u8], imm: u32) -> &mut Self {
+    pub(crate) fn op_imm(&mut self, bytes: &[u8], imm: u32) -> &mut Self {
         self.0.extend_from_slice(bytes);
         self.0.extend_from_slice(&imm.to_le_bytes());
         self
     }
 
-    fn here(&self) -> usize {
+    pub(crate) fn here(&self) -> usize {
         self.0.len()
     }
 
     /// A short branch `op rel8` back to `target`.
-    fn branch_back(&mut self, op: u8, target: usize) -> &mut Self {
+    pub(crate) fn branch_back(&mut self, op: u8, target: usize) -> &mut Self {
         let rel = target as isize - (self.0.len() as isize + 2);
         self.0.extend_from_slice(&[op, rel as i8 as u8]);
         self
     }
 
     /// A short forward branch `op rel8`; returns the site to [`Self::land`].
-    fn branch_fwd(&mut self, op: u8) -> usize {
+    pub(crate) fn branch_fwd(&mut self, op: u8) -> usize {
         self.0.extend_from_slice(&[op, 0]);
         self.0.len()
     }
 
     /// Point the forward branch ending at `site` here.
-    fn land(&mut self, site: usize) {
+    pub(crate) fn land(&mut self, site: usize) {
         self.0[site - 1] = (self.0.len() - site) as u8;
     }
 }

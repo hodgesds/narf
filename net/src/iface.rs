@@ -3232,6 +3232,13 @@ impl RxHandle {
         }
     }
 
+    /// The interface name this handle resolves. A driver whose name can
+    /// change after its receive path started (published by probe after the
+    /// pumps were spawned) compares it with its current name each poll.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Start a receive batch: no registry lock unless the registry changed
     /// since the last one (or the name was not registered then).
     pub fn batch(&mut self) -> RxBatch<'_> {
@@ -3295,8 +3302,12 @@ impl RxBatch<'_> {
         let Some(dev) = self.dev.as_ref().filter(|_| handler != 0) else {
             let name = match (&self.dev, &self.unknown) {
                 (Some(dev), _) => dev.get().name.as_str(),
-                (None, Some(name)) => name.as_str(),
-                (None, None) => return,
+                (None, Some(name)) if !name.is_empty() => name.as_str(),
+                // The unpublished (empty) name: the driver has no netdev
+                // yet, and a frame never reaches the stack without its
+                // device (Linux enables NAPI only on a registered netdev;
+                // `publish::deliver_rx` drops it the same way).
+                (None, _) => return,
             };
             return on_native_rx_timestamped(name, frame, timestamp);
         };
