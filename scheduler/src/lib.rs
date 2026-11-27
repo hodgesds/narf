@@ -1363,7 +1363,12 @@ pub(crate) struct WakeCell {
     /// false→true, and the value of `HALT_GEN[home]` at that instant. Read at
     /// dispatch to measure wake→run latency and whether a HLT intervened (a
     /// lost-wakeup) vs the task merely waiting extra passes (pure ordering).
-    /// Zero when never externally woken. Off-path unless `wake_race` is set.
+    /// Zero when never externally woken. The halt-generation half is off-path
+    /// unless `wake_race` is set; the cycle half is the wake-arrival stamp
+    /// that feeds `sched_info` run delay — every false→true transition
+    /// stamps it, and a dispatch consumes it exactly once via
+    /// `take_wake_stamp` (`wake_race_dispatch` on the executor path,
+    /// `stackful::stamp_slice_start` on the stackful paths).
     wake_cyc: AtomicU64,
     wake_halt_gen: AtomicU64,
     /// Stable stackful continuation, published after slot construction and
@@ -1405,6 +1410,20 @@ impl WakeCell {
     #[inline]
     fn executor_runnable(&self) -> bool {
         self.flag.load(Ordering::Acquire) && !self.direct_claimed.load(Ordering::Acquire)
+    }
+
+    /// Take the pending wake-arrival stamp (TSC cycles), if any, clearing
+    /// it so the wake→dispatch wait is charged exactly once. Zero means no
+    /// wake is outstanding for this cell: either it was already consumed
+    /// by a dispatch, or the task became runnable without a wake (e.g. a
+    /// fresh spawn is stamped at creation instead). The two dispatch-side
+    /// consumers — `wake_race_dispatch` (executor poll loop) and
+    /// `stackful::stamp_slice_start` (direct handoff, poll entry,
+    /// preempt/yield resume) — both take through here, so whichever runs
+    /// first for a given wake owns the feed and the other sees zero.
+    #[inline]
+    pub(crate) fn take_wake_stamp(&self) -> u64 {
+        self.wake_cyc.swap(0, Ordering::Relaxed)
     }
 }
 
@@ -2517,7 +2536,7 @@ pub fn dbg_take_long_run_delay(cpu: usize) -> Option<(u64, u64)> {
 /// and whether a HLT intervened since the wake.
 #[inline]
 fn wake_race_dispatch(cell: &WakeCell, cpu: usize) {
-    let w = cell.wake_cyc.swap(0, Ordering::Relaxed);
+    let w = cell.take_wake_stamp();
     let now = if w == 0 { 0 } else { narf_time::now_cycles() };
     let waited = now.saturating_sub(w);
     schedstat::note_dispatch(waited);

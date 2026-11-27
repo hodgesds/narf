@@ -2339,8 +2339,32 @@ fn stamp_slice_start(task: &KernelTask, cpu: usize) {
     // model never reaches — so it read 0 for every live thread and
     // schbench divided runqueue_ns by it (#2400).
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if let Some(cputime) = task_wake_cell(task).and_then(|cell| cell.cputime.as_ref()) {
-        cputime.note_dispatch();
+    if let Some(cell) = task_wake_cell(task) {
+        if let Some(cputime) = cell.cputime.as_ref() {
+            cputime.note_dispatch();
+        }
+        // Feed the wait-time accumulators (Linux `sched_info_arrive`):
+        // the wake-arrival stamp (`WakeCell::wake_cyc`, stamped on every
+        // false→true wake transition) minus dispatch time is the time this
+        // task spent runnable but waiting for a CPU. The executor poll
+        // loop already feeds this through `wake_race_dispatch`, but every
+        // stackful resume path lands here instead — direct handoff, poll
+        // entry, preempt-resume, yield-resume — so without this feed those
+        // dispatches never charged their wait, and a direct handoff left
+        // the stamp live for the next executor dispatch to over-count
+        // (its waited span then covered the whole handoff run as well).
+        // Taking the stamp consumes it exactly once: a zero take means
+        // the executor loop already fed this dispatch (or no wake
+        // preceded it), so skip both accumulators and keep the per-CPU
+        // `pcount` — which `schedstat::note_dispatch` also bumps — exact.
+        let w = cell.take_wake_stamp();
+        if w != 0 {
+            let waited = now.saturating_sub(w);
+            if let Some(cputime) = cell.cputime.as_ref() {
+                cputime.note_run_delay(waited);
+            }
+            crate::schedstat::note_dispatch(waited);
+        }
     }
     #[cfg(feature = "instruction-quantum")]
     {
@@ -9360,6 +9384,123 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// One wake→dispatch cycle through `stamp_slice_start` feeds both wait
+    /// accumulators (Linux `sched_info_arrive`): the task's own run delay
+    /// (`/proc/<pid>/schedstat`'s second field) and the CPU's (`/proc/
+    /// schedstat` `run_delay`). The stamp is consumed exactly once — a
+    /// second slice start with no new wake charges nothing further, so
+    /// the legacy longjmp tail (which never feeds these fields) cannot
+    /// double-charge them either.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn smoke_slice_start_feeds_wait_time() -> TestResult {
+        use alloc::sync::Arc;
+        struct ReadyImmediately;
+        impl Future for ReadyImmediately {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        let cpu = this_cpu();
+        let cputime = Arc::new(crate::cputime::TaskCputime::new());
+        let cell = crate::new_wake_cell_with_cputime(
+            crate::TaskId(24002),
+            cpu as u32,
+            false,
+            cputime.clone(),
+        );
+        // Age the wake-arrival stamp the cell constructor took, so the
+        // waited span is unmistakably nonzero.
+        let end = narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(2_000_000));
+        while narf_time::now_cycles() < end {
+            core::hint::spin_loop();
+        }
+        let task = KernelTask::new(ReadyImmediately);
+        task.bind_wake_cell(cell.clone());
+        let task_before = cputime.run_delay_ns();
+        let cpu_before = crate::schedstat::cpu_schedstat(cpu);
+        stamp_slice_start(&task, cpu);
+        // The stamp is consumed: a later take finds nothing to feed.
+        if cell.take_wake_stamp() != 0 {
+            task.unbind_wake_cell();
+            return TestResult::Fail("stamp_slice_start left the wake-arrival stamp live");
+        }
+        // Per-CPU counters are monotone and shared, so only lower bounds
+        // are asserted on them; the per-task counter is exact.
+        let waited = cputime.run_delay_ns() - task_before;
+        if waited < 500_000 {
+            return TestResult::Fail("a wake→dispatch cycle did not charge the task's wait time");
+        }
+        let cpu_after = crate::schedstat::cpu_schedstat(cpu);
+        if cpu_after.run_delay_ns <= cpu_before.run_delay_ns {
+            return TestResult::Fail("a wake→dispatch cycle did not charge the CPU's wait time");
+        }
+        if cpu_after.pcount < cpu_before.pcount + 1 {
+            return TestResult::Fail("a wake→dispatch cycle did not count the CPU dispatch");
+        }
+        // A second slice start with no new wake charges nothing further.
+        stamp_slice_start(&task, cpu);
+        task.unbind_wake_cell();
+        if cputime.run_delay_ns() != task_before + waited {
+            return TestResult::Fail("a slice start with no new wake re-charged the wait time");
+        }
+        TestResult::Pass
+    }
+
+    /// The executor poll loop's feed and `stamp_slice_start`'s feed
+    /// partition one wake: whichever consumes the stamp first owns it, and
+    /// the other must add nothing. Otherwise a stackful task dispatched by
+    /// the loop would have its wait charged twice (once per feed).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn smoke_slice_start_does_not_double_count_executor_dispatch() -> TestResult {
+        use alloc::sync::Arc;
+        struct ReadyImmediately;
+        impl Future for ReadyImmediately {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        let cpu = this_cpu();
+        let cputime = Arc::new(crate::cputime::TaskCputime::new());
+        let cell = crate::new_wake_cell_with_cputime(
+            crate::TaskId(24003),
+            cpu as u32,
+            false,
+            cputime.clone(),
+        );
+        let end = narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(2_000_000));
+        while narf_time::now_cycles() < end {
+            core::hint::spin_loop();
+        }
+        let task = KernelTask::new(ReadyImmediately);
+        task.bind_wake_cell(cell.clone());
+        let cpu_before = crate::schedstat::cpu_schedstat(cpu);
+        // The executor loop's feed, as `run_until_empty` performs it.
+        crate::wake_race_dispatch(&cell, cpu);
+        let fed_by_loop = cputime.run_delay_ns();
+        if fed_by_loop < 500_000 {
+            task.unbind_wake_cell();
+            return TestResult::Fail(
+                "the executor loop's feed did not charge the task's wait time",
+            );
+        }
+        // The stackful slice start for the same dispatch must add nothing.
+        stamp_slice_start(&task, cpu);
+        task.unbind_wake_cell();
+        if cputime.run_delay_ns() != fed_by_loop {
+            return TestResult::Fail("stamp_slice_start re-charged a wait the executor loop fed");
+        }
+        let cpu_after = crate::schedstat::cpu_schedstat(cpu);
+        if cpu_after.run_delay_ns < cpu_before.run_delay_ns + 500_000 {
+            return TestResult::Fail("the executor loop's feed did not charge the CPU's wait time");
+        }
+        if cpu_after.pcount < cpu_before.pcount + 1 {
+            return TestResult::Fail("the executor loop's feed did not count the CPU dispatch");
+        }
+        TestResult::Pass
+    }
+
     /// Owner context follows `CURRENT_STACKFUL_TASK`, not the CPU that first
     /// polled a task. This is the property syscall task-local lookup relies on
     /// across work stealing and direct `kernel_switch` resume.
@@ -10477,6 +10618,13 @@ pub mod tests {
     kernel_test_in!("scheduler/stackful", smoke_current_task_cleared_after_poll);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_slice_start_counts_a_dispatch);
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    kernel_test_in!("scheduler/stackful", smoke_slice_start_feeds_wait_time);
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_slice_start_does_not_double_count_executor_dispatch
+    );
     kernel_test_in!(
         "scheduler/stackful",
         smoke_current_user_context_is_task_local
