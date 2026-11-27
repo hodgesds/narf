@@ -1075,7 +1075,8 @@ fn futex_timeout(uaddr: u64, op: u64, timeout: u64) -> Option<i64> {
 /// session audio stack — never started.
 ///
 /// The non-blocking decisions, in `futex_lock_pi_atomic` / `futex_lock_pi` /
-/// `futex_unlock_pi` order; the blocking handoff is the boot's to prove.
+/// `futex_unlock_pi` order; the blocking handoff is covered by
+/// `smoke_abi_futex_pi_ordered_handoff` below.
 fn smoke_abi_futex_pi_lock_unlock_protocol() -> TestResult {
     with_setup(|| {
         let me = call(Syscall::Gettid.raw(), a0(0)).ok_or("gettid")? as u32;
@@ -1163,3 +1164,142 @@ fn smoke_abi_futex_pi_lock_unlock_protocol() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/futex", smoke_abi_futex_pi_lock_unlock_protocol);
+
+/// Ordered PI handoff (`futex_unlock_pi`): ownership transfers directly
+/// to the head waiter instead of cmpxchg-to-`FUTEX_WAITERS` + wake-1.
+///
+/// The old shape left the word free while waiters were queued, so the
+/// unlocker itself (or any new locker) could re-take the word via cmpxchg
+/// before the woken waiter was scheduled. The handoff writes the head
+/// waiter's TID into the word, so only the head waiter can acquire next:
+/// any other locker finds the word owned and parks.
+///
+/// The harness cannot really park (no yield hook), so the head waiter is
+/// a real registered task whose `LOCK_PI` re-execution is driven by
+/// switching the harness's current task to it (`set_task`); its queue
+/// entry is the same one a parked `FUTEX_WAIT` would register. The
+/// second waiter is a ctx-less fake tid, which the unlock path cannot
+/// designate — it exercises the old-shape fallback and proves the
+/// second waiter is still reached once the head releases.
+fn smoke_abi_futex_pi_ordered_handoff() -> TestResult {
+    with_setup(|| {
+        let me = call(Syscall::Gettid.raw(), a0(0)).ok_or("gettid")? as u32;
+        let word = core::sync::atomic::AtomicU32::new(0);
+        let p = &word as *const _ as u64;
+        let get = || word.load(Ordering::SeqCst);
+        let p_op = |op: u64| futex(p, op | FUTEX_PRIVATE_FLAG, 0, 0);
+        // Head waiter: a real registered task, so the unlock path can
+        // carry a handoff grant on its task ctx. The pid mappings make
+        // its Linux TID resolve back to itself, as the existing test's
+        // OTHER mapping does.
+        let w1_id = narf_scheduler::alloc_task_id().raw();
+        if w1_id as u32 == me {
+            return Err("waiter task id must differ from the owner's TID");
+        }
+        let w1 = crate::task::Task::new_registered(w1_id, w1_id);
+        crate::handlers::register_pid_task_mapping(w1_id, w1_id);
+        crate::handlers::register_task_to_pid(w1_id, w1_id);
+        const T2: u64 = 0x7e_0055;
+        let woken1 = queue(true, p, MATCH_ANY, w1_id)?;
+        let woken2 = queue(true, p, MATCH_ANY, T2)?;
+        let r = (|| {
+            // Owner takes with two waiters queued: FUTEX_WAITERS set.
+            if p_op(FUTEX_LOCK_PI) != Some(0) || get() != (me | PI_WAITERS) {
+                return Err("taking a PI futex with two parked waiters must set FUTEX_WAITERS");
+            }
+            // Unlock transfers ownership DIRECTLY to the head waiter:
+            // the word names it (not FUTEX_WAITERS, not 0), so no other
+            // locker can take the word before it is scheduled.
+            if p_op(FUTEX_UNLOCK_PI) != Some(0) || get() != w1_id as u32 {
+                return Err(
+                    "unlocking with parked waiters must transfer the word to the head waiter",
+                );
+            }
+            // Only the head waiter is woken — FIFO order, not a broadcast.
+            if woken1.load(Ordering::Acquire) != 1 || woken2.load(Ordering::Acquire) != 0 {
+                return Err("unlocking with parked waiters must wake only the head waiter");
+            }
+            // The head waiter re-executes LOCK_PI as itself: the grant
+            // turns the owner==me check into an acquire, not EDEADLK,
+            // and the word is untouched by the acquire.
+            set_task(w1_id);
+            if p_op(FUTEX_LOCK_PI) != Some(0) || get() != w1_id as u32 {
+                return Err("the designated head waiter must acquire via its handoff grant");
+            }
+            // The grant is single-use: locking again is a recursive lock.
+            if p_op(FUTEX_LOCK_PI) != Some(EDEADLK) {
+                return Err("a second LOCK_PI after a handoff acquire must be EDEADLK");
+            }
+            // The head waiter releases: the ctx-less waiter behind it
+            // cannot be designated, so the old unowned-FUTEX_WAITERS
+            // word + wake-1 fallback runs and the waiter is not stranded.
+            if p_op(FUTEX_UNLOCK_PI) != Some(0) || get() != PI_WAITERS {
+                return Err("unlocking to a ctx-less waiter must leave FUTEX_WAITERS, no owner");
+            }
+            if woken2.load(Ordering::Acquire) != 1 {
+                return Err("unlocking to a ctx-less waiter must wake it");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::handlers::__test_futex_drop_current(true, p, w1_id);
+        crate::handlers::__test_futex_drop_current(true, p, T2);
+        crate::task::abort_prepared_registration(&w1);
+        crate::handlers::release_reaped_task(w1_id);
+        r
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_pi_ordered_handoff);
+
+/// The handoff's in-flight rule (`futex_lock_pi`): a designated waiter
+/// whose deadline has passed must NOT time out while the unlock path is
+/// still between setting the grant and rewriting the word — it re-parks
+/// instead, and the unlock's wake (or its error-path generation bump)
+/// re-executes it once the word names it.
+///
+/// The harness has no yield hook, so the re-park falls out the bottom
+/// as EAGAIN ("no task to park") rather than parking; the assertion is
+/// that the call does NOT report ETIMEDOUT. Without the rule it would.
+fn smoke_abi_futex_pi_handoff_deadline_repark() -> TestResult {
+    with_setup(|| {
+        let word = core::sync::atomic::AtomicU32::new(0);
+        let p = &word as *const _ as u64;
+        // An owner that exists (so the lock attempt reaches the deadline
+        // check instead of ESRCH), per the existing test's OTHER mapping.
+        const OTHER: u64 = 0x7e_0051;
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        crate::handlers::register_task_to_pid(OTHER, OTHER);
+        word.store(OTHER as u32, Ordering::SeqCst);
+        // The designated waiter: a real registered task carrying a grant
+        // for this word, as `futex_pi_designate_head` would set it.
+        let w1_id = narf_scheduler::alloc_task_id().raw();
+        let w1 = crate::task::Task::new_registered(w1_id, w1_id);
+        crate::handlers::register_pid_task_mapping(w1_id, w1_id);
+        crate::handlers::register_task_to_pid(w1_id, w1_id);
+        crate::user_task::with_user_task_ctx(w1_id, |uc| {
+            uc.futex_pi_granted_uaddr.store(p, Ordering::Release);
+        });
+        let zero = [0u64; 2];
+        let r = (|| {
+            set_task(w1_id);
+            if futex_timeout(p, FUTEX_LOCK_PI2 | FUTEX_PRIVATE_FLAG, zero.as_ptr() as u64)
+                != Some(EAGAIN)
+            {
+                return Err("a designated waiter past its deadline must re-park, not time out");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::user_task::with_user_task_ctx(w1_id, |uc| {
+            uc.futex_pi_granted_uaddr.store(0, Ordering::Release);
+        });
+        crate::task::abort_prepared_registration(&w1);
+        crate::handlers::release_reaped_task(w1_id);
+        crate::handlers::release_reaped_task(OTHER);
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_pi_handoff_deadline_repark
+);

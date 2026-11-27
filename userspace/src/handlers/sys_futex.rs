@@ -313,10 +313,14 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
 /// handler runs first.
 ///
 /// Order, as `futex_lock_pi_atomic` + `futex_lock_pi`: EFAULT; EDEADLK when
-/// the caller already owns it; a free word is taken atomically (keeping
-/// OWNER_DIED, and FUTEX_WAITERS while others are parked); ESRCH when the
-/// owner does not exist; EWOULDBLOCK for trylock; otherwise FUTEX_WAITERS is
-/// set and the caller parks until the deadline (ETIMEDOUT).
+/// the caller already owns it — unless the caller holds an ordered-handoff
+/// grant for this word, in which case the unlock path transferred the lock
+/// to it directly and 0 is the acquire; a free word is taken atomically
+/// (keeping OWNER_DIED, and FUTEX_WAITERS while others are parked); ESRCH
+/// when the owner does not exist; EWOULDBLOCK for trylock; otherwise
+/// FUTEX_WAITERS is set and the caller parks until the deadline
+/// (ETIMEDOUT — except a designated waiter re-parks while its handoff is
+/// still in flight instead of timing out).
 ///
 /// LINUX-GAP: no priority inheritance proper — a blocked waiter does not
 /// boost the owner's scheduling priority (`rt_mutex_adjust_prio_chain`).
@@ -340,7 +344,18 @@ fn futex_lock_pi(
         };
         let owner = uval & FUTEX_TID_MASK;
         if owner == me {
-            ctx.set_return(SyscallReturn::ok((-EDEADLK) as u64));
+            // Ordered handoff: the unlock path may have transferred this
+            // lock to us directly — the word names us AND a grant for this
+            // word sits on our task ctx (see `futex_pi_designate_head`).
+            // That grant is the only thing that tells the transfer apart
+            // from a recursive lock attempt: the word alone cannot, both
+            // present our own TID as owner. A grant is consumed exactly
+            // once, here; without one this is a genuine recursive lock.
+            if futex_pi_take_grant(uaddr) {
+                ctx.set_return(SyscallReturn::ok(0));
+            } else {
+                ctx.set_return(SyscallReturn::ok((-EDEADLK) as u64));
+            }
             return;
         }
         if owner == 0 {
@@ -385,8 +400,21 @@ fn futex_lock_pi(
         }
         let deadline = deadline.unwrap_or(u64::MAX);
         if deadline <= narf_scheduler::narf_time::monotonic_ns() {
-            ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
-            return;
+            // A designated waiter must not time out while the handoff is
+            // still in flight: the unlock path sets the grant BEFORE
+            // rewriting the word, and this pass may still see the word
+            // naming the unlocker. Re-park instead of reporting
+            // ETIMEDOUT — the unlock's wake (or, on its error path, the
+            // generation bump in `futex_pi_release_designation`) wakes
+            // us, and the word names us by then. If the unlock failed
+            // it cleared our grant, so the next pass reports ETIMEDOUT
+            // normally; the park below is bounded by the already-expired
+            // deadline, so this costs one prompt re-execution, not a
+            // sleep.
+            if !futex_pi_has_grant(uaddr) {
+                ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
+                return;
+            }
         }
         let (Some(uctx), Some(hook)) = (
             crate::user_task::current_user_task(),
@@ -431,40 +459,86 @@ fn futex_lock_pi(
 
 /// `kernel/futex/pi.c::futex_unlock_pi`: release the PI lock at `uaddr`.
 /// EFAULT, then EPERM unless the caller owns it. With tasks parked on it,
-/// the word becomes FUTEX_WAITERS with no owner and one waiter is woken: it
-/// re-executes FUTEX_LOCK_PI and takes the lock, and because the word is
-/// not zero no userspace fast path can take it past the parked waiters.
-/// Otherwise the word returns to 0 (OWNER_DIED goes with the release).
+/// ownership transfers DIRECTLY to the head waiter: the word is rewritten
+/// with the head waiter's TID (keeping FUTEX_WAITERS while further waiters
+/// remain), and the waiter is woken. The woken waiter re-executes
+/// FUTEX_LOCK_PI, finds itself the owner with a handoff grant, and
+/// acquires — no other locker can take the word in between, because the
+/// word never sits free while a waiter is queued: the old
+/// cmpxchg-to-FUTEX_WAITERS + wake-1 let the unlocker itself (or any new
+/// locker) re-take the word via cmpxchg before the woken waiter was
+/// scheduled. Only the head waiter may take a contended lock; the
+/// transfer is FIFO-ordered (the queue is the FIFO in `futex_queue.rs`).
+/// With no live head waiter the word falls back to the old shape —
+/// FUTEX_WAITERS with no owner (or 0 when nobody is parked) — and one
+/// waiter is woken; the free-word take is ungated, so that fallback can
+/// never strand a waiter. PI priority boost is still unimplemented
+/// (the LINUX-GAP in `futex_lock_pi`): this is FIFO-ordered acquisition
+/// only.
 fn futex_unlock_pi(ctx: &mut dyn TrapContext, uaddr: u64, key: FutexKey) {
     let task = current_task_id();
     let me = (linux_tid_for_task(task) as u32) & FUTEX_TID_MASK;
-    loop {
-        let Some(uval) = futex_read_user_word(uaddr) else {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-            return;
-        };
-        if uval & FUTEX_TID_MASK != me {
-            ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
-            return;
+    let Some(mut uval) = futex_read_user_word(uaddr) else {
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        return;
+    };
+    if uval & FUTEX_TID_MASK != me {
+        ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+        return;
+    }
+    // Designate BEFORE rewriting the word (see `futex_pi_designate_head`).
+    // With no live head waiter this is None and the word below falls back
+    // to the old unowned shape.
+    let designated = futex_pi_designate_head(key, uaddr);
+    let newval = match &designated {
+        Some(designation) => {
+            (designation.linux_tid as u32 & FUTEX_TID_MASK)
+                | if designation.more_waiters { FUTEX_WAITERS } else { 0 }
         }
-        let waiting = futex_waiter_count_key(key) > 0;
-        let newval = if waiting { FUTEX_WAITERS } else { 0 };
+        None => {
+            if futex_waiter_count_key(key) > 0 {
+                FUTEX_WAITERS
+            } else {
+                0
+            }
+        }
+    };
+    // Publish the transfer. Retries keep the SAME designation: only a
+    // contender setting FUTEX_WAITERS can move the word under us, and
+    // that converges — re-designating mid-retry could leave the first
+    // designee behind a stale grant.
+    loop {
         // SAFETY: `uaddr` passed `get_futex_key` (aligned, user range).
         match unsafe { cmpxchg_user_u32(uaddr, uval, newval) } {
-            Ok(prev) if prev == uval => {}
-            Ok(_) => continue,
+            Ok(prev) if prev == uval => break,
+            Ok(_) => {
+                let Some(next) = futex_read_user_word(uaddr) else {
+                    futex_pi_release_designation(&designated, key, uaddr);
+                    ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                    return;
+                };
+                if next & FUTEX_TID_MASK != me {
+                    futex_pi_release_designation(&designated, key, uaddr);
+                    ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+                    return;
+                }
+                uval = next;
+            }
             Err(_) => {
+                futex_pi_release_designation(&designated, key, uaddr);
                 ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
                 return;
             }
         }
-        // A locker that set FUTEX_WAITERS but has not registered its waker
-        // yet sees the generation move and does not sleep.
-        if uval & FUTEX_WAITERS != 0 || waiting {
-            futex_bump_counter_key(key);
-            futex_wake_waiters_key_bitset(key, 1, FUTEX_BITSET_MATCH_ANY);
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
     }
+    // A locker that set FUTEX_WAITERS but has not registered its waker
+    // yet sees the generation move and does not sleep.
+    if uval & FUTEX_WAITERS != 0
+        || designated.is_some()
+        || futex_waiter_count_key(key) > 0
+    {
+        futex_bump_counter_key(key);
+        futex_wake_waiters_key_bitset(key, 1, FUTEX_BITSET_MATCH_ANY);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
 }
