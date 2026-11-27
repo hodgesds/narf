@@ -349,7 +349,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if !self.is_read_only() {
             return Ok(());
         }
-        if self.device.is_read_only() || !self.journal_overrides.is_empty() {
+        if self.device.is_read_only() {
             return Err(FsError::ReadOnly);
         }
         let mut bytes = [0u8; 1024];

@@ -37,6 +37,7 @@ pub mod htree;
 pub mod inode;
 pub mod interop;
 pub mod journal;
+mod journal_tests;
 pub mod metadata_csum;
 pub mod mount_opts;
 pub mod node;
@@ -119,12 +120,17 @@ fn build_named(
 
     mount_opts::validate_remount(request.options)?;
     let read_only = request.read_only || request.options.split(',').any(|o| o == "ro");
+    // `Opt_noload`: "noload" and "norecovery" are one option.
+    let noload = request
+        .options
+        .split(',')
+        .any(|o| o == "noload" || o == "norecovery");
     let name = request
         .source
         .strip_prefix("/dev/")
         .unwrap_or(request.source);
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
-    let volume = registry::mount(dev, read_only)?;
+    let volume = registry::mount_with_options(dev, read_only, noload)?;
     if !read_only && volume.is_read_only() {
         return match volume.refusal() {
             Some(Refusal::ReadOnlyFeature) => {

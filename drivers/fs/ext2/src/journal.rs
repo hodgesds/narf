@@ -1,43 +1,50 @@
-//! JBD2 (ext3/4 journal) on-disk format + read-side replay.
+//! JBD2, the ext3/ext4 journal: the on-disk format, superblock validation,
+//! and recovery, as Linux does them.
 //!
-//! Pure-logic parsers + a replay driver that walks transactions from
-//! the journal-superblock's `s_start` for `s_sequence` and builds a
-//! map of `target_fs_block → replayed_data`. The caller (typically
-//! `Ext2Volume`) uses that override map to serve reads after an
-//! unclean shutdown without ever touching the disk — RO replay only.
+//! - `include/linux/jbd2.h`: the block layouts and feature bits.
+//! - `fs/jbd2/journal.c`: `journal_check_superblock`,
+//!   `journal_load_superblock`, `jbd2_journal_load`, `journal_reset`,
+//!   `jbd2_journal_wipe`, `jbd2_mark_journal_empty`,
+//!   `jbd2_journal_update_sb_log_tail`, `jbd2_journal_update_sb_errno`.
+//! - `fs/jbd2/recovery.c`: `jbd2_journal_recover`, `do_one_pass` (the three
+//!   passes SCAN, REVOKE, REPLAY), `jbd2_do_replay`, `count_tags`,
+//!   `calc_chksums`, the checksum checks, `scan_revoke_records`.
+//! - `fs/jbd2/revoke.c`: `jbd2_journal_set_revoke`,
+//!   `jbd2_journal_test_revoke`.
 //!
-//! NARF is GPL-2.0-or-later (relicensed 2026-05-20), so the Linux
-//! `fs/jbd2/` sources are directly cited where the on-disk layout or
-//! recovery algorithm comes from them.
+//! [`Journal`] is the `journal_t` subset recovery needs. The ext4 side
+//! (`ext4_load_journal`, in `volume.rs`) decides when to wipe, load or
+//! refuse; this module does the jbd2 part. All I/O goes through
+//! [`JournalIo`], so the same code runs against a device at mount and
+//! against memory in the tests.
 //!
-//! References (all big-endian on disk — JBD2 is a network-byte-order
-//! format):
+//! Everything on disk is big-endian. Block numbers inside the log are
+//! journal-relative (the journal inode's logical blocks); tags name
+//! filesystem blocks.
 //!
-//! - Linux `include/linux/jbd2.h` — `struct journal_header_s`,
-//!   `struct journal_block_tag_s`, `struct journal_superblock_s`,
-//!   `struct commit_header`, block-type constants, tag-flag constants.
-//! - Linux `fs/jbd2/journal.c` — `journal_get_superblock` (magic +
-//!   superblock_v1/v2 dispatch).
-//! - Linux `fs/jbd2/recovery.c` — `do_one_pass` (the descriptor /
-//!   commit / revoke walker this module reimplements), `count_tags`
-//!   (tag stride math), `jbd2_journal_revoke` (revoke-table semantics).
-//!
-//! Deferred for follow-up commits:
-//!   * Journal checksum feature (`JBD2_FEATURE_INCOMPAT_CSUM_V2/V3`)
-//!     — we read past csum tags but don't verify them.
-//!   * 64-bit block tags (`JBD2_FEATURE_INCOMPAT_64BIT`) — only the
-//!     32-bit tag stride is implemented.
-//!   * Async commit + fast commits — handled as plain commits if seen.
+//! Fast commits are not replayed yet. A dirty journal with the FAST_COMMIT
+//! feature fails with [`JournalError::FastCommit`] before anything is
+//! written (`fc_do_one_pass` and ext4's replay callback come later).
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 
-/// JBD2 magic. ASCII "JBD\x99" big-endian. Linux
-/// `include/linux/jbd2.h::JBD2_MAGIC_NUMBER`.
+use crate::metadata_csum::crc32c;
+
+/// `JBD2_MAGIC_NUMBER`.
 pub const JBD2_MAGIC_NUMBER: u32 = 0xC03B_3998;
+/// `JBD2_MIN_JOURNAL_BLOCKS`.
+pub const JBD2_MIN_JOURNAL_BLOCKS: u32 = 1024;
+/// `JBD2_DEFAULT_FAST_COMMIT_BLOCKS`.
+pub const JBD2_DEFAULT_FAST_COMMIT_BLOCKS: u32 = 256;
+/// Size of `journal_superblock_t`.
+pub const SUPERBLOCK_BYTES: usize = 1024;
 
-/// Block-type discriminator values. Linux
-/// `include/linux/jbd2.h::JBD2_*_BLOCK`.
+/// `JBD2_*_BLOCK`.
 pub mod block_type {
     pub const DESCRIPTOR: u32 = 1;
     pub const COMMIT: u32 = 2;
@@ -46,551 +53,973 @@ pub mod block_type {
     pub const REVOKE: u32 = 5;
 }
 
-/// Tag-flag bits (per-block flags within a descriptor entry). Linux
-/// `include/linux/jbd2.h::JBD2_FLAG_*`.
+/// `JBD2_FLAG_*`: the 16-bit tag flags.
 pub mod tag_flag {
-    /// First word of the data block matched JBD2_MAGIC_NUMBER and was
-    /// escaped (XOR'd with zero in the journaled copy).
-    pub const ESCAPE: u32 = 1;
-    /// The UUID field is absent — reuse the previous tag's UUID.
-    pub const SAME_UUID: u32 = 2;
-    /// Block was deleted by this transaction (don't replay).
-    pub const DELETED: u32 = 4;
-    /// Last tag in this descriptor block.
-    pub const LAST_TAG: u32 = 8;
+    /// The block began with the magic number; the log copy's first four
+    /// bytes are zero and replay puts the magic back.
+    pub const ESCAPE: u16 = 1;
+    /// No UUID follows this tag.
+    pub const SAME_UUID: u16 = 2;
+    /// Never written by Linux; ignored.
+    pub const DELETED: u16 = 4;
+    /// The last tag of the descriptor.
+    pub const LAST_TAG: u16 = 8;
 }
 
-/// Header common to every journal block — descriptor, commit,
-/// superblock, revoke. Linux `journal_header_s`.
-///
-/// On disk (big-endian):
-///   off 0  : h_magic     u32 — JBD2_MAGIC_NUMBER
-///   off 4  : h_blocktype u32 — one of `block_type::*`
-///   off 8  : h_sequence  u32 — transaction sequence number
+/// `JBD2_FEATURE_*`.
+pub mod feature {
+    pub const COMPAT_CHECKSUM: u32 = 0x1;
+    pub const INCOMPAT_REVOKE: u32 = 0x1;
+    pub const INCOMPAT_64BIT: u32 = 0x2;
+    pub const INCOMPAT_ASYNC_COMMIT: u32 = 0x4;
+    pub const INCOMPAT_CSUM_V2: u32 = 0x8;
+    pub const INCOMPAT_CSUM_V3: u32 = 0x10;
+    pub const INCOMPAT_FAST_COMMIT: u32 = 0x20;
+    /// `JBD2_KNOWN_ROCOMPAT_FEATURES`.
+    pub const KNOWN_ROCOMPAT: u32 = 0;
+    /// `JBD2_KNOWN_INCOMPAT_FEATURES`.
+    pub const KNOWN_INCOMPAT: u32 = INCOMPAT_REVOKE
+        | INCOMPAT_64BIT
+        | INCOMPAT_ASYNC_COMMIT
+        | INCOMPAT_CSUM_V2
+        | INCOMPAT_CSUM_V3
+        | INCOMPAT_FAST_COMMIT;
+}
+
+/// `JBD2_CRC32_CHKSUM`.
+pub const JBD2_CRC32_CHKSUM: u8 = 1;
+/// `JBD2_CRC32C_CHKSUM`.
+pub const JBD2_CRC32C_CHKSUM: u8 = 4;
+/// `JBD2_CRC32_CHKSUM_SIZE`.
+pub const JBD2_CRC32_CHKSUM_SIZE: u8 = 4;
+
+/// `journal_header_t`.
+const HEADER_BYTES: usize = 12;
+/// `struct jbd2_journal_block_tail`.
+const TAIL_BYTES: usize = 4;
+/// `jbd2_journal_revoke_header_t`.
+const REVOKE_HEADER_BYTES: usize = 16;
+/// `struct commit_header` through `h_commit_nsec`.
+const COMMIT_HEADER_BYTES: usize = 60;
+/// Revoke records held during recovery before it fails with
+/// [`JournalError::NoMemory`]. Linux allocates one record per revoked block
+/// with no limit and fails with `-ENOMEM` when an allocation does.
+const MAX_REVOKE_RECORDS: usize = 1 << 20;
+
+/// Where Linux would fail, and with what.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct JournalHeader {
-    pub magic: u32,
-    pub block_type: u32,
-    pub sequence: u32,
+pub enum JournalError {
+    /// `-EINVAL`: a malformed journal superblock or revoke block.
+    Invalid,
+    /// `-EFSBADCRC` (`EBADMSG`): a checksum that does not match.
+    BadChecksum,
+    /// `-EFSCORRUPTED` (`EUCLEAN`): a corrupt transaction, or a journal
+    /// block that does not map.
+    Corrupted,
+    /// `-EIO`: a read or write failed, or the passes disagreed.
+    Io,
+    /// `-ENOMEM`.
+    NoMemory,
+    /// The journal needs a fast-commit replay, which NARF does not do yet.
+    FastCommit,
 }
 
-impl JournalHeader {
-    /// Decode the 12-byte common header. Returns `None` if the magic
-    /// is wrong.
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 12 {
-            return None;
+/// A boxed I/O future, so [`JournalIo`] stays object-safe and `Send`.
+pub type IoFuture<'a> = Pin<Box<dyn Future<Output = Result<(), JournalError>> + Send + 'a>>;
+
+/// The journal's view of the device.
+pub trait JournalIo: Send {
+    /// Read journal block `block` (journal-relative) into `buf`, one
+    /// filesystem block. A block that does not map is
+    /// [`JournalError::Corrupted`] (`ext4_journal_bmap`).
+    fn read_log<'a>(&'a mut self, block: u32, buf: &'a mut [u8]) -> IoFuture<'a>;
+    /// Write filesystem block `block` (replay).
+    fn write_home<'a>(&'a mut self, block: u64, data: &'a [u8]) -> IoFuture<'a>;
+    /// Write journal block `block` with FUA (the journal superblock).
+    fn write_log_fua<'a>(&'a mut self, block: u32, data: &'a [u8]) -> IoFuture<'a>;
+    /// `sync_blockdev` + `blkdev_issue_flush`.
+    fn flush(&mut self) -> IoFuture<'_>;
+}
+
+fn be16(b: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([b[off], b[off + 1]])
+}
+fn be32(b: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+fn be64(b: &[u8], off: usize) -> u64 {
+    (be32(b, off) as u64) << 32 | be32(b, off + 4) as u64
+}
+fn put_be32(b: &mut [u8], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+/// `tid_gt`.
+fn tid_gt(x: u32, y: u32) -> bool {
+    (x.wrapping_sub(y) as i32) > 0
+}
+/// `tid_geq`.
+fn tid_geq(x: u32, y: u32) -> bool {
+    (x.wrapping_sub(y) as i32) >= 0
+}
+
+/// `crc32_be`: the big-endian CRC-32 (polynomial 0x04C11DB7) with no pre- or
+/// post-inversion, as `lib/crc32.c` computes it. Only COMPAT_CHECKSUM (v1)
+/// journals use it.
+pub fn crc32_be(mut crc: u32, data: &[u8]) -> u32 {
+    for &byte in data {
+        crc ^= (byte as u32) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
         }
-        let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if magic != JBD2_MAGIC_NUMBER {
-            return None;
-        }
-        Some(Self {
-            magic,
-            block_type: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            sequence: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
-        })
     }
+    crc
 }
 
-/// Decoded journal superblock — subset of `journal_superblock_s` the
-/// replay path actually needs. Linux
-/// `include/linux/jbd2.h::journal_superblock_s`, v1 + v2 layouts.
-///
-/// On disk (big-endian, offsets from start of journal block 0):
-///   off 0   : s_header        12 bytes (JournalHeader)
-///   off 12  : s_blocksize     u32 — journal block size
-///   off 16  : s_maxlen        u32 — total journal blocks
-///   off 20  : s_first         u32 — first log block (after the SB)
-///   off 24  : s_sequence      u32 — first commit ID expected at s_start
-///   off 28  : s_start         u32 — first block of the log; 0 = clean
-///   off 32  : s_errno         s32
-///   v2 only:
-///   off 36  : s_feature_compat       u32
-///   off 40  : s_feature_incompat     u32
-///   off 44  : s_feature_ro_compat    u32
-///   off 48  : s_uuid          16 bytes
-///   off 64  : s_nr_users      u32
-///   off 68  : s_dynsuper      u32
-///   off 72  : s_max_transaction u32
-///   off 76  : s_max_trans_data u32
-#[derive(Copy, Clone, Debug)]
+/// `journal_superblock_t`, kept as the bytes it was read as so a rewrite
+/// preserves every field this code does not own.
+#[derive(Clone)]
 pub struct JournalSuperblock {
-    pub header: JournalHeader,
-    pub block_size: u32,
-    pub maxlen: u32,
-    pub first: u32,
-    pub sequence: u32,
-    pub start: u32,
-    pub errno: i32,
-    pub feature_compat: u32,
-    pub feature_incompat: u32,
-    pub feature_ro_compat: u32,
+    raw: Vec<u8>,
+}
+
+impl core::fmt::Debug for JournalSuperblock {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("JournalSuperblock")
+            .field("blocktype", &self.blocktype())
+            .field("maxlen", &self.maxlen())
+            .field("first", &self.first())
+            .field("sequence", &self.sequence())
+            .field("start", &self.start())
+            .field("incompat", &self.feature_incompat())
+            .finish_non_exhaustive()
+    }
 }
 
 impl JournalSuperblock {
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        let header = JournalHeader::parse(buf)?;
-        // Both v1 and v2 superblocks have the first 36 bytes laid
-        // out the same way; v2 extends with feature flags. Reject
-        // anything that isn't one of the two superblock blocktypes.
-        if header.block_type != block_type::SUPERBLOCK_V1
-            && header.block_type != block_type::SUPERBLOCK_V2
-        {
-            return None;
+    /// The first [`SUPERBLOCK_BYTES`] of `block`; `None` if shorter.
+    pub fn from_bytes(block: &[u8]) -> Option<Self> {
+        (block.len() >= SUPERBLOCK_BYTES).then(|| Self {
+            raw: block[..SUPERBLOCK_BYTES].to_vec(),
+        })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.raw
+    }
+    pub fn magic(&self) -> u32 {
+        be32(&self.raw, 0)
+    }
+    pub fn blocktype(&self) -> u32 {
+        be32(&self.raw, 4)
+    }
+    pub fn blocksize(&self) -> u32 {
+        be32(&self.raw, 0x0C)
+    }
+    pub fn maxlen(&self) -> u32 {
+        be32(&self.raw, 0x10)
+    }
+    pub fn first(&self) -> u32 {
+        be32(&self.raw, 0x14)
+    }
+    pub fn sequence(&self) -> u32 {
+        be32(&self.raw, 0x18)
+    }
+    pub fn start(&self) -> u32 {
+        be32(&self.raw, 0x1C)
+    }
+    pub fn errno(&self) -> i32 {
+        be32(&self.raw, 0x20) as i32
+    }
+    pub fn feature_compat(&self) -> u32 {
+        be32(&self.raw, 0x24)
+    }
+    pub fn feature_incompat(&self) -> u32 {
+        be32(&self.raw, 0x28)
+    }
+    pub fn feature_ro_compat(&self) -> u32 {
+        be32(&self.raw, 0x2C)
+    }
+    pub fn uuid(&self) -> &[u8] {
+        &self.raw[0x30..0x40]
+    }
+    pub fn checksum_type(&self) -> u8 {
+        self.raw[0x50]
+    }
+    /// `jbd2_journal_get_num_fc_blks`.
+    pub fn num_fc_blocks(&self) -> u32 {
+        match be32(&self.raw, 0x54) {
+            0 => JBD2_DEFAULT_FAST_COMMIT_BLOCKS,
+            n => n,
         }
-        if buf.len() < 36 {
-            return None;
+    }
+    pub fn head(&self) -> u32 {
+        be32(&self.raw, 0x58)
+    }
+    pub fn checksum(&self) -> u32 {
+        be32(&self.raw, 0xFC)
+    }
+
+    /// `jbd2_format_support_feature`: only a v2 superblock has features.
+    fn v2(&self) -> bool {
+        self.blocktype() == block_type::SUPERBLOCK_V2
+    }
+    fn incompat(&self, bit: u32) -> bool {
+        self.v2() && self.feature_incompat() & bit != 0
+    }
+    pub fn has_checksum_v1(&self) -> bool {
+        self.v2() && self.feature_compat() & feature::COMPAT_CHECKSUM != 0
+    }
+    pub fn has_csum2(&self) -> bool {
+        self.incompat(feature::INCOMPAT_CSUM_V2)
+    }
+    pub fn has_csum3(&self) -> bool {
+        self.incompat(feature::INCOMPAT_CSUM_V3)
+    }
+    /// `jbd2_journal_has_csum_v2or3`.
+    pub fn has_csum_v2or3(&self) -> bool {
+        self.has_csum2() || self.has_csum3()
+    }
+    pub fn has_64bit(&self) -> bool {
+        self.incompat(feature::INCOMPAT_64BIT)
+    }
+    pub fn has_async_commit(&self) -> bool {
+        self.incompat(feature::INCOMPAT_ASYNC_COMMIT)
+    }
+    pub fn has_fast_commit(&self) -> bool {
+        self.incompat(feature::INCOMPAT_FAST_COMMIT)
+    }
+
+    /// `journal_tag_bytes`.
+    pub fn tag_bytes(&self) -> usize {
+        if self.has_csum3() {
+            return 16;
         }
-        let g32 = |o: usize| u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
-        let block_size = g32(12);
-        let maxlen = g32(16);
-        let first = g32(20);
-        let sequence = g32(24);
-        let start = g32(28);
-        let errno = g32(32) as i32;
-        let (feature_compat, feature_incompat, feature_ro_compat) =
-            if header.block_type == block_type::SUPERBLOCK_V2 && buf.len() >= 48 {
-                (g32(36), g32(40), g32(44))
-            } else {
-                (0, 0, 0)
-            };
-        Some(Self {
-            header,
+        let size = 12 + if self.has_csum2() { 2 } else { 0 };
+        if self.has_64bit() {
+            size
+        } else {
+            size - 4
+        }
+    }
+
+    /// `jbd2_superblock_csum`: crc32c over the superblock with `s_checksum`
+    /// zeroed, seeded with ~0.
+    pub fn compute_checksum(&self) -> u32 {
+        let mut copy = self.raw.clone();
+        copy[0xFC..0x100].fill(0);
+        crc32c(!0, &copy)
+    }
+
+    fn set(&mut self, off: usize, value: u32) {
+        put_be32(&mut self.raw, off, value);
+    }
+}
+
+/// The journal: `journal_t`'s recovery-time state.
+pub struct Journal {
+    sb: JournalSuperblock,
+    /// The whole first journal block, written back around the superblock.
+    sb_block: Vec<u8>,
+    block_size: usize,
+    /// `j_total_len`.
+    pub total_len: u32,
+    /// `j_first`; the log is `[first, last)`.
+    pub first: u32,
+    /// `j_last`.
+    pub last: u32,
+    /// `j_tail`.
+    pub tail: u32,
+    /// `j_tail_sequence`.
+    pub tail_sequence: u32,
+    /// `j_transaction_sequence`: the next transaction id.
+    pub transaction_sequence: u32,
+    /// `j_head`.
+    pub head: u32,
+    /// `j_errno`, from `s_errno`.
+    pub errno: i32,
+    /// `j_failed_commit`.
+    pub failed_commit: u32,
+    /// `JBD2_FLUSHED`: the on-disk superblock says the log is empty.
+    pub flushed: bool,
+    csum_seed: u32,
+    revoke: BTreeMap<u64, u32>,
+}
+
+impl core::fmt::Debug for Journal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Journal")
+            .field("sb", &self.sb)
+            .field("first", &self.first)
+            .field("last", &self.last)
+            .field("tail", &self.tail)
+            .field("tail_sequence", &self.tail_sequence)
+            .field("transaction_sequence", &self.transaction_sequence)
+            .field("head", &self.head)
+            .field("errno", &self.errno)
+            .field("failed_commit", &self.failed_commit)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a recovery found and did (`struct recovery_info`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryInfo {
+    pub start_transaction: u32,
+    pub end_transaction: u32,
+    pub head_block: u32,
+    pub nr_replays: u32,
+    pub nr_revokes: u32,
+    pub nr_revoke_hits: u32,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Pass {
+    Scan,
+    Revoke,
+    Replay,
+}
+
+impl Journal {
+    /// `journal_load_superblock`. `first_block` is journal block 0,
+    /// `block_size` the filesystem block size (`j_blocksize`) and
+    /// `total_len` the journal inode's size in blocks (`j_total_len`).
+    /// The superblock is checked as `journal_check_superblock` does.
+    pub fn load_superblock(
+        first_block: &[u8],
+        block_size: usize,
+        total_len: u32,
+    ) -> Result<Self, JournalError> {
+        let sb = JournalSuperblock::from_bytes(first_block).ok_or(JournalError::Io)?;
+        check_superblock(&sb, block_size, total_len)?;
+        let csum_seed = if sb.has_csum_v2or3() {
+            crc32c(!0, sb.uuid())
+        } else {
+            0
+        };
+        let mut journal = Self {
+            tail_sequence: sb.sequence(),
+            tail: sb.start(),
+            first: sb.first(),
+            errno: sb.errno(),
+            last: sb.maxlen(),
+            total_len: total_len.min(sb.maxlen()),
+            transaction_sequence: 0,
+            head: 0,
+            failed_commit: 0,
+            flushed: false,
+            csum_seed,
+            revoke: BTreeMap::new(),
             block_size,
-            maxlen,
-            first,
-            sequence,
-            start,
-            errno,
-            feature_compat,
-            feature_incompat,
-            feature_ro_compat,
-        })
-    }
-
-    /// `s_start == 0` means the journal was committed clean — no
-    /// replay needed. Linux `recovery.c::do_one_pass` PASS_SCAN.
-    pub fn is_clean(&self) -> bool {
-        self.start == 0
-    }
-}
-
-/// One entry inside a descriptor block. Linux `journal_block_tag_s`
-/// (non-64BIT, non-csum_v3 stride = 8 bytes; UUID optional).
-///
-///   off 0 : t_blocknr u32 (target FS block, big-endian)
-///   off 4 : t_flags   u32 (`tag_flag::*` bits)
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct DescriptorTag {
-    /// FS-side target block this descriptor entry redirects to.
-    pub target_block: u64,
-    pub flags: u32,
-}
-
-impl DescriptorTag {
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 8 {
-            return None;
+            sb_block: first_block.to_vec(),
+            sb,
+        };
+        if journal.sb.has_fast_commit() {
+            journal.last = journal.sb.maxlen() - journal.sb.num_fc_blocks();
         }
-        let blocknr = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let flags = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        Some(Self {
-            target_block: blocknr as u64,
-            flags,
-        })
+        Ok(journal)
     }
 
-    pub fn is_last(&self) -> bool {
-        self.flags & tag_flag::LAST_TAG != 0
+    pub fn superblock(&self) -> &JournalSuperblock {
+        &self.sb
     }
-    pub fn has_uuid(&self) -> bool {
-        self.flags & tag_flag::SAME_UUID == 0
-    }
-    pub fn is_deleted(&self) -> bool {
-        self.flags & tag_flag::DELETED != 0
-    }
-    pub fn is_escaped(&self) -> bool {
-        self.flags & tag_flag::ESCAPE != 0
-    }
-}
 
-/// One descriptor block fully decoded — header + tag list. Each tag
-/// corresponds to a journal block following the descriptor (in
-/// log-block order) that should be replayed into `tag.target_block`.
-#[derive(Debug, Clone)]
-pub struct DescriptorBlock {
-    pub header: JournalHeader,
-    pub tags: Vec<DescriptorTag>,
-}
+    /// `wrap`.
+    fn wrap(&self, block: u32) -> u32 {
+        if block >= self.last {
+            block - (self.last - self.first)
+        } else {
+            block
+        }
+    }
 
-impl DescriptorBlock {
-    /// Decode a descriptor block. `buf` is the full journal-block-
-    /// sized buffer. Tags follow the 12-byte header; each tag is 8
-    /// bytes, plus an optional 16-byte UUID unless `SAME_UUID` is
-    /// set on the tag. Iteration stops at the first tag with the
-    /// `LAST_TAG` flag (inclusive) or when the buffer is exhausted.
+    /// `jbd2_journal_recover`. Replays every complete, un-revoked
+    /// transaction through `io.write_home`, then flushes. On success
+    /// `transaction_sequence` and `head` say where the log restarts.
+    pub async fn recover(&mut self, io: &mut dyn JournalIo) -> Result<RecoveryInfo, JournalError> {
+        let mut info = RecoveryInfo::default();
+        if self.tail == 0 {
+            self.transaction_sequence = self.sb.sequence().wrapping_add(1);
+            self.head = self.sb.head();
+            return Ok(info);
+        }
+        if self.sb.has_fast_commit() {
+            return Err(JournalError::FastCommit);
+        }
+        let mut err = self.do_one_pass(io, &mut info, Pass::Scan).await;
+        if err.is_ok() {
+            err = self.do_one_pass(io, &mut info, Pass::Revoke).await;
+        }
+        if err.is_ok() {
+            err = self.do_one_pass(io, &mut info, Pass::Replay).await;
+        }
+        // Restart the log at the next transaction id, invalidating every
+        // commit record still in it.
+        info.end_transaction = info.end_transaction.wrapping_add(1);
+        self.transaction_sequence = info.end_transaction;
+        self.head = info.head_block;
+        self.revoke.clear();
+        let flushed = io.flush().await;
+        err?;
+        flushed?;
+        Ok(info)
+    }
+
+    /// `jbd2_journal_skip_recovery`: one SCAN pass to find the next unused
+    /// transaction id, then forget the log.
+    async fn skip_recovery(&mut self, io: &mut dyn JournalIo) -> Result<(), JournalError> {
+        let mut info = RecoveryInfo::default();
+        let err = self.do_one_pass(io, &mut info, Pass::Scan).await;
+        match err {
+            Err(_) => {
+                self.transaction_sequence = self.transaction_sequence.wrapping_add(1);
+                self.head = self.first;
+            }
+            Ok(()) => {
+                self.transaction_sequence = info.end_transaction.wrapping_add(1);
+                self.head = info.head_block;
+            }
+        }
+        self.tail = 0;
+        err
+    }
+
+    /// `jbd2_journal_wipe`: ignore the log's contents; with `write`, mark it
+    /// empty on disk too.
+    pub async fn wipe(&mut self, io: &mut dyn JournalIo, write: bool) -> Result<(), JournalError> {
+        if self.tail == 0 {
+            return Ok(());
+        }
+        let err = self.skip_recovery(io).await;
+        if write {
+            self.mark_empty(io).await;
+        }
+        err
+    }
+
+    /// `jbd2_journal_load`: recover, refuse a corrupt transaction, and
+    /// reset the log. `writable` is false on a read-only device, where
+    /// `journal_reset`'s log-tail update cannot be written.
+    pub async fn load(
+        &mut self,
+        io: &mut dyn JournalIo,
+        writable: bool,
+    ) -> Result<RecoveryInfo, JournalError> {
+        let info = self.recover(io).await?;
+        if self.failed_commit != 0 {
+            return Err(JournalError::Corrupted);
+        }
+        self.reset(io, writable).await?;
+        Ok(info)
+    }
+
+    /// `journal_reset`, with ext4's `JBD2_CYCLE_RECORD`.
+    async fn reset(&mut self, io: &mut dyn JournalIo, writable: bool) -> Result<(), JournalError> {
+        let first = self.sb.first();
+        let last = self.sb.maxlen();
+        if u64::from(first) + u64::from(JBD2_MIN_JOURNAL_BLOCKS) > u64::from(last) + 1 {
+            return Err(JournalError::Invalid);
+        }
+        self.first = first;
+        self.last = last;
+        if self.head != 0 {
+            if self.head < first || self.head >= last {
+                self.head = first;
+            }
+        } else {
+            self.head = first;
+        }
+        self.tail = self.head;
+        self.tail_sequence = self.transaction_sequence;
+        // Recovery is done: fast commits stay off until the filesystem asks
+        // for them again.
+        let incompat = self.sb.feature_incompat() & !feature::INCOMPAT_FAST_COMMIT;
+        self.sb.set(0x28, incompat);
+        if self.sb.start() == 0 {
+            self.flushed = true;
+        } else if writable {
+            // Linux ignores a failure here (the journal is aborted instead).
+            let _ = self
+                .update_sb_log_tail(io, self.tail_sequence, self.tail)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// `jbd2_journal_update_sb_log_tail` with `REQ_FUA`.
+    pub async fn update_sb_log_tail(
+        &mut self,
+        io: &mut dyn JournalIo,
+        tail_tid: u32,
+        tail_block: u32,
+    ) -> Result<(), JournalError> {
+        self.sb.set(0x18, tail_tid);
+        self.sb.set(0x1C, tail_block);
+        self.write_superblock(io).await?;
+        self.flushed = false;
+        Ok(())
+    }
+
+    /// `jbd2_mark_journal_empty` with `REQ_FUA`. A write error is not
+    /// returned, as in Linux (which aborts the journal on one).
+    pub async fn mark_empty(&mut self, io: &mut dyn JournalIo) {
+        if self.sb.start() == 0 {
+            return;
+        }
+        self.sb.set(0x18, self.tail_sequence);
+        self.sb.set(0x1C, 0);
+        self.sb.set(0x58, self.head);
+        let incompat = self.sb.feature_incompat();
+        let had_fast_commit = incompat & feature::INCOMPAT_FAST_COMMIT != 0;
+        self.sb.set(0x28, incompat & !feature::INCOMPAT_FAST_COMMIT);
+        let _ = self.write_superblock(io).await;
+        if had_fast_commit {
+            self.sb.set(0x28, incompat);
+        }
+        self.flushed = true;
+    }
+
+    /// `jbd2_journal_clear_err`, then `jbd2_journal_update_sb_errno`, whose
+    /// write errors are not returned.
+    pub async fn clear_err(&mut self, io: &mut dyn JournalIo) {
+        self.errno = 0;
+        self.sb.set(0x20, 0);
+        let _ = self.write_superblock(io).await;
+    }
+
+    /// `jbd2_write_superblock`: the checksum, then the whole first block,
+    /// with FUA.
+    async fn write_superblock(&mut self, io: &mut dyn JournalIo) -> Result<(), JournalError> {
+        if self.sb.has_csum_v2or3() {
+            let csum = self.sb.compute_checksum();
+            self.sb.set(0xFC, csum);
+        }
+        self.sb_block[..SUPERBLOCK_BYTES].copy_from_slice(&self.sb.raw);
+        let block = self.sb_block.clone();
+        io.write_log_fua(0, &block).await
+    }
+
+    /// `jbd2_descriptor_block_csum_verify`, also used for revoke blocks.
+    fn descriptor_csum_ok(&self, block: &[u8]) -> bool {
+        if !self.sb.has_csum_v2or3() {
+            return true;
+        }
+        let tail = self.block_size - TAIL_BYTES;
+        let provided = be32(block, tail);
+        let mut copy = block.to_vec();
+        copy[tail..].fill(0);
+        crc32c(self.csum_seed, &copy) == provided
+    }
+
+    /// `jbd2_commit_block_csum_verify`.
+    fn commit_csum_ok(&self, block: &[u8]) -> bool {
+        if !self.sb.has_csum_v2or3() {
+            return true;
+        }
+        let provided = be32(block, 16);
+        let mut copy = block.to_vec();
+        copy[16..20].fill(0);
+        crc32c(self.csum_seed, &copy) == provided
+    }
+
+    /// `jbd2_commit_block_csum_verify_partial`: the commit header made it to
+    /// disk and the rest of the block did not.
+    fn commit_csum_partial_ok(&self, block: &[u8]) -> bool {
+        let provided = be32(block, 16);
+        let mut copy = vec![0u8; self.block_size];
+        copy[..COMMIT_HEADER_BYTES].copy_from_slice(&block[..COMMIT_HEADER_BYTES]);
+        copy[16..20].fill(0);
+        crc32c(self.csum_seed, &copy) == provided
+    }
+
+    /// `jbd2_block_tag_csum_verify`.
+    fn tag_csum_ok(&self, tag: &[u8], data: &[u8], sequence: u32) -> bool {
+        if !self.sb.has_csum_v2or3() {
+            return true;
+        }
+        let csum = crc32c(crc32c(self.csum_seed, &sequence.to_be_bytes()), data);
+        if self.sb.has_csum3() {
+            be32(tag, 12) == csum
+        } else {
+            be16(tag, 4) == csum as u16
+        }
+    }
+
+    /// `read_tag_block`.
+    fn tag_block(&self, tag: &[u8]) -> u64 {
+        let low = be32(tag, 0) as u64;
+        if self.sb.has_64bit() {
+            low | (be32(tag, 8) as u64) << 32
+        } else {
+            low
+        }
+    }
+
+    /// The tags of a descriptor block, in order, as offsets into it:
+    /// `count_tags` and `jbd2_do_replay` walk them the same way.
+    fn tags(&self, block: &[u8]) -> Vec<usize> {
+        let tag_bytes = self.sb.tag_bytes();
+        let size = if self.sb.has_csum_v2or3() {
+            self.block_size - TAIL_BYTES
+        } else {
+            self.block_size
+        };
+        let mut offsets = Vec::new();
+        let mut at = HEADER_BYTES;
+        while at + tag_bytes <= size {
+            offsets.push(at);
+            let flags = be16(block, at + 6);
+            at += tag_bytes;
+            if flags & tag_flag::SAME_UUID == 0 {
+                at += 16;
+            }
+            if flags & tag_flag::LAST_TAG != 0 {
+                break;
+            }
+        }
+        offsets
+    }
+
+    /// `jbd2_journal_set_revoke`: keep the latest transaction that revoked
+    /// the block.
+    fn set_revoke(&mut self, block: u64, sequence: u32) -> Result<(), JournalError> {
+        if let Some(seen) = self.revoke.get_mut(&block) {
+            if tid_gt(sequence, *seen) {
+                *seen = sequence;
+            }
+            return Ok(());
+        }
+        if self.revoke.len() >= MAX_REVOKE_RECORDS {
+            return Err(JournalError::NoMemory);
+        }
+        self.revoke.insert(block, sequence);
+        Ok(())
+    }
+
+    /// `jbd2_journal_test_revoke`: revoked by this transaction or a later
+    /// one.
+    fn test_revoke(&self, block: u64, sequence: u32) -> bool {
+        match self.revoke.get(&block) {
+            Some(&seen) => !tid_gt(sequence, seen),
+            None => false,
+        }
+    }
+
+    /// `scan_revoke_records`.
+    fn scan_revoke_records(
+        &mut self,
+        pass: Pass,
+        block: &[u8],
+        sequence: u32,
+        info: &mut RecoveryInfo,
+    ) -> Result<(), JournalError> {
+        let rcount = be32(block, HEADER_BYTES) as usize;
+        let csum_size = if self.sb.has_csum_v2or3() {
+            TAIL_BYTES
+        } else {
+            0
+        };
+        if rcount > self.block_size - csum_size {
+            return Err(JournalError::Invalid);
+        }
+        let record_len = if self.sb.has_64bit() { 8 } else { 4 };
+        if pass == Pass::Scan {
+            let records = rcount.saturating_sub(REVOKE_HEADER_BYTES) / record_len;
+            info.nr_revokes = info.nr_revokes.wrapping_add(records as u32);
+            return Ok(());
+        }
+        let mut offset = REVOKE_HEADER_BYTES;
+        while offset + record_len <= rcount {
+            let target = if record_len == 4 {
+                be32(block, offset) as u64
+            } else {
+                be64(block, offset)
+            };
+            offset += record_len;
+            self.set_revoke(target, sequence)?;
+        }
+        Ok(())
+    }
+
+    /// `calc_chksums`: fold a descriptor and the blocks it describes into
+    /// the v1 transaction checksum. False on a read error, which ends the
+    /// scan.
+    async fn calc_chksums(
+        &self,
+        io: &mut dyn JournalIo,
+        descriptor: &[u8],
+        next_log_block: &mut u32,
+        crc32_sum: &mut u32,
+    ) -> bool {
+        let count = self.tags(descriptor).len();
+        *crc32_sum = crc32_be(*crc32_sum, descriptor);
+        let mut buf = vec![0u8; self.block_size];
+        for _ in 0..count {
+            let io_block = *next_log_block;
+            *next_log_block = self.wrap(*next_log_block + 1);
+            if io.read_log(io_block, &mut buf).await.is_err() {
+                return false;
+            }
+            *crc32_sum = crc32_be(*crc32_sum, &buf);
+        }
+        true
+    }
+
+    /// `jbd2_do_replay`: write every un-revoked block of one descriptor home.
+    /// Returns the last error a block hit, having replayed the others.
+    async fn do_replay(
+        &mut self,
+        io: &mut dyn JournalIo,
+        info: &mut RecoveryInfo,
+        descriptor: &[u8],
+        next_log_block: &mut u32,
+        next_commit_id: u32,
+    ) -> Result<(), JournalError> {
+        let mut ret = Ok(());
+        let tag_bytes = self.sb.tag_bytes();
+        let mut data = vec![0u8; self.block_size];
+        for tag_at in self.tags(descriptor) {
+            let tag = &descriptor[tag_at..tag_at + tag_bytes];
+            let flags = be16(tag, 6);
+            let io_block = *next_log_block;
+            *next_log_block = self.wrap(*next_log_block + 1);
+            if let Err(e) = io.read_log(io_block, &mut data).await {
+                // Recover what we can, report the failure at the end.
+                ret = Err(e);
+                continue;
+            }
+            let block = self.tag_block(tag);
+            if self.test_revoke(block, next_commit_id) {
+                info.nr_revoke_hits = info.nr_revoke_hits.wrapping_add(1);
+                continue;
+            }
+            if !self.tag_csum_ok(tag, &data, next_commit_id) {
+                ret = Err(JournalError::BadChecksum);
+                continue;
+            }
+            if flags & tag_flag::ESCAPE != 0 {
+                put_be32(&mut data, 0, JBD2_MAGIC_NUMBER);
+            }
+            io.write_home(block, &data).await?;
+            info.nr_replays = info.nr_replays.wrapping_add(1);
+        }
+        ret
+    }
+
+    /// `do_one_pass`.
     ///
-    /// Linux `fs/jbd2/recovery.c::do_one_pass`, the
-    /// `JBD2_DESCRIPTOR_BLOCK` arm.
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        let header = JournalHeader::parse(buf)?;
-        if header.block_type != block_type::DESCRIPTOR {
-            return None;
+    /// Linux bounds the walk only by the log's contents. This also ends a
+    /// pass with [`JournalError::Corrupted`] once it has read more block
+    /// headers than one lap of the log holds, so a log that never ends (one
+    /// sequence's descriptors all the way round, no commit) cannot spin.
+    async fn do_one_pass(
+        &mut self,
+        io: &mut dyn JournalIo,
+        info: &mut RecoveryInfo,
+        pass: Pass,
+    ) -> Result<(), JournalError> {
+        let mut next_commit_id = self.sb.sequence();
+        let mut next_log_block = self.sb.start();
+        let mut head_block = next_log_block;
+        let mut success: Result<(), JournalError> = Ok(());
+        let mut crc32_sum: u32 = !0;
+        let mut need_check_commit_time = false;
+        let mut last_trans_commit_time: u64 = 0;
+        if pass == Pass::Scan {
+            info.start_transaction = next_commit_id;
         }
-        let mut tags = Vec::new();
-        let mut cursor = 12usize;
+        let lap = u64::from(self.last.saturating_sub(self.first));
+        let mut walked: u64 = 0;
+        let mut block = vec![0u8; self.block_size];
+
         loop {
-            if cursor + 8 > buf.len() {
+            if pass != Pass::Scan && tid_geq(next_commit_id, info.end_transaction) {
                 break;
             }
-            let tag = DescriptorTag::parse(&buf[cursor..cursor + 8])?;
-            cursor += 8;
-            let last = tag.is_last();
-            let need_uuid = tag.has_uuid();
-            tags.push(tag);
-            if need_uuid {
-                // Skip the 16-byte UUID.
-                if cursor + 16 > buf.len() {
-                    break;
-                }
-                cursor += 16;
+            walked += 1;
+            if walked > lap + 1 {
+                return Err(JournalError::Corrupted);
             }
-            if last {
+            io.read_log(next_log_block, &mut block).await?;
+            next_log_block = self.wrap(next_log_block + 1);
+
+            if be32(&block, 0) != JBD2_MAGIC_NUMBER {
                 break;
             }
-        }
-        Some(Self { header, tags })
-    }
-}
+            let blocktype = be32(&block, 4);
+            let sequence = be32(&block, 8);
+            if sequence != next_commit_id {
+                break;
+            }
 
-/// Commit block — the marker that closes a transaction. Linux
-/// `struct commit_header` (we only consult the common header; the
-/// commit-time + checksum tail is ignored on the read-side replay).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CommitBlock {
-    pub header: JournalHeader,
-}
-
-impl CommitBlock {
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        let header = JournalHeader::parse(buf)?;
-        if header.block_type != block_type::COMMIT {
-            return None;
-        }
-        Some(Self { header })
-    }
-}
-
-/// Revoke block — list of FS blocks that should be skipped during
-/// replay because a newer copy exists outside the journal. Linux
-/// `struct jbd2_journal_revoke_header_s` + the trailing block-number
-/// array.
-///
-///   off 0  : header        12 bytes
-///   off 12 : r_count       u32 (BE) — total bytes including header
-///   off 16 : blocks[]      u32 BE each (32-bit revoke records)
-#[derive(Debug, Clone)]
-pub struct RevokeBlock {
-    pub header: JournalHeader,
-    /// FS-side block numbers that this revoke record marks as
-    /// "newer-version-exists-outside-journal — do not replay".
-    pub revoked: Vec<u64>,
-}
-
-impl RevokeBlock {
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        let header = JournalHeader::parse(buf)?;
-        if header.block_type != block_type::REVOKE {
-            return None;
-        }
-        if buf.len() < 16 {
-            return None;
-        }
-        let count = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
-        // r_count is total byte size of the revoke record including
-        // the 12-byte header + the 4-byte count itself.
-        if count < 16 || count > buf.len() {
-            return None;
-        }
-        let payload = &buf[16..count];
-        let mut revoked = Vec::with_capacity(payload.len() / 4);
-        let mut i = 0;
-        while i + 4 <= payload.len() {
-            let b =
-                u32::from_be_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
-            revoked.push(b as u64);
-            i += 4;
-        }
-        Some(Self { header, revoked })
-    }
-}
-
-/// Outcome of a `replay_journal` run.
-#[derive(Debug, Default, Clone)]
-pub struct ReplayReport {
-    /// Number of complete transactions (descriptor … commit pairs)
-    /// that were replayed into `blocks_to_write`.
-    pub transactions_replayed: u32,
-    /// FS-block-number → journaled-data-bytes. Each value is exactly
-    /// one filesystem block in length (matches the journal superblock's
-    /// `s_blocksize`). The caller serves reads of these blocks from
-    /// this map instead of from disk.
-    pub blocks_to_write: BTreeMap<u64, Vec<u8>>,
-}
-
-/// Errors returned by `replay_journal`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum JournalError {
-    /// Block 0 didn't decode as a journal superblock (bad magic /
-    /// blocktype).
-    BadSuperblock,
-    /// A descriptor or revoke block was corrupt (header magic ok,
-    /// payload not parseable).
-    CorruptBlock,
-    /// The replay walk would have run off the end of the journal
-    /// without seeing a commit.
-    UnterminatedTransaction,
-}
-
-/// Replay the journal, returning a map of FS-block → post-replay
-/// bytes.
-///
-/// `journal_blocks(i)` returns a slice covering journal block `i`
-/// (size == `s_blocksize`). The function is pure — it never writes
-/// to disk; the caller installs the resulting overrides into a
-/// volume-level cache and serves reads from there for RO mounts.
-///
-/// Algorithm (Linux `fs/jbd2/recovery.c::do_one_pass`):
-///   1. Read journal superblock from block 0.
-///   2. If `s_start == 0` the journal is clean — no work.
-///   3. Walk log blocks starting at `s_start`, wrapping at `maxlen`
-///      back to `first`:
-///        * Descriptor: each tag is paired with the next log block;
-///          buffer the (target, data) pairs until a Commit closes
-///          the transaction.
-///        * Revoke: mark the listed FS blocks; any descriptor entry
-///          for one of these blocks that was buffered AFTER the
-///          revoke is replayed normally, but anything BEFORE the
-///          revoke at the same sequence is dropped. (Spec-accurate
-///          behavior: revokes apply to records with sequence numbers
-///          ≤ the revoke's sequence. We track this per-transaction.)
-///        * Commit: flush buffered (target, data) pairs into the
-///          output map (skipping revoked blocks) and increment the
-///          transaction counter.
-///   4. Stop when a transaction's expected sequence doesn't match
-///      the journal's `s_sequence`-monotonic walk.
-pub fn replay_journal<F>(
-    block_count: u32,
-    mut journal_block: F,
-) -> Result<ReplayReport, JournalError>
-where
-    F: FnMut(u32) -> Option<Vec<u8>>,
-{
-    let sb_bytes = journal_block(0).ok_or(JournalError::BadSuperblock)?;
-    let sb = JournalSuperblock::parse(&sb_bytes).ok_or(JournalError::BadSuperblock)?;
-    let mut report = ReplayReport::default();
-    if sb.is_clean() {
-        return Ok(report);
-    }
-    // Revoke table — FS-block → highest sequence at which the block
-    // was revoked. Records with sequence ≤ that value are not
-    // replayed; records strictly above ARE replayed. Linux
-    // `recovery.c::jbd2_journal_test_revoke`.
-    let mut revoke_at: BTreeMap<u64, u32> = BTreeMap::new();
-
-    let first = sb.first.max(1);
-    let maxlen = sb.maxlen.max(first + 1).min(block_count);
-    let mut cursor = sb.start;
-    let mut expected_seq = sb.sequence;
-
-    // Bounded walk — at most `maxlen` iterations through the log
-    // ring before we must have hit either a sequence mismatch or
-    // exhausted the journal.
-    let mut steps_remaining = maxlen as u64 * 2 + 16;
-
-    'outer: loop {
-        if steps_remaining == 0 {
-            return Err(JournalError::UnterminatedTransaction);
-        }
-        steps_remaining -= 1;
-
-        if cursor >= maxlen {
-            cursor = first;
-        }
-        let buf = match journal_block(cursor) {
-            Some(b) => b,
-            None => break,
-        };
-        let header = match JournalHeader::parse(&buf) {
-            Some(h) => h,
-            None => break,
-        };
-        // A sequence mismatch — common-case termination per
-        // recovery.c PASS_SCAN: "transaction we expected got
-        // overwritten with garbage / a future-transaction's data".
-        if header.sequence != expected_seq {
-            break;
-        }
-
-        match header.block_type {
-            block_type::DESCRIPTOR => {
-                let desc = DescriptorBlock::parse(&buf).ok_or(JournalError::CorruptBlock)?;
-                // Each tag consumes the next log block as its data.
-                let mut pending: Vec<(u64, Vec<u8>, bool)> = Vec::new();
-                for tag in &desc.tags {
-                    cursor = if cursor + 1 >= maxlen {
-                        first
-                    } else {
-                        cursor + 1
-                    };
-                    if steps_remaining == 0 {
-                        return Err(JournalError::UnterminatedTransaction);
-                    }
-                    steps_remaining -= 1;
-                    let data =
-                        journal_block(cursor).ok_or(JournalError::UnterminatedTransaction)?;
-                    pending.push((tag.target_block, data, tag.is_escaped()));
-                }
-                // Advance past the last data block; the next block
-                // in the log should be a commit / revoke / next
-                // descriptor for the same sequence.
-                cursor = if cursor + 1 >= maxlen {
-                    first
-                } else {
-                    cursor + 1
-                };
-
-                // Buffer transactionally — only commit installs.
-                // Walk forward from here looking for commit, applying
-                // any revoke we see along the way.
-                let mut commit_seen = false;
-                let mut local_steps = maxlen as u64 + 8;
-                let mut walk = cursor;
-                while local_steps > 0 {
-                    local_steps -= 1;
-                    if walk >= maxlen {
-                        walk = first;
-                    }
-                    let nxt = match journal_block(walk) {
-                        Some(b) => b,
-                        None => break,
-                    };
-                    let nh = match JournalHeader::parse(&nxt) {
-                        Some(h) => h,
-                        None => break,
-                    };
-                    if nh.sequence != expected_seq {
-                        break;
-                    }
-                    match nh.block_type {
-                        block_type::COMMIT => {
-                            commit_seen = true;
-                            walk = if walk + 1 >= maxlen { first } else { walk + 1 };
-                            break;
+            match blocktype {
+                block_type::DESCRIPTOR => {
+                    if !self.descriptor_csum_ok(&block) {
+                        // SCAN can see stale blocks left by lazy journal
+                        // init; the commit time decides later.
+                        if pass != Pass::Scan {
+                            return Err(JournalError::BadChecksum);
                         }
-                        block_type::REVOKE => {
-                            let rev = RevokeBlock::parse(&nxt).ok_or(JournalError::CorruptBlock)?;
-                            for b in &rev.revoked {
-                                let entry = revoke_at.entry(*b).or_insert(0);
-                                if expected_seq > *entry {
-                                    *entry = expected_seq;
-                                }
+                        need_check_commit_time = true;
+                    }
+                    if pass != Pass::Replay {
+                        if pass == Pass::Scan
+                            && self.sb.has_checksum_v1()
+                            && info.end_transaction == 0
+                        {
+                            let descriptor = block.clone();
+                            if !self
+                                .calc_chksums(io, &descriptor, &mut next_log_block, &mut crc32_sum)
+                                .await
+                            {
+                                break;
                             }
-                            walk = if walk + 1 >= maxlen { first } else { walk + 1 };
-                        }
-                        block_type::DESCRIPTOR => {
-                            // A second descriptor inside the same
-                            // sequence — buffer its tags too.
-                            let dd =
-                                DescriptorBlock::parse(&nxt).ok_or(JournalError::CorruptBlock)?;
-                            for tag in &dd.tags {
-                                walk = if walk + 1 >= maxlen { first } else { walk + 1 };
-                                let data = journal_block(walk)
-                                    .ok_or(JournalError::UnterminatedTransaction)?;
-                                pending.push((tag.target_block, data, tag.is_escaped()));
-                            }
-                            walk = if walk + 1 >= maxlen { first } else { walk + 1 };
-                        }
-                        _ => {
-                            walk = if walk + 1 >= maxlen { first } else { walk + 1 };
-                        }
-                    }
-                }
-                if !commit_seen {
-                    // Incomplete transaction — Linux drops it
-                    // silently (PASS_SCAN exits the loop).
-                    break 'outer;
-                }
-                // Install pending into the output, honoring revokes
-                // (revokes seen at this sequence apply to tags with
-                // sequence ≤ revoke sequence — which is all our
-                // pending tags since they all carry expected_seq).
-                for (target, mut data, escape) in pending.drain(..) {
-                    if let Some(&rev_seq) = revoke_at.get(&target) {
-                        if rev_seq >= expected_seq {
                             continue;
                         }
+                        let count = self.tags(&block).len() as u32;
+                        next_log_block = self.wrap(next_log_block + count);
+                        continue;
                     }
-                    if escape {
-                        // The journaled copy had its first 4 bytes
-                        // zeroed so the data block wouldn't be
-                        // mistaken for a descriptor — restore the
-                        // magic. Linux `recovery.c` calls the
-                        // restored word JBD2_MAGIC_NUMBER.
-                        if data.len() >= 4 {
-                            data[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
+                    let descriptor = block.clone();
+                    if let Err(e) = self
+                        .do_replay(io, info, &descriptor, &mut next_log_block, next_commit_id)
+                        .await
+                    {
+                        if e == JournalError::NoMemory {
+                            return Err(e);
+                        }
+                        success = Err(e);
+                    }
+                    continue;
+                }
+                block_type::COMMIT => {
+                    if pass != Pass::Scan {
+                        next_commit_id = next_commit_id.wrapping_add(1);
+                        continue;
+                    }
+                    let commit_time = be64(&block, 48);
+                    if need_check_commit_time {
+                        if commit_time >= last_trans_commit_time {
+                            return Err(JournalError::BadChecksum);
+                        }
+                        // Likely a stale block of an older journal: end here.
+                        break;
+                    }
+                    let ok = if self.sb.has_checksum_v1() {
+                        let found = be32(&block, 16);
+                        if info.end_transaction != 0 {
+                            self.failed_commit = info.end_transaction;
+                            break;
+                        }
+                        let kind = block[12];
+                        let size = block[13];
+                        let good = (crc32_sum == found
+                            && kind == JBD2_CRC32_CHKSUM
+                            && size == JBD2_CRC32_CHKSUM_SIZE)
+                            || (kind == 0 && size == 0 && found == 0);
+                        if good {
+                            crc32_sum = !0;
+                        }
+                        good
+                    } else {
+                        self.commit_csum_ok(&block) || self.commit_csum_partial_ok(&block)
+                    };
+                    if !ok {
+                        if commit_time < last_trans_commit_time {
+                            break;
+                        }
+                        info.end_transaction = next_commit_id;
+                        info.head_block = head_block;
+                        if !self.sb.has_async_commit() {
+                            self.failed_commit = next_commit_id;
+                            break;
                         }
                     }
-                    report.blocks_to_write.insert(target, data);
+                    last_trans_commit_time = commit_time;
+                    head_block = next_log_block;
+                    next_commit_id = next_commit_id.wrapping_add(1);
+                    continue;
                 }
-                report.transactions_replayed = report.transactions_replayed.saturating_add(1);
-                cursor = walk;
-                expected_seq = expected_seq.wrapping_add(1);
-            }
-            block_type::COMMIT => {
-                // Standalone commit (e.g. an empty transaction) —
-                // skip + advance.
-                cursor = if cursor + 1 >= maxlen {
-                    first
-                } else {
-                    cursor + 1
-                };
-                expected_seq = expected_seq.wrapping_add(1);
-            }
-            block_type::REVOKE => {
-                let rev = RevokeBlock::parse(&buf).ok_or(JournalError::CorruptBlock)?;
-                for b in &rev.revoked {
-                    let entry = revoke_at.entry(*b).or_insert(0);
-                    if expected_seq > *entry {
-                        *entry = expected_seq;
+                block_type::REVOKE => {
+                    if pass != Pass::Revoke && pass != Pass::Scan {
+                        continue;
                     }
+                    if pass == Pass::Scan && !self.descriptor_csum_ok(&block) {
+                        need_check_commit_time = true;
+                    }
+                    let revoke = block.clone();
+                    self.scan_revoke_records(pass, &revoke, next_commit_id, info)?;
+                    continue;
                 }
-                cursor = if cursor + 1 >= maxlen {
-                    first
-                } else {
-                    cursor + 1
-                };
+                _ => break,
             }
-            _ => break,
         }
+
+        if pass == Pass::Scan {
+            if info.end_transaction == 0 {
+                info.end_transaction = next_commit_id;
+            }
+            if info.head_block == 0 {
+                info.head_block = head_block;
+            }
+        } else if info.end_transaction != next_commit_id && success.is_ok() {
+            // The passes ended in different places (an I/O error).
+            success = Err(JournalError::Io);
+        }
+        success
     }
-    Ok(report)
 }
 
-/// Convenience wrapper: pure in-memory replay over a flat journal
-/// image (no wrap-around bookkeeping by the caller). Each block is
-/// exactly `block_size` bytes; index `i` is at offset `i * block_size`.
-///
-/// Used by the smokes in `tests.rs`; also handy for any caller that
-/// has already read the entire journal into a contiguous buffer.
-pub fn replay_journal_flat(image: &[u8], block_size: usize) -> Result<ReplayReport, JournalError> {
-    let count = (image.len() / block_size) as u32;
-    replay_journal(count, |i| {
-        let off = (i as usize).checked_mul(block_size)?;
-        if off + block_size > image.len() {
-            return None;
+/// `journal_check_superblock`, in its order.
+fn check_superblock(
+    sb: &JournalSuperblock,
+    block_size: usize,
+    total_len: u32,
+) -> Result<(), JournalError> {
+    if sb.magic() != JBD2_MAGIC_NUMBER || sb.blocksize() as usize != block_size {
+        return Err(JournalError::Invalid);
+    }
+    if sb.blocktype() != block_type::SUPERBLOCK_V1 && sb.blocktype() != block_type::SUPERBLOCK_V2 {
+        return Err(JournalError::Invalid);
+    }
+    if sb.maxlen() > total_len {
+        return Err(JournalError::Invalid);
+    }
+    if sb.first() == 0 || sb.first() >= total_len {
+        return Err(JournalError::Invalid);
+    }
+    if !sb.v2() {
+        return Ok(());
+    }
+    if sb.feature_ro_compat() & !feature::KNOWN_ROCOMPAT != 0
+        || sb.feature_incompat() & !feature::KNOWN_INCOMPAT != 0
+    {
+        return Err(JournalError::Invalid);
+    }
+    let num_fc = if sb.has_fast_commit() {
+        sb.num_fc_blocks()
+    } else {
+        0
+    };
+    if sb.maxlen() < JBD2_MIN_JOURNAL_BLOCKS || sb.maxlen() - JBD2_MIN_JOURNAL_BLOCKS < num_fc {
+        return Err(JournalError::Invalid);
+    }
+    if sb.has_csum2() && sb.has_csum3() {
+        return Err(JournalError::Invalid);
+    }
+    if sb.has_csum_v2or3() && sb.has_checksum_v1() {
+        return Err(JournalError::Invalid);
+    }
+    if sb.has_csum_v2or3() {
+        if sb.checksum_type() != JBD2_CRC32C_CHKSUM {
+            return Err(JournalError::Invalid);
         }
-        Some(image[off..off + block_size].to_vec())
-    })
+        if sb.checksum() != sb.compute_checksum() {
+            return Err(JournalError::BadChecksum);
+        }
+    }
+    Ok(())
 }

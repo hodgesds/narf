@@ -311,6 +311,8 @@ pub(crate) fn mount_error_errno(error: FsError) -> i64 {
         FsError::BadChecksum => EBADMSG,
         FsError::Corrupted => EUCLEAN,
         FsError::Io(_) => EIO,
+        // `ext4_fill_super` / jbd2 recovery out of memory.
+        FsError::OutOfMemory => ENOMEM,
         _ => EINVAL,
     }
 }

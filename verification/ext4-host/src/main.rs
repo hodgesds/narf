@@ -32,7 +32,7 @@ USAGE: narf-ext4-host [OPTIONS]
   --seeds N         seeds per scenario (default 2)
   --ops N           operations per run (default 1500)
   --scenario LIST   comma-separated subset of: baseline,lifecycle,gate,uninit,
-                    htree,extents
+                    htree,extents,replay
                     (default all)
   --workdir DIR     scratch directory (default target/ext4-host)
   --keep            keep the images of passing runs
@@ -482,18 +482,162 @@ fn extents(o: &Opts, seed: u64) -> Result<String, String> {
     Ok(report.join(", "))
 }
 
+/// One filesystem block of `image`.
+fn fs_block(image: &Path, bs: u64, block: u64) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(image).unwrap();
+    f.seek(SeekFrom::Start(block * bs)).unwrap();
+    let mut out = vec![0u8; bs as usize];
+    f.read_exact(&mut out).unwrap();
+    out
+}
+
+/// A journal written by e2fsprogs (`debugfs` `jo -c`, `jw`, `jc`), replayed
+/// by a NARF mount and, on a copy, by `e2fsck -fy`:
+/// - T1 logs blocks A and B; T2 revokes A; T3 logs C, which begins with the
+///   JBD2 magic (escaped in the log); T4 logs D without a commit.
+/// - Both replays must leave A, B, C and D the same: A as before (revoked
+///   later), B and C replayed, D as before (uncommitted).
+/// - After the NARF mount the log is empty, needs_recovery is gone and
+///   `e2fsck -fn` finds nothing.
+///
+/// Run as a read-write mount and as a read-only one: Linux replays on both
+/// when the device can be written.
+fn replay(o: &Opts, seed: u64) -> Result<String, String> {
+    let name = format!("replay-{seed}");
+    let spec = fixture::Spec {
+        lib_files: 50,
+        packages: 10,
+        ..fixture::Spec::root()
+    };
+    let fx = fixture::build(&o.workdir, &name, &spec, seed);
+    let dir = o.workdir.join(&name);
+    let bs: u64 = sb_field(&fx.image, "Block size").parse().unwrap();
+    let count: u64 = sb_field(&fx.image, "Block count").parse().unwrap();
+    // Four free blocks past the middle: their old contents are known and
+    // nothing references them.
+    let ffb = std::process::Command::new("debugfs")
+        .args(["-R", &format!("ffb 4 {}", count / 2)])
+        .arg(&fx.image)
+        .output()
+        .expect("run debugfs ffb");
+    let found: Vec<u64> = String::from_utf8_lossy(&ffb.stdout)
+        .split_whitespace()
+        .filter_map(|w| w.parse().ok())
+        .collect();
+    let [a, b, c, d] = found[..] else {
+        return Err(format!("ffb found {found:?}"));
+    };
+    let mut rng = rng::Rng::new(seed);
+    let mut bytes = |n: u64| -> Vec<u8> { (0..n).map(|_| rng.next() as u8).collect() };
+    let f1 = bytes(2 * bs);
+    let mut f2 = bytes(bs);
+    f2[..4].copy_from_slice(&0xC03B_3998u32.to_be_bytes());
+    let f3 = bytes(bs);
+    for (file, data) in [("f1", &f1), ("f2", &f2), ("f3", &f3)] {
+        std::fs::write(dir.join(file), data).unwrap();
+    }
+    std::fs::write(dir.join("empty"), b"").unwrap();
+    let cmds = format!(
+        "jo -c\njw -b {a},{b} {f1}\njw -r {a} {empty}\njw -b {c} {f2}\njw -b {d} -c {f3}\njc\n",
+        f1 = dir.join("f1").display(),
+        f2 = dir.join("f2").display(),
+        f3 = dir.join("f3").display(),
+        empty = dir.join("empty").display(),
+    );
+    std::fs::write(dir.join("cmds"), cmds).unwrap();
+    let dirty = dir.join("dirty.img");
+    std::fs::copy(&fx.image, &dirty).unwrap();
+    let ok = std::process::Command::new("debugfs")
+        .arg("-w")
+        .arg("-f")
+        .arg(dir.join("cmds"))
+        .arg(&dirty)
+        .output()
+        .expect("run debugfs")
+        .status
+        .success();
+    if !ok {
+        return Err("debugfs could not write the journal".into());
+    }
+    if !sb_field(&dirty, "Filesystem features").contains("needs_recovery")
+        || sb_field(&dirty, "Journal start") == "0"
+    {
+        return Err("debugfs left no journal to recover".into());
+    }
+    let before: Vec<Vec<u8>> = [a, b, c, d]
+        .iter()
+        .map(|&n| fs_block(&dirty, bs, n))
+        .collect();
+
+    // e2fsprogs' replay.
+    let linux = dir.join("linux.img");
+    std::fs::copy(&dirty, &linux).unwrap();
+    let fsck = std::process::Command::new("e2fsck")
+        .arg("-fy")
+        .arg(&linux)
+        .output()
+        .expect("run e2fsck -fy");
+    if !matches!(fsck.status.code(), Some(0 | 1)) {
+        return Err(format!("e2fsck -fy failed: {:?}", fsck.status));
+    }
+    let want: Vec<Vec<u8>> = [a, b, c, d]
+        .iter()
+        .map(|&n| fs_block(&linux, bs, n))
+        .collect();
+    if want[0] != before[0] || want[1] != f1[bs as usize..] || want[2] != f2 || want[3] != before[3]
+    {
+        return Err("fixture: e2fsck's replay is not what the transactions say".into());
+    }
+
+    let mut report = Vec::new();
+    for read_only in [false, true] {
+        let image = dir.join(format!("narf-{read_only}.img"));
+        std::fs::copy(&dirty, &image).unwrap();
+        let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&image, 512));
+        let fs = narf::mount_with(dev, "", read_only)?;
+        drop(fs);
+        narf_block::registry::__reset_for_test();
+        let got: Vec<Vec<u8>> = [a, b, c, d]
+            .iter()
+            .map(|&n| fs_block(&image, bs, n))
+            .collect();
+        if got != want {
+            return Err(format!(
+                "read_only={read_only}: NARF's replay differs from e2fsck's"
+            ));
+        }
+        if sb_field(&image, "Journal start") != "0" {
+            return Err(format!("read_only={read_only}: the log is not empty"));
+        }
+        if read_only && sb_field(&image, "Filesystem features").contains("needs_recovery") {
+            return Err("read-only mount left needs_recovery".into());
+        }
+        let (code, out) = check::e2fsck(&image);
+        if code != 0 {
+            return Err(format!("read_only={read_only}: e2fsck -fn: {out}"));
+        }
+        report.push(if read_only { "ro" } else { "rw" });
+    }
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(format!("replayed on {}", report.join(" and ")))
+}
+
 fn main() {
     let o = parse_args();
     host::init();
     std::fs::create_dir_all(&o.workdir).unwrap();
     type Scenario = fn(&Opts, u64) -> Result<String, String>;
-    let all: [(&str, Scenario); 6] = [
+    let all: [(&str, Scenario); 7] = [
         ("baseline", baseline),
         ("lifecycle", lifecycle),
         ("gate", gate),
         ("uninit", uninit),
         ("htree", htree),
         ("extents", extents),
+        ("replay", replay),
     ];
     let mut failed = 0;
     for (name, run) in all {

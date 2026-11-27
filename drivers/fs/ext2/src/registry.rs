@@ -48,19 +48,28 @@ fn share(existing: Arc<Volume>, read_only: bool) -> Result<Arc<Volume>, FsError>
 /// `read_only` is what the caller asked for; a refused read-write request
 /// is the caller's to report (the named `ext4` constructor does).
 pub fn mount(dev: Arc<dyn BlockDeviceSync>, read_only: bool) -> Result<Arc<Volume>, FsError> {
+    mount_with_options(dev, read_only, false)
+}
+
+/// [`mount`] with ext4's `noload`: the journal is not loaded (see
+/// [`Volume::mount_with_options`]). An already-mounted volume is shared
+/// as it is.
+pub fn mount_with_options(
+    dev: Arc<dyn BlockDeviceSync>,
+    read_only: bool,
+    noload: bool,
+) -> Result<Arc<Volume>, FsError> {
     let key = device_key(&dev);
     if let Some(existing) = live(key) {
         return share(existing, read_only);
     }
     let async_dev = SyncBlock::new(dev);
-    let volume = if read_only {
-        narf_filesystem::fs_registry::mount_wait(Volume::mount_read_only(
-            async_dev,
-            DomainId::DRIVER_0,
-        ))?
-    } else {
-        narf_filesystem::fs_registry::mount_wait(Volume::mount(async_dev, DomainId::DRIVER_0))?
-    };
+    let volume = narf_filesystem::fs_registry::mount_wait(Volume::mount_with_options(
+        async_dev,
+        DomainId::DRIVER_0,
+        read_only,
+        noload,
+    ))?;
     let mut mounted = MOUNTED.lock();
     mounted.retain(|(_, weak)| weak.strong_count() > 0);
     // A mount that raced this one and registered first wins: this volume is

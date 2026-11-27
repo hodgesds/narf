@@ -25,6 +25,15 @@ fn register_fstypes() {
 /// Mount `dev` read-write under `narf.disks=all` (every disk writable): a
 /// fresh boot's registry, then the named `ext4` constructor.
 pub fn mount(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, String> {
+    mount_with(dev, "", false)
+}
+
+/// [`mount`] with mount `options` and `MS_RDONLY`.
+pub fn mount_with(
+    dev: Arc<dyn BlockDeviceSync>,
+    options: &str,
+    read_only: bool,
+) -> Result<Arc<dyn FsInstance>, String> {
     register_fstypes();
     narf_block::registry::__reset_for_test();
     narf_drivers_fs_ext2::registry::__reset_for_test();
@@ -45,12 +54,12 @@ pub fn mount(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, Strin
         .init(&narf_filesystem::MountRequest {
             fs_type: "ext4",
             source: &source,
-            options: "",
+            options,
             uid: 0,
             gid: 0,
             umask: 0o022,
             initial_namespace: false,
-            read_only: false,
+            read_only,
         })
         .map_err(|e| format!("mount: {e:?}"))?;
     Ok(fs)

@@ -149,8 +149,8 @@ A device without `BlockFeature::Discard` fails the ioctl with
   bitmap, classic-directory leaf, or HTREE index block before mutation. Writers
   install dependent bitmap/directory checksums first, then the
   group-descriptor/superblock checksum that names them. Unknown
-  read-only-compatible features, a dirty JBD2 log, and a non-empty orphan file
-  keep the volume read-only. One-level HTREE insertion into an existing leaf
+  read-only-compatible features and a non-empty orphan file keep the volume
+  read-only. One-level HTREE insertion into an existing leaf
   and deletion from existing one-level HTREE leaves are supported; a full
   leaf or multi-level mutation is rejected before mutation.
 - **Directory names hash as Linux hashes them** (`htree::ext4fs_dirhash`,
@@ -177,7 +177,6 @@ A device without `BlockFeature::Discard` fails the ioctl with
 - **The write gate** refuses a read-write mount, and writes nothing, for:
   - an unknown or unwritable read-only-compatible feature;
   - legacy `gdt_csum`;
-  - a journal that needs recovery;
   - a non-empty orphan file or `s_last_orphan` list;
   - a default directory hash other than 0-2.
 
@@ -318,10 +317,45 @@ A device without `BlockFeature::Discard` fails the ioctl with
   classic directory mutation, checksum-aware bitmaps/descriptors, extent
   trees of any depth (growth, unwritten conversion, truncation, punch), and
   HTREE inserts with leaf and index splits up to two index levels persist.
-  Dirty-journal commit remains unsupported: a volume needing recovery is
-  refused read-write by the write gate.
+  Metadata is still written in place, not through the journal.
   If the JBD2 superblock and orphan file are both clean, stale `RECOVER` and
   `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
+- **The journal is recovered at mount, as Linux does it** (`journal.rs`;
+  `fs/jbd2/recovery.c`, `fs/jbd2/journal.c`, `ext4_load_journal`). Before
+  any inode but the journal's own is read:
+  - The journal inode must be live and regular (EFSCORRUPTED) and its
+    superblock valid, in `journal_check_superblock`'s order (EINVAL;
+    EFSBADCRC for its checksum). An external journal is EOPNOTSUPP.
+  - `RECOVER` clear: the log is wiped (`jbd2_journal_wipe`), and marked empty
+    when the device can be written.
+  - `RECOVER` set: the three passes (SCAN, REVOKE, REPLAY) write every
+    complete, un-revoked transaction home, then flush. They verify csum v2/v3
+    descriptor, revoke, commit and tag checksums and the v1 transaction
+    checksum, tell a stale log from a corrupt one by commit time, accept a
+    torn commit block, restore escaped blocks, wrap at `s_maxlen` and carry
+    64-bit block numbers. Any recovery error fails the mount; a corrupt
+    committed transaction is EFSCORRUPTED. The log restarts two ids past the
+    last good one, and `journal_reset` rewrites its tail.
+  - This happens on a read-only mount too. Only a device that cannot be
+    written refuses it, with EROFS ("try mounting with noload"), writing
+    nothing. `noload` / `norecovery` skip the journal: a read-only mount
+    then sees the filesystem as it is on disk; a read-write mount of one
+    that needs recovery is EINVAL.
+  - Error fields the replay overwrote in the superblock are put back, and
+    an error recorded in the journal (`s_errno`) becomes `EXT4_ERROR_FS`
+    (`ext4_clear_journal_err`).
+  - Then `ext4_mark_recovery_complete`: the log is marked empty and, on a
+    read-only mount, `RECOVER` and `ORPHAN_PRESENT` are cleared.
+  - LINUX-GAPs:
+    - No orphan cleanup yet: a read-only mount whose orphan file still
+      holds inodes leaves `RECOVER` and `ORPHAN_PRESENT` set for Linux.
+    - Fast commits are not replayed: a dirty journal with `FAST_COMMIT` is
+      EOPNOTSUPP, before anything is written.
+    - A pass that reads more block headers than one lap of the log holds
+      ends with EFSCORRUPTED (Linux would loop).
+    - Recovery holds at most 2^20 revoke records (ENOMEM beyond).
+    - On a read-only device an `s_errno` is noted in memory only; Linux
+      attempts the superblock write.
 - **Block-size flexibility.** Block size is `1024 << s_log_block_size`;
   the driver does not hard-code 4096.
 - **Damaged-group containment.** Allocation scans treat a checksum-invalid

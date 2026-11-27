@@ -12,8 +12,7 @@
 //! under ext4-flavour names, layer **ext4-specific validation** on
 //! top (must have EXTENTS, must validate every extent header,
 //! 64BIT-aware group descriptor sizing), and add ext4-only
-//! algorithms: extent insertion + split + merge, and the journal
-//! commit-record builder.
+//! algorithms: extent insertion, split and merge.
 //!
 //! NARF is GPL-2.0-or-later as of 2026-05-20, so Linux `fs/ext4/*`
 //! sources are cited directly where the on-disk layout or algorithm
