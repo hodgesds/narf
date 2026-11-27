@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
-use narf_lib::sync::IrqSafeSpinLock;
+use narf_lib::sync::{IrqSafeSpinLock, IrqSafeTicketSpinLock};
 
 use crate::errno::{to_ret, *};
 use crate::fd;
@@ -218,13 +218,15 @@ fn next_sub_id() -> u64 {
 #[derive(Debug)]
 pub struct EpollInstance {
     /// Cold `epoll_ctl` metadata plus per-subscription delivery state.
-    inner: IrqSafeSpinLock<EpollInner>,
+    /// FIFO ticket lock: `ctl` callers queue in arrival order instead of
+    /// racing a test-and-set (fairness only — no throughput gain claimed).
+    inner: IrqSafeTicketSpinLock<EpollInner>,
     /// Ordered ready index plus cold fallback-poll membership. This mirrors
     /// Linux's single `rdllist`: callbacks only link/refresh registrations,
     /// while delivery snapshots a bounded window and polls without the lock.
-    ready: IrqSafeSpinLock<EpollReady>,
+    ready: IrqSafeTicketSpinLock<EpollReady>,
     /// Shared-epoll sleepers, kept off the ready-list lock.
-    waiters: IrqSafeSpinLock<EpollWaiters>,
+    waiters: IrqSafeTicketSpinLock<EpollWaiters>,
     /// Lockless equivalent of Linux's `waitqueue_active(&ep->wq)`: avoid taking
     /// the shared waiter lock for every callback in a large ready burst once
     /// all sleepers have already been woken. A false-negative race with waiter
@@ -920,10 +922,10 @@ impl EpollInstance {
 
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: IrqSafeSpinLock::new(EpollInner {
+            inner: IrqSafeTicketSpinLock::new(EpollInner {
                 interest: BTreeMap::new(),
             }),
-            ready: IrqSafeSpinLock::new(EpollReady {
+            ready: IrqSafeTicketSpinLock::new(EpollReady {
                 head: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 tail: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 len: 0,
@@ -932,7 +934,7 @@ impl EpollInstance {
                 always_poll: BTreeMap::new(),
                 deadline_poll: BTreeMap::new(),
             }),
-            waiters: IrqSafeSpinLock::new(EpollWaiters {
+            waiters: IrqSafeTicketSpinLock::new(EpollWaiters {
                 head: core::ptr::null_mut(),
                 tail: core::ptr::null_mut(),
                 selected_head: core::ptr::null_mut(),
@@ -3326,6 +3328,40 @@ mod tests {
         "userspace/epoll",
         smoke_epoll_ctl_seed_wakes_existing_waiter
     );
+
+    fn smoke_epoll_ctl_add_mod_del_round_trip() -> TestResult {
+        // The three instance locks (`inner` / `ready` / `waiters`) are
+        // ticket locks now; a ctl ADD/MOD/DEL round-trip through them
+        // must behave exactly as before the swap.
+        let ep = EpollInstance::new();
+        let ep_ops = ep.clone() as Arc<dyn FileOps>;
+        let file = MaskFile::new(0);
+        let file_ops = file.clone() as Arc<dyn FileOps>;
+
+        if !ep.ctl_add(FD, &file_ops, 0, EPOLLIN, 0x11, &ep_ops) {
+            return TestResult::Fail("CTL_ADD failed");
+        }
+        if ep.inner.lock().interest.get(&FD).is_none() {
+            return TestResult::Fail("CTL_ADD must insert the interest record");
+        }
+        if !ep.ctl_mod(FD, &file_ops, EPOLLOUT, 0x22, &ep_ops) {
+            return TestResult::Fail("CTL_MOD failed");
+        }
+        if ep.inner.lock().interest.get(&FD).is_none() {
+            return TestResult::Fail("CTL_MOD must keep the interest record");
+        }
+        if !ep.ctl_del(FD, &file_ops) {
+            return TestResult::Fail("CTL_DEL failed");
+        }
+        if ep.inner.lock().interest.get(&FD).is_some() {
+            return TestResult::Fail("CTL_DEL must remove the interest record");
+        }
+        if ep.ctl_del(FD, &file_ops) {
+            return TestResult::Fail("second CTL_DEL must fail (ENOENT)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/epoll", smoke_epoll_ctl_add_mod_del_round_trip);
 
     fn smoke_nested_epoll_arm_sees_existing_ready_child() -> TestResult {
         let (child, _file) = one_fd(EPOLLIN, POLL_IN, 0, true, true);
