@@ -211,6 +211,7 @@ pub fn register_initcalls() {
             let _ = writeln!(narf_console::Writer, "amd-pmf: not bound: {error:?}");
             InitResult::NotPresent
         }
+    });
     // ThinkPad LEDs (tracker #2448): the dual-build driver crate
     // registers the seven available LEDs with the LED class.
     // Stage::Device, next to the LED class's own Device initcall —
