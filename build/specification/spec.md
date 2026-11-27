@@ -72,16 +72,30 @@ kernel IPC. CI checks both native-ring feature configurations.
   hash-chain match finder (window 64 KiB); the in-tree Wi-Fi driver modules
   compress 2.1x to 3.9x.
 - Commands with common kernel build arguments also accept
-  `--config NAME`, naming a build configuration from the closed
-  registry in `build/xtask/src/configs.rs`: `all` (frame's default
-  feature set — every driver group; the configuration production
-  and release builds use) or `minimal` (`--no-default-features`
-  plus the always-on core features; the net and storage driver
-  groups are neither compiled into the kernel nor registered).
-  `--config` unions with `--features`; unknown names are rejected.
-  Configs select `narf-frame` driver-group features only — the
-  per-driver facade features remain an internal detail of the
-  net/storage facades.
+  `--config NAME-OR-PATH`, naming a TOML driver configuration
+  (design `narf-configurable-drivers-design.md` §5.1/§5.2,
+  loader/resolver/validator/translator in
+  `build/xtask/src/configs.rs`). A bare word is a preset name
+  resolving to `configs/<name>.toml` under the repo root: `all`
+  (every driver built in — the configuration production and
+  release builds use, observably identical to no `--config`) or
+  `minimal` (`--no-default-features` plus the always-on core
+  features; the net and storage driver groups are neither compiled
+  into the kernel nor registered). An argument containing `/` or
+  ending in `.toml` is a path, used as-is whether it lives inside
+  the repo or outside it, relative to the cwd. The file lists
+  `[drivers.*]` tables with `"y"` / `"n"` / `"m"` per driver
+  (lane 1: `[drivers.net]` 17 keys, `[drivers.storage]` 7 keys
+  plus the special `nvme` key mapping to the standalone
+  `drivers/nvme` crate; `[drivers.gpu]` lands in lane 2);
+  unspecified keys default to `"y"`, an empty file means all
+  `"y"`, and unknown tables/keys/values are hard errors. `"m"`
+  is a hard error in lane 1 (the module build belongs to the
+  modules-for-everything programme); `auto` is reserved for the
+  lane-5 test-config generator. `--config` unions with
+  `--features`. Configs select `narf-frame` driver features only
+  — the per-driver facade features are selected through the
+  TOML file, not by hand.
 - `cargo xtask test` (kernel-test features) stages its module fixtures in the
   initramfs: `lib/modules/{narf_test_module,narf_module_rt_smoke,
   narf_drivers_net_e1000}.ko` raw, `narf_test_module.ko.lz4`, and the

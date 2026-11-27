@@ -1158,13 +1158,17 @@ struct BuildArgs {
     #[arg(long, default_value = "")]
     features: String,
 
-    /// Named build configuration from the closed registry in
-    /// `configs.rs`: `all` (every driver group — the default build,
-    /// unchanged) or `minimal` (always-on core only; the net and
-    /// storage driver groups are neither compiled into the kernel
-    /// nor registered). Unioned with `--features`; CI passes names,
-    /// not feature vectors.
-    #[arg(long, value_name = "NAME")]
+    /// TOML driver configuration (design §5.2): a preset name or
+    /// a path. A bare word is a preset name resolving to
+    /// `configs/<name>.toml` (`all`: every driver in; `minimal`:
+    /// always-on core only, net + storage out); an argument
+    /// containing `/` or ending in `.toml` is a path, used as-is,
+    /// relative to the cwd. The file lists `[drivers.*]` tables
+    /// with `"y"` / `"n"` / `"m"` per driver (unspecified defaults
+    /// to `"y"`); `"m"` is a hard error in lane 1. `auto` is
+    /// reserved for the lane-5 test-config generator. Unioned with
+    /// `--features`; CI passes names/paths, not feature vectors.
+    #[arg(long, value_name = "NAME-OR-PATH")]
     config: Option<String>,
 
     /// External kernel composition manifest. The file can live outside this
@@ -5192,25 +5196,21 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
     {
         ensure_feature(&mut features, "module-allow-unsigned");
     }
-    // Named build configuration (`--config`, closed registry in
-    // `configs.rs`): `all` leaves the invocation untouched — frame's
-    // defaults already include every driver group, so the build is
-    // bit-for-bit today's. A subset config drops frame's defaults
-    // and selects its core/group features explicitly, unioned with
-    // the caller's `--features` like everything above.
+    // TOML driver configuration (`--config`, design §5.2/§5.3):
+    // a preset name or a path, resolved in `configs.rs`. `all`
+    // re-selects frame's default feature set explicitly, so the
+    // build is bit-for-bit today's; a subset config drops frame's
+    // defaults and selects its core features, the group gates, and
+    // the per-driver facade features for the `"y"` keys, unioned
+    // with the caller's `--features` like everything above.
     let mut no_default_features = false;
-    if let Some(name) = &args.config {
+    if let Some(arg) = &args.config {
         if args.package != "narf-frame" {
-            bail!("--config selects narf-frame feature groups and requires --package narf-frame");
+            bail!("--config selects narf-frame driver features and requires --package narf-frame");
         }
-        let config = configs::lookup(name).ok_or_else(|| {
-            anyhow!(
-                "unknown --config {name:?} (registered: {})",
-                configs::names().collect::<Vec<_>>().join(", ")
-            )
-        })?;
+        let config = configs::resolve(arg, root)?;
         no_default_features = config.no_default_features;
-        for feature in config.features {
+        for feature in &config.features {
             ensure_feature(&mut features, feature);
         }
     }

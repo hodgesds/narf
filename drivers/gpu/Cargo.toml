@@ -47,8 +47,11 @@ narf-drivers-sound = { path = "../sound" }
 # set it did before the split. Drop one (e.g.
 # `--no-default-features --features intel`) to build a kernel
 # without that vendor's drivers: none of its modules compile and
-# none of its PCI drivers register. The named-config registry
-# (build/xtask configs) selects these per build configuration.
+# none of its PCI drivers register. The TOML driver config
+# (`--config`, build/xtask/src/configs.rs) selects these per
+# build configuration, from lane 2 (design §5.1: the
+# `[drivers.gpu]` keys become valid when the frame forwarding
+# feature and the per-vendor registration gating land).
 default = ["amdgpu", "intel"]
 amdgpu = []
 intel = []

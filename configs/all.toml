@@ -1,0 +1,34 @@
+# All drivers built in — today's build, bit-for-bit.
+# Every key the file expresses is "y"; groups with no selection
+# surface yet (gpu, wireless, usb, ...) are always in, so the
+# effective selection is exactly a plain `cargo xtask build`.
+# Lane 1: net + storage tables only (design §5.2).
+
+[drivers.net]
+aqc1xx = "y"
+atheros = "y"
+bnxt = "y"
+cxgb4 = "y"
+e1000 = "y"
+enic = "y"
+forcedeth = "y"
+i40e = "y"
+igb = "y"
+igc = "y"
+ixgbe = "y"
+mlx4 = "y"
+mlx5 = "y"
+realtek = "y"
+rtl8139 = "y"
+tg3 = "y"
+vmxnet3 = "y"
+
+[drivers.storage]
+ahci = "y"
+megaraid = "y"
+mpt3sas = "y"
+rtsx = "y"
+sdhci = "y"
+smartpqi = "y"
+vmd = "y"
+nvme = "y"

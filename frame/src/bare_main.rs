@@ -3351,6 +3351,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(feature = "bpf-leds")]
             narf_bpf_leds::register_initcalls();
             narf_input::register_initcalls();
+            #[cfg(feature = "drivers-nvme")]
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();
             #[cfg(feature = "drivers-net")]

@@ -20,7 +20,16 @@
 //! The census fixture asserts the snapshot equals the recorded
 //! baseline for this arch, minus the names owned by any driver group
 //! the build's config left out (frame's `drivers-net` /
-//! `drivers-storage` features gate those groups' registrations).
+//! `drivers-storage` features gate those groups' registrations, and
+//! `drivers-nvme` gates the standalone `nvme` name — it is tracked
+//! apart from the storage group, because a config can select nvme
+//! without any storage-facade driver and vice versa).
+//! The fixture is group-granular: it is exact for `all`, `minimal`,
+//! and every group-uniform config, while a hand-written *partial*
+//! config (some keys `"y"`, some `"n"` inside one group) trips it
+//! loudly — the gate is on, so the full group set is expected, but
+//! only the `"y"` drivers registered. Per-driver census tables are
+//! a follow-up, not this lane.
 //! Habitat: the CI kernel-test invocation —
 //! `cargo xtask test --features cgroup-all,container` (xtask itself
 //! adds `kernel-test` + `module-allow-unsigned`), per
@@ -675,6 +684,7 @@ fn smoke_composition_census_matches_baseline() -> TestResult {
     };
     let net_on = cfg!(feature = "drivers-net");
     let storage_on = cfg!(feature = "drivers-storage");
+    let nvme_on = cfg!(feature = "drivers-nvme");
     let mut mismatch = false;
     for (i, stage) in narf_init::Stage::ALL.iter().enumerate() {
         let expected: Vec<&str> = baseline[i]
@@ -682,6 +692,7 @@ fn smoke_composition_census_matches_baseline() -> TestResult {
             .copied()
             .filter(|n| net_on || !NET_GROUP_NAMES.contains(n))
             .filter(|n| storage_on || !STORAGE_GROUP_NAMES.contains(n))
+            .filter(|n| nvme_on || *n != "nvme")
             .collect();
         if snap[i].iter().ne(expected.iter()) {
             mismatch = true;
