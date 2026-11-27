@@ -964,7 +964,6 @@ fn navi48_vram_checks_gmc12_dcn4_and_training() -> TestResult {
     }
     TestResult::Pass
 }
-#[test]
 fn navi31_vram_checks_gmc11_dcn32_and_training() -> TestResult {
     use crate::amdgpu::{ChipInfo, Family, VramInfo, NAVI31};
     use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, HW_ID_GC, HW_ID_MMHUB, MAX_BASE_ADDRS};
@@ -1118,26 +1117,32 @@ fn navi31_vram_checks_gmc11_dcn32_and_training() -> TestResult {
     {
         return TestResult::Fail("Navi31 plan mismeasured the pipe-0 surface");
     }
-    if plan.map().dmub != Some((40 * MIB, 0x4000)) {
+    if !plan
+        .protected()
+        .iter()
+        .any(|r| r.owner == Owner::Dmub && r.range == (40 * MIB..40 * MIB + 0x4000))
+    {
         return TestResult::Fail("Navi31 plan misplaced the DMUB Region5 window");
     }
     // Revoked authority refuses the plan before any register is read.
-    crate::amdgpu::revoke_authority();
+    cap.revoke();
     // SAFETY: revoked authority must reject before dereferencing MMIO.
     if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.err() != Some(Error::Revoked) {
         return TestResult::Fail("Navi31 inventory bypassed capability invocation");
     }
-    crate::amdgpu::grant_authority();
     TestResult::Pass
 }
+kernel_test_in!(
+    "drivers/gpu/vram",
+    navi31_vram_checks_gmc11_dcn32_and_training
+);
 
 /// Each Navi3 die carries its own GC framebuffer triplet: Navi31/33 at
 /// 0x1678/0x1679 (GC 11.0.0/11.0.2), Navi32 at 0x1688/0x1689 (GC 11.0.3,
 /// whose whole GCMC block sits 0x10 higher). A die driven with another
 /// die's triplet must fail closed.
-#[test]
 fn navi31_vram_per_die_fb_triplets() -> TestResult {
-    use crate::amdgpu::{ChipInfo, Family, VramInfo};
+    use crate::amdgpu::{ChipInfo, Family, VramInfo, NAVI31};
     use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, HW_ID_GC, HW_ID_MMHUB, MAX_BASE_ADDRS};
     // DIDs from the KNOWN_DEVICES table (`amdgpu.rs`: Navi32 0x747E,
     // Navi33 0x7480).
@@ -1299,6 +1304,7 @@ fn navi31_vram_per_die_fb_triplets() -> TestResult {
     }
     TestResult::Pass
 }
+kernel_test_in!("drivers/gpu/vram", navi31_vram_per_die_fb_triplets);
 
 kernel_test_in!(
     "drivers/gpu/vram",
