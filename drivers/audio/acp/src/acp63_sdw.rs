@@ -459,8 +459,13 @@ fn compose_cards(
     Ok(cards)
 }
 
+/// Linux's poll budget for the RT711 DAC DC-offset calibration
+/// (500 iterations ~10 ms apart, ~5 s); see `init_codec`.
+const RT711_CALIBRATION_TIMEOUT_MS: u64 = 5_000;
+
 /// Run an enumerated peripheral's vendor attach-time init, if it
-/// has one (RT711: `soundwire_rt711::io_init`; RT1316:
+/// has one (RT711: `soundwire_rt711::io_init` +
+/// `soundwire_rt711::rt711_calibration`; RT1316:
 /// `soundwire_rt1316::io_init`). Unknown codecs need none: the
 /// generic conversation is all they get. Jack-detect arming
 /// (`soundwire_rt711::jack_init`) is deliberately not run here —
@@ -468,7 +473,25 @@ fn compose_cards(
 fn init_codec<T: Transport>(bus: &Bus<T>, peripheral: &Peripheral) -> Result<(), SdwError> {
     match (peripheral.id.mfg_id, peripheral.id.part_id) {
         (crate::soundwire::REALTEK_MFG_ID, 0x0711) => {
-            soundwire_rt711::io_init(bus, peripheral.dev_num)
+            soundwire_rt711::io_init(bus, peripheral.dev_num)?;
+            // DAC DC-offset calibration, right after `io_init`:
+            // Linux's first-init path runs `rt711_calibration`
+            // synchronously at the end of `io_init`
+            // (`first_hw_init`; later inits defer it to
+            // `calibration_work`), and attach here is always the
+            // first init — there is no resume re-init. The poll
+            // budget is Linux's: 500 iterations ~10 ms apart
+            // (~5 s). A calibration failure does not fail the
+            // bind: Linux ignores the return too (the codec still
+            // binds, uncalibrated) — the depop write and power-D3
+            // already ran inside `rt711_calibration` even on
+            // timeout.
+            let _ = soundwire_rt711::rt711_calibration(
+                bus,
+                peripheral.dev_num,
+                RT711_CALIBRATION_TIMEOUT_MS,
+            );
+            Ok(())
         }
         (crate::soundwire::REALTEK_MFG_ID, 0x1316) => {
             soundwire_rt1316::io_init(bus, peripheral.dev_num)
@@ -871,11 +894,15 @@ mod tests {
         // landed on the peripheral model. SET verbs below 0x4fff go out
         // at their own address (Linux rt711_sdw_write), so the HP pin
         // widget is 0x3721 and the AFG power state 0x3501; the 0xbxxx
-        // addresses are the GET verbs, which nothing writes.
+        // addresses are the GET verbs, which nothing writes. The
+        // data-low byte at 0x84a0 is 0x03, not the 0x49 low byte of
+        // the INLINE_CMD_CTL index write: the DAC DC-offset
+        // calibration's depop write (FSM_CTL = 0x3) is the last
+        // VENDOR_REG index write and overwrites that address.
         if fixture.model.regs.get(&0x3721).copied() != Some(0xc0)
             || fixture.model.regs.get(&0x4f12).copied() != Some(0x91)
             || fixture.model.regs.get(&0x3501).copied() != Some(0x03)
-            || fixture.model.regs.get(&0x84a0).copied() != Some(0x49)
+            || fixture.model.regs.get(&0x84a0).copied() != Some(0x03)
         {
             return TestResult::Fail("RT711 attach-time init did not land");
         }
@@ -891,6 +918,44 @@ mod tests {
     kernel_test_in!(
         "audio/acp63-sdw",
         composed_bind_publishes_codecs_despite_pdm_pin_config
+    );
+
+    fn composed_bind_runs_rt711_dc_offset_calibration() -> TestResult {
+        let fixture = Fixture::new(true, false);
+        fixture.model.write(POWER_STATUS, 0);
+        fixture.model.write(CONTROL, 1);
+        fixture.model.write(PIN_CONFIG, 4);
+        let cards = match compose_cards(fixture.model.mmio) {
+            Ok(cards) => cards,
+            Err(_) => return TestResult::Fail("composed bind failed with answering codec"),
+        };
+        if cards.len() != 1 {
+            return TestResult::Fail("composed bind must yield exactly one card");
+        }
+        // DAC DC-offset calibration ran during attach: the trigger
+        // write behind NID 0x58 (data-high 0x7458 carries the
+        // 0x8000 trigger's high byte, data-low 0x84d8 its low
+        // byte), the FSM_CTL index select (0x85a0 = 0x6f, the last
+        // VENDOR_REG index written), the depop-mode write
+        // (FSM_CTL = 0x3 at data-low 0x84a0), and power D3
+        // (0x3501 = 0x03). The model answers index reads with
+        // zero, so the trigger bit reads clear on the first poll
+        // and calibration completes; the timeout and
+        // still-depop-still-D3 paths are proven at the profile
+        // level (`calibration_timeout_still_depops`).
+        if fixture.model.regs.get(&0x7458).copied() != Some(0x80)
+            || fixture.model.regs.get(&0x84d8).copied() != Some(0x00)
+            || fixture.model.regs.get(&0x85a0).copied() != Some(0x6f)
+            || fixture.model.regs.get(&0x84a0).copied() != Some(0x03)
+            || fixture.model.regs.get(&0x3501).copied() != Some(0x03)
+        {
+            return TestResult::Fail("RT711 DC-offset calibration did not run at attach");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/acp63-sdw",
+        composed_bind_runs_rt711_dc_offset_calibration
     );
 
     fn composed_bind_empty_bus_fails_closed() -> TestResult {
