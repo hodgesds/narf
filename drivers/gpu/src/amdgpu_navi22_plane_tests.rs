@@ -277,7 +277,12 @@ fn drm_planes(fb: (u32, u32), placed: Option<Rects>) -> crate::drm_native_planes
     use crate::amdgpu_dcn401_otg::{Blend, PlaneSurface, SurfaceFormat, MAX_OVERLAYS};
     use crate::amdgpu_dcn401_spl::{Rect, Rotation};
     use crate::amdgpu_navi48_boot::{PlaneGeometry, PlaneSetup};
-    let primary = placed.map(|(src, dst)| PlaneGeometry {
+    // None is the full-frame unscaled primary, not an absent one: the
+    // primary is present, showing the whole framebuffer in the CRTC
+    // rectangle. (An absent primary is an overlay-only commit, which the
+    // caller builds by clearing `setup.primary` itself.)
+    let (src, dst) = placed.unwrap_or(((0, 0, fb.0, fb.1), (0, 0, fb.0, fb.1)));
+    let primary = Some(PlaneGeometry {
         src_x: src.0,
         src_y: src.1,
         width: src.2,
