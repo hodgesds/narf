@@ -67,12 +67,16 @@ work had.
   (`narf.intel.panel_replay=1`) and compressed scanout (`narf.intel.ccs=1`)
   have native fixtures only. Still open: their silicon runs, the HDA probe
   deferral when the display binds after the HDA controller, deep colour
-  through a branch, UHBR, MST or DSC, MST audio, DP YCbCr 4:2:0, MST or
-  UHBR beside a second route, Panel Replay on the external routes (their
-  console scanout has no frontbuffer tracking to exit replay) and with the
-  AS SDP, region early transport, and panned compressed views. Native HDMI
-  FRL stays refused: Linux 7.4 has no source FRL link training (its rate
-  and PHY facts are carried).
+  through a branch, UHBR, MST or DSC, MST audio, DP YCbCr 4:2:0, Panel
+  Replay on the external routes (their console scanout has no frontbuffer
+  tracking to exit replay) and with the AS SDP, and region early
+  transport. MST and UHBR beside a second route and panned compressed
+  views have native fixtures; open there are two 128b/132b routes in one
+  DP tunnel BW group that Linux resolves by reducing a lit route's bpp
+  (`intel_link_bw_reduce_bpp`, refused typed) or that compress, and a
+  tunnelled MST route in that group check (it covers SST tunnels). Native
+  HDMI FRL stays refused: Linux 7.4 has no source FRL link training (its
+  rate and PHY facts are carried).
 - DP 2.0 UHBR beyond the 128b/132b SST route behind `narf.intel.uhbr=1`
   (UHBR10/20 on C20 and LT ports, over display-30 Thunderbolt with DP
   tunnel BW allocation, through non-transparent LTTPRs, with the
