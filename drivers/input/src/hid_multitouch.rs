@@ -159,6 +159,9 @@ pub enum MtClass {
     Nsmu = 0x000a,
     Win8 = 0x0012,
     ExportAllInputs = 0x0013,
+    /// Win8 PTP, force multi-input, not-seen-means-up — Goodix
+    /// GT7868Q (Linux `MT_CLS_WIN_8_FORCE_MULTI_INPUT_NSMU`).
+    Win8ForceMultiInputNsmu = 0x0018,
     Apple = 0x0114,
 }
 
@@ -166,7 +169,9 @@ pub enum MtClass {
 /// `linux/drivers/hid/hid-multitouch.c:267-458`, covering the four
 /// classes the task spec calls out: Elan (Default), Synaptics
 /// (Default), Apple Magic Trackpad 2 (Apple), Generic Win8 PTP
-/// (Win8). Adding more entries is mechanical — copy the Linux
+/// (Win8) — plus the Goodix GT7868Q class
+/// (`Win8ForceMultiInputNsmu`, Linux `hid-multitouch.c:592-608`).
+/// Adding more entries is mechanical — copy the Linux
 /// `MT_QUIRK_*` set into [`MtQuirks`] flags.
 #[derive(Copy, Clone, Debug)]
 pub struct MtClassEntry {
@@ -258,6 +263,30 @@ const MT_CLASSES: &[MtClassEntry] = &[
     MtClassEntry {
         class: MtClass::ExportAllInputs,
         quirks: MtQuirks(MtQuirks::ALWAYS_VALID.bits() | MtQuirks::CONTACT_CNT_ACCURATE.bits()),
+        max_contacts: 0,
+        is_indirect: true,
+    },
+    // MT_CLS_WIN_8_FORCE_MULTI_INPUT_NSMU — Goodix GT7868Q
+    // (27c6:01e8/01e9). Linux: hid-multitouch.c:592-608. Note the
+    // bundle has NO ALWAYS_VALID, unlike Win8 (0x0012) and
+    // Win8ForceMultiInput (0x0015): a contact the device stops
+    // reporting is a release (NOT_SEEN_MEANS_UP), so validity
+    // comes from presence, not from a per-contact valid bit.
+    // Linux also sets `export_all_inputs = true` on this class;
+    // NARF needs no separate flag for that — the i2c-HID pump
+    // already registers keyboard + PTP + touchscreen evdev nodes
+    // additively for one device, which is the same behaviour.
+    MtClassEntry {
+        class: MtClass::Win8ForceMultiInputNsmu,
+        quirks: MtQuirks(
+            MtQuirks::IGNORE_DUPLICATES.bits()
+                | MtQuirks::HOVERING.bits()
+                | MtQuirks::CONTACT_CNT_ACCURATE.bits()
+                | MtQuirks::STICKY_FINGERS.bits()
+                | MtQuirks::WIN8_PTP_BUTTONS.bits()
+                | MtQuirks::FORCE_MULTI_INPUT.bits()
+                | MtQuirks::NOT_SEEN_MEANS_UP.bits(),
+        ),
         max_contacts: 0,
         is_indirect: true,
     },

@@ -15,6 +15,7 @@ pub mod alps;
 pub mod amd_sfh;
 pub mod goodix;
 pub mod hid_elan;
+pub mod hid_goodix;
 pub mod hid_mt_features;
 pub mod hid_multitouch;
 pub mod hid_rmi;
@@ -84,6 +85,14 @@ pub fn register_initcalls() {
     // (`UsbHidIo` implements `ElanHidIo`, USB-bus rows of
     // `ELAN_DEVICE_TABLE` only — issue #1681, PR #1721).
     hid_elan::register_initcalls();
+
+    // hid-goodix — banner + device-id table load. The GT7868Q
+    // is a Win8 PTP device, so it rides the generic PTP branch of
+    // the i2c-HID bind pump (no vendor session, unlike RMI/Elan);
+    // the pump applies the GT7868Q report-descriptor fixup and
+    // logs the NSMU classification there, and the i2c-HID PM
+    // hooks honour the 27c6:0d42 resume wakeup delay.
+    hid_goodix::register_initcalls();
 
     // RMI4-over-SMBus transport probe (issue #765) — runs once
     // the platform SMBus controller is up (Stage::Subsys).

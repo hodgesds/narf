@@ -721,7 +721,7 @@ async fn pump_task_inner(
         }
     };
 
-    let report_desc_blob = match driver.read_report_descriptor().await {
+    let mut report_desc_blob = match driver.read_report_descriptor().await {
         Ok(b) => b,
         Err(e) => {
             let _ = writeln!(
@@ -733,6 +733,43 @@ async fn pump_task_inner(
             return;
         }
     };
+    // Goodix GT7868Q report-descriptor fixup (Linux
+    // `mt_report_fixup`, `hid-multitouch.c:3238-3303`): patch the
+    // blob in hand before `narf_hid::parse` — the parsed
+    // descriptor and the `hid_info` blob registered below both
+    // carry the patched byte, as in Linux where the fixup runs
+    // before `hid_parse_report`. Non-Goodix devices pass through
+    // untouched.
+    match crate::hid_goodix::fixup_report_descriptor(
+        hid_desc.w_vendor_id,
+        hid_desc.w_product_id,
+        &mut report_desc_blob,
+    ) {
+        crate::hid_goodix::ReportDescriptorFixup::NotApplicable => {}
+        crate::hid_goodix::ReportDescriptorFixup::SkippedUndersize => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid-pump: {}: GT7868Q fixup: report descriptor is only {} bytes, skipping",
+                path,
+                report_desc_blob.len()
+            );
+        }
+        crate::hid_goodix::ReportDescriptorFixup::Patched => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid-pump: {}: GT7868Q report descriptor fixup is applied.",
+                path
+            );
+        }
+        crate::hid_goodix::ReportDescriptorFixup::UnexpectedByte(got) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid-pump: {}: The byte is not expected for fixing the report descriptor. It's possible that the touchpad firmware is not suitable for applying the fix. got: {:x}",
+                path,
+                got
+            );
+        }
+    }
     let parsed = match narf_hid::parse(&report_desc_blob) {
         Ok(p) => p,
         Err(e) => {
@@ -822,6 +859,24 @@ async fn pump_task_inner(
     // Detection keys off the ACPI _HID prefix and the HID
     // descriptor VID/PID; a failed vendor probe falls back to
     // the generic routing instead of dropping the device.
+    //
+    // Goodix GT7868Q is a Win8 PTP device, so it needs no vendor
+    // session here — it rides the generic PTP branch below. The
+    // classification is recorded so the boot log shows the NSMU
+    // class the multitouch path binds it to; the descriptor
+    // fixup already ran on the same VID:PID above.
+    if let Some(class) = crate::hid_goodix::classify_device(
+        &identity.acpi_hid,
+        hid_desc.w_vendor_id,
+        hid_desc.w_product_id,
+    ) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  i2c-hid-pump: {}: Goodix GT7868Q detected (multitouch class {:?})",
+            path,
+            class
+        );
+    }
     let mut rmi_session: Option<crate::hid_rmi::HidRmiSession<'_>> = None;
     let mut rmi_probe: Option<crate::rmi4_core::Rmi4DeviceProbe> = None;
     let mut rmi_node: Option<Arc<narf_input::evdev::DeviceNode>> = None;

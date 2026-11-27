@@ -219,7 +219,21 @@ async fn suspend_one(device: &I2cHidPmDevice) -> Result<(), DeviceSuspendError> 
 /// Re-arm one device: RESET (with the zero-length sentinel poll),
 /// SET_POWER(ON), then the PTP multi-touch mode restore when the
 /// device had one at probe time.
+///
+/// Goodix 27c6:0d42 first waits 1500 ms before the wakeup (Linux
+/// `I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME`,
+/// `i2c-hid-core.c:1851-1861`): "if we send wakeup too early, the
+/// device will never trigger input interrupts." The delay goes
+/// before the RESET — the wakeup — not after it. The 60 ms
+/// post-PWR_ON settle is already inside `set_power`, so it applies
+/// to the POWER_ON below without a second sleep here.
 async fn resume_one(device: &I2cHidPmDevice) -> Result<(), DeviceSuspendError> {
+    if crate::hid_goodix::needs_delayed_wakeup_after_resume(
+        device.descriptor.w_vendor_id,
+        device.descriptor.w_product_id,
+    ) {
+        narf_time::sleep_ms(crate::hid_goodix::GOODIX_RESUME_WAKEUP_DELAY_MS).await;
+    }
     let driver = I2cHidDriver::from_descriptor(
         device.bus.clone(),
         device.addr,
@@ -326,6 +340,14 @@ pub mod tests {
     /// wCommandRegister 0x0005, wInputRegister 0x0003,
     /// wDataRegister 0x0006, wReportDescLength 100.
     fn make_descriptor_bytes() -> Vec<u8> {
+        make_descriptor_bytes_for(0x04F3, 0x3045)
+    }
+
+    /// Same descriptor with the caller's VID:PID at offsets 20/22
+    /// (wVendorID / wProductID) — the PM snapshot keys power
+    /// quirks off those fields, so a Goodix 27c6:0d42 device is
+    /// built this way.
+    fn make_descriptor_bytes_for(vendor: u16, product: u16) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; crate::i2c_hid::HID_DESC_LENGTH];
         let put16 = |buf: &mut [u8], off: usize, v: u16| {
             buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
@@ -340,8 +362,8 @@ pub mod tests {
         put16(&mut buf, 14, 32);
         put16(&mut buf, 16, 0x0005);
         put16(&mut buf, 18, 0x0006);
-        put16(&mut buf, 20, 0x04F3);
-        put16(&mut buf, 22, 0x3045);
+        put16(&mut buf, 20, vendor);
+        put16(&mut buf, 22, product);
         put16(&mut buf, 24, 0x0001);
         buf
     }
@@ -359,9 +381,19 @@ pub mod tests {
     /// `record_device` exactly as the pump does. Returns `None`
     /// when the setup descriptor read fails.
     fn record_mock_device(ptp_mode: Option<Vec<u8>>) -> Option<alloc::sync::Arc<MockBus>> {
+        record_mock_device_for(ptp_mode, 0x04F3, 0x3045)
+    }
+
+    /// Same, with the caller's VID:PID in the descriptor — the
+    /// snapshot's power quirks key off those fields.
+    fn record_mock_device_for(
+        ptp_mode: Option<Vec<u8>>,
+        vendor: u16,
+        product: u16,
+    ) -> Option<alloc::sync::Arc<MockBus>> {
         __reset_for_test();
         let bus = alloc::sync::Arc::new(MockBus::new());
-        bus.stage_read(make_descriptor_bytes());
+        bus.stage_read(make_descriptor_bytes_for(vendor, product));
         let bus_dyn: Arc<dyn I2cBus> = bus.clone();
         let mut driver = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
         let desc = run(async move { driver.read_descriptor().await.ok() })?;
@@ -466,6 +498,84 @@ pub mod tests {
     kernel_test_in!(
         "drivers/input/i2c-hid-pm",
         smoke_i2c_hid_pm_resume_without_ptp_skips_mode_restore
+    );
+
+    /// Elapsed wall time of a resume in nanoseconds, measured on
+    /// the TSC clock the sleeps themselves use
+    /// (`Deadline::after_ms` → `ns_to_cycles`, `cycles_to_ns`
+    /// back) — so the floor is self-consistent even before timer
+    /// calibration. Floors sit below the nominal sleeps to absorb
+    /// wheel granularity; there is no ceiling (a slow CI host only
+    /// makes the sleeps longer, never shorter).
+    fn elapsed_ns_since(start: narf_time::Instant) -> u64 {
+        narf_time::cycles_to_ns(narf_time::Instant::now().cycles_since(start))
+    }
+
+    fn smoke_i2c_hid_pm_resume_powers_on_with_settle_delay() -> TestResult {
+        // `set_power(POWER_ON)` sleeps POWER_ON_SETTLE_MS (60 ms,
+        // Linux `i2c_hid_set_power`): a plain resume must take at
+        // least that long and still emit RESET + SET_POWER(ON).
+        let Some(bus) = record_mock_device(None) else {
+            return TestResult::Fail("setup descriptor read failed");
+        };
+        bus.stage_read(alloc::vec![0u8, 0u8]);
+        let devices = __devices_for_test();
+        let start = narf_time::Instant::now();
+        if run(__resume_one_for_test(&devices[0])).is_err() {
+            return TestResult::Fail("resume_one errored on a healthy mock bus");
+        }
+        if elapsed_ns_since(start) < 50_000_000 {
+            return TestResult::Fail("resume did not wait out the 60 ms PWR_ON settle");
+        }
+        let writes = bus.writes();
+        if writes.len() != 4 || writes[3] != alloc::vec![0x05, 0x00, 0x00, 0x08] {
+            return TestResult::Fail("resume wire sequence wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid-pm",
+        smoke_i2c_hid_pm_resume_powers_on_with_settle_delay
+    );
+
+    fn smoke_i2c_hid_pm_resume_goodix_0d42_delays_wakeup() -> TestResult {
+        // Goodix 27c6:0d42 (Linux
+        // `I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME`): resume waits
+        // 1500 ms BEFORE the wakeup — the RESET must still be the
+        // first wire frame after the wait, and the whole resume
+        // takes at least the quirk delay (plus the 60 ms PWR_ON
+        // settle inside `set_power`).
+        let Some(bus) = record_mock_device_for(
+            None,
+            crate::hid_goodix::GOODIX_VENDOR_ID,
+            crate::hid_goodix::GOODIX_0D42,
+        ) else {
+            return TestResult::Fail("setup descriptor read failed");
+        };
+        bus.stage_read(alloc::vec![0u8, 0u8]);
+        let devices = __devices_for_test();
+        let start = narf_time::Instant::now();
+        if run(__resume_one_for_test(&devices[0])).is_err() {
+            return TestResult::Fail("resume_one errored on a healthy mock bus");
+        }
+        if elapsed_ns_since(start) < 1_400_000_000 {
+            return TestResult::Fail("0d42 resume did not wait out the 1500 ms wakeup delay");
+        }
+        let writes = bus.writes();
+        if writes.len() != 4 {
+            return TestResult::Fail("0d42 resume must emit RESET + input + SET_POWER(ON)");
+        }
+        if writes[1] != alloc::vec![0x05, 0x00, 0x00, 0x01] {
+            return TestResult::Fail("RESET frame bytes wrong");
+        }
+        if writes[3] != alloc::vec![0x05, 0x00, 0x00, 0x08] {
+            return TestResult::Fail("SET_POWER(ON) frame bytes wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid-pm",
+        smoke_i2c_hid_pm_resume_goodix_0d42_delays_wakeup
     );
 
     fn smoke_i2c_hid_pm_record_is_idempotent_per_bus_addr() -> TestResult {

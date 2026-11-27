@@ -76,6 +76,18 @@ const REPORT_TYPE_FEATURE: u8 = 0x03;
 pub const POWER_ON: u8 = 0x00;
 pub const POWER_SLEEP: u8 = 0x01;
 
+/// Settle delay after a successful SET_POWER(ON), in ms. Linux
+/// `i2c_hid_set_power` (`drivers/hid/i2c-hid/i2c-hid-core.c:843-845`)
+/// sleeps 60 ms after every successful PWR_ON — "According to
+/// Goodix Windows even waits 60 ms after (other?) PWR_ON requests.
+/// Testing has confirmed that several devices will not work
+/// properly without a delay after a PWR_ON request." The delay is
+/// unconditional on the generic path there, so it lives here in
+/// `set_power` (the funnel every PWR_ON goes through: probe
+/// bring-up, PM resume, pump recovery re-bind) rather than at one
+/// call site.
+pub const POWER_ON_SETTLE_MS: u64 = 60;
+
 /// `HID_MIN_BUFFER_SIZE` (`include/linux/hid.h:589`): the transfer buffer
 /// i2c-hid starts with, before `i2c_hid_start` grows it to the largest
 /// report the descriptor declares.
@@ -390,7 +402,11 @@ impl I2cHidDriver {
     }
 
     /// SET_POWER opcode. Caller passes [`POWER_ON`] or
-    /// [`POWER_SLEEP`]; anything else is rejected.
+    /// [`POWER_SLEEP`]; anything else is rejected. After a
+    /// successful POWER_ON the device gets [`POWER_ON_SETTLE_MS`]
+    /// to come up (Linux `i2c_hid_set_power`); a failed POWER_ON
+    /// returns before the sleep, matching Linux (`if (!ret &&
+    /// power_state == I2C_HID_PWR_ON) msleep(60)`).
     pub async fn set_power(&self, state: u8) -> Result<(), I2cHidError> {
         if state != POWER_ON && state != POWER_SLEEP {
             return Err(I2cHidError::BadPowerState);
@@ -403,7 +419,11 @@ impl I2cHidDriver {
             CMD_OP_SET_POWER,
             state,
         )
-        .await
+        .await?;
+        if state == POWER_ON {
+            narf_time::sleep_ms(POWER_ON_SETTLE_MS).await;
+        }
+        Ok(())
     }
 
     /// `i2c_hid_get_report` (`drivers/hid/i2c-hid/i2c-hid-core.c:257`):
