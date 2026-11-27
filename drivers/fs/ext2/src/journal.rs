@@ -973,6 +973,256 @@ impl Journal {
     }
 }
 
+impl Journal {
+    /// The journal features ext4 writes with (`ext4_set_journal_csum_feature_set`
+    /// with ext4's default `journal_checksum` under `metadata_csum`, and the
+    /// 64-bit tag format on a 64-bit filesystem), applied as
+    /// `jbd2_journal_set_features` and `jbd2_journal_clear_features` do: v3
+    /// checksums with crc32c and the seed from the journal UUID, or no
+    /// checksums at all; `async_commit` off. A v1 superblock carries no
+    /// features (EINVAL, as `jbd2_journal_check_available_features` refuses).
+    pub fn set_write_features(
+        &mut self,
+        metadata_csum: bool,
+        wide: bool,
+    ) -> Result<(), JournalError> {
+        let mut compat = self.sb.feature_compat() & !feature::COMPAT_CHECKSUM;
+        let mut incompat = self.sb.feature_incompat()
+            & !(feature::INCOMPAT_CSUM_V2
+                | feature::INCOMPAT_CSUM_V3
+                | feature::INCOMPAT_ASYNC_COMMIT);
+        if metadata_csum {
+            incompat |= feature::INCOMPAT_CSUM_V3;
+        }
+        if wide {
+            incompat |= feature::INCOMPAT_64BIT;
+        }
+        let needs_features = incompat != 0 || compat != 0;
+        if !self.sb.v2() {
+            if needs_features {
+                return Err(JournalError::Invalid);
+            }
+            return Ok(());
+        }
+        if incompat & feature::INCOMPAT_CSUM_V3 != 0 {
+            self.sb.raw[0x50] = JBD2_CRC32C_CHKSUM;
+            self.csum_seed = crc32c(!0, self.sb.uuid());
+            compat &= !feature::COMPAT_CHECKSUM;
+        }
+        self.sb.set(0x24, compat);
+        self.sb.set(0x28, incompat);
+        Ok(())
+    }
+}
+
+/// One journal block a commit writes: where in the log, and its bytes.
+#[derive(Debug)]
+pub struct LogWrite {
+    pub block: u32,
+    pub data: Vec<u8>,
+}
+
+/// A transaction's log blocks, in the order they are written, and where the
+/// log continues after it.
+#[derive(Debug)]
+pub struct EncodedTransaction {
+    /// Revoke, descriptor and data blocks: written first, plain.
+    pub body: Vec<LogWrite>,
+    /// The commit block: written after a flush, with FUA.
+    pub commit: LogWrite,
+    /// The block after the commit (`j_head` once it is written).
+    pub next_head: u32,
+}
+
+impl Journal {
+    /// Log blocks free from `head` to the tail, the way `jbd2_log_space_left`
+    /// counts them; with every commit checkpointed at once the whole log is
+    /// free between transactions.
+    pub fn log_len(&self) -> u32 {
+        self.last - self.first
+    }
+
+    /// The blocks one transaction of `blocks` filesystem blocks and
+    /// `revokes` revoked blocks needs in the log: descriptors (each holding
+    /// as many tags as fit, `commit.c` line ~695), the data copies, revoke
+    /// blocks, and the commit block.
+    pub fn transaction_blocks(&self, blocks: usize, revokes: usize) -> usize {
+        let per_descriptor = self.tags_per_descriptor().max(1);
+        let per_revoke = self.revokes_per_block().max(1);
+        blocks.div_ceil(per_descriptor) + blocks + revokes.div_ceil(per_revoke) + 1
+    }
+
+    fn csum_size(&self) -> usize {
+        if self.sb.has_csum_v2or3() {
+            TAIL_BYTES
+        } else {
+            0
+        }
+    }
+
+    /// Tags a descriptor holds: the first carries a 16-byte UUID after it,
+    /// the rest share it (`SAME_UUID`); the block keeps room for the tail.
+    fn tags_per_descriptor(&self) -> usize {
+        let space = self.block_size - HEADER_BYTES - self.csum_size();
+        let tag = self.sb.tag_bytes();
+        if space < tag + 16 {
+            return 0;
+        }
+        1 + (space - tag - 16) / tag
+    }
+
+    /// `journal_revoke_records_per_block`.
+    fn revokes_per_block(&self) -> usize {
+        let record = if self.sb.has_64bit() { 8 } else { 4 };
+        (self.block_size - REVOKE_HEADER_BYTES - self.csum_size()) / record
+    }
+
+    /// Lay out transaction `tid` from `head`: revoke blocks, then for each
+    /// run of tags a descriptor followed by its data copies (escaped when a
+    /// block begins with the magic, `jbd2_journal_write_metadata_buffer`),
+    /// then the commit block stamped `commit_sec`/`commit_nsec`. Checksums
+    /// as the superblock's features say: v3/v2 tag, descriptor-tail and
+    /// commit checksums; v1 a running crc32_be over descriptors and data.
+    pub fn encode_transaction(
+        &self,
+        tid: u32,
+        head: u32,
+        blocks: &[(u64, &[u8])],
+        revokes: &[u64],
+        commit_sec: u64,
+        commit_nsec: u32,
+    ) -> EncodedTransaction {
+        let bs = self.block_size;
+        let mut at = head;
+        let mut body = Vec::new();
+        let mut crc32_sum: u32 = !0;
+        let take = |at: &mut u32| {
+            let block = *at;
+            *at = self.wrap(*at + 1);
+            block
+        };
+
+        // Revoke blocks (`jbd2_journal_write_revoke_records`).
+        let record = if self.sb.has_64bit() { 8 } else { 4 };
+        for chunk in revokes.chunks(self.revokes_per_block().max(1)) {
+            let mut r = vec![0u8; bs];
+            put_be32(&mut r, 0, JBD2_MAGIC_NUMBER);
+            put_be32(&mut r, 4, block_type::REVOKE);
+            put_be32(&mut r, 8, tid);
+            let mut off = REVOKE_HEADER_BYTES;
+            for &target in chunk {
+                if record == 8 {
+                    r[off..off + 8].copy_from_slice(&target.to_be_bytes());
+                } else {
+                    put_be32(&mut r, off, target as u32);
+                }
+                off += record;
+            }
+            put_be32(&mut r, HEADER_BYTES, off as u32);
+            self.seal_tail(&mut r);
+            body.push(LogWrite {
+                block: take(&mut at),
+                data: r,
+            });
+        }
+
+        // Descriptors and data.
+        let tag_bytes = self.sb.tag_bytes();
+        for run in blocks.chunks(self.tags_per_descriptor().max(1)) {
+            let mut d = vec![0u8; bs];
+            put_be32(&mut d, 0, JBD2_MAGIC_NUMBER);
+            put_be32(&mut d, 4, block_type::DESCRIPTOR);
+            put_be32(&mut d, 8, tid);
+            let descriptor_at = take(&mut at);
+            let mut data_writes = Vec::with_capacity(run.len());
+            let mut off = HEADER_BYTES;
+            for (i, &(target, content)) in run.iter().enumerate() {
+                let mut logged = content.to_vec();
+                let mut flags = 0u16;
+                if be32(&logged, 0) == JBD2_MAGIC_NUMBER {
+                    flags |= tag_flag::ESCAPE;
+                    logged[..4].fill(0);
+                }
+                if i > 0 {
+                    flags |= tag_flag::SAME_UUID;
+                }
+                if i + 1 == run.len() {
+                    flags |= tag_flag::LAST_TAG;
+                }
+                put_be32(&mut d, off, target as u32);
+                d[off + 6..off + 8].copy_from_slice(&flags.to_be_bytes());
+                if self.sb.has_64bit() {
+                    put_be32(&mut d, off + 8, (target >> 32) as u32);
+                }
+                if self.sb.has_csum_v2or3() {
+                    let csum = crc32c(crc32c(self.csum_seed, &tid.to_be_bytes()), &logged);
+                    if self.sb.has_csum3() {
+                        put_be32(&mut d, off + 12, csum);
+                    } else {
+                        d[off + 4..off + 6].copy_from_slice(&(csum as u16).to_be_bytes());
+                    }
+                }
+                off += tag_bytes;
+                if i == 0 {
+                    // `j_uuid`, which Linux never sets: sixteen zero bytes.
+                    off += 16;
+                }
+                data_writes.push(LogWrite {
+                    block: take(&mut at),
+                    data: logged,
+                });
+            }
+            self.seal_tail(&mut d);
+            if self.sb.has_checksum_v1() {
+                crc32_sum = crc32_be(crc32_sum, &d);
+                for w in &data_writes {
+                    crc32_sum = crc32_be(crc32_sum, &w.data);
+                }
+            }
+            body.push(LogWrite {
+                block: descriptor_at,
+                data: d,
+            });
+            body.extend(data_writes);
+        }
+
+        // The commit block (`journal_submit_commit_record`).
+        let mut c = vec![0u8; bs];
+        put_be32(&mut c, 0, JBD2_MAGIC_NUMBER);
+        put_be32(&mut c, 4, block_type::COMMIT);
+        put_be32(&mut c, 8, tid);
+        c[48..56].copy_from_slice(&commit_sec.to_be_bytes());
+        put_be32(&mut c, 56, commit_nsec);
+        if self.sb.has_checksum_v1() {
+            c[12] = JBD2_CRC32_CHKSUM;
+            c[13] = JBD2_CRC32_CHKSUM_SIZE;
+            put_be32(&mut c, 16, crc32_sum);
+        } else if self.sb.has_csum_v2or3() {
+            let csum = crc32c(self.csum_seed, &c);
+            put_be32(&mut c, 16, csum);
+        }
+        let commit = LogWrite {
+            block: take(&mut at),
+            data: c,
+        };
+        EncodedTransaction {
+            body,
+            commit,
+            next_head: at,
+        }
+    }
+
+    /// `jbd2_descriptor_block_csum_set`.
+    fn seal_tail(&self, block: &mut [u8]) {
+        if self.sb.has_csum_v2or3() {
+            let tail = self.block_size - TAIL_BYTES;
+            block[tail..].fill(0);
+            let csum = crc32c(self.csum_seed, block);
+            put_be32(block, tail, csum);
+        }
+    }
+}
+
 /// `journal_check_superblock`, in its order.
 fn check_superblock(
     sb: &JournalSuperblock,

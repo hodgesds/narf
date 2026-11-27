@@ -846,6 +846,137 @@ kernel_test_in!(
     smoke_jbd2_read_error_fails_recovery
 );
 
+// ── The write side: transactions as NARF's commit encodes them ──────
+
+/// Place `t`'s blocks into `log`.
+fn place(log: &mut Log, t: &crate::journal::EncodedTransaction) {
+    for w in t.body.iter().chain(core::iter::once(&t.commit)) {
+        log.blocks[w.block as usize] = w.data.clone();
+    }
+}
+
+/// Transactions encoded by `Journal::encode_transaction` recover through
+/// the same passes as Linux-written ones, under every checksum and tag
+/// format: 130 blocks (at 1 KiB, two descriptors with 8-byte tags, three
+/// with csum v3's 16-byte ones) starting 30 blocks before `s_maxlen` so the
+/// log wraps, an escaped block, and a later
+/// transaction that revokes one of them.
+fn smoke_jbd2_encoded_transactions_recover() -> TestResult {
+    let formats = [
+        (0, V3),
+        (0, feature::INCOMPAT_CSUM_V2 | feature::INCOMPAT_64BIT),
+        (feature::COMPAT_CHECKSUM, 0),
+        (0, 0),
+        (0, feature::INCOMPAT_64BIT | feature::INCOMPAT_REVOKE),
+    ];
+    for (compat, incompat) in formats {
+        let head = MAXLEN - 30;
+        let mut log = Log::new(BS, MAXLEN, compat, incompat);
+        log.superblock(500, head, 0);
+        let Ok(writer) = Journal::load_superblock(&log.blocks[0], BS, MAXLEN) else {
+            return TestResult::Fail("superblock rejected");
+        };
+        let mut contents: Vec<(u64, Vec<u8>)> =
+            (0..130u64).map(|i| (1000 + i, block_of(i as u8))).collect();
+        contents[5].1[..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
+        let refs: Vec<(u64, &[u8])> = contents.iter().map(|(b, d)| (*b, &d[..])).collect();
+        let t1 = writer.encode_transaction(500, head, &refs, &[], 100, 0);
+        let second = block_of(0xee);
+        let t2 = writer.encode_transaction(501, t1.next_head, &[(2000, &second)], &[1003], 101, 0);
+        if t1.body.len() < 132 || t1.next_head >= head {
+            return TestResult::Fail("fixture: T1 should need two descriptors and wrap");
+        }
+        place(&mut log, &t1);
+        place(&mut log, &t2);
+        let mut mem = Mem::new(log);
+        let Ok((j, _)) = load(&mut mem) else {
+            return TestResult::Fail("an encoded transaction failed to recover");
+        };
+        for (block, data) in &contents {
+            let got = mem.home.get(block);
+            if *block == 1003 {
+                if got.is_some() {
+                    return TestResult::Fail("block revoked by a later transaction replayed");
+                }
+            } else if got != Some(data) {
+                return TestResult::Fail("encoded block did not round-trip");
+            }
+        }
+        if mem.home.get(&2000) != Some(&second) || j.transaction_sequence != 503 {
+            return TestResult::Fail("second transaction or restart id wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_jbd2_encoded_transactions_recover
+);
+
+/// `set_write_features` turns a feature-less v2 superblock into ext4's
+/// write format (csum v3 + 64-bit), and what is then encoded and written
+/// recovers with the checksums verified; without `metadata_csum` it clears
+/// every checksum feature. A v1 superblock cannot carry them (EINVAL).
+fn smoke_jbd2_write_features_as_ext4_sets_them() -> TestResult {
+    let mut log = Log::new(
+        BS,
+        MAXLEN,
+        feature::COMPAT_CHECKSUM,
+        feature::INCOMPAT_ASYNC_COMMIT,
+    );
+    log.superblock(9, 0, 0);
+    let mut mem = Mem::new(log);
+    let first = mem.log[0].clone();
+    let Ok(mut j) = Journal::load_superblock(&first, BS, MAXLEN) else {
+        return TestResult::Fail("superblock rejected");
+    };
+    if j.set_write_features(true, true).is_err() {
+        return TestResult::Fail("v2 superblock refused the write features");
+    }
+    let sb = j.superblock();
+    if !sb.has_csum3() || !sb.has_64bit() || sb.has_checksum_v1() || sb.has_async_commit() {
+        return TestResult::Fail("features differ from ext4's");
+    }
+    let data = block_of(0x42);
+    let t = j.encode_transaction(9, 1, &[(5_000_000_000, &data)], &[], 7, 0);
+    for w in t.body.iter().chain(core::iter::once(&t.commit)) {
+        mem.log[w.block as usize] = w.data.clone();
+    }
+    if run(j.update_sb_log_tail(&mut mem, 9, 1)).is_err() {
+        return TestResult::Fail("superblock write failed");
+    }
+    match load(&mut mem) {
+        Ok(_) if mem.home.get(&5_000_000_000) == Some(&data) => {}
+        _ => {
+            return TestResult::Fail(
+                "csum-v3 transaction written after set_write_features did not recover",
+            )
+        }
+    }
+    let Ok(mut plain) = Journal::load_superblock(&first, BS, MAXLEN) else {
+        return TestResult::Fail("superblock rejected");
+    };
+    if plain.set_write_features(false, false).is_err()
+        || plain.superblock().has_checksum_v1()
+        || plain.superblock().has_csum_v2or3()
+    {
+        return TestResult::Fail("without metadata_csum no checksum feature stays");
+    }
+    let mut v1 = first.clone();
+    put32(&mut v1, 4, block_type::SUPERBLOCK_V1);
+    let Ok(mut old) = Journal::load_superblock(&v1, BS, MAXLEN) else {
+        return TestResult::Fail("v1 superblock rejected");
+    };
+    if old.set_write_features(true, true) != Err(JournalError::Invalid) {
+        return TestResult::Fail("a v1 superblock must refuse features");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_jbd2_write_features_as_ext4_sets_them
+);
+
 // ── The journal at mount (ext4_load_journal) ────────────────────────
 
 use narf_block::ram::RamBlockDevice;
