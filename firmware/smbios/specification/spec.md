@@ -295,6 +295,7 @@ impl RawTable {
     pub fn structure_count(&self) -> u16;
     pub fn version(&self) -> u32;                // dmi_ver
     pub fn source(&self) -> Option<Source>;
+    pub fn entry_point(&self) -> &[u8];          // smbios_entry_point (scan_machine only)
     pub fn structures(&self) -> Vec<RawStructure<'_>>;          // dmi_walk order
     pub fn structures_of_type(&self, kind: u8) -> Vec<RawStructure<'_>>;
 }
@@ -304,7 +305,32 @@ impl RawStructure<'_> { fn length(&self) -> u8; fn formatted(&self) -> &[u8];
                         fn strings(&self) -> &[u8]; fn string(&self, idx: u8) -> Option<&[u8]>; }
 pub fn boot_table() -> Option<&'static RawTable>;           // dmi_available
 pub fn raw_structures_of_type(kind: u8) -> Vec<RawStructure<'static>>; // empty without a table
+
+// dmi_ident[] (src/ident.rs)
+pub enum DmiField { BiosVendor, BiosVersion, BiosDate, BiosRelease, EcFirmwareRelease,
+                    SysVendor, ProductName, ProductVersion, ProductSerial, ProductUuid,
+                    ProductSku, ProductFamily, BoardVendor, BoardName, BoardVersion,
+                    BoardSerial, BoardAssetTag, ChassisVendor, ChassisType,
+                    ChassisVersion, ChassisSerial, ChassisAssetTag }
+pub struct DmiIdent;
+impl DmiIdent {
+    pub fn decode(table: &RawTable) -> Self;     // dmi_decode, types 0-3
+    pub fn get(&self, field: DmiField) -> Option<&[u8]>; // dmi_get_system_info
+}
 ```
+
+`scan_machine` keeps the entry point the table was found through, as
+`dmi_scan.c` keeps `smbios_entry_point`: `buf[6]` bytes of an `_SM3_`
+one, `buf[5]` bytes of a valid `_SM_` one that names a version, and
+otherwise (legacy DMI) the 15-byte `_DMI_` header.
+
+`DmiIdent::decode` saves each field as `dmi_decode` does: the first
+structure of a type that has the field fills it; a field past the
+formatted area is absent; strings are `dmi_string`'s (index 0, one past
+the set and an all-space one are empty, nothing is trimmed); the BIOS and
+EC releases are `major.minor`, absent at `0xFF.0xFF`; the UUID is `%pUl`
+from SMBIOS 2.6 and `%pUb` below, absent when all 00 or all FF; the
+chassis type is the type byte's low 7 bits in decimal.
 
 `parse_stream` overwrites the global typed tables (tests call it with
 synthetic streams); `boot_table()` is set once and never overwritten,

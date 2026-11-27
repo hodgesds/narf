@@ -414,6 +414,13 @@ pub struct Kobject {
     store_attrs: IrqSafeSpinLock<BTreeMap<&'static str, AttrStore>>,
     /// Binary attribute files.
     bin_attrs: IrqSafeSpinLock<BTreeMap<&'static str, BinAttrRead>>,
+    /// The `mode` an attribute was declared with, where it is not the
+    /// default (0444, or 0644 with a store; 0444 for a binary one) — a
+    /// root-only 0400 one, say. Linux ref: `struct attribute::mode`.
+    modes: IrqSafeSpinLock<BTreeMap<&'static str, u16>>,
+    /// `bin_attribute::size` of a binary attribute that has one (its
+    /// `st_size`; 0 when absent).
+    bin_sizes: IrqSafeSpinLock<BTreeMap<&'static str, u64>>,
     /// Symlink children: name → target path (verbatim, as `readlink`
     /// returns it). udev relies on `subsystem`/`device`/`driver` links and
     /// the `/sys/dev/char/<maj>:<min>` layout.
@@ -443,6 +450,8 @@ impl Kobject {
             attr_events: IrqSafeSpinLock::new(BTreeMap::new()),
             store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            modes: IrqSafeSpinLock::new(BTreeMap::new()),
+            bin_sizes: IrqSafeSpinLock::new(BTreeMap::new()),
             symlinks: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
@@ -460,6 +469,8 @@ impl Kobject {
             attr_events: IrqSafeSpinLock::new(BTreeMap::new()),
             store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            modes: IrqSafeSpinLock::new(BTreeMap::new()),
+            bin_sizes: IrqSafeSpinLock::new(BTreeMap::new()),
             symlinks: IrqSafeSpinLock::new(BTreeMap::new()),
         });
         parent.children.lock().push(child.clone());
@@ -588,6 +599,17 @@ impl Kobject {
     /// Recover the `&'static str` key of a BINARY attr matching `name`.
     pub fn find_bin_attr_key(&self, name: &str) -> Option<&'static str> {
         self.bin_attrs.lock().keys().copied().find(|&k| k == name)
+    }
+
+    /// The `mode` attribute `name` was declared with, when it is not the
+    /// default.
+    pub fn attr_mode(&self, name: &str) -> Option<u16> {
+        self.modes.lock().get(name).copied()
+    }
+
+    /// `bin_attribute::size` of binary attribute `name`, when it has one.
+    pub fn bin_attr_size(&self, name: &str) -> Option<u64> {
+        self.bin_sizes.lock().get(name).copied()
     }
 
     /// Call the show function for `name` and return its output.
@@ -755,6 +777,47 @@ pub fn kobject_notify(kobj: &Kobject, name: &str) {
 /// Linux ref: `sysfs_create_bin_file` (fs/sysfs/bin.c:209).
 pub fn kobject_add_bin_attr(kobj: &Kobject, name: &'static str, read: BinAttrRead) {
     kobj.bin_attrs.lock().insert(name, read);
+}
+
+/// [`kobject_add_attr`] for an attribute declared with `mode` rather than
+/// the default 0444 — `__ATTR(name, 0400, show, NULL)`, say, which only
+/// root may open (the open path checks the mode against the node's root
+/// ownership).
+pub fn kobject_add_attr_mode<F>(kobj: &Kobject, name: &'static str, mode: u16, show: F)
+where
+    F: Fn() -> String + Send + Sync + 'static,
+{
+    kobj.modes.lock().insert(name, mode);
+    kobject_add_attr(kobj, name, show);
+}
+
+/// [`kobject_add_bin_attr`] with the `bin_attribute`'s `mode` and `size`,
+/// which `stat` reports: `sysfs_create_bin_file` sets the inode's size
+/// from `size`, and readers such as dmidecode take the length to read from
+/// it. Linux ref: `sysfs_add_bin_file_mode_ns` (fs/sysfs/file.c).
+pub fn kobject_add_sized_bin_attr(
+    kobj: &Kobject,
+    name: &'static str,
+    mode: u16,
+    size: u64,
+    read: BinAttrRead,
+) {
+    kobj.modes.lock().insert(name, mode);
+    kobj.bin_sizes.lock().insert(name, size);
+    kobject_add_bin_attr(kobj, name, read);
+}
+
+/// A [`BinAttrRead`] over a fixed blob: `offset` past its end reads 0
+/// bytes, as `sysfs_kf_bin_read` clamps a read to `size`.
+pub fn bin_blob_read(bytes: Vec<u8>) -> BinAttrRead {
+    Arc::new(move |offset: usize, buf: &mut [u8]| {
+        let Some(rest) = bytes.get(offset..) else {
+            return 0;
+        };
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        n
+    })
 }
 
 /// Add a read-write text attribute (show + store) to a kobject.
@@ -3487,8 +3550,149 @@ pub fn populate_rtc_class() {
     kobject_emit_uevent(&rtc0, crate::uevent::UeventAction::Add);
 }
 
-/// `/sys/class/dmi/id` and `/sys/firmware/dmi/tables` for `table`.
-pub fn publish_dmi(_table: &narf_firmware_smbios::RawTable) {}
+/// `dmi_id_init_attr_table`'s attributes, in its order, with the mode
+/// `DEFINE_DMI_ATTR_WITH_SHOW` declares each with: the serials and the
+/// UUID are root-only.
+const DMI_ID_ATTRS: [(&str, narf_firmware_smbios::DmiField, u16); 22] = {
+    use narf_firmware_smbios::DmiField as F;
+    [
+        ("bios_vendor", F::BiosVendor, 0o444),
+        ("bios_version", F::BiosVersion, 0o444),
+        ("bios_date", F::BiosDate, 0o444),
+        ("bios_release", F::BiosRelease, 0o444),
+        ("ec_firmware_release", F::EcFirmwareRelease, 0o444),
+        ("sys_vendor", F::SysVendor, 0o444),
+        ("product_name", F::ProductName, 0o444),
+        ("product_version", F::ProductVersion, 0o444),
+        ("product_serial", F::ProductSerial, 0o400),
+        ("product_uuid", F::ProductUuid, 0o400),
+        ("product_family", F::ProductFamily, 0o444),
+        ("product_sku", F::ProductSku, 0o444),
+        ("board_vendor", F::BoardVendor, 0o444),
+        ("board_name", F::BoardName, 0o444),
+        ("board_version", F::BoardVersion, 0o444),
+        ("board_serial", F::BoardSerial, 0o400),
+        ("board_asset_tag", F::BoardAssetTag, 0o444),
+        ("chassis_vendor", F::ChassisVendor, 0o444),
+        ("chassis_type", F::ChassisType, 0o444),
+        ("chassis_version", F::ChassisVersion, 0o444),
+        ("chassis_serial", F::ChassisSerial, 0o400),
+        ("chassis_asset_tag", F::ChassisAssetTag, 0o444),
+    ]
+};
+
+/// `get_modalias`'s fields, in its order. "Note new fields need to be
+/// added at the end to keep compatibility with udev's hwdb which does
+/// matches on "`cat dmi/id/modalias`*"."
+const DMI_MODALIAS_FIELDS: [(&str, narf_firmware_smbios::DmiField); 16] = {
+    use narf_firmware_smbios::DmiField as F;
+    [
+        ("bvn", F::BiosVendor),
+        ("bvr", F::BiosVersion),
+        ("bd", F::BiosDate),
+        ("br", F::BiosRelease),
+        ("efr", F::EcFirmwareRelease),
+        ("svn", F::SysVendor),
+        ("pn", F::ProductName),
+        ("pvr", F::ProductVersion),
+        ("rvn", F::BoardVendor),
+        ("rn", F::BoardName),
+        ("rvr", F::BoardVersion),
+        ("cvn", F::ChassisVendor),
+        ("ct", F::ChassisType),
+        ("cvr", F::ChassisVersion),
+        ("sku", F::ProductSku),
+        ("pfa", F::ProductFamily),
+    ]
+};
+
+/// `get_modalias`: `dmi`, then `:<prefix><value>` for each field the table
+/// has, each value `ascii_filter`ed (only bytes above ' ' and below DEL,
+/// and no ':'), then a closing ':'.
+fn dmi_modalias(ident: &narf_firmware_smbios::DmiIdent) -> String {
+    let mut out = String::from("dmi");
+    for (prefix, field) in DMI_MODALIAS_FIELDS {
+        let Some(value) = ident.get(field) else {
+            continue;
+        };
+        out.push(':');
+        out.push_str(prefix);
+        out.extend(
+            value
+                .iter()
+                .filter(|&&c| c > b' ' && c < 127 && c != b':')
+                .map(|&c| char::from(c)),
+        );
+    }
+    out.push(':');
+    out
+}
+
+/// Linux `drivers/firmware/dmi-id.c` (`dmi_id_init`) and
+/// `dmi_scan.c::dmi_init` for an SMBIOS table:
+///
+/// - class `dmi` device `id` at `/sys/devices/virtual/dmi/id`, linked from
+///   `/sys/class/dmi/id`, with an attribute for each `dmi_ident[]` field
+///   the table has ("%s\n" of the saved string), `modalias`, and a
+///   writable `uevent` carrying `MODALIAS=` (`dmi_dev_uevent`);
+/// - `/sys/firmware/dmi/tables/{smbios_entry_point,DMI}`, the entry point
+///   and the walked table as root-only binary files.
+///
+/// Publishing again replaces what an earlier table published.
+pub fn publish_dmi(table: &narf_firmware_smbios::RawTable) {
+    let ident = narf_firmware_smbios::DmiIdent::decode(table);
+    let root = get_root();
+    let devices = get_or_create_child(&root, "devices");
+    let virtual_devices = get_or_create_child(&devices, "virtual");
+    let virtual_dmi = get_or_create_child(&virtual_devices, "dmi");
+    virtual_dmi.remove_child("id");
+    let id = get_or_create_child(&virtual_dmi, "id");
+    // `ADD_DMI_ATTR`: only the fields the table has.
+    for (name, field, mode) in DMI_ID_ATTRS {
+        let Some(value) = ident.get(field) else {
+            continue;
+        };
+        // `sys_dmi_field_show`. Byte strings that are not UTF-8 are shown
+        // with U+FFFD in place of each invalid sequence.
+        let shown = format!("{}\n", String::from_utf8_lossy(value));
+        kobject_add_attr_mode(&id, name, mode, move || shown.clone());
+    }
+    let modalias = dmi_modalias(&ident);
+    let shown = format!("{modalias}\n");
+    kobject_add_attr(&id, "modalias", move || shown.clone());
+    kobject_add_uevent_attr(&id, format!("MODALIAS={modalias}\n"));
+    id.add_symlink("subsystem", "../../../../class/dmi");
+    class_register("dmi").add_symlink("id", "../../devices/virtual/dmi/id");
+
+    // `dmi_init`: `BIN_ATTR_SIMPLE_ADMIN_RO(smbios_entry_point)` and
+    // `(DMI)`, sized `smbios_entry_point_size` and the walked `dmi_len`.
+    let firmware = get_or_create_child(&root, "firmware");
+    let dmi = get_or_create_child(&firmware, "dmi");
+    dmi.remove_child("tables");
+    let tables = get_or_create_child(&dmi, "tables");
+    for (name, bytes) in [
+        ("smbios_entry_point", table.entry_point()),
+        ("DMI", table.bytes()),
+    ] {
+        kobject_add_sized_bin_attr(
+            &tables,
+            name,
+            0o400,
+            bytes.len() as u64,
+            bin_blob_read(bytes.to_vec()),
+        );
+    }
+    // `device_register` announces the device.
+    kobject_emit_uevent(&id, crate::uevent::UeventAction::Add);
+}
+
+/// [`publish_dmi`] for the table the boot scan found, if any
+/// (`dmi_id_init` and `dmi_init` return early without `dmi_available`).
+pub fn populate_dmi() {
+    if let Some(table) = narf_firmware_smbios::boot_table() {
+        publish_dmi(table);
+    }
+}
 
 /// A boot-time projection into the shared kobject registry. Providers must
 /// tolerate refresh after devices probe; mounting sysfs only attaches a view
@@ -3562,6 +3766,10 @@ fn builtin_providers() -> Vec<SysfsProvider> {
         SysfsProvider {
             name: "rtc",
             populate: populate_rtc_class
+        },
+        SysfsProvider {
+            name: "dmi",
+            populate: populate_dmi
         },
     ]
 }
@@ -3990,11 +4198,11 @@ impl FileOps for SysBinAttrFile {
 
     fn stat(&self) -> Stat {
         Stat {
-            size: 0,
+            size: self.kobj.bin_attr_size(self.attr_name).unwrap_or(0),
             blocks: 0,
             mode: Mode {
                 file_type: FileType::File,
-                perms: 0o444,
+                perms: self.kobj.attr_mode(self.attr_name).unwrap_or(0o444),
             },
             mtime_cycles: 0,
         }
@@ -4147,10 +4355,13 @@ impl FileOps for SysAttrFile {
         Stat {
             size,
             blocks: 0,
-            mode: if is_writable {
-                Mode::FILE_RW
-            } else {
-                Mode::FILE_RO
+            mode: match self.kobj.attr_mode(self.attr_name) {
+                Some(perms) => Mode {
+                    file_type: FileType::File,
+                    perms,
+                },
+                None if is_writable => Mode::FILE_RW,
+                None => Mode::FILE_RO,
             },
             mtime_cycles: 0,
         }
