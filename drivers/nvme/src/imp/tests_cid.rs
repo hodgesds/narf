@@ -443,7 +443,7 @@ fn io_submit(ctrl: &Controller, sqe: Sqe) -> CmdOutcome {
 
 fn smoke_nvme_stray_drop_is_counted() -> TestResult {
     // A stray completion is never dropped silently: both matchers — the
-    // polled `submit_raw_ms` loop and the IRQ path's `try_take_io_cqe` —
+    // polled `submit_raw_ms` loop and the IRQ path's `process_cq` / `complete_one` —
     // count it (and report the 1st, 10th, 100th ...), while a stray AER on
     // the admin queue, which is stashed rather than dropped, is not counted.
     use super::log_due_decade;
@@ -616,7 +616,7 @@ fn smoke_nvme_polled_last_look_finds_completion() -> TestResult {
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_polled_last_look_finds_completion);
 
-// ── Async path (`submit_io_begin` / `submit_io_poll` / `submit_io_irq_async`) ──
+// ── Async path (`submit_io_irq_async` + `Cmd::poll_outcome`) ──
 //
 // Driven against the RAM-backed controller: the "device" is whatever the
 // test stages into the CQ, and the queue's interrupt is whatever the test

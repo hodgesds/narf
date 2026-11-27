@@ -305,39 +305,37 @@ multipath / fabrics (defer).
   repointed at the first I/O queue's vector by the multi-queue setup):
   it is the vector the AER supervisor parks on, and
   `disable_after_failure` releases it together with every I/O vector,
-  each exactly once. Production submissions
-  (`nvm_io_dma`, `nvm_io_multipage`, hence every block-layer read /
-  write) route through `submit_sqe_irq` — IRQ-driven wait on the
-  queue's vector `fire_count` with a CQE-phase fallback, 30 s budget
-  (`IO_TIMEOUT_MS`), CID-matched drain, one last CQ look at expiry —
-  whenever the picked queue has a vector; the polled
-  `Queue::submit` stays the fallback for vector-less boots.
-  `submit_io_irq_async` is the async form: `submit_io_begin(opcode,
-  lba, n_blocks, buf) -> Result<IoInFlight, NvmeError>` (SQE +
-  doorbell), then the loop "arm `IoInFlight::wait()`, check
-  `submit_io_poll(&IoInFlight) -> Result<bool, NvmeError>`, await the
-  wait" until the poll reports the command finished. A wake is only a
-  reason to look at the CQ: `Ok(false)` — not yet — for a wake that
-  was not this command's completion (another queue on a shared vector,
-  the late MSI of an earlier polled Flush on the same queue), never a
-  lost completion. On an IRQ-driven queue the wait is **not** bounded
-  by any poll slice of its own (the former `ASYNC_CQ_POLL_MS`, 250 ms,
-  is gone): it ends with the handler's wake or at the command's deadline
-  (`IO_TIMEOUT_MS`), where the timeout path's one poll either finds the
-  completion ("timeout, completion polled", `irq_missed`) or, finding
-  nothing, returns `CompletionTimeout` and marks the controller dead.
-  On a vector-less queue the waiter re-polls cooperatively. The waker
-  is registered in the slot before the state re-check that follows it,
-  which is what closes the lost-wakeup window. (`submit_io_finish`, the
-  former single-shot drain, is gone.) The split
-  lets a caller release the slot gate across the await — no
-  `IrqSafeSpinLock` is ever held across a suspension point and no
-  `block_on` appears on this path. The composed async form still
-  holds the slot gate (an atomic, IRQs live) across the await, so
-  one async I/O is in flight per controller; completion matching is
-  CID-aware (see §10.1) — true concurrency still needs the
-  per-queue CID waiter table + the request-gate → async-Mutex
-  migration. Bring-up enables Async Event
+  each exactly once. Block-layer reads / writes go through the
+  gate-free async path: `BlockDevice::submit` returns an
+  `NvmeRequest` future (`imp/req.rs`), which posts its command on
+  the submitting CPU's queue with a per-tag slot and awaits its own
+  completion — no gate is held across the await, and any number of
+  requests may be at the device at once (see §10.1). The sync
+  wrappers (`submit_io_irq` → `nvm_io_dma` /
+  `nvm_io_multipage` → `submit_io_sync`) post the same way and wait
+  with `Cmd::wait_sync`, a responsive spin on the CQ bounded by the
+  command's deadline (`IO_TIMEOUT_MS`, 30 s). Both forms complete
+  through the per-tag slot: `IoQueue::process_cq` matches each CQE
+  to its slot by `cqe.cid` (`mq::complete_one`) and wakes the
+  owner; on an IRQ-driven queue the waiter never touches the CQ
+  itself — the handler reaps and wakes it, and the queue's timeout
+  timer wakes it at the deadline, where the one poll either finds
+  the completion ("timeout, completion polled", `irq_missed`) or,
+  finding nothing, returns `CompletionTimeout` and marks the
+  controller dead. On a vector-less queue the waiter re-polls
+  cooperatively (`Cmd::poll_outcome` reaps when the head is fresh).
+  The waker is registered in the slot before the state re-check
+  that follows it, which is what closes the lost-wakeup window.
+  (`submit_io_finish`, the former single-shot drain, is gone; so
+  are `submit_sqe_irq`, `reap_io_cqe`, `submit_io_begin` /
+  `submit_io_poll` / `submit_io_finish` and `IoInFlight` — the
+  `Cmd`-based form replaced them.) No `IrqSafeSpinLock` is ever
+  held across a suspension point and no `block_on` appears on this
+  path. The request gate is taken only on the slow paths (a command
+  timeout, a controller found dead or mid-reset at submission, the
+  AER drain + rescan); the request-gate → async-Mutex migration
+  was bypassed, not completed — the data path runs on immutable
+  `IoPath` snapshots published by the gate holder instead. Bring-up enables Async Event
   Configuration (SMART/health + namespace-attribute-changed, FID
   0x0B) and posts 3 AERs (§5.2 recommends ≥4; the depth-8 admin
   queue could host 7 — see §8.4 — but QEMU accepts only 3 before
@@ -584,15 +582,14 @@ NVMe-specific public API beyond that.
   accepts only 3 and returns "Cmd Limit Exceeded" on the 4th;
   raising the posted count toward `depth - 1` is a follow-up for
   silicon that accepts more.
-- **Concurrent async I/O (#928 remainder).** `submit_io_irq_async`
-  holds the slot gate across its await (sound — the gate is an
-  atomic, IRQs live — but one async I/O in flight per controller).
-  Completion matching is CID-aware since #1619 (§10.1); true
-  concurrency still needs a per-queue CID waiter table +
-  routing `BlockDevice::submit` through `submit_io_irq_async`,
-  gated on the `InstalledController` request-gate → async-Mutex
-  migration — until then the async block-layer submit stays
-  eager-sync through the sync IRQ path.
+- **Concurrent async I/O (#928 remainder) — delivered, see §10.1.**
+  The per-queue CID waiter table is the per-tag `CmdSlot` + waker
+  (`imp/mq.rs`), `BlockDevice::submit` already routes through the
+  gate-free `NvmeRequest` future (`imp/req.rs`), and the
+  request-gate → async-Mutex migration was bypassed: the gate is
+  taken only on the slow paths, while the data path runs on
+  immutable `IoPath` snapshots. The multi-submitter smoke already
+  exists (`tests_mq.rs`, §10.1).
 
 ### 10.1 CID-matched completion tracking (delivered, #1619)
 
@@ -614,16 +611,19 @@ head:
   late completion of a timed-out admin command (no admin command
   can be mid-wait while the drain runs): it is consumed, counted
   and logged as a stray, so it cannot block the AERs behind it.
-- `Controller::submit_io_irq` / `submit_io_irq_async` drain
-  through `try_take_io_cqe`: only the CQE carrying the
-  submitted CID is accepted; strays are consumed and dropped
-  and the wait repeats within the command deadline. The sync
-  path loops inside `submit_sqe_irq` (30 s budget, then
-  `reap_io_cqe`: one non-blocking drain of up to `depth` head
-  entries before the command is declared lost); the async
-  form is `submit_io_begin` + a loop of `IoInFlight::wait` /
-  `submit_io_poll` (the same `reap_io_cqe` drain on every wake,
-  fatal only at the command's deadline) — see §3.
+- `Controller::submit_io_irq` / `submit_io_irq_async` complete
+  through the per-tag slot (`Cmd::poll_outcome` /
+  `Cmd::wait_sync`): only the CQE carrying the submitted CID is
+  accepted — `IoQueue::process_cq` matches each CQE to its slot
+  by `cqe.cid` (`mq::complete_one`) and wakes the owner; strays
+  are consumed, counted and dropped, and the wait repeats within
+  the command deadline. The sync path is `submit_io_sync` (30 s
+  budget, `IO_TIMEOUT_MS`); the async form is
+  `submit_io_irq_async` (`Cmd` + `poll_fn`, no gate held) and,
+  for production, the gate-free `NvmeRequest` future — see §3.
+  (`try_take_io_cqe`, `reap_io_cqe` and `submit_sqe_irq` are gone;
+  the timeout path now does `nvme_timeout`'s one poll via
+  `poll_cmd`.)
 - Diagnostics: `Controller::aer_outstanding()` (AER CIDs still
   tracked on the admin queue — a completion stashed by
   `submit_raw_ms` untracks its CID, so the count drops until
@@ -662,23 +662,30 @@ same carve-out as the AER supervisor.
 first, so this PR rebased onto it and dropped the duplicate
 admin half #1617 already carried (`submit_raw_ms` CID loop,
 `stray_aer`, the AER-supervisor wiring) — keeping the
-`aer_cids` tracking, the `try_take_io_cqe` I/O drain, the
+`aer_cids` tracking, the CID-aware I/O drain, the
 `tests_cid.rs` fixture, and the DSM model-controller CID
 tagging (which #1617 also carried, so that commit was
 skipped as already-applied). The CID-aware drain was wired
-into #1617's `submit_io_begin` / `submit_io_finish` split
-(`begin` returns the CID, `finish` takes it) and into
-`submit_sqe_irq`, instead of the branch's pre-#1617
-monolithic async loop.
+into #1617's async split at the time; that split
+(`submit_io_begin` / `submit_io_finish`, `submit_sqe_irq`)
+has since been replaced by the `Cmd`-based form
+(`submit_io_irq_async` + `NvmeRequest`, see §3), so the
+names above are history, not the current API.
 
 **Remainders (not this change):**
 
-- True concurrent async I/O still needs a per-queue CID waiter
-  table + routing `BlockDevice::submit` through
-  `submit_io_irq_async` — all gated on the
-  `InstalledController` request-gate → async-Mutex migration,
-  since the gate serialises the whole controller today and no
-  second submitter can exist to wait.
-- A multi-submitter smoke belongs with that migration, not
-  here: through the gate it would only prove sequential
-  submits, not concurrency.
+- None of the above remains: the per-queue CID waiter table is
+  the per-tag `CmdSlot` + waker, `BlockDevice::submit` already
+  routes through the gate-free `NvmeRequest` future, and the
+  multi-submitter smoke already exists —
+  `smoke_nvme_mq_concurrent_requests_overlap_qemu` (16
+  concurrent reads through the block path, peak in flight ≥ 2,
+  batch faster than serial) and
+  `smoke_nvme_mq_concurrent_integrity_qemu` (`tests_mq.rs`).
+  The request-gate → async-Mutex migration was bypassed, not
+  completed: the gate is still taken on the slow paths, and the
+  no-data paths (Trim / WriteZeroes) still take the gate-held
+  paths (#927) — that is the remaining serialisation, not the
+  data path. The one-at-a-time limit now applies only to the
+  `&mut Controller` helper `submit_io_irq_async` (smokes), by
+  its borrow — not to production I/O.
