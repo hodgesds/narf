@@ -137,6 +137,22 @@ pub fn spawn_user(
     spec: TaskSpec,
     address_space: Arc<AddressSpace>,
 ) -> TaskId;
+/// System-wide task admission (Linux `kernel/fork.c` `max_threads`, the
+/// `kernel.threads-max` sysctl). `init` calls `fork_init`, which sizes it
+/// from managed RAM as `set_max_threads` does: the tasks' kernel stacks
+/// (`stackful::DEFAULT_KERNEL_STACK_BYTES` each) take at most an eighth of
+/// it, clamped to [MIN_THREADS, MAX_THREADS]. fork/clone refuse with EAGAIN
+/// while `live_user_task_count() >= max_threads()`, for every uid. There is
+/// no fixed task count; init's RLIMIT_NPROC is `boot_max_threads() / 2`.
+pub const MAX_THREADS: usize = 0x3fff_ffff; // FUTEX_TID_MASK
+pub const MIN_THREADS: usize = 20;
+pub fn threads_for_ram(ram_bytes: u64) -> usize;
+pub fn fork_init();
+pub fn max_threads() -> usize;
+pub fn boot_max_threads() -> usize;
+pub fn set_max_threads(threads: usize) -> Result<(), ThreadsMaxOutOfRange>; // [1, MAX_THREADS]
+pub fn live_user_task_count() -> usize;
+pub fn user_nproc_available() -> bool; // live_user_task_count() < max_threads()
 pub fn yield_now() -> impl Future<Output=()>;
 /// Handle sched_yield for the current own-stack task; an eligible local peer
 /// may use the bounded direct-transfer path; false selects fallback.

@@ -12632,9 +12632,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         }
     };
 
-    // Per-uid RLIMIT_NPROC. The global live-task cap below bounds the whole
+    // Per-uid RLIMIT_NPROC. kernel.threads-max below bounds the whole
     // MACHINE; this bounds ONE user, so a single unprivileged account cannot
-    // consume every slot that cap allows.
+    // consume every task that bound allows.
     //
     // Ahead of the address-space work on purpose: `copy_process` runs
     // `copy_creds` — and this check — long before `copy_mm`, so a process
@@ -12645,16 +12645,16 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
-    // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — threads
-    // included; a SCHED_DEADLINE reservation cannot be duplicated.
-    if sched_fork_denied(current_task_id()) {
+    // `copy_process`: `if (data_race(nr_threads >= max_threads)) return
+    // -EAGAIN;` — kernel.threads-max, threads included (every clone mints a
+    // user task), binding every uid, root included.
+    if !narf_scheduler::user_nproc_available() {
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
-
-    // Fork-bomb guard (also covers pthread/thread storms — every clone mints a
-    // user task). EAGAIN at the live-task cap, matching clone(2)/fork(2).
-    if !narf_scheduler::user_nproc_available() {
+    // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — threads
+    // included; a SCHED_DEADLINE reservation cannot be duplicated.
+    if sched_fork_denied(current_task_id()) {
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
@@ -18907,6 +18907,15 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
         cur: 8 * 1024 * 1024,
         max: 8 * 1024 * 1024,
     };
+    // RLIMIT_NPROC = 6. `kernel/fork.c::fork_init` gives init
+    // `max_threads / 2`, soft and hard, from the RAM-derived `max_threads`:
+    // one user may hold at most half the tasks the machine is sized for.
+    // Infinity left every non-root fork bomb to the system-wide bound.
+    let nproc = (narf_scheduler::boot_max_threads() / 2) as u64;
+    t[RLIMIT_NPROC] = RLimitPair {
+        cur: nproc,
+        max: nproc,
+    };
     t
 }
 
@@ -19369,8 +19378,8 @@ fn nproc_over_limit(task: u64, uid: u32, extra: u64) -> bool {
 ///
 /// The exemptions are the whole reason a fork bomb from root is a
 /// different problem from one by a user: uid 0 (`INIT_USER`) is never
-/// refused here, and neither is a task holding either capability. The
-/// global live-task cap, which this sits beside, is what covers root.
+/// refused here, and neither is a task holding either capability.
+/// kernel.threads-max, which this sits beside, is what covers root.
 pub(crate) fn nproc_fork_would_exceed(task: u64) -> bool {
     let uid = read_uidgid(task).uid;
     if uid == 0 {

@@ -3583,8 +3583,19 @@ const RLIMIT_NPROC_RES: u64 = 6;
 #[cfg(target_arch = "x86_64")]
 const NOCHANGE_ID: u64 = u64::MAX;
 
+/// Set the RLIMIT_NPROC soft limit, keeping the hard one: the default hard
+/// limit is finite (`max_threads / 2`), and a task that dropped privilege
+/// may not raise it.
 fn set_nproc_limit(cur: u64) -> Result<(), &'static str> {
-    let pair = [cur, u64::MAX];
+    let mut pair = [0u64; 2];
+    if call(
+        Syscall::Getrlimit.raw(),
+        a1(RLIMIT_NPROC_RES, pair.as_mut_ptr() as u64),
+    ) != Some(0)
+    {
+        return Err("could not read RLIMIT_NPROC");
+    }
+    pair[0] = cur;
     match call(
         Syscall::Setrlimit.raw(),
         a1(RLIMIT_NPROC_RES, pair.as_ptr() as u64),
