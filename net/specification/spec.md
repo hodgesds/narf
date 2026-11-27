@@ -1388,7 +1388,12 @@ dropped; every counter reader folds them into the interface totals. A
 receive path that keeps an `iface::RxHandle` (as a driver holds its
 `net_device`) gets its batches from `RxHandle::batch()`, which reads the
 registry only after a writer changed it (the registry's generation, bumped
-by every mutable borrow): a steady-state poll takes no global lock. `iface::on_native_rx_timestamped` remains for callers
+by every mutable borrow): a steady-state poll takes no global lock.
+`RxHandle::name()` is the name the handle resolves; a driver whose pumps
+start before probe publishes its netdev rebuilds the handle when its own
+name changes. A batch whose device has the empty (unpublished) name
+delivers nothing, as `publish::deliver_rx` does: no frame reaches the stack
+without its device. `iface::on_native_rx_timestamped` remains for callers
 that deliver single frames by name.
 
 IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,
