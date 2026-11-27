@@ -1393,10 +1393,14 @@ pub fn compute_mst(
     if hdisplay == 0 || clock == 0 {
         return Err(DscRefusal::NoBppRange);
     }
-    let (_, pipe_max) = pipe_bpp_limits(dpcd, max_bpp.min(PIPE_BPP)).ok_or(DscRefusal::NoBppRange)?;
+    let (_, pipe_max) =
+        pipe_bpp_limits(dpcd, max_bpp.min(PIPE_BPP)).ok_or(DscRefusal::NoBppRange)?;
     // intel_dp_dsc_bpp_step_x16 for an MST connector: one whole bpp.
     let step = 16;
-    let min_x16 = round_up(SRC_MIN_COMPRESSED_BPP.max(SINK_MIN_COMPRESSED_BPP) * 16, step);
+    let min_x16 = round_up(
+        SRC_MIN_COMPRESSED_BPP.max(SINK_MIN_COMPRESSED_BPP) * 16,
+        step,
+    );
     let max_x16 = max_compressed_bpp_x16_step(dpcd, hdisplay, pipe_max, pipe_max * 16, step);
     if min_x16 == 0 || min_x16 > max_x16 {
         return Err(DscRefusal::NoBppRange);

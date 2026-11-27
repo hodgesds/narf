@@ -61,7 +61,10 @@ const PURGEABLE_STATE_DONTNEED: u32 = 1;
 /// One attribute to set (`args->type` and its union member).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Advice {
-    PreferredLoc { devmem_fd: u32, migration_policy: u16 },
+    PreferredLoc {
+        devmem_fd: u32,
+        migration_policy: u16,
+    },
     Atomic(u32),
     Pat(u8),
 }
@@ -173,7 +176,12 @@ fn bo_admits_atomic(object: &crate::intel_gpu_gem::GemObject, atomic: u32) -> bo
 /// Split `mappings` at `start` and `end` (`xe_vm_alloc_madvise_vma`) and
 /// give the parts inside a PAT index of `pat`. Returns whether any part
 /// changed (`skip_invalidation` false).
-fn advise_mappings(mappings: &mut Vec<VmMapping>, start: u64, end: u64, pat: u8) -> Result<bool, FsError> {
+fn advise_mappings(
+    mappings: &mut Vec<VmMapping>,
+    start: u64,
+    end: u64,
+    pat: u8,
+) -> Result<bool, FsError> {
     let mut changed = false;
     let mut next = Vec::new();
     next.try_reserve(mappings.len() + 2)
@@ -252,9 +260,7 @@ fn advise_mirrors(
         if vma.start < start {
             next.push(MirrorVma { end: start, ..vma });
         }
-        changed
-            .try_reserve(1)
-            .map_err(|_| FsError::OutOfMemory)?;
+        changed.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
         changed.push((inside.start, inside.end));
         next.push(inside);
         if vma.end > end {

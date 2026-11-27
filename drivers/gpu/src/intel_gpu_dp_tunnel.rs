@@ -324,7 +324,9 @@ impl Tunnel {
         if gr == 0 {
             return bw;
         }
-        bw.div_ceil(gr).saturating_mul(gr).min(MAX_DP_REQUEST_BW * gr)
+        bw.div_ceil(gr)
+            .saturating_mul(gr)
+            .min(MAX_DP_REQUEST_BW * gr)
     }
 
     /// `drm_dp_tunnel_atomic_check_stream_bws` for this tunnel's one-tunnel
@@ -341,7 +343,8 @@ impl Tunnel {
         }
         let gr = self.granularity.max(1);
         let group_bw = required.div_ceil(gr).saturating_mul(gr).min(max_dprx_bw);
-        self.available_bw.is_some_and(|available| group_bw <= available)
+        self.available_bw
+            .is_some_and(|available| group_bw <= available)
     }
 
     /// `intel_dp_tunnel_uhbr_lanes_wa_setup`: with BW allocation enabled and

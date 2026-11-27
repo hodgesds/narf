@@ -2283,8 +2283,13 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         // The rebound tables are published before GuC reads
                         // the request (xe_device_wmb).
                         fence(Ordering::SeqCst);
-                        match ct.send(0, crate::intel_gpu_ggtt_tlb::ACTION, 0, &inval.payload, true)
-                        {
+                        match ct.send(
+                            0,
+                            crate::intel_gpu_ggtt_tlb::ACTION,
+                            0,
+                            &inval.payload,
+                            true,
+                        ) {
                             Ok(()) => {
                                 inval.sent = Some(
                                     now.checked_add(crate::intel_gpu_ggtt_tlb::TIMEOUT_NS)
@@ -2338,7 +2343,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
             let mappings = resolution.result.as_deref().unwrap_or(&[]);
             let start = mappings.iter().map(|m| m.va).min().unwrap_or(0);
-            let end = mappings.iter().map(|m| m.va + m.length).max().unwrap_or(start);
+            let end = mappings
+                .iter()
+                .map(|m| m.va + m.length)
+                .max()
+                .unwrap_or(start);
             faults.inval = Some(FaultInval {
                 seqno: candidate,
                 payload: crate::intel_gpu_xe_usm::ppgtt_invalidation(
@@ -2438,7 +2447,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
         // xe_guc_pagefault_handler: a malformed descriptor (-EPROTO) or a
         // full queue (-ENOSPC) kills Linux's CT; here it loses the GT, as
         // does a fault on a GuC without the service.
-        if u32::from(action) == crate::intel_gpu_xe_vm::svm::guc::ACTION_REPORT_PAGE_FAULT_REQ_DESC {
+        if u32::from(action) == crate::intel_gpu_xe_vm::svm::guc::ACTION_REPORT_PAGE_FAULT_REQ_DESC
+        {
             let faults = self
                 .faults
                 .as_ref()

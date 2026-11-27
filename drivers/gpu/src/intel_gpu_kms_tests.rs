@@ -1511,7 +1511,11 @@ fn smoke_kms_vblank_wait_takes_the_interrupt_owners_vblank() -> TestResult {
     let mut guard = complete(device.session()).unwrap();
     let mut call = Box::pin(guard.wait_vblank());
     assert!(once(call.as_mut()).is_pending());
-    assert_eq!(platform.0.lock().vblank_refs, 1, "the wait holds a reference");
+    assert_eq!(
+        platform.0.lock().vblank_refs,
+        1,
+        "the wait holds a reference"
+    );
     // The first tick: FRAME 40 -> 41 at now = 1000 + 250_000.
     assert_eq!(
         complete(call),
@@ -2136,6 +2140,8 @@ kernel_test_in!(
 
 #[path = "intel_gpu_color_kms_tests.rs"]
 mod color;
+#[path = "intel_gpu_gen12_legacy_kms_tests.rs"]
+mod gen12_legacy;
 #[cfg(target_arch = "x86_64")]
 #[path = "intel_gpu_kms_multipipe_tests.rs"]
 mod multipipe;
@@ -2144,5 +2150,3 @@ mod multipipe;
 mod psr;
 #[path = "intel_gpu_xe2lpd_kms_tests.rs"]
 mod xe2lpd;
-#[path = "intel_gpu_gen12_legacy_kms_tests.rs"]
-mod gen12_legacy;

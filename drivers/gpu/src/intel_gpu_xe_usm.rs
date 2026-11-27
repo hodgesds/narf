@@ -42,11 +42,11 @@
 //!   arena hands out discontiguous host frames, so its ADS has no
 //!   `um_init_data` and no hardware fault reaches this queue: every path
 //!   below runs, and is checked, against the native GuC model.
+use crate::intel_gpu_exec::VmMapping;
 use crate::intel_gpu_xe_vm::{
     svm::{self, guc::PageFault},
     Vm,
 };
-use crate::intel_gpu_exec::VmMapping;
 use alloc::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Weak},
@@ -260,7 +260,6 @@ impl Usm {
     pub(crate) fn pop_resolved(&self) -> Option<Resolution> {
         self.queue.lock().resolved.pop_front()
     }
-
 
     /// Wait until a fault is queued.
     fn queued_fault(&self) -> QueuedFault<'_> {

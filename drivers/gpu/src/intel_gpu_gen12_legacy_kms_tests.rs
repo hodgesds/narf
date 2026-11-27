@@ -16,9 +16,9 @@ use super::*;
 fn gen12_system_ptes(mappings: &[(u64, u32)], platform: &MockPlatform) -> bool {
     let low: Vec<_> = mappings.iter().filter(|(r, _)| r % 8 == 0).collect();
     low.len() == 2
-        && low.iter().all(|&&(register, pte)| {
-            pte & 0xfff == 1 && platform.read32(register + 4) & !0x7f == 0
-        })
+        && low
+            .iter()
+            .all(|&&(register, pte)| pte & 0xfff == 1 && platform.read32(register + 4) & !0x7f == 0)
 }
 
 /// With `narf.intel.rkl_edp=1` the Rocket Lake panel's Pipe A primary flips

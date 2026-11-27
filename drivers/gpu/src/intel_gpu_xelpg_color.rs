@@ -327,7 +327,9 @@ pub struct DfpLimits {
 /// `is_edid_digital_input_dp`: an EDID 1.4 digital DisplayPort input.
 fn edid_digital_input_dp(edid: &[u8]) -> bool {
     edid.get(19).is_some_and(|&rev| rev >= 4)
-        && edid.get(20).is_some_and(|&input| input & 0x80 != 0 && input & 7 == 5)
+        && edid
+            .get(20)
+            .is_some_and(|&input| input & 0x80 != 0 && input & 7 == 5)
 }
 
 /// The `drm_dp_downstream_*` limits of downstream port 0 (`port_cap`) for
@@ -521,13 +523,12 @@ fn output_for(dpcd: &[u8], dfp: DfpCaps, edid: &[u8], sink_420: bool) -> DpOutpu
         (true, false, true) => (true, false),
         (true, false, false) => (false, true),
     };
-    let pcon = (branch && dpcd.get(DP_DPCD_REV).is_some_and(|&rev| rev >= 0x13)).then(|| {
-        PconConfig {
+    let pcon =
+        (branch && dpcd.get(DP_DPCD_REV).is_some_and(|&rev| rev >= 0x13)).then(|| PconConfig {
             hdmi_sink: crate::intel_gpu_hdmi::is_hdmi_sink(edid),
             ycbcr444_to_420: sink_420 && !ycbcr420,
             rgb_to_ycbcr: sink_420 && !ycbcr420 && !ycbcr444,
-        }
-    });
+        });
     DpOutput {
         ycbcr444,
         ycbcr420,

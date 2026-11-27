@@ -1055,7 +1055,8 @@ fn smoke_uhbr_mst_dsc_link_math() -> TestResult {
     let fits = |bpp: u32, slices: u8| mst_dsc_stream(r, 1, &uhd60, bpp, slices, true).is_some();
     match compute_mst(&sink(true, true), &uhd60, 24, 1_000_000, 1, &fits) {
         Ok(p)
-            if (p.link_rate, p.lanes, p.pipe_bpp, p.compressed_bpp_x16) == (1_000_000, 1, 24, 256)
+            if (p.link_rate, p.lanes, p.pipe_bpp, p.compressed_bpp_x16)
+                == (1_000_000, 1, 24, 256)
                 && (p.slice_count, p.num_streams, p.fec) == (2, 2, false) => {}
         _ => return TestResult::Fail("the MST walk lands on 16 bpp in two slices"),
     }
@@ -1068,4 +1069,7 @@ fn smoke_uhbr_mst_dsc_link_math() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/intel_gpu_dp_uhbr", smoke_uhbr_mst_dsc_link_math);
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_mst_dsc_link_math
+);

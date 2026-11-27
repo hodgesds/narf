@@ -96,11 +96,13 @@ fn smoke_mei_hdcp_component_match() -> TestResult {
     // later use the GSC.
     if hdcp::HDCP_HECI_IDS
         != [
-            0xA0E0, 0x43E0, 0x7AE8, 0x7A60, 0x51E0, 0x54E0, 0x7A68, 0xA360, 0x02E0, 0x06E0,
-            0x9D3A, 0xA13A, 0xA2BA, 0x9DE0, 0x34E0, 0x38E0, 0x4DE0, 0x4B70,
+            0xA0E0, 0x43E0, 0x7AE8, 0x7A60, 0x51E0, 0x54E0, 0x7A68, 0xA360, 0x02E0, 0x06E0, 0x9D3A,
+            0xA13A, 0xA2BA, 0x9DE0, 0x34E0, 0x38E0, 0x4DE0, 0x4B70,
         ]
     {
-        return TestResult::Fail("HDCP HECI ids differ from TGP / ADP / RPL / CNP / CMP / SPT / KBP / ICP / JSP / MCC");
+        return TestResult::Fail(
+            "HDCP HECI ids differ from TGP / ADP / RPL / CNP / CMP / SPT / KBP / ICP / JSP / MCC",
+        );
     }
     // Every one is claimed by the MEI driver once the option is on, the
     // display 9-11 ones only then.
@@ -317,4 +319,7 @@ fn smoke_mei_hdcp_binds_on_display9_11_pchs() -> TestResult {
     registry::__reset_for_test();
     r
 }
-kernel_test_in!("drivers/platform/mei", smoke_mei_hdcp_binds_on_display9_11_pchs);
+kernel_test_in!(
+    "drivers/platform/mei",
+    smoke_mei_hdcp_binds_on_display9_11_pchs
+);

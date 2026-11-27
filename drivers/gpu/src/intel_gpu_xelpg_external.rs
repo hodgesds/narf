@@ -1662,10 +1662,7 @@ fn uhbr_mst_link_with<A: crate::dp_aux::AuxChannel + ?Sized>(
     // UHBR configurations.
     let (mut limits, lane_mask) = match tunnel {
         Some(t) => (
-            dsc::LinkLimits::standard(
-                t.max_dprx_rate.min(810_000),
-                tc_lanes.min(t.max_dprx_lanes),
-            ),
+            dsc::LinkLimits::standard(t.max_dprx_rate.min(810_000), tc_lanes.min(t.max_dprx_lanes)),
             t.uhbr_lane_mask(),
         ),
         None => {
@@ -1771,7 +1768,8 @@ pub(crate) fn group_available_bw(sibling: &tunnel::Tunnel, new: &tunnel::Tunnel)
 fn max_dprx_bw(t: &tunnel::Tunnel) -> u64 {
     let g = u64::from(t.granularity.max(1));
     let rate = tunnel::max_dprx_data_rate(t.max_dprx_rate, u32::from(t.max_dprx_lanes));
-    rate.next_multiple_of(g).min(u64::from(tunnel::MAX_DP_REQUEST_BW) * g)
+    rate.next_multiple_of(g)
+        .min(u64::from(tunnel::MAX_DP_REQUEST_BW) * g)
 }
 
 /// `drm_dp_tunnel_atomic_check_group_bw` over the two tunnels of one group,
@@ -1786,7 +1784,9 @@ pub(crate) fn group_bw_fits(streams: [(&tunnel::Tunnel, u32); 2], available: u32
         if required > max {
             return false;
         }
-        group += required.next_multiple_of(u64::from(t.granularity.max(1))).min(max);
+        group += required
+            .next_multiple_of(u64::from(t.granularity.max(1)))
+            .min(max);
     }
     group <= u64::from(available)
 }
@@ -1823,8 +1823,7 @@ fn tunnel_group_admits(
         u32::from(plan.max_bpp),
         Some(u64::from(available)),
     );
-    if first != uhbr::WideLink::Uhbr(plan.link)
-        || !group_bw_fits([(&t1, s1), (&t2, s2)], available)
+    if first != uhbr::WideLink::Uhbr(plan.link) || !group_bw_fits([(&t1, s1), (&t2, s2)], available)
     {
         return Err(SecondRouteRefusal::TunnelGroupBw);
     }
@@ -1869,14 +1868,7 @@ fn tunnel_alloc<M: MmioWindow + ?Sized>(
     } else {
         tunnel::enable_bw_alloc(&mut aux, &mut t)
     }
-    .and_then(|()| {
-        tunnel::alloc_bw(
-            &mut aux,
-            &mut uhbr::SystemClock,
-            &mut t,
-            required,
-        )
-    });
+    .and_then(|()| tunnel::alloc_bw(&mut aux, &mut uhbr::SystemClock, &mut t, required));
     plan.tunnel = Some(t);
     route.probe.uhbr = Some(alloc::boxed::Box::new(plan));
     result.map_err(|e| ExternalError::Uhbr(uhbr::UhbrRefusal::Tunnel(e)))
@@ -1947,8 +1939,13 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         Default::default()
     };
     let mut output = if ext {
-        let mut output =
-            color::dp_output(&raw, dfp, dfp_limits.min_tmds_clock, &edid[..edid_len], &mode);
+        let mut output = color::dp_output(
+            &raw,
+            dfp,
+            dfp_limits.min_tmds_clock,
+            &edid[..edid_len],
+            &mode,
+        );
         output.dprx = color::read_dprx_feature_enum(&mut aux);
         output
     } else {
@@ -2070,9 +2067,8 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     if uhbr_plan.is_some() {
         // The 128b/132b link above is Linux's choice.
     } else if output.ycbcr420 {
-        let link = color::output_link(&limits, &mode, deep_bpp, &output).ok_or_else(|| {
-            rollback(ExternalError::Color(color::ColorRefusal::Ycbcr420Link))
-        })?;
+        let link = color::output_link(&limits, &mode, deep_bpp, &output)
+            .ok_or_else(|| rollback(ExternalError::Color(color::ColorRefusal::Ycbcr420Link)))?;
         negotiated = ycbcr_link(link, &output)
             .ok_or_else(|| rollback(ExternalError::Dsc(DscRefusal::LinkRateUnqualified)))?;
         pipe_bpp = link.pipe_bpp;
@@ -2466,12 +2462,22 @@ fn uhbr_dsc_fallback(
     caps: uhbr::LinkCaps,
     cap: Option<u64>,
 ) -> Option<MtlSinkProbe> {
-    let d = plan.dsc_sink.filter(|d| d.dsc.dpcd.supports_dsc() && !d.branch)?;
+    let d = plan
+        .dsc_sink
+        .filter(|d| d.dsc.dpcd.supports_dsc() && !d.branch)?;
     let mode = probe.mode;
     let display14 = probe.display_ip == DisplayIp::Xelpdp;
     let limits = caps.limits_8b10b();
-    let found = uhbr_dsc_search(&d, &limits, &caps, &mode, u32::from(plan.max_bpp), cap, display14)
-        .ok()?;
+    let found = uhbr_dsc_search(
+        &d,
+        &limits,
+        &caps,
+        &mode,
+        u32::from(plan.max_bpp),
+        cap,
+        display14,
+    )
+    .ok()?;
     let mut next = probe.clone();
     next.pipe_bpp = found.pipe_bpp;
     next.dsc = Some(found);
@@ -4867,9 +4873,7 @@ impl MtlExternalService {
         // route's tunnel ([`mst_tunnel_group_admits`]): refused typed, the
         // tunnel handed back to its legacy allocation.
         if let Some(mut t) = mst_uhbr.and_then(|u| u.tunnel) {
-            let sibling = self.routes[1 - slot]
-                .as_ref()
-                .and_then(MtlRoute::bw_tunnel);
+            let sibling = self.routes[1 - slot].as_ref().and_then(MtlRoute::bw_tunnel);
             if mst_tunnel_group_admits(Some(t), sibling).is_err() {
                 {
                     let mut aux = link.aux(io);
@@ -4893,15 +4897,7 @@ impl MtlExternalService {
             // levels under narf.intel.uhbr=1 only.
             let mut decl = self.policy.decl(port);
             decl.dp14_vspeo = decl.dp14_vspeo.filter(|_| uhbr_on);
-            match MtlMstRoute::connect(
-                io,
-                link,
-                decl,
-                &self.display,
-                alloc,
-                mst_uhbr,
-                beside,
-            ) {
+            match MtlMstRoute::connect(io, link, decl, &self.display, alloc, mst_uhbr, beside) {
                 Ok(route) => {
                     let (pipe, mode, fb) = route.first().expect("live MST has a first stream");
                     self.hold(slot, MtlRoute::Mst(route));

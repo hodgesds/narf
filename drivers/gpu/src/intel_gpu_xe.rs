@@ -608,12 +608,13 @@ impl XeFile {
                 // service (gpusvm->mm).
                 let mirror = (fault && crate::intel_gpu_xe_vm::svm::admitted(info))
                     .then(|| {
-                        user.address_space_identity()
-                            .map(|space| crate::intel_gpu_xe_vm::svm::Mirror {
+                        user.address_space_identity().map(|space| {
+                            crate::intel_gpu_xe_vm::svm::Mirror {
                                 space,
                                 remote: user.remote_mm(),
                                 discrete: info.platform.is_discrete(),
-                            })
+                            }
+                        })
                     })
                     .flatten();
                 let vm = Vm::with_svm(

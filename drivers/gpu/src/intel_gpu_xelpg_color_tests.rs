@@ -332,8 +332,7 @@ pub(crate) const DP_420_ALSO_BLOCKS: [u8; 5] = [(2 << 5) | 1, 97, (7 << 5) | 2, 
 ///   4:2:0 sink format only as the second try; a 4:2:0-only mode never
 ///   offers it.
 fn smoke_xelpg_dp_ycbcr420_link_msa_vsc() -> TestResult {
-    let mode = match crate::intel_gpu_dp::mode_from_edid(&edid_4k60_with(&HDMI_420_ONLY_BLOCKS))
-    {
+    let mode = match crate::intel_gpu_dp::mode_from_edid(&edid_4k60_with(&HDMI_420_ONLY_BLOCKS)) {
         Ok(mode) => mode,
         Err(_) => return TestResult::Fail("the 4K60 EDID must give its preferred mode"),
     };

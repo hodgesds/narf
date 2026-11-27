@@ -129,7 +129,11 @@ fn timing_1080() -> crate::intel_gpu_dsb::Timing {
 /// 01 and zeros, between the enable off and VSC_HSW (bit 20) |
 /// VSC_DIP_HW_DATA_SW_HEA (2 << 25).
 fn vsc_writes(base: u64) -> Vec<(u64, u32)> {
-    let mut writes = alloc::vec![(base + 0x200, 0), (base + 0x320, 0x1006_0700), (base + 0x324, 0x0100_0001)];
+    let mut writes = alloc::vec![
+        (base + 0x200, 0),
+        (base + 0x320, 0x1006_0700),
+        (base + 0x324, 0x0100_0001)
+    ];
     for i in 2..9 {
         writes.push((base + 0x320 + 4 * i, 0));
     }
@@ -241,15 +245,16 @@ fn smoke_panel_replay_caps_and_compute_follow_linux() -> TestResult {
         },
         None,
     ) {
-        Ok(c) if c.pr_alpm_ctl == Some(0x11)
-            && c.as_sdp
-                == Some(AsSdp {
-                    mode: 1,
-                    vtotal: 1125,
-                    target_rr: 0,
-                    target_rr_divider: false,
-                    coasting_vtotal: 1125,
-                }) => {}
+        Ok(c)
+            if c.pr_alpm_ctl == Some(0x11)
+                && c.as_sdp
+                    == Some(AsSdp {
+                        mode: 1,
+                        vtotal: 1125,
+                        target_rr: 0,
+                        target_rr_divider: false,
+                        coasting_vtotal: 1125,
+                    }) => {}
         _ => return TestResult::Fail("an AS SDP sink must get Linux's AS SDP and PR_ALPM_CTL"),
     }
     let mut no_aux_less = edp_sink();
@@ -355,9 +360,7 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     // dg2_activate_panel_replay: EDP_PSR2_CTL = LNL_EDP_PSR2_SU_REGION_ET_
     // ENABLE (bit 27; no SDP line), PSR2_MAN_TRK_CTL continuous full frame,
     // TRANS_DP2_CTL(A) PR on.
-    if regs.log() != [(0x60900, 1 << 27), (0x60910, 1 << 13), (0x600a0, 1 << 30)]
-        || !pr.active()
-    {
+    if regs.log() != [(0x60900, 1 << 27), (0x60910, 1 << 13), (0x600a0, 1 << 30)] || !pr.active() {
         return TestResult::Fail("activation must write PSR2_CTL, MAN_TRK and TRANS_DP2_CTL");
     }
     // Exit before a frame change, then the SU of a damaged band.
@@ -544,7 +547,18 @@ fn smoke_panel_replay_as_sdp_follows_intel_dp() -> TestResult {
     };
     let as_sdp = words(pack_as_sdp(&as_sdp_fixed(1125, true)));
     let no_coast = words(pack_as_sdp(&as_sdp_fixed(1125, false)));
-    if as_sdp != [0x0902_2200, 0x0004_6501, 0x6500_0000, 0x0000_0004, 0, 0, 0, 0, 0]
+    if as_sdp
+        != [
+            0x0902_2200,
+            0x0004_6501,
+            0x6500_0000,
+            0x0000_0004,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
         || no_coast != [0x0902_2200, 0x0004_6501, 0, 0, 0, 0, 0, 0, 0]
     {
         return TestResult::Fail("the AS SDP must pack as intel_dp_as_sdp_pack does");

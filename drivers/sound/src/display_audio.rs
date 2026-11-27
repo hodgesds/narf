@@ -920,7 +920,12 @@ pub mod tests {
         fn get_cdclk_freq(&self) -> Result<u32, ComponentError> {
             Err(ComponentError::NoDevice)
         }
-        fn sync_audio_rate(&self, _port: i32, _pipe: i32, _rate: u32) -> Result<(), ComponentError> {
+        fn sync_audio_rate(
+            &self,
+            _port: i32,
+            _pipe: i32,
+            _rate: u32,
+        ) -> Result<(), ComponentError> {
             Err(ComponentError::NoDevice)
         }
         fn get_eld(

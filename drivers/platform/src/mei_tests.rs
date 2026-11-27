@@ -954,11 +954,15 @@ fn smoke_mei_display9_11_pch_ids_and_fw_sku_quirks() -> TestResult {
     }
     for (did, _) in gated {
         if mei::is_supported_device(did) || mei::claims(did, false) || !mei::claims(did, true) {
-            return TestResult::Fail("display 9-11 HECI-1 claimed without, or not with, the option");
+            return TestResult::Fail(
+                "display 9-11 HECI-1 claimed without, or not with, the option",
+            );
         }
     }
     // SPT_2, SPT_3 (iTouch), SPT_H_2, KBP_2, KBP_3, CNP_LP_3, ICP_LP_3, MCC_4.
-    for did in [0x9D3B, 0x9D3E, 0xA13B, 0xA2BB, 0xA2BE, 0x9DE4, 0x34E4, 0x4B75] {
+    for did in [
+        0x9D3B, 0x9D3E, 0xA13B, 0xA2BB, 0xA2BE, 0x9DE4, 0x34E4, 0x4B75,
+    ] {
         if mei::claims(did, true) {
             return TestResult::Fail("a second HECI or iTouch function claimed");
         }
@@ -1015,8 +1019,18 @@ fn smoke_mei_display9_11_pch_ids_and_fw_sku_quirks() -> TestResult {
         (Q::None, 0x000f_0000, 0x60, false),
         // A failed read is `PCI_ERROR_RESPONSE`: SPS opmode, but neither
         // the IGN nor the SPS SKU.
-        (Q::Sps4, mei::PCI_ERROR_RESPONSE, mei::PCI_ERROR_RESPONSE, true),
-        (Q::SpsIgn, mei::PCI_ERROR_RESPONSE, mei::PCI_ERROR_RESPONSE, false),
+        (
+            Q::Sps4,
+            mei::PCI_ERROR_RESPONSE,
+            mei::PCI_ERROR_RESPONSE,
+            true,
+        ),
+        (
+            Q::SpsIgn,
+            mei::PCI_ERROR_RESPONSE,
+            mei::PCI_ERROR_RESPONSE,
+            false,
+        ),
     ];
     if cases
         .iter()

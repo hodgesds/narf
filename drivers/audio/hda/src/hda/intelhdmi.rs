@@ -255,8 +255,7 @@ pub(super) fn i915_init(
     upstream: &dyn Fn(&BusDevice) -> Option<BusDevice>,
     bound: bool,
 ) -> I915Init {
-    if !i915_component(hdac.id.vendor, hdac.id.device)
-        || !i915_gfx_present(hdac, devices, upstream)
+    if !i915_component(hdac.id.vendor, hdac.id.device) || !i915_gfx_present(hdac, devices, upstream)
     {
         I915Init::Without
     } else if bound {
@@ -500,7 +499,12 @@ impl IntelHda {
     /// `pin2port`; the monitor is present when the display reports audio
     /// enabled, and the ELD is valid when it has a size, parses and carries
     /// a SAD.
-    fn intel_entry_eld(&self, graph: &Codec, pin: u8, dev_id: u8) -> (bool, Option<super::hdmi::Sink>) {
+    fn intel_entry_eld(
+        &self,
+        graph: &Codec,
+        pin: u8,
+        dev_id: u8,
+    ) -> (bool, Option<super::hdmi::Sink>) {
         let mut buf = [0u8; ELD_MAX_SIZE];
         let codec = IntelPin {
             model: hda_codec::intel_hdmi_model(graph),

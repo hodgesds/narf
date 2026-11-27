@@ -359,7 +359,9 @@ impl MtlMstRoute {
                         (None, Some((rate, lanes)))
                     }
                 };
-                self.streams_at(io, &decl, display, alloc, aux, uhbr, forced, &sinks, &ledger)
+                self.streams_at(
+                    io, &decl, display, alloc, aux, uhbr, forced, &sinks, &ledger,
+                )
             }
             (result, _) => result,
         }
@@ -783,11 +785,7 @@ fn tunnel_alloc<M: MmioWindow + ?Sized>(
 /// The tunnel handed back with the link: the streams' allocation freed and
 /// BW allocation disabled (`drm_dp_tunnel_disable_bw_alloc`), as the SST
 /// route's stop. Best effort, as the hub may be gone.
-fn tunnel_off<M: MmioWindow + ?Sized>(
-    io: &M,
-    link: LinkProbe,
-    found: &mut Option<tunnel::Tunnel>,
-) {
+fn tunnel_off<M: MmioWindow + ?Sized>(io: &M, link: LinkProbe, found: &mut Option<tunnel::Tunnel>) {
     let Some(mut t) = found.take() else {
         return;
     };
@@ -1161,7 +1159,14 @@ pub(super) mod tests {
                     aux,
                 )
             } else {
-                MtlMstRoute::connect_aux(io, link, MtlPortDecl::USB_C, &MtlDisplay::NONE, alloc, aux)
+                MtlMstRoute::connect_aux(
+                    io,
+                    link,
+                    MtlPortDecl::USB_C,
+                    &MtlDisplay::NONE,
+                    alloc,
+                    aux,
+                )
             };
             owner.ok()
         };
@@ -1778,7 +1783,12 @@ pub(super) mod tests {
             if owner.stream_count() != streams
                 || owner.streams.iter().any(|s| {
                     s.route.probe.uhbr.as_deref().map(|p| {
-                        (p.link.pipe_bpp, p.stream.tu, p.stream.m_n, p.tunnel.is_none())
+                        (
+                            p.link.pipe_bpp,
+                            p.stream.tu,
+                            p.stream.m_n,
+                            p.tunnel.is_none(),
+                        )
                     }) != Some((bpp, tu, mn, true))
                 })
             {

@@ -381,7 +381,11 @@ fn smoke_ext_replay_display30_route_lifecycle() -> TestResult {
         return TestResult::Fail("the fixture must light the display-30 panel");
     };
     if !matches!(
-        service.handle(&io, tc2(MtlHpdKind::Connected(LiveMode::DpAlt)), &mut fb_for),
+        service.handle(
+            &io,
+            tc2(MtlHpdKind::Connected(LiveMode::DpAlt)),
+            &mut fb_for
+        ),
         ServiceOutcome::Activated { .. }
     ) {
         return TestResult::Fail("the TC2 route must light on Pipe B");
@@ -465,9 +469,21 @@ fn smoke_ext_replay_refusals_leave_the_route_lit() -> TestResult {
     use crate::intel_gpu_psr::panel_replay::Refusal;
     let cases = [
         (DisplayIp::Xe3Lpd, false, true, Refusal::Disabled, false),
-        (DisplayIp::Xe3Lpd, true, false, Refusal::NoSinkSupport, false),
+        (
+            DisplayIp::Xe3Lpd,
+            true,
+            false,
+            Refusal::NoSinkSupport,
+            false,
+        ),
         (DisplayIp::Xelpdp, true, true, Refusal::WmLevelUnknown, true),
-        (DisplayIp::Xe2Lpd, true, true, Refusal::SetContextLatency, true),
+        (
+            DisplayIp::Xe2Lpd,
+            true,
+            true,
+            Refusal::SetContextLatency,
+            true,
+        ),
     ];
     for (ip, option, sink_replay, refusal, pretrain) in cases {
         let io = route_fake(sink_replay);
@@ -475,7 +491,11 @@ fn smoke_ext_replay_refusals_leave_the_route_lit() -> TestResult {
             return TestResult::Fail("the fixture must light the panel");
         };
         if !matches!(
-            service.handle(&io, tc2(MtlHpdKind::Connected(LiveMode::DpAlt)), &mut fb_for),
+            service.handle(
+                &io,
+                tc2(MtlHpdKind::Connected(LiveMode::DpAlt)),
+                &mut fb_for
+            ),
             ServiceOutcome::Activated { .. }
         ) {
             return TestResult::Fail("the route must light without replay");
@@ -513,7 +533,11 @@ fn smoke_ext_replay_display30_sends_the_as_sdp() -> TestResult {
     let Some(mut service) = service_on(&io, DisplayIp::Xe3Lpd, true) else {
         return TestResult::Fail("the fixture must light the display-30 panel");
     };
-    let outcome = service.handle(&io, tc2(MtlHpdKind::Connected(LiveMode::DpAlt)), &mut fb_for);
+    let outcome = service.handle(
+        &io,
+        tc2(MtlHpdKind::Connected(LiveMode::DpAlt)),
+        &mut fb_for,
+    );
     let ServiceOutcome::Activated { mode, .. } = outcome else {
         return TestResult::Fail("the TC2 route must light");
     };
@@ -521,7 +545,17 @@ fn smoke_ext_replay_display30_sends_the_as_sdp() -> TestResult {
         return TestResult::Fail("the EDID must give the 806-line DMT vtotal");
     }
     // HB 00 22 02 09; DB0 = 01 (FIXED_VTOTAL), DB1/2 = 26 03, DB7/8 = 26 03.
-    let want = [0x0902_2200, 0x0003_2601, 0x2600_0000, 0x0000_0003, 0, 0, 0, 0, 0];
+    let want = [
+        0x0902_2200,
+        0x0003_2601,
+        0x2600_0000,
+        0x0000_0003,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
     for (i, w) in want.iter().enumerate() {
         if io.writes_to(0x61484 + 4 * i as u64) != [*w] {
             return TestResult::Fail("the AS SDP must be Linux's packing at transcoder B");

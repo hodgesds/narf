@@ -654,7 +654,8 @@ impl GemObject {
             // TTM waits for the object's fences before the move; the NARF
             // eviction copy requires an idle object.
             self.wait_idle(true, None).await?;
-            self.evict_locked(backend, epoch, false, mapped_moves).await?;
+            self.evict_locked(backend, epoch, false, mapped_moves)
+                .await?;
         }
         self.prime.lock().pins += 1;
         Ok(())
@@ -688,7 +689,8 @@ impl GemObject {
             }
             let epoch = epoch.ok_or(FsError::NoDevice)?;
             self.wait_idle(true, None).await?;
-            self.evict_locked(backend, epoch, false, mapped_moves).await?;
+            self.evict_locked(backend, epoch, false, mapped_moves)
+                .await?;
         }
         Ok(placement)
     }
@@ -723,7 +725,8 @@ impl GemObject {
         // TTM waits for the object's fences before the move; the NARF
         // eviction copy requires an idle object.
         self.wait_idle(true, None).await?;
-        self.evict_locked(backend, epoch, false, mapped_moves).await?;
+        self.evict_locked(backend, epoch, false, mapped_moves)
+            .await?;
         Ok(true)
     }
     /// A suspend backup awaits [`Self::restore_pinned`]: until then the VRAM
@@ -1355,7 +1358,8 @@ impl GemObject {
         allow_scanout: bool,
     ) -> Result<u64, FsError> {
         let _migrating = self.migrating.lock().await;
-        self.evict_locked(backend, epoch, allow_scanout, false).await
+        self.evict_locked(backend, epoch, allow_scanout, false)
+            .await
     }
 
     /// [`Self::evict_to_system`] under the caller's `migrating` guard. A

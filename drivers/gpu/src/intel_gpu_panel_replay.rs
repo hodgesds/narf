@@ -801,7 +801,10 @@ pub(crate) fn compute(
     // intel_dp_compute_as_sdp, and on eDP (AUX-less ALPM with an AS SDP
     // sink) lnl_alpm_configure's PR_ALPM_CTL.
     let as_sdp = if stream.as_sdp_v2 {
-        Some(as_sdp_fixed(stream.timing.vtotal, caps.async_video_timing()))
+        Some(as_sdp_fixed(
+            stream.timing.vtotal,
+            caps.async_video_timing(),
+        ))
     } else {
         None
     };

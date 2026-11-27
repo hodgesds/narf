@@ -1477,7 +1477,12 @@ pub(crate) trait VblankIrq {
 
 impl VblankIrq for VblankRef {
     fn last(&self) -> Option<(u64, VblankStamp)> {
-        self.installed.controller.inner.lock().1.last_vblank(self.pipe)
+        self.installed
+            .controller
+            .inner
+            .lock()
+            .1
+            .last_vblank(self.pipe)
     }
 }
 
@@ -1627,7 +1632,9 @@ async fn service_task(installed: alloc::sync::Arc<Installed>) {
             let now = narf_time::monotonic_ns();
             let mut guard = installed.controller.inner.lock();
             let (io, core) = &mut *guard;
-            core.service(&*io, &MonitorHotplug, now, || display_access(&installed.bar))
+            core.service(&*io, &MonitorHotplug, now, || {
+                display_access(&installed.bar)
+            })
         };
         if let Ok(events) = &result {
             report_underruns(events.underruns);
@@ -1651,7 +1658,10 @@ fn report_underruns(pipes: u8) {
     for (i, name) in ['A', 'B', 'C'].into_iter().enumerate() {
         if pipes & (1 << i) != 0 {
             use core::fmt::Write as _;
-            let _ = writeln!(narf_console::Writer, "intel-gpu: CPU pipe {name} FIFO underrun");
+            let _ = writeln!(
+                narf_console::Writer,
+                "intel-gpu: CPU pipe {name} FIFO underrun"
+            );
         }
     }
 }
@@ -2694,7 +2704,11 @@ pub mod tests {
             Ok(events) if events.vblank == 1 && events.flip_done == 1 => {}
             _ => return TestResult::Fail("the vblank and the flip done are handled"),
         }
-        if core.take_flip_done(Pipe::A) != Some(VblankStamp { frame: 77, ns: 9_000 })
+        if core.take_flip_done(Pipe::A)
+            != Some(VblankStamp {
+                frame: 77,
+                ns: 9_000,
+            })
             || core.take_flip_done(Pipe::A).is_some()
         {
             return TestResult::Fail("the flip-done event carries that vblank, once");

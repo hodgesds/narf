@@ -635,8 +635,8 @@ impl HbmVersionResponse {
             return Some((HBM_MAJOR_VERSION, HBM_MINOR_VERSION));
         }
         let (major, minor) = (self.me_major, self.me_minor);
-        let supported = major < HBM_MAJOR_VERSION
-            || (major == HBM_MAJOR_VERSION && minor <= HBM_MINOR_VERSION);
+        let supported =
+            major < HBM_MAJOR_VERSION || (major == HBM_MAJOR_VERSION && minor <= HBM_MINOR_VERSION);
         if supported && major >= HBM_MAJOR_VERSION_DOT {
             Some((major, minor))
         } else {
@@ -2571,11 +2571,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // yields `PCI_ERROR_RESPONSE` there, as in Linux, not 0: all ones is
     // SPS opmode (refused) but neither the IGN nor the SPS SKU (bound).
     let quirk = fw_quirk(device.id.device);
-    let read_status = |offset| {
-        narf_bus::pci::read_config32(&cap, &device, offset).unwrap_or(PCI_ERROR_RESPONSE)
-    };
+    let read_status =
+        |offset| narf_bus::pci::read_config32(&cap, &device, offset).unwrap_or(PCI_ERROR_RESPONSE);
     if quirk != MeiFwQuirk::None
-        && no_valid_me_interface(quirk, read_status(PCI_CFG_HFS_1), read_status(PCI_CFG_HFS_3))
+        && no_valid_me_interface(
+            quirk,
+            read_status(PCI_CFG_HFS_1),
+            read_status(PCI_CFG_HFS_3),
+        )
     {
         use core::fmt::Write as _;
         let _ = writeln!(

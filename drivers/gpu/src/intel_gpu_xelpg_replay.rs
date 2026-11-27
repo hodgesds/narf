@@ -598,7 +598,9 @@ impl Replays {
             let mut result = Ok(WorkStep::Idle);
             if dirty & (1 << slot) != 0 {
                 let bits = frontbuffer(replay.pipe(), PLANE_PRIMARY);
-                result = replay.flush(io, bits, Origin::Dirtyfb).map(|()| WorkStep::Idle);
+                result = replay
+                    .flush(io, bits, Origin::Dirtyfb)
+                    .map(|()| WorkStep::Idle);
             }
             if result.is_ok() {
                 result = replay.run_work(io, now_ns);
@@ -644,7 +646,13 @@ pub(crate) fn pretrain<A: crate::dp_aux::AuxChannel + ?Sized>(
     display_ver: u16,
     mst: bool,
 ) -> bool {
-    pr::enable_before_training(aux, display_ver, false, mst, PRETRAIN.load(Ordering::Acquire))
+    pr::enable_before_training(
+        aux,
+        display_ver,
+        false,
+        mst,
+        PRETRAIN.load(Ordering::Acquire),
+    )
 }
 
 // ── The console's frontbuffer queue ───────────────────────────────

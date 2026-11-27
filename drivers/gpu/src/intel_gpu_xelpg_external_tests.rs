@@ -4908,8 +4908,13 @@ fn smoke_mtl_external_uhbr_compressed_fallback_retry() -> TestResult {
     let mn = [(63 << 25) | 0x7f_e2e3, 0x80_0000, 0xf_34d6, 0x8_0000];
     match (route.probe.dsc, route.probe.uhbr.as_deref()) {
         (Some(d), Some(u))
-            if (d.link_rate, d.lanes, d.compressed_bpp_x16, d.slice_count, d.fec)
-                == (1_000_000, 1, 259, 2, false)
+            if (
+                d.link_rate,
+                d.lanes,
+                d.compressed_bpp_x16,
+                d.slice_count,
+                d.fec,
+            ) == (1_000_000, 1, 259, 2, false)
                 && u.link == uhbr10
                 && u.stream.tu == 64
                 && u.stream.m_n == mn
@@ -4952,8 +4957,13 @@ fn smoke_mtl_external_uhbr_compressed_fallback_retry() -> TestResult {
     match route.probe.dsc {
         Some(d)
             if route.probe.uhbr.is_none()
-                && (d.link_rate, d.lanes, d.compressed_bpp_x16, d.slice_count, d.fec)
-                    == (810_000, 1, 169, 2, true)
+                && (
+                    d.link_rate,
+                    d.lanes,
+                    d.compressed_bpp_x16,
+                    d.slice_count,
+                    d.fec,
+                ) == (810_000, 1, 169, 2, true)
                 && route.probe.negotiated.rate == TrainRate::Hbr3
                 && route.probe.negotiated.lanes == 1 => {}
         _ => return TestResult::Fail("the retry runs Linux's 8b/10b DSC plan at HBR3 x1"),
@@ -5103,7 +5113,10 @@ kernel_test_in!(
 /// lock and alignment.
 fn lttpr_8b10b_sink() -> Sink {
     let mut sink = Sink::new(0x14, edid_1024());
-    for (i, b) in [0x14u8, 0x14, 0x80, 0x55, 4, 0, 0, 0].into_iter().enumerate() {
+    for (i, b) in [0x14u8, 0x14, 0x80, 0x55, 4, 0, 0, 0]
+        .into_iter()
+        .enumerate()
+    {
         sink.extra.push((uhbr::DP_LTTPR_COMMON_CAPS + i as u32, b));
     }
     sink.extra.push((0xf_0030, 0x77));
@@ -7023,8 +7036,9 @@ fn smoke_mtl_external_dp_ycbcr420_route() -> TestResult {
     // second pass) at 24 bpp on HBR2 x4.
     let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid));
     match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, false) {
-        Ok(p) if !p.output.ycbcr420
-            && (p.negotiated.rate, p.negotiated.lanes) == (TrainRate::Hbr2, 4) =>
+        Ok(p)
+            if !p.output.ycbcr420
+                && (p.negotiated.rate, p.negotiated.lanes) == (TrainRate::Hbr2, 4) =>
         {
             TestResult::Pass
         }

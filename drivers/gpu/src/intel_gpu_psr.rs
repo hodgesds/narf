@@ -1348,10 +1348,7 @@ pub fn sel_fetch_update(su: &Psr2, commit: &SuCommit<'_>, previous: (Area, Area)
                 }
             }
             // intel_psr2_sel_fetch_pipe_alignment without DSC.
-            let aligned = (
-                y1 - y1 % g,
-                if y2 % g != 0 { (y2 / g + 1) * g } else { y2 },
-            );
+            let aligned = (y1 - y1 % g, if y2 % g != 0 { (y2 / g + 1) * g } else { y2 });
             let changed = aligned != (y1, y2);
             (y1, y2) = aligned;
             if cursor_in_su || !changed {

@@ -282,7 +282,12 @@ impl View {
             let view = View { ccs: None, ..self };
             let (_, _, bytes) = view.footprint(geometry)?;
             let placed = ccs
-                .place(geometry.pitch, ccs::MAIN_ALIGNMENT, self.origin.x, self.origin.y)
+                .place(
+                    geometry.pitch,
+                    ccs::MAIN_ALIGNMENT,
+                    self.origin.x,
+                    self.origin.y,
+                )
                 .ok_or(ScanoutError::Unsupported)?;
             return Ok((placed.main, placed.plane_offset(), bytes.max(ccs.fetch_end)));
         }
@@ -384,7 +389,13 @@ impl View {
     /// without an AUX plane.
     pub(crate) fn ccs_aux_dist(self, geometry: Geometry) -> Option<u32> {
         let ccs = self.ccs.filter(|c| c.aux.is_some())?;
-        ccs.place(geometry.pitch, ccs::MAIN_ALIGNMENT, self.origin.x, self.origin.y)?.aux_dist()
+        ccs.place(
+            geometry.pitch,
+            ccs::MAIN_ALIGNMENT,
+            self.origin.x,
+            self.origin.y,
+        )?
+        .aux_dist()
     }
     /// The GGTT alignment a surface of this view needs: `fallback`, or a
     /// compressed view's 16 KiB (`tgl_plane_min_alignment`), so its main
@@ -525,7 +536,12 @@ impl DptLayout {
             pitch: geometry.pitch,
         };
         let (layout, ..) = Self::with_origin_for(whole, Layout::Tile4, Viewport::default(), true)?;
-        let placed = ccs.place(layout.dst * 128, ccs::DPT_MAIN_ALIGNMENT, origin.x, origin.y)?;
+        let placed = ccs.place(
+            layout.dst * 128,
+            ccs::DPT_MAIN_ALIGNMENT,
+            origin.x,
+            origin.y,
+        )?;
         Some((layout, placed.main >> 9, placed.plane_offset()))
     }
     /// The layout of `geometry` in `layout`, or `None` for a linear surface,
@@ -1045,8 +1061,8 @@ impl<M: ScanoutIo> Presenter<M> {
         }
         let (layout, start_col, start_row, plane_offset, dpt_surf) = match view.ccs {
             Some(ccs) => {
-                let (layout, surf, plane_offset) = DptLayout::ccs(geometry, view.origin, &ccs)
-                    .ok_or(ScanoutError::Unsupported)?;
+                let (layout, surf, plane_offset) =
+                    DptLayout::ccs(geometry, view.origin, &ccs).ok_or(ScanoutError::Unsupported)?;
                 (layout, 0, 0, plane_offset, surf)
             }
             None => {

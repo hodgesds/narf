@@ -559,7 +559,13 @@ impl Svm {
         if carve(&mut vmas, start, end, None).is_err() || vmas.try_reserve(1).is_err() {
             return;
         }
-        vmas.push(MirrorVma::new(start, end, vma.default_pat, vma.read_only, true));
+        vmas.push(MirrorVma::new(
+            start,
+            end,
+            vma.default_pat,
+            vma.read_only,
+            true,
+        ));
         vmas.sort_unstable_by_key(|vma| vma.start);
         *self.vmas.lock() = vmas;
     }
@@ -942,7 +948,11 @@ pub(crate) mod guc {
         if !mapping.writable && !read {
             return Err(FsError::OperationNotPermitted);
         }
-        Ok((mapping.va, mapping.va + mapping.length, Some(mapping.clone())))
+        Ok((
+            mapping.va,
+            mapping.va + mapping.length,
+            Some(mapping.clone()),
+        ))
     }
 
     /// [`service_with`] from the VM creator's own syscall context.
@@ -967,10 +977,7 @@ pub(crate) mod guc {
         let (start, end, mapping) = service_with(vm, state, fault, super::Svm::remote)?;
         let mapping = match mapping {
             Some(mapping) => Some(mapping),
-            None => vm
-                .svm
-                .as_ref()
-                .and_then(|svm| svm.range_mapping(start)),
+            None => vm.svm.as_ref().and_then(|svm| svm.range_mapping(start)),
         };
         // A range invalidated again since it was collected is left out: the
         // GPU faults once more and the next service collects it again.
