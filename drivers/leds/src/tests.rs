@@ -288,6 +288,169 @@ fn smoke_trigger_audio_mute_level() -> TestResult {
 }
 kernel_test_in!("drivers/leds", smoke_trigger_audio_mute_level);
 
+// ── Test 8b: mic-mute state bit defaults false, follows the feed ────
+//
+// The `audio-micmute` trigger is a module (tracker #2448); this pins
+// the core-side contract it reads: the bit defaults `false` until
+// the lane-4 sound feed calls `set_audio_micmuted`.
+
+fn smoke_trigger_audio_micmute_state() -> TestResult {
+    crate::triggers::__reset_for_test();
+    if crate::triggers::audio_mic_muted() {
+        return TestResult::Fail("mic-mute must default to unmuted (false)");
+    }
+    crate::triggers::set_audio_micmuted(true);
+    if !crate::triggers::audio_mic_muted() {
+        return TestResult::Fail("mic-mute must read true after the feed reports muted");
+    }
+    crate::triggers::set_audio_micmuted(false);
+    if crate::triggers::audio_mic_muted() {
+        return TestResult::Fail("mic-mute must read false after the feed reports unmuted");
+    }
+    crate::triggers::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_trigger_audio_micmute_state);
+
+// ── smoke: module-trigger registry + default-trigger map ──────────
+// Tracker #2448: the `audio-micmute` trigger module registers
+// through `narf_led_register_trigger`; the core keeps the registry
+// and the default-trigger map, and the engine clamps the module's
+// computed brightness to [0, max].
+
+fn smoke_module_trigger_register_rules() -> TestResult {
+    crate::triggers::__reset_for_test();
+    let compute = alloc::sync::Arc::new(|max: u32, _ticks: u32| max);
+    // Empty name rejected; builtin names win on collision.
+    if crate::triggers::register_module_trigger("", compute.clone()).is_ok() {
+        return TestResult::Fail("empty module-trigger name accepted");
+    }
+    if crate::triggers::register_module_trigger("audio-mute", compute.clone()).is_ok() {
+        return TestResult::Fail("module trigger stole the builtin audio-mute name");
+    }
+    let handle = match crate::triggers::register_module_trigger("audio-micmute", compute.clone()) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("audio-micmute registration failed"),
+    };
+    if handle == 0 {
+        return TestResult::Fail("module-trigger handle 0 is the invalid handle");
+    }
+    // Duplicate name rejected.
+    if crate::triggers::register_module_trigger("audio-micmute", compute.clone()).is_ok() {
+        return TestResult::Fail("duplicate module-trigger name accepted");
+    }
+    // Name ↔ trigger round-trip through the registry.
+    if crate::triggers::trigger_from_name("audio-micmute")
+        != Some(crate::triggers::Trigger::Module(handle))
+    {
+        return TestResult::Fail("module trigger name did not resolve to its handle");
+    }
+    if crate::triggers::name_of_trigger(&crate::triggers::Trigger::Module(handle))
+        != Some(alloc::string::String::from("audio-micmute"))
+    {
+        return TestResult::Fail("module trigger handle did not resolve to its name");
+    }
+    // Engine clamps the module's computed brightness to [0, max].
+    let over = alloc::sync::Arc::new(|_max: u32, _ticks: u32| u32::MAX);
+    let over_handle = match crate::triggers::register_module_trigger("over-bright", over) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("over-bright registration failed"),
+    };
+    if crate::triggers::__compute_brightness_for_test(
+        &crate::triggers::Trigger::Module(over_handle),
+        0,
+        7,
+    ) != 7
+    {
+        return TestResult::Fail("module trigger brightness was not clamped to max");
+    }
+    // Unknown handle computes dark (unregistered between snapshot
+    // and compute).
+    if crate::triggers::__compute_brightness_for_test(
+        &crate::triggers::Trigger::Module(u64::MAX),
+        0,
+        7,
+    ) != 0
+    {
+        return TestResult::Fail("unknown module-trigger handle did not compute dark");
+    }
+    // Unknown name unregisters with -ENODEV.
+    if crate::triggers::unregister_module_trigger("no-such-trigger") != Err(-19) {
+        return TestResult::Fail("unregister of an unknown trigger did not return -ENODEV");
+    }
+    if crate::triggers::unregister_module_trigger("audio-micmute").is_err() {
+        return TestResult::Fail("unregister of audio-micmute failed");
+    }
+    crate::triggers::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_module_trigger_register_rules);
+
+fn smoke_module_trigger_busy_and_force() -> TestResult {
+    crate::triggers::__reset_for_test();
+    crate::class::__reset_for_test();
+    let compute = alloc::sync::Arc::new(|max: u32, _ticks: u32| max);
+    let handle = match crate::triggers::register_module_trigger("audio-micmute", compute) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("audio-micmute registration failed"),
+    };
+    let led = alloc::sync::Arc::new(crate::class::SimpleLed::onoff("platform::micmute"));
+    crate::class::register_led(led.clone());
+    led.set_trigger(crate::triggers::Trigger::Module(handle));
+    // Voluntary unregister refuses while a LED uses the trigger.
+    if crate::triggers::unregister_module_trigger("audio-micmute") != Err(-16) {
+        return TestResult::Fail("unregister of an in-use trigger did not return -EBUSY");
+    }
+    // The backstop force-reverts the LED to None, then removes it.
+    if !crate::triggers::force_unregister_module_trigger("audio-micmute") {
+        return TestResult::Fail("force-unregister reported no entry");
+    }
+    if led.current_trigger() != crate::triggers::Trigger::None {
+        return TestResult::Fail("force-unregister did not revert the LED to None");
+    }
+    if crate::triggers::trigger_from_name("audio-micmute").is_some() {
+        return TestResult::Fail("force-unregistered trigger still resolves by name");
+    }
+    crate::triggers::__reset_for_test();
+    crate::class::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_module_trigger_busy_and_force);
+
+fn smoke_default_trigger_pending_resolution() -> TestResult {
+    crate::triggers::__reset_for_test();
+    crate::class::__reset_for_test();
+    // Default recorded before the trigger module exists: the LED
+    // stays on None until the trigger registers.
+    let led = alloc::sync::Arc::new(crate::class::SimpleLed::onoff("platform::micmute"));
+    crate::class::register_led(led.clone());
+    crate::triggers::set_led_default_trigger("platform::micmute", "audio-micmute");
+    if led.current_trigger() != crate::triggers::Trigger::None {
+        return TestResult::Fail("pending default applied before its trigger existed");
+    }
+    // Trigger registers later: the pending default resolves.
+    let compute = alloc::sync::Arc::new(|max: u32, _ticks: u32| max);
+    let handle = match crate::triggers::register_module_trigger("audio-micmute", compute) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("audio-micmute registration failed"),
+    };
+    if led.current_trigger() != crate::triggers::Trigger::Module(handle) {
+        return TestResult::Fail("pending default did not resolve when the trigger registered");
+    }
+    // Default recorded before the LED exists: applies at LED
+    // registration time.
+    crate::triggers::set_led_default_trigger("platform::mute", "audio-mute");
+    let mute = alloc::sync::Arc::new(crate::class::SimpleLed::onoff("platform::mute"));
+    crate::class::register_led(mute.clone());
+    if mute.current_trigger() != crate::triggers::Trigger::AudioMute {
+        return TestResult::Fail("default recorded before LED registration did not apply");
+    }
+    crate::triggers::__reset_for_test();
+    crate::class::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/leds", smoke_default_trigger_pending_resolution);
+
 // ── Test 9: trigger engine tick drives an AudioMute LED ─────────────
 
 fn smoke_trigger_audio_mute_tick() -> TestResult {

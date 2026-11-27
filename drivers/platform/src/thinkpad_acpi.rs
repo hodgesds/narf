@@ -4,8 +4,13 @@
 //! Implements the Lenovo ThinkPad-specific ACPI surface:
 //!   - HKEY hotkey decode (Fn+F1–F12, volume, brightness, mute, mic-mute,
 //!     wireless toggle, tablet mode for Yoga/X1 Fold families)
-//!   - LED control: ThinkLight, keyboard backlight, charging LED,
-//!     power LED, mic-mute LED
+//!   - LED control lives in the dual-build driver crate
+//!     `drivers/platform/thinkpad_led` (tracker #2448): keyboard
+//!     backlight, mute/micmute LEDs, and the Linux-safe generic LEDs
+//!     (power, standby, lid-logo dot, ThinkVantage) — three separate
+//!     mechanisms, never one setter. This file keeps only the HKEY
+//!     dispatch; its 0x60C0 arm calls back into the LED crate to
+//!     re-assert the mic-mute state.
 //!   - Battery conservation mode (stop charging at ~60%)
 //!   - Fan control: read speed via `\HFSP`, set via `\HFNF` / EC offsets
 //!   - Dock detection via HKEY notify value 0x4010 / 0x4011
@@ -15,7 +20,13 @@
 //! - `drivers/platform/x86/thinkpad_acpi.c` — main driver (~10 000 lines).
 //!   Key functions:
 //!   - `hotkey_decode_one_event()` — HKEY notify decode (line ~1400).
-//!   - `tpacpi_led_set()` — LED blink/on/off via `MLCG`/`MLCS` (line ~4800).
+//!   - `led_set_status()` — generic LEDs via the EC `LED` object,
+//!     NEW mode (Linux 7.4-rc2 `thinkpad_acpi.c:5646`).
+//!   - `kbdlight_set_level()` — keyboard-backlight level via HKEY
+//!     `MLCS` / `MLCG` (`thinkpad_acpi.c:5108`).
+//!   - `tpacpi_led_set()` — mute/micmute LEDs ONLY, via HKEY `SSMS` /
+//!     `MMTS` (`thinkpad_acpi.c:9409`); it is not a generic LED
+//!     setter and builds no packed byte.
 //!   - `fan_set_level()` — writes `\HFNF` with fan level (line ~6600).
 //!   - `battery_conservation_mode_show/store()` — reads/writes BIOS WMI
 //!     variable index 0x44 (line ~9400).
@@ -92,7 +103,9 @@ pub fn set_battery_conservation(enable: bool) {
 }
 
 fn do_set_conservation(enable: bool) {
-    // Invoke `\_SB.PCI0.LPCB.EC.BCTG` (HBIF WMI index 0x44) via AML.
+    // Invoke `\_SB.PCI0.LPC0.EC0.HKEY.BCTG` (HBIF WMI index 0x44) via AML.
+    // DSDT-verified: BCTG is a method of HKEY (`dsdt.dsl:18854`, inside
+    // `Scope (HKEY)` under `Scope (\_SB.PCI0.LPC0.EC0)`), not of the EC.
     // ThinkPad BIOS WMI GUID: "3FC0DE0C-2A72-4B88-BDC5-1D24E64AB5C6"
     // Command byte: 0x21 = enable conservation, 0x20 = disable.
     // Reference: thinkpad_acpi.c `tpacpi_battery_conservation_mode_store`.
@@ -100,7 +113,7 @@ fn do_set_conservation(enable: bool) {
     // Best-effort: if the AML method doesn't exist on this system,
     // the state is still recorded in BATTERY_CONSERVATION.
     let _ = narf_aml::eval::evaluate_method(
-        r"\_SB.PCI0.LPCB.EC.BCTG",
+        r"\_SB.PCI0.LPC0.EC0.HKEY.BCTG",
         &[narf_aml::Value::Integer(cmd)],
     );
 }
@@ -224,53 +237,6 @@ pub fn hkey_to_keycode(hkey: u32) -> Option<KeyCode> {
     }
 }
 
-// ── LED control ────────────────────────────────────────────────────────
-
-/// ThinkPad LED identifiers.
-/// Reference: `thinkpad_acpi.c` `TPACPI_LED_*` enum (line ~4740).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ThinkpadLed {
-    /// Power LED (index 0).
-    Power = 0,
-    /// Battery / charging LED (index 1).
-    Battery = 1,
-    /// UltraBay eject LED (index 2).
-    UltraBay = 2,
-    /// ThinkLight (screen light, index 4).
-    ThinkLight = 4,
-    /// Keyboard backlight (index 8).
-    KbdBacklight = 8,
-    /// Mic-mute LED (index 9). Shows mute state.
-    MicMute = 9,
-}
-
-/// LED state.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum LedState {
-    Off,
-    On,
-    Blink,
-}
-
-/// Set a ThinkPad LED state by writing the `MLCS` (LED Set) ACPI method.
-///
-/// MLCS Arg0 encodes `(led_index << 4) | blink_bit | on_bit`.
-/// Reference: `thinkpad_acpi.c::tpacpi_led_set()` line ~4800 — builds
-/// a packed byte from led id + blink/on flags and passes to `MLCS`.
-pub fn set_led(led: ThinkpadLed, state: LedState) {
-    let id = led as u8;
-    let arg: u8 = match state {
-        LedState::Off => id << 4,
-        LedState::On => (id << 4) | 0x01,
-        LedState::Blink => (id << 4) | 0x02,
-    };
-    let _ = narf_aml::eval::evaluate_method(
-        r"\_SB.PCI0.LPCB.EC.MLCS",
-        &[narf_aml::Value::Integer(arg as u64)],
-    );
-}
-
 // ── Statistics ─────────────────────────────────────────────────────────
 
 static HOTKEY_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -320,7 +286,13 @@ fn handle_hkey_notify_aml(_target: &str, value: u64) {
             // Route to platform event bus in Wave 16.
         }
         HkeyEvent::MicMuteLed => {
-            // Sync mic-mute LED — would read mic state and call set_led.
+            // 0x60C0: firmware says the mic-mute LED may be out of
+            // sync — re-assert the last state the LED driver wrote.
+            // The audio mic-mute feed (lane 4) replaces this cache
+            // read when it lands; do not invent a feed here.
+            let _ = narf_drivers_platform_thinkpad_led::builtin::set_micmute(
+                narf_drivers_platform_thinkpad_led::builtin::micmute_state(),
+            );
         }
         HkeyEvent::Unknown { .. } => {}
     }

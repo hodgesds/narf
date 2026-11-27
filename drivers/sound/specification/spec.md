@@ -74,7 +74,11 @@ Software-only registered cards retain their synthetic test behavior.
 backend when one exists. It must not report synthetic controls for native cards.
 A Master Playback Switch write through `mixer::set` also reports the mute state
 to the LED trigger engine (`Trigger::AudioMute`), so the Elan `elan:red:mute`
-LED follows mixer mute (Linux `sound/core/control_led.c`).
+LED follows mixer mute (Linux `sound/core/control_led.c`). A Capture Switch
+(`ControlKind::MicMute`, registered only for cards with a mic) write through
+`mixer::set` likewise reports the mic-mute state (`set_audio_micmuted`), so the
+`audio-micmute` trigger module follows mixer mic-mute — the same Linux
+`sound/core/control_led.c` Mic Capture Switch watch.
 
 `sound_fs_initcall` publishes `/dev/snd`, sysfs and procfs card information.
 Per card, `/proc/asound` carries `cards`, `version`, `cardN/id`, `cardN/codec#A`,

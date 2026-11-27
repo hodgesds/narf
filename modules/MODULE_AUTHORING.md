@@ -241,6 +241,17 @@ So the surface is small and grows deliberately. Today:
 | `narf_mmio_read16` | `(u64, u64, u64, *mut u16) -> i32` | bounded, 2-byte-aligned 16-bit BAR read |
 | `narf_mmio_write8` | `(u64, u64, u64, u8) -> i32` | bounded 8-bit BAR write |
 | `narf_mmio_write16` | `(u64, u64, u64, u16) -> i32` | bounded, 2-byte-aligned 16-bit BAR write |
+| `narf_register_acpi_driver` | `(*const u8, usize, *const u8, usize, usize, usize, u64) -> i32` | register an ACPI driver: name, NUL-separated HID list, probe/remove callbacks; one driver per module; requires `PlatformDriver` |
+| `narf_unregister_acpi_driver` | `() -> i32` | unregister this module's ACPI driver; `-ENODEV` when none; requires `PlatformDriver` |
+| `narf_aml_evaluate_method` | `(*const u8, usize, *const u8, usize, *const u8, usize, *mut u8, usize, *mut usize) -> i32` | evaluate an AML method by path; args/results are flat 32-byte quads; `-105` (`-ENOSPC`) with the required length when short; requires `PlatformDriver` |
+| `narf_acpi_find_devices_by_hid` | `(*const u8, usize, *mut u8, usize, *mut usize, *mut usize) -> i32` | NUL-separated device paths matching a HID; null buffer + len 0 is a size query; requires `PlatformDriver` |
+| `narf_acpi_register_notify_handler` | `(*const u8, usize, usize, u64) -> i32` | subscribe a handler to ACPI notify events on a path; `-ENODEV` unknown path, `-EEXIST` duplicate; requires `PlatformDriver` |
+| `narf_acpi_unregister_notify_handler` | `(*const u8, usize, usize) -> i32` | remove a notify subscription; `-ENODEV` when absent; requires `PlatformDriver` |
+| `narf_led_register` | `(*const u8, usize, u32, usize, usize, usize, u64, *const u8, usize) -> i32` | publish an LED with set/get/trigger callbacks and an optional default trigger; requires `PlatformDriver` |
+| `narf_led_unregister` | `(*const u8, usize) -> i32` | remove an LED (driven off first); `-ENODEV` when absent; requires `PlatformDriver` |
+| `narf_led_register_trigger` | `(*const u8, usize, usize, u64) -> i32` | publish a trigger: `compute(cookie, value, max) -> level`; requires `PlatformDriver` |
+| `narf_led_unregister_trigger` | `(*const u8, usize) -> i32` | remove a trigger; `-EBUSY` while LEDs use it; requires `PlatformDriver` |
+| `narf_led_audio_mic_muted` | `() -> u8` | current audio mic-mute state (0/1) from the LED core; no cap |
 
 Declare them as you would any foreign function:
 
@@ -275,7 +286,25 @@ The module never sees the caller's buffer. `drivers/nvme` (`module_probe.rs`)
 is the PCI worked example, a polled NVMe host; `drivers/usb/storage` is the
 USB one, BOT over bulk requests waited with `narf_usb_wait` (callback-less
 requests only; it polls the transfer inline, so a synchronous request
-callback never depends on another task running). The retained per-device cap is still checked on every invocation; the
+callback never depends on another task running). The platform exports
+(`narf_register_acpi_driver`, `narf_aml_evaluate_method`, `narf_acpi_*`,
+`narf_led_*`) require `PlatformDriver` and let a module behave like an
+ACPI platform driver: register one driver per module against a HID list,
+evaluate AML methods, subscribe to notify events, and publish LEDs and
+triggers into the LED class. AML values cross the boundary as flat
+32-byte quads (tag, int, payload offset/length, or Package child count)
+— flat C arguments, one per value field, so no `repr(C)` struct is
+shared with the separately compiled module and the signature CRC covers
+every field. A module declares `required_caps=PlatformDriver:Write` in
+`.modinfo`. The worked example is `drivers/platform/thinkpad_led`
+(dual-build): the builtin build registers LEDs directly, the module
+build registers through these exports, and `drivers/leds/audio_micmute`
+is a trigger-only module that reads the mic-mute feed with
+`narf_led_audio_mic_muted` (the one export in the family with no cap).
+Unload removes the module's ACPI driver, notify shims, LEDs, and
+triggers; an LED that is still registered is driven off first, and a
+trigger that LEDs still use answers `-EBUSY` until the backstop
+force-reverts those LEDs to no trigger. The retained per-device cap is still checked on every invocation; the
 manifest declaration only controls whether the imports can link.
 
 IRQ callbacks never run in hard-IRQ context. The FRAME handler accounts and

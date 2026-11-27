@@ -44,6 +44,7 @@ pub mod domain;
 pub mod elf;
 pub mod got;
 pub mod kabi;
+pub mod kabi_platform;
 pub mod lifecycle;
 pub mod loader;
 pub mod manifest;

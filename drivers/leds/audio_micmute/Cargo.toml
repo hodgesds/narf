@@ -1,0 +1,52 @@
+# audio-micmute — the `audio-micmute` LED trigger, loadable module only.
+#
+# The first trigger module (tracker #2448, KABI design §1.5/§4.8):
+# it registers the `audio-micmute` trigger through
+# `narf_led_register_trigger` and computes the LED level from the
+# core mic-mute bit (`narf_led_audio_mic_muted`). There is NO builtin
+# duplicate by design — the trigger exists only as a `.ko`, so the
+# `builtin` build registers nothing (the crate still builds in both
+# modes for workspace uniformity; the module build is the real one).
+#
+#   * `builtin` (default): compiles the pure level computation and
+#     the (empty) registration. Nothing is registered.
+#   * `module`: built to a relocatable `.ko` via
+#     `cargo xtask build-module --package narf-drivers-leds-audio-micmute \
+#        --no-default-features --features module`. The only undefined
+#     symbols in the `.ko` are the C-ABI KSYMTAB exports.
+
+[package]
+name         = "narf-drivers-leds-audio-micmute"
+description  = "audio-micmute LED trigger — loadable module only (no builtin duplicate)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_leds_audio_micmute"
+path = "src/lib.rs"
+# rlib for the built-in facade dependency and the kernel link. The `.ko` build
+# overrides this to `staticlib` via `cargo xtask build-module`.
+
+[features]
+default = ["builtin"]
+# Built-in: only the kernel-test harness (for the smokes). The trigger
+# itself is module-only — no kernel crates, no registration.
+builtin = ["dep:narf-kernel-test"]
+# Module: NO kernel crates. The only undefined symbols in the `.ko` are the
+# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
+module = []
+# Declared so the `any(test, feature = "kernel-test")` gate on the
+# tests module resolves; the smokes need no extra dependency.
+kernel-test = []
+
+[dependencies]
+# Always present: a decl-macro crate with no object code of its own, so it is
+# safe to link into the `.ko`.
+narf-driver-macros = { path = "../../../driver-macros" }
+narf-kernel-test = { path = "../../../verification/kernel-test", optional = true }
+
+[lints]
+workspace = true

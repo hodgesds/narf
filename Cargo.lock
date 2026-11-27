@@ -1682,6 +1682,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-leds-audio-micmute"
+version = "0.0.0"
+dependencies = [
+ "narf-driver-macros",
+ "narf-kernel-test",
+]
+
+[[package]]
 name = "narf-drivers-media"
 version = "0.0.0"
 dependencies = [
@@ -2230,6 +2238,7 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-drivers",
+ "narf-drivers-platform-thinkpad-led",
  "narf-drivers-tpm",
  "narf-filesystem",
  "narf-firmware-fdt",
@@ -2246,6 +2255,17 @@ dependencies = [
  "narf-scheduler",
  "narf-time",
  "narf-tpm",
+]
+
+[[package]]
+name = "narf-drivers-platform-thinkpad-led"
+version = "0.0.0"
+dependencies = [
+ "narf-aml",
+ "narf-driver-macros",
+ "narf-drivers-leds",
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]
@@ -3556,6 +3576,7 @@ dependencies = [
 name = "narf-modules"
 version = "0.0.0"
 dependencies = [
+ "narf-aml",
  "narf-arch",
  "narf-block",
  "narf-boot",
@@ -3563,6 +3584,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-crypto",
+ "narf-drivers-leds",
  "narf-drivers-usb",
  "narf-filesystem",
  "narf-firmware",

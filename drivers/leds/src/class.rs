@@ -97,6 +97,10 @@ pub fn register_led(dev: Arc<dyn LedDevice>) {
         crate::sysfs_bridge::unpublish(&name);
     }
     crate::sysfs_bridge::sync_publication();
+    // A default trigger recorded before this LED existed (or a
+    // trigger that loaded after the default was recorded) applies
+    // now that the LED is registered.
+    crate::triggers::apply_pending_default(&name);
 }
 
 /// Unregister a device by name. No-op if not present.

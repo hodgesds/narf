@@ -310,6 +310,78 @@ kernel_test_in!(
     smoke_mixer_master_mute_drives_audio_trigger
 );
 
+// ── #17b: Mixer — MicMute write feeds the mic-mute trigger ─────────
+
+fn smoke_mixer_mic_mute_drives_audio_micmute_trigger() -> TestResult {
+    use narf_drivers_leds::triggers as led_triggers;
+    mixer::__reset_for_test();
+    led_triggers::__reset_for_test();
+    mixer::register_standard_realtek(/*ctrl=*/ 103, true, true, true);
+    let ids = mixer::list_for_controller(103);
+    let Some(mic_mute) = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MicMute))
+        .copied()
+    else {
+        return TestResult::Fail("mic mute not registered");
+    };
+    // Starts unmuted (Capture Switch = true).
+    if led_triggers::audio_mic_muted() {
+        return TestResult::Fail("mic-mute trigger must start unmuted");
+    }
+    // Mute (switch false) → trigger reports mic muted.
+    mixer::set(103, mic_mute, ControlValue::boolean(false)).unwrap();
+    if !led_triggers::audio_mic_muted() {
+        return TestResult::Fail("muting the mic must report audio mic muted");
+    }
+    // Unmute (switch true) → trigger reports mic unmuted.
+    mixer::set(103, mic_mute, ControlValue::boolean(true)).unwrap();
+    if led_triggers::audio_mic_muted() {
+        return TestResult::Fail("unmuting the mic must clear audio mic muted");
+    }
+    // A master-mute write must not touch the mic-mute state.
+    let Some(master_mute) = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterMute))
+        .copied()
+    else {
+        return TestResult::Fail("master mute not registered");
+    };
+    mixer::set(103, master_mute, ControlValue::boolean(false)).unwrap();
+    if led_triggers::audio_mic_muted() {
+        return TestResult::Fail("master mute must not change audio mic muted");
+    }
+    if !led_triggers::audio_muted() {
+        return TestResult::Fail("master mute must still report audio muted");
+    }
+    // A volume write must not touch the mic-mute state either.
+    let Some(master) = ids
+        .iter()
+        .find(|id| matches!(id.kind, ControlKind::MasterVolume))
+        .copied()
+    else {
+        return TestResult::Fail("master volume not registered");
+    };
+    mixer::set(103, master, ControlValue::integer(10, 10)).unwrap();
+    if led_triggers::audio_mic_muted() {
+        return TestResult::Fail("volume write must not change audio mic muted");
+    }
+    // A card without a mic has no Capture Switch at all.
+    mixer::register_standard_realtek(/*ctrl=*/ 104, true, true, false);
+    let no_mic_ids = mixer::list_for_controller(104);
+    if no_mic_ids
+        .iter()
+        .any(|id| matches!(id.kind, ControlKind::MicMute))
+    {
+        return TestResult::Fail("mic mute registered for a mic-less card");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sound",
+    smoke_mixer_mic_mute_drives_audio_micmute_trigger
+);
+
 // ── #18: Format support filter ─────────────────────────────────────
 
 fn smoke_format_filter() -> TestResult {

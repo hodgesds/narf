@@ -982,6 +982,14 @@ pub enum CapKind {
     Governor = 0x0088,
     PmBus = 0x0089,
 
+    /// Platform / ACPI driver binding: ACPI driver registration, AML
+    /// method evaluation, HID discovery, notify handlers, LED
+    /// registration, trigger registration. Gate for the ThinkPad LED
+    /// driver `.ko` and future ACPI `.ko` (Dell/ASUS/HP WMI).
+    /// Value `0x008B` — `0x008A` belongs to the cpufreq track's
+    /// earlier `CpufreqDriver` claim (unlanded; tracker #2448).
+    PlatformDriver = 0x008B,
+
     // RCU
     SleepableReader = 0x0090,
 
@@ -1139,6 +1147,7 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("DevicePm", CapKind::DevicePm),
     ("Governor", CapKind::Governor),
     ("PmBus", CapKind::PmBus),
+    ("PlatformDriver", CapKind::PlatformDriver),
     ("SleepableReader", CapKind::SleepableReader),
     ("Scmi", CapKind::Scmi),
     ("Process", CapKind::Process),

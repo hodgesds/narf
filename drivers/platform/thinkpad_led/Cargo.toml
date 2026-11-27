@@ -1,0 +1,73 @@
+# thinkpad-led — ThinkPad LED driver, dual-build.
+#
+# The LED half of `drivers/platform/thinkpad_acpi` (lane 2's corrected
+# surface: three per-mechanism setters, `GenericLed` + `u8` level +
+# `bool`, packed-`AtomicU32` state cache, wired 0x60C0 arm), promoted
+# into its own crate so it builds two ways from one source, exactly
+# like `drivers/wireless/mt76/` (the locked dual-build template):
+#
+#   * `builtin` (default): an rlib the `narf-drivers-platform` facade
+#     registers from its `Stage::Device` initcall. The builtin backend
+#     calls the moved setters (AML evaluation + state cache) directly.
+#   * `module`: built to a relocatable `.ko` via
+#     `cargo xtask build-module --package narf-drivers-platform-thinkpad-led \
+#        --no-default-features --features module`. The kernel crates drop
+#     from the graph; the driver registers through the `narf_register_acpi_driver`
+#     / `narf_led_register` KSYMTAB exports (tracker #2448, KABI design §4).
+#
+# The module backend speaks AML through the KABI's flat quad stream
+# (`quad.rs`, the module-side twin of the kernel codec in
+# `modules/src/kabi_platform.rs`); the builtin backend speaks it
+# through `narf-aml` directly. Both share the LED definitions
+# (`defs.rs`) and the probe/register/set logic (`driver.rs`) behind
+# the `Backend` trait.
+#
+# DSDT-VERIFIED (2026-11-26, P14s `dsdt.aml`): the AML path
+# literals in `defs.rs` are the DSDT's real paths
+# (`\_SB.PCI0.LPC0.EC0`, HKEY `LEN0268` under it); the old
+# `\_SB.PCI0.LPCB.EC.*` literals were corrected in the same change.
+
+[package]
+name         = "narf-drivers-platform-thinkpad-led"
+description  = "ThinkPad LED driver (kbdlight, mute/micmute, safe generic LEDs) — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_platform_thinkpad_led"
+path = "src/lib.rs"
+# rlib for the built-in facade dependency and the kernel link. The `.ko` build
+# overrides this to `staticlib` via `cargo xtask build-module`.
+
+[features]
+default = ["builtin"]
+# Built-in: pull the real kernel crates. The driver body only compiles here.
+builtin = [
+    "dep:narf-aml",
+    "dep:narf-drivers-leds",
+    "dep:narf-kernel-test",
+    "dep:narf-lib",
+]
+# Module: NO kernel crates. The only undefined symbols in the `.ko` are the
+# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
+module = []
+# Enables the AML fixture tests (narf_aml test-only namespace helpers).
+# The fixture tests also require the builtin build (default feature).
+kernel-test = ["narf-aml/kernel-test"]
+
+[dependencies]
+# Always present: a decl-macro crate with no object code of its own, so it is
+# safe to link into the `.ko`.
+narf-driver-macros = { path = "../../../driver-macros" }
+
+# Real kernel crates — present for `builtin`, absent for `module`.
+narf-aml          = { path = "../../../aml", optional = true }
+narf-drivers-leds = { path = "../../leds", optional = true }
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+
+[lints]
+workspace = true

@@ -51,6 +51,10 @@ pub enum ControlKind {
     SpeakerMute,
     /// Mic Boost (Capture path).
     MicBoost,
+    /// Mic Capture Switch — 1 = unmute, 0 = mute (same convention
+    /// as MasterMute; Linux `sound/core/control_led.c` watches the
+    /// Mic Capture Switch alongside the Master Playback Switch).
+    MicMute,
     /// Capture Volume.
     CaptureVolume,
     /// Jack-Sense — read-only, 1 = plugged.
@@ -89,6 +93,7 @@ impl ControlKind {
             ControlKind::SpeakerVolume => "Speaker Playback Volume",
             ControlKind::SpeakerMute => "Speaker Playback Switch",
             ControlKind::MicBoost => "Mic Boost",
+            ControlKind::MicMute => "Capture Switch",
             ControlKind::CaptureVolume => "Capture Volume",
             ControlKind::JackSense => "Headphone Jack",
             // PCM device 0 is the only playback PCM a native card has.
@@ -109,6 +114,7 @@ impl ControlKind {
             ControlKind::MasterMute
                 | ControlKind::HeadphoneMute
                 | ControlKind::SpeakerMute
+                | ControlKind::MicMute
                 | ControlKind::JackSense
                 | ControlKind::HdmiJack
                 | ControlKind::Iec958Switch
@@ -464,7 +470,7 @@ pub fn register_standard_realtek(
             index: next_idx,
             kind: ControlKind::MicBoost,
         };
-        let _ = next_idx; // last add — keep symmetry, suppress lint
+        next_idx += 1;
         add(
             ControlInfo {
                 id,
@@ -477,6 +483,24 @@ pub fn register_standard_realtek(
                 is_read_only: false,
             },
             ControlValue::integer(1, 1),
+        );
+        let id = ControlId {
+            index: next_idx,
+            kind: ControlKind::MicMute,
+        };
+        let _ = next_idx; // last add — keep symmetry, suppress lint
+        add(
+            ControlInfo {
+                id,
+                name: ControlKind::MicMute.name(),
+                value_min: 0,
+                value_max: 1,
+                step: 1,
+                channels: 1,
+                is_boolean: true,
+                is_read_only: false,
+            },
+            ControlValue::boolean(true), // start unmuted
         );
     }
 
@@ -532,11 +556,15 @@ pub fn get(controller_index: usize, id: ControlId) -> Result<ControlValue, Mixer
 /// state into the LED trigger engine
 /// (`narf_drivers_leds::triggers::set_audio_muted`), so LEDs bound
 /// to `Trigger::AudioMute` — e.g. the Elan `elan:red:mute` LED —
-/// follow the mixer within one trigger-engine tick. This is the
-/// NARF analogue of Linux `sound/core/control_led.c`
+/// follow the mixer within one trigger-engine tick. A successful
+/// Capture Switch (MicMute) write likewise reports into
+/// `set_audio_micmuted`, so the mic-mute state the `audio-micmute`
+/// trigger module reads (tracker #2448) follows the mixer. This is
+/// the NARF analogue of Linux `sound/core/control_led.c`
 /// (`snd_ctl_led_set_state` watches the Master Playback Switch and
-/// calls `ledtrig_audio_mute()`); the ALSA value convention is
-/// `Boolean(true)` = unmute, so the trigger receives the negation.
+/// the Mic Capture Switch and calls `ledtrig_audio_mute()` /
+/// `ledtrig_audio_micmute()`); the ALSA value convention is
+/// `Boolean(true)` = unmute, so the triggers receive the negation.
 ///
 /// Only the mixer surface feeds the trigger: the USB UAC card
 /// (`drivers/usb/src/uac_card.rs`) and virtio-snd
@@ -563,6 +591,11 @@ pub fn set(controller_index: usize, id: ControlId, value: ControlValue) -> Resul
         // `true` = unmute on the ALSA switch; the trigger wants
         // `true` = muted.
         narf_drivers_leds::triggers::set_audio_muted(!unmuted);
+    }
+    if let (ControlKind::MicMute, ControlValue::Boolean(unmuted)) = (kind, value) {
+        // Same convention as MasterMute: `true` = unmute on the
+        // ALSA switch; the trigger wants `true` = muted.
+        narf_drivers_leds::triggers::set_audio_micmuted(!unmuted);
     }
     Ok(())
 }

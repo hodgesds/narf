@@ -58,6 +58,24 @@ This pushes cap enforcement to *link time* instead of first call.
 A buggy out-of-tree driver can't accidentally invoke a privileged
 API path because the kernel refuses to wire the pointer in.
 
+The newest cap-gated family is `PlatformDriver` (`CapKind::PlatformDriver`,
+`0x008B`), added for ACPI platform drivers as loadable modules
+(tracker #2448): `narf_register_acpi_driver` / `narf_unregister_acpi_driver`,
+`narf_aml_evaluate_method`, `narf_acpi_find_devices_by_hid`,
+`narf_acpi_register_notify_handler` / `narf_acpi_unregister_notify_handler`,
+`narf_led_register` / `narf_led_unregister`,
+`narf_led_register_trigger` / `narf_led_unregister_trigger`, plus
+`narf_led_audio_mic_muted` (the one export in the family with no cap —
+it only reads a core atomic). AML values cross as flat 32-byte quads,
+not a shared `repr(C)` struct: the in-tree rule (see the USB export's
+comment in `kabi.rs`) is flat C arguments, one per value field, so the
+signature CRC covers every field instead of only a struct type name.
+Unload is explicit per family — `unregister_module_acpi_drivers`,
+`unregister_module_notify_shims`, `unregister_module_leds`,
+`unregister_module_triggers` at both retire sites — because
+`unregister_exports_of` only sweeps the module's own KSYMTAB entries
+and cannot drive hardware off or call `remove` callbacks.
+
 ### 2. Domain placement
 
 Every NARF module declares a `target_domain=<name>` author hint in its

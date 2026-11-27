@@ -321,6 +321,25 @@ pub fn register_notify_handler(target_path: &str, handler: NotifyHandler) {
     });
 }
 
+/// Unregister a previously registered notify handler.
+///
+/// Removes the entry for (`target_path`, `handler`); other handlers
+/// on the same path and the same handler on other paths are
+/// untouched. Returns `true` iff an entry was removed. This is the
+/// core-side primitive behind the KABI's
+/// `narf_acpi_unregister_notify_handler` (tracker #2448): module
+/// notify handlers are unregistered from the exit path and from the
+/// loader backstop before the module's text is unmapped.
+pub fn unregister_notify_handler(target_path: &str, handler: NotifyHandler) -> bool {
+    let mut g = HANDLERS.lock();
+    let before = g.len();
+    // fn-pointer identity by address: `==` on fn pointers is
+    // unpredictable across codegen units (the pinned nightly warns
+    // on it), so compare addresses instead.
+    g.retain(|e| !(e.path == target_path && core::ptr::fn_addr_eq(e.handler, handler)));
+    g.len() != before
+}
+
 /// Dispatch a Notify event to all registered handlers for `target_path`.
 pub fn dispatch_notify(target_path: &str, value: u64) {
     // Collect matching handlers without holding the lock while calling
@@ -475,3 +494,56 @@ fn sync_sleep_clamp_bound() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml/sync", sync_sleep_clamp_bound);
+
+/// Notify unregistration removes only the matching (path, handler)
+/// pair: other handlers on the same path and the same handler on
+/// other paths keep firing. Core-side pin for the KABI's
+/// `narf_acpi_unregister_notify_handler` (tracker #2448).
+static NOTIFY_UNREG_A_COUNT: AtomicU32 = AtomicU32::new(0);
+static NOTIFY_UNREG_B_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn sync_notify_count_a(_target: &str, _value: u64) {
+    NOTIFY_UNREG_A_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn sync_notify_count_b(_target: &str, _value: u64) {
+    NOTIFY_UNREG_B_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn sync_notify_unregister_removes_only_matching_handler() -> TestResult {
+    __reset_for_test();
+    NOTIFY_UNREG_A_COUNT.store(0, Ordering::Relaxed);
+    NOTIFY_UNREG_B_COUNT.store(0, Ordering::Relaxed);
+    register_notify_handler("/SB.HKEY", sync_notify_count_a);
+    register_notify_handler("/SB.HKEY", sync_notify_count_b);
+    register_notify_handler("/SB.EC", sync_notify_count_a);
+    dispatch_notify("/SB.HKEY", 0x60C0);
+    if NOTIFY_UNREG_A_COUNT.load(Ordering::Relaxed) != 1
+        || NOTIFY_UNREG_B_COUNT.load(Ordering::Relaxed) != 1
+    {
+        return TestResult::Fail("dispatch must call both handlers on the path");
+    }
+    if !unregister_notify_handler("/SB.HKEY", sync_notify_count_a) {
+        return TestResult::Fail("unregister must report a removal");
+    }
+    if unregister_notify_handler("/SB.HKEY", sync_notify_count_a) {
+        return TestResult::Fail("second unregister of the same handler must report nothing");
+    }
+    dispatch_notify("/SB.HKEY", 0x60C0);
+    dispatch_notify("/SB.EC", 0x60C0);
+    if NOTIFY_UNREG_A_COUNT.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("A must still fire on /SB.EC after removal from /SB.HKEY");
+    }
+    if NOTIFY_UNREG_B_COUNT.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("B must still fire on /SB.HKEY after A is removed");
+    }
+    if unregister_notify_handler("/SB.NOPE", sync_notify_count_a) {
+        return TestResult::Fail("unregister on an unknown path must report nothing");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "aml/sync",
+    sync_notify_unregister_removes_only_matching_handler
+);
