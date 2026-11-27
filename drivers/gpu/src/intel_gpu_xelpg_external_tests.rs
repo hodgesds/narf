@@ -71,6 +71,9 @@ pub struct Sink {
     /// A `DP_LINK_BW_SET` code at which 128b/132b training reports
     /// `DP_128B132B_LT_FAILED` (0: never).
     pub uhbr_lt_fail_bw: u8,
+    /// 128b/132b training reports `DP_128B132B_LT_FAILED` with more lanes
+    /// than this (0: never).
+    pub uhbr_lt_fail_lanes: u8,
     /// Further DPCD bytes the sink reports.
     pub extra: Vec<(u32, u8)>,
     /// Native writes to `DP_PROTOCOL_CONVERTER_CONTROL_0..=2`, in order.
@@ -119,6 +122,7 @@ impl Sink {
             uhbr_reads: Vec::new(),
             link_bw: 0,
             uhbr_lt_fail_bw: 0,
+            uhbr_lt_fail_lanes: 0,
             extra: Vec::new(),
             pcon_log: Vec::new(),
             tunnel: None,
@@ -186,6 +190,11 @@ impl Sink {
                 0x202 => return self.uhbr_status(0),
                 0x203 => return self.uhbr_status(1),
                 0x204 if self.uhbr_lt_fail_bw != 0 && self.link_bw == self.uhbr_lt_fail_bw => {
+                    return uhbr::DP_128B132B_LT_FAILED;
+                }
+                0x204
+                    if self.uhbr_lt_fail_lanes != 0 && self.lanes_set > self.uhbr_lt_fail_lanes =>
+                {
                     return uhbr::DP_128B132B_LT_FAILED;
                 }
                 0x204 => {
@@ -4760,6 +4769,155 @@ fn smoke_mtl_external_uhbr_dsc_route_without_fec() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_uhbr_dsc_route_without_fec
+);
+
+/// The reduced-parameter retry with DSC (`intel_dp_get_link_train_fallback_values`,
+/// then the retry's `intel_dp_compute_config`: the uncompressed search,
+/// then Linux 7.4's DSC search over what is still allowed), on one-lane
+/// DP 2.0 sinks with the monitor's DSC caps and a 3840x2160 594 MHz stream:
+///
+/// - UHBR10/20 and HBR2: UHBR20 x1 carries the stream uncompressed at
+///   24 bpp; its training fails (`DP_128B132B_LT_FAILED`), the limits drop
+///   to UHBR10 x1 (`reduce_link_params`, descending lane/rate order), where
+///   nothing fits uncompressed, so the retry compresses: UHBR10 x1 at
+///   259/16 bpp with two slices, 64 slots and the `DATA_M` / `LINK_M` of
+///   [`smoke_mtl_external_uhbr_dsc_route_without_fec`].
+/// - UHBR10 and HBR3: the compressed UHBR10 x1 stream (259/16 bpp) fails
+///   to train; the limits drop to HBR3 x1 and the retry's DSC search lands
+///   on 8b/10b: 169/16 bpp with FEC and two slices at HBR3 x1, the plan of
+///   [`smoke_mtl_external_dp_dsc_with_fec_lights_and_stops`], with
+///   `DP_TP_CTL` FEC on.
+/// - UHBR10 and HBR2: the compressed UHBR10 x1 stream's fallback (HBR2 x1)
+///   carries nothing, even compressed (below the 8 bpp minimum): no retry,
+///   the route is stopped and refused typed.
+fn smoke_mtl_external_uhbr_compressed_fallback_retry() -> TestResult {
+    let sink = |max_bw: u8, rates: u8, fail_bw: u8| {
+        let mut sink = Sink::dp20(max_bw, edid_uhd(594_000), rates);
+        sink.caps[2] = 1 | 0x40 | 0x80;
+        sink.dsc = MONITOR_DSC;
+        sink.fec_cap = dsc::DP_FEC_CAPABLE;
+        sink.ffe_request = [4, 0, 0, 0];
+        sink.uhbr_lt_fail_bw = fail_bw;
+        let io = ExtFake::new(XeLpgPort::Tc2, sink);
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        io
+    };
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let uhbr10 = uhbr::UhbrLink {
+        rate: uhbr::UhbrRate::Uhbr10,
+        lanes: 1,
+        pipe_bpp: 24,
+    };
+    // Uncompressed UHBR20 x1, then compressed UHBR10 x1.
+    let io = sink(0x14, uhbr::DP_UHBR10 | uhbr::DP_UHBR20, 0x02);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the DSC DP 2.0 sink must probe with UHBR on");
+    };
+    match probe.uhbr.as_deref() {
+        Some(p)
+            if probe.dsc.is_none()
+                && p.dsc_sink.is_some()
+                && p.link
+                    == (uhbr::UhbrLink {
+                        rate: uhbr::UhbrRate::Uhbr20,
+                        lanes: 1,
+                        pipe_bpp: 24,
+                    }) => {}
+        _ => return TestResult::Fail("UHBR20 x1 carries 594 MHz uncompressed"),
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the retry must light the compressed route"),
+    };
+    let mn = [(63 << 25) | 0x7f_e2e3, 0x80_0000, 0xf_34d6, 0x8_0000];
+    match (route.probe.dsc, route.probe.uhbr.as_deref()) {
+        (Some(d), Some(u))
+            if (d.link_rate, d.lanes, d.compressed_bpp_x16, d.slice_count, d.fec)
+                == (1_000_000, 1, 259, 2, false)
+                && u.link == uhbr10
+                && u.stream.tu == 64
+                && u.stream.m_n == mn
+                && !u.caps.allowed(2_000_000, 1)
+                && u.caps.max_limits() == (1_000_000, 1) => {}
+        _ => return TestResult::Fail("the retry compresses over UHBR10 x1 at 259/16 bpp"),
+    }
+    {
+        let sink = io.sink.borrow();
+        let bw: Vec<u8> = sink
+            .uhbr_log
+            .iter()
+            .filter_map(|&(a, v)| (a == 0x100).then_some(v))
+            .collect();
+        if bw != [0x02, 0x01]
+            || !sink
+                .dsc_log
+                .contains(&(dsc::DP_DSC_ENABLE, dsc::DP_DECOMPRESSION_EN))
+        {
+            return TestResult::Fail("UHBR20, then UHBR10 with the sink decompressing");
+        }
+    }
+    if route.stop(&io).is_err() || route.release(&io).is_err() {
+        return TestResult::Fail("the retried compressed route must stop and release");
+    }
+    // Compressed UHBR10 x1, then 8b/10b DSC with FEC at HBR3 x1.
+    let io = sink(0x1e, uhbr::DP_UHBR10, 0x01);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the HBR3 DSC DP 2.0 sink must probe with UHBR on");
+    };
+    match (probe.dsc, probe.uhbr.as_deref()) {
+        (Some(d), Some(u)) if d.compressed_bpp_x16 == 259 && u.link == uhbr10 => {}
+        _ => return TestResult::Fail("the probe compresses over UHBR10 x1 at 259/16 bpp"),
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the retry must light the 8b/10b compressed route"),
+    };
+    match route.probe.dsc {
+        Some(d)
+            if route.probe.uhbr.is_none()
+                && (d.link_rate, d.lanes, d.compressed_bpp_x16, d.slice_count, d.fec)
+                    == (810_000, 1, 169, 2, true)
+                && route.probe.negotiated.rate == TrainRate::Hbr3
+                && route.probe.negotiated.lanes == 1 => {}
+        _ => return TestResult::Fail("the retry runs Linux's 8b/10b DSC plan at HBR3 x1"),
+    }
+    if io.read32(DP_TP_CTL_B) & dsc::DP_TP_CTL_FEC_ENABLE == 0
+        || !io
+            .sink
+            .borrow()
+            .dsc_log
+            .contains(&(dsc::DP_FEC_CONFIGURATION, 1))
+    {
+        return TestResult::Fail("the 8b/10b retry enables FEC on source and sink");
+    }
+    if route.stop(&io).is_err() || route.release(&io).is_err() {
+        return TestResult::Fail("the 8b/10b compressed route must stop and release");
+    }
+    // Compressed UHBR10 x1 on an HBR2 sink: nothing to retry.
+    let io = sink(0x14, uhbr::DP_UHBR10, 0x01);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the HBR2 DSC DP 2.0 sink must probe with UHBR on");
+    };
+    if probe.dsc.is_none() || uhbr_fallback(&probe).is_some() {
+        return TestResult::Fail("HBR2 x1 carries 594 MHz at no compressed bpp");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Err(ActivateError::Failed(
+            route,
+            ExternalError::Uhbr(uhbr::UhbrRefusal::Training(uhbr::TrainFailure::LtFailed)),
+        )) if route.state() == RouteState::Stopped => {
+            let _ = route.release(&io);
+        }
+        _ => return TestResult::Fail("no reduced configuration: the stopped route is refused"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_compressed_fallback_retry
 );
 
 /// The 128b/132b route through one 128b/132b LTTPR (`DP_PHY_REPEATER_CNT`

@@ -280,12 +280,63 @@ impl MtlMstRoute {
         }
         let sinks = topology.sinks();
         self.topology = Some(topology);
+        let first = self.streams_at(io, &decl, display, alloc, aux, uhbr, None, &sinks, &ledger);
+        // intel_dp_start_link_train's failure on the link's first stream:
+        // intel_dp_get_link_train_fallback_values in the MST (BW) order and
+        // the modeset retry of every stream on the link, once, from the
+        // proven stop (no stream was enabled, no payload allocated).
+        match (first, uhbr) {
+            (Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Training(f))), Some(u))
+                if self.streams.is_empty()
+                    && self
+                        .failed
+                        .as_ref()
+                        .is_some_and(|r| r.state == RouteState::Stopped) =>
+            {
+                let Some(next) = mst_fallback(&u) else {
+                    return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Training(f)));
+                };
+                self.failed = None;
+                let (uhbr, forced) = match next {
+                    MstRetry::Uhbr(u) => (Some(u), None),
+                    MstRetry::EightTenB(rate, lanes) => (None, Some((rate, lanes))),
+                };
+                self.streams_at(io, &decl, display, alloc, aux, uhbr, forced, &sinks, &ledger)
+            }
+            (result, _) => result,
+        }
+    }
+
+    /// The stream loop of [`Self::start`] on one link: the 128b/132b link
+    /// `uhbr`, else 8b/10b at the source/sink maximum or at `forced` (an
+    /// MST retry's reduced configuration). `ledger` is each output port's
+    /// available PBN before any stream.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn streams_at<M: MmioWindow + ?Sized, A: MstAux>(
+        &mut self,
+        io: &M,
+        decl: &MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+        uhbr: Option<UhbrMstLink>,
+        forced: Option<(TrainRate, u8)>,
+        sinks: &[Sink],
+        ledger: &[(Sink, u16)],
+    ) -> Result<(), ExternalError> {
+        let mut ledger = ledger.to_vec();
         let caps = DpcdCaps::decode(&self.link.raw);
         let source = SourceCaps {
             max_rate: TrainRate::Hbr3,
             max_lanes: self.link.tc.map_or(4, |tc| tc.max_lanes),
         };
         let mut negotiated = negotiate(&source, &caps, u64::MAX);
+        if let Some((rate, lanes)) = forced {
+            negotiated.rate = rate;
+            negotiated.lanes = lanes;
+            negotiated.payload_kbps = rate.payload_kbps(lanes);
+        }
         let link_kbps = negotiated.rate.payload_kbps(negotiated.lanes) as u32;
         if let Some(u) = uhbr {
             negotiated.lanes = u.lanes;
@@ -296,7 +347,7 @@ impl MtlMstRoute {
         } else {
             1u8
         };
-        for sink in sinks {
+        for &sink in sinks {
             let topology = self.topology.as_ref().expect("probed");
             let edid = complete(self.manager.read_edid_block(aux, topology, sink, 0))?;
             let mode = crate::intel_gpu_dp::mode_from_edid(&edid)
@@ -577,6 +628,42 @@ impl MtlMstRoute {
     }
 }
 
+/// The link an MST retry runs ([`mst_fallback`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MstRetry {
+    /// 128b/132b at the reduced configuration.
+    Uhbr(UhbrMstLink),
+    /// 8b/10b at this rate and lane count.
+    EightTenB(TrainRate, u8),
+}
+
+/// `intel_dp_get_link_train_fallback_values` after the 128b/132b MST link
+/// failed to train: [`uhbr::LinkCaps::fallback`] in
+/// `intel_dp_link_caps_connector_fallback_order(is_mst)`
+/// (`INTEL_DP_LINK_CAPS_ORDER_KEY_BW`, descending), then the retry's link,
+/// `intel_dp_get_connector_max_link_config`: the highest-bandwidth
+/// configuration still allowed (with the reduced maximum limits, the
+/// fallback's own). `None` when nothing follows (Linux marks the link
+/// `INTEL_DP_LINK_RECOVERY_NO_FALLBACK`).
+fn mst_fallback(link: &UhbrMstLink) -> Option<MstRetry> {
+    let mut caps = link.caps;
+    caps.fallback(link.rate.link_rate(), link.lanes, true)?;
+    let (order, n) = caps.ordered(uhbr::FallbackOrder::Bw);
+    let &(rate, lanes) = order[..n]
+        .iter()
+        .rev()
+        .find(|&&(r, l)| caps.allowed(r, l))?;
+    Some(match uhbr::UhbrRate::from_link_rate(rate) {
+        Some(rate) => MstRetry::Uhbr(UhbrMstLink {
+            rate,
+            lanes,
+            caps,
+            ..*link
+        }),
+        None => MstRetry::EightTenB(train_rate_for(rate)?, lanes),
+    })
+}
+
 /// The stream of [`uhbr::mst_stream`] for `mode` on the 128b/132b link
 /// (out of line: the connect loop's frame stays small).
 #[inline(never)]
@@ -598,6 +685,7 @@ fn uhbr_plan(link: &UhbrMstLink, stream: &uhbr::MstUhbrStream) -> Box<UhbrPlan> 
         tunnel: None,
         caps: link.caps,
         max_bpp: dsc::PIPE_BPP as u8,
+        dsc_sink: None,
     })
 }
 
@@ -1127,6 +1215,109 @@ pub(super) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xelpg_mst",
         smoke_mtl_mst_128b132b_two_streams_on_uhbr20
+    );
+
+    /// The reduced-parameter retry of a 128b/132b MST link
+    /// (`intel_dp_get_link_train_fallback_values` with `is_mst`, then the
+    /// modeset retry of the link's streams): the UHBR10/20 hub of
+    /// [`smoke_mtl_mst_128b132b_two_streams_on_uhbr20`] reports
+    /// `DP_128B132B_LT_FAILED` on four lanes, so the primary's UHBR20 x4
+    /// training fails and the route stops before any payload. In
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_BW` order (descending) the next
+    /// configuration is UHBR20 x2 (4835500 kBps, above UHBR10 x4's equal
+    /// bandwidth by rate): UHBR20 x4 is disabled and the maximum limits are
+    /// UHBR20 x2. Both 1024x768 65 MHz streams run there (Linux 7.4's
+    /// formulas): `drm_dp_get_vc_payload_bw(2000000, 2)` = 366781, the
+    /// remote TU 4 (aligned to 4 / 2 lanes), the allocated PBN 358 and four
+    /// slots each, from slot 0 and slot 4, `DATA_M` = `TU_SIZE(4)` |
+    /// 0x05296d, `LINK_M` 0xd4fd at N 0x80000. Training writes UHBR20 with
+    /// four lanes, then with two.
+    fn smoke_mtl_mst_128b132b_training_fallback_retry() -> TestResult {
+        let mut hub = DpSink::dp20(0x14, edid(), uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+        hub.uhbr_lt_fail_lanes = 2;
+        let io = ExtFake::new(XeLpgPort::Tc1, hub);
+        let Ok(link) = probe_link(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) else {
+            return TestResult::Fail("the DP 2.0 hub must answer its DPCD");
+        };
+        let u = match uhbr_mst_link(&io, &link) {
+            Ok(Some(u)) if u.rate == uhbr::UhbrRate::Uhbr20 && u.lanes == 4 => u,
+            _ => return TestResult::Fail("Linux runs MST at the highest bandwidth: UHBR20 x4"),
+        };
+        let mut aux = Logged {
+            inner: branch(&io),
+            payload: Vec::new(),
+        };
+        let mut index = 0;
+        let mut owner = match MtlMstRoute::connect_aux_with(
+            &io,
+            link,
+            MtlPortDecl::USB_C,
+            &MtlDisplay::NONE,
+            &mut |mode| Some(fb(mode, &mut index)),
+            &mut aux,
+            Some(u),
+        ) {
+            Ok(owner) => owner,
+            Err((_, error)) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "128b/132b MST retry: {error:?}");
+                return TestResult::Fail("the reduced retry must light both streams");
+            }
+        };
+        let mn = [(3 << 25) | 0x05_296d, 0x80_0000, 0xd4fd, 0x8_0000];
+        if owner.stream_count() != 2
+            || owner.streams[0].route.pipe != Pipe::B
+            || owner.streams[0].slot != 0
+            || owner.streams[1].slot != 4
+            || owner.streams.iter().any(|s| {
+                s.route.probe.mst.map(|m| m.slots) != Some(4)
+                    || s.route.probe.uhbr.as_deref().map(|p| {
+                        (
+                            p.link,
+                            p.stream.tu,
+                            p.stream.m_n,
+                            p.caps.allowed(2_000_000, 4),
+                            p.caps.max_limits(),
+                        )
+                    }) != Some((
+                        uhbr::UhbrLink {
+                            rate: uhbr::UhbrRate::Uhbr20,
+                            lanes: 2,
+                            pipe_bpp: 24,
+                        },
+                        4,
+                        mn,
+                        false,
+                        (2_000_000, 2),
+                    ))
+            })
+        {
+            return TestResult::Fail("the retry runs both streams at UHBR20 x2 with Linux's slots");
+        }
+        let tables: Vec<[u8; 3]> = aux.payload.iter().map(|&(t, _)| t).collect();
+        if tables != [[0, 0, 0x3f], [2, 0, 4], [3, 4, 4]] {
+            return TestResult::Fail("only the retry allocates payloads: slots 0..4 and 4..8");
+        }
+        {
+            let sink = io.sink.borrow();
+            let bw: Vec<u8> = sink
+                .uhbr_log
+                .iter()
+                .filter_map(|&(a, v)| (a == 0x100).then_some(v))
+                .collect();
+            if bw != [0x02, 0x02] || sink.training_writes_to(0x101) != [4, 2] {
+                return TestResult::Fail("training must try UHBR20 x4, then UHBR20 x2");
+            }
+        }
+        if owner.stop_aux(&io, &mut aux).is_err() || !owner.stopped() || owner.release(&io).is_err()
+        {
+            return TestResult::Fail("the retried MST link must stop and release");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_mtl_mst_128b132b_training_fallback_retry
     );
 
     /// What keeps a hub off 128b/132b MST under `narf.intel.uhbr=1`: no

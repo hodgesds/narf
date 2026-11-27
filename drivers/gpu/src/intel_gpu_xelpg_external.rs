@@ -139,7 +139,9 @@
 //! reverses it and hands the sink back to 8b/10b channel coding. A failed
 //! 128b/132b training stops the route and retries once at Linux's reduced
 //! configuration (`intel_dp_get_link_train_fallback_values`, then the
-//! modeset retry's link choice), which may be 8b/10b. On
+//! modeset retry's link choice), which may be 8b/10b and, for a sink that
+//! decompresses, compressed again by the retry's DSC search; a 128b/132b
+//! MST link retries its streams at the BW-order reduction. On
 //! display 30+ Thunderbolt alt mode the link runs through the DP tunnel's BW
 //! allocation ([`tunnel`]): the tunnel supplies the DPRX's 128b/132b rates
 //! and caps the link, the stream's bandwidth is requested before the port
@@ -1094,6 +1096,9 @@ pub struct UhbrPlan {
     pub caps: uhbr::LinkCaps,
     /// The pipe's maximum bpp (`compute_sink_pipe_bpp`), for the retry.
     pub max_bpp: u8,
+    /// The sink's DSC capabilities when it decompresses
+    /// (`intel_dp_get_dsc_sink_cap`), for the retry's DSC search.
+    pub dsc_sink: Option<dsc::DpDscSink>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1447,6 +1452,7 @@ fn plan_uhbr_link<A: crate::dp_aux::AuxChannel + ?Sized>(
                     tunnel,
                     caps,
                     max_bpp: max_bpp.min(dsc::PIPE_BPP) as u8,
+                    dsc_sink: dsc_sink.copied(),
                 },
                 dsc: None,
             }))
@@ -1484,19 +1490,7 @@ fn plan_uhbr_dsc(
     }
     // DISPLAY_VER < 20: the DSC->DPT interface limit.
     let display14 = link.display_ip == DisplayIp::Xelpdp;
-    let fit = |bpp_x16: u32, slices: u8| -> Option<(u32, u8)> {
-        let (order, n) = caps.ordered(uhbr::FallbackOrder::RateLane);
-        order[..n]
-            .iter()
-            .copied()
-            .filter(|&(r, l)| r >= 1_000_000 && caps.allowed(r, l))
-            .find(|&(r, l)| {
-                uhbr::UhbrRate::from_link_rate(r)
-                    .and_then(|rate| uhbr::dsc_mtp_tu(rate, l, mode, bpp_x16, slices, display14))
-                    .is_some()
-            })
-    };
-    let plan = dsc::compute_with(&d.dsc, limits, mode, max_bpp, cap, Some(&fit))
+    let plan = uhbr_dsc_search(d, limits, caps, mode, max_bpp, cap, display14)
         .map_err(ExternalError::Dsc)?;
     let Some(rate) = uhbr::UhbrRate::from_link_rate(plan.link_rate) else {
         return Ok(None);
@@ -1504,15 +1498,8 @@ fn plan_uhbr_dsc(
     if link.tbt() && !link.display_ip.is_display30() {
         return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt));
     }
-    let stream = uhbr::dsc_mtp_tu(
-        rate,
-        plan.lanes,
-        mode,
-        u32::from(plan.compressed_bpp_x16),
-        plan.slice_count,
-        display14,
-    )
-    .ok_or(ExternalError::Uhbr(uhbr::UhbrRefusal::Slots))?;
+    let stream = uhbr_dsc_stream(&plan, rate, mode, display14)
+        .ok_or(ExternalError::Uhbr(uhbr::UhbrRefusal::Slots))?;
     Ok(Some(UhbrChoice {
         plan: UhbrPlan {
             link: uhbr::UhbrLink {
@@ -1525,9 +1512,54 @@ fn plan_uhbr_dsc(
             tunnel,
             caps: *caps,
             max_bpp: max_bpp.min(dsc::PIPE_BPP) as u8,
+            dsc_sink: Some(*d),
         },
         dsc: Some(plan),
     }))
+}
+
+/// [`dsc::compute_with`] over the 8b/10b configurations of `limits` and
+/// the allowed 128b/132b configurations of `caps` (`dsc_compute_link_config`
+/// in `INTEL_DP_LINK_CAPS_ORDER_KEY_RATE_LANE` order).
+fn uhbr_dsc_search(
+    d: &dsc::DpDscSink,
+    limits: &dsc::LinkLimits,
+    caps: &uhbr::LinkCaps,
+    mode: &Mode,
+    max_bpp: u32,
+    cap: Option<u64>,
+    display14: bool,
+) -> Result<DscPlan, DscRefusal> {
+    let fit = |bpp_x16: u32, slices: u8| -> Option<(u32, u8)> {
+        let (order, n) = caps.ordered(uhbr::FallbackOrder::RateLane);
+        order[..n]
+            .iter()
+            .copied()
+            .filter(|&(r, l)| r >= 1_000_000 && caps.allowed(r, l))
+            .find(|&(r, l)| {
+                uhbr::UhbrRate::from_link_rate(r)
+                    .and_then(|rate| uhbr::dsc_mtp_tu(rate, l, mode, bpp_x16, slices, display14))
+                    .is_some()
+            })
+    };
+    dsc::compute_with(&d.dsc, limits, mode, max_bpp, cap, Some(&fit))
+}
+
+/// The compressed MTP and M/N of a 128b/132b DSC plan ([`uhbr::dsc_mtp_tu`]).
+fn uhbr_dsc_stream(
+    plan: &DscPlan,
+    rate: uhbr::UhbrRate,
+    mode: &Mode,
+    display14: bool,
+) -> Option<uhbr::UhbrStream> {
+    uhbr::dsc_mtp_tu(
+        rate,
+        plan.lanes,
+        mode,
+        u32::from(plan.compressed_bpp_x16),
+        plan.slice_count,
+        display14,
+    )
 }
 
 /// The 128b/132b MST link Linux would run (`intel_dp_compute_config_limits`
@@ -2185,20 +2217,22 @@ fn activate_with_payload<M: MmioWindow + ?Sized>(
     }
 }
 
-/// The modeset retry after a failed 128b/132b training at the probe's
+/// The modeset retry after a failed 128b/132b SST training at the probe's
 /// link: [`uhbr::LinkCaps::fallback`] (SST order), then
-/// `intel_dp_compute_link_config_wide` over the configurations still
-/// allowed ([`uhbr::wide_search`], with the tunnel's cap). A 128b/132b
-/// result is a new plan (its MTP and M/N); an 8b/10b result hands the
-/// probe to the 8b/10b route at that rate, lane count and pipe bpp (the
-/// stop already returned the tunnel to its legacy allocation). `None` when
-/// nothing follows or nothing allowed carries the stream (Linux would
-/// prune the mode).
+/// `intel_dp_compute_config` over the configurations still allowed:
+/// `intel_dp_compute_link_config_wide` ([`uhbr::wide_search`], with the
+/// tunnel's cap) and, when nothing carries the stream uncompressed and the
+/// sink decompresses, Linux 7.4's DSC search ([`uhbr_dsc_search`]: the
+/// 8b/10b configurations under the reduced maximum with FEC, then the
+/// allowed 128b/132b ones). A compressed stream retries the same way,
+/// recomputing its DSC configuration. A 128b/132b result is a new plan (its
+/// MTP and M/N); an 8b/10b result hands the probe to the 8b/10b route at
+/// that rate, lane count and pipe bpp, compressed or not (the stop already
+/// returned the tunnel to its legacy allocation). `None` when nothing
+/// follows or nothing allowed carries the stream (Linux would prune the
+/// mode). An MST link retries in its owner (`intel_gpu_xelpg_mst.rs`).
 fn uhbr_fallback(probe: &MtlSinkProbe) -> Option<MtlSinkProbe> {
-    // A compressed 128b/132b stream's retry would recompute the DSC
-    // configuration too (Linux reruns intel_dp_compute_config), and an MST
-    // link's retry the whole topology (the BW-order fallback); not run.
-    if probe.dsc.is_some() || probe.mst.is_some() {
+    if probe.mst.is_some() {
         return None;
     }
     let plan = *probe.uhbr.as_deref()?;
@@ -2209,10 +2243,14 @@ fn uhbr_fallback(probe: &MtlSinkProbe) -> Option<MtlSinkProbe> {
         .filter(|t| t.bw_alloc_supported)
         .and_then(|t| t.available_bw)
         .map(u64::from);
-    let link = uhbr::wide_search(&caps, &probe.mode, u32::from(plan.max_bpp), cap)?;
     let mode = probe.mode;
+    let max_bpp = u32::from(plan.max_bpp);
+    let Some(link) = uhbr::wide_search(&caps, &mode, max_bpp, cap) else {
+        return uhbr_dsc_fallback(probe, &plan, caps, cap);
+    };
     let mut next = probe.clone();
     next.pipe_bpp = link.pipe_bpp;
+    next.dsc = None;
     match uhbr::UhbrRate::from_link_rate(link.link_rate) {
         Some(rate) => {
             let chosen = uhbr::UhbrLink {
@@ -2245,6 +2283,70 @@ fn uhbr_fallback(probe: &MtlSinkProbe) -> Option<MtlSinkProbe> {
                 lanes: link.lanes,
                 demand_kbps: stream_demand_kbps(mode.pixel_clock_khz, link.pipe_bpp),
                 payload_kbps: rate.payload_kbps(link.lanes),
+                over_budget: false,
+            };
+        }
+    }
+    Some(next)
+}
+
+/// [`uhbr_fallback`]'s DSC half (`intel_dp_dsc_compute_config` in the
+/// retry's `intel_dp_compute_config`): the search over `caps` after the
+/// fallback, its 8b/10b side being the common rates and lane counts under
+/// the reduced maximum limits ([`uhbr::LinkCaps::limits_8b10b`]).
+fn uhbr_dsc_fallback(
+    probe: &MtlSinkProbe,
+    plan: &UhbrPlan,
+    caps: uhbr::LinkCaps,
+    cap: Option<u64>,
+) -> Option<MtlSinkProbe> {
+    let d = plan.dsc_sink.filter(|d| d.dsc.dpcd.supports_dsc() && !d.branch)?;
+    let mode = probe.mode;
+    let display14 = probe.display_ip == DisplayIp::Xelpdp;
+    let limits = caps.limits_8b10b();
+    let found = uhbr_dsc_search(&d, &limits, &caps, &mode, u32::from(plan.max_bpp), cap, display14)
+        .ok()?;
+    let mut next = probe.clone();
+    next.pipe_bpp = found.pipe_bpp;
+    next.dsc = Some(found);
+    let compressed = u32::from(found.compressed_bpp_x16);
+    match uhbr::UhbrRate::from_link_rate(found.link_rate) {
+        Some(rate) => {
+            let stream = uhbr_dsc_stream(&found, rate, &mode, display14)?;
+            let lanes = u32::from(found.lanes);
+            next.negotiated.lanes = found.lanes;
+            next.negotiated.demand_kbps = uhbr::link_required(
+                lanes,
+                mode.pixel_clock_khz,
+                u32::from(mode.h_active),
+                compressed,
+            ) * 8;
+            next.negotiated.payload_kbps = uhbr::max_link_data_rate(rate, lanes) * 8;
+            next.uhbr = Some(alloc::boxed::Box::new(UhbrPlan {
+                link: uhbr::UhbrLink {
+                    rate,
+                    lanes: found.lanes,
+                    pipe_bpp: found.pipe_bpp,
+                },
+                stream,
+                caps,
+                ..*plan
+            }));
+        }
+        None => {
+            let rate = train_rate_for(found.link_rate)?;
+            next.uhbr = None;
+            next.negotiated = NegotiatedLink {
+                rate,
+                lanes: found.lanes,
+                demand_kbps: dsc::link_required(
+                    u32::from(found.lanes),
+                    mode.pixel_clock_khz,
+                    u32::from(mode.h_active),
+                    compressed,
+                    found.fec,
+                ) * 8,
+                payload_kbps: rate.payload_kbps(found.lanes),
                 over_budget: false,
             };
         }

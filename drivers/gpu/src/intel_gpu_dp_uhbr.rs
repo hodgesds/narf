@@ -50,7 +50,10 @@
 //!   128b/132b training (the failed configuration disabled, the maximum
 //!   limits reduced), and the modeset retry's
 //!   `intel_dp_compute_link_config_wide` over what is still allowed
-//!   ([`wide_search`]), which may land on 8b/10b.
+//!   ([`wide_search`]), which may land on 8b/10b; with a DSC sink the
+//!   retry's DSC search ([`LinkCaps::limits_8b10b`] and the allowed
+//!   128b/132b configurations), and for MST the BW-order reduction with
+//!   every stream retried at the new link.
 //!
 //! - **DSC** ([`dsc_mtp_tu`]): Linux 7.4's `dsc_compute_link_config` with
 //!   the 128b/132b configurations (`intel_dp_mtp_tu_compute_config` with
@@ -789,6 +792,26 @@ impl LinkCaps {
     /// The maximum link limits (`intel_dp_link_caps_get_max_limits`).
     pub fn max_limits(&self) -> (u32, u8) {
         (self.max_rate, self.max_lane_count)
+    }
+
+    /// The 8b/10b configurations the maximum link limits allow, as the DSC
+    /// search's 8b/10b limits: the common 8b/10b rates up to the maximum
+    /// rate and the lane counts up to the maximum lane count (a fallback
+    /// only disables the failed configuration, a 128b/132b one here).
+    pub fn limits_8b10b(&self) -> dsc::LinkLimits {
+        let mut rates = [0u32; 9];
+        let allowed = self.rates[..usize::from(self.num_rates)]
+            .iter()
+            .copied()
+            .filter(|&r| r < 1_000_000 && r <= self.max_rate);
+        for (dst, r) in rates.iter_mut().zip(allowed) {
+            *dst = r;
+        }
+        dsc::LinkLimits {
+            rates,
+            max_lanes: self.max_lane_count.min(self.max_lanes),
+            use_max: false,
+        }
     }
 
     /// Every supported configuration, ascending in `order`.
