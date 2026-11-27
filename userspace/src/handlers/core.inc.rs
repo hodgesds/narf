@@ -12652,6 +12652,17 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
+    // `cgroup_can_fork` → `pids_can_fork`, threads included: the child would
+    // take a level of the parent's cgroup past pids.max. A CLONE_INTO_CGROUP
+    // child joins its target instead, whose controllers decide at placement.
+    #[cfg(feature = "cgroup")]
+    if flags & CLONE_INTO_CGROUP == 0 {
+        let task = current_task_id();
+        if !narf_filesystem::cgroupfs::can_fork(task_to_pid_raw(task).unwrap_or(task), task) {
+            ctx.set_return(errno_ret(EAGAIN));
+            return;
+        }
+    }
     // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — threads
     // included; a SCHED_DEADLINE reservation cannot be duplicated.
     if sched_fork_denied(current_task_id()) {

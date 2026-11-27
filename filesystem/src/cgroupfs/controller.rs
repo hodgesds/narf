@@ -82,6 +82,14 @@ pub trait ControllerState: Send + Sync + core::fmt::Debug + 'static {
         Ok(())
     }
 
+    /// Linux `cgroup_subsys::can_fork`: may one more task be forked into
+    /// this level? Asked of every active level before fork or clone creates
+    /// anything (`pids_can_fork` refuses past `pids.max`); a refusal is the
+    /// fork's -EAGAIN. Default: allow.
+    fn can_fork(&self) -> bool {
+        true
+    }
+
     /// Commit: a process joined this cgroup level. Charge counters here.
     fn on_attach(&self, _pid: u64) {}
 

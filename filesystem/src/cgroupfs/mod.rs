@@ -810,6 +810,20 @@ pub fn attach_to_root(pid: u64) {
     place_forced(pid, &r);
 }
 
+/// Linux `cgroup_can_fork`: may the task `parent_tid` (of process
+/// `parent_pid`) fork a child into its cgroup? Asked of every active
+/// controller on every level up to the root before fork or clone creates
+/// anything; false is the fork's -EAGAIN (`pids.max`). The child is charged
+/// when it joins ([`fork_inherit`] / [`fork_thread_inherit`]).
+pub fn can_fork(parent_pid: u64, parent_tid: u64) -> bool {
+    let cg = thread_cgroup_of(parent_tid, parent_pid);
+    charge_chain(&cg).iter().all(|node| {
+        snapshot_ctrl_states(node)
+            .iter()
+            .all(|(_, state)| state.can_fork())
+    })
+}
+
 /// Fork/clone inheritance: a child process joins its parent's cgroup.
 pub fn fork_inherit(parent_pid: u64, child_pid: u64) {
     let dst = cgroup_of(parent_pid);

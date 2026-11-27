@@ -114,6 +114,16 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
         ctx.set_return(errno_ret(EAGAIN));
         return;
     }
+    // `cgroup_can_fork` → `pids_can_fork`: the child would take a level of
+    // the parent's cgroup past pids.max. The child joins that cgroup below.
+    #[cfg(feature = "cgroup")]
+    {
+        let task = current_task_id();
+        if !narf_filesystem::cgroupfs::can_fork(task_to_pid_raw(task).unwrap_or(task), task) {
+            ctx.set_return(errno_ret(EAGAIN));
+            return;
+        }
+    }
     // `sched_fork`: `if (dl_prio(p->prio)) return -EAGAIN;` — a
     // SCHED_DEADLINE reservation cannot be duplicated into a child.
     if sched_fork_denied(current_task_id()) {
