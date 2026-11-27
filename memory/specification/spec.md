@@ -913,9 +913,16 @@ impl AddressSpace {
     /// Registration and ticket recheck share the region lock with retirement.
     /// Publish, failure, cancellation and overlapping VMA removal wake every
     /// waiter on that ticket; replacement tickets and other mms cannot alias.
-    /// Wait storage is fixed at MAX_DEMAND_WAITERS (at least the user-task
-    /// admission limit), allocation-free and released on waiter drop. Wakes
-    /// occur by reference under the region lock and require IRQ-safe wakers.
+    /// Each DemandPageWait carries its own wait-queue entry, linked into one
+    /// of 256 hashed queues (Linux `folio_wait_table`) on first pending poll
+    /// and unlinked on drop: no capacity, no allocation. A polled wait is
+    /// !Unpin and stays pinned until dropped. Wakes occur by reference
+    /// under the region lock and require IRQ-safe wakers. The parking hook
+    /// records the pinned wait with the scheduler (stackful::StackWait,
+    /// detach = DemandPageWait::detach_raw) so a task dropped mid-park has
+    /// its entry unlinked before its stack is retired.
+    ///
+    /// pub unsafe fn DemandPageWait::detach_raw(wait: *const ());
     /// The installed task-layer hook parks without any AS lock, checks fatal
     /// signals, and fails when it cannot park; it never spins an executor.
     ///

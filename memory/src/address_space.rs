@@ -26,9 +26,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod demand_wait;
 #[path = "device_revoke.rs"]
 mod device_revoke;
-pub use demand_wait::{
-    install_demand_page_wait_hook, DemandPageWait, DemandPageWaitHook, MAX_DEMAND_WAITERS,
-};
+pub use demand_wait::{install_demand_page_wait_hook, DemandPageWait, DemandPageWaitHook};
 #[path = "region_index.rs"]
 mod region_index;
 #[path = "remote_access.rs"]

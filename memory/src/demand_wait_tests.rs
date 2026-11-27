@@ -45,9 +45,9 @@ fn smoke_demand_wait_blocks_until_exact_owner_retires() -> TestResult {
     let count = Arc::new(Count::default());
     let waker = Waker::from(count.clone());
     let mut cx = Context::from_waker(&waker);
-    let mut wait = DemandPageWait::new(&space, BASE, ticket);
+    let mut wait = core::pin::pin!(DemandPageWait::new(&space, BASE, ticket));
     for _ in 0..16 {
-        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
     }
     other.cancel_demand_page(BASE, other_ticket);
     space.cancel_demand_page(BASE + 4096, neighbor);
@@ -56,7 +56,7 @@ fn smoke_demand_wait_blocks_until_exact_owner_retires() -> TestResult {
     assert_eq!(count.0.load(Ordering::Relaxed), 1);
     // A new owner at the same VA cannot extend the old ticket's wait.
     let replacement = claim(&space, BASE);
-    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     space.cancel_demand_page(BASE, replacement);
     assert_eq!(count.0.load(Ordering::Relaxed), 1);
     TestResult::Pass
@@ -70,12 +70,12 @@ fn smoke_demand_wait_completion_before_registration() -> TestResult {
     let space = AddressSpace::empty();
     space.map_region(region()).unwrap();
     let ticket = claim(&space, BASE);
-    let mut wait = DemandPageWait::new(&space, BASE, ticket);
+    let mut wait = core::pin::pin!(DemandPageWait::new(&space, BASE, ticket));
     space.cancel_demand_page(BASE, ticket);
     let count = Arc::new(Count::default());
     let waker = Waker::from(count.clone());
     let mut cx = Context::from_waker(&waker);
-    assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     assert_eq!(count.0.load(Ordering::Relaxed), 0);
     assert!(wait.registration.is_none());
     TestResult::Pass
@@ -97,8 +97,12 @@ fn smoke_demand_wait_unmap_wakes_inline_overflow_and_all_peers() -> TestResult {
     let mut cx = Context::from_waker(&waker);
     let mut waits = alloc::vec::Vec::new();
     for index in [0, 0, 0, super::super::INLINE_DEMAND_CLAIMS] {
-        let mut wait = DemandPageWait::new(&space, BASE + index as u64 * 4096, tickets[index]);
-        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+        let mut wait = alloc::boxed::Box::pin(DemandPageWait::new(
+            &space,
+            BASE + index as u64 * 4096,
+            tickets[index],
+        ));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
         waits.push(wait);
     }
     // Dropping one waiter (e.g. SIGKILL) removes only its registration.
@@ -107,18 +111,22 @@ fn smoke_demand_wait_unmap_wakes_inline_overflow_and_all_peers() -> TestResult {
     assert_eq!(count.0.load(Ordering::Relaxed), 3);
     space.map_region(region()).unwrap();
     for wait in &mut waits {
-        assert_eq!(Pin::new(wait).poll(&mut cx), Poll::Ready(Ok(())));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
     // Also exercise an actual waiter on the overflow claim's cancellation.
     for (page, ticket) in tickets.iter_mut().enumerate() {
         *ticket = claim(&space, BASE + page as u64 * 4096);
     }
     let index = super::super::INLINE_DEMAND_CLAIMS;
-    let mut overflow = DemandPageWait::new(&space, BASE + index as u64 * 4096, tickets[index]);
-    assert!(Pin::new(&mut overflow).poll(&mut cx).is_pending());
+    let mut overflow = core::pin::pin!(DemandPageWait::new(
+        &space,
+        BASE + index as u64 * 4096,
+        tickets[index]
+    ));
+    assert!(overflow.as_mut().poll(&mut cx).is_pending());
     space.unmap_region(VirtAddr::new(BASE)).unwrap();
     assert_eq!(count.0.load(Ordering::Relaxed), 4);
-    assert_eq!(Pin::new(&mut overflow).poll(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(overflow.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     TestResult::Pass
 }
 kernel_test_in!(
@@ -134,8 +142,8 @@ fn smoke_demand_wait_publish_and_install_failure_wake() -> TestResult {
         let count = Arc::new(Count::default());
         let waker = Waker::from(count.clone());
         let mut cx = Context::from_waker(&waker);
-        let mut wait = DemandPageWait::new(&space, BASE, ticket);
-        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+        let mut wait = core::pin::pin!(DemandPageWait::new(&space, BASE, ticket));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
         // Synthetic backing: removed before AS destruction, never freed.
         let phys = PhysAddr::new(0x34_000);
         crate::rmap::try_prepare_owner_slots(phys, 1).unwrap();
@@ -155,7 +163,7 @@ fn smoke_demand_wait_publish_and_install_failure_wake() -> TestResult {
             assert_eq!(result, Ok(true));
         }
         assert_eq!(count.0.load(Ordering::Relaxed), 1);
-        assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(Ok(())));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
     TestResult::Pass
 }
@@ -166,7 +174,8 @@ kernel_test_in!(
 
 fn smoke_demand_wait_real_fault_enters_unlocked_wait() -> TestResult {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
-    fn complete_owner(mut wait: DemandPageWait<'_>) -> Result<(), AddressSpaceError> {
+    fn complete_owner(wait: DemandPageWait<'_>) -> Result<(), AddressSpaceError> {
+        let mut wait = core::pin::pin!(wait);
         CALLS.fetch_add(1, Ordering::Relaxed);
         assert!(
             wait.space.regions.try_lock().is_some(),
@@ -175,10 +184,10 @@ fn smoke_demand_wait_real_fault_enters_unlocked_wait() -> TestResult {
         let count = Arc::new(Count::default());
         let waker = Waker::from(count.clone());
         let mut cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
         wait.space.cancel_demand_page(wait.page, wait.ticket);
         assert_eq!(count.0.load(Ordering::Relaxed), 1);
-        assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(Ok(())));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
         Ok(())
     }
     struct Restore(usize);
@@ -219,7 +228,8 @@ kernel_test_in!(
     smoke_demand_wait_real_fault_enters_unlocked_wait
 );
 
-fn smoke_demand_wait_capacity_and_replacement_waker() -> TestResult {
+fn smoke_demand_wait_replacement_waker() -> TestResult {
+    const PEERS: usize = 3;
     let space = AddressSpace::empty();
     space.map_region(region()).unwrap();
     let ticket = claim(&space, BASE);
@@ -228,34 +238,29 @@ fn smoke_demand_wait_capacity_and_replacement_waker() -> TestResult {
     let old_waker = Waker::from(old.clone());
     let new_waker = Waker::from(new.clone());
     let mut cx = Context::from_waker(&old_waker);
-    let mut waits = alloc::vec::Vec::with_capacity(MAX_DEMAND_WAITERS);
-    for _ in 0..MAX_DEMAND_WAITERS {
-        let mut wait = DemandPageWait::new(&space, BASE, ticket);
-        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    let mut waits = alloc::vec::Vec::with_capacity(PEERS);
+    for _ in 0..PEERS {
+        let mut wait = alloc::boxed::Box::pin(DemandPageWait::new(&space, BASE, ticket));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
         waits.push(wait);
     }
-    let mut extra = DemandPageWait::new(&space, BASE, ticket);
-    assert_eq!(
-        Pin::new(&mut extra).poll(&mut cx),
-        Poll::Ready(Err(AddressSpaceError::AllocationFailed))
-    );
-    waits.pop();
-    assert!(Pin::new(&mut extra).poll(&mut cx).is_pending());
-    assert!(Pin::new(&mut extra)
+    // A re-poll with another waker replaces it in place: one entry, the
+    // newest waker.
+    let mut extra = core::pin::pin!(DemandPageWait::new(&space, BASE, ticket));
+    assert!(extra.as_mut().poll(&mut cx).is_pending());
+    assert!(extra
+        .as_mut()
         .poll(&mut Context::from_waker(&new_waker))
         .is_pending());
     space.cancel_demand_page(BASE, ticket);
-    assert_eq!(old.0.load(Ordering::Relaxed), MAX_DEMAND_WAITERS - 1);
+    assert_eq!(old.0.load(Ordering::Relaxed), PEERS);
     assert_eq!(new.0.load(Ordering::Relaxed), 1);
     drop(waits);
-    drop(extra);
+    assert_eq!(extra.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     assert_eq!(ACTIVE.load(Ordering::Acquire), 0);
     TestResult::Pass
 }
-kernel_test_in!(
-    "memory/demand_wait",
-    smoke_demand_wait_capacity_and_replacement_waker
-);
+kernel_test_in!("memory/demand_wait", smoke_demand_wait_replacement_waker);
 
 /// More waiters than the old fixed table held (one slot per task the
 /// scheduler could admit) all park on one owner, and all wake when it

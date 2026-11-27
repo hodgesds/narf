@@ -1414,11 +1414,23 @@ impl narf_filesystem::procfs::ProcFile for NarfMmOrphansFile {
 /// Linux's killable folio wait: competitors sleep while one fault owns the
 /// page, and SIGKILL can end that sleep without cancelling the owner's I/O.
 fn wait_for_demand_owner(
-    mut wait: narf_memory::address_space::DemandPageWait<'_>,
+    wait: narf_memory::address_space::DemandPageWait<'_>,
 ) -> Result<(), narf_memory::AddressSpaceError> {
     use core::future::Future;
-    const _: () =
-        assert!(narf_memory::address_space::MAX_DEMAND_WAITERS >= narf_scheduler::MAX_USER_TASKS);
+    // The wait links its own queue entry once polled: pinned from here on,
+    // and recorded so a task dropped while parked here has it unlinked
+    // before its stack is retired. The record drops first, the wait last.
+    let mut wait = core::pin::pin!(wait);
+    // SAFETY: `detach_raw` unlinks exactly this pinned wait's entry and
+    // does not block; the scheduler calls it only once this task has
+    // stopped for good, while its stack (and so `wait`) is still mapped.
+    let stack_wait = core::pin::pin!(unsafe {
+        narf_scheduler::stackful::StackWait::new(
+            core::ptr::from_ref(&*wait).cast(),
+            narf_memory::address_space::DemandPageWait::detach_raw,
+        )
+    });
+    let _record = narf_scheduler::stackful::record_stack_wait(stack_wait.as_ref());
     // No fallback spin inside an executor poll or an IRQ handler. A synchronous
     // caller without its own stack cannot wait for another task to run.
     if narf_scheduler::stackful::current_stackful_waker().is_none() {
@@ -1437,7 +1449,7 @@ fn wait_for_demand_owner(
     }
     let mut signal = SignalWait { task: current_task_id(), armed: false };
     poll_blocking(core::future::poll_fn(|cx| {
-        let result = core::pin::Pin::new(&mut wait).poll(cx);
+        let result = wait.as_mut().poll(cx);
         if result.is_ready() {
             return result;
         }
