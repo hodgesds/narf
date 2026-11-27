@@ -15079,23 +15079,37 @@ fn parse_scm_send_ancillary(
             }
         } else if level == 0 && ctype == 8 {
             // SOL_IP / IP_PKTINFO: struct in_pktinfo { int ipi_ifindex;
-            // in_addr ipi_spec_dst; in_addr ipi_addr; } = 12 bytes. The source
-            // override is `ipi_spec_dst`; a zero spec_dst means "no override".
+            // in_addr ipi_spec_dst; in_addr ipi_addr; } = 12 bytes.
+            // `ip_cmsg_send`: a nonzero `ipi_ifindex` is the output device
+            // (`ipc->oif`) and `ipi_spec_dst` the source; a zero spec_dst
+            // means "no override".
             if cmsg_len >= 16 + 12 {
+                let ifindex = u32::from_ne_bytes(ctrl[off + 16..off + 20].try_into().unwrap());
                 let mut addr = [0u8; 16];
                 addr[..4].copy_from_slice(&ctrl[off + 20..off + 24]);
-                if addr[..4] != [0, 0, 0, 0] {
-                    out.src_override = Some(crate::socket::SendPktInfo { v6: false, addr });
+                if addr[..4] != [0, 0, 0, 0] || ifindex != 0 {
+                    out.src_override = Some(crate::socket::SendPktInfo {
+                        v6: false,
+                        addr,
+                        ifindex,
+                    });
                 }
             }
         } else if level == 41 && ctype == 50 {
             // SOL_IPV6 / IPV6_PKTINFO: struct in6_pktinfo { in6_addr ipi6_addr;
-            // int ipi6_ifindex; } = 20 bytes. Source override is `ipi6_addr`.
+            // int ipi6_ifindex; } = 20 bytes. `ip6_datagram_send_ctl`: a
+            // nonzero `ipi6_ifindex` is the output device
+            // (`fl6->flowi6_oif`) and `ipi6_addr` the source.
             if cmsg_len >= 16 + 20 {
                 let mut addr = [0u8; 16];
                 addr.copy_from_slice(&ctrl[off + 16..off + 32]);
-                if addr != [0u8; 16] {
-                    out.src_override = Some(crate::socket::SendPktInfo { v6: true, addr });
+                let ifindex = u32::from_ne_bytes(ctrl[off + 32..off + 36].try_into().unwrap());
+                if addr != [0u8; 16] || ifindex != 0 {
+                    out.src_override = Some(crate::socket::SendPktInfo {
+                        v6: true,
+                        addr,
+                        ifindex,
+                    });
                 }
             }
         }

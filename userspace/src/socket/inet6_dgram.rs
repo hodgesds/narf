@@ -183,6 +183,7 @@ fn enqueue6_local(target: &SocketFile, pkt: DgramPacket6, gso: Option<u16>) {
                 peer_addr: pkt.peer_addr,
                 peer_port: pkt.peer_port,
                 scope_id: pkt.scope_id,
+                ifindex: pkt.ifindex,
                 destination: pkt.destination,
                 hop_limit: pkt.hop_limit,
                 traffic_class: pkt.traffic_class,
@@ -216,6 +217,28 @@ fn udp6_gso_send_check(
         Err(narf_net::udp_gso::GsoError::MsgSize) => Err(SockError::MsgSize),
         Err(narf_net::udp_gso::GsoError::Invalid) => Err(SockError::InvalidArg),
     }
+}
+
+/// The arrival device of a datagram this host sends to its own address `dst`
+/// (`scope_id` being the destination's scope), as IPV6_PKTINFO reports it.
+/// The packet loops through lo, and `ip6_rcv_core` sets `IP6CB(skb)->iif`
+/// from `ip6_dst_idev(dst)`: the local route's own device
+/// (`ip6_rt_copy_init` takes `rt6i_idev` from the route's nexthop device,
+/// while `ip6_rt_get_dev_rcu` makes lo the dst's output device). That is lo
+/// for `::1` and the owning device for any other address of the host; a
+/// link-local address is the one on the scope's device.
+pub(super) fn local_arrival_ifindex(ns: u64, dst: &[u8; 16], scope_id: u32) -> u32 {
+    if *dst == LOOPBACK {
+        return super::sockopt::LOOPBACK_IFINDEX;
+    }
+    let link_local = dst[0] == 0xfe && dst[1] & 0xc0 == 0x80;
+    if link_local && scope_id != 0 {
+        return scope_id;
+    }
+    narf_net::ipv6::addrs::snapshot_in(ns)
+        .into_iter()
+        .find(|a| a.addr == *dst && a.ifindex != 0)
+        .map_or(super::sockopt::LOOPBACK_IFINDEX, |a| a.ifindex)
 }
 
 /// The device MTU of interface `ifindex` (lo's 64 KiB when unregistered).
@@ -598,6 +621,13 @@ impl SocketFile {
         flags: u32,
         addr: Option<&SockAddr>,
     ) -> SocketOpResult {
+        // This send's IPV6_PKTINFO (`ip6_datagram_send_ctl`), taken before
+        // any early return so it never outlives the sendmsg that carried it:
+        // a nonzero `ipi6_ifindex` is the flow's output device and
+        // `ipi6_addr` its source.
+        let pktinfo = self.take_send_pktinfo().filter(|pi| pi.v6);
+        let cmsg_oif = pktinfo.map_or(0, |pi| pi.ifindex);
+        let src_override = pktinfo.and_then(|pi| pi.src_v6());
         {
             let mut guard = INET6_DGRAM_BOUND.lock();
             let map = guard.get_or_insert_with(BTreeMap::new);
@@ -693,22 +723,45 @@ impl SocketFile {
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }
+        if cmsg_oif != 0 {
+            // `ip6_datagram_send_ctl`: the flow's oif so far is the scope id
+            // or the bound device; an `ipi6_ifindex` naming another device is
+            // EINVAL, one naming no device ENODEV.
+            let bound = self.options.lock().bindtodevice_index;
+            let prior = if dest.2 != 0 { dest.2 } else { bound };
+            if prior != 0 && prior != cmsg_oif {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            }
+            if !super::sockopt::ifindex_exists(self.net_ns_id(), cmsg_oif) {
+                return SocketOpResult::Err(SockError::NoDevice);
+            }
+        }
         if super::sockopt::is_multicast_v6(&dest.0) {
-            return self.inet6_dgram_send_mcast(buf, local, local_port, dest, gso_size);
+            return self.inet6_dgram_send_mcast(
+                buf,
+                local,
+                local_port,
+                dest,
+                gso_size,
+                cmsg_oif,
+                src_override,
+            );
         }
         let options = self.options.lock().clone();
         let hop_limit = options.ipv6_unicast_hops;
         let is_local =
             dest.0 == LOOPBACK || narf_net::ipv6::addrs::is_local_in(self.net_ns_id(), &dest.0);
         if !is_local {
-            let bound_ifindex = if dest.2 != 0 {
+            let bound_ifindex = if cmsg_oif != 0 {
+                cmsg_oif
+            } else if dest.2 != 0 {
                 dest.2
             } else {
                 options.bindtodevice_index
             };
             return match narf_net::ipv6_stack::send_udp(
                 self.net_ns_id(),
-                (local != UNSPEC).then_some(local),
+                src_override.or((local != UNSPEC).then_some(local)),
                 local_port,
                 dest.0,
                 dest.1,
@@ -756,7 +809,13 @@ impl SocketFile {
             Ok(g) => g,
             Err(e) => return SocketOpResult::Err(e),
         };
-        let source = if local == UNSPEC { LOOPBACK } else { local };
+        // An unbound socket's source for one of the host's own addresses is
+        // that address (`ipv6_dev_get_saddr`, RFC 6724 rule 1).
+        let source = match src_override {
+            Some(s) => s,
+            None if local == UNSPEC => dest.0,
+            None => local,
+        };
         let target = {
             let guard = INET6_DGRAM_BOUND.lock();
             guard.as_ref().and_then(|m| {
@@ -778,6 +837,7 @@ impl SocketFile {
                     peer_addr: source,
                     peer_port: local_port,
                     scope_id: dest.2,
+                    ifindex: local_arrival_ifindex(self.net_ns_id(), &dest.0, dest.2),
                     destination: dest.0,
                     hop_limit: if hop_limit < 0 { 64 } else { hop_limit },
                     traffic_class: options.ext.ipv6_tclass as u8,
@@ -796,8 +856,14 @@ impl SocketFile {
     /// A datagram to an IPv6 multicast group: out the destination scope,
     /// `IPV6_MULTICAST_IF`, the bound device or the first NIC, with the
     /// `IPV6_MULTICAST_HOPS` limit; `ip6_finish_output2` loops a copy back
-    /// to local members while `IPV6_MULTICAST_LOOP` is set, and one sent out
-    /// lo comes back in through lo regardless.
+    /// to local members while `IPV6_MULTICAST_LOOP` is set. lo has no
+    /// multicast route, so a group send out lo is unreachable.
+    ///
+    /// `cmsg_oif` and `src_override` are the send's IPV6_PKTINFO
+    /// `ipi6_ifindex` and `ipi6_addr`: `udpv6_sendmsg` falls back to
+    /// `mcast_oif` only when the flow has no oif. avahi names every mDNS
+    /// packet's interface this way and never sets IPV6_MULTICAST_IF.
+    #[allow(clippy::too_many_arguments)]
     fn inet6_dgram_send_mcast(
         self: &Arc<Self>,
         buf: &[u8],
@@ -805,12 +871,27 @@ impl SocketFile {
         local_port: u16,
         dest: Inet6Peer,
         gso_size: u16,
+        cmsg_oif: u32,
+        src_override: Option<[u8; 16]>,
     ) -> SocketOpResult {
         let ns = self.net_ns_id();
         let options = self.options.lock().clone();
-        let Some(egress) = super::sockopt::mc_egress_v6(ns, &options, dest.2) else {
+        let egress = if cmsg_oif != 0 {
+            Some(cmsg_oif)
+        } else {
+            super::sockopt::mc_egress_v6(ns, &options, dest.2)
+        };
+        let Some(egress) = egress else {
             return SocketOpResult::Err(SockError::NetUnreach);
         };
+        // lo carries no multicast route: `addrconf_add_mroute` installs
+        // ff00::/8 only on a device `addrconf_dev_config` configures, which
+        // excludes loopback (`init_loopback`). With lo as the output device
+        // `ip6_dst_lookup_flow` finds no route, so the send is -ENETUNREACH,
+        // though joining a group on lo succeeds.
+        if egress == super::sockopt::LOOPBACK_IFINDEX {
+            return SocketOpResult::Err(SockError::NetUnreach);
+        }
         // `udp_v6_send_skb`'s GSO checks precede `ip6_finish_output2`'s
         // loopback of the group copy.
         let gso = match udp6_gso_send_check(
@@ -823,15 +904,12 @@ impl SocketFile {
             Err(e) => return SocketOpResult::Err(e),
         };
         let hops = options.ext.ipv6_mcast_hops;
-        let source = if local == UNSPEC {
-            mc_source_v6(ns, egress)
-        } else {
-            local
+        let source = match src_override {
+            Some(s) => s,
+            None if local == UNSPEC => mc_source_v6(ns, egress),
+            None => local,
         };
-        let via_lo = egress == super::sockopt::LOOPBACK_IFINDEX;
-        if (via_lo || options.ext.ipv6_mc_loop)
-            && super::sockopt::host_joined_v6(ns, egress, &dest.0)
-        {
+        if options.ext.ipv6_mc_loop && super::sockopt::host_joined_v6(ns, egress, &dest.0) {
             let targets = {
                 let guard = INET6_DGRAM_BOUND.lock();
                 guard
@@ -846,6 +924,9 @@ impl SocketFile {
                         peer_addr: source,
                         peer_port: local_port,
                         scope_id: egress,
+                        // `ip6_finish_output2`'s looped copy arrives on the
+                        // egress device.
+                        ifindex: egress,
                         destination: dest.0,
                         hop_limit: hops,
                         traffic_class: options.ext.ipv6_tclass as u8,
@@ -857,12 +938,12 @@ impl SocketFile {
                 );
             }
         }
-        if via_lo || hops == 0 {
+        if hops == 0 {
             return SocketOpResult::Ok(buf.len() as u64);
         }
         match narf_net::ipv6_stack::send_udp(
             ns,
-            (local != UNSPEC).then_some(local),
+            src_override.or((local != UNSPEC).then_some(local)),
             local_port,
             dest.0,
             dest.1,
@@ -919,7 +1000,7 @@ impl SocketFile {
                 ));
                 self.stash_inet6_recv_ancillary(super::Inet6RecvAncillary {
                     destination: packet.destination,
-                    ifindex: packet.scope_id,
+                    ifindex: packet.ifindex,
                     hop_limit: packet.hop_limit,
                     traffic_class: packet.traffic_class,
                     gso_size: packet.gso_size,
@@ -1000,6 +1081,7 @@ pub(super) fn deliver_wire(
                     peer_addr: src_ip,
                     peer_port: src_port,
                     scope_id: in_ifindex,
+                    ifindex: in_ifindex,
                     destination: dst_ip,
                     hop_limit: i32::from(meta.ttl),
                     traffic_class: meta.tos,
@@ -1034,6 +1116,7 @@ pub(super) fn deliver_wire(
         peer_addr: src_ip,
         peer_port: src_port,
         scope_id: in_ifindex,
+        ifindex: in_ifindex,
         destination: dst_ip,
         hop_limit: i32::from(meta.ttl),
         traffic_class: meta.tos,

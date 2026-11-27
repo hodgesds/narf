@@ -952,14 +952,33 @@ pub(crate) const SO_EE_ORIGIN_LOCAL: u8 = 1;
 /// `SO_EE_ORIGIN_ICMP` (`include/uapi/linux/errqueue.h`).
 pub(crate) const SO_EE_ORIGIN_ICMP: u8 = 2;
 
-/// A source-address override supplied by an `IP_PKTINFO` / `IPV6_PKTINFO`
-/// send control message (`sendmsg`). QUIC uses it to pin a reply's source
-/// address to the one the peer saw. `addr` holds an IPv4 `ipi_spec_dst` in its
-/// first 4 bytes, or a full IPv6 `ipi6_addr`.
+/// The output device and source address an `IP_PKTINFO` / `IPV6_PKTINFO`
+/// send control message (`sendmsg`) names. QUIC uses the address to pin a
+/// reply's source to the one the peer saw; avahi names each mDNS packet's
+/// interface with the ifindex. `addr` holds an IPv4 `ipi_spec_dst` in its
+/// first 4 bytes, or a full IPv6 `ipi6_addr`; zero means no override.
+/// `ifindex` is `ipi_ifindex` / `ipi6_ifindex`, which `ip_cmsg_send` and
+/// `ip6_datagram_send_ctl` make the flow's output device (`ipc->oif`,
+/// `fl6->flowi6_oif`) when it is not 0.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SendPktInfo {
     pub v6: bool,
     pub addr: [u8; 16],
+    pub ifindex: u32,
+}
+
+impl SendPktInfo {
+    /// The IPv4 source override (`ipi_spec_dst`), host order, if one was
+    /// given.
+    pub(crate) fn src_v4(&self) -> Option<u32> {
+        let a = u32::from_be_bytes([self.addr[0], self.addr[1], self.addr[2], self.addr[3]]);
+        (!self.v6 && a != 0).then_some(a)
+    }
+
+    /// The IPv6 source override (`ipi6_addr`), if one was given.
+    pub(crate) fn src_v6(&self) -> Option<[u8; 16]> {
+        (self.v6 && self.addr != [0; 16]).then_some(self.addr)
+    }
 }
 
 // ── SocketFile (FileOps impl, lives in fd table) ────────────────
@@ -1921,7 +1940,12 @@ fn map_admin_ioctl_error(error: narf_net::AdminError) -> FsError {
 struct DgramPacket6 {
     peer_addr: [u8; 16],
     peer_port: u16,
+    /// The source address's `sin6_scope_id` as recvfrom reports it.
     scope_id: u32,
+    /// The arrival device, `IP6CB(skb)->iif`, which IPV6_PKTINFO reports
+    /// (`ip6_datagram_recv_specific_ctl`). Never 0: every datagram arrives
+    /// on some device, a looped-back one on its local route's device.
+    ifindex: u32,
     destination: [u8; 16],
     hop_limit: i32,
     traffic_class: u8,
@@ -9506,6 +9530,7 @@ impl SocketFile {
                 peer_addr: dest.0,
                 peer_port: dest.1,
                 scope_id: dest.2,
+                ifindex: inet6_dgram::local_arrival_ifindex(self.net_ns_id(), &dest.0, dest.2),
                 destination: dest.0,
                 hop_limit: 64,
                 traffic_class: 0,
