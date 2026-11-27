@@ -53,6 +53,8 @@ const CGC_GATE_ALL: u32 = 0x1b; // JPEG_DEC|JPEG2_DEC|JMCIF|JRBBM
 const CGC_CTRL_TIMERS: u32 = 0x82; // (1<<CLK_GATE_DLY_TIMER shift 1)|(4<<CLK_OFF_DELAY shift 5)
 const CGC_CTRL_DYN: u32 = 0x1;
 const CGC_CTRL_DEC_MODE: u32 = 0x10000;
+const CGC_CTRL_DLY_TIMER_MASK: u32 = 0x1e; // JPEG_CGC_CTRL__CLK_GATE_DLY_TIMER_MASK
+const CGC_CTRL_OFF_DELAY_MASK: u32 = 0x1fe0; // JPEG_CGC_CTRL__CLK_OFF_DELAY_MASK
 const PGFSM_UVDJ_SHIFT: u32 = 0x16;
 const PGFSM_UVDJ_MASK: u32 = 0x00c0_0000;
 const JPEG_POWER_MASK: u32 = 0x1;
@@ -240,11 +242,18 @@ impl<I: Io> Engine<I> {
         if self.mgcg {
             self.set(
                 CGC_CTRL,
-                CGC_CTRL_DYN | CGC_CTRL_DEC_MODE,
+                CGC_CTRL_DYN
+                    | CGC_CTRL_DLY_TIMER_MASK
+                    | CGC_CTRL_OFF_DELAY_MASK
+                    | CGC_CTRL_DEC_MODE,
                 CGC_CTRL_TIMERS | CGC_CTRL_DYN,
             )?;
         } else {
-            self.set(CGC_CTRL, CGC_CTRL_DYN, CGC_CTRL_TIMERS)?;
+            self.set(
+                CGC_CTRL,
+                CGC_CTRL_DLY_TIMER_MASK | CGC_CTRL_OFF_DELAY_MASK,
+                CGC_CTRL_TIMERS,
+            )?;
         }
         self.set(CGC_GATE, CGC_GATE_ALL, 0)?;
         Ok(())
@@ -254,11 +263,18 @@ impl<I: Io> Engine<I> {
         if self.mgcg {
             self.set(
                 CGC_CTRL,
-                CGC_CTRL_DYN | CGC_CTRL_DEC_MODE,
+                CGC_CTRL_DYN
+                    | CGC_CTRL_DLY_TIMER_MASK
+                    | CGC_CTRL_OFF_DELAY_MASK
+                    | CGC_CTRL_DEC_MODE,
                 CGC_CTRL_TIMERS | CGC_CTRL_DYN | CGC_CTRL_DEC_MODE,
             )?;
         } else {
-            self.set(CGC_CTRL, CGC_CTRL_DYN, CGC_CTRL_TIMERS)?;
+            self.set(
+                CGC_CTRL,
+                CGC_CTRL_DLY_TIMER_MASK | CGC_CTRL_OFF_DELAY_MASK,
+                CGC_CTRL_TIMERS,
+            )?;
         }
         self.set(CGC_GATE, CGC_GATE_ALL, CGC_GATE_ALL)?;
         Ok(())
