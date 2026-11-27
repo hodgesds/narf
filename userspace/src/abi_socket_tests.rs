@@ -12630,8 +12630,13 @@ kernel_test_in!(
     smoke_abi_socket_sockopt_mcast_delivery_pos
 );
 
-/// IPv6: a multicast to ff02::fb out lo reaches a member joined on lo.
-fn smoke_abi_socket_sockopt_mcast6_delivery_pos() -> TestResult {
+/// IPv6: joining ff02::fb on lo succeeds, but a multicast out lo is
+/// ENETUNREACH. lo has no multicast route (`addrconf_add_mroute` installs
+/// ff00::/8 only on devices `addrconf_dev_config` configures, not
+/// loopback), so `ip6_dst_lookup_flow` fails; a member on lo gets nothing.
+/// Linux 7.3: `sendto(ff02::fb)` with IPV6_MULTICAST_IF=1 is
+/// "[Errno 101] Network is unreachable".
+fn smoke_abi_socket_sockopt_mcast6_out_lo_is_unreachable() -> TestResult {
     with_setup(|| {
         const PORT: u16 = 47_353;
         let rx = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
@@ -12644,20 +12649,331 @@ fn smoke_abi_socket_sockopt_mcast6_delivery_pos() -> TestResult {
         if sockopt_set_int(tx, so::IPPROTO_IPV6, so::IPV6_MULTICAST_IF, 1)? != 0 {
             return Err("IPV6_MULTICAST_IF(lo) failed");
         }
-        if sockopt_sendto(tx, b"mdns6", &sockaddr_in6(so::MDNS_V6, PORT, 0)) != Some(5) {
-            return Err("sendto(ff02::fb) did not send 5 bytes");
+        if sockopt_sendto(tx, b"mdns6", &sockaddr_in6(so::MDNS_V6, PORT, 0)) != Some(ENETUNREACH) {
+            return Err("sendto(ff02::fb) out lo was not ENETUNREACH");
         }
         let mut buf = [0u8; 16];
-        if sockopt_recv_nb(rx, &mut buf) != Some(5) || &buf[..5] != b"mdns6" {
-            return Err("an IPv6 member on lo did not receive the multicast");
+        if sockopt_recv_nb(rx, &mut buf) != Some(EAGAIN) {
+            return Err("an IPv6 multicast out lo reached a member");
         }
         sockopt_close(&[rx, tx]);
         Ok(())
     })
 }
 kernel_test_in!(
-    "syscall_abi/socket",
-    smoke_abi_socket_sockopt_mcast6_delivery_pos
+    "syscall_abi/pktinfo-ifindex",
+    smoke_abi_socket_sockopt_mcast6_out_lo_is_unreachable
+);
+
+/// avahi-daemon takes every mDNS datagram's interface from IP_PKTINFO /
+/// IPV6_PKTINFO and asserts it is a real one (`dispatch_packet: Assertion
+/// 'iface > 0'`). It names each send's interface and source with the same
+/// cmsg (`avahi_send_dns_packet_ipv4/6`) and never sets
+/// IP(V6)_MULTICAST_IF. Linux reports the device a datagram was delivered
+/// on:
+/// - a datagram to 127.0.0.1 or ::1 arrives on lo, ifindex 1;
+/// - one to an address of the host's arrives on that address's device.
+///   `ip_route_output_key_hash_rcu` sets `orig_oif = FIB_RES_OIF` for an
+///   RTN_LOCAL route, and `ip6_rcv_core` takes `IP6CB->iif` from the
+///   local route's `rt6i_idev`. An unbound IPv6 sender's source is that
+///   address (RFC 6724 rule 1);
+/// - the IP_MULTICAST_LOOP copy arrives on the output device. A nonzero
+///   `ipi_ifindex` / `ipi6_ifindex` names that device (`ip_cmsg_send`,
+///   `ip6_datagram_send_ctl`), and `ipi_spec_dst` / `ipi6_addr` is the
+///   source. An IPv6 group send out lo is ENETUNREACH.
+///
+/// Linux 7.3 on the desktop: 224.0.0.251 via IP_PKTINFO(1, 127.0.0.1), and
+/// unicast to 127.0.0.1 and ::1, report ifindex 1. Unicast to enp14s0's
+/// address reports 2, and to its link-local fe80::..%2 reports 2 from that
+/// address. ff02::fb via IPV6_PKTINFO(1, ::1) is ENETUNREACH. NARF reported
+/// ::1 as ifindex 0, which aborted avahi at boot, and sent avahi's per-link
+/// packets out whatever device the group route picked.
+fn smoke_abi_socket_pktinfo_reports_the_delivering_device() -> TestResult {
+    use alloc::vec::Vec;
+    const DEV: &str = "abi-pki0";
+    const DEV_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x4b, 0x01];
+    const DEV_IP: [u8; 4] = [10, 75, 1, 20];
+    const DEV_LL: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x4b, 0x01];
+    const LO4: [u8; 4] = [127, 0, 0, 1];
+    const LO6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const PORT4: u16 = 47_511;
+    const PORT6: u16 = 47_512;
+    const SOL_IP: i32 = 0;
+    const SOL_IPV6: i32 = 41;
+    const IPV6_PKTINFO: i32 = 50;
+    static DEV_TX: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    fn capture(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        DEV_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+    /// The source of each UDP datagram the device sent to 224.0.0.251
+    /// (joining the group may also send IGMP reports there).
+    fn group_udp_sources() -> Vec<[u8; 4]> {
+        DEV_TX
+            .lock()
+            .iter()
+            .filter(|f| {
+                f.len() >= 34
+                    && f[12..14] == [0x08, 0x00]
+                    && f[23] == 17
+                    && f[30..34] == so::MDNS_V4.to_be_bytes()
+            })
+            .map(|f| [f[26], f[27], f[28], f[29]])
+            .collect()
+    }
+    /// sendmsg `payload` to `to` carrying one `(level, type, data)` cmsg.
+    fn send_cmsg(fd: u64, payload: &[u8], to: &[u8], level: i32, kind: i32, data: &[u8]) -> i64 {
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let space = 16 + ((data.len() + 7) & !7);
+        let mut ctrl = alloc::vec![0u8; space];
+        ctrl[0..8].copy_from_slice(&((16 + data.len()) as u64).to_ne_bytes());
+        ctrl[8..12].copy_from_slice(&level.to_ne_bytes());
+        ctrl[12..16].copy_from_slice(&kind.to_ne_bytes());
+        ctrl[16..16 + data.len()].copy_from_slice(data);
+        let mut msg = [0u8; 56];
+        msg[0..8].copy_from_slice(&(to.as_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&(to.len() as u32).to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(space as u64).to_ne_bytes());
+        call(Syscall::SocketSendMsg.raw(), a2(fd, msg.as_ptr() as u64, 0)).unwrap_or(i64::MIN)
+    }
+    /// recvmsg one datagram: its source sockaddr and the PKTINFO ifindex
+    /// (`None` when no PKTINFO record came).
+    fn recv_pktinfo(fd: u64, v6: bool) -> Result<([u8; 28], Option<u32>), &'static str> {
+        let mut data = [0u8; 64];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+        let mut name = [0u8; 28];
+        let mut ctrl = [0u8; 256];
+        let mut msg = [0u8; 56];
+        msg[0..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        match call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd, msg.as_mut_ptr() as u64, MSG_DONTWAIT),
+        ) {
+            Some(n) if n >= 0 => {}
+            _ => return Err("the datagram did not arrive"),
+        }
+        let controllen = u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize;
+        // in_pktinfo starts with ipi_ifindex; in6_pktinfo has it after
+        // the 16-byte ipi6_addr.
+        let (want_level, want_kind, at) = if v6 {
+            (SOL_IPV6, IPV6_PKTINFO, 16)
+        } else {
+            (SOL_IP, so::IP_PKTINFO as i32, 0)
+        };
+        let mut off = 0usize;
+        while off + 16 <= controllen {
+            let len = u64::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
+            let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
+            let kind = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
+            if len < 16 || off + len > controllen {
+                return Err("recvmsg returned a malformed cmsghdr");
+            }
+            if level == want_level && kind == want_kind && len >= 16 + at + 4 {
+                let i = off + 16 + at;
+                let ifindex = u32::from_ne_bytes(ctrl[i..i + 4].try_into().unwrap());
+                return Ok((name, Some(ifindex)));
+            }
+            off += (len + 7) & !7;
+        }
+        Ok((name, None))
+    }
+    fn in_pktinfo(ifindex: u32, spec_dst: [u8; 4]) -> [u8; 12] {
+        let mut p = [0u8; 12];
+        p[0..4].copy_from_slice(&ifindex.to_ne_bytes());
+        p[4..8].copy_from_slice(&spec_dst);
+        p
+    }
+    fn in6_pktinfo(addr: [u8; 16], ifindex: u32) -> [u8; 20] {
+        let mut p = [0u8; 20];
+        p[..16].copy_from_slice(&addr);
+        p[16..20].copy_from_slice(&ifindex.to_ne_bytes());
+        p
+    }
+    with_setup(|| {
+        narf_net::iface::register_loopback_iface();
+        narf_net::iface::register(DEV, DEV_MAC, capture);
+        narf_net::iface::set_link_state(DEV, true);
+        narf_net::iface::set_iface_ipv4_fields(DEV, DEV_IP, [0; 4]);
+        narf_net::iface::add_addr(DEV, DEV_IP, 24);
+        narf_net::ipv6::addrs::add(narf_net::ipv6::addrs::Ipv6IfAddr {
+            iface: alloc::string::String::from(DEV),
+            addr: DEV_LL,
+            prefix_len: 64,
+            state: narf_net::ipv6::addrs::AddrState::Preferred,
+            scope: narf_net::ipv6::addrs::AddrScope::LinkLocal,
+            preferred_deadline_ns: u64::MAX,
+            valid_deadline_ns: u64::MAX,
+            temporary: false,
+        });
+        DEV_TX.lock().clear();
+        let rx4 = sockopt_socket(AF_INET, SOCK_DGRAM)?;
+        let rx6 = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        let result = (|| -> Result<(), &'static str> {
+            let dev = narf_net::iface::ifindex_of(DEV).ok_or("the test device has no ifindex")?;
+            sockopt_bind(rx4, &sockaddr_in(0, PORT4))?;
+            if sockopt_set_int(rx6, so::IPPROTO_IPV6, so::IPV6_V6ONLY, 1)? != 0 {
+                return Err("IPV6_V6ONLY failed");
+            }
+            sockopt_bind(rx6, &sockaddr_in6([0; 16], PORT6, 0))?;
+            if sockopt_set_int(rx4, so::IPPROTO_IP, so::IP_PKTINFO, 1)? != 0
+                || sockopt_set_int(rx6, so::IPPROTO_IPV6, so::IPV6_RECVPKTINFO, 1)? != 0
+            {
+                return Err("IP_PKTINFO / IPV6_RECVPKTINFO failed");
+            }
+            // avahi joins each link's group by index (struct ip_mreqn).
+            for ifindex in [1, dev] {
+                let mreqn = ip_mreqn(so::MDNS_V4, 0, ifindex);
+                if sockopt_set(rx4, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &mreqn)? != 0 {
+                    return Err("IP_ADD_MEMBERSHIP(224.0.0.251) failed");
+                }
+                let mreq = ipv6_mreq(so::MDNS_V6, ifindex);
+                if sockopt_set(rx6, so::IPPROTO_IPV6, so::IPV6_ADD_MEMBERSHIP, &mreq)? != 0 {
+                    return Err("IPV6_ADD_MEMBERSHIP(ff02::fb) failed");
+                }
+            }
+            let lo4 = u32::from_be_bytes(LO4);
+            let dev4 = u32::from_be_bytes(DEV_IP);
+
+            // IPv4 unicast to 127.0.0.1 arrives on lo.
+            if sockopt_sendto(rx4, b"lo4", &sockaddr_in(lo4, PORT4)) != Some(3) {
+                return Err("sendto(127.0.0.1) failed");
+            }
+            let (name, ifindex) = recv_pktinfo(rx4, false)?;
+            if ifindex != Some(1) || name[4..8] != LO4 {
+                return Err("a datagram to 127.0.0.1 did not report lo (ifindex 1)");
+            }
+            // IPv4 unicast to the device's address arrives on the device.
+            if sockopt_sendto(rx4, b"dev4", &sockaddr_in(dev4, PORT4)) != Some(4) {
+                return Err("sendto(the device's address) failed");
+            }
+            let (name, ifindex) = recv_pktinfo(rx4, false)?;
+            if ifindex != Some(dev) || name[4..8] != DEV_IP {
+                return Err("a datagram to the device's address did not report the device");
+            }
+            // avahi on lo.IPv4: IP_PKTINFO(lo, 127.0.0.1) to the group loops
+            // back on lo from 127.0.0.1 and does not leave the device.
+            let sent = send_cmsg(
+                rx4,
+                b"mdns-lo",
+                &sockaddr_in(so::MDNS_V4, PORT4),
+                SOL_IP,
+                so::IP_PKTINFO as i32,
+                &in_pktinfo(1, LO4),
+            );
+            if sent != 7 {
+                return Err("sendmsg(224.0.0.251, IP_PKTINFO lo) failed");
+            }
+            let (name, ifindex) = recv_pktinfo(rx4, false)?;
+            if ifindex != Some(1) || name[4..8] != LO4 {
+                return Err("an IP_PKTINFO(lo) group send did not loop back on lo from 127.0.0.1");
+            }
+            if !group_udp_sources().is_empty() {
+                return Err("an IP_PKTINFO(lo) group send left the test device");
+            }
+            // avahi on the device: IP_PKTINFO(dev, its address) leaves the
+            // device from that address and loops back on it.
+            let sent = send_cmsg(
+                rx4,
+                b"mdns-dev",
+                &sockaddr_in(so::MDNS_V4, PORT4),
+                SOL_IP,
+                so::IP_PKTINFO as i32,
+                &in_pktinfo(dev, DEV_IP),
+            );
+            if sent != 8 {
+                return Err("sendmsg(224.0.0.251, IP_PKTINFO dev) failed");
+            }
+            let (name, ifindex) = recv_pktinfo(rx4, false)?;
+            if ifindex != Some(dev) || name[4..8] != DEV_IP {
+                return Err("an IP_PKTINFO(dev) group send did not loop back on the device");
+            }
+            if group_udp_sources() != [DEV_IP] {
+                return Err(
+                    "an IP_PKTINFO(dev) group send did not leave the device from its address",
+                );
+            }
+            // An ifindex naming no device is ENODEV.
+            let sent = send_cmsg(
+                rx4,
+                b"nodev",
+                &sockaddr_in(so::MDNS_V4, PORT4),
+                SOL_IP,
+                so::IP_PKTINFO as i32,
+                &in_pktinfo(so::NO_IFINDEX, [0; 4]),
+            );
+            if sent != ENODEV {
+                return Err("an IP_PKTINFO ifindex naming no device was not ENODEV");
+            }
+
+            // IPv6 unicast to ::1 arrives on lo from ::1, unscoped.
+            if sockopt_sendto(rx6, b"lo6", &sockaddr_in6(LO6, PORT6, 0)) != Some(3) {
+                return Err("sendto(::1) failed");
+            }
+            let (name, ifindex) = recv_pktinfo(rx6, true)?;
+            if ifindex != Some(1) || name[8..24] != LO6 || name[24..28] != [0; 4] {
+                return Err("a datagram to ::1 did not report lo (ifindex 1)");
+            }
+            // To the device's link-local: the device, from that address.
+            if sockopt_sendto(rx6, b"ll6", &sockaddr_in6(DEV_LL, PORT6, dev)) != Some(3) {
+                return Err("sendto(the device's link-local) failed");
+            }
+            let (name, ifindex) = recv_pktinfo(rx6, true)?;
+            if ifindex != Some(dev) || name[8..24] != DEV_LL {
+                return Err("a datagram to the device's link-local did not report the device");
+            }
+            // avahi on lo.IPv6: IPV6_PKTINFO(::1, lo) to ff02::fb.
+            let sent = send_cmsg(
+                rx6,
+                b"mdns6-lo",
+                &sockaddr_in6(so::MDNS_V6, PORT6, 0),
+                SOL_IPV6,
+                IPV6_PKTINFO,
+                &in6_pktinfo(LO6, 1),
+            );
+            if sent != ENETUNREACH {
+                return Err("an IPV6_PKTINFO(lo) group send was not ENETUNREACH");
+            }
+            // avahi on the device: IPV6_PKTINFO(::, dev) loops back on the
+            // device from its link-local.
+            let sent = send_cmsg(
+                rx6,
+                b"mdns6-dev",
+                &sockaddr_in6(so::MDNS_V6, PORT6, 0),
+                SOL_IPV6,
+                IPV6_PKTINFO,
+                &in6_pktinfo([0; 16], dev),
+            );
+            if sent != 9 {
+                return Err("sendmsg(ff02::fb, IPV6_PKTINFO dev) failed");
+            }
+            let (name, ifindex) = recv_pktinfo(rx6, true)?;
+            if ifindex != Some(dev) || name[8..24] != DEV_LL {
+                return Err("an IPV6_PKTINFO(dev) group send did not loop back on the device");
+            }
+            Ok(())
+        })();
+        sockopt_close(&[rx4, rx6]);
+        narf_net::ipv6::addrs::remove(DEV, &DEV_LL);
+        narf_net::iface::del_addr(DEV, DEV_IP, 24);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/pktinfo-ifindex",
+    smoke_abi_socket_pktinfo_reports_the_delivering_device
 );
 
 /// The desktop's IPv6 state: a link-local address only, and a route to the
