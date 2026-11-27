@@ -5187,6 +5187,296 @@ kernel_test_in!(
     smoke_hid_elan_mute_led_feature_encode
 );
 
+// ─── hid-goodix touchpad smoke tests ─────────────────────────────
+// Fixtures are built from the Linux spec, not from the code under
+// test: GT7868Q VID/PIDs + NSMU class from
+// `hid-multitouch.c:4599-4611` / `:592-608`, the fixup bytes from
+// `mt_report_fixup` (`:3238-3303`, <608 skip, `rdesc[607] 0x15 →
+// 0x25`), and the PTP publication shape from the canonical PTP
+// descriptor blob (`narf_hid::ptp::__ptp_descriptor_blob`) with a
+// Goodix GT7868Q identity. The BUTTONPAD → ID_INPUT_TOUCHPAD=1
+// mapping itself is covered on the sysfs side
+// (`filesystem/src/sysfs_tests.rs`, BUTTONPAD uevent test).
+
+fn smoke_hid_goodix_device_table_gt7868q() -> TestResult {
+    use crate::hid_goodix::{
+        match_device, GOODIX_DEVICE_TABLE, GOODIX_GT7868Q_01E8, GOODIX_GT7868Q_01E9,
+        GOODIX_VENDOR_ID,
+    };
+    use crate::hid_multitouch::MtClass;
+    if GOODIX_DEVICE_TABLE.len() != 2 {
+        return TestResult::Fail("expected exactly the two GT7868Q rows in GOODIX_DEVICE_TABLE");
+    }
+    for pid in [GOODIX_GT7868Q_01E8, GOODIX_GT7868Q_01E9] {
+        match match_device(GOODIX_VENDOR_ID, pid) {
+            Some(m) => {
+                if m.class != MtClass::Win8ForceMultiInputNsmu {
+                    return TestResult::Fail("GT7868Q row must carry Win8ForceMultiInputNsmu");
+                }
+            }
+            None => return TestResult::Fail("GT7868Q PID missing from table"),
+        }
+    }
+    // 01f0 is defined in Linux `hid-ids.h` but has no user — it
+    // must NOT be added here.
+    if match_device(GOODIX_VENDOR_ID, 0x01f0).is_some() {
+        return TestResult::Fail("unused 01f0 must not be in the table");
+    }
+    // 0d42 carries only the resume quirk, not a multitouch row.
+    if match_device(GOODIX_VENDOR_ID, crate::hid_goodix::GOODIX_0D42).is_some() {
+        return TestResult::Fail("0d42 must not be in the multitouch table");
+    }
+    if match_device(0xDEAD, 0xBEEF).is_some() {
+        return TestResult::Fail("unknown VID/PID must not match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-goodix",
+    smoke_hid_goodix_device_table_gt7868q
+);
+
+fn smoke_hid_goodix_classify_nsmu_quirks() -> TestResult {
+    use crate::hid_goodix::{
+        classify_device, GOODIX_GT7868Q_01E8, GOODIX_GT7868Q_01E9, GOODIX_VENDOR_ID,
+    };
+    use crate::hid_multitouch::{lookup_class, MtClass, MtQuirks};
+    for pid in [GOODIX_GT7868Q_01E8, GOODIX_GT7868Q_01E9] {
+        match classify_device("PNP0C50", GOODIX_VENDOR_ID, pid) {
+            Some(class) => {
+                if class != MtClass::Win8ForceMultiInputNsmu {
+                    return TestResult::Fail("GT7868Q must classify as Win8ForceMultiInputNsmu");
+                }
+            }
+            None => return TestResult::Fail("GT7868Q must classify"),
+        }
+    }
+    // The class entry must carry Linux's exact NSMU bundle
+    // (`hid-multitouch.c:592-608`) — including NOT_SEEN_MEANS_UP
+    // and FORCE_MULTI_INPUT, and NOT ALWAYS_VALID.
+    let e = lookup_class(MtClass::Win8ForceMultiInputNsmu);
+    for q in [
+        MtQuirks::IGNORE_DUPLICATES,
+        MtQuirks::HOVERING,
+        MtQuirks::CONTACT_CNT_ACCURATE,
+        MtQuirks::STICKY_FINGERS,
+        MtQuirks::WIN8_PTP_BUTTONS,
+        MtQuirks::FORCE_MULTI_INPUT,
+        MtQuirks::NOT_SEEN_MEANS_UP,
+    ] {
+        if !e.quirks.contains(q) {
+            return TestResult::Fail("NSMU class missing a Linux quirk bit");
+        }
+    }
+    if e.quirks.contains(MtQuirks::ALWAYS_VALID) {
+        return TestResult::Fail("NSMU class must NOT carry ALWAYS_VALID (Linux has none here)");
+    }
+    if !e.is_indirect {
+        return TestResult::Fail("NSMU class must be indirect (touchpad)");
+    }
+    // No VID / GDIX-prefix fallback: 0d42 is resume-quirk-only,
+    // 01f0 is unused, and a GDIX _HID does not identify a
+    // touchpad (GDIX1001 is a touchscreen).
+    if classify_device("PNP0C50", GOODIX_VENDOR_ID, crate::hid_goodix::GOODIX_0D42).is_some() {
+        return TestResult::Fail("0d42 must not classify as a multitouch device");
+    }
+    if classify_device("PNP0C50", GOODIX_VENDOR_ID, 0x01f0).is_some() {
+        return TestResult::Fail("unused 01f0 must not classify");
+    }
+    if classify_device("GDIX1001", GOODIX_VENDOR_ID, 0x1234).is_some() {
+        return TestResult::Fail("GDIX prefix must not classify an unlisted PID");
+    }
+    if classify_device("PNP0C50", 0x1234, 0x5678).is_some() {
+        return TestResult::Fail("unknown device must not classify as Goodix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-goodix",
+    smoke_hid_goodix_classify_nsmu_quirks
+);
+
+fn smoke_hid_goodix_fixup_report_descriptor() -> TestResult {
+    use crate::hid_goodix::{
+        fixup_report_descriptor, ReportDescriptorFixup, GOODIX_GT7868Q_01E8, GOODIX_VENDOR_ID,
+        GT7868Q_FIXUP_MIN_LEN, GT7868Q_FIXUP_OFFSET,
+    };
+    use alloc::vec;
+    // Fixture shape from Linux `mt_report_fixup`: the patched
+    // byte is rdesc[607]; only its value matters, the rest of the
+    // blob is filler with sentinels proving nothing else moves.
+    let mut blob = vec![0u8; GT7868Q_FIXUP_MIN_LEN];
+    blob[100] = 0xAB;
+    blob[GT7868Q_FIXUP_OFFSET] = 0x15;
+    if fixup_report_descriptor(GOODIX_VENDOR_ID, GOODIX_GT7868Q_01E8, &mut blob)
+        != ReportDescriptorFixup::Patched
+    {
+        return TestResult::Fail("0x15 at [607] must patch");
+    }
+    if blob[GT7868Q_FIXUP_OFFSET] != 0x25 {
+        return TestResult::Fail("[607] must be 0x25 after fixup");
+    }
+    if blob[100] != 0xAB || blob[606] != 0x00 {
+        return TestResult::Fail("fixup must not touch any other byte");
+    }
+    // Longer descriptors patch too (the bound is a minimum, not
+    // an exact size).
+    let mut long = vec![0u8; 700];
+    long[GT7868Q_FIXUP_OFFSET] = 0x15;
+    if fixup_report_descriptor(GOODIX_VENDOR_ID, GOODIX_GT7868Q_01E8, &mut long)
+        != ReportDescriptorFixup::Patched
+    {
+        return TestResult::Fail("700-byte descriptor must patch");
+    }
+    // Undersize: left alone, exactly as Linux logs + skips.
+    let mut short = vec![0u8; GT7868Q_FIXUP_MIN_LEN - 1];
+    short[100] = 0x15;
+    if fixup_report_descriptor(GOODIX_VENDOR_ID, GOODIX_GT7868Q_01E8, &mut short)
+        != ReportDescriptorFixup::SkippedUndersize
+    {
+        return TestResult::Fail("607-byte descriptor must be skipped");
+    }
+    if short[100] != 0x15 {
+        return TestResult::Fail("undersize descriptor must be untouched");
+    }
+    // Already-patched firmware (0x25) and any other byte: logged
+    // via the outcome, left alone.
+    let mut patched = vec![0u8; GT7868Q_FIXUP_MIN_LEN];
+    patched[GT7868Q_FIXUP_OFFSET] = 0x25;
+    if fixup_report_descriptor(GOODIX_VENDOR_ID, GOODIX_GT7868Q_01E8, &mut patched)
+        != ReportDescriptorFixup::UnexpectedByte(0x25)
+    {
+        return TestResult::Fail("0x25 at [607] must report UnexpectedByte(0x25)");
+    }
+    if patched[GT7868Q_FIXUP_OFFSET] != 0x25 {
+        return TestResult::Fail("unexpected byte must be left alone");
+    }
+    let mut other = vec![0u8; GT7868Q_FIXUP_MIN_LEN];
+    other[GT7868Q_FIXUP_OFFSET] = 0x00;
+    if fixup_report_descriptor(GOODIX_VENDOR_ID, GOODIX_GT7868Q_01E8, &mut other)
+        != ReportDescriptorFixup::UnexpectedByte(0x00)
+    {
+        return TestResult::Fail("0x00 at [607] must report UnexpectedByte(0x00)");
+    }
+    // Fixup is GT7868Q-only: another vendor, and 27c6:0d42, pass
+    // through untouched.
+    let mut foreign = vec![0u8; GT7868Q_FIXUP_MIN_LEN];
+    foreign[GT7868Q_FIXUP_OFFSET] = 0x15;
+    if fixup_report_descriptor(0x04F3, 0x3045, &mut foreign) != ReportDescriptorFixup::NotApplicable
+    {
+        return TestResult::Fail("non-Goodix device must not fix up");
+    }
+    if foreign[GT7868Q_FIXUP_OFFSET] != 0x15 {
+        return TestResult::Fail("non-Goodix descriptor must be untouched");
+    }
+    let mut resume_only = vec![0u8; GT7868Q_FIXUP_MIN_LEN];
+    resume_only[GT7868Q_FIXUP_OFFSET] = 0x15;
+    if fixup_report_descriptor(
+        GOODIX_VENDOR_ID,
+        crate::hid_goodix::GOODIX_0D42,
+        &mut resume_only,
+    ) != ReportDescriptorFixup::NotApplicable
+    {
+        return TestResult::Fail("0d42 must not fix up");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-goodix",
+    smoke_hid_goodix_fixup_report_descriptor
+);
+
+fn smoke_hid_goodix_ptp_publication_buttonpad() -> TestResult {
+    use crate::hid_goodix::{classify_device, GOODIX_GT7868Q_01E8, GOODIX_VENDOR_ID};
+    use crate::hid_multitouch::MtClass;
+    use crate::i2c_hid_touch::build_ptp_caps;
+    use narf_input::evdev::{bus, prop, DeviceCaps, InputId};
+    let blob = narf_hid::ptp::__ptp_descriptor_blob();
+    let parsed = match narf_hid::parse(blob) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("parse(PTP_DESCRIPTOR) failed"),
+    };
+    let profile = match narf_hid::ptp::detect(&parsed) {
+        Some(p) => p,
+        None => return TestResult::Fail("PTP detect rejected the descriptor"),
+    };
+    // The GT7868Q rides the generic PTP branch: its identity is
+    // the HID VID:PID, and the caps must publish it as a buttonpad
+    // touchpad — which sysfs then tags ID_INPUT_TOUCHPAD=1 (see
+    // `filesystem/src/sysfs_tests.rs`).
+    if classify_device("PNP0C50", GOODIX_VENDOR_ID, GOODIX_GT7868Q_01E8)
+        != Some(MtClass::Win8ForceMultiInputNsmu)
+    {
+        return TestResult::Fail("GT7868Q must classify as Win8ForceMultiInputNsmu");
+    }
+    let mut identity = DeviceCaps::new();
+    identity.set_identity(
+        "Goodix GT7868Q I2C-HID Touchpad",
+        "i2c-GT7868Q/input0",
+        "",
+        InputId::new(bus::I2C, GOODIX_VENDOR_ID, GOODIX_GT7868Q_01E8, 0x0001),
+    );
+    let caps = build_ptp_caps(&profile, &identity);
+    if !caps.has_prop(prop::BUTTONPAD) || !caps.has_prop(prop::POINTER) {
+        return TestResult::Fail("GT7868Q PTP caps must carry POINTER+BUTTONPAD props");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-goodix",
+    smoke_hid_goodix_ptp_publication_buttonpad
+);
+
+fn smoke_hid_goodix_nsmu_class_attach_synthesises_release() -> TestResult {
+    // The NSMU class entry must flow through `MtDevice::attach`
+    // into a live device whose quirks synthesise a release for a
+    // contact the next frame stops reporting — the GT7868Q
+    // behaviour Linux's class exists for.
+    use crate::hid_multitouch::{
+        MtClass, MtQuirks, __attach_synth_pad_for_test, __build_ptp_decoded_for_test,
+        __reset_registry_for_test,
+    };
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_touch, TouchState};
+    init_global_ring(16);
+    __reset_global_ring_for_test();
+    __reset_registry_for_test();
+    let dev = __attach_synth_pad_for_test(MtClass::Win8ForceMultiInputNsmu, 5);
+    if !dev.quirks.contains(MtQuirks::NOT_SEEN_MEANS_UP) {
+        return TestResult::Fail("attached NSMU device missing NOT_SEEN_MEANS_UP");
+    }
+    if !dev.quirks.contains(MtQuirks::FORCE_MULTI_INPUT) {
+        return TestResult::Fail("attached NSMU device missing FORCE_MULTI_INPUT");
+    }
+    if !dev.quirks.contains(MtQuirks::WIN8_PTP_BUTTONS) {
+        return TestResult::Fail("attached NSMU device missing WIN8_PTP_BUTTONS");
+    }
+    if dev.quirks.contains(MtQuirks::ALWAYS_VALID) {
+        return TestResult::Fail("attached NSMU device must NOT carry ALWAYS_VALID");
+    }
+    // Frame 1: contact 99 down.
+    let f1 = __build_ptp_decoded_for_test(&[(99, true, 50, 60)], false);
+    let _ = dev.pump_ptp(&f1);
+    let _ = pop_touch();
+    // Frame 2: empty report — the unseen contact must release.
+    let f2 = __build_ptp_decoded_for_test(&[], false);
+    let _ = dev.pump_ptp(&f2);
+    let t = match pop_touch() {
+        Some(t) => t,
+        None => return TestResult::Fail("expected synthesised Up for unseen contact"),
+    };
+    if t.state != TouchState::Up {
+        return TestResult::Fail("expected TouchState::Up");
+    }
+    if t.tracking_id.is_some() {
+        return TestResult::Fail("Up tracking_id should be None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/hid-goodix",
+    smoke_hid_goodix_nsmu_class_attach_synthesises_release
+);
+
 // ─── hid-elan mute-LED driving (issue #1684) ────────────────────────
 //
 // Fixtures are built from the Linux `hid-elan.c` report shape
