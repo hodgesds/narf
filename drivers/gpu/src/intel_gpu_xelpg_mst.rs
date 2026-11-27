@@ -135,6 +135,12 @@ impl MtlMstRoute {
     pub fn first(&self) -> Option<(Pipe, Mode, Framebuffer)> {
         self.first
     }
+    /// The DP tunnel with BW allocation this route's 128b/132b link runs
+    /// through, if any (the second route's group check,
+    /// `mst_tunnel_group_admits`).
+    pub(crate) fn bw_tunnel(&self) -> Option<tunnel::Tunnel> {
+        self.tunnel.filter(|t| t.bw_alloc_enabled)
+    }
     pub fn live(&self) -> bool {
         !self.stopped && !self.streams.is_empty() && self.failed.is_none()
     }

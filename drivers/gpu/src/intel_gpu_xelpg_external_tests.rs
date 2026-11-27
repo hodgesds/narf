@@ -5992,6 +5992,18 @@ fn smoke_ptl_second_route_tunnel_group_bw() -> TestResult {
     {
         return TestResult::Fail("an overallocated group refuses; other groups never share");
     }
+    // A tunnelled MST route in one group with the other route's tunnel is
+    // refused, whichever route is the MST one; other groups admit.
+    if mst_tunnel_group_admits(Some(sibling), Some(new)) != Err(SecondRouteRefusal::TunnelGroupBw)
+        || mst_tunnel_group_admits(Some(new), Some(sibling))
+            != Err(SecondRouteRefusal::TunnelGroupBw)
+        || mst_tunnel_group_admits(Some(other_group), Some(new)).is_err()
+        || mst_tunnel_group_admits(Some(group_zero), Some(group_zero)).is_err()
+        || mst_tunnel_group_admits(None, Some(new)).is_err()
+        || mst_tunnel_group_admits(Some(sibling), None).is_err()
+    {
+        return TestResult::Fail("a tunnelled MST route never shares a BW group");
+    }
     // A probe at 18 bpp where the group cap admits 24: not Linux's choice.
     let mut low = probe.clone();
     let mut plan = *low.uhbr.as_deref().expect("UHBR plan");

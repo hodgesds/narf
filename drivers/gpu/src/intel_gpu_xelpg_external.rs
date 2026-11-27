@@ -544,7 +544,8 @@ pub enum SecondRouteRefusal {
     /// Both routes run 128b/132b through DP tunnels of one BW allocation
     /// group and Linux's group check (`drm_dp_tunnel_atomic_check_group_bw`)
     /// would fail for its first link choice, or the new stream compresses
-    /// (see [`tunnel_group_admits`]).
+    /// (see [`tunnel_group_admits`]), or either route is a tunnelled MST
+    /// link (see [`mst_tunnel_group_admits`]).
     TunnelGroupBw,
 }
 
@@ -1826,6 +1827,21 @@ fn tunnel_group_admits(
         return Err(SecondRouteRefusal::TunnelGroupBw);
     }
     Ok(())
+}
+
+/// A tunnelled 128b/132b MST route and another BW-allocating tunnel in one
+/// group (`lookup_or_alloc_group`). Linux checks the group across every
+/// stream of both routes (`drm_dp_tunnel_atomic_check_group_bw`);
+/// [`tunnel_group_admits`] covers one SST stream per route, so the pair is
+/// refused typed until the group check carries an MST route's streams.
+fn mst_tunnel_group_admits(
+    mst: Option<tunnel::Tunnel>,
+    other: Option<tunnel::Tunnel>,
+) -> Result<(), SecondRouteRefusal> {
+    match (mst, other) {
+        (Some(a), Some(b)) if tunnels_share_group(&a, &b) => Err(SecondRouteRefusal::TunnelGroupBw),
+        _ => Ok(()),
+    }
 }
 
 /// `intel_dp_tunnel_atomic_alloc_bw` before the 128b/132b port is
@@ -4326,6 +4342,22 @@ impl MtlRoute {
         }
     }
 
+    /// The live 128b/132b MST route's DP tunnel with BW allocation; its
+    /// streams' bandwidth is the MST owner's, outside [`Self::tunnel_stream`].
+    fn mst_bw_tunnel(&self) -> Option<tunnel::Tunnel> {
+        match self {
+            MtlRoute::Mst(r) => r.bw_tunnel(),
+            _ => None,
+        }
+    }
+
+    /// Any DP tunnel with BW allocation this route runs through.
+    fn bw_tunnel(&self) -> Option<tunnel::Tunnel> {
+        self.tunnel_stream()
+            .map(|(t, _)| t)
+            .or_else(|| self.mst_bw_tunnel())
+    }
+
     fn stop<M: MmioWindow + ?Sized>(&mut self, io: &M) -> Result<(), RouteError> {
         // HDCP off before the transcoder goes down (`intel_hdcp_disable`);
         // inert without `narf.intel.hdcp=1`.
@@ -4790,6 +4822,27 @@ impl MtlExternalService {
                 }
             }
         }
+        // A tunnelled 128b/132b MST link in one BW group with the other
+        // route's tunnel ([`mst_tunnel_group_admits`]): refused typed, the
+        // tunnel handed back to its legacy allocation.
+        if let Some(mut t) = mst_uhbr.and_then(|u| u.tunnel) {
+            let sibling = self.routes[1 - slot]
+                .as_ref()
+                .and_then(MtlRoute::bw_tunnel);
+            if mst_tunnel_group_admits(Some(t), sibling).is_err() {
+                {
+                    let mut aux = link.aux(io);
+                    let _ = tunnel::disable_bw_alloc(&mut aux, &mut t);
+                }
+                let _ = link.release(io);
+                return ServiceOutcome::Refused {
+                    port,
+                    error: RouteError::Dp(ExternalError::SecondRoute(
+                        SecondRouteRefusal::TunnelGroupBw,
+                    )),
+                };
+            }
+        }
         if cap[0] & 1 != 0 {
             // Beside a sibling route the first stream joins its layout
             // (`intel_dp_mst.c` runs MST on this port while the other port
@@ -4828,8 +4881,18 @@ impl MtlExternalService {
             let sibling = self.routes[1 - slot]
                 .as_ref()
                 .and_then(MtlRoute::tunnel_stream);
+            let sibling_mst = self.routes[1 - slot]
+                .as_ref()
+                .and_then(MtlRoute::mst_bw_tunnel);
             match probe_sink_link(io, link, uhbr_on, color::opted_in()) {
-                Ok(probe) if tunnel_group_admits(sibling, &probe).is_err() => {
+                Ok(probe)
+                    if tunnel_group_admits(sibling, &probe).is_err()
+                        || mst_tunnel_group_admits(
+                            sibling_mst,
+                            probe_tunnel_stream(&probe).map(|(t, _)| t),
+                        )
+                        .is_err() =>
+                {
                     let _ = release_probe(io, &probe);
                     ServiceOutcome::Refused {
                         port,
