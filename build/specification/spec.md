@@ -71,6 +71,17 @@ kernel IPC. CI checks both native-ring feature configurations.
   name. `--compress` wraps the ELF in the `NRFCMOD` LZ4 envelope with a
   hash-chain match finder (window 64 KiB); the in-tree Wi-Fi driver modules
   compress 2.1x to 3.9x.
+- Commands with common kernel build arguments also accept
+  `--config NAME`, naming a build configuration from the closed
+  registry in `build/xtask/src/configs.rs`: `all` (frame's default
+  feature set — every driver group; the configuration production
+  and release builds use) or `minimal` (`--no-default-features`
+  plus the always-on core features; the net and storage driver
+  groups are neither compiled into the kernel nor registered).
+  `--config` unions with `--features`; unknown names are rejected.
+  Configs select `narf-frame` driver-group features only — the
+  per-driver facade features remain an internal detail of the
+  net/storage facades.
 - `cargo xtask test` (kernel-test features) stages its module fixtures in the
   initramfs: `lib/modules/{narf_test_module,narf_module_rt_smoke,
   narf_drivers_net_e1000}.ko` raw, `narf_test_module.ko.lz4`, and the
