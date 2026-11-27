@@ -2332,3 +2332,240 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_sysv_shared_memory
 );
+
+// ── Sockets ──────────────────────────────────────────────────────────
+
+/// [`Ia32Ctx`] with the caller's user stack pointer: the conversions that
+/// stage native structures below it (`compat32::stage`) need one.
+struct Ia32StackCtx {
+    args: SyscallArgs,
+    ret: Option<SyscallReturn>,
+    sp: u64,
+}
+
+impl TrapContext for Ia32StackCtx {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, r: SyscallReturn) {
+        self.ret = Some(r);
+    }
+    fn user_rsp(&self) -> u64 {
+        self.sp
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
+    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        false
+    }
+    fn in_ia32_syscall(&self) -> bool {
+        true
+    }
+    fn in_compat_mode(&self) -> bool {
+        true
+    }
+}
+
+/// [`call32`] from a task whose stack pointer is `sp`.
+fn call32_sp(nr: u32, regs: [u64; 6], sp: u64) -> i64 {
+    let reg = |i: usize| u64::from(regs[i] as u32);
+    let mut ctx = Ia32StackCtx {
+        args: SyscallArgs {
+            arg0: reg(0),
+            arg1: reg(1),
+            arg2: reg(2),
+            arg3: reg(3),
+            arg4: reg(4),
+            arg5: reg(5),
+        },
+        ret: None,
+        sp,
+    };
+    let _ = crate::compat32::table::dispatch(nr, &mut ctx);
+    match ctx.ret {
+        Some(r) => i64::from(r.value as u32 as i32),
+        None => i64::MIN,
+    }
+}
+
+/// Little-endian `u32` words, as an i386 structure lays them out.
+fn words(ws: &[u32]) -> Vec<u8> {
+    ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+const AF_UNIX: u64 = 1;
+const SOCK_DGRAM: u64 = 2;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_CTRUNC: u32 = 0x8;
+
+/// The i386 socket calls with their own structure layouts (`net/compat.c`)
+/// on an AF_UNIX datagram socketpair (360):
+///
+///   * `sendmsg` (370) of a `struct compat_msghdr` with two `compat_iovec`s
+///     and a `compat_cmsghdr` SCM_RIGHTS record (12-byte header);
+///   * `recvmsg` (372) into a `compat_msghdr` whose 16-byte control buffer
+///     receives that record in compat form — cmsg_len 16, a live fd —
+///     with msg_controllen 16 and no MSG_CTRUNC; a control buffer too small
+///     for the fd sets MSG_CTRUNC;
+///   * `sendmmsg` (345) / `recvmmsg_time64` (417) over `compat_mmsghdr`s,
+///     each entry's `msg_len` written back at offset 28;
+///   * SO_RCVTIMEO through `setsockopt` (366) / `getsockopt` (365) as an
+///     `old_timeval32`;
+///   * `socketcall` (102): SYS_SOCKETPAIR, SYS_SEND and SYS_RECV.
+fn smoke_compat32_table_socket_msghdr_and_socketcall() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["sock"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            // The staged native structures go below the "stack pointer": the
+            // end of the data segment's first page, clear of the fixtures.
+            let sp = base + 0x1000;
+            let b32 = |off: u64| (base + off) as u32;
+            let mut fds = Vec::new();
+            if call32(360, [AF_UNIX, SOCK_DGRAM, 0, base + 0x100, 0, 0]) != 0 {
+                return Err("i386 socketpair(AF_UNIX, SOCK_DGRAM) failed");
+            }
+            let (s0, s1) = (get_u32(base + 0x100)?, get_u32(base + 0x104)?);
+            fds.extend([u64::from(s0), u64::from(s1)]);
+            let result = (|| {
+                // sendmsg: iovecs "ab" + "cd", SCM_RIGHTS carrying s0.
+                put_user(base + 0x200, b"abcd")?;
+                put_user(base + 0x220, &words(&[b32(0x200), 2, b32(0x202), 2]))?;
+                put_user(base + 0x240, &words(&[16, 1, 1, s0]))?;
+                let msg = words(&[0, 0, b32(0x220), 2, b32(0x240), 16, 0]);
+                put_user(base + 0x260, &msg)?;
+                if call32_sp(370, [u64::from(s0), base + 0x260, 0, 0, 0, 0], sp) != 4 {
+                    return Err("i386 sendmsg of a compat_msghdr with SCM_RIGHTS failed");
+                }
+                // recvmsg into one 16-byte compat_iovec and a 16-byte control buffer.
+                put_user(base + 0x300, &words(&[b32(0x320), 16]))?;
+                put_user(base + 0x340, &[0u8; 16])?;
+                let msg = words(&[0, 0, b32(0x300), 1, b32(0x340), 16, 0]);
+                put_user(base + 0x380, &msg)?;
+                if call32_sp(372, [u64::from(s1), base + 0x380, 0, 0, 0, 0], sp) != 4
+                    || get_user(base + 0x320, 4)? != b"abcd"
+                {
+                    return Err("i386 recvmsg did not fill its compat_iovec");
+                }
+                let ctrl = get_user(base + 0x340, 16)?;
+                let w = |i: usize| {
+                    u32::from_le_bytes([
+                        ctrl[i * 4],
+                        ctrl[i * 4 + 1],
+                        ctrl[i * 4 + 2],
+                        ctrl[i * 4 + 3],
+                    ])
+                };
+                if w(0) != 16 || w(1) != 1 || w(2) != 1 || w(3) > 0xFFFF {
+                    return Err("i386 recvmsg did not write a compat_cmsghdr SCM_RIGHTS record");
+                }
+                fds.push(u64::from(w(3)));
+                if get_u32(base + 0x380 + 20)? != 16
+                    || get_u32(base + 0x380 + 24)? & MSG_CTRUNC != 0
+                {
+                    return Err("i386 recvmsg did not report msg_controllen 16 without MSG_CTRUNC");
+                }
+                // A 12-byte control buffer holds no fd: MSG_CTRUNC.
+                if call32_sp(370, [u64::from(s0), base + 0x260, 0, 0, 0, 0], sp) != 4 {
+                    return Err("i386 sendmsg (second) failed");
+                }
+                let msg = words(&[0, 0, b32(0x300), 1, b32(0x340), 12, 0]);
+                put_user(base + 0x380, &msg)?;
+                if call32_sp(372, [u64::from(s1), base + 0x380, 0, 0, 0, 0], sp) != 4
+                    || get_u32(base + 0x380 + 24)? & MSG_CTRUNC == 0
+                {
+                    return Err(
+                        "i386 recvmsg into a too-small control buffer did not set MSG_CTRUNC",
+                    );
+                }
+                // sendmmsg / recvmmsg_time64: two datagrams, msg_len at +28.
+                put_user(base + 0x400, b"xyz")?;
+                put_user(base + 0x410, &words(&[b32(0x400), 1, b32(0x401), 2]))?;
+                let mut vec = words(&[0, 0, b32(0x410), 1, 0, 0, 0, 0]);
+                vec.extend(words(&[0, 0, b32(0x418), 1, 0, 0, 0, 0]));
+                put_user(base + 0x440, &vec)?;
+                if call32_sp(345, [u64::from(s0), base + 0x440, 2, 0, 0, 0], sp) != 2
+                    || get_u32(base + 0x440 + 28)? != 1
+                    || get_u32(base + 0x460 + 28)? != 2
+                {
+                    return Err("i386 sendmmsg did not send both compat_mmsghdrs");
+                }
+                put_user(base + 0x500, &words(&[b32(0x520), 8, b32(0x530), 8]))?;
+                let mut vec = words(&[0, 0, b32(0x500), 1, 0, 0, 0, 0]);
+                vec.extend(words(&[0, 0, b32(0x508), 1, 0, 0, 0, 0]));
+                put_user(base + 0x540, &vec)?;
+                if call32_sp(
+                    417,
+                    [u64::from(s1), base + 0x540, 2, MSG_DONTWAIT, 0, 0],
+                    sp,
+                ) != 2
+                    || get_u32(base + 0x540 + 28)? != 1
+                    || get_u32(base + 0x560 + 28)? != 2
+                    || get_user(base + 0x530, 2)? != b"yz"
+                {
+                    return Err("i386 recvmmsg_time64 did not fill both compat_mmsghdrs");
+                }
+                // SO_RCVTIMEO as an old_timeval32 { 1, 500000 }.
+                put_user(base + 0x600, &words(&[1, 500_000]))?;
+                if call32_sp(366, [u64::from(s0), 1, 20, base + 0x600, 8, 0], sp) != 0 {
+                    return Err("i386 setsockopt(SO_RCVTIMEO) of an old_timeval32 failed");
+                }
+                put_user(base + 0x610, &[0u8; 8])?;
+                put_user(base + 0x620, &8u32.to_le_bytes())?;
+                if call32_sp(
+                    365,
+                    [u64::from(s0), 1, 20, base + 0x610, base + 0x620, 0],
+                    sp,
+                ) != 0
+                    || get_user(base + 0x610, 8)? != words(&[1, 500_000])
+                    || get_u32(base + 0x620)? != 8
+                {
+                    return Err("i386 getsockopt(SO_RCVTIMEO) did not return the old_timeval32");
+                }
+                // socketcall(SYS_SOCKETPAIR / SYS_SEND / SYS_RECV).
+                put_user(base + 0x700, &words(&[1, 2, 0, b32(0x740)]))?;
+                if call32_sp(102, [8, base + 0x700, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 socketcall(SYS_SOCKETPAIR) failed");
+                }
+                let (t0, t1) = (get_u32(base + 0x740)?, get_u32(base + 0x744)?);
+                fds.extend([u64::from(t0), u64::from(t1)]);
+                put_user(base + 0x760, b"sc")?;
+                put_user(base + 0x700, &words(&[t0, b32(0x760), 2, 0]))?;
+                if call32_sp(102, [9, base + 0x700, 0, 0, 0, 0], sp) != 2 {
+                    return Err("i386 socketcall(SYS_SEND) failed");
+                }
+                put_user(
+                    base + 0x700,
+                    &words(&[t1, b32(0x780), 8, MSG_DONTWAIT as u32]),
+                )?;
+                if call32_sp(102, [10, base + 0x700, 0, 0, 0, 0], sp) != 2
+                    || get_user(base + 0x780, 2)? != b"sc"
+                {
+                    return Err("i386 socketcall(SYS_RECV) failed");
+                }
+                if call32_sp(102, [0, base + 0x700, 0, 0, 0, 0], sp) != EINVAL {
+                    return Err("socketcall(0) must be EINVAL");
+                }
+                Ok(())
+            })();
+            for fd in fds {
+                let _ = call32(6, [fd, 0, 0, 0, 0, 0]);
+            }
+            result
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_socket_msghdr_and_socketcall
+);
