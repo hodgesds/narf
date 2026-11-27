@@ -1669,6 +1669,9 @@ mod tests {
         // Every priority-only UPDATE_CONTEXT_POLICIES the model's CT
         // consumed, as (GuC context id, priority), in order.
         priority_updates: Vec<(u32, u32)>,
+        // Every PPGTT TLB invalidation (0x7000, seven dwords) and
+        // PAGE_FAULT_RES_DESC (0x6003) the model's CT consumed, in order.
+        fault_h2g: Vec<Vec<u32>>,
         profile: Option<GtPlatform>,
         regs: BTreeMap<u64, u32>,
         writes: Vec<(u64, u32)>,

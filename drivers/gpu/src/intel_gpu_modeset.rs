@@ -1321,6 +1321,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.program_cdclk_floor(mode)?;
         self.program_dpclka_routing()?;
         self.enable_pipe_power_well(self.pipe)?;
+        self.gen9_arm_fifo_underrun();
         self.program_transcoder(mode);
         self.program_pipe(mode);
         if self.hdmi_ycbcr420 {
@@ -1587,6 +1588,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // via HSW_PWR_WELL_CTL2, mirroring i915's
         // `hsw_set_power_well`.
         self.enable_pipe_power_well(self.pipe)?;
+        self.gen9_arm_fifo_underrun();
 
         // Step 6: program transcoder timing. PRM Vol. 14 §"TRANS_*"
         // — HTOTAL / VTOTAL / HSYNC / VSYNC registers.
@@ -1796,7 +1798,15 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.gen9_platform.is_some() {
             return match pipe {
                 Pipe::A => Ok(()),
-                Pipe::B | Pipe::C => self.enable_power_well(15),
+                Pipe::B | Pipe::C => {
+                    // hsw_power_well_enable → hsw_power_well_post_enable:
+                    // PW_2's irq_pipe_mask (B, C) set up again once the
+                    // driver's request brought it up (Gen9 interrupt owner).
+                    if self.request_power_well(15)? {
+                        crate::intel_gpu_gen9_irq::power_well_2_post_enable();
+                    }
+                    Ok(())
+                }
                 Pipe::D => Err(ModesetError::PowerWellTimeout),
             };
         }
@@ -1860,11 +1870,19 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// path; the SKL indices — PW_2 15, DDI_IO_* 1–4 — on the
     /// Gen9 path).
     fn enable_power_well(&mut self, idx: u32) -> Result<(), ModesetError> {
+        self.request_power_well(idx).map(|_| ())
+    }
+
+    /// [`Self::enable_power_well`], answering whether this call set the
+    /// driver's request (the `hsw_power_well_enable` a refcount's first
+    /// user runs) rather than finding it set.
+    fn request_power_well(&mut self, idx: u32) -> Result<bool, ModesetError> {
         let req = pwr_well_req(idx);
         let state = pwr_well_state(idx);
         // Idempotent request — set REQUEST bit without disturbing
         // the other 7 power-well slots in the DRIVER register.
         let cur = self.mmio.read32(PWR_WELL_CTL2);
+        let newly = cur & req == 0;
         self.mmio.write32(PWR_WELL_CTL2, cur | req);
         compiler_fence(Ordering::SeqCst);
         // Poll for grant. 1 ms cap matches i915's default
@@ -1878,12 +1896,23 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             let expired = narf_time::now_cycles().wrapping_sub(start) > budget;
             let s = self.mmio.read32(PWR_WELL_CTL2);
             if s & state != 0 {
-                return Ok(());
+                return Ok(newly);
             }
             if expired {
                 return Err(ModesetError::PowerWellTimeout);
             }
             core::hint::spin_loop();
+        }
+    }
+
+    /// Gen9: `intel_ddi_pre_enable`'s `intel_set_cpu_fifo_underrun_reporting
+    /// (pipe, true)`, at the same point of the crtc enable (after the port
+    /// PLL and the pipe's power well, before the transcoder): this run's
+    /// pipe reports its next FIFO underrun through the Gen9 interrupt owner
+    /// (`narf.intel.gen9_irq=1`). Inert elsewhere.
+    fn gen9_arm_fifo_underrun(&self) {
+        if self.gen9_platform.is_some() {
+            let _ = crate::intel_gpu_gen9_irq::set_fifo_underrun_reporting(self.pipe, true);
         }
     }
 
@@ -4715,6 +4744,44 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_rkl_pipe_power_wells_skip_pw2
+    );
+
+    /// Gen9 PW_2 (`skl_power_wells`: `SKL_PW_CTL_IDX_PW_2` = 15, request
+    /// bit 31, state bit 30): `hsw_power_well_enable` runs, and with it
+    /// `hsw_power_well_post_enable`'s interrupt setup for pipes B/C, when
+    /// the driver's request is new; a request this driver already holds is
+    /// not a new enable. Pipe A (PW_1, always on) requests nothing.
+    fn smoke_gen9_pw2_request_reports_a_new_enable() -> TestResult {
+        for (held, newly) in [(0u32, true), (1 << 31, false)] {
+            let mut mmio = FakeMmio::new();
+            mmio.state_offset = super::PWR_WELL_CTL2;
+            mmio.state_value = 1 << 30;
+            mmio.set_read(super::PWR_WELL_CTL2, held);
+            let mut ms = Modeset::for_pipe(&mmio, Ddi::B, Pipe::B);
+            ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::KabyLake);
+            if ms.request_power_well(15) != Ok(newly) {
+                return TestResult::Fail("a new PW_2 request is reported, a held one is not");
+            }
+            if mmio.writes_to(super::PWR_WELL_CTL2).last() != Some(&(held | 1 << 31 | 1 << 30)) {
+                return TestResult::Fail("the PW_2 request bit is written");
+            }
+            if ms.enable_pipe_power_well(Pipe::B).is_err() {
+                return TestResult::Fail("Pipe B's PW_2 enable succeeds once granted");
+            }
+        }
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::for_pipe(&mmio, Ddi::A, Pipe::A);
+        ms.set_gen9_platform(crate::intel_gpu_gt::Gen9Platform::KabyLake);
+        if ms.enable_pipe_power_well(Pipe::A).is_err()
+            || !mmio.writes_to(super::PWR_WELL_CTL2).is_empty()
+        {
+            return TestResult::Fail("Gen9 Pipe A requests no well");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen9_pw2_request_reports_a_new_enable
     );
 
     fn smoke_enable_pg4_for_pipe_c() -> TestResult {

@@ -352,6 +352,8 @@ struct Owner {
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
     hwmon: Option<Arc<crate::intel_gpu_hwmon::Monitor>>,
     ccs_control: Option<Arc<crate::intel_gpu_ccs_control::Control>>,
+    /// `xe->usm` under `narf.intel.svm=1` on a USM device.
+    usm: Option<Arc<crate::intel_gpu_xe_usm::Usm>>,
 }
 
 #[derive(Debug)]
@@ -365,6 +367,7 @@ struct Backend {
     facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
     ccs_control: Option<Arc<crate::intel_gpu_ccs_control::Control>>,
+    usm: Option<Arc<crate::intel_gpu_xe_usm::Usm>>,
 }
 
 impl crate::intel_gpu_user::UserBackend for Backend {
@@ -1107,6 +1110,9 @@ impl crate::intel_gpu_user::UserBackend for Backend {
     fn cpu_addr_mirror(&self) -> bool {
         crate::intel_gpu_xe_vm::svm::opted_in()
     }
+    fn usm(&self) -> Option<Arc<crate::intel_gpu_xe_usm::Usm>> {
+        self.usm.clone()
+    }
     fn native_xe(&self) -> bool {
         // Fixed-mode KMS becomes usable at probe, before this GT has even
         // observed its two firmware frames. Advertise Mesa submission on
@@ -1785,6 +1791,17 @@ pub(crate) fn start_pending() {
             p.bar.len,
         );
         let ccs_control = crate::intel_gpu_ccs_control::Control::new(p.index);
+        // xe_pagefault_init: only a USM device under narf.intel.svm=1 has a
+        // fault service; its task drains the queue the GuC fills.
+        let usm = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
+            .filter(|platform| {
+                crate::intel_gpu_xe_vm::svm::has_usm(*platform)
+                    && crate::intel_gpu_xe_vm::svm::opted_in()
+            })
+            .map(|_| crate::intel_gpu_xe_usm::Usm::new());
+        if let Some(usm) = &usm {
+            narf_scheduler::spawn(crate::intel_gpu_xe_usm::serve(Arc::downgrade(usm)));
+        }
         let coredump = crate::intel_gpu_error::coredump::arm(p.index);
         let user_epoch = Arc::new(AtomicU64::new(0));
         let reset_publication = Arc::new(recovery::Publication::new(
@@ -1872,6 +1889,7 @@ pub(crate) fn start_pending() {
             power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
             hwmon,
             ccs_control,
+            usm,
         });
         *ops.0.lock() = Arc::downgrade(&owner);
         let backend = Arc::new(Backend {
@@ -1888,6 +1906,7 @@ pub(crate) fn start_pending() {
             facts: owner.user_facts.clone(),
             power_controls: owner.power_controls.clone(),
             ccs_control: owner.ccs_control.clone(),
+            usm: owner.usm.clone(),
         });
         if owner.pending.card.install_user_backend(backend).is_err() {
             log(
@@ -2390,6 +2409,9 @@ impl Owner {
             }
             .map_err(RuntimeError::Gt)?,
         );
+        if let Some(usm) = &self.usm {
+            state.gt.as_mut().expect("retained GT").set_usm(usm.clone());
+        }
         state
             .gt
             .as_mut()

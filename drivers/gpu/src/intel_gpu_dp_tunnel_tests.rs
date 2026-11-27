@@ -406,3 +406,52 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dp_uhbr",
     smoke_uhbr_tunnel_alloc_bw_request_and_completion
 );
+
+/// `drm_dp_tunnel_atomic_check_group_bw` for a one-tunnel group (the
+/// streams of a 128b/132b MST link through the tunnel), from Linux 7.4's
+/// `get_max_dprx_bw` and `roundup` to the 31250 kBps granularity: a UHBR10
+/// x2 DPRX carries `drm_dp_max_dprx_data_rate` 2417750 kBps, rounded up to
+/// 2437500 (78 units); with 2250000 kBps available a 2250000 kBps sum passes
+/// and one more kBps (rounded up to 2281250) does not; with plenty
+/// available a sum above 2437500 fails the DPRX check; an undetermined
+/// available bandwidth fails every sum; a UHBR20 x4 DPRX (9671000 kBps) is
+/// capped at `MAX_DP_REQUEST_BW` units (7968750 kBps).
+fn smoke_uhbr_tunnel_stream_bw_check() -> TestResult {
+    let mut t = Tunnel {
+        granularity: 31_250,
+        estimated_bw: 2_250_000,
+        allocated_bw: None,
+        available_bw: Some(2_250_000),
+        drv_group_id: (1 << 3) | 1,
+        bw_alloc_supported: true,
+        bw_alloc_enabled: true,
+        dprx_128b132b_rates: 0x01,
+        lane0_mapping: true,
+        max_dprx_rate: 1_000_000,
+        max_dprx_lanes: 2,
+    };
+    if t.max_dprx_bw() != 2_437_500
+        || !t.check_stream_bws(2_250_000)
+        || t.check_stream_bws(2_250_001)
+    {
+        return TestResult::Fail("the group check rounds the sum up to the granularity");
+    }
+    t.available_bw = Some(7_968_750);
+    if !t.check_stream_bws(2_437_500) || t.check_stream_bws(2_437_501) {
+        return TestResult::Fail("the sum must fit the DPRX's rounded-up bandwidth");
+    }
+    t.available_bw = None;
+    if t.check_stream_bws(1) {
+        return TestResult::Fail("an undetermined group bandwidth fits nothing");
+    }
+    t.max_dprx_rate = 2_000_000;
+    t.max_dprx_lanes = 4;
+    if t.max_dprx_bw() != 255 * 31_250 {
+        return TestResult::Fail("get_max_dprx_bw is capped at MAX_DP_REQUEST_BW units");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dp_uhbr",
+    smoke_uhbr_tunnel_stream_bw_check
+);

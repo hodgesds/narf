@@ -960,9 +960,35 @@ pub enum PsrLayout {
     AlderLakeP,
 }
 
+/// Wa_16011181250 (`intel_display_wa.c`: Rocket Lake, Alder Lake-S and
+/// DG2): "PSR2 is defeatured for this platform" (`intel_psr.c`
+/// `intel_psr2_config_valid`). DG2 runs no console PSR here.
+pub(crate) fn wa_16011181250(family: Option<crate::intel_gpu_gt::Gen12Platform>) -> bool {
+    use crate::intel_gpu_gt::Gen12Platform;
+    matches!(
+        family,
+        Some(Gen12Platform::RocketLake | Gen12Platform::AlderLakeS)
+    )
+}
+
+/// The panel's PSR capabilities as `family` may use them: a PSR2 panel runs
+/// PSR1 where Wa_16011181250 defeatures PSR2 (`intel_psr_compute_config`
+/// falls back to PSR1 when `intel_sel_update_config_valid` refuses).
+pub(crate) fn platform_psr_caps(
+    mut caps: PsrCaps,
+    family: Option<crate::intel_gpu_gt::Gen12Platform>,
+) -> PsrCaps {
+    if wa_16011181250(family) {
+        caps.psr2 = false;
+    }
+    caps
+}
+
 impl PsrLayout {
     /// Map the driver's chip generation onto a PSR layout.
-    /// Only called for display-supported generations.
+    /// Only called for generations whose panel takes the owned route
+    /// (`crate::intel_gpu_modeset::panel_route`): Rocket Lake's display 12
+    /// takes the Tiger Lake layout (transcoder A, `TRANS_PSR_CTL`).
     pub fn from_generation(generation: Generation) -> PsrLayout {
         match generation {
             Generation::AlderLake => PsrLayout::AlderLakeP,
@@ -1576,6 +1602,10 @@ pub fn enable_psr_for_panel(gpu: &crate::intel_gpu::IntelGpu, mode: &Mode) {
         return;
     };
     let tps3 = receiver.tps3_supported;
+    let caps = platform_psr_caps(
+        caps,
+        crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
+    );
     let layout = PsrLayout::from_generation(gpu.chip.generation);
     match psr_enable(&window, &mut aux, &caps, layout, mode, tps3) {
         Ok(active) => {
@@ -2352,6 +2382,75 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_edp",
         smoke_psr_sink_setup_bytes_are_spec_exact
+    );
+
+    /// Wa_16011181250 (`intel_display_wa.c`: `rocketlake || alderlake_s ||
+    /// dg2`, "PSR2 is defeatured for this platform"): the Rocket Lake panel
+    /// (`narf.intel.rkl_edp=1`) runs a PSR2-capable sink as PSR1 on the
+    /// Tiger Lake layout, with the PSR1 sink bytes (EN_CFG 0x07, D0) and
+    /// `TRANS_PSR_CTL` 0x89F006E6 and no PSR2 register; Tiger Lake and
+    /// Alder Lake-P keep PSR2.
+    fn smoke_psr_rkl_wa_16011181250_runs_psr1() -> TestResult {
+        use crate::intel_gpu_gt::Gen12Platform;
+        for (family, defeatured) in [
+            (Gen12Platform::RocketLake, true),
+            (Gen12Platform::AlderLakeS, true),
+            (Gen12Platform::TigerLake, false),
+            (Gen12Platform::AlderLakeP, false),
+            (Gen12Platform::AlderLakeN, false),
+        ] {
+            if wa_16011181250(Some(family)) != defeatured {
+                return TestResult::Fail("Wa_16011181250's platforms");
+            }
+        }
+        if wa_16011181250(None) {
+            return TestResult::Fail("no Gen12 family, no workaround");
+        }
+        if PsrLayout::from_generation(Generation::RocketLake) != PsrLayout::TigerLake {
+            return TestResult::Fail("Rocket Lake takes the display-12 Tiger Lake layout");
+        }
+        let aux = ScriptAux::default();
+        aux.set(DPCD_PSR_SUPPORT, &[3, 0x04, 0, 0, 0]);
+        aux.set(DPCD_SYNC_LATENCY, &[0x20]);
+        let mut aux = aux;
+        let Ok(Some(caps)) = PsrCaps::probe(&mut aux) else {
+            return TestResult::Fail("support-3 panel must decode as PSR2 caps");
+        };
+        if !platform_psr_caps(caps, Some(Gen12Platform::TigerLake)).psr2 {
+            return TestResult::Fail("Tiger Lake keeps the panel's PSR2");
+        }
+        let caps = platform_psr_caps(caps, Some(Gen12Platform::RocketLake));
+        let mmio = ScriptMmio::default();
+        match psr_enable(
+            &mmio,
+            &mut aux,
+            &caps,
+            PsrLayout::from_generation(Generation::RocketLake),
+            &mode_1080p(),
+            false,
+        ) {
+            Ok(PsrMode::Psr1) => {}
+            _ => return TestResult::Fail("the Rocket Lake panel runs PSR1"),
+        }
+        if aux.writes()
+            != alloc::vec![
+                (DPCD_PSR_EN_CFG, alloc::vec![0x07]),
+                (DPCD_SET_POWER, alloc::vec![0x01]),
+            ]
+        {
+            return TestResult::Fail("PSR1 sink bytes, no ALPM");
+        }
+        if mmio.writes_to(PSR_CTL) != alloc::vec![0x89F0_06E6]
+            || !mmio.writes_to(PSR2_CTL).is_empty()
+            || !mmio.writes_to(PSR2_MAN_TRK_CTL).is_empty()
+        {
+            return TestResult::Fail("TRANS_PSR_CTL only");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_edp",
+        smoke_psr_rkl_wa_16011181250_runs_psr1
     );
 
     /// The masking-defeating case: a PSR2 panel dirtied over

@@ -3,6 +3,90 @@ use super::*;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+/// A device driver's `mmgrab` of an ioctl caller's address space
+/// ([`narf_filesystem::IoctlContext::remote_mm`]). The `Arc` keeps the
+/// address-space object (`mm_count`); each use takes a user reference
+/// (`mmget_not_zero`) first, so nothing is pinned or watched once the
+/// address space has started `exit_mmap`.
+#[derive(Debug)]
+struct GrabbedMm(Arc<narf_memory::AddressSpace>);
+
+impl narf_filesystem::RemoteMm for GrabbedMm {
+    /// `get_user_pages_remote` under the contract of the syscall-context
+    /// [`narf_filesystem::IoctlContext::pin_user_pages`]: each page is faulted
+    /// in through the remote demand path (`access_remote`, a one-byte read
+    /// that never forces), its COW copy resolved for a write pin, then
+    /// pinned. All-or-nothing.
+    fn pin_user_pages(
+        &self,
+        address: u64,
+        pages: u64,
+        writable: bool,
+    ) -> Result<Vec<narf_memory::address_space::UserPagePin>, narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        use narf_memory::{address_space::RegionPerms, RemoteAccess, RemoteBuf};
+        let len = pages.checked_mul(4096).ok_or(FsError::BadAddress)?;
+        if address % 4096 != 0 {
+            return Err(FsError::InvalidData);
+        }
+        address.checked_add(len).ok_or(FsError::BadAddress)?;
+        let mm = self.0.mmget_not_zero().ok_or(FsError::BadAddress)?;
+        let mut pins = Vec::new();
+        pins.try_reserve_exact(pages as usize)
+            .map_err(|_| FsError::OutOfMemory)?;
+        for page in 0..pages {
+            let va = address + page * 4096;
+            validate_user_range(va, 4096).map_err(|_| FsError::BadAddress)?;
+            let at = narf_memory::VirtAddr::new(va);
+            let (perms, phys) = mm.page_backing(at).ok_or(FsError::BadAddress)?;
+            if !perms.contains(RegionPerms::READ) {
+                return Err(FsError::BadAddress);
+            }
+            if writable && !perms.contains(RegionPerms::WRITE) {
+                return Err(FsError::OperationNotPermitted);
+            }
+            if phys.raw() == 0 {
+                let access = RemoteAccess {
+                    write: false,
+                    force: false,
+                    expand_stack: None,
+                };
+                // SAFETY: `mm` is a user reference, so the address space and
+                // its root stay live and `exit_mmap` cannot start; the demand
+                // path is safe against the owner running on another CPU.
+                if unsafe { mm.access_remote(va, RemoteBuf::Read(&mut [0]), access) } != 1 {
+                    return Err(FsError::BadAddress);
+                }
+            }
+            // SAFETY: as above; the identity map and COW tables are live.
+            if writable && !unsafe { mm.user_page_writable_or_resolve(at) } {
+                return Err(FsError::BadAddress);
+            }
+            pins.push(mm.pin_user_page(at).ok_or(FsError::BadAddress)?);
+        }
+        Ok(pins)
+    }
+
+    fn mmu_interval_notifier(
+        &self,
+        address: u64,
+        length: u64,
+        ops: Arc<dyn narf_memory::mmu_notifier::MmuIntervalNotifierOps>,
+    ) -> Result<narf_memory::mmu_notifier::MmuIntervalNotifier, narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        use narf_memory::mmu_notifier::{MmuIntervalNotifier, MmuNotifierError};
+        let mm = self.0.mmget_not_zero().ok_or(FsError::BadAddress)?;
+        MmuIntervalNotifier::insert(&mm, address, length, ops).map_err(|error| match error {
+            MmuNotifierError::InvalidRange => FsError::BadAddress,
+            MmuNotifierError::OutOfMemory => FsError::OutOfMemory,
+        })
+    }
+
+    fn identity(&self) -> u64 {
+        self.0.identity()
+    }
+}
+
 struct DeviceIoctlContext {
     nonblocking: bool,
     /// Non-zero once the driver asked for an interruptible restart
@@ -109,6 +193,11 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
 
     fn address_space_identity(&self) -> Option<u64> {
         current_address_space().map(|space| space.identity())
+    }
+
+    fn remote_mm(&self) -> Option<Arc<dyn narf_filesystem::RemoteMm>> {
+        current_address_space()
+            .map(|space| Arc::new(GrabbedMm(space)) as Arc<dyn narf_filesystem::RemoteMm>)
     }
 
     fn nonblocking(&self) -> bool {

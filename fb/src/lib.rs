@@ -775,6 +775,10 @@ impl FbScanout for GenericScanout {
         // owner publishes the flush. Boot/GOP and DCN314 scanouts have none.
         #[cfg(feature = "amdgpu")]
         narf_drivers_gpu::amdgpu_dcn_display::flush_active_scanout();
+        // An Intel external route under Panel Replay exits replay for it
+        // (frontbuffer tracking); a no-op otherwise.
+        #[cfg(feature = "intel")]
+        narf_drivers_gpu::intel_gpu::flush_active_scanout();
     }
     unsafe fn framebuffer(&self) -> Framebuffer {
         GENERIC_FB

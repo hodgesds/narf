@@ -1086,6 +1086,38 @@ impl Vbt {
         encoder: &VbtEncoder,
         is_uhbr: bool,
     ) -> Option<[(u8, u8, u8); VSPEO_ROWS_DISPLAY14]> {
+        self.vspeo_rows(encoder, if is_uhbr { 5 } else { 4 })
+    }
+
+    /// `intel_bios_get_c10_vspeo` for a DP or eDP output on display 14+:
+    /// table 3 for an eDP link above HBR2 (`port_clock > 540000`), table 2
+    /// for one at or below it, table 1 for a DP link above HBR
+    /// (`port_clock > 270000`) and table 0 at or below it, read as
+    /// [`Self::c20_vspeo`] reads its table.
+    pub fn c10_vspeo(
+        &self,
+        encoder: &VbtEncoder,
+        port_clock_khz: u32,
+        has_edp: bool,
+    ) -> Option<[(u8, u8, u8); VSPEO_ROWS_DISPLAY14]> {
+        let idx = match (has_edp, port_clock_khz) {
+            (true, c) if c > 540_000 => 3,
+            (true, _) => 2,
+            (false, c) if c > 270_000 => 1,
+            (false, _) => 0,
+        };
+        self.vspeo_rows(encoder, idx)
+    }
+
+    /// Table `idx` of `BDB_VSWING_PREEMPH` for an encoder that requests it
+    /// (`validate_vspeo`; the caller checks `has_dp`): sixteen rows at row
+    /// stride `num_columns`, columns 0..2 as (vswing, pre-cursor,
+    /// post-cursor) truncated to the `snps` bytes.
+    fn vspeo_rows(
+        &self,
+        encoder: &VbtEncoder,
+        idx: usize,
+    ) -> Option<[(u8, u8, u8); VSPEO_ROWS_DISPLAY14]> {
         if !encoder.use_vbt_vswing {
             return None;
         }
@@ -1096,7 +1128,6 @@ impl Vbt {
             let raw = tables.get(i * 4..i * 4 + 4)?;
             Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
         };
-        let idx = if is_uhbr { 5 } else { 4 };
         let mut offset = idx * VSPEO_ROWS_DISPLAY14 * columns;
         let mut rows = [(0u8, 0u8, 0u8); VSPEO_ROWS_DISPLAY14];
         for row in rows.iter_mut() {

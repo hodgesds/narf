@@ -103,6 +103,14 @@ struct Hardware {
     psr_pci: Option<(u16, u16, u16)>,
     /// A `CURSURFLIVE` write does not take PSR2 out of deep sleep.
     psr2_stuck: bool,
+    /// A display interrupt owner delivers Pipe A's vblank ([`MockVblank`]).
+    vblank_irq: bool,
+    /// Its handler stops counting vblanks.
+    vblank_irq_stuck: bool,
+    /// Vblank references held.
+    vblank_refs: usize,
+    /// The discrete display IP the install proved (`DiscreteDisplayIp`).
+    discrete: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
 }
 /// Sink AUX writes are logged in the MMIO write log at this pseudo offset
 /// plus the DPCD address, so register and sink order can be compared.
@@ -195,6 +203,10 @@ impl MockPlatform {
                 step_on_read: None,
                 psr_pci: None,
                 psr2_stuck: false,
+                vblank_irq: false,
+                vblank_irq_stuck: false,
+                vblank_refs: 0,
+                discrete: None,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -210,6 +222,35 @@ impl MockPlatform {
     }
     pub(crate) fn tiger(&self) -> Device<Self> {
         self.gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
+    }
+    /// Rocket Lake's panel route (`narf.intel.rkl_edp=1`): display 12 with
+    /// three pipes and five planes (`rkl_desc`, HAS_D12_PLANE_MINIMIZATION),
+    /// the Tiger Lake XR24 literal. Pipe D's registers do not exist.
+    pub(crate) fn rocket(&self) -> Device<Self> {
+        let mut platform = self.clone();
+        platform.3 = Some(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+        {
+            let mut hw = self.0.lock();
+            hw.gen12_display = true;
+            hw.gen12_planes = 5;
+            hw.display13 = false;
+        }
+        Device::new(platform, Generation::RocketLake, 0x1000000, console())
+    }
+    /// DG1's display behind `narf.intel.dg1_kms=1`: Tiger Lake's display 12
+    /// (`dg1_desc`'s `XE_D_DISPLAY`: four pipes, seven planes) on a discrete
+    /// card that scans out of VRAM.
+    pub(crate) fn dg1(&self) -> Device<Self> {
+        let mut platform = self.clone();
+        platform.3 = Some(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        {
+            let mut hw = self.0.lock();
+            hw.gen12_display = true;
+            hw.gen12_planes = 7;
+            hw.display13 = false;
+            hw.discrete = Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg1);
+        }
+        Device::new(platform, Generation::TigerLake, 0x1000000, console())
     }
     pub(crate) fn gen12(&self, family: crate::intel_gpu_gt::Gen12Platform) -> Device<Self> {
         // Select a literal source family when converting the initial generic
@@ -702,6 +743,12 @@ impl MmioWindow for MockPlatform {
             hw.forbidden_display_reads += 1;
             return u32::MAX;
         }
+        if self.3 == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+            && (0x73000..0x74000).contains(&offset)
+        {
+            hw.forbidden_display_reads += 1;
+            return u32::MAX;
+        }
         if hw.gen12_display && !hw.display13 && offset == 0x42084 {
             hw.forbidden_display_reads += 1;
             return u32::MAX;
@@ -1077,6 +1124,10 @@ unsafe impl DisplayAccess for MockPlatform {
     fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
         self.0.lock().display_ip
     }
+
+    fn discrete_display(&self) -> Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp> {
+        self.0.lock().discrete
+    }
 }
 impl Platform for MockPlatform {
     fn published_epoch(&self) -> Option<u64> {
@@ -1103,6 +1154,9 @@ impl Platform for MockPlatform {
     }
     fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         self.3
+    }
+    fn vram_scanout(&self) -> bool {
+        self.0.lock().discrete.is_some()
     }
     fn takeover(&self, _owned_cursor: bool) -> Result<(), FsError> {
         if self.reset_lost() {
@@ -1142,11 +1196,10 @@ impl Platform for MockPlatform {
         }
         fetchers_with_cursor(
             &fresh,
-            match self.3 {
-                Some(crate::intel_gpu_gt::Gen12Platform::TigerLake) => Generation::TigerLake,
-                Some(_) => Generation::AlderLake,
-                None => Generation::MeteorLake,
-            },
+            self.3.map_or(
+                Generation::MeteorLake,
+                crate::intel_gpu_scanout_io::gen12_generation,
+            ),
             fresh.display_ip(),
             owned_dsb,
             owned_cursor,
@@ -1239,6 +1292,15 @@ impl Platform for MockPlatform {
         view.2 = true;
         view.access_ok().then_some(view)
     }
+    fn vblank_irq(&self) -> Option<Box<dyn crate::intel_gpu_gen9_irq::VblankIrq + Send>> {
+        let mut hw = self.0.lock();
+        if !hw.vblank_irq {
+            return None;
+        }
+        hw.vblank_refs += 1;
+        drop(hw);
+        Some(Box::new(MockVblank(self.clone())))
+    }
     fn tick(&self) -> Wait<'_> {
         let mut yielded = false;
         Box::pin(core::future::poll_fn(move |cx| {
@@ -1251,6 +1313,32 @@ impl Platform for MockPlatform {
                 Poll::Ready(())
             }
         }))
+    }
+}
+/// A display interrupt owner's vblank reference over the fixture
+/// (`drm_vblank_get` / `drm_vblank_put`): every display tick is one vblank
+/// its handler counts (`drm_crtc_handle_vblank`), stamped 7 ns after the
+/// tick so a stamp taken from it differs from the frame-counter poll's.
+struct MockVblank(MockPlatform);
+impl crate::intel_gpu_gen9_irq::VblankIrq for MockVblank {
+    fn last(&self) -> Option<(u64, crate::intel_gpu_gen9_irq::VblankStamp)> {
+        let hw = self.0 .0.lock();
+        if hw.vblank_irq_stuck {
+            return Some((0, crate::intel_gpu_gen9_irq::VblankStamp::default()));
+        }
+        let frame = hw.regs.get(&FRAME).copied().unwrap_or(0);
+        Some((
+            u64::from(frame),
+            crate::intel_gpu_gen9_irq::VblankStamp {
+                frame,
+                ns: hw.now + 7,
+            },
+        ))
+    }
+}
+impl Drop for MockVblank {
+    fn drop(&mut self) {
+        self.0 .0.lock().vblank_refs -= 1;
     }
 }
 fn console() -> ActiveScanout {
@@ -1407,6 +1495,61 @@ fn smoke_kms_console_vblank_is_observed_and_loss_is_not_a_stamp() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     smoke_kms_console_vblank_is_observed_and_loss_is_not_a_stamp
+);
+
+/// `drm_crtc_wait_one_vblank` on a display interrupt owner (the Gen9 owner,
+/// `narf.intel.gen9_irq=1`): the wait holds a vblank reference
+/// (`drm_vblank_get`) and ends at the next vblank the handler counts, with
+/// that vblank's frame counter and handling time (`drm_crtc_handle_vblank`,
+/// `drm_crtc_vblank_count_and_time`), then drops it (`drm_vblank_put`). A
+/// handler that stops counting is given Linux's 100 ms ("vblank wait timed
+/// out") and the wait falls back to the frame counter.
+fn smoke_kms_vblank_wait_takes_the_interrupt_owners_vblank() -> TestResult {
+    let platform = MockPlatform::new();
+    let device = device(&platform);
+    platform.0.lock().vblank_irq = true;
+    let mut guard = complete(device.session()).unwrap();
+    let mut call = Box::pin(guard.wait_vblank());
+    assert!(once(call.as_mut()).is_pending());
+    assert_eq!(
+        platform.0.lock().vblank_refs,
+        1,
+        "the wait holds a reference"
+    );
+    // The first tick: FRAME 40 -> 41 at now = 1000 + 250_000.
+    assert_eq!(
+        complete(call),
+        Ok(FlipStamp {
+            ns: 251_007,
+            sequence: 41
+        })
+    );
+    assert_eq!(platform.0.lock().vblank_refs, 0, "drm_vblank_put");
+    // A stuck handler: ten 10 ms ticks reach the 100 ms limit, then the
+    // frame counter's next change is the stamp (its `now`, not +7).
+    platform.0.lock().vblank_irq_stuck = true;
+    platform.0.lock().tick_ns = 10_000_000;
+    let before = platform.read32(FRAME);
+    let stamp = complete(guard.wait_vblank()).unwrap();
+    let now = platform.0.lock().now;
+    if stamp.ns != now || stamp.sequence == before || stamp.sequence != platform.read32(FRAME) {
+        return TestResult::Fail("a stuck vblank handler falls back to the frame counter");
+    }
+    if now < 251_000 + 100_000_000 || platform.0.lock().vblank_refs != 0 {
+        return TestResult::Fail("after Linux's 100 ms, with the reference dropped");
+    }
+    // No owner: the frame counter alone, as before.
+    platform.0.lock().vblank_irq = false;
+    platform.0.lock().vblank_irq_stuck = false;
+    let stamp = complete(guard.wait_vblank()).unwrap();
+    if stamp.ns != platform.0.lock().now {
+        return TestResult::Fail("without an owner the poll stamps the wait");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_vblank_wait_takes_the_interrupt_owners_vblank
 );
 
 fn smoke_kms_start_refusal_and_hard_failure_never_fall_back() -> TestResult {
@@ -1997,6 +2140,8 @@ kernel_test_in!(
 
 #[path = "intel_gpu_color_kms_tests.rs"]
 mod color;
+#[path = "intel_gpu_gen12_legacy_kms_tests.rs"]
+mod gen12_legacy;
 #[cfg(target_arch = "x86_64")]
 #[path = "intel_gpu_kms_multipipe_tests.rs"]
 mod multipipe;

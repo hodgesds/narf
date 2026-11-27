@@ -18,18 +18,20 @@
 //!
 //! # The NARF model, and where it departs from Linux
 //!
-//! - **Fault delivery.** NARF's GPU takes no recoverable page fault: every
-//!   job runs on private page tables built at EXEC, and contexts carry no
-//!   ASID. [`guc::PageFault`] decodes the GuC `REPORT_PAGE_FAULT_REQ_DESC`
-//!   descriptor (`xe_guc_pagefault_handler`) and encodes the
-//!   `PAGE_FAULT_RES_DESC` reply (`guc_ack_fault`), and
-//!   `XeFile::service_page_fault` services it (`xe_pagefault_service`), but
-//!   nothing routes a hardware fault there yet. Pages can only be collected
-//!   from the creator's own syscall context (NARF pins fault user memory in
-//!   through the active address space), so the service runs there and
-//!   refuses another process with ENOSYS, as USERPTR re-collection does.
-//!   `DRM_XE_VM_BIND_OP_PREFETCH` over a mirror VMA (`prefetch_ranges`) is the
-//!   populate path userspace can reach today.
+//! - **Fault delivery.** [`guc::PageFault`] decodes the GuC
+//!   `REPORT_PAGE_FAULT_REQ_DESC` descriptor (`xe_guc_pagefault_handler`) and
+//!   encodes the `PAGE_FAULT_RES_DESC` reply (`guc_ack_fault`). The GuC
+//!   scheduler queues decoded faults on the device's USM state
+//!   (`intel_gpu_xe_vm::usm`), whose service looks the VM up by ASID and
+//!   collects through the creator's address space grabbed at VM creation
+//!   (`gpusvm->mm`, [`narf_filesystem::RemoteMm`]); the GT owner then writes
+//!   the result into the tables of the VM's running jobs, invalidates their
+//!   TLB and answers the GuC. The firmware delivers no fault yet: NARF
+//!   registers no UM queues (see `usm`). From the creator's own syscall,
+//!   `XeFile::service_page_fault` runs the same service, and EXEC refaults
+//!   invalidated ranges; from another process both are ENOSYS, as USERPTR
+//!   re-collection is. `DRM_XE_VM_BIND_OP_PREFETCH` over a mirror VMA
+//!   (`prefetch_ranges`) populates ranges ahead of any fault.
 //! - **Zap and refault at the job boundary.** Invalidation callbacks run under
 //!   IRQ-masked mapping locks and cannot wait for jobs or touch page tables.
 //!   The registry publishes the new sequence before the callback runs, so a
@@ -70,10 +72,14 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
-use narf_filesystem::{FsError, IoctlContext};
+use narf_filesystem::{FsError, IoctlContext, RemoteMm};
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::mmu_notifier::{
-    MmuInterval, MmuIntervalNotifier, MmuIntervalNotifierOps, MmuNotifierEvent, MmuNotifierRange,
+use narf_memory::{
+    address_space::UserPagePin,
+    mmu_notifier::{
+        MmuInterval, MmuIntervalNotifier, MmuIntervalNotifierOps, MmuNotifierEvent,
+        MmuNotifierRange,
+    },
 };
 
 /// The strict boot option.
@@ -120,7 +126,14 @@ const TABLE_BYTES: u64 = 512 * 1024 * 1024;
 /// Linux does without `CONFIG_DRM_XE_PAGEMAP` (`xe_vma_resolve_pagemap` and
 /// `xe_tile_local_pagemap` return NULL), so the type has no value and no
 /// path can migrate a range to VRAM: the `match pagemap {}` at each would-be
-/// migration point proves it.
+/// migration point proves it. That is where migration stops: Linux's
+/// `xe_pagemap_create` registers VRAM as `MEMORY_DEVICE_PRIVATE` pages
+/// (`devm_memremap_pages`), `drm_pagemap_migrate_to_devmem` moves a range's
+/// anonymous pages there through `migrate_vma_setup`/`migrate_vma_pages`,
+/// and a CPU touch faults back through the device-private entry
+/// (`drm_pagemap_migrate_to_ram`, `drm_pagemap_evict_to_ram`). NARF memory/
+/// has no ZONE_DEVICE pages or device-private entries, which no small
+/// driver-facing API can add.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Pagemap {}
 
@@ -132,6 +145,20 @@ fn pagemap(_region: u32) -> Option<Pagemap> {
     None
 }
 
+/// The `DRM_IOCTL_XE_MADVISE` attributes of a mirror VMA other than its PAT
+/// index (`struct xe_vma_mem_attr`). The default is
+/// `DRM_XE_PREFERRED_LOC_DEFAULT_DEVICE`, `DRM_XE_MIGRATE_ALL_PAGES` and
+/// `DRM_XE_ATOMIC_UNDEFINED`, all zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MemAttr {
+    /// `preferred_loc.devmem_fd`.
+    pub devmem_fd: u32,
+    /// `preferred_loc.migration_policy`.
+    pub migration_policy: u16,
+    /// `atomic_access`.
+    pub atomic: u32,
+}
+
 /// One CPU-address-mirror VMA (`XE_VMA_SYSTEM_ALLOCATOR`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MirrorVma {
@@ -141,28 +168,59 @@ pub(crate) struct MirrorVma {
     pub pat: u8,
     /// `XE_VMA_READ_ONLY`.
     pub read_only: bool,
+    /// `vma->attr.default_pat_index`: the bind's PAT index.
+    pub default_pat: u8,
+    pub attr: MemAttr,
+    /// `XE_VMA_MADV_AUTORESET` (`DRM_XE_VM_BIND_FLAG_MADVISE_AUTORESET`).
+    pub autoreset: bool,
 }
 
 impl MirrorVma {
+    /// A mirror bind's VMA, with default attributes.
+    pub(crate) fn new(start: u64, end: u64, pat: u8, read_only: bool, autoreset: bool) -> Self {
+        Self {
+            start,
+            end,
+            pat,
+            read_only,
+            default_pat: pat,
+            attr: MemAttr::default(),
+            autoreset,
+        }
+    }
+    /// `xe_vma_has_default_mem_attrs`.
+    pub(crate) fn has_default_attrs(&self) -> bool {
+        self.attr == MemAttr::default() && self.pat == self.default_pat
+    }
+    /// `xe_vma_set_default_attributes`.
+    pub(crate) fn set_default_attrs(&mut self) {
+        self.attr = MemAttr::default();
+        self.pat = self.default_pat;
+    }
     pub(crate) fn contains(&self, address: u64) -> bool {
         (self.start..self.end).contains(&address)
     }
-    fn overlaps(&self, start: u64, end: u64) -> bool {
+    pub(crate) fn overlaps(&self, start: u64, end: u64) -> bool {
         self.start < end && start < self.end
     }
 }
 
 /// `xe_vm_find_cpu_addr_mirror_vma_range`: widen `[start, end)` over the
-/// mirror VMAs holding `start - 4K` and `end + 1` (every mirror VMA has
-/// default attributes, there being no madvise).
+/// mirror VMAs holding `start - 4K` and `end + 1` that have default
+/// attributes (`is_cpu_addr_vma_with_default_attr`).
 pub(crate) fn merge_extent(vmas: &[MirrorVma], start: u64, end: u64) -> (u64, u64) {
+    let absorbs = |address: u64| {
+        vmas.iter()
+            .find(|vma| vma.contains(address))
+            .filter(|vma| vma.has_default_attrs())
+    };
     let start = start
         .checked_sub(PAGE)
-        .and_then(|before| vmas.iter().find(|vma| vma.contains(before)))
+        .and_then(absorbs)
         .map_or(start, |prev| prev.start);
     let end = Some(end)
         .filter(|end| *end < MAX_VA)
-        .and_then(|end| vmas.iter().find(|vma| vma.contains(end + 1)))
+        .and_then(|end| absorbs(end + 1))
         .map_or(end, |next| next.end);
     (start, end)
 }
@@ -223,6 +281,41 @@ pub(crate) fn covered(mappings: &[VmMapping], vmas: &[MirrorVma], address: u64, 
 }
 
 // ── SVM ranges (drm_gpusvm.c) ─────────────────────────────────────────
+
+/// Where a range's pages are collected: the VM creator's own syscall, or the
+/// creator's address space grabbed at VM creation (`gpusvm->mm`), from the
+/// GPU page-fault service.
+#[derive(Clone, Copy)]
+pub(crate) enum Collector<'a> {
+    Syscall(&'a dyn IoctlContext),
+    Remote(&'a dyn RemoteMm),
+}
+
+impl Collector<'_> {
+    fn identity(&self) -> Option<u64> {
+        match self {
+            Self::Syscall(user) => user.address_space_identity(),
+            Self::Remote(mm) => Some(mm.identity()),
+        }
+    }
+    fn pin(&self, address: u64, pages: u64, writable: bool) -> Result<Vec<UserPagePin>, FsError> {
+        match self {
+            Self::Syscall(user) => user.pin_user_pages(address, pages, writable),
+            Self::Remote(mm) => mm.pin_user_pages(address, pages, writable),
+        }
+    }
+    fn notifier(
+        &self,
+        address: u64,
+        length: u64,
+        ops: Arc<dyn MmuIntervalNotifierOps>,
+    ) -> Result<MmuIntervalNotifier, FsError> {
+        match self {
+            Self::Syscall(user) => user.mmu_interval_notifier(address, length, ops),
+            Self::Remote(mm) => mm.mmu_interval_notifier(address, length, ops),
+        }
+    }
+}
 
 /// A range's interval-notifier consumer (`xe_svm_invalidate`). The registry
 /// has already stored the new sequence, which invalidates the range's pages
@@ -300,13 +393,13 @@ impl Range {
     /// `xe_svm_range_get_pages`.
     fn insert(
         vm: &Vm,
-        user: &dyn IoctlContext,
+        user: Collector<'_>,
         start: u64,
         end: u64,
         vma: &MirrorVma,
     ) -> Result<Self, FsError> {
         let events = Arc::new(RangeEvents::default());
-        let notifier = user.mmu_interval_notifier(start, end - start, events.clone())?;
+        let notifier = user.notifier(start, end - start, events.clone())?;
         let mut range = Self {
             start,
             end,
@@ -324,12 +417,7 @@ impl Range {
     /// collect the range inside `read_begin`/`read_retry` until no
     /// invalidation raced it; -EFAULT once the range is unmapped, -EBUSY when
     /// every round was raced (`HMM_RANGE_DEFAULT_TIMEOUT`).
-    fn collect(
-        &mut self,
-        vm: &Vm,
-        user: &dyn IoctlContext,
-        vma: &MirrorVma,
-    ) -> Result<(), FsError> {
+    fn collect(&mut self, vm: &Vm, user: Collector<'_>, vma: &MirrorVma) -> Result<(), FsError> {
         self.pages = None;
         self.writable = !vma.read_only;
         self.pat = vma.pat;
@@ -338,8 +426,7 @@ impl Range {
                 return Err(FsError::BadAddress);
             }
             let seq = self.notifier.read_begin();
-            let pins =
-                user.pin_user_pages(self.start, (self.end - self.start) / PAGE, self.writable)?;
+            let pins = user.pin(self.start, (self.end - self.start) / PAGE, self.writable)?;
             // drm_gpusvm_get_pages: a range unmapped meanwhile is -EFAULT.
             if self.gone() {
                 return Err(FsError::BadAddress);
@@ -357,11 +444,27 @@ impl Range {
     }
 }
 
+/// What `xe_svm_init` mirrors: the creator's address space (`current->mm`)
+/// by identity, grabbed when the creator's context offers it, on a device
+/// that is or is not discrete.
+pub(crate) struct Mirror {
+    pub space: u64,
+    pub remote: Option<Arc<dyn RemoteMm>>,
+    pub discrete: bool,
+}
+
 /// A fault-mode VM's GPU SVM (`vm->svm.gpusvm`).
 #[derive(Debug)]
 pub(crate) struct Svm {
     /// [`narf_memory::AddressSpace::identity`] of the mirrored address space.
     space: u64,
+    /// That address space, grabbed at VM creation (`gpusvm->mm`), through
+    /// which the GPU page-fault service collects pages. `None` when the
+    /// creator's context offered none; then only the creator's own syscalls
+    /// collect.
+    remote: Option<Arc<dyn RemoteMm>>,
+    /// `IS_DGFX`.
+    discrete: bool,
     /// The CPU-address-mirror VMAs, sorted and disjoint from the VM's
     /// mappings. Published with them, with the VM's `state` held.
     vmas: IrqSafeSpinLock<Vec<MirrorVma>>,
@@ -371,9 +474,16 @@ pub(crate) struct Svm {
 }
 
 impl Svm {
-    pub(crate) fn new(space: u64) -> Self {
+    pub(crate) fn new(mirror: Mirror) -> Self {
+        let Mirror {
+            space,
+            remote,
+            discrete,
+        } = mirror;
         Self {
             space,
+            remote: remote.filter(|mm| mm.identity() == space),
+            discrete,
             vmas: IrqSafeSpinLock::new(Vec::new()),
             ranges: IrqSafeSpinLock::new(Vec::new()),
         }
@@ -403,10 +513,75 @@ impl Svm {
     /// (`xe_svm_garbage_collector`: "Always process UNMAPs first").
     fn with<T>(&self, work: impl FnOnce(&mut Vec<Range>) -> T) -> T {
         let mut ranges = core::mem::take(&mut *self.ranges.lock());
-        ranges.retain(|range| !range.gone());
+        let mut unmapped = Vec::new();
+        ranges.retain(|range| {
+            let gone = range.gone();
+            if gone && unmapped.try_reserve(1).is_ok() {
+                unmapped.push((range.start, range.end));
+            }
+            !gone
+        });
+        for (start, end) in unmapped {
+            self.reset_default_attrs(start, end);
+        }
         let result = work(&mut ranges);
         *self.ranges.lock() = ranges;
         result
+    }
+
+    /// `xe_svm_range_set_default_attr` for a range the CPU unmapped, with the
+    /// VM state held: in a mirror VMA bound with `MADVISE_AUTORESET`, the
+    /// range's part (the whole VMA when it already has default attributes)
+    /// becomes a default-attribute mirror VMA merged with its default
+    /// neighbours (`xe_vm_alloc_cpu_addr_mirror_vma`).
+    fn reset_default_attrs(&self, start: u64, end: u64) {
+        let mut vmas = self.vmas.lock().clone();
+        let Some(index) = vmas.iter().position(|vma| vma.contains(start)) else {
+            return;
+        };
+        let vma = vmas[index];
+        if !vma.autoreset {
+            return;
+        }
+        let default = vma.has_default_attrs();
+        let (start, end) = if default {
+            (vma.start, vma.end)
+        } else {
+            if (vma.start, vma.end) == (start, end) {
+                vmas[index].set_default_attrs();
+            }
+            (start, end)
+        };
+        let (start, end) = merge_extent(&vmas, start, end);
+        if (vma.start, vma.end) == (start, end) && default {
+            return;
+        }
+        if carve(&mut vmas, start, end, None).is_err() || vmas.try_reserve(1).is_err() {
+            return;
+        }
+        vmas.push(MirrorVma::new(
+            start,
+            end,
+            vma.default_pat,
+            vma.read_only,
+            true,
+        ));
+        vmas.sort_unstable_by_key(|vma| vma.start);
+        *self.vmas.lock() = vmas;
+    }
+
+    /// `xe_svm_ranges_zap_ptes_in_range` over `[start, end)`, with the VM
+    /// state held: every range there drops its pages, so the next job
+    /// refaults it under its VMA's new attributes and no job built after maps
+    /// it with the old ones. Returns whether any range was zapped.
+    pub(crate) fn zap(&self, _held: &State, start: u64, end: u64) -> bool {
+        self.with(|ranges| {
+            let mut zapped = false;
+            for range in ranges.iter_mut().filter(|range| range.overlaps(start, end)) {
+                zapped |= range.pages.take().is_some();
+            }
+            zapped
+        })
     }
 
     /// `xe_svm_garbage_collector`, with the VM state held.
@@ -450,7 +625,7 @@ impl Svm {
             for range in ranges.iter_mut().filter(|range| !range.valid()) {
                 range.pages = None;
                 if let Some(vma) = self.vma_at(range.start).filter(|_| refault) {
-                    let _ = range.collect(vm, user, &vma);
+                    let _ = range.collect(vm, Collector::Syscall(user), &vma);
                 }
             }
             ranges.iter().filter_map(Range::mapping).collect()
@@ -467,12 +642,31 @@ impl Svm {
         state: &State,
         vma: &MirrorVma,
         address: u64,
-        user: &dyn IoctlContext,
+        user: Collector<'_>,
     ) -> Result<(u64, u64), FsError> {
-        if user.address_space_identity() != Some(self.space) {
+        if user.identity() != Some(self.space) {
             return Err(FsError::NotImplemented);
         }
         self.with(|ranges| fault_locked(ranges, vm, state, vma, address, user))
+    }
+
+    /// The creator's grabbed address space, for the GPU page-fault service:
+    /// ENOSYS without one, as for another process.
+    pub(crate) fn remote(&self) -> Result<Collector<'_>, FsError> {
+        self.remote
+            .as_deref()
+            .map(Collector::Remote)
+            .ok_or(FsError::NotImplemented)
+    }
+
+    /// The mapping a job needs for the valid range starting at `start`
+    /// (what `xe_svm_range_bind` writes).
+    pub(crate) fn range_mapping(&self, start: u64) -> Option<VmMapping> {
+        self.ranges
+            .lock()
+            .iter()
+            .find(|range| range.start == start && range.valid())
+            .and_then(Range::mapping)
     }
 
     /// `prefetch_ranges` for the mirror VMAs over `[start, start + length)`:
@@ -504,7 +698,7 @@ impl Svm {
         for vma in &vmas {
             let (mut address, stop) = (vma.start.max(start), vma.end.min(end));
             while address < stop {
-                address = match self.fault(vm, state, vma, address, user) {
+                address = match self.fault(vm, state, vma, address, Collector::Syscall(user)) {
                     Ok((_, range_end)) => range_end,
                     Err(FsError::NotFound) => address + PAGE,
                     Err(error) => return Err(error),
@@ -522,7 +716,7 @@ fn fault_locked(
     state: &State,
     vma: &MirrorVma,
     address: u64,
-    user: &dyn IoctlContext,
+    user: Collector<'_>,
 ) -> Result<(u64, u64), FsError> {
     // drm_gpusvm_range_find: an existing range is valid ("PAGE FAULT -
     // VALID") or collects its pages again. A CPU mapping gone without an
@@ -588,12 +782,14 @@ fn budget(state: &State, scratch: bool, ranges: &[Range]) -> (u64, usize) {
     )
 }
 
-/// GPU page-fault reports (`xe_guc_pagefault.c`, `xe_pagefault.c`). Nothing
-/// routes a hardware fault here yet (see the module notes), so outside the
-/// native fixtures only `XeFile::service_page_fault` names it.
+/// GPU page-fault reports (`xe_guc_pagefault.c`, `xe_pagefault.c`), decoded
+/// by the GuC scheduler and serviced by the device's fault service
+/// (`intel_gpu_xe_vm::usm`).
 pub(crate) mod guc {
     #![cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
-    use super::{pagemap, State, Vm};
+    use super::{pagemap, Collector, State, Vm};
+    use crate::intel_gpu_exec::VmMapping;
+    use alloc::vec::Vec;
     use narf_filesystem::{FsError, IoctlContext};
 
     /// `XE_GUC_ACTION_REPORT_PAGE_FAULT_REQ_DESC`.
@@ -702,14 +898,16 @@ pub(crate) mod guc {
     /// `xe_pagefault_service` once the producer's VM is known: a NACK is -EFAULT,
     /// a VM not in fault mode -EINVAL, a closed one -ENOENT, an address no VMA
     /// holds -EINVAL, and a write or atomic access to a read-only VMA -EPERM. A
-    /// mirror VMA goes to `xe_svm_handle_pagefault`; any other VMA is already in
-    /// every job's tables (NARF binds all mappings at EXEC), so it is valid.
-    pub(crate) fn service(
-        vm: &Vm,
+    /// mirror VMA goes to `xe_svm_handle_pagefault` with the pages collected
+    /// through `collector`; any other VMA is bound whole
+    /// (`xe_pagefault_handle_vma`), so its mapping is returned. Returns the
+    /// bounds Linux records as the ack hint.
+    fn service_with<'a>(
+        vm: &'a Vm,
         state: &State,
         fault: &PageFault,
-        user: &dyn IoctlContext,
-    ) -> Result<(u64, u64), FsError> {
+        collector: impl FnOnce(&'a super::Svm) -> Result<Collector<'a>, FsError>,
+    ) -> Result<(u64, u64, Option<VmMapping>), FsError> {
         if fault.fault_type_level == TYPE_LEVEL_NACK {
             return Err(FsError::BadAddress);
         }
@@ -727,15 +925,20 @@ pub(crate) mod guc {
             if vma.read_only && !read {
                 return Err(FsError::OperationNotPermitted);
             }
-            // xe_vma_need_vram_for_atomic is 0 on an iGPU, and without a pagemap
+            // xe_vma_need_vram_for_atomic is 0 on an iGPU and -EACCES on a dGPU
+            // for DRM_XE_ATOMIC_CPU; otherwise, without a pagemap,
             // `devmem_only` is false on a dGPU: an atomic fault collects system
             // pages like any other.
             if fault.atomic() {
+                if svm.discrete && vma.attr.atomic == crate::intel_gpu_xe_vm::madvise::ATOMIC_CPU {
+                    return Err(FsError::PermissionDenied);
+                }
                 if let Some(pagemap) = pagemap(1) {
                     match pagemap {}
                 }
             }
-            return svm.fault(vm, state, &vma, address, user);
+            let (start, end) = svm.fault(vm, state, &vma, address, collector(svm)?)?;
+            return Ok((start, end, None));
         }
         let mapping = state
             .mappings
@@ -745,6 +948,39 @@ pub(crate) mod guc {
         if !mapping.writable && !read {
             return Err(FsError::OperationNotPermitted);
         }
-        Ok((mapping.va, mapping.va + mapping.length))
+        Ok((
+            mapping.va,
+            mapping.va + mapping.length,
+            Some(mapping.clone()),
+        ))
+    }
+
+    /// [`service_with`] from the VM creator's own syscall context.
+    pub(crate) fn service(
+        vm: &Vm,
+        state: &State,
+        fault: &PageFault,
+        user: &dyn IoctlContext,
+    ) -> Result<(u64, u64), FsError> {
+        service_with(vm, state, fault, |_| Ok(Collector::Syscall(user)))
+            .map(|(start, end, _)| (start, end))
+    }
+
+    /// [`service_with`] from the GPU page-fault service, collecting through
+    /// the creator's grabbed address space: the bounds and the mappings the
+    /// faulting jobs need (the range, or the whole VMA).
+    pub(crate) fn service_remote(
+        vm: &Vm,
+        state: &State,
+        fault: &PageFault,
+    ) -> Result<(u64, u64, Vec<VmMapping>), FsError> {
+        let (start, end, mapping) = service_with(vm, state, fault, super::Svm::remote)?;
+        let mapping = match mapping {
+            Some(mapping) => Some(mapping),
+            None => vm.svm.as_ref().and_then(|svm| svm.range_mapping(start)),
+        };
+        // A range invalidated again since it was collected is left out: the
+        // GPU faults once more and the next service collects it again.
+        Ok((start, end, mapping.into_iter().collect()))
     }
 }

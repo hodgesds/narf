@@ -583,6 +583,9 @@ impl Model {
             }
             (_, 0xf2d, _) if converter => 1,
             (_, 0xf07, _) if pin => 0x40,
+            // AC_PAR_DEVLIST_LEN: four device entries (0-based 3), a
+            // Tiger Lake+ pin behind an MST-capable receiver.
+            (_, 0xf00, 0x15) if pin => 3,
             _ => 0,
         }
     }
@@ -4731,3 +4734,258 @@ fn native_hda_pcms_are_interleaved_only() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda/access", native_hda_pcms_are_interleaved_only);
+
+fn pci_function(bus: u8, device: u8, function: u8, id: (u16, u16), class: u32) -> BusDevice {
+    let addr = narf_bus::PcieAddr {
+        segment: 0,
+        bus,
+        device,
+        function,
+    };
+    BusDevice {
+        addr: narf_bus::BusAddr::Pcie(addr),
+        kind: narf_bus::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+        id: narf_bus::DeviceId {
+            vendor: id.0,
+            device: id.1,
+            class,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+    }
+}
+
+/// The display functions the scripted Intel display binds a component for:
+/// Meteor Lake's 8086:7d55 and a Battlemage 8086:e20b.
+fn scripted_provider(vendor: u16, device: u16) -> bool {
+    vendor == 0x8086 && matches!(device, 0x7d55 | 0xe20b | 0x5a40)
+}
+
+/// `snd_hdac_i915_init` at the controller probe (sound/hda/core/i915.c,
+/// sound/hda/controllers/intel.c `azx_probe`): a Meteor Lake PCH
+/// controller (00:1f.3, 8086:7e28) beside its display (00:02.0) defers
+/// (-EPROBE_DEFER) while the display has not bound its component and
+/// probes once it has; without a display driver that binds one (the
+/// `narf.intel.hdmi14_ext` option off) it probes without the component
+/// (-ENODEV, "don't bother any longer"), as do an ICH9 controller (no
+/// `AZX_DCAPS_I915_COMPONENT`) and a denylisted Cannon Lake display.
+/// `connectivity_check`: two root buses count as connected ("may be
+/// NULL!"); a display behind a root port does not reach a root-bus
+/// controller; a discrete GPU's HD-audio under a sibling switch port does
+/// (the parents' parent).
+fn native_hda_i915_init_defers_until_display_binds() -> TestResult {
+    use super::super::intelhdmi::{connectivity_check, i915_init, I915Init};
+    use narf_drivers_sound::display_audio as acomp;
+    let hdac = pci_function(0, 0x1f, 3, (0x8086, 0x7e28), 0x040300);
+    let gpu = pci_function(0, 2, 0, (0x8086, 0x7d55), 0x030000);
+    let none = |_: &BusDevice| None;
+    let saved = acomp::display_audio_provider();
+    acomp::register_display_audio_provider(scripted_provider);
+    let defer = i915_init(&hdac, &[gpu, hdac], &none, false);
+    let bound = i915_init(&hdac, &[gpu, hdac], &none, true);
+    let ich9 = i915_init(
+        &pci_function(0, 0x1b, 0, (0x8086, 0x293e), 0x040300),
+        &[gpu],
+        &none,
+        false,
+    );
+    let cnl = i915_init(
+        &hdac,
+        &[pci_function(0, 2, 0, (0x8086, 0x5a40), 0x030000)],
+        &none,
+        false,
+    );
+    // A non-display Intel function is not a display.
+    let not_display = i915_init(
+        &hdac,
+        &[pci_function(0, 2, 0, (0x8086, 0x7d55), 0x048000)],
+        &none,
+        false,
+    );
+    acomp::unregister_display_audio_provider();
+    let option_off = i915_init(&hdac, &[gpu, hdac], &none, false);
+    if let Some(provider) = saved {
+        acomp::register_display_audio_provider(provider);
+    }
+    if defer != I915Init::Defer || bound != I915Init::Bound {
+        return TestResult::Fail("a present display defers the probe until its component binds");
+    }
+    if option_off != I915Init::Without
+        || ich9 != I915Init::Without
+        || cnl != I915Init::Without
+        || not_display != I915Init::Without
+    {
+        return TestResult::Fail("no binding display (or no I915_COMPONENT) probes without it");
+    }
+    // Bus topology: root port 00:01.0 -> bus 3; on bus 3 the switch ports
+    // 03:00.0 -> bus 4 and 03:01.0 -> bus 7; on bus 4 the ports 04:01.0 ->
+    // bus 5 (GPU) and 04:04.0 -> bus 6 (HD-audio, same parent bus); on bus
+    // 7 the port 07:00.0 -> bus 8 (HD-audio, the parents' parent bus 3).
+    let root_port = pci_function(0, 1, 0, (0x8086, 0x7ecc), 0x060400);
+    let switch_a = pci_function(3, 0, 0, (0x8086, 0xe2ff), 0x060400);
+    let switch_b = pci_function(3, 1, 0, (0x8086, 0xe2fe), 0x060400);
+    let gpu_port = pci_function(4, 1, 0, (0x8086, 0xe2f0), 0x060400);
+    let audio_port = pci_function(4, 4, 0, (0x8086, 0xe2f1), 0x060400);
+    let far_port = pci_function(7, 0, 0, (0x8086, 0xe2f2), 0x060400);
+    let dgpu = pci_function(5, 0, 0, (0x8086, 0xe20b), 0x030000);
+    let dhda = pci_function(6, 0, 0, (0x8086, 0xe2f7), 0x040300);
+    let far_hda = pci_function(8, 0, 0, (0x8086, 0xe2f7), 0x040300);
+    let behind_root = pci_function(3, 0, 0, (0x8086, 0x7d55), 0x030000);
+    let parent = move |d: &BusDevice| -> Option<BusDevice> {
+        let narf_bus::BusKind::Pcie { addr, .. } = d.kind else {
+            return None;
+        };
+        match addr.bus {
+            3 => Some(root_port),
+            4 => Some(switch_a),
+            7 => Some(switch_b),
+            5 => Some(gpu_port),
+            6 => Some(audio_port),
+            8 => Some(far_port),
+            _ => None,
+        }
+    };
+    let other_root = pci_function(0x80, 2, 0, (0x8086, 0x7d55), 0x030000);
+    if !connectivity_check(&gpu, &hdac, &parent)
+        || !connectivity_check(&other_root, &hdac, &parent)
+        || connectivity_check(&behind_root, &hdac, &parent)
+        || !connectivity_check(&dgpu, &dhda, &parent)
+        || !connectivity_check(&dgpu, &far_hda, &parent)
+        || connectivity_check(&dgpu, &hdac, &parent)
+    {
+        return TestResult::Fail("connectivity_check differs from sound/hda/core/i915.c");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_i915_init_defers_until_display_binds);
+
+/// A scripted Intel display whose only audio stream is a DP MST (or UHBR
+/// SST) stream on port B's CPU transcoder C: `find_audio_state` answers it
+/// at (PORT_B, 2) alone.
+#[derive(Debug)]
+struct MstScriptedDisplay {
+    state: IrqSafeSpinLock<ScriptedState>,
+}
+
+impl narf_drivers_sound::display_audio::DisplayAudioComponent for MstScriptedDisplay {
+    fn get_power(&self) -> u64 {
+        1
+    }
+    fn put_power(&self, _cookie: u64) {}
+    fn codec_wake_override(&self, _enable: bool) {}
+    fn get_cdclk_freq(&self) -> Result<u32, narf_drivers_sound::display_audio::ComponentError> {
+        Ok(307_200)
+    }
+    fn sync_audio_rate(
+        &self,
+        port: i32,
+        pipe: i32,
+        rate: u32,
+    ) -> Result<(), narf_drivers_sound::display_audio::ComponentError> {
+        self.state.lock().calls.push(("rate", port, pipe, rate));
+        Ok(())
+    }
+    fn get_eld(
+        &self,
+        port: i32,
+        pipe: i32,
+        buf: &mut [u8],
+    ) -> Result<(bool, usize), narf_drivers_sound::display_audio::ComponentError> {
+        let state = self.state.lock();
+        match (&state.eld, port, pipe) {
+            (Some(eld), 1, 2) => {
+                let n = eld.len().min(buf.len());
+                buf[..n].copy_from_slice(&eld[..n]);
+                Ok((true, eld.len()))
+            }
+            _ => Err(narf_drivers_sound::display_audio::ComponentError::Invalid),
+        }
+    }
+}
+
+static MST_DISPLAY: MstScriptedDisplay = MstScriptedDisplay {
+    state: IrqSafeSpinLock::new(ScriptedState {
+        eld: None,
+        calls: Vec::new(),
+    }),
+};
+
+/// DP MST audio on the Intel HDMI codec (sound/hda/codecs/hdmi/hdmi.c,
+/// intelhdmi.c, sound/hda/common/codec.c): the display lights an MST
+/// stream on port B's transcoder C and calls `pin_eld_notify(PORT_B, 2)`;
+/// the pin's sense reads its device entries (`dev_num` 4 for this
+/// Meteor Lake codec) through `snd_hdac_acomp_get_eld(pin 6, dev_id)` and
+/// finds the ELD on entry 2 (`dev_id = pipe`). At stream setup
+/// `snd_hda_set_dev_select` reads the pin's `AC_PAR_DEVLIST_LEN` (3: four
+/// entries) and selects entry 2 (`AC_VERB_SET_DEVICE_SEL`) before the
+/// pin's converter select and InfoFrame, and `snd_hdac_sync_audio_rate`
+/// names (PORT_B, 2).
+fn native_hda_intel_hdmi_mst_device_entry() -> TestResult {
+    use narf_drivers_sound::display_audio as acomp;
+    acomp::unbind_display_audio_component();
+    *MST_DISPLAY.state.lock() = ScriptedState::default();
+    super::super::intelhdmi::reset_display_power_for_test();
+    if !acomp::bind_display_audio_component(&MST_DISPLAY) {
+        return TestResult::Fail("the scripted MST display must bind");
+    }
+    let result = intel_mst_entry();
+    acomp::unbind_display_audio_component();
+    acomp::unregister_display_audio_codec();
+    super::super::intelhdmi::reset_display_power_for_test();
+    result
+}
+
+fn intel_mst_entry() -> TestResult {
+    let fixture = match intel_fixture() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    super::super::intelhdmi::register_notifier(&dev);
+    MST_DISPLAY.state.lock().eld = Some(INTEL_SINK_ELD.to_vec());
+    dev.jack_dirty.store(false, Ordering::Release);
+    narf_drivers_sound::display_audio::notify_pin_eld(1, 2);
+    if !dev.jack_dirty.load(Ordering::Acquire) {
+        return TestResult::Fail("pin_eld_notify(PORT_B, 2) must mark the codec's jack dirty");
+    }
+    if dev.refresh_hdmi(false).is_err() {
+        return TestResult::Fail("the jack re-read must run");
+    }
+    let (jack, eld) = dev.hdmi_jack();
+    if !jack || eld != INTEL_SINK_ELD || dev.hdmi.lock()[0].dev_id != 2 {
+        return TestResult::Fail("the pin must sit on device entry 2 with the stream's ELD");
+    }
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 3) else {
+        return TestResult::Fail("open the HDMI PCM");
+    };
+    let first = fixture.model.verbs.len();
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure Intel HDMI playback on the MST entry");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    let at = |v: u32| verbs.iter().position(|x| *x == v);
+    match (
+        at(make_verb(0, 6, 0xf0015)),
+        at(make_verb(0, 6, 0x73502)),
+        at(make_verb(0, 6, 0xf0100)),
+        at(make_verb(0, 6, 0x73184)),
+    ) {
+        (Some(len), Some(sel), Some(conn), Some(ai)) if len < sel && sel < conn && conn < ai => {}
+        _ => return TestResult::Fail("the device entry must be selected before the pin verbs"),
+    }
+    let calls = MST_DISPLAY.state.lock().calls.clone();
+    if calls.is_empty() || calls.iter().any(|c| *c != ("rate", 1, 2, 48_000)) {
+        return TestResult::Fail("the rate sync must name the MST stream's transcoder");
+    }
+    drop(playback);
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_intel_hdmi_mst_device_entry);

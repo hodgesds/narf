@@ -138,6 +138,9 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     /// bracketed by Wa_14015076503 while GSC firmware reports loaded
     /// (xe_gt.c::do_gt_reset), so scheduling is admitted beside it.
     gsc_reset_wa: bool,
+    /// The device's USM state (`narf.intel.svm=1` on a USM device), handed
+    /// to every primary-GT scheduler this owner builds.
+    usm: Option<Arc<crate::intel_gpu_xe_usm::Usm>>,
     /// HECI_H_GS1 ER_PREP was set and is still owed its clear.
     gsc_prepared: bool,
     /// GRDOM_FULL waits for the GSC's reset preparation until this time.
@@ -323,7 +326,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             gsc_reset_wa: false,
             gsc_prepared: false,
             gsc_prepare_until: None,
+            usm: None,
         }
+    }
+
+    /// `narf.intel.svm=1` on a USM device: route this GT's GPU page faults
+    /// to the device's fault service once its scheduler exists.
+    pub(crate) fn set_usm(&mut self, usm: Arc<crate::intel_gpu_xe_usm::Usm>) {
+        self.usm = Some(usm);
     }
 
     /// `narf.intel.gsc=1` on the standalone media GT, before scheduling:
@@ -1731,6 +1741,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             // Optional: an allocation failure only loses the manual fallback.
             let _ =
                 scheduler.enable_error_capture(capture.lists.family(), capture.lists.max_regs());
+        }
+        if let Some(usm) = &self.usm {
+            let eus = self.topology().map_or(0, GtTopology::eu_count) as usize;
+            scheduler
+                .set_usm(usm.clone(), eus)
+                .map_err(GtError::Scheduling)?;
         }
         self.parts.scheduler = Some(scheduler);
         self.compute_configuration = Some(registers.compute_configuration());

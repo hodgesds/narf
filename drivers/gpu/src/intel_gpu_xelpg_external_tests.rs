@@ -71,6 +71,9 @@ pub struct Sink {
     /// A `DP_LINK_BW_SET` code at which 128b/132b training reports
     /// `DP_128B132B_LT_FAILED` (0: never).
     pub uhbr_lt_fail_bw: u8,
+    /// 128b/132b training reports `DP_128B132B_LT_FAILED` with more lanes
+    /// than this (0: never).
+    pub uhbr_lt_fail_lanes: u8,
     /// Further DPCD bytes the sink reports.
     pub extra: Vec<(u32, u8)>,
     /// Native writes to `DP_PROTOCOL_CONVERTER_CONTROL_0..=2`, in order.
@@ -81,6 +84,9 @@ pub struct Sink {
     pub tunnel: Option<[u8; 0x32]>,
     /// Native writes to the tunnel registers, in order.
     pub tunnel_log: Vec<(u32, u8)>,
+    /// Native writes to `PANEL_REPLAY_CONFIG`, `_CONFIG2` and `_CONFIG3`,
+    /// in order; each also reads back (through `extra`).
+    pub pr_log: Vec<(u32, u8)>,
 }
 
 impl Sink {
@@ -119,10 +125,12 @@ impl Sink {
             uhbr_reads: Vec::new(),
             link_bw: 0,
             uhbr_lt_fail_bw: 0,
+            uhbr_lt_fail_lanes: 0,
             extra: Vec::new(),
             pcon_log: Vec::new(),
             tunnel: None,
             tunnel_log: Vec::new(),
+            pr_log: Vec::new(),
         }
     }
     /// A DP 2.0 sink: `DP_CAP_ANSI_128B132B` with `uhbr_rates`.
@@ -186,6 +194,11 @@ impl Sink {
                 0x202 => return self.uhbr_status(0),
                 0x203 => return self.uhbr_status(1),
                 0x204 if self.uhbr_lt_fail_bw != 0 && self.link_bw == self.uhbr_lt_fail_bw => {
+                    return uhbr::DP_128B132B_LT_FAILED;
+                }
+                0x204
+                    if self.uhbr_lt_fail_lanes != 0 && self.lanes_set > self.uhbr_lt_fail_lanes =>
+                {
                     return uhbr::DP_128B132B_LT_FAILED;
                 }
                 0x204 => {
@@ -307,6 +320,14 @@ impl Sink {
                 self.uhbr_log.push((addr, value));
                 self.payload_status &= !value;
             }
+            // The PHY repeaters' training registers (per-hop 8b/10b): logged,
+            // the pattern sets also in order with the DPRX's.
+            0xf_0010..=0xf_02ff => {
+                self.uhbr_log.push((addr, value));
+                if (addr - 0xf_0010) % 0x50 == 0 {
+                    self.training_writes.push((addr, value));
+                }
+            }
             0x120 | 0x160 | 0x280 => {
                 self.dsc_log.push((addr, value));
                 match addr {
@@ -316,6 +337,13 @@ impl Sink {
                 }
             }
             0x3050..=0x3052 => self.pcon_log.push((addr, value)),
+            0x1b0 | 0x1b1 | 0x11a => {
+                self.pr_log.push((addr, value));
+                match self.extra.iter_mut().find(|(a, _)| *a == addr) {
+                    Some(entry) => entry.1 = value,
+                    None => self.extra.push((addr, value)),
+                }
+            }
             0x600 => {
                 self.power_log.push(value);
                 self.powered = value & 0x3 == 1;
@@ -2377,6 +2405,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
                 legacy: true,
                 ddc_pin: None,
                 c20_uhbr_vspeo: None,
+                dp14_vspeo: None,
             },
             Legacy,
             RoutePlan::DpThenHdmi,
@@ -2404,6 +2433,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
         legacy: false,
         ddc_pin: None,
         c20_uhbr_vspeo: None,
+        dp14_vspeo: None,
     };
     if !hdmi_only.legacy_effective() || MtlPortDecl::COMBO_DP_HDMI.legacy_effective() {
         return TestResult::Fail("effective legacy flag must follow intel_ddi_init");
@@ -2797,6 +2827,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
             legacy: false,
             ddc_pin: Some(PinPair::Pin2Bxt),
             c20_uhbr_vspeo: None,
+            dp14_vspeo: None,
         },
         tc: [
             MtlPortDecl::USB_C,
@@ -2807,6 +2838,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
                 legacy: true,
                 ddc_pin: Some(PinPair::Pin10Tc2),
                 c20_uhbr_vspeo: None,
+                dp14_vspeo: None,
             },
             MtlPortDecl {
                 lane_reversal: false,
@@ -2815,6 +2847,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
                 legacy: false,
                 ddc_pin: Some(PinPair::Pin11Tc3),
                 c20_uhbr_vspeo: None,
+                dp14_vspeo: None,
             },
             MtlPortDecl::NONE,
         ],
@@ -3493,7 +3526,7 @@ kernel_test_in!(
 /// A DP 1.4 monitor's DSC 1.2 capabilities: 1/2/4 slices, 9-bit line
 /// buffer, block prediction, no maximum bpp, 1/16 bpp increments and an
 /// 850/340 MP/s per-slice throughput.
-const MONITOR_DSC: [u8; 16] = [
+pub(crate) const MONITOR_DSC: [u8; 16] = [
     0x01, 0x21, 0x00, 0x0f, 0x0b, 0x00, 0x01, 0x00, 0x00, 0x01, 0x06, 0x0b, 0x08, 0x00, 0x00, 0x00,
 ];
 
@@ -4322,6 +4355,62 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_option_off_refuses_over_budget
 );
 
+/// Deep colour over 128b/132b SST (`narf.intel.uhbr=1` with
+/// `narf.intel.hdmi14_ext=1`): the two-lane 4K60 DP 2.0 sink of
+/// [`uhbr_tc`] with an EDID 1.4 12 bpc depth. `intel_dp_compute_link_config_wide`
+/// walks the pipe bpp from 36 over every configuration in rate-lane order:
+/// 4K60 at 36 bpp needs 2673000 kBps, above UHBR10 x2 (2417750) and UHBR20
+/// x1, so UHBR20 x2 (4835500) carries 36 bpp, ahead of a shallower pipe on
+/// UHBR10. The retry keeps the 36 bpp maximum. Without
+/// `narf.intel.hdmi14_ext` the same sink runs 24 bpp on UHBR10 x2.
+fn smoke_mtl_external_uhbr_deep_colour_36_bpp() -> TestResult {
+    let deep = || {
+        let mut edid = edid_uhd(594_000);
+        edid[20] = 0xC0;
+        edid[127] = edid[127].wrapping_sub(0xC0);
+        let mut sink = Sink::dp20(0x14, edid, uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+        sink.ffe_request = [4, 9, 0, 0];
+        let io = ExtFake::new(XeLpgPort::Tc2, sink);
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        io
+    };
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let io = deep();
+    let probe = match probe_sink_profile_link(&io, profile, XeLpgPort::Tc2, true, true) {
+        Ok(probe) => probe,
+        Err(_) => return TestResult::Fail("the 12 bpc DP 2.0 sink must probe"),
+    };
+    match probe.uhbr.as_deref() {
+        Some(plan)
+            if plan.link
+                == (uhbr::UhbrLink {
+                    rate: uhbr::UhbrRate::Uhbr20,
+                    lanes: 2,
+                    pipe_bpp: 36,
+                })
+                && plan.max_bpp == 36
+                && probe.pipe_bpp == 36
+                && probe.dsc.is_none() => {}
+        _ => return TestResult::Fail("36 bpp must take UHBR20 x2"),
+    }
+    let io = deep();
+    match probe_sink_profile_link(&io, profile, XeLpgPort::Tc2, true, false) {
+        Ok(probe)
+            if probe.pipe_bpp == 24
+                && probe.uhbr.as_deref().is_some_and(|plan| {
+                    (plan.link.rate, plan.link.lanes) == (uhbr::UhbrRate::Uhbr10, 2)
+                }) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("without narf.intel.hdmi14_ext the sink runs 24 bpp on UHBR10 x2"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_deep_colour_36_bpp
+);
+
 /// `narf.intel.uhbr=1` on Meteor Lake TC2: `intel_dp_compute_link_config_wide`
 /// picks UHBR10 x2 at 24 bpp; `mtl_ddi_pre_enable_dp` and `intel_ddi_enable`
 /// then run the 128b/132b route: the C20 MPLLA UHBR10 image with
@@ -4757,6 +4846,165 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_dsc_route_without_fec
 );
 
+/// The reduced-parameter retry with DSC (`intel_dp_get_link_train_fallback_values`,
+/// then the retry's `intel_dp_compute_config`: the uncompressed search,
+/// then Linux 7.4's DSC search over what is still allowed), on one-lane
+/// DP 2.0 sinks with the monitor's DSC caps and a 3840x2160 594 MHz stream:
+///
+/// - UHBR10/20 and HBR2: UHBR20 x1 carries the stream uncompressed at
+///   24 bpp; its training fails (`DP_128B132B_LT_FAILED`), the limits drop
+///   to UHBR10 x1 (`reduce_link_params`, descending lane/rate order), where
+///   nothing fits uncompressed, so the retry compresses: UHBR10 x1 at
+///   259/16 bpp with two slices, 64 slots and the `DATA_M` / `LINK_M` of
+///   [`smoke_mtl_external_uhbr_dsc_route_without_fec`].
+/// - UHBR10 and HBR3: the compressed UHBR10 x1 stream (259/16 bpp) fails
+///   to train; the limits drop to HBR3 x1 and the retry's DSC search lands
+///   on 8b/10b: 169/16 bpp with FEC and two slices at HBR3 x1, the plan of
+///   [`smoke_mtl_external_dp_dsc_with_fec_lights_and_stops`], with
+///   `DP_TP_CTL` FEC on.
+/// - UHBR10 and HBR2: the compressed UHBR10 x1 stream's fallback (HBR2 x1)
+///   carries nothing, even compressed (below the 8 bpp minimum): no retry,
+///   the route is stopped and refused typed.
+fn smoke_mtl_external_uhbr_compressed_fallback_retry() -> TestResult {
+    let sink = |max_bw: u8, rates: u8, fail_bw: u8| {
+        let mut sink = Sink::dp20(max_bw, edid_uhd(594_000), rates);
+        sink.caps[2] = 1 | 0x40 | 0x80;
+        sink.dsc = MONITOR_DSC;
+        sink.fec_cap = dsc::DP_FEC_CAPABLE;
+        sink.ffe_request = [4, 0, 0, 0];
+        sink.uhbr_lt_fail_bw = fail_bw;
+        let io = ExtFake::new(XeLpgPort::Tc2, sink);
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        io
+    };
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let uhbr10 = uhbr::UhbrLink {
+        rate: uhbr::UhbrRate::Uhbr10,
+        lanes: 1,
+        pipe_bpp: 24,
+    };
+    // Uncompressed UHBR20 x1, then compressed UHBR10 x1.
+    let io = sink(0x14, uhbr::DP_UHBR10 | uhbr::DP_UHBR20, 0x02);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the DSC DP 2.0 sink must probe with UHBR on");
+    };
+    match probe.uhbr.as_deref() {
+        Some(p)
+            if probe.dsc.is_none()
+                && p.dsc_sink.is_some()
+                && p.link
+                    == (uhbr::UhbrLink {
+                        rate: uhbr::UhbrRate::Uhbr20,
+                        lanes: 1,
+                        pipe_bpp: 24,
+                    }) => {}
+        _ => return TestResult::Fail("UHBR20 x1 carries 594 MHz uncompressed"),
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the retry must light the compressed route"),
+    };
+    let mn = [(63 << 25) | 0x7f_e2e3, 0x80_0000, 0xf_34d6, 0x8_0000];
+    match (route.probe.dsc, route.probe.uhbr.as_deref()) {
+        (Some(d), Some(u))
+            if (
+                d.link_rate,
+                d.lanes,
+                d.compressed_bpp_x16,
+                d.slice_count,
+                d.fec,
+            ) == (1_000_000, 1, 259, 2, false)
+                && u.link == uhbr10
+                && u.stream.tu == 64
+                && u.stream.m_n == mn
+                && !u.caps.allowed(2_000_000, 1)
+                && u.caps.max_limits() == (1_000_000, 1) => {}
+        _ => return TestResult::Fail("the retry compresses over UHBR10 x1 at 259/16 bpp"),
+    }
+    {
+        let sink = io.sink.borrow();
+        let bw: Vec<u8> = sink
+            .uhbr_log
+            .iter()
+            .filter_map(|&(a, v)| (a == 0x100).then_some(v))
+            .collect();
+        if bw != [0x02, 0x01]
+            || !sink
+                .dsc_log
+                .contains(&(dsc::DP_DSC_ENABLE, dsc::DP_DECOMPRESSION_EN))
+        {
+            return TestResult::Fail("UHBR20, then UHBR10 with the sink decompressing");
+        }
+    }
+    if route.stop(&io).is_err() || route.release(&io).is_err() {
+        return TestResult::Fail("the retried compressed route must stop and release");
+    }
+    // Compressed UHBR10 x1, then 8b/10b DSC with FEC at HBR3 x1.
+    let io = sink(0x1e, uhbr::DP_UHBR10, 0x01);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the HBR3 DSC DP 2.0 sink must probe with UHBR on");
+    };
+    match (probe.dsc, probe.uhbr.as_deref()) {
+        (Some(d), Some(u)) if d.compressed_bpp_x16 == 259 && u.link == uhbr10 => {}
+        _ => return TestResult::Fail("the probe compresses over UHBR10 x1 at 259/16 bpp"),
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the retry must light the 8b/10b compressed route"),
+    };
+    match route.probe.dsc {
+        Some(d)
+            if route.probe.uhbr.is_none()
+                && (
+                    d.link_rate,
+                    d.lanes,
+                    d.compressed_bpp_x16,
+                    d.slice_count,
+                    d.fec,
+                ) == (810_000, 1, 169, 2, true)
+                && route.probe.negotiated.rate == TrainRate::Hbr3
+                && route.probe.negotiated.lanes == 1 => {}
+        _ => return TestResult::Fail("the retry runs Linux's 8b/10b DSC plan at HBR3 x1"),
+    }
+    if io.read32(DP_TP_CTL_B) & dsc::DP_TP_CTL_FEC_ENABLE == 0
+        || !io
+            .sink
+            .borrow()
+            .dsc_log
+            .contains(&(dsc::DP_FEC_CONFIGURATION, 1))
+    {
+        return TestResult::Fail("the 8b/10b retry enables FEC on source and sink");
+    }
+    if route.stop(&io).is_err() || route.release(&io).is_err() {
+        return TestResult::Fail("the 8b/10b compressed route must stop and release");
+    }
+    // Compressed UHBR10 x1 on an HBR2 sink: nothing to retry.
+    let io = sink(0x14, uhbr::DP_UHBR10, 0x01);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc2, false, true) else {
+        return TestResult::Fail("the HBR2 DSC DP 2.0 sink must probe with UHBR on");
+    };
+    if probe.dsc.is_none() || uhbr_fallback(&probe).is_some() {
+        return TestResult::Fail("HBR2 x1 carries 594 MHz at no compressed bpp");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Err(ActivateError::Failed(
+            route,
+            ExternalError::Uhbr(uhbr::UhbrRefusal::Training(uhbr::TrainFailure::LtFailed)),
+        )) if route.state() == RouteState::Stopped => {
+            let _ = route.release(&io);
+        }
+        _ => return TestResult::Fail("no reduced configuration: the stopped route is refused"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_compressed_fallback_retry
+);
+
 /// The 128b/132b route through one 128b/132b LTTPR (`DP_PHY_REPEATER_CNT`
 /// 0x80, revision 2.0, UHBR10/20, a 20 ms extended wait request):
 /// `mtl_ddi_pre_enable_dp` switches it non-transparent (0x55, 0xaa) and
@@ -4860,6 +5108,122 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_lttpr_non_transparent_route
 );
 
+/// An 8b/10b DPRX (HBR2 x4) behind one LTTPR (`DP_PHY_REPEATER_CNT` 0x80,
+/// revision 1.4, HBR2 x4) whose PHY status reports CR, channel EQ, symbol
+/// lock and alignment.
+fn lttpr_8b10b_sink() -> Sink {
+    let mut sink = Sink::new(0x14, edid_1024());
+    for (i, b) in [0x14u8, 0x14, 0x80, 0x55, 4, 0, 0, 0]
+        .into_iter()
+        .enumerate()
+    {
+        sink.extra.push((uhbr::DP_LTTPR_COMMON_CAPS + i as u32, b));
+    }
+    sink.extra.push((0xf_0030, 0x77));
+    sink.extra.push((0xf_0031, 0x77));
+    sink.extra.push((0xf_0032, 0x01));
+    sink
+}
+
+/// Per-hop 8b/10b training through an LTTPR (`narf.intel.uhbr=1`, Meteor
+/// Lake TC1, RBR x4): `mtl_ddi_pre_enable_dp` switches the repeater
+/// non-transparent (`DP_PHY_REPEATER_MODE` 0x55, then 0xaa) before
+/// `drm_dp_lttpr_wake_timeout_setup`, `intel_dp_start_link_train`
+/// re-initializes it (0x55, 0xaa), then `intel_dp_link_train_all_phys`
+/// trains the LTTPR at `DP_TRAINING_PATTERN_SET_PHY_REPEATER1` (TPS1 without
+/// scrambling 0x21, TPS4 0x07, disabled) and then the DPRX at
+/// `DP_TRAINING_PATTERN_SET` (0x21, its TPS3 without scrambling 0x23,
+/// disabled). The source's `DP_TP_CTL` follows every pattern but the
+/// repeater's disable (`intel_dp_disable_dpcd_training_pattern` is DPCD
+/// only): PAT1 at the port enable, PAT1, PAT4, PAT1, PAT3, normal, then
+/// the normal of `intel_dp_stop_link_train`. The stop hands the repeater
+/// back transparent. Without the option the repeater keeps its mode and
+/// the link trains end to end at the DPRX (0x21, 0x23, 0).
+fn smoke_mtl_external_lttpr_per_hop_8b10b_route() -> TestResult {
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let mode = uhbr::DP_PHY_REPEATER_MODE;
+    for uhbr_on in [true, false] {
+        let io = ExtFake::new(XeLpgPort::Tc1, lttpr_8b10b_sink());
+        let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc1, false, uhbr_on)
+        else {
+            return TestResult::Fail("the DPRX must probe through its LTTPR");
+        };
+        if probe.uhbr.is_some() || probe.lttpr_per_hop != uhbr_on {
+            return TestResult::Fail("an 8b/10b probe trains per hop only with the option");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+            Ok(route) if route.state() == RouteState::Live => route,
+            _ => return TestResult::Fail("the 8b/10b route must light through the LTTPR"),
+        };
+        {
+            let sink = io.sink.borrow();
+            let modes: Vec<u8> = sink
+                .uhbr_log
+                .iter()
+                .filter_map(|&(a, v)| (a == mode).then_some(v))
+                .collect();
+            let patterns: Vec<(u32, u8)> = sink
+                .training_writes
+                .iter()
+                .copied()
+                .filter(|&(a, _)| a != 0x101)
+                .collect();
+            let (want_modes, want_patterns): (&[u8], &[(u32, u8)]) = if uhbr_on {
+                (
+                    &[0x55, 0xaa, 0x55, 0xaa],
+                    &[
+                        (0xf_0010, 0x21),
+                        (0xf_0010, 0x07),
+                        (0xf_0010, 0x00),
+                        (0x102, 0x21),
+                        (0x102, 0x23),
+                        (0x102, 0x00),
+                    ],
+                )
+            } else {
+                (&[], &[(0x102, 0x21), (0x102, 0x23), (0x102, 0x00)])
+            };
+            if modes != want_modes || patterns != want_patterns {
+                return TestResult::Fail("the LTTPR trains first, only with the option");
+            }
+        }
+        let fields: Vec<u32> = io
+            .writes_to(DP_TP_CTL_B)
+            .iter()
+            .filter(|&&v| v & DP_TP_CTL_ENABLE != 0)
+            .map(|v| (v >> 8) & 7)
+            .collect();
+        let want: &[u32] = if uhbr_on {
+            &[0, 0, 5, 0, 4, 3, 3]
+        } else {
+            &[0, 0, 4, 3, 3]
+        };
+        if fields != want || route.lttprs != u8::from(uhbr_on) {
+            return TestResult::Fail("the source pattern follows each hop's training");
+        }
+        if route.stop(&io).is_err() || route.release(&io).is_err() {
+            return TestResult::Fail("the route must stop and release");
+        }
+        let last_mode = io
+            .sink
+            .borrow()
+            .uhbr_log
+            .iter()
+            .rev()
+            .find(|&&(a, _)| a == mode)
+            .map(|&(_, v)| v);
+        if last_mode != uhbr_on.then_some(uhbr::DP_PHY_REPEATER_MODE_TRANSPARENT) {
+            return TestResult::Fail("the stop hands a per-hop repeater back transparent");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_lttpr_per_hop_8b10b_route
+);
+
 /// `BDB_VSWING_PREEMPH` with `tables` tables of sixteen rows and `columns`
 /// columns: table `t`, row `r` is (0x1_0000 + 20 + r + t, t, r), then 0xee
 /// in any further column (the high bits are lost to the `snps` bytes).
@@ -4956,6 +5320,97 @@ fn smoke_mtl_external_uhbr_vbt_c20_override() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_uhbr_vbt_c20_override
+);
+
+/// The VBT's DP 1.4 overrides on 8b/10b links (`mtl_get_c10_buf_trans_override`,
+/// `mtl_get_c20_buf_trans_override` with `is_uhbr` false): DP children on
+/// DDI B (C10 on Meteor Lake) and TC1 (C20) with `use_vbt_vswing` and a
+/// six-table `BDB_VSWING_PREEMPH` (table `t` row 0 is vswing 20 + t,
+/// pre-cursor t, post-cursor 0). Under `narf.intel.uhbr=1` the trained level
+/// (swing 0, pre-emphasis 0: row 0) on PHY lane 0 is [pre, swing, post] =
+/// [0, 20, 0] from table 0 at RBR on DDI B (`intel_bios_get_c10_vspeo`:
+/// `port_clock <= 270000`), [1, 21, 0] from table 1 at HBR2, and [4, 24, 0]
+/// from table 4 on TC1 (`intel_bios_get_c20_vspeo`). Without the option the
+/// same routes keep `mtl_c10_trans_dp14` row 0 [0, 26, 0] and
+/// `mtl_c20_trans_dp14` row 0 [0, 20, 0], and the probe carries no override.
+fn smoke_mtl_external_vbt_dp14_overrides() -> TestResult {
+    use crate::intel_gpu_vbt::tests::{general_definitions, Child, VbtImage};
+    use crate::intel_gpu_vbt::{block, device_type, dp_aux, dvo_port, Vbt};
+    let ddi_b = Child::new(device_type::DP, dvo_port::DPB)
+        .aux(dp_aux::B)
+        .byte(23, 1 << 5);
+    let tc1 = Child::new(device_type::DP, dvo_port::DPF)
+        .aux(dp_aux::F)
+        .typec()
+        .byte(23, 1 << 5);
+    let image = VbtImage::new(250)
+        .block(
+            block::GENERAL_DEFINITIONS,
+            general_definitions(44, &[ddi_b, tc1]),
+        )
+        .block(block::VSWING_PREEMPH, vspeo_block(6, 3))
+        .build();
+    let Ok(vbt) = Vbt::parse(&image) else {
+        return TestResult::Fail("the VBT must parse");
+    };
+    let policy = MtlPortPolicy::from_vbt(&vbt);
+    let row0 = |t: u8| crate::intel_gpu_xelpg::snps(20 + t, t, 0);
+    let Some(b) = policy.ddi_b.dp14_vspeo else {
+        return TestResult::Fail("DDI B's DP child must carry the DP 1.4 overrides");
+    };
+    if b.c10.map(|t| t.map(|t| t[0])) != [Some(row0(0)), Some(row0(1))]
+        || b.c20.map(|t| t[0]) != Some(row0(4))
+        || policy.tc[0].dp14_vspeo.is_none()
+        || policy.tc[1].dp14_vspeo.is_some()
+    {
+        return TestResult::Fail("tables 0, 1 and 4 for each requesting DP child");
+    }
+    let b = ddi_b_event(MtlHpdKind::Connected(LiveMode::Native));
+    let tc = MtlHpdEvent {
+        pin: MtlHpdPin::Tc1,
+        kind: MtlHpdKind::Connected(LiveMode::DpAlt),
+    };
+    let cases: [(XeLpgPort, MtlHpdEvent, Vec<u8>, bool, [u8; 3]); 5] = [
+        (XeLpgPort::B, b, edid_1024(), true, [0, 20, 0]),
+        (XeLpgPort::B, b, edid_uhd(594_000), true, [1, 21, 0]),
+        (XeLpgPort::B, b, edid_1024(), false, [0, 26, 0]),
+        (XeLpgPort::Tc1, tc, edid_1024(), true, [4, 24, 0]),
+        (XeLpgPort::Tc1, tc, edid_1024(), false, [0, 20, 0]),
+    ];
+    for (port, event, edid, uhbr_on, want) in cases {
+        let io = ExtFake::new(port, Sink::new(0x14, edid));
+        let mut service = MtlExternalService::new();
+        service.set_generation(Generation::MeteorLake);
+        service.set_uhbr(uhbr_on);
+        if !service.set_policy(policy) {
+            return TestResult::Fail("the policy must install with no route");
+        }
+        match service.handle(&io, event, &mut fb_for) {
+            ServiceOutcome::Activated { .. } => {}
+            other => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "DP 1.4 override route: {other:?}");
+                return TestResult::Fail("the 8b/10b route must light");
+            }
+        }
+        let vdr = |a: u16| io.phy.vdr_get(0, a);
+        if [vdr(0xD80), vdr(0xD81), vdr(0xD82)] != want {
+            return TestResult::Fail("the trained level takes the override only with the option");
+        }
+        match service.route() {
+            Some(MtlRoute::Dp(r))
+                if r.probe.uhbr.is_none() && r.probe.dp14_vspeo.is_some() == uhbr_on => {}
+            _ => return TestResult::Fail("the probe holds the override only with the option"),
+        }
+        if !service.teardown(&io) {
+            return TestResult::Fail("the route must stop and release");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_vbt_dp14_overrides
 );
 
 /// HDCP on a live 128b/132b SST route (`_intel_hdcp_enable` outside
@@ -5241,7 +5696,7 @@ kernel_test_in!(
 /// group 1, 0.25 Gbps granularity, 72 units (2250000 kBps) estimated,
 /// nothing allocated, and a DPRX of HBR3 x2 with UHBR10 and the 128b/132b
 /// lane 0 mapping.
-fn usb4_adapter() -> [u8; 0x32] {
+pub(crate) fn usb4_adapter() -> [u8; 0x32] {
     let mut t = [0u8; 0x32];
     t[0x0d] = tunnel::DP_TUNNELING_SUPPORT | tunnel::DP_IN_BW_ALLOCATION_MODE_SUPPORT;
     t[0x0f] = 1;
@@ -5484,6 +5939,111 @@ fn smoke_external_uhbr_tbt_tunnel_refusals() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_external_uhbr_tbt_tunnel_refusals
+);
+
+/// A second 128b/132b route (`narf.intel.ext_routes=2`) whose tunnel shares
+/// a BW allocation group with the sibling's (`lookup_or_alloc_group`: driver
+/// 1, group 1, `drv_group_id` 9). The new tunnel is the Panther Lake TC2
+/// probe's (0.25 Gbps = 31250 kBps units, 72 units = 2250000 kBps estimated,
+/// nothing allocated, a UHBR10 x2 DPRX: `get_max_dprx_bw` =
+/// roundup(2417750, 31250) = 2437500); its 4K60 stream needs 1782000 kBps
+/// at UHBR10 x2 and 24 bpp. The sibling carries the same stream with 58
+/// units (1812500) allocated. `calc_group_available_bw` = 1812500 +
+/// (2250000 - 0) = 4062500; `drm_dp_tunnel_atomic_check_group_bw` sums
+/// roundup(1782000, 31250) twice = 3625000: admitted, and Linux's first
+/// link choice at the group cap is the probe's (HBR3 x2 and UHBR10 x1 carry
+/// 1620000 and 1208875). With only 50 units (1562500) free the group has
+/// 3375000 < 3625000 available and Linux would reduce the bpp of the
+/// group's highest-bpp pipe, the lit sibling's (`intel_link_bw_reduce_bpp`):
+/// refused typed. Tunnels in different groups, or with group ID 0, never
+/// share; a probe whose link Linux's group-capped search would not pick is
+/// refused too.
+fn smoke_ptl_second_route_tunnel_group_bw() -> TestResult {
+    let port = XeLpgPort::Tc2;
+    let mut sink = Sink::new(0x14, edid_uhd(594_000));
+    sink.caps[2] = 2 | 0x40 | 0x80;
+    sink.tunnel = Some(usb4_adapter());
+    let io = ExtFake::new(port, sink);
+    if io.light_panel_ip(DisplayIp::Xe3Lpd).is_none() {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    }
+    io.pica_isr.set(pica_tbt_hotplug(1));
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, port, false, true) else {
+        return TestResult::Fail("the tunnelled DP 2.0 sink must probe with UHBR on");
+    };
+    let Some((new, required)) = probe_tunnel_stream(&probe) else {
+        return TestResult::Fail("the probe must run through the BW-allocation tunnel");
+    };
+    if required != 1_782_000 || new.drv_group_id != 9 || new.estimated_bw != 2_250_000 {
+        return TestResult::Fail("the tunnel's stream and group facts must be the probe's");
+    }
+    let sibling = tunnel::Tunnel {
+        allocated_bw: Some(58 * 31_250),
+        ..new
+    };
+    if !tunnels_share_group(&sibling, &new)
+        || group_available_bw(&sibling, &new) != 4_062_500
+        || !group_bw_fits([(&sibling, 1_782_000), (&new, 1_782_000)], 3_625_000)
+        || group_bw_fits([(&sibling, 1_782_000), (&new, 1_782_000)], 3_624_999)
+        || group_bw_fits([(&sibling, 1_782_000), (&new, 2_437_501)], u32::MAX)
+        || tunnel_group_admits(Some((sibling, 1_782_000)), &probe).is_err()
+    {
+        return TestResult::Fail("one group: 4062500 available carries both 1812500 shares");
+    }
+    // 50 units free: 3375000 available, the group check fails.
+    let mut short = probe.clone();
+    let mut plan = *short.uhbr.as_deref().expect("UHBR plan");
+    plan.tunnel = Some(tunnel::Tunnel {
+        estimated_bw: 50 * 31_250,
+        ..new
+    });
+    short.uhbr = Some(alloc::boxed::Box::new(plan));
+    let other_group = tunnel::Tunnel {
+        drv_group_id: (1 << 3) | 2,
+        ..sibling
+    };
+    let group_zero = tunnel::Tunnel {
+        drv_group_id: 1 << 3,
+        ..sibling
+    };
+    if plan.tunnel.map(|t| group_available_bw(&sibling, &t)) != Some(3_375_000)
+        || tunnel_group_admits(Some((sibling, 1_782_000)), &short)
+            != Err(SecondRouteRefusal::TunnelGroupBw)
+        || tunnel_group_admits(Some((other_group, 1_782_000)), &short).is_err()
+        || tunnels_share_group(&group_zero, &group_zero)
+        || tunnel_group_admits(None, &short).is_err()
+    {
+        return TestResult::Fail("an overallocated group refuses; other groups never share");
+    }
+    // A tunnelled MST route in one group with the other route's tunnel is
+    // refused, whichever route is the MST one; other groups admit.
+    if mst_tunnel_group_admits(Some(sibling), Some(new)) != Err(SecondRouteRefusal::TunnelGroupBw)
+        || mst_tunnel_group_admits(Some(new), Some(sibling))
+            != Err(SecondRouteRefusal::TunnelGroupBw)
+        || mst_tunnel_group_admits(Some(other_group), Some(new)).is_err()
+        || mst_tunnel_group_admits(Some(group_zero), Some(group_zero)).is_err()
+        || mst_tunnel_group_admits(None, Some(new)).is_err()
+        || mst_tunnel_group_admits(Some(sibling), None).is_err()
+    {
+        return TestResult::Fail("a tunnelled MST route never shares a BW group");
+    }
+    // A probe at 18 bpp where the group cap admits 24: not Linux's choice.
+    let mut low = probe.clone();
+    let mut plan = *low.uhbr.as_deref().expect("UHBR plan");
+    plan.link.pipe_bpp = 18;
+    low.uhbr = Some(alloc::boxed::Box::new(plan));
+    if tunnel_group_admits(Some((sibling, 1_782_000)), &low)
+        != Err(SecondRouteRefusal::TunnelGroupBw)
+    {
+        return TestResult::Fail("a link Linux's group-capped search would not pick refuses");
+    }
+    let _ = release_probe(&io, &probe);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ptl_second_route_tunnel_group_bw
 );
 
 // ── Nova Lake-S display 35: the routes through the LT PHY ───────────
@@ -6391,6 +6951,151 @@ fn smoke_mtl_external_dp_ycbcr444_pcon_route() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_dp_ycbcr444_pcon_route
+);
+
+/// The DP YCbCr 4:2:0 route (`narf.intel.hdmi14_ext=1`): a native DP sink
+/// whose 4K60 mode is 4:2:0-only (a Y420VDB naming VIC 97) and that
+/// advertises `DP_VSC_SDP_EXT_FOR_COLORIMETRY_SUPPORTED` (DPCD 0x2210 bit
+/// 3). `intel_dp_output_format` drives YCbCr 4:2:0 on the link and
+/// `intel_dp_compute_link_config_wide` runs at 12 link bpp: 891000 kBps on
+/// HBR x4. The route carries it in the MSA (8 bpc | `SYNC_CLOCK` |
+/// `DP_MSA_MISC_COLOR_VSC_SDP` = 0x4021), `intel_link_compute_m_n` at 12
+/// bpp (data M/N 891000/1080000 at N 0x8000000 reduced to 0x699999 /
+/// 0x800000 with TU 64; link M/N 594000/270000 at N 0x80000), `PIPE_MISC`
+/// YUV 4:2:0, the 1:1 scaler and the BT.709 output CSC, and the VSC SDP
+/// (`drm_dp_vsc_sdp_pack`: HB 00 07 05 13, DB16 0x31, DB17 0x81) with
+/// `VIDEO_DIP_ENABLE_VSC_HSW | VSC_DIP_HW_DATA_SW_HEA`; the stop clears the
+/// VSC enable, the scaler, the CSC and the YUV encoding and restores the
+/// 8 bpc RGB MSA. Without the option the sink runs RGB on HBR2 x4.
+fn smoke_mtl_external_dp_ycbcr420_route() -> TestResult {
+    use crate::intel_gpu_xelpg_external::color::tests;
+    let edid = tests::edid_4k60_with(&[(7 << 5) | 2, 0x0E, 97]);
+    let mut sink = Sink::new(0x14, edid.clone());
+    sink.extra.push((0x2210, 0x08));
+    let io = ExtFake::new(XeLpgPort::B, sink);
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let probe = match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, true) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("the 4:2:0 DP sink must probe"),
+    };
+    if !probe.output.ycbcr420
+        || probe.output.ycbcr444
+        || probe.output.pcon.is_some()
+        || !probe.output.vsc_colorimetry()
+        || probe.pipe_bpp != 24
+        || (probe.negotiated.rate, probe.negotiated.lanes) != (TrainRate::Hbr, 4)
+    {
+        return TestResult::Fail("the sink must take YCbCr 4:2:0 at 24 bpp on HBR x4");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the YCbCr 4:2:0 route must light"),
+    };
+    let pipe = Pipe::B;
+    let misc = pipe.base() + crate::intel_gpu_xelpg_dsc::PIPE_MISC_OFFSET;
+    let csc_mode = 0x4_9028 + 0x100 * pipe as u64;
+    let ps_ctrl = crate::intel_gpu_xelpg_scaler::ps_ctrl(pipe, 0);
+    let yuv = crate::intel_gpu_modeset::PIPE_MISC_YCBCR420;
+    if io.writes_to(0x6_1410) != [0x4021]
+        || io.writes_to(0x6_1030) != [(63 << 25) | 0x69_9999]
+        || io.writes_to(0x6_1034) != [0x80_0000]
+        || io.writes_to(0x6_1040) != [1_153_433]
+        || io.writes_to(0x6_1044) != [0x8_0000]
+    {
+        return TestResult::Fail("the MSA and M/N must carry 4:2:0 at 12 link bpp");
+    }
+    if io.read32(misc) & yuv != yuv
+        || io.read32(csc_mode) & (1 << 30) == 0
+        || io.read32(ps_ctrl) & (1 << 31) == 0
+    {
+        return TestResult::Fail("the pipe must run PIPE_MISC YUV 4:2:0, the scaler and CSC");
+    }
+    let vsc_on = (1 << 20) | (2 << 25);
+    if io.read32(0x6_1320) != 0x1305_0700
+        || io.read32(0x6_1334) != 0x8131
+        || (0x6_1324..0x6_1344)
+            .step_by(4)
+            .filter(|&r| r != 0x6_1334)
+            .any(|r| io.read32(r) != 0)
+        || io.writes_to(0x6_1320 + 32).len() != 1
+        || io.read32(0x6_1200) & vsc_on != vsc_on
+    {
+        return TestResult::Fail("the VSC SDP must carry the 4:2:0 colorimetry");
+    }
+    if route.stop(&io).is_err()
+        || io.read32(0x6_1410) != 0x21
+        || io.read32(0x6_1200) & (1 << 20) != 0
+        || io.read32(misc) & yuv != 0
+        || io.read32(csc_mode) & (1 << 30) != 0
+        || io.read32(ps_ctrl) != 0
+    {
+        return TestResult::Fail("the stop must clear the VSC SDP, the 4:2:0 pipe and the MSA");
+    }
+    // narf.intel.hdmi14_ext off: the 4:2:0-only mode runs RGB (Linux's
+    // second pass) at 24 bpp on HBR2 x4.
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid));
+    match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, false) {
+        Ok(p)
+            if !p.output.ycbcr420
+                && (p.negotiated.rate, p.negotiated.lanes) == (TrainRate::Hbr2, 4) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("without the option the 4:2:0-only mode runs RGB"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_ycbcr420_route
+);
+
+/// `intel_dp_compute_formats`' 4:2:0 fallback on the DP route
+/// (`narf.intel.hdmi14_ext=1`): a 4:2:0-also 4K60 sink (a Y420CMDB marking
+/// VIC 97) on an HBR x4 link (1080000 kBps) carries no RGB (24 bpp needs
+/// 1782000, 18 bpp 1336500), so the second try takes YCbCr 4:2:0 at 24 bpp
+/// (891000). Without the sink's VSC SDP colorimetry the MSA has no VSC
+/// delegation (0x21) and no VSC SDP is sent (`intel_dp_needs_vsc_colorimetry`).
+/// Without the option the RGB route is over budget.
+fn smoke_mtl_external_dp_ycbcr420_also_fallback() -> TestResult {
+    use crate::intel_gpu_xelpg_external::color::tests;
+    let edid = tests::edid_4k60_with(&tests::DP_420_ALSO_BLOCKS);
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x0A, edid.clone()));
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let probe = match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, true) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("the 4:2:0-also sink must fall back to 4:2:0"),
+    };
+    if !probe.output.ycbcr420
+        || probe.output.vsc_colorimetry()
+        || probe.pipe_bpp != 24
+        || (probe.negotiated.rate, probe.negotiated.lanes) != (TrainRate::Hbr, 4)
+    {
+        return TestResult::Fail("the fallback must take 4:2:0 at 24 bpp on HBR x4");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the 4:2:0 fallback route must light"),
+    };
+    if io.writes_to(0x6_1410) != [0x21]
+        || !io.writes_to(0x6_1320).is_empty()
+        || io.read32(0x6_1200) & (1 << 20) != 0
+    {
+        return TestResult::Fail("a sink without VSC colorimetry gets no VSC SDP");
+    }
+    if route.stop(&io).is_err() {
+        return TestResult::Fail("the fallback route must stop");
+    }
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x0A, edid));
+    match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, false) {
+        Err(ExternalError::OverBudget { .. }) => TestResult::Pass,
+        _ => TestResult::Fail("without the option the RGB route is over budget"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_ycbcr420_also_fallback
 );
 
 /// The DP route's ELD/audio enable sequence with a scripted HDA side

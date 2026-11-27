@@ -24,17 +24,37 @@
 //! ([`Refusal::SourceUnsupported`]). The DP sink must answer
 //! `DP_PANEL_REPLAY_CAP_SUPPORT`; an eDP sink must also report AUX-less
 //! ALPM and early transport. Panel Replay never runs over MST, over a
-//! 128b/132b eDP link, with HDCP on eDP, with DSC a sink cannot decode in
-//! replay, or when the sink would need the Adaptive-Sync SDP
-//! (`intel_dp_needs_as_sdp`: AS SDP v2 without async video timing in PR),
-//! whose `PR_ALPM_CTL` programming is not modelled.
+//! 128b/132b eDP link, with HDCP on eDP, or with DSC a sink cannot decode in
+//! replay.
+//!
+//! The replay stream's secondary data packets (Linux 7.4-rc4 `intel_dp.c`
+//! `intel_dp_compute_vsc_sdp`, `intel_dp_compute_as_sdp`,
+//! `intel_dp_as_sdp_pack`, `intel_dp_detect_sdp_caps`,
+//! `intel_dp_sink_supports_as_sdp_v2`, `intel_dp_needs_as_sdp`,
+//! `drm_dp_helper.c` `drm_dp_vsc_sdp_pack` / `drm_dp_as_sdp_supported`,
+//! `intel_hdmi.c` `hsw_write_infoframe`, `intel_alpm.c`
+//! `intel_alpm_configure_pr_as_sdp`): the VSC SDP header of DP 2.0 Table
+//! 2-223 (revision 6) for every replay, and the Adaptive-Sync SDP (fixed
+//! vtotal) when the sink takes AS SDP v2 and is no branch, which on eDP also
+//! programs `PR_ALPM_CTL`. Linux writes both in the modeset before replay
+//! enables; here they are written at the replay enable, on a transcoder the
+//! modeset already gave its AS SDP timing (`TRANS_VRR_VSYNC`), and cleared
+//! again at the disable.
 //!
 //! The sink's `PANEL_REPLAY_CONFIG` enable must be written before link
 //! training ([`enable_before_training`]); a link trained without it is
 //! refused ([`Refusal::NotEnabledAtTraining`]). Selective update over
 //! Panel Replay runs with selective fetch (display 14+ have no PSR HW
 //! tracking) at the sink's granularity, through the PSR owner's
-//! selective-fetch programming ([`crate::intel_gpu_psr::Psr`]).
+//! selective-fetch programming ([`crate::intel_gpu_psr::Psr`]); on display
+//! 20+ eDP with region early transport (`psr2_su_region_et_valid`: the
+//! sink's `DP_PANEL_REPLAY_ENABLE_SU_REGION_ET`, `LNL_EDP_PSR2_SU_REGION_ET_ENABLE`,
+//! the SU area grown over the cursor, `PIPE_SRCSZ_ERLY_TPT` and the cursor's
+//! `CURPOS_ERLY_TPT`), except with DSC.
+//!
+//! The owned external DP SST routes run this owner behind their own option,
+//! `narf.intel.ext_panel_replay=1`, with frontbuffer tracking for their
+//! console scanout ([`crate::intel_gpu_xelpg_external::replay`]).
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_aux::MmioWindow;
@@ -97,6 +117,26 @@ const DP_SET_POWER: u32 = 0x600;
 const DP_SET_POWER_D0: u8 = 1;
 /// `DP_EDP_14b`: `_compute_psr2_sdp_prior_scanline_indication`'s floor.
 const DP_EDP_14B: u8 = 0x05;
+/// `DP_PANEL_REPLAY_LINK_OFF_SUPPORTED_IN_PR_AFTER_ADAPTIVE_SYNC_SDP`.
+pub const DP_PANEL_REPLAY_LINK_OFF_SUPPORTED_IN_PR_AFTER_ADAPTIVE_SYNC_SDP: u8 = 1 << 7;
+/// `DP_DPRX_FEATURE_ENUMERATION_LIST_CONT_1` and its
+/// `DP_ADAPTIVE_SYNC_SDP_SUPPORTED` / `DP_AS_SDP_FAVT_PAYLOAD_FIELDS_PARSING_SUPPORTED`.
+pub const DP_DPRX_FEATURE_ENUMERATION_LIST_CONT_1: u32 = 0x2214;
+pub const DP_ADAPTIVE_SYNC_SDP_SUPPORTED: u8 = 1 << 0;
+pub const DP_AS_SDP_FAVT_PAYLOAD_FIELDS_PARSING_SUPPORTED: u8 = 1 << 2;
+/// `DP_DOWNSTREAMPORT_PRESENT` / `DP_DWN_STRM_PORT_PRESENT` (`drm_dp_is_branch`).
+pub const DP_DOWNSTREAMPORT_PRESENT: u32 = 0x005;
+pub const DP_DWN_STRM_PORT_PRESENT: u8 = 1 << 0;
+/// `DP_DPCD_REV_13`, `drm_dp_as_sdp_supported`'s floor.
+pub const DP_DPCD_REV_13: u8 = 0x13;
+/// `DP_SDP_VSC` / `DP_SDP_ADAPTIVE_SYNC` (secondary-data packet types).
+pub const DP_SDP_VSC: u8 = 0x07;
+pub const DP_SDP_ADAPTIVE_SYNC: u8 = 0x22;
+/// `DP_AS_SDP_AVT_FIXED_VTOTAL` (`enum operation_mode`).
+pub const DP_AS_SDP_AVT_FIXED_VTOTAL: u8 = 0x01;
+/// `sizeof(struct dp_sdp)`: `VIDEO_DIP_VSC_DATA_SIZE` and
+/// `VIDEO_DIP_ASYNC_DATA_SIZE`.
+pub const DP_SDP_BYTES: usize = 36;
 
 // ── Source registers ─────────────────────────────────────────────
 
@@ -108,6 +148,34 @@ pub const fn trans_dp2_ctl(trans: u8) -> u64 {
 pub const TRANS_DP2_PANEL_REPLAY_ENABLE: u32 = 1 << 30;
 /// `TRANS_DP2_PR_TUNNELING_ENABLE` (only display 35 sets it).
 pub const TRANS_DP2_PR_TUNNELING_ENABLE: u32 = 1 << 26;
+/// `HSW_TVIDEO_DIP_CTL(trans)` and the enables `hsw_write_infoframe` sets
+/// for the VSC (`VIDEO_DIP_ENABLE_VSC_HSW`, with `VSC_DIP_HW_DATA_SW_HEA`)
+/// and AS (`VIDEO_DIP_ENABLE_AS_ADL`) SDPs.
+pub const fn video_dip_ctl(trans: u8) -> u64 {
+    0x60200 + 0x1000 * trans as u64
+}
+pub const VIDEO_DIP_ENABLE_VSC_HSW: u32 = 1 << 20;
+pub const VSC_DIP_HW_DATA_SW_HEA: u32 = 2 << 25;
+pub const VIDEO_DIP_ENABLE_AS_ADL: u32 = 1 << 23;
+/// `HSW_TVIDEO_DIP_VSC_DATA(trans, i)` / `ADL_TVIDEO_DIP_AS_SDP_DATA(trans, i)`.
+pub const fn video_dip_vsc_data(trans: u8, i: usize) -> u64 {
+    0x60320 + 0x1000 * trans as u64 + 4 * i as u64
+}
+pub const fn video_dip_as_sdp_data(trans: u8, i: usize) -> u64 {
+    0x60484 + 0x1000 * trans as u64 + 4 * i as u64
+}
+/// `TRANS_VRR_VSYNC(trans)`: the AS SDP's vsync window.
+pub const fn trans_vrr_vsync(trans: u8) -> u64 {
+    0x60078 + 0x1000 * trans as u64
+}
+/// `PR_ALPM_CTL(trans)` and the fields `intel_alpm_configure_pr_as_sdp`
+/// sets below display 35 (no skip frames, no DC3CO idle protocol).
+pub const fn pr_alpm_ctl(trans: u8) -> u64 {
+    0x60948 + 0x1000 * trans as u64
+}
+pub const PR_ALPM_CTL_ALLOW_LINK_OFF_BETWEEN_AS_SDP_AND_SU: u32 = 1 << 6;
+pub const PR_ALPM_CTL_AS_SDP_TRANSMISSION_IN_ACTIVE_DISABLE: u32 = 1 << 4;
+pub const PR_ALPM_CTL_ADAPTIVE_SYNC_SDP_POSITION_T1: u32 = 1;
 /// The transcoder's `EDP_PSR_STATUS`, `EDP_PSR_IMR`, `EDP_PSR_DEBUG`,
 /// `EDP_PSR2_CTL`, `EDP_PSR2_STATUS`, `PSR2_MAN_TRK_CTL` and `ALPM_CTL`.
 pub const fn psr_status(trans: u8) -> u64 {
@@ -225,9 +293,10 @@ pub enum Refusal {
     Hdcp,
     /// `alpm_config_valid`: the eDP wake or ALPM parameters do not fit.
     Alpm,
-    /// `intel_dp_needs_as_sdp`: the AS SDP and its `PR_ALPM_CTL` would be
-    /// needed, which this driver does not program.
-    AsSdpUnmodelled,
+    /// `intel_dp_needs_as_sdp`: the stream needs the AS SDP, but the lit
+    /// transcoder has no AS SDP timing (`TRANS_VRR_VSYNC`, which
+    /// `intel_vrr_set_transcoder_timings` programs in the modeset).
+    AsSdpTiming,
     /// The link was trained without the sink's `PANEL_REPLAY_CONFIG`
     /// enable (`intel_ddi_pre_enable_dp` writes it before training).
     NotEnabledAtTraining,
@@ -239,6 +308,13 @@ pub enum Refusal {
     ExitTimeout,
     /// Wa_14015648006's `wm_level_disabled` is not known (display 14).
     WmLevelUnknown,
+    /// `_intel_psr_min_set_context_latency`: the lit transcoder's
+    /// `TRANS_SET_CONTEXT_LATENCY` is below what replay needs (DP on display
+    /// 20 reads `SRD_STATUS`, which needs the delayed vblank a line after
+    /// the undelayed one; Wa_14015401596 on display 13/14). Linux sets it in
+    /// the modeset that computes replay; an external route lit before
+    /// replay qualifies is refused instead.
+    SetContextLatency,
 }
 
 // ── Sink capability ──────────────────────────────────────────────
@@ -363,6 +439,31 @@ pub fn enabled_at_training<A: AuxChannel + ?Sized>(aux: &mut A) -> Result<bool, 
     Ok(config[0] & DP_PANEL_REPLAY_ENABLE != 0)
 }
 
+/// `_intel_psr_min_set_context_latency` (Linux 7.4-rc4) for a stream with
+/// PSR or replay: the delayed-vblank lines the transcoder's set context
+/// latency must reach. `vrr_possible` is `intel_vrr_possible` (every
+/// progressive DP stream on display 11+ in 7.4-rc4, whose fixed refresh
+/// rate sets a flipline), `edp` the output type.
+pub const fn min_set_context_latency(
+    display_ver: u16,
+    edp: bool,
+    panel_replay: bool,
+    sel_update: bool,
+    vrr_possible: bool,
+) -> u32 {
+    // Wa_14015401596.
+    if vrr_possible && (display_ver == 13 || display_ver == 14) {
+        return 1;
+    }
+    if display_ver < 20 || sel_update || (display_ver < 30 && edp) {
+        return 0;
+    }
+    if display_ver >= 30 && panel_replay {
+        return 0;
+    }
+    1
+}
+
 /// `intel_psr_init`'s `source_panel_replay_support`, narrowed to the
 /// display IPs this module qualifies.
 pub const fn source_supported(display_ver: u16, edp: bool) -> Result<(), Refusal> {
@@ -395,7 +496,9 @@ pub(crate) struct Stream {
     pub uhbr: bool,
     /// HDCP is desired or enabled.
     pub hdcp: bool,
-    /// `intel_dp->as_sdp_v2_supported` and not a branch device.
+    /// `intel_dp_needs_as_sdp`: an AS SDP v2 sink that is no branch device
+    /// (every progressive stream is `intel_vrr_possible` in 7.4-rc4), see
+    /// [`as_sdp_needed`].
     pub as_sdp_v2: bool,
     /// The eDP DPCD revision (`intel_dp->edp_dpcd[0]`), 0 for DP.
     pub edp_rev: u8,
@@ -436,6 +539,140 @@ pub struct Config {
     pub alpm: Option<Alpm>,
     /// Wa_14015648006 input (`IS_DISPLAY_VER(11, 14)` only).
     pub wm_level_disabled: bool,
+    /// The Adaptive-Sync SDP the stream sends (`intel_dp_needs_as_sdp`).
+    pub as_sdp: Option<AsSdp>,
+    /// eDP with an AS SDP sink: `PR_ALPM_CTL` (`lnl_alpm_configure`).
+    pub pr_alpm_ctl: Option<u32>,
+}
+
+/// `struct drm_dp_as_sdp` as `intel_dp_compute_as_sdp` fills it (type
+/// `DP_SDP_ADAPTIVE_SYNC`, revision 2, length 9, no duration increment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsSdp {
+    /// `enum operation_mode`.
+    pub mode: u8,
+    /// `intel_vrr_vmin_vtotal`.
+    pub vtotal: u16,
+    pub target_rr: u16,
+    pub target_rr_divider: bool,
+    /// `crtc_state->vrr.vmax` when the sink keeps async video timing in PR.
+    pub coasting_vtotal: u16,
+}
+
+/// `intel_dp_compute_as_sdp` at a fixed refresh rate (no CMRR, VRR off;
+/// replay is refused at a variable rate): `DP_AS_SDP_AVT_FIXED_VTOTAL` at
+/// vmin = vmax = `crtc_vtotal`, the coasting vtotal only for a sink with
+/// async video timing in PR.
+pub const fn as_sdp_fixed(vtotal: u16, async_video_timing: bool) -> AsSdp {
+    AsSdp {
+        mode: DP_AS_SDP_AVT_FIXED_VTOTAL,
+        vtotal,
+        target_rr: 0,
+        target_rr_divider: false,
+        coasting_vtotal: if async_video_timing { vtotal } else { 0 },
+    }
+}
+
+/// `intel_dp_as_sdp_pack`.
+pub fn pack_as_sdp(sdp: &AsSdp) -> [u8; DP_SDP_BYTES] {
+    let mut b = [0u8; DP_SDP_BYTES];
+    b[1] = DP_SDP_ADAPTIVE_SYNC;
+    b[2] = 0x2;
+    b[3] = 0x9;
+    let db = &mut b[4..];
+    db[0] = sdp.mode;
+    db[1] = sdp.vtotal as u8;
+    db[2] = (sdp.vtotal >> 8) as u8;
+    db[3] = sdp.target_rr as u8;
+    db[4] = ((sdp.target_rr >> 8) & 0x3) as u8;
+    if sdp.target_rr_divider {
+        db[4] |= 0x20;
+    }
+    db[7] = sdp.coasting_vtotal as u8;
+    db[8] = (sdp.coasting_vtotal >> 8) as u8;
+    b
+}
+
+/// `drm_dp_vsc_sdp_pack` of `intel_dp_compute_vsc_sdp`'s replay header
+/// without colorimetry: revision 0x6, length 0x10 (DP 2.0 Table 2-223),
+/// DB0 and DB3 set.
+pub fn pack_replay_vsc_sdp() -> [u8; DP_SDP_BYTES] {
+    let mut b = [0u8; DP_SDP_BYTES];
+    b[1] = DP_SDP_VSC;
+    b[2] = 0x6;
+    b[3] = 0x10;
+    b[4] = 1;
+    b[7] = 1;
+    b
+}
+
+/// `intel_alpm_configure_pr_as_sdp` below display 35: the AS SDP at T1
+/// (`intel_dp_as_sdp_transmission_time`), link off between the AS SDP and
+/// SU when the sink allows it, and no AS SDP in PR active when the sink
+/// keeps async video timing (`disable_as_sdp_when_pr_active`).
+pub const fn pr_alpm_ctl_value(caps: &Caps) -> u32 {
+    let mut value = PR_ALPM_CTL_ADAPTIVE_SYNC_SDP_POSITION_T1;
+    if caps.dpcd[1] & DP_PANEL_REPLAY_LINK_OFF_SUPPORTED_IN_PR_AFTER_ADAPTIVE_SYNC_SDP != 0 {
+        value |= PR_ALPM_CTL_ALLOW_LINK_OFF_BETWEEN_AS_SDP_AND_SU;
+    }
+    if caps.dpcd[1] & DP_PANEL_REPLAY_ASYNC_VIDEO_TIMING_NOT_SUPPORTED_IN_PR == 0 {
+        value |= PR_ALPM_CTL_AS_SDP_TRANSMISSION_IN_ACTIVE_DISABLE;
+    }
+    value
+}
+
+/// `intel_dp_detect_sdp_caps` and `intel_dp_needs_as_sdp` for a replay
+/// sink (`HAS_AS_SDP`: display 13+): DPCD 1.3+ with
+/// `DP_ADAPTIVE_SYNC_SDP_SUPPORTED`; eDP always takes v2, DP when it parses
+/// FAVT payloads or keeps no async video timing in PR
+/// (`intel_dp_sink_supports_as_sdp_v2`); a branch never gets it. A failed
+/// read is "not supported", as `drm_dp_as_sdp_supported` answers.
+pub fn as_sdp_needed<A: AuxChannel + ?Sized>(aux: &mut A, dpcd_rev: u8, caps: &Caps) -> bool {
+    if dpcd_rev < DP_DPCD_REV_13 {
+        return false;
+    }
+    let mut rx = [0u8];
+    if read(aux, DP_DPRX_FEATURE_ENUMERATION_LIST_CONT_1, &mut rx).is_err()
+        || rx[0] & DP_ADAPTIVE_SYNC_SDP_SUPPORTED == 0
+    {
+        return false;
+    }
+    let v2 = caps.edp
+        || rx[0] & DP_AS_SDP_FAVT_PAYLOAD_FIELDS_PARSING_SUPPORTED != 0
+        || !caps.async_video_timing();
+    if !v2 {
+        return false;
+    }
+    if caps.edp {
+        return true;
+    }
+    let mut ports = [0u8];
+    read(aux, DP_DOWNSTREAMPORT_PRESENT, &mut ports).is_ok()
+        && ports[0] & DP_DWN_STRM_PORT_PRESENT == 0
+}
+
+/// `hsw_write_infoframe` for a 36-byte SDP on `trans`: the type's enable
+/// (`hsw_infoframe_enable`) cleared, the nine data dwords (`dp_sdp` bytes,
+/// little-endian) at `data(i)`, then `set` (the enable, and for the VSC SDP
+/// `VSC_DIP_HW_DATA_SW_HEA`) ORed in.
+pub fn write_sdp<M: MmioWindow + ?Sized>(
+    regs: &M,
+    trans: u8,
+    data: fn(u8, usize) -> u64,
+    enable: u32,
+    set: u32,
+    sdp: &[u8; DP_SDP_BYTES],
+) {
+    let ctl = video_dip_ctl(trans);
+    let val = regs.read32(ctl) & !enable;
+    regs.write32(ctl, val);
+    for (i, word) in sdp.chunks_exact(4).enumerate() {
+        regs.write32(
+            data(trans, i),
+            u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+        );
+    }
+    regs.write32(ctl, val | set);
 }
 
 /// `_lnl_compute_aux_less_wake_time` in µs (port clock in 10 kbit/s).
@@ -561,13 +798,21 @@ pub(crate) fn compute(
             return Err(Refusal::Hdcp);
         }
     }
-    // eDP Panel Replay is AUX-less ALPM: with an AS SDP sink
-    // `lnl_alpm_configure` programs `PR_ALPM_CTL`
-    // (`intel_alpm_configure_pr_as_sdp`), and without async video timing
-    // `intel_dp_needs_as_sdp` sends the AS SDP. Neither is modelled.
-    if caps.edp && stream.as_sdp_v2 {
-        return Err(Refusal::AsSdpUnmodelled);
-    }
+    // intel_dp_compute_as_sdp, and on eDP (AUX-less ALPM with an AS SDP
+    // sink) lnl_alpm_configure's PR_ALPM_CTL.
+    let as_sdp = if stream.as_sdp_v2 {
+        Some(as_sdp_fixed(
+            stream.timing.vtotal,
+            caps.async_video_timing(),
+        ))
+    } else {
+        None
+    };
+    let pr_alpm = if caps.edp && stream.as_sdp_v2 {
+        Some(pr_alpm_ctl_value(caps))
+    } else {
+        None
+    };
     // Wa_14015648006 is IS_DISPLAY_VER(11, 14); later IPs clear the bit.
     let wm_level_disabled = if stream.display_ver <= 14 {
         wm_level_disabled.ok_or(Refusal::WmLevelUnknown)?
@@ -594,14 +839,21 @@ pub(crate) fn compute(
         port: stream.port,
         su,
         su_y_granularity: u16::from(caps.su_y_granularity),
-        // psr2_su_region_et_valid would allow early transport on display
-        // 20+ eDP; the selective-fetch area code here has no early
-        // transport adjustments, so it stays off, as Linux's
-        // I915_PSR_DEBUG_SU_REGION_ET_DISABLE leaves it.
-        su_region_et: false,
+        // psr2_su_region_et_valid: display 20+ eDP with the sink's
+        // early-transport capability (eDP replay already requires it).
+        // Stricter than Linux: off with DSC, whose SU early-transport
+        // parameters (intel_dsc_su_et_parameters_configure) are not
+        // modelled.
+        su_region_et: su
+            && caps.edp
+            && stream.display_ver >= 20
+            && caps.dpcd[0] & DP_PANEL_REPLAY_EARLY_TRANSPORT_SUPPORT != 0
+            && !stream.dsc,
         sdp_prior_scanline: sdp_prior,
         alpm,
         wm_level_disabled,
+        as_sdp,
+        pr_alpm_ctl: pr_alpm,
     })
 }
 
@@ -720,6 +972,10 @@ impl PanelReplay {
         }
         let dcpr = readable(regs, CHICKEN_DCPR_1)?;
         let imr = readable(regs, psr_imr(t))?;
+        readable(regs, video_dip_ctl(t))?;
+        if config.as_sdp.is_some() && readable(regs, trans_vrr_vsync(t))? == 0 {
+            return Err(Refusal::AsSdpTiming);
+        }
         let [first, second] = sink_config(&config);
         let alpm = if config.edp {
             write(aux, DP_RECEIVER_ALPM_CONFIG, SINK_ALPM_AUX_LESS)
@@ -745,6 +1001,26 @@ impl PanelReplay {
             }
             return Err(Refusal::Aux(error));
         }
+        // intel_dp_set_infoframes' SDPs of a replay stream: the VSC SDP
+        // (has_psr), then the AS SDP.
+        write_sdp(
+            regs,
+            t,
+            video_dip_vsc_data,
+            VIDEO_DIP_ENABLE_VSC_HSW,
+            VIDEO_DIP_ENABLE_VSC_HSW | VSC_DIP_HW_DATA_SW_HEA,
+            &pack_replay_vsc_sdp(),
+        );
+        if let Some(as_sdp) = config.as_sdp {
+            write_sdp(
+                regs,
+                t,
+                video_dip_as_sdp_data,
+                VIDEO_DIP_ENABLE_AS_ADL,
+                VIDEO_DIP_ENABLE_AS_ADL,
+                &pack_as_sdp(&as_sdp),
+            );
+        }
         // intel_psr_enable_source.
         regs.write32(psr_debug(t), debug_mask(&config));
         regs.write32(psr_imr(t), (imr & !TGL_PSR_MASK) | !TGL_PSR_ERROR);
@@ -761,6 +1037,9 @@ impl PanelReplay {
             let (port_ctl, lfps) = port_alpm_values(&alpm);
             regs.write32(port_alpm_ctl(config.port), port_ctl);
             regs.write32(port_alpm_lfps_ctl(config.port), lfps);
+            if let Some(pr_alpm) = config.pr_alpm_ctl {
+                regs.write32(pr_alpm_ctl(t), pr_alpm);
+            }
             regs.write32(alpm_ctl(t), alpm_ctl_value(&alpm));
         }
         Ok(Self {
@@ -878,6 +1157,7 @@ impl PanelReplay {
             frames_before_su: 0,
             tp2_wakeup_us: 0,
             a0_to_b0: false,
+            su_region_et: self.config.su_region_et,
             width,
             height,
         })
@@ -885,7 +1165,8 @@ impl PanelReplay {
 
     /// One commit's selective update over Panel Replay for the pipe's
     /// full-screen primary: the noarm `SEL_FETCH_PLANE_POS`, `_OFFSET`,
-    /// `_SIZE`, then `PSR2_MAN_TRK_CTL` and `SEL_FETCH_PLANE_CTL`
+    /// `_SIZE`, then `PSR2_MAN_TRK_CTL` (with early transport
+    /// `PIPE_SRCSZ_ERLY_TPT`) and `SEL_FETCH_PLANE_CTL`
     /// (`icl_plane_update_sel_fetch_noarm` / `_arm`,
     /// `intel_psr2_program_trans_man_trk_ctl`).
     pub fn program_sel_fetch<M: MmioWindow + ?Sized>(
@@ -909,6 +1190,12 @@ impl PanelReplay {
             ((y2.wrapping_sub(y1).wrapping_sub(1) as u32) << 16) | u32::from(width).wrapping_sub(1),
         );
         regs.write32(psr2_man_trk_ctl(self.config.pipe), sf.man_trk_ctl);
+        if self.config.su_region_et {
+            regs.write32(
+                crate::intel_gpu_psr::PIPE_SRCSZ_ERLY_TPT + pipe,
+                sf.early_tpt,
+            );
+        }
         regs.write32(
             crate::intel_gpu_psr::SEL_FETCH_PLANE_CTL + pipe,
             if y2 > y1 {
@@ -935,7 +1222,10 @@ impl PanelReplay {
     /// `intel_psr_disable_locked` for Panel Replay: exit, wait idle, clear
     /// `LATENCY_REPORTING_REMOVED`, then on eDP `intel_alpm_disable`. The
     /// sink keeps its replay configuration (Linux clears only PSR's
-    /// `DP_PSR_EN_CFG`). Every step runs; the first failure is returned.
+    /// `DP_PSR_EN_CFG`). The VSC and AS SDP enables the enable set are
+    /// cleared last (Linux clears them when the crtc goes off,
+    /// `intel_dp_set_infoframes(false)`, which no route stop here runs).
+    /// Every step runs; the first failure is returned.
     pub fn disable<M: MmioWindow + ?Sized>(
         &mut self,
         regs: &M,
@@ -961,6 +1251,15 @@ impl PanelReplay {
                     ctl & !(ALPM_CTL_ALPM_ENABLE | ALPM_CTL_LOBF_ENABLE),
                 );
             }
+        }
+        let t = self.config.pipe;
+        let dip = regs.read32(video_dip_ctl(t));
+        if dip != u32::MAX {
+            let mut enables = VIDEO_DIP_ENABLE_VSC_HSW;
+            if self.config.as_sdp.is_some() {
+                enables |= VIDEO_DIP_ENABLE_AS_ADL;
+            }
+            regs.write32(video_dip_ctl(t), dip & !enables);
         }
         self.active = false;
         first.map_or(Ok(()), Err)

@@ -123,6 +123,24 @@ fn timing_1080() -> crate::intel_gpu_dsb::Timing {
     }
 }
 
+/// `hsw_write_infoframe(DP_SDP_VSC)` of the replay VSC SDP on the
+/// transcoder at `base` (`HSW_TVIDEO_DIP_CTL` = base + 0x200, VSC data at
+/// base + 0x320): the dwords of HB0..HB3 = 00 07 06 10, DB0..DB3 = 01 00 00
+/// 01 and zeros, between the enable off and VSC_HSW (bit 20) |
+/// VSC_DIP_HW_DATA_SW_HEA (2 << 25).
+fn vsc_writes(base: u64) -> Vec<(u64, u32)> {
+    let mut writes = alloc::vec![
+        (base + 0x200, 0),
+        (base + 0x320, 0x1006_0700),
+        (base + 0x324, 0x0100_0001)
+    ];
+    for i in 2..9 {
+        writes.push((base + 0x320 + 4 * i, 0));
+    }
+    writes.push((base + 0x200, 0x0410_0000));
+    writes
+}
+
 fn edp_stream() -> Stream {
     Stream {
         display_ver: 20,
@@ -171,8 +189,15 @@ fn smoke_panel_replay_caps_and_compute_follow_linux() -> TestResult {
         silence_period_sym_clocks: 105,
         lfps_half_cycle_num_of_syms: 19,
     };
-    if config.alpm != Some(want) || !config.su || config.sdp_prior_scanline || !config.edp {
-        return TestResult::Fail("the eDP ALPM state and SU must be Linux's");
+    // psr2_su_region_et_valid: display 20 eDP whose 0x0b0 reports early
+    // transport (bit 2).
+    if config.alpm != Some(want)
+        || !config.su
+        || !config.su_region_et
+        || config.sdp_prior_scanline
+        || !config.edp
+    {
+        return TestResult::Fail("the eDP ALPM state, SU and early transport must be Linux's");
     }
     // Typed refusals: eDP below display 20, eDP off pipes A/B, HDCP,
     // 128b/132b, no AUX-less ALPM, MST, and the AS SDP need.
@@ -208,15 +233,29 @@ fn smoke_panel_replay_caps_and_compute_follow_linux() -> TestResult {
     {
         return TestResult::Fail("eDP Panel Replay must refuse what Linux refuses");
     }
-    if refused(
-        Stream {
+    // An AS SDP sink: intel_dp_compute_as_sdp at the fixed 1125-line
+    // vtotal (FIXED_VTOTAL, coasting at vmax: 0x0b1 keeps async video
+    // timing), and PR_ALPM_CTL = POSITION_T1 | AS_SDP_TRANSMISSION_IN_ACTIVE_
+    // DISABLE (0x11; no link-off capability in 0x0b1 bit 7).
+    match compute(
+        &caps,
+        &Stream {
             as_sdp_v2: true,
             ..edp_stream()
         },
-        &caps,
-    ) != Some(Refusal::AsSdpUnmodelled)
-    {
-        return TestResult::Fail("a sink needing the AS SDP must be refused typed");
+        None,
+    ) {
+        Ok(c)
+            if c.pr_alpm_ctl == Some(0x11)
+                && c.as_sdp
+                    == Some(AsSdp {
+                        mode: 1,
+                        vtotal: 1125,
+                        target_rr: 0,
+                        target_rr_divider: false,
+                        coasting_vtotal: 1125,
+                    }) => {}
+        _ => return TestResult::Fail("an AS SDP sink must get Linux's AS SDP and PR_ALPM_CTL"),
     }
     let mut no_aux_less = edp_sink();
     no_aux_less.dpcd.insert(0x02e, 0x01);
@@ -279,12 +318,13 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     };
     // intel_alpm_enable_sink (ENABLE | LOCK_ERROR_IRQ_HPD | MODE_AUX_LESS),
     // PANEL_REPLAY_CONFIG = ENABLE | VSC_SDP_CRC | UNRECOVERABLE_ERROR |
-    // RFB_STORAGE_ERROR | ACTIVE_FRAME_CRC_ERROR | SU_ENABLE (0x7b),
-    // CONFIG2 = CRC_VERIFICATION, CONFIG3 = T1, then DP_SET_POWER D0.
+    // RFB_STORAGE_ERROR | ACTIVE_FRAME_CRC_ERROR | SU_ENABLE |
+    // ENABLE_SU_REGION_ET (0xfb), CONFIG2 = CRC_VERIFICATION, CONFIG3 = T1,
+    // then DP_SET_POWER D0.
     if sink.writes
         != [
             (0x116, 0x07),
-            (0x1b0, 0x7b),
+            (0x1b0, 0xfb),
             (0x1b1, 0x02),
             (0x11a, 0x00),
             (0x600, 0x01),
@@ -297,14 +337,19 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     // AUX_LESS | swing setup 15 | silence 105, PORT_ALPM_LFPS_CTL(A) =
     // cycles 10 (field 3) and 19-symbol half cycles, ALPM_CTL(A) = ENABLE |
     // AUX_LESS | entry check 3 | AUX-less wake 5.
-    let want = [
+    // First the replay VSC SDP (hsw_write_infoframe on HSW_TVIDEO_DIP_CTL(A)
+    // 0x60200: VSC enable off, HB0..HB3 = 00 07 06 10 and DB0 = DB3 = 1 at
+    // HSW_TVIDEO_DIP_VSC_DATA(A) 0x60320.., then VIDEO_DIP_ENABLE_VSC_HSW |
+    // VSC_DIP_HW_DATA_SW_HEA).
+    let mut want = vsc_writes(0x60000);
+    want.extend_from_slice(&[
         (0x60860, 0x0e00_0000),
         (0x60814, 0xffff_fffb),
         (0x46430, 0),
         (0x16fa2c, 0x80f0_0069),
         (0x16fa30, 0x0313_1313),
         (0x60950, 0xc003_0005),
-    ];
+    ]);
     if regs.log() != want || pr.active() {
         return TestResult::Fail("the source enable must be Linux's, inactive until resumed");
     }
@@ -312,9 +357,10 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     if pr.resume(&regs) != Ok(true) {
         return TestResult::Fail("an idle replay must activate");
     }
-    // dg2_activate_panel_replay: EDP_PSR2_CTL (no region ET, no SDP line)
-    // = 0, PSR2_MAN_TRK_CTL continuous full frame, TRANS_DP2_CTL(A) PR on.
-    if regs.log() != [(0x60900, 0), (0x60910, 1 << 13), (0x600a0, 1 << 30)] || !pr.active() {
+    // dg2_activate_panel_replay: EDP_PSR2_CTL = LNL_EDP_PSR2_SU_REGION_ET_
+    // ENABLE (bit 27; no SDP line), PSR2_MAN_TRK_CTL continuous full frame,
+    // TRANS_DP2_CTL(A) PR on.
+    if regs.log() != [(0x60900, 1 << 27), (0x60910, 1 << 13), (0x600a0, 1 << 30)] || !pr.active() {
         return TestResult::Fail("activation must write PSR2_CTL, MAN_TRK and TRANS_DP2_CTL");
     }
     // Exit before a frame change, then the SU of a damaged band.
@@ -339,8 +385,13 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
         (None, None),
     );
     // Y granularity 4: rows 101..203 align to 100..204; MAN_TRK (ADL-P
-    // layout) = SF_PARTIAL | start 100 << 16 | end 203.
-    if sf.full_update || sf.su != (100, 204) || sf.man_trk_ctl != (1 << 31) | (100 << 16) | 203 {
+    // layout) = SF_PARTIAL | start 100 << 16 | end 203; early transport's
+    // PIPE_SRCSZ_ERLY_TPT = PIPESRC_WIDTH(1919) | PIPESRC_HEIGHT(103).
+    if sf.full_update
+        || sf.su != (100, 204)
+        || sf.man_trk_ctl != (1 << 31) | (100 << 16) | 203
+        || sf.early_tpt != (1919 << 16) | 103
+    {
         return TestResult::Fail("the SU area must align to the sink's 4-line granularity");
     }
     regs.writes.borrow_mut().clear();
@@ -351,6 +402,7 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
             (0x7089c, 100 << 16),
             (0x70898, (103 << 16) | 1919),
             (0x60910, (1 << 31) | (100 << 16) | 203),
+            (0x70074, (1919 << 16) | 103),
             (0x70890, 1 << 31),
         ]
     {
@@ -365,7 +417,13 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     regs.writes.borrow_mut().clear();
     regs.set(0x46430, 1 << 23);
     if pr.disable(&regs, 1).is_err()
-        || regs.log() != [(0x600a0, 0), (0x46430, 0), (0x60950, 0x4003_0005)]
+        || regs.log()
+            != [
+                (0x600a0, 0),
+                (0x46430, 0),
+                (0x60950, 0x4003_0005),
+                (0x60200, 0x0400_0000),
+            ]
         || pr.active()
         || sink.writes.len() != 5
     {
@@ -404,14 +462,13 @@ fn smoke_panel_replay_external_dp_on_transcoder_b() -> TestResult {
         Ok(pr) => pr,
         Err(_) => return TestResult::Fail("DP Panel Replay must enable on transcoder B"),
     };
-    if sink.writes != [(0x1b0, 0x7b), (0x1b1, 0x02), (0x11a, 0x00)]
-        || regs.log()
-            != [
-                (0x61860, 1 << 25),
-                (0x61814, 0xffff_fffb),
-                (0x46430, 1 << 24),
-            ]
-    {
+    let mut want = vsc_writes(0x61000);
+    want.extend_from_slice(&[
+        (0x61860, 1 << 25),
+        (0x61814, 0xffff_fffb),
+        (0x46430, 1 << 24),
+    ]);
+    if sink.writes != [(0x1b0, 0x7b), (0x1b1, 0x02), (0x11a, 0x00)] || regs.log() != want {
         return TestResult::Fail("DP replay takes no ALPM, no SET_POWER and the Pipe-B Wa bit");
     }
     if pr.resume(&regs) != Ok(false) || pr.active() {
@@ -423,8 +480,10 @@ fn smoke_panel_replay_external_dp_on_transcoder_b() -> TestResult {
         return TestResult::Fail("DP activation writes MAN_TRK(B) and TRANS_DP2_CTL(B) only");
     }
     regs.writes.borrow_mut().clear();
-    if pr.disable(&regs, 1).is_err() || regs.log() != [(0x610a0, 0), (0x46430, 0)] {
-        return TestResult::Fail("DP disable clears the enable and the Wa bit");
+    if pr.disable(&regs, 1).is_err()
+        || regs.log() != [(0x610a0, 0), (0x46430, 0), (0x61200, 0x0400_0000)]
+    {
+        return TestResult::Fail("DP disable clears the enable, the Wa bit and the VSC SDP");
     }
     // An inherited replay enable refuses before any write.
     let inherited = Regs::default();
@@ -472,4 +531,248 @@ fn smoke_panel_replay_leaves_nova_dc3co_refused() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_psr",
     smoke_panel_replay_leaves_nova_dc3co_refused
+);
+
+/// The replay stream's SDPs (Linux 7.4-rc4 `intel_dp.c`, `drm_dp_helper.c`,
+/// `intel_hdmi.c`, `intel_alpm.c`): the AS SDP and VSC SDP bytes, which
+/// sinks need the AS SDP, and an eDP AS SDP sink's enable, which refuses a
+/// transcoder without AS SDP timing before any write.
+fn smoke_panel_replay_as_sdp_follows_intel_dp() -> TestResult {
+    // intel_dp_as_sdp_pack of FIXED_VTOTAL at 1125 lines, coasting 1125:
+    // HB 00 22 02 09; DB0 = 01, DB1/2 = 65 04, DB7/8 = 65 04.
+    let words = |b: [u8; DP_SDP_BYTES]| -> Vec<u32> {
+        b.chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect()
+    };
+    let as_sdp = words(pack_as_sdp(&as_sdp_fixed(1125, true)));
+    let no_coast = words(pack_as_sdp(&as_sdp_fixed(1125, false)));
+    if as_sdp
+        != [
+            0x0902_2200,
+            0x0004_6501,
+            0x6500_0000,
+            0x0000_0004,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+        || no_coast != [0x0902_2200, 0x0004_6501, 0, 0, 0, 0, 0, 0, 0]
+    {
+        return TestResult::Fail("the AS SDP must pack as intel_dp_as_sdp_pack does");
+    }
+    if words(pack_replay_vsc_sdp()) != [0x1006_0700, 0x0100_0001, 0, 0, 0, 0, 0, 0, 0] {
+        return TestResult::Fail("the replay VSC SDP must pack as drm_dp_vsc_sdp_pack does");
+    }
+    // PR_ALPM_CTL: a sink with link off after the AS SDP and no async video
+    // timing in PR (0x0b1 = 0x88) -> POSITION_T1 | ALLOW_LINK_OFF (0x41).
+    let mut dpcd = [0u8; DP_PANEL_REPLAY_CAP_SIZE];
+    dpcd[0] = 0x07;
+    dpcd[1] = 0x88;
+    if pr_alpm_ctl_value(&Caps::parse(dpcd, true)) != 0x41 {
+        return TestResult::Fail("PR_ALPM_CTL must follow intel_alpm_configure_pr_as_sdp");
+    }
+    // intel_dp_needs_as_sdp: (DPCD rev, 0x2214, 0x005, 0x0b1, eDP) -> needed.
+    let cases: [(u8, u8, u8, u8, bool, bool); 7] = [
+        (0x14, 0x01, 0x00, 0x00, true, true),
+        (0x14, 0x00, 0x00, 0x00, true, false),
+        (0x12, 0x01, 0x00, 0x00, true, false),
+        (0x14, 0x05, 0x00, 0x00, false, true),
+        (0x14, 0x01, 0x00, 0x00, false, false),
+        (0x14, 0x01, 0x00, 0x08, false, true),
+        (0x14, 0x05, 0x01, 0x00, false, false),
+    ];
+    for (rev, rx, ports, cap, edp, want) in cases {
+        let mut sink = Sink::default();
+        sink.dpcd.insert(0x2214, rx);
+        sink.dpcd.insert(0x005, ports);
+        let mut dpcd = [0u8; DP_PANEL_REPLAY_CAP_SIZE];
+        dpcd[0] = 0x01;
+        dpcd[1] = cap;
+        if as_sdp_needed(&mut sink, rev, &Caps::parse(dpcd, edp)) != want {
+            return TestResult::Fail("which sinks take the AS SDP must be Linux's");
+        }
+    }
+    // The eDP enable with the AS SDP: no TRANS_VRR_VSYNC(A) refuses before
+    // any write; with it, the VSC SDP, the AS SDP at
+    // ADL_TVIDEO_DIP_AS_SDP_DATA(A) 0x60484.. with VIDEO_DIP_ENABLE_AS_ADL
+    // (bit 23), and PR_ALPM_CTL(A) 0x60948 before ALPM_CTL.
+    let mut sink = edp_sink();
+    let caps = Caps::read(&mut sink, true, false).expect("caps");
+    let config = compute(
+        &caps,
+        &Stream {
+            as_sdp_v2: true,
+            ..edp_stream()
+        },
+        None,
+    )
+    .expect("config");
+    if !enable_before_training(&mut sink, 20, true, false, true) {
+        return TestResult::Fail("the pre-training enable must be written");
+    }
+    sink.writes.clear();
+    let regs = Regs::default();
+    if PanelReplay::enable(&regs, &mut sink, config) != Err(Refusal::AsSdpTiming)
+        || !regs.log().is_empty()
+        || !sink.writes.is_empty()
+    {
+        return TestResult::Fail("no AS SDP timing must refuse untouched");
+    }
+    regs.set(0x60078, (5 << 16) | 10);
+    let mut pr = match PanelReplay::enable(&regs, &mut sink, config) {
+        Ok(pr) => pr,
+        Err(_) => return TestResult::Fail("the AS SDP sink must enable with its timing"),
+    };
+    let mut want = vsc_writes(0x60000);
+    want.push((0x60200, 0x0410_0000));
+    for (i, w) in as_sdp.iter().enumerate() {
+        want.push((0x60484 + 4 * i as u64, *w));
+    }
+    want.extend_from_slice(&[
+        (0x60200, 0x0490_0000),
+        (0x60860, 0x0e00_0000),
+        (0x60814, 0xffff_fffb),
+        (0x46430, 0),
+        (0x16fa2c, 0x80f0_0069),
+        (0x16fa30, 0x0313_1313),
+        (0x60948, 0x11),
+        (0x60950, 0xc003_0005),
+    ]);
+    if regs.log() != want {
+        return TestResult::Fail("the AS SDP replay enable must be Linux's, SDPs first");
+    }
+    regs.writes.borrow_mut().clear();
+    if pr.disable(&regs, 1).is_err() || regs.log().last() != Some(&(0x60200, 0x0400_0000)) {
+        return TestResult::Fail("disable must clear the VSC and AS SDP enables");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_panel_replay_as_sdp_follows_intel_dp
+);
+
+/// Region early transport on the display-20 eDP replay
+/// (`intel_psr2_sel_fetch_update` with `enable_psr2_su_region_et`, Linux
+/// 7.4-rc4): the SU area grows over a cursor it touches, also when the
+/// alignment pulls the cursor in; `PIPE_SRCSZ_ERLY_TPT` follows the area;
+/// the cursor's `CURPOS_ERLY_TPT` is its position against the area's top
+/// (`intel_cursor_position(.., true)`), and a cursor leaving the area keeps
+/// Wa_16021440873's parked 64x64 2-bit fetch. Without early transport (DSC
+/// here) nothing grows.
+fn smoke_panel_replay_region_early_transport_follows_intel_psr() -> TestResult {
+    use crate::intel_gpu_psr::{CursorPlane, Psr, Psr1, SuCommit, MCURSOR_MODE_64_ARGB_AX};
+    let mut sink = edp_sink();
+    let caps = Caps::read(&mut sink, true, false).expect("caps");
+    let config = compute(&caps, &edp_stream(), None).expect("config");
+    if !config.su_region_et
+        || compute(
+            &caps,
+            &Stream {
+                dsc: true,
+                ..edp_stream()
+            },
+            None,
+        )
+        .map(|c| (c.su, c.su_region_et))
+            != Ok((true, false))
+    {
+        return TestResult::Fail("early transport must be on, and off with DSC");
+    }
+    let _ = enable_before_training(&mut sink, 20, true, false, true);
+    let regs = Regs::default();
+    let src = Rect::new(0, 0, 1920, 1080);
+    let full = Damage::Full;
+    let psr1 = Psr1 {
+        idle_frames: 0,
+        tps3: false,
+        wm_level_disabled: false,
+        tp1_wakeup_us: 0,
+        tp2_tp3_wakeup_us: 0,
+        display20: true,
+        entry_setup_frames: 0,
+    };
+    fn commit(damage: &Damage, src: Rect, cursor: Option<CursorPlane>) -> SuCommit<'_> {
+        SuCommit {
+            damage,
+            old_src: src,
+            src,
+            pipe_supported: true,
+            cursor,
+        }
+    }
+    let mut psr = match Psr::enable_replay(
+        &regs,
+        &mut sink,
+        psr1,
+        config,
+        1920,
+        1080,
+        &commit(&full, src, None),
+    ) {
+        Ok(psr) => psr,
+        Err(_) => return TestResult::Fail("the eDP replay must enable"),
+    };
+    let cursor = |y| CursorPlane {
+        dst: Rect::new(100, y, 164, y + 64),
+        ctl: MCURSOR_MODE_64_ARGB_AX,
+    };
+    // A: rows 101..103 touch a cursor at y 102: 101..166, aligned 100..168.
+    let band_a = Damage::Clips(alloc::vec![Rect::new(0, 101, 1920, 103)]);
+    let Some(sf) = psr.sel_fetch(&commit(&band_a, src, Some(cursor(102)))) else {
+        return TestResult::Fail("replay SU must compute a selective fetch");
+    };
+    if sf.full_update
+        || sf.su != (100, 168)
+        || sf.man_trk_ctl != (1 << 31) | (100 << 16) | 167
+        || sf.early_tpt != (1919 << 16) | 67
+        || sf.cursor != Some((Some((0, 64)), MCURSOR_MODE_64_ARGB_AX))
+        || sf.cursor_early_tpt != (2 << 16) | 100
+    {
+        return TestResult::Fail("early transport must cover the cursor it touches");
+    }
+    regs.writes.borrow_mut().clear();
+    psr.program_sel_fetch_arm(&regs, &sf);
+    psr.program_sel_fetch_cursor(&regs, &sf);
+    if regs.log()
+        != [
+            (0x60910, (1 << 31) | (100 << 16) | 167),
+            (0x70074, (1919 << 16) | 67),
+            (0x70890, 1 << 31),
+            (0x7008c, (2 << 16) | 100),
+            (0x70880, MCURSOR_MODE_64_ARGB_AX),
+            (0x70084, 0),
+        ]
+    {
+        return TestResult::Fail("MAN_TRK, PIPE_SRCSZ_ERLY_TPT and CURPOS_ERLY_TPT in arm order");
+    }
+    // B: rows 101..102 miss a cursor at y 103 until the 4-line alignment
+    // (100..104) reaches it: 100..167, aligned 100..168, cursor row 3.
+    let band_b = Damage::Clips(alloc::vec![Rect::new(0, 101, 1920, 102)]);
+    match psr.sel_fetch(&commit(&band_b, src, Some(cursor(103)))) {
+        Some(sf) if sf.su == (100, 168) && sf.cursor_early_tpt == (3 << 16) | 100 => {}
+        _ => return TestResult::Fail("an alignment that reaches the cursor must cover it"),
+    }
+    // C: the cursor (last fetched rows 0..64) leaves rows 500..504:
+    // Wa_16021440873 parks a 64x64 2-bit fetch at CURSOR_POS_Y(1081).
+    let band_c = Damage::Clips(alloc::vec![Rect::new(0, 500, 1920, 502)]);
+    let Some(sf) = psr.sel_fetch(&commit(&band_c, src, Some(cursor(102)))) else {
+        return TestResult::Fail("replay SU must compute a selective fetch");
+    };
+    if sf.su != (500, 504) || sf.cursor != Some((None, MCURSOR_MODE_64_ARGB_AX)) {
+        return TestResult::Fail("a cursor outside the area must leave the commit's fetch");
+    }
+    regs.writes.borrow_mut().clear();
+    psr.program_sel_fetch_cursor(&regs, &sf);
+    if regs.log() != [(0x70880, 0x04), (0x7008c, 1081 << 16), (0x70084, 0)] {
+        return TestResult::Fail("Wa_16021440873 must park the cursor fetch below the pipe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_panel_replay_region_early_transport_follows_intel_psr
 );

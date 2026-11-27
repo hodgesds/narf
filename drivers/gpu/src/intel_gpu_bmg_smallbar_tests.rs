@@ -682,6 +682,7 @@ fn smoke_bmg_smallbar_cpu_export_alias_and_profile_refusals() -> TestResult {
         let exporter = || Exporter {
             platform: GtPlatform::Battlemage,
             backend: rig.backend.clone(),
+            mapped_moves: false,
         };
         // xe_dma_buf_attach: this nonvisible object's placement is VRAM
         // only, so an importer without a peer path is -EOPNOTSUPP.

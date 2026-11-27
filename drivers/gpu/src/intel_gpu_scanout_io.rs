@@ -57,10 +57,27 @@ pub(crate) const fn display_pte(generation: Generation) -> Option<(PteFormat, u8
         Generation::IceLake => None,
         // Gen9 has no KMS owner in Lane 1 (display lands in Lane 5).
         Generation::Skylake | Generation::Broxton => None,
-        Generation::RocketLake => None,
+        // Rocket Lake's display 12 (`narf.intel.rkl_edp=1` owns its panel):
+        // the Tiger Lake GGTT PTE, no PAT field.
+        Generation::RocketLake => Some((PteFormat::Gen12, 0)),
         Generation::MeteorLake => Some((PteFormat::XeLpg, 1)),
         Generation::LunarLake => Some((PteFormat::Xe2, 3)),
         Generation::PantherLake => None,
+    }
+}
+
+/// The broad generation a Gen12 PCI family's display runs as: Tiger Lake
+/// and DG1 (`XE_D_DISPLAY`), Rocket Lake (`XE_D_DISPLAY` with three pipes and
+/// `HAS_D12_PLANE_MINIMIZATION`), and the Alder Lake families. A KMS owner
+/// whose generation and family disagree is refused.
+pub(crate) const fn gen12_generation(family: crate::intel_gpu_gt::Gen12Platform) -> Generation {
+    use crate::intel_gpu_gt::Gen12Platform;
+    match family {
+        Gen12Platform::TigerLake | Gen12Platform::Dg1 => Generation::TigerLake,
+        Gen12Platform::RocketLake => Generation::RocketLake,
+        Gen12Platform::AlderLakeS | Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => {
+            Generation::AlderLake
+        }
     }
 }
 
@@ -170,7 +187,7 @@ pub(crate) fn display_pat_programmed(
         Generation::IceLake => false,
         // Gen9 has no display owner in Lane 1; nothing programmed it.
         Generation::Skylake | Generation::Broxton => false,
-        Generation::RocketLake => false,
+        Generation::RocketLake => true,
         Generation::MeteorLake => io.read32(0x4804) == 4,
         Generation::LunarLake => io.read32(0x480c) == 0x3c,
         Generation::PantherLake => false,
@@ -366,9 +383,7 @@ impl<M: DisplayAccess> PollIo<M> {
     ) -> Result<(), IoError> {
         let expected = match (self.format, family) {
             (PteFormat::Gen12, Some(family)) => {
-                if (self.generation == Generation::TigerLake)
-                    != (family == crate::intel_gpu_gt::Gen12Platform::TigerLake)
-                {
+                if self.generation != gen12_generation(family) {
                     return Err(IoError::Unsupported);
                 }
                 if stride > crate::intel_gpu_scanout::gen12_max_stride(family) / 64 {

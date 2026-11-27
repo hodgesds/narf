@@ -21,6 +21,20 @@
 //! whose compression comes from the BO's PAT index (`XE2_COMP_EN`) and whose
 //! decompression is `PLANE_CTL` alone, with no AUX plane or distance; Nova
 //! Lake-S (display 35) and discrete parts are not admitted here.
+//!
+//! A panned view is placed as `skl_check_plane_surface` places it
+//! ([`CcsPlanes::place`]): `skl_check_ccs_aux_surface` puts the AUX plane at
+//! the 4 KiB AUX tile under the source position, then
+//! `skl_check_main_surface` steps the main surface's aligned offset
+//! (`tgl_plane_min_alignment`: 16 KiB in GGTT, 2 MiB through a DPT) back
+//! until its x/y equal the AUX plane's, with `intel_fb.c`'s
+//! `intel_compute_aligned_offset`, `intel_adjust_tile_offset`,
+//! `intel_fb_offset_to_xy` and `intel_fb_plane_get_subsampling` (AUX 2 x 32).
+//! `PLANE_SURF` is the main offset, `PLANE_OFFSET` its x/y and
+//! `PLANE_AUX_DIST` the AUX offset minus the main one (`skl_plane_aux_dist`).
+//! Display 20's flat CCS has no AUX plane: its main offset is taken in the
+//! framebuffer's remapped DPT view, which a CCS plane never narrows to the
+//! viewport (`intel_plane_can_remap`).
 
 /// The strict default-off option.
 pub const BOOT_OPTION: &str = "narf.intel.ccs";
@@ -270,19 +284,122 @@ impl CcsPlanes {
 
     /// [`Self::program`]'s writes as a register list (`PLANE_CC_VAL` low and
     /// high, `PLANE_AUX_DIST`, `PLANE_AUX_OFFSET`) for a DSB arm of the
-    /// primary of `pipe`.
+    /// primary of `pipe`, scanned out from origin zero.
     pub fn noarm_registers(&self, pipe: u8, ccval: Option<u64>) -> alloc::vec::Vec<(u64, u32)> {
+        self.noarm_registers_at(pipe, ccval, self.aux_dist())
+    }
+
+    /// [`Self::noarm_registers`] with the AUX distance of the view's
+    /// placement ([`CcsPlacement::aux_dist`]).
+    pub fn noarm_registers_at(
+        &self,
+        pipe: u8,
+        ccval: Option<u64>,
+        aux_dist: Option<u32>,
+    ) -> alloc::vec::Vec<(u64, u32)> {
         let mut out = alloc::vec::Vec::new();
         if let (Some(_), Some(native)) = (self.cc, ccval) {
             let [lo, hi] = Self::cc_val(native);
             out.push((plane_cc_val(pipe, 0), lo));
             out.push((plane_cc_val(pipe, 1), hi));
         }
-        if let Some(dist) = self.aux_dist() {
+        if let Some(dist) = aux_dist.filter(|_| self.aux.is_some()) {
             out.push((plane_aux_dist(pipe), dist));
             out.push((plane_aux_offset(pipe), 0));
         }
         out
+    }
+
+    /// `skl_check_plane_surface` for a compressed primary scanned out from
+    /// (`src_x`, `src_y`): `skl_check_ccs_aux_surface` places the AUX plane
+    /// at the 4 KiB AUX tile holding the source position (its x/y in main
+    /// pixels within that tile), then `skl_check_main_surface` takes the
+    /// main surface's aligned offset (`skl_calc_main_surface_offset`, kept
+    /// at or below the AUX one) and steps it back by `alignment` until its
+    /// x/y equal the AUX plane's (`skl_check_main_ccs_coordinates`, which
+    /// may step the AUX plane back by 4 KiB tiles too), since "CCS AUX
+    /// surface doesn't have its own x/y offsets". `mapping_pitch` is the
+    /// main surface's row pitch in the view (the framebuffer pitch in GGTT,
+    /// or the remapped DPT stride on display 20) and `alignment` the main
+    /// surface's (`tgl_plane_min_alignment`: [`MAIN_ALIGNMENT`] in GGTT,
+    /// [`DPT_MAIN_ALIGNMENT`] through a DPT). `None` where Linux finds no
+    /// offset ("unable to find suitable display surface offset due to
+    /// CCS") or the x/y would not fit `PLANE_OFFSET`.
+    pub fn place(
+        &self,
+        mapping_pitch: u32,
+        alignment: u32,
+        src_x: u32,
+        src_y: u32,
+    ) -> Option<CcsPlacement> {
+        let main_pitch_tiles = u64::from(mapping_pitch) / (MAIN_TILE_W * 4);
+        let alignment = u64::from(alignment);
+        if main_pitch_tiles == 0 || alignment == 0 || alignment % TILE_SIZE != 0 {
+            return None;
+        }
+        let main = Tiled {
+            tile_w: MAIN_TILE_W,
+            tile_h: MAIN_TILE_H,
+            pitch_tiles: main_pitch_tiles,
+        };
+        let (src_x, src_y) = (u64::from(src_x), u64::from(src_y));
+        // skl_check_ccs_aux_surface.
+        let aux = match self.aux {
+            Some((offset, pitch)) => {
+                let tiled = Tiled {
+                    tile_w: AUX_TILE_W,
+                    tile_h: AUX_TILE_H,
+                    pitch_tiles: u64::from(pitch) / AUX_TILE_W,
+                };
+                if tiled.pitch_tiles == 0 {
+                    return None;
+                }
+                // intel_fb_offset_to_xy: the AUX plane's normal-view x/y.
+                let (mut nx, mut ny) = (0, 0);
+                tiled.adjust(&mut nx, &mut ny, u64::from(offset), 0);
+                let mut x = src_x / AUX_HSUB + nx;
+                let mut y = src_y / AUX_VSUB + ny;
+                let at = tiled.aligned_offset(&mut x, &mut y, AUX_ALIGNMENT);
+                Some(AuxState {
+                    tiled,
+                    x: x * AUX_HSUB + src_x % AUX_HSUB,
+                    y: y * AUX_VSUB + src_y % AUX_VSUB,
+                    offset: at,
+                })
+            }
+            None => None,
+        };
+        // skl_check_main_surface / skl_calc_main_surface_offset.
+        let (mut x, mut y) = (src_x, src_y);
+        let mut offset = main.aligned_offset(&mut x, &mut y, alignment);
+        let aux = match aux {
+            Some(mut aux) => {
+                if offset > aux.offset {
+                    let to = aux.offset & !(alignment - 1);
+                    offset = main.adjust(&mut x, &mut y, offset, to);
+                }
+                while !aux.matches(x, y, offset) {
+                    if offset == 0 {
+                        break;
+                    }
+                    offset = main.adjust(&mut x, &mut y, offset, offset - alignment);
+                }
+                if x != aux.x || y != aux.y {
+                    return None;
+                }
+                Some(u32::try_from(aux.offset).ok()?)
+            }
+            None => None,
+        };
+        if x > 0xffff || y > 0xffff {
+            return None;
+        }
+        Some(CcsPlacement {
+            main: u32::try_from(offset).ok()?,
+            x: x as u32,
+            y: y as u32,
+            aux,
+        })
     }
 
     /// `skl_program_plane_noarm`'s compressed registers for the primary of
@@ -300,6 +417,125 @@ impl CcsPlanes {
             regs.write32(register, value);
         }
         self.ccs.plane_ctl()
+    }
+}
+
+/// `intel_tile_size`.
+const TILE_SIZE: u64 = 4096;
+/// The Tile4 main plane of an XRGB8888 primary in pixels:
+/// `intel_tile_width_bytes` 128 over cpp 4, `intel_tile_height` 4096 / 128.
+const MAIN_TILE_W: u64 = 32;
+const MAIN_TILE_H: u64 = 32;
+/// The Gen12 CCS AUX plane in its own units (cpp 1):
+/// `intel_tile_width_bytes` 64, `intel_tile_height` 4096 / 64.
+const AUX_TILE_W: u64 = 64;
+const AUX_TILE_H: u64 = 64;
+/// `intel_fb_plane_get_subsampling` for the AUX plane of a
+/// `gen12_ccs_formats` XRGB8888/XBGR8888 primary: `block_w` 2 over 1 times
+/// the format's hsub 1, and vsub 32.
+const AUX_HSUB: u64 = 2;
+const AUX_VSUB: u64 = 32;
+/// `tgl_plane_min_alignment` for the AUX plane: "AUX_DIST needs only 4K
+/// alignment".
+const AUX_ALIGNMENT: u64 = 4096;
+/// `tgl_plane_min_alignment` for a CCS main surface in GGTT: "Align to at
+/// least 4x1 main surface tiles (16K) to match 64B of AUX".
+pub const MAIN_ALIGNMENT: u32 = 16 * 1024;
+/// The same through a display page table (`mult` 512: "PLANE_SURF GGTT ->
+/// DPT alignment").
+pub const DPT_MAIN_ALIGNMENT: u32 = 512 * 4096;
+
+/// Where [`CcsPlanes::place`] puts a compressed view's planes, as byte
+/// offsets into the view's mapping: the main surface's aligned offset
+/// (`PLANE_SURF`), its x/y (`PLANE_OFFSET`) and the AUX surface's offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CcsPlacement {
+    pub main: u32,
+    pub x: u32,
+    pub y: u32,
+    pub aux: Option<u32>,
+}
+
+impl CcsPlacement {
+    /// `PLANE_OFFSET`: y in the high half, x in the low one.
+    pub fn plane_offset(&self) -> u32 {
+        (self.y << 16) | self.x
+    }
+
+    /// `skl_plane_aux_dist` on display 12+: the AUX surface's distance from
+    /// the main one (`skl_calc_main_surface_offset` keeps it non-negative).
+    pub fn aux_dist(&self) -> Option<u32> {
+        self.aux.map(|aux| aux - self.main)
+    }
+}
+
+/// One tiled colour plane's geometry in a view: tile size in the plane's
+/// units and the mapping pitch in tiles.
+#[derive(Clone, Copy)]
+struct Tiled {
+    tile_w: u64,
+    tile_h: u64,
+    pitch_tiles: u64,
+}
+
+impl Tiled {
+    /// `intel_adjust_tile_offset`: move the tiles between `old` and `new`
+    /// into x/y, then minimize x.
+    fn adjust(self, x: &mut u64, y: &mut u64, old: u64, new: u64) -> u64 {
+        let tiles = (old - new) / TILE_SIZE;
+        *y += tiles / self.pitch_tiles * self.tile_h;
+        *x += tiles % self.pitch_tiles * self.tile_w;
+        let pitch_pixels = self.pitch_tiles * self.tile_w;
+        *y += *x / pitch_pixels * self.tile_h;
+        *x %= pitch_pixels;
+        new
+    }
+
+    /// `intel_compute_aligned_offset` for a tiled plane: the offset of the
+    /// tile holding x/y, rounded down to `alignment`, the rest in x/y.
+    fn aligned_offset(self, x: &mut u64, y: &mut u64, alignment: u64) -> u64 {
+        let tile_rows = *y / self.tile_h;
+        *y %= self.tile_h;
+        let tiles = *x / self.tile_w;
+        *x %= self.tile_w;
+        let offset = (tile_rows * self.pitch_tiles + tiles) * TILE_SIZE;
+        self.adjust(x, y, offset, offset - offset % alignment)
+    }
+}
+
+/// The AUX plane's view offset and x/y in main pixels.
+#[derive(Clone, Copy)]
+struct AuxState {
+    tiled: Tiled,
+    x: u64,
+    y: u64,
+    offset: u64,
+}
+
+impl AuxState {
+    /// `skl_check_main_ccs_coordinates`: step the AUX plane back by 4 KiB
+    /// tiles while it stays at or above the main surface and its y at or
+    /// above the main one, until both x/y match; only a match is kept.
+    fn matches(&mut self, main_x: u64, main_y: u64, main_offset: u64) -> bool {
+        let (mut ax, mut ay, mut at) = (self.x, self.y, self.offset);
+        while at >= main_offset && ay <= main_y {
+            if ax == main_x && ay == main_y {
+                break;
+            }
+            if at == 0 {
+                break;
+            }
+            let mut x = ax / AUX_HSUB;
+            let mut y = ay / AUX_VSUB;
+            at = self.tiled.adjust(&mut x, &mut y, at, at - AUX_ALIGNMENT);
+            ax = x * AUX_HSUB + ax % AUX_HSUB;
+            ay = y * AUX_VSUB + ay % AUX_VSUB;
+        }
+        if ax != main_x || ay != main_y {
+            return false;
+        }
+        (self.x, self.y, self.offset) = (ax, ay, at);
+        true
     }
 }
 

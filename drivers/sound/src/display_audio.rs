@@ -402,14 +402,86 @@ static CODEC: IrqSafeSpinLock<Option<&'static (dyn DisplayAudioCodec + Sync)>> =
     IrqSafeSpinLock::new(None);
 
 /// Bind the display's half (`intel_audio_component_bind`); refused when
-/// one is already bound (`-EEXIST`).
+/// one is already bound (`-EEXIST`). A bind completes every waiting
+/// [`DisplayAudioBound`] (`complete_all(&acomp->master_bind_complete)`).
 pub fn bind_display_audio_component(ops: &'static (dyn DisplayAudioComponent + Sync)) -> bool {
-    let mut slot = COMPONENT.lock();
-    if slot.is_some() {
-        return false;
+    {
+        let mut slot = COMPONENT.lock();
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(ops);
     }
-    *slot = Some(ops);
+    let waiters = core::mem::take(&mut *BIND_WAITERS.lock());
+    for waker in waiters {
+        waker.wake();
+    }
     true
+}
+
+// SEAM — COMPONENT BIND ORDER. Linux's HD-audio probe on a controller that
+// binds with the graphics driver (`AZX_DCAPS_I915_COMPONENT`) and finds its
+// display present (`snd_hdac_i915_init` over `i915_gfx_present`) returns
+// -EPROBE_DEFER while the display has not added its audio component, and
+// the driver core probes it again once the display driver has bound. NARF's
+// bus has no deferred probe: the display driver states at its registration
+// which display functions it binds a component for
+// ([`register_display_audio_provider`]), and the HDA probe of such a
+// controller waits for the bind with [`DisplayAudioBound`].
+
+/// Whether the display driver binds an audio component for the display
+/// PCI function `(vendor, device)`.
+pub type DisplayAudioProvider = fn(u16, u16) -> bool;
+
+static PROVIDER: IrqSafeSpinLock<Option<DisplayAudioProvider>> = IrqSafeSpinLock::new(None);
+static BIND_WAITERS: IrqSafeSpinLock<Vec<core::task::Waker>> = IrqSafeSpinLock::new(Vec::new());
+
+/// The display driver's registration-time statement of the functions it
+/// binds a component for (one display driver per system).
+pub fn register_display_audio_provider(provider: DisplayAudioProvider) {
+    *PROVIDER.lock() = Some(provider);
+}
+
+/// Drop the provider (fixtures).
+pub fn unregister_display_audio_provider() {
+    *PROVIDER.lock() = None;
+}
+
+/// The registered provider, if any (fixtures save and restore it).
+pub fn display_audio_provider() -> Option<DisplayAudioProvider> {
+    *PROVIDER.lock()
+}
+
+/// Whether a registered display driver binds a component for the display
+/// function `(vendor, device)`.
+pub fn display_audio_provided(vendor: u16, device: u16) -> bool {
+    let provider = *PROVIDER.lock();
+    provider.is_some_and(|provides| provides(vendor, device))
+}
+
+/// `acomp->master_bind_complete`: ready once a display half is bound.
+#[derive(Debug, Default)]
+pub struct DisplayAudioBound;
+
+impl core::future::Future for DisplayAudioBound {
+    type Output = ();
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        // Register before checking, so a bind between the two still wakes.
+        {
+            let mut waiters = BIND_WAITERS.lock();
+            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
+        }
+        if display_audio_component().is_some() {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
+    }
 }
 
 /// Unbind the display's half (`intel_audio_component_unbind`).
@@ -825,5 +897,101 @@ pub mod tests {
     kernel_test_in!(
         "drivers/sound/display_audio",
         smoke_display_audio_component_hda_side
+    );
+
+    struct CountWake(core::sync::atomic::AtomicU32);
+    impl alloc::task::Wake for CountWake {
+        fn wake(self: alloc::sync::Arc<Self>) {
+            self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn meteor_lake_display(vendor: u16, device: u16) -> bool {
+        vendor == 0x8086 && device == 0x7d55
+    }
+
+    struct ScriptedBound;
+    impl DisplayAudioComponent for ScriptedBound {
+        fn get_power(&self) -> u64 {
+            1
+        }
+        fn put_power(&self, _cookie: u64) {}
+        fn codec_wake_override(&self, _enable: bool) {}
+        fn get_cdclk_freq(&self) -> Result<u32, ComponentError> {
+            Err(ComponentError::NoDevice)
+        }
+        fn sync_audio_rate(
+            &self,
+            _port: i32,
+            _pipe: i32,
+            _rate: u32,
+        ) -> Result<(), ComponentError> {
+            Err(ComponentError::NoDevice)
+        }
+        fn get_eld(
+            &self,
+            _port: i32,
+            _pipe: i32,
+            _buf: &mut [u8],
+        ) -> Result<(bool, usize), ComponentError> {
+            Err(ComponentError::Invalid)
+        }
+    }
+    static BOUND_DISPLAY: ScriptedBound = ScriptedBound;
+
+    /// `snd_hdac_i915_init`'s wait for the display (`hdac_component_master_bind`'s
+    /// `complete_all(&acomp->master_bind_complete)`): the bind future stays
+    /// pending while no display half is bound, the bind wakes it once, and
+    /// it is then ready. The provider answers only for the functions it
+    /// names, and nothing is provided without one.
+    fn smoke_display_audio_bound_waits_for_bind() -> TestResult {
+        let saved = display_audio_provider();
+        let result = bound_waits_for_bind();
+        match saved {
+            Some(provider) => register_display_audio_provider(provider),
+            None => unregister_display_audio_provider(),
+        }
+        result
+    }
+
+    fn bound_waits_for_bind() -> TestResult {
+        use core::future::Future;
+        unbind_display_audio_component();
+        unregister_display_audio_provider();
+        if display_audio_provided(0x8086, 0x7d55) {
+            return TestResult::Fail("no provider: no display binds a component");
+        }
+        register_display_audio_provider(meteor_lake_display);
+        let named = display_audio_provided(0x8086, 0x7d55);
+        let other = display_audio_provided(0x8086, 0x9a49);
+        unregister_display_audio_provider();
+        if !named || other {
+            return TestResult::Fail("the provider names the functions it binds");
+        }
+        let count = alloc::sync::Arc::new(CountWake(core::sync::atomic::AtomicU32::new(0)));
+        let waker = core::task::Waker::from(count.clone());
+        let mut cx = core::task::Context::from_waker(&waker);
+        let mut bound = DisplayAudioBound;
+        let mut pinned = core::pin::Pin::new(&mut bound);
+        if pinned.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("no component bound: the wait must be pending");
+        }
+        // A second poll keeps one waker.
+        let _ = pinned.as_mut().poll(&mut cx);
+        if !bind_display_audio_component(&BOUND_DISPLAY) {
+            return TestResult::Fail("the scripted display must bind");
+        }
+        let woken = count.0.load(core::sync::atomic::Ordering::SeqCst);
+        let ready = pinned.as_mut().poll(&mut cx).is_ready();
+        unbind_display_audio_component();
+        BIND_WAITERS.lock().clear();
+        if woken != 1 || !ready {
+            return TestResult::Fail("the bind must wake the waiter once and complete it");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/sound/display_audio",
+        smoke_display_audio_bound_waits_for_bind
     );
 }

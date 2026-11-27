@@ -71,7 +71,10 @@
 //! 2. Reset the link (`H_RST`), wait for `ME_CSR_HA.ME_RDY`, release
 //!    the reset, then publish `H_RDY`.
 //! 3. Send `HOST_START_REQ_CMD` with HBM version 2.2 and read the
-//!    `HOST_START_RES_CMD` reply.
+//!    `HOST_START_RES_CMD` reply. Firmware that does not support 2.2
+//!    reports its highest version, which is adopted when this driver
+//!    supports it (`mei_hbm_dispatch`, `mei_hbm_version_is_supported`);
+//!    see [`HbmVersionResponse::negotiated`].
 //! 4. Send `HOST_ENUM_REQ_CMD` and keep the 256-bit bitmap of
 //!    firmware clients the response carries.
 //! 5. Walk the bitmap with `HOST_CLIENT_PROPERTIES_REQ_CMD`, one
@@ -145,7 +148,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 //
 // Linux `hw-me-regs.h`. Only the recent PCH generations are listed;
 // the register layout below has been stable since Cannon Lake, but
-// claiming a controller we have not reasoned about buys nothing.
+// claiming a controller we have not reasoned about buys nothing. The
+// display 9-11 PCHs of [`HDCP_GATED_DEVICE_IDS`] are claimed only for the
+// HDCP client, with its option.
 
 /// Intel.
 pub const MEI_VENDOR: u16 = 0x8086;
@@ -184,6 +189,22 @@ pub const MEI_DEV_PTL_H: u16 = 0xE370;
 pub const MEI_DEV_PTL_P: u16 = 0xE470;
 /// Wildcat Lake P.
 pub const MEI_DEV_WCL_P: u16 = 0x4D70;
+/// Sunrise Point (LP).
+pub const MEI_DEV_SPT: u16 = 0x9D3A;
+/// Sunrise Point H.
+pub const MEI_DEV_SPT_H: u16 = 0xA13A;
+/// Kaby Point.
+pub const MEI_DEV_KBP: u16 = 0xA2BA;
+/// Cannon Point LP.
+pub const MEI_DEV_CNP_LP: u16 = 0x9DE0;
+/// Ice Lake Point LP.
+pub const MEI_DEV_ICP_LP: u16 = 0x34E0;
+/// Ice Lake Point N.
+pub const MEI_DEV_ICP_N: u16 = 0x38E0;
+/// Jasper Lake Point N.
+pub const MEI_DEV_JSP_N: u16 = 0x4DE0;
+/// Mule Creek Canyon (Elkhart Lake).
+pub const MEI_DEV_MCC: u16 = 0x4B70;
 
 /// Every device ID this driver claims, in one `const` so
 /// `register_pci_driver` and the match-table smoke cannot drift.
@@ -207,9 +228,86 @@ pub const SUPPORTED_DEVICE_IDS: &[u16] = &[
     MEI_DEV_WCL_P,
 ];
 
-/// `true` iff this driver claims `did`.
+/// `true` iff this driver claims `did` on every boot.
 pub fn is_supported_device(did: u16) -> bool {
     SUPPORTED_DEVICE_IDS.contains(&did)
+}
+
+/// The HECI-1 functions of the display 9-11 PCHs (Sunrise, Kaby, Cannon
+/// LP, Ice, Jasper and Mule Creek Point) that `mei_me_pci_tbl` carries.
+/// NARF's only consumer there is the HDCP 2.2 client
+/// (`crate::mei_hdcp`), so they are claimed only when its strict option
+/// `narf.intel.hdcp=1` is on the command line (Linux binds them on every
+/// boot); without it nothing on these boards changes. The second HECI and
+/// iTouch functions (`_2`, `_3` IDs) are not claimed.
+pub const HDCP_GATED_DEVICE_IDS: &[u16] = &[
+    MEI_DEV_SPT,
+    MEI_DEV_SPT_H,
+    MEI_DEV_KBP,
+    MEI_DEV_CNP_LP,
+    MEI_DEV_ICP_LP,
+    MEI_DEV_ICP_N,
+    MEI_DEV_JSP_N,
+    MEI_DEV_MCC,
+];
+
+/// `true` iff this driver claims `did`, given whether the HDCP client's
+/// option is on.
+pub fn claims(did: u16, hdcp_opted_in: bool) -> bool {
+    is_supported_device(did) || (hdcp_opted_in && HDCP_GATED_DEVICE_IDS.contains(&did))
+}
+
+/// The `quirk_probe` of the `mei_cfg` `mei_me_pci_tbl` gives a device:
+/// whether its firmware SKU can leave the function without a valid ME
+/// interface (`hw-me.c`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MeiFwQuirk {
+    /// No `quirk_probe` (`MEI_ME_PCH8_CFG`, `MEI_ME_PCH12_CFG`,
+    /// `MEI_ME_PCH15_CFG`).
+    None,
+    /// `MEI_CFG_FW_SPS_4` (`MEI_ME_PCH8_SPS_4_CFG`):
+    /// `mei_me_fw_type_sps_4`.
+    Sps4,
+    /// `MEI_CFG_FW_SPS_IGN` (`MEI_ME_PCH12_SPS_CFG`,
+    /// `MEI_ME_PCH15_SPS_CFG`): `mei_me_fw_type_sps_ign`.
+    SpsIgn,
+}
+
+/// `mei_me_pci_tbl`'s configuration for each claimed ID: Sunrise Point H
+/// is `MEI_ME_PCH8_SPS_4_CFG`, Cannon Point H `MEI_ME_PCH12_SPS_CFG`,
+/// Tiger Lake Point H and Raptor Lake Point S `MEI_ME_PCH15_SPS_CFG`;
+/// every other claimed ID has a configuration without `quirk_probe`.
+pub const fn fw_quirk(did: u16) -> MeiFwQuirk {
+    match did {
+        MEI_DEV_SPT_H => MeiFwQuirk::Sps4,
+        MEI_DEV_CNP_H | MEI_DEV_TGP_H | MEI_DEV_RPL_S => MeiFwQuirk::SpsIgn,
+        _ => MeiFwQuirk::None,
+    }
+}
+
+/// `PCI_CFG_HFS_1_OPMODE_MSK` / `PCI_CFG_HFS_1_OPMODE_SPS` (SPS <= 4.0).
+pub const PCI_CFG_HFS_1_OPMODE_MSK: u32 = 0x000F_0000;
+pub const PCI_CFG_HFS_1_OPMODE_SPS: u32 = 0x000F_0000;
+/// `PCI_CFG_HFS_3_FW_SKU_MSK` and its IGN / SPS values.
+pub const PCI_CFG_HFS_3_FW_SKU_MSK: u32 = 0x0000_0070;
+pub const PCI_CFG_HFS_3_FW_SKU_IGN: u32 = 0x0000_0000;
+pub const PCI_CFG_HFS_3_FW_SKU_SPS: u32 = 0x0000_0060;
+/// `PCI_ERROR_RESPONSE`: what Linux's config accessors return when a
+/// read fails (`PCI_SET_ERROR_RESPONSE`, `drivers/pci/access.c`).
+pub const PCI_ERROR_RESPONSE: u32 = !0;
+
+/// `mei_me_quirk_probe`: `true` when the firmware SKU signalled in
+/// function 0's `PCI_CFG_HFS_1` / `PCI_CFG_HFS_3` means the device has no
+/// valid ME interface ("Device doesn't have valid ME Interface", -ENODEV).
+pub const fn no_valid_me_interface(quirk: MeiFwQuirk, hfs_1: u32, hfs_3: u32) -> bool {
+    match quirk {
+        MeiFwQuirk::None => false,
+        MeiFwQuirk::Sps4 => hfs_1 & PCI_CFG_HFS_1_OPMODE_MSK == PCI_CFG_HFS_1_OPMODE_SPS,
+        MeiFwQuirk::SpsIgn => {
+            let sku = hfs_3 & PCI_CFG_HFS_3_FW_SKU_MSK;
+            sku == PCI_CFG_HFS_3_FW_SKU_IGN || sku == PCI_CFG_HFS_3_FW_SKU_SPS
+        }
+    }
 }
 
 // ── MMIO registers (BAR0) ───────────────────────────────────────────
@@ -300,6 +398,8 @@ pub const PCI_CFG_HFS_6: u16 = 0x6C;
 pub const HBM_MAJOR_VERSION: u8 = 2;
 /// `HBM_MINOR_VERSION`.
 pub const HBM_MINOR_VERSION: u8 = 2;
+/// `HBM_MAJOR_VERSION_DOT`: disconnect on connect timeout (HBM 2.0).
+pub const HBM_MAJOR_VERSION_DOT: u8 = 2;
 
 /// Mask selecting the opcode out of an HBM command byte.
 pub const MEI_HBM_CMD_OP_MSK: u8 = 0x7F;
@@ -522,6 +622,28 @@ pub struct HbmVersionResponse {
 }
 
 impl HbmVersionResponse {
+    /// The version the link runs (`mei_hbm_dispatch`'s
+    /// `HOST_START_RES_CMD`): this driver's 2.2 when firmware supports it,
+    /// else firmware's highest version, kept only when
+    /// `mei_hbm_version_is_supported` (not above 2.2) and, a NARF bound,
+    /// at least 2.0: the client paths here are the HBM 2.0 ones (a
+    /// connect timeout disconnects, `hbm_f_dot_supported`). Linux also runs
+    /// 1.x firmware, with a link reset on connect timeout. `None` refuses
+    /// the link.
+    pub const fn negotiated(&self) -> Option<(u8, u8)> {
+        if self.host_version_supported {
+            return Some((HBM_MAJOR_VERSION, HBM_MINOR_VERSION));
+        }
+        let (major, minor) = (self.me_major, self.me_minor);
+        let supported =
+            major < HBM_MAJOR_VERSION || (major == HBM_MAJOR_VERSION && minor <= HBM_MINOR_VERSION);
+        if supported && major >= HBM_MAJOR_VERSION_DOT {
+            Some((major, minor))
+        } else {
+            None
+        }
+    }
+
     /// Decode the 4-byte response body. `struct hbm_version` is
     /// `{ minor_version, major_version }` — minor first.
     pub fn parse(buf: &[u8]) -> Option<Self> {
@@ -746,7 +868,9 @@ pub enum MeiError {
     /// Firmware answered with something other than the expected
     /// response opcode.
     HbmUnexpected(u8),
-    /// Firmware rejected the HBM version we proposed.
+    /// Firmware rejected the HBM version we proposed and its own highest
+    /// version is not one this driver runs
+    /// ([`HbmVersionResponse::negotiated`]).
     HbmVersionRejected {
         me_major: u8,
         me_minor: u8,
@@ -1141,7 +1265,8 @@ pub struct MeiDevice<R: HeciRegs = BarRegs> {
     pub device_id: u16,
     /// Host write-buffer depth in slots, latched at config time.
     pub hbuf_depth: u8,
-    /// HBM version firmware reported in `HOST_START_RES_CMD`.
+    /// HBM version firmware reported in `HOST_START_RES_CMD`; the link
+    /// runs [`HbmVersionResponse::negotiated`].
     pub hbm_version: HbmVersionResponse,
     /// Firmware supports D0i3 (`PCI_CFG_HFS_1` bit 31).
     pub d0i3_supported: bool,
@@ -1409,7 +1534,7 @@ impl<R: HeciRegs> MeiDevice<R> {
         self.hbm_exchange(&req, HOST_START_RES_CMD, &mut resp)?;
         let v = HbmVersionResponse::parse(&resp)
             .ok_or(MeiError::HbmUnexpected(resp.first().copied().unwrap_or(0)))?;
-        if !v.host_version_supported {
+        if v.negotiated().is_none() {
             return Err(MeiError::HbmVersionRejected {
                 me_major: v.me_major,
                 me_minor: v.me_minor,
@@ -2434,11 +2559,34 @@ static CONTROLLER: IrqSafeSpinLock<Option<Arc<MeiDevice>>> = IrqSafeSpinLock::ne
 
 /// Probe entry — installed via `bus::register_pci_driver`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if device.id.vendor != MEI_VENDOR || !is_supported_device(device.id.device) {
+    let hdcp = crate::mei_hdcp::boot_opt_in(narf_boot::cmdline(), crate::mei_hdcp::BOOT_OPTION);
+    if device.id.vendor != MEI_VENDOR || !claims(device.id.device, hdcp) {
         return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     if CONTROLLER.lock().is_some() {
         return Ok(());
+    }
+    // `mei_me_quirk_probe`: Linux reads function 0's status words; every
+    // claimed ID is a HECI-1 function, which is function 0. A failed read
+    // yields `PCI_ERROR_RESPONSE` there, as in Linux, not 0: all ones is
+    // SPS opmode (refused) but neither the IGN nor the SPS SKU (bound).
+    let quirk = fw_quirk(device.id.device);
+    let read_status =
+        |offset| narf_bus::pci::read_config32(&cap, &device, offset).unwrap_or(PCI_ERROR_RESPONSE);
+    if quirk != MeiFwQuirk::None
+        && no_valid_me_interface(
+            quirk,
+            read_status(PCI_CFG_HFS_1),
+            read_status(PCI_CFG_HFS_3),
+        )
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  mei: {:04x}: device doesn't have valid ME interface",
+            device.id.device,
+        );
+        return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     narf_bus::pci::set_command(
         &cap,
@@ -2542,9 +2690,15 @@ fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     }
 }
 
-/// Register the MEI PCI driver — one match entry per device ID.
+/// Register the MEI PCI driver — one match entry per device ID. The
+/// HDCP-gated IDs are matched too; [`probe`] refuses them without the
+/// option.
 pub fn register_pci_driver() {
-    for did in SUPPORTED_DEVICE_IDS.iter().copied() {
+    for did in SUPPORTED_DEVICE_IDS
+        .iter()
+        .chain(HDCP_GATED_DEVICE_IDS)
+        .copied()
+    {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name: "mei-me",
             kind: narf_bus::MatchKind::VendorDevice {

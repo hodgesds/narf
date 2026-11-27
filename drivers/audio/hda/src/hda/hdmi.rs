@@ -632,6 +632,10 @@ pub(crate) struct Port {
     /// the sense changes (or the last read gave no usable ELD).
     pub eldv: bool,
     pub sink: Option<Sink>,
+    /// The pin's device entry the sink sits on (`per_pin->dev_id`): 0 for a
+    /// legacy SST stream, the display's CPU transcoder for a DP MST or UHBR
+    /// stream on an Intel pin.
+    pub dev_id: u8,
 }
 
 impl IntelHda {
@@ -651,6 +655,7 @@ impl IntelHda {
                 present: false,
                 eldv: false,
                 sink: None,
+                dev_id: 0,
             })
             .collect()
     }
@@ -679,6 +684,15 @@ impl IntelHda {
     /// The HDMI PCM an output path's pin is bound to (static PCM mapping).
     pub(super) fn hdmi_pcm_of_output(&self, output: usize) -> Option<usize> {
         self.hdmi.lock().iter().position(|p| p.output == output)
+    }
+
+    /// The device entry the HDMI port of `output` sits on (0 without one).
+    pub(super) fn hdmi_dev_id_of_output(&self, output: usize) -> u8 {
+        self.hdmi
+            .lock()
+            .iter()
+            .find(|p| p.output == output)
+            .map_or(0, |p| p.dev_id)
     }
 
     /// The open playback PCM, when it is an HDMI one.
@@ -803,13 +817,15 @@ impl IntelHda {
             let pin = path.nodes.pin_nid;
             // An Intel pin: `sync_eld_via_acomp` (no sense verb).
             if hda_codec::intel_hdmi_model(graph).is_some() {
-                let (present, sink) = self.intel_sense(graph, pin);
+                let current = self.hdmi.lock()[index].dev_id;
+                let (present, sink, dev_id) = self.intel_sense(graph, pin, current);
                 let mut ports = self.hdmi.lock();
                 let port = &mut ports[index];
                 port.eldv = sink.is_some();
-                if port.present != present || port.sink != sink {
+                if port.present != present || port.sink != sink || port.dev_id != dev_id {
                     port.present = present;
                     port.sink = sink;
+                    port.dev_id = dev_id;
                     changed.push(index);
                 }
                 continue;

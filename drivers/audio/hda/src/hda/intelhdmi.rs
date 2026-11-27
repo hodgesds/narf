@@ -21,8 +21,10 @@
 //! Deviations, each a simplification: converters are assigned to pins once,
 //! at discovery (the first free converter in each pin's connection list),
 //! and each pin keeps its own PCM, where Linux picks a converter at PCM open
-//! and maps PCMs to pins dynamically; only device entry 0 of each pin is
-//! used (no DP MST audio, which Linux also leaves as a todo); the silent
+//! and maps PCMs to pins dynamically (`dyn_pcm_assign`): a pin's PCM sits on
+//! one of its device entries (`dev_num`; an MST or UHBR SST stream's entry is
+//! its CPU transcoder), so a second MST stream on the same pin gets no PCM
+//! of its own; the silent
 //! stream and keep-alive are not modelled; the vendor verbs are re-issued
 //! before the AFG's D0 at stream configuration, not at every power
 //! transition; display power is dropped at codec suspend.
@@ -30,8 +32,28 @@ use super::*;
 use crate::hda_codec::{self, AudioPath, Codec, IntelHdmiModel, WidgetType};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use narf_bus::BusDevice;
 use narf_drivers_sound::display_audio::{self as acomp, DisplayAudioCodec, DisplayAudioComponent};
 use narf_lib::sync::IrqSafeSpinLock;
+
+/// `AC_VERB_GET_PARAMETERS`, `AC_PAR_DEVLIST_LEN` and `AC_DEV_LIST_LEN_MASK`;
+/// `AC_VERB_SET_DEVICE_SEL`.
+const GET_PARAMETER: u32 = 0xf00;
+const AC_PAR_DEVLIST_LEN: u32 = 0x15;
+const AC_DEV_LIST_LEN_MASK: u32 = 0x3f;
+const SET_DEVICE_SEL: u32 = 0x735;
+
+/// `spec->dev_num` of an Intel display codec: `intel_hsw_common_init`'s
+/// worst-case device entries per pin (`intel_hsw_fixup`: 3 for Haswell,
+/// Gemini Lake and Ice Lake, 4 from Tiger Lake on), 1 for the models
+/// without `codec->dp_mst` (Baytrail, the PCH codecs).
+pub(super) const fn dev_num(model: IntelHdmiModel) -> u8 {
+    match model {
+        IntelHdmiModel::Hsw | IntelHdmiModel::Glk | IntelHdmiModel::Icl => 3,
+        IntelHdmiModel::Tgl | IntelHdmiModel::Adlp => 4,
+        IntelHdmiModel::Byt | IntelHdmiModel::Cpt => 1,
+    }
+}
 
 /// `INTEL_GET_VENDOR_VERB` / `INTEL_SET_VENDOR_VERB` and their bits.
 pub(super) const INTEL_GET_VENDOR_VERB: u32 = 0xf81;
@@ -135,6 +157,122 @@ pub(super) fn intel_port2pin(model: IntelHdmiModel, codec_id: u32, port: i32) ->
 /// registered one.
 fn component() -> Option<&'static (dyn DisplayAudioComponent + Sync)> {
     acomp::display_audio_component()
+}
+
+// ── snd_hdac_i915_init (sound/hda/core/i915.c) ───────────────────────
+
+/// Whether Linux binds the controller `vendor:device` with the graphics
+/// driver (`AZX_DCAPS_I915_COMPONENT` in its `azx_ids[]` entry): every
+/// Intel controller this driver claims but the ICH6/7/9 parts
+/// (`AZX_DCAPS_INTEL_ICH`).
+pub(super) fn i915_component(vendor: u16, device: u16) -> bool {
+    use crate::ids::{HDA_INTEL_ICH6_DEVICE, HDA_INTEL_ICH7_DEVICE, HDA_INTEL_ICH9_DEVICE};
+    vendor == 0x8086
+        && !matches!(
+            device,
+            HDA_INTEL_ICH6_DEVICE | HDA_INTEL_ICH7_DEVICE | HDA_INTEL_ICH9_DEVICE
+        )
+}
+
+/// `i915_gfx_present`'s denylist: the Cannon Lake and Lakefield displays
+/// (no i915 support).
+const I915_DENYLIST: [u16; 15] = [
+    0x5a40, 0x5a41, 0x5a42, 0x5a44, 0x5a49, 0x5a4a, 0x5a4c, 0x5a50, 0x5a51, 0x5a52, 0x5a54, 0x5a59,
+    0x5a5a, 0x5a5c, 0x9840,
+];
+
+/// The PCI bus `device` sits on, as `(segment, bus)`.
+fn pci_bus(device: &BusDevice) -> Option<(u16, u8)> {
+    match device.kind {
+        narf_bus::BusKind::Pcie { addr, .. } => Some((addr.segment, addr.bus)),
+        _ => None,
+    }
+}
+
+/// `connectivity_check`: the two functions share a bus, a parent bus (two
+/// root buses count: "may be NULL!") or, for a discrete GPU's embedded
+/// HD-audio, the parent's parent. `upstream` is `pci_upstream_bridge`.
+pub(super) fn connectivity_check(
+    display: &BusDevice,
+    hdac: &BusDevice,
+    upstream: &dyn Fn(&BusDevice) -> Option<BusDevice>,
+) -> bool {
+    let (Some(a), Some(b)) = (pci_bus(display), pci_bus(hdac)) else {
+        return false;
+    };
+    if a == b {
+        return true;
+    }
+    let (ua, ub) = (upstream(display), upstream(hdac));
+    if ua.and_then(|d| pci_bus(&d)) == ub.and_then(|d| pci_bus(&d)) {
+        return true;
+    }
+    let (Some(ua), Some(ub)) = (ua, ub) else {
+        return false;
+    };
+    let ga = upstream(&ua).and_then(|d| pci_bus(&d));
+    ga.is_some() && ga == upstream(&ub).and_then(|d| pci_bus(&d))
+}
+
+/// `i915_gfx_present` for the controller `hdac` among `devices`: an Intel
+/// display-class function (`pci_is_display`) off the denylist that
+/// `connectivity_check` reaches and, NARF's stand-in for the driver core
+/// knowing the graphics driver will bind, that the registered display
+/// driver binds an audio component for ([`acomp::display_audio_provided`]).
+/// `gpu_bind` and `nomodeset` are not modelled (NARF has neither).
+pub(super) fn i915_gfx_present(
+    hdac: &BusDevice,
+    devices: &[BusDevice],
+    upstream: &dyn Fn(&BusDevice) -> Option<BusDevice>,
+) -> bool {
+    devices.iter().any(|d| {
+        d.id.vendor == 0x8086
+            && d.id.class >> 16 == 0x03
+            && !I915_DENYLIST.contains(&d.id.device)
+            && acomp::display_audio_provided(d.id.vendor, d.id.device)
+            && connectivity_check(d, hdac, upstream)
+    })
+}
+
+/// What `snd_hdac_i915_init` decides for a controller at probe.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum I915Init {
+    /// No component binding: not an `AZX_DCAPS_I915_COMPONENT` controller,
+    /// or no reachable display (`-ENODEV`: "don't bother any longer").
+    Without,
+    /// The display's component is bound: probe now.
+    Bound,
+    /// The display is present and has not bound its component yet
+    /// (`-EPROBE_DEFER`, "couldn't bind with audio component").
+    Defer,
+}
+
+/// `snd_hdac_i915_init` for the controller `hdac` (`bound`: a display half
+/// is bound).
+pub(super) fn i915_init(
+    hdac: &BusDevice,
+    devices: &[BusDevice],
+    upstream: &dyn Fn(&BusDevice) -> Option<BusDevice>,
+    bound: bool,
+) -> I915Init {
+    if !i915_component(hdac.id.vendor, hdac.id.device) || !i915_gfx_present(hdac, devices, upstream)
+    {
+        I915Init::Without
+    } else if bound {
+        I915Init::Bound
+    } else {
+        I915Init::Defer
+    }
+}
+
+/// [`i915_init`] over the bus registry and the bound component.
+pub(super) fn i915_init_for(hdac: &BusDevice) -> I915Init {
+    i915_init(
+        hdac,
+        &narf_bus::registry::devices(),
+        &narf_bus::pci::upstream_bridge,
+        component().is_some(),
+    )
 }
 
 /// `alloc_intel_hdmi`'s precondition: an Intel HDMI codec binds only with
@@ -356,11 +494,17 @@ impl IntelHda {
         })
     }
 
-    /// `sync_eld_via_acomp` + `update_eld` for one Intel pin (device entry
-    /// 0): `snd_hdac_acomp_get_eld` through this codec's `pin2port`; the
-    /// monitor is present when the display reports audio enabled, and the
-    /// ELD is valid when it has a size, parses and carries a SAD.
-    pub(super) fn intel_sense(&self, graph: &Codec, pin: u8) -> (bool, Option<super::hdmi::Sink>) {
+    /// `sync_eld_via_acomp` + `update_eld` for one device entry of an Intel
+    /// pin: `snd_hdac_acomp_get_eld(pin, dev_id)` through this codec's
+    /// `pin2port`; the monitor is present when the display reports audio
+    /// enabled, and the ELD is valid when it has a size, parses and carries
+    /// a SAD.
+    fn intel_entry_eld(
+        &self,
+        graph: &Codec,
+        pin: u8,
+        dev_id: u8,
+    ) -> (bool, Option<super::hdmi::Sink>) {
         let mut buf = [0u8; ELD_MAX_SIZE];
         let codec = IntelPin {
             model: hda_codec::intel_hdmi_model(graph),
@@ -370,7 +514,7 @@ impl IntelHda {
             component().map(|c| c as &dyn DisplayAudioComponent),
             Some(&codec as &dyn DisplayAudioCodec),
             u32::from(pin),
-            0,
+            i32::from(dev_id),
             &mut buf,
         ) {
             Ok((present, size)) if size > 0 => (
@@ -382,8 +526,56 @@ impl IntelHda {
         }
     }
 
-    /// `snd_hdac_sync_audio_rate` for `pin` (device entry 0) at `rate` Hz.
-    fn intel_sync_audio_rate(&self, graph: &Codec, pin: u8, rate: u32) {
+    /// The sense of an Intel pin over its device entries (`hdmi_add_pin`
+    /// allocates [`dev_num`] per pin; an MST or UHBR SST stream sits on the
+    /// entry of its CPU transcoder, `intel_pin_eld_notify`'s `dev_id =
+    /// pipe`). The pin's PCM (NARF keeps one per pin) stays on `current`
+    /// while its ELD is valid, as an attached PCM stays on its pin
+    /// (`update_eld`), else moves to the lowest entry with a valid ELD
+    /// (`hdmi_attach_hda_pcm`), else reports `current`. Returns presence,
+    /// sink and the entry.
+    pub(super) fn intel_sense(
+        &self,
+        graph: &Codec,
+        pin: u8,
+        current: u8,
+    ) -> (bool, Option<super::hdmi::Sink>, u8) {
+        let entries = hda_codec::intel_hdmi_model(graph).map_or(1, dev_num);
+        let (present, sink) = self.intel_entry_eld(graph, pin, current);
+        if sink.is_some() {
+            return (present, sink, current);
+        }
+        for dev in (0..entries).filter(|&dev| dev != current) {
+            let (on, other) = self.intel_entry_eld(graph, pin, dev);
+            if other.is_some() {
+                return (on, other, dev);
+            }
+        }
+        (present, None, current)
+    }
+
+    /// `snd_hda_set_dev_select` on an Intel pin: nothing without
+    /// `codec->dp_mst` (Baytrail and the PCH codecs) or for a pin whose
+    /// device list (`AC_PAR_DEVLIST_LEN`, 0-based) has one entry; a
+    /// `dev_id` past the list is refused (-EINVAL, nothing written); else
+    /// `AC_VERB_SET_DEVICE_SEL`.
+    fn intel_set_dev_select(&self, graph: &Codec, pin: u8, dev_id: u8) -> Result<(), HdaError> {
+        if hda_codec::intel_hdmi_model(graph).map_or(1, dev_num) == 1 {
+            return Ok(());
+        }
+        let parm = self.verb(graph.addr, pin, (GET_PARAMETER << 8) | AC_PAR_DEVLIST_LEN)?;
+        let parm = if parm == u32::MAX { 0 } else { parm };
+        let devices = (parm & AC_DEV_LIST_LEN_MASK) + 1;
+        if devices == 1 || devices <= u32::from(dev_id) {
+            return Ok(());
+        }
+        self.verb(graph.addr, pin, (SET_DEVICE_SEL << 8) | u32::from(dev_id))?;
+        Ok(())
+    }
+
+    /// `snd_hdac_sync_audio_rate` for `pin`'s device entry `dev_id` at
+    /// `rate` Hz.
+    fn intel_sync_audio_rate(&self, graph: &Codec, pin: u8, dev_id: u8, rate: u32) {
         let codec = IntelPin {
             model: hda_codec::intel_hdmi_model(graph),
             codec_id: codec_id(graph),
@@ -392,7 +584,7 @@ impl IntelHda {
             component().map(|c| c as &dyn DisplayAudioComponent),
             Some(&codec as &dyn DisplayAudioCodec),
             u32::from(pin),
-            0,
+            i32::from(dev_id),
             rate,
         );
     }
@@ -531,8 +723,12 @@ impl IntelHda {
             .hdmi_pcm_of_output(output)
             .ok_or(HdaError::NoOutputStream)?;
         let pcm = self.hdmi_state(index);
+        // snd_hda_set_dev_select: the pin's verbs below address the device
+        // entry its PCM sits on.
+        let dev_id = self.hdmi_dev_id_of_output(output);
+        self.intel_set_dev_select(graph, pin, dev_id)?;
         self.intel_pin_cvt_fixup(graph, nodes)?;
-        self.intel_sync_audio_rate(graph, pin, rate);
+        self.intel_sync_audio_rate(graph, pin, dev_id, rate);
         let sink = self.hdmi_sink(output);
         let ca = self.intel_hdmi_infoframe(graph, nodes, channels, sink.as_ref(), &pcm)?;
         self.update_hdmi_state(index, |state| {

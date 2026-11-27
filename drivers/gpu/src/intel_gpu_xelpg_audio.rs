@@ -19,7 +19,8 @@
 //!   `hsw_audio_codec_disable` with `enable_audio_dsc_wa` (DP:
 //!   `HBLANK_EARLY_ENABLE_TGL` and, for a compressed 4K stream, the hblank
 //!   start count and samples per line), `intel_audio_sdp_split_update`
-//!   (`AUD_DP_2DOT0_CTRL`, UHBR with audio), Wa_14020863754
+//!   (`AUD_DP_2DOT0_CTRL`, UHBR audio on MST or to a sink with SST split
+//!   SDP), Wa_14020863754
 //!   (`AUD_CHICKENBIT_REG3`, display 20.00 and 30.00) and the DP / HDMI
 //!   `AUD_CONFIG` updates (`hsw_dp_audio_config_update`,
 //!   `hsw_hdmi_audio_config_update`: the `hdmi_audio_clock` pixel-clock
@@ -40,11 +41,16 @@
 //!   `intel_audio_min_cdclk` floor the Pipe B–D owner applies for a pipe
 //!   with audio.
 //!
+//! DP MST streams take audio as Linux's `mst_stream_enable` /
+//! `mst_stream_disable` do: each stream's transcoder runs its own
+//! `AUD_CONFIG`, the ELD is the stream's connector ELD, and the codec is
+//! notified with `pin_eld_notify(port, cpu_transcoder)`, which
+//! `find_audio_state` answers by transcoder (`needs_cpu_transcoder_id`).
+//!
 //! Not modelled: the `POWER_DOMAIN_AUDIO_PLAYBACK` wakeref (on display 14
 //! it is PW_2, which every live external route already holds; the
 //! component does not request power wells itself), the LPE audio bridge
-//! (Valleyview/Cherryview only) and Gemini Lake's forced CDCLK. MST audio
-//! is not enabled (the MST route keeps audio off).
+//! (Valleyview/Cherryview only) and Gemini Lake's forced CDCLK.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -173,19 +179,24 @@ pub struct AudioStream {
     pub ycbcr420: bool,
     /// `INTEL_DISPLAY_WA_14020863754` (display 30.00, 20.00 and 14.01).
     pub wa_14020863754: bool,
+    /// `intel_crtc_has_type(crtc_state, INTEL_OUTPUT_DP_MST)`: a DP MST
+    /// stream (`encoder->port` is the MST port).
+    pub mst: bool,
+    /// `intel_dp->sst_split_sdp_support` (`DP_SST_SPLIT_SDP_CAP`).
+    pub sst_split_sdp: bool,
 }
 
 impl AudioStream {
-    /// `crtc_state->sdp_split_enable`: DP audio on a UHBR link
-    /// (`intel_dp_audio_compute_config`).
+    /// `crtc_state->sdp_split_enable` (`intel_dp_audio_compute_config`):
+    /// DP audio on a UHBR link, which MST supports inherently and SST only
+    /// with the sink's `DP_SST_SPLIT_SDP_CAP`.
     pub const fn sdp_split_enable(&self) -> bool {
-        self.dp && self.uhbr
+        self.dp && self.uhbr && (self.mst || self.sst_split_sdp)
     }
 
-    /// `intel_audio_needs_cpu_transcoder_id` (MST is never an audio route
-    /// here): UHBR SST.
+    /// `intel_audio_needs_cpu_transcoder_id`: an MST stream, or UHBR SST.
     pub const fn needs_cpu_transcoder_id(&self) -> bool {
-        self.dp && self.uhbr
+        self.mst || (self.dp && self.uhbr)
     }
 
     /// The `pipe` argument of `pin_eld_notify`: the CPU transcoder when it
@@ -838,8 +849,10 @@ fn sample_rate(port: i32) -> u32 {
         .unwrap_or(0)
 }
 
-/// `find_audio_state`: an MST/UHBR stream by its CPU transcoder, a legacy
-/// SST stream by its port alone (the first transcoder carrying it).
+/// `find_audio_state`: an MST or UHBR SST stream by its CPU transcoder
+/// (`needs_cpu_transcoder_id`), a legacy SST stream by its port alone (the
+/// first transcoder carrying it; `cpu_transcoder` -1 or 0, so the first
+/// device entry of a legacy port still finds it).
 fn find_audio_state(audio: &Audio, port: i32, cpu_transcoder: i32) -> Option<AudioState> {
     if cpu_transcoder >= 0 {
         if let Some(state) = audio.state.get(cpu_transcoder as usize).and_then(|s| *s) {
@@ -879,7 +892,7 @@ pub fn audio_codec_enable<M: MmioWindow + ?Sized>(
         });
     }
     if let Some(publication) = publication {
-        acomp::publish_display_audio(sink_id(s.port), publication);
+        acomp::publish_display_audio(stream_sink_id(s), publication);
     }
     acomp::notify_pin_eld(s.port, s.notify_pipe());
     Ok(())
@@ -896,9 +909,20 @@ pub fn audio_codec_disable<M: MmioWindow + ?Sized>(
     if let Some(slot) = AUDIO.lock().state.get_mut(s.trans as usize) {
         *slot = None;
     }
-    acomp::clear_display_audio(sink_id(s.port));
+    acomp::clear_display_audio(stream_sink_id(s));
     acomp::notify_pin_eld(s.port, s.notify_pipe());
     result
+}
+
+/// The shared display-audio sink id of a stream: [`sink_id`] of its port
+/// for SST; an MST stream adds `cpu_transcoder + 1` in bits 23:16, so the
+/// streams of one MST port publish apart.
+pub const fn stream_sink_id(s: &AudioStream) -> acomp::DisplaySinkId {
+    if s.mst {
+        acomp::DisplaySinkId(sink_id(s.port).0 | ((s.trans as u32 + 1) << 16))
+    } else {
+        sink_id(s.port)
+    }
 }
 
 /// The shared display-audio sink id of a display-14 port: `enum port + 1`

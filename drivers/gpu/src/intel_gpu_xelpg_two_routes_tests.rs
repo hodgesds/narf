@@ -435,3 +435,325 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_second_route_refusals_precede_mmio
 );
+
+const PIPECONF_D: u64 = 0x7_3008;
+const PLANE_SURF_1_D: u64 = 0x7_319C;
+
+/// The programmed PM demand matches Linux's for `pipes` active pipes and
+/// `phys` non-Type-C PHYs at a highest port clock of `ddiclk` MHz
+/// (`intel_pmdemand_update_max_ddiclk`: `DIV_ROUND_UP(port_clock, 1000)`
+/// over every active pipe).
+fn demand_at(io: &Dual, pipes: u8, phys: u8, ddiclk: u16) -> bool {
+    let p = pmdemand(io);
+    p.active_pipes == pipes.min(3)
+        && p.active_phys == phys
+        && p.plls == (phys + 1).min(7)
+        && p.ddiclk_max == ddiclk
+}
+
+/// DP MST beside a second route (`narf.intel.ext_routes=2`): HDMI on DDI B
+/// lights Pipe B, then the TC1 hub's two 1024x768 sinks take Pipes C and D
+/// with their first stream planned beside the HDMI route's owner
+/// (`intel_dp_mst.c` runs on TC1 while DDI B keeps its own stream; nothing
+/// but the joint plan is shared). Linux's plan for Pipes A-D
+/// (`adlp_allowed_dbufs`: A and D on S1|S2, B and C on S3|S4, 2048 blocks
+/// each, split by `intel_crtc_ddb_weight` 1024 each; MBUS unjoined;
+/// `PLANE_BUF_CFG` relative to the slice group) and the PM demand of three
+/// (`min(4, 3)`) pipes with the panel's and DDI B's combo PHYs. Unplugging
+/// DDI B keeps both streams lit and gives C the whole S3|S4; HDMI then
+/// relights on Pipe B beside the live MST route (a second route beside
+/// MST), and the MST stop (D, then C) leaves the HDMI route lit with the
+/// A|B plan.
+fn smoke_mtl_two_routes_mst_beside_hdmi() -> TestResult {
+    let Some((io, panel)) = dual() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    let dmc = DmcEvents::leak();
+    let mut service = service(panel, dmc);
+    let next = Cell::new(0);
+    let mut alloc = allocator(&next);
+    match service.handle(
+        &io,
+        event(XeLpgPort::B, MtlHpdKind::Connected(LiveMode::Native)),
+        &mut alloc,
+    ) {
+        ServiceOutcome::Activated {
+            protocol: MtlProtocol::Hdmi,
+            pipe: Pipe::B,
+            ..
+        } => {}
+        _ => return TestResult::Fail("DDI B HDMI must light Pipe B first"),
+    }
+    if service.connect_slot() != Ok(Some(1)) {
+        return TestResult::Fail("a live HDMI route must admit a sibling in slot 1");
+    }
+    let Ok(link) = probe_link(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) else {
+        return TestResult::Fail("the TC1 hub must answer its DPCD");
+    };
+    let mut aux = super::mst::tests::branch(&io.tc);
+    let mst_from = io.tc.writes.borrow().len();
+    let owner = match MtlMstRoute::connect_aux_beside(
+        &io,
+        link,
+        MtlPortDecl::USB_C,
+        &service.display(),
+        &mut alloc,
+        &mut aux,
+        None,
+        service.beside(1),
+    ) {
+        Ok(owner) => owner,
+        Err((_, error)) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "MST beside HDMI: {error:?}");
+            return TestResult::Fail("MST must light its two sinks beside the HDMI route");
+        }
+    };
+    if owner.stream_count() != 2
+        || owner.first().map(|(pipe, _, _)| pipe) != Some(Pipe::C)
+        || !lit(&io, PIPECONF_C)
+        || !lit(&io, PIPECONF_D)
+        || io.read32(PLANE_SURF_1_C) != SURFACES[1]
+        || io.read32(PLANE_SURF_1_D) != SURFACES[2]
+    {
+        return TestResult::Fail("the MST streams must take Pipes C and D, own surfaces");
+    }
+    service.hold(1, MtlRoute::Mst(owner));
+    if !never_blanked(&io, PIPECONF_B, mst_from, SURFACES[0])
+        || !io.tc.writes_to(PIPECONF_A).is_empty()
+        || !io.tc.writes_to(PLANE_CTL_1_A).is_empty()
+    {
+        return TestResult::Fail("the MST route must keep the panel and the HDMI route lit");
+    }
+    if ddb_span(&io, 0) != (0, 1023)
+        || ddb_span(&io, 3) != (1024, 2047)
+        || ddb_span(&io, 1) != (0, 1023)
+        || ddb_span(&io, 2) != (1024, 2047)
+        || io.read32(crate::intel_gpu_xelpg_dbuf::MBUS_CTL)
+            & crate::intel_gpu_xelpg_dbuf::MBUS_CTL_MASK
+            != 0
+        || !demand_matches(&io, 4, 2)
+    {
+        return TestResult::Fail("Pipes A-D must hold Linux's four-pipe plan");
+    }
+    // DDI B unplugged: C and D stay lit, C takes S3|S4 alone.
+    let unplug_from = io.tc.writes.borrow().len();
+    if !matches!(
+        service.handle(
+            &io,
+            event(XeLpgPort::B, MtlHpdKind::Disconnected),
+            &mut alloc
+        ),
+        ServiceOutcome::Withdrawn { port: XeLpgPort::B }
+    ) || io.read32(PIPECONF_B) & (ENABLE | STATE) != 0
+        || !never_blanked(&io, PIPECONF_C, unplug_from, SURFACES[1])
+        || !never_blanked(&io, PIPECONF_D, unplug_from, SURFACES[2])
+        || ddb_span(&io, 0) != (0, 1023)
+        || ddb_span(&io, 2) != (0, 2047)
+        || ddb_span(&io, 3) != (1024, 2047)
+        || !demand_matches(&io, 3, 1)
+    {
+        return TestResult::Fail("the HDMI unplug must leave the MST streams on the A|C|D plan");
+    }
+    // HDMI relights beside the live MST route, on the free Pipe B.
+    let relight_from = io.tc.writes.borrow().len();
+    match service.handle(
+        &io,
+        event(XeLpgPort::B, MtlHpdKind::Connected(LiveMode::Native)),
+        &mut alloc,
+    ) {
+        ServiceOutcome::Activated {
+            protocol: MtlProtocol::Hdmi,
+            pipe: Pipe::B,
+            ..
+        } => {}
+        _ => return TestResult::Fail("HDMI must light Pipe B beside the MST route"),
+    }
+    if io.read32(PLANE_SURF_1_B) != SURFACES[3]
+        || !never_blanked(&io, PIPECONF_C, relight_from, SURFACES[1])
+        || !never_blanked(&io, PIPECONF_D, relight_from, SURFACES[2])
+        || ddb_span(&io, 1) != (0, 1023)
+        || ddb_span(&io, 2) != (1024, 2047)
+        || !demand_matches(&io, 4, 2)
+    {
+        return TestResult::Fail("HDMI beside MST must rejoin the four-pipe plan");
+    }
+    // The MST route's stop (the withdraw's steps over the fake sideband).
+    let Some(mut route) = service.routes[1].take() else {
+        return TestResult::Fail("the MST route holds slot 1");
+    };
+    let stop_from = io.tc.writes.borrow().len();
+    let stopped = match &mut route {
+        MtlRoute::Mst(owner) => owner.stop_aux(&io, &mut aux).is_ok() && owner.stopped(),
+        _ => false,
+    };
+    service.share_from(1, &mut route);
+    if !stopped
+        || route.release(&io).is_err()
+        || io.read32(PIPECONF_C) & (ENABLE | STATE) != 0
+        || io.read32(PIPECONF_D) & (ENABLE | STATE) != 0
+        || !never_blanked(&io, PIPECONF_B, stop_from, SURFACES[3])
+        || ddb_span(&io, 0) != (0, 2047)
+        || ddb_span(&io, 1) != (0, 2047)
+        || !demand_matches(&io, 2, 2)
+    {
+        return TestResult::Fail("the MST stop must leave HDMI lit on the A|B plan");
+    }
+    if dmc.events()
+        != [
+            (1, true),
+            (2, true),
+            (3, true),
+            (1, false),
+            (1, true),
+            (3, false),
+            (2, false),
+        ]
+    {
+        return TestResult::Fail("each crtc's DMC must follow its own stream's lifetime");
+    }
+    if !service.teardown(&io)
+        || crate::intel_gpu_display_resources::Profile::capture(&io, &panel).is_err()
+        || !demand_matches(&io, 1, 1)
+    {
+        return TestResult::Fail("the panel must hold its fixed profile again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_two_routes_mst_beside_hdmi
+);
+
+/// A 3840x2160 60 Hz (594 MHz) DP 2.0 monitor on TC1 in pin assignment D
+/// (two lanes, HBR2 ceiling: only UHBR10 x2 carries it at 24 bpp) and an
+/// HDMI monitor on DDI B, with the owned panel lit on Pipe A.
+fn dual_uhbr() -> Option<(Dual, Mode)> {
+    let mut sink = Sink::dp20(
+        0x14,
+        super::tests::edid_for(594_000, 3840, 560, 176, 88, 2160, 90, 8, 10),
+        uhbr::DP_UHBR10 | uhbr::DP_UHBR20,
+    );
+    sink.ffe_request = [4, 9, 0, 0];
+    let io = Dual {
+        tc: ExtFake::new(XeLpgPort::Tc1, sink),
+        b: hdmi_on_ddi_b(edid_1024()),
+    };
+    io.tc.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+    io.tc.sde_isr.set(io.tc.sde_isr.get() | 1 << 17);
+    let panel = io.tc.light_panel()?;
+    Some((io, panel))
+}
+
+/// A 128b/132b SST route beside a second route (`narf.intel.ext_routes=2`,
+/// `narf.intel.uhbr=1`): HDMI on DDI B lights Pipe B, then the TC1 4K60
+/// sink trains UHBR10 x2 on Pipe C beside it. The joint plan is Linux's:
+/// `intel_pmdemand_update_max_ddiclk` takes the UHBR10 port clock
+/// (`DIV_ROUND_UP(1000000, 1000)` = 1000 MHz) over the panel's HBR3, the
+/// CDCLK the 594 MHz pipe needs (`intel_pixel_rate_to_cdclk` 297000, the
+/// `mtl_cdclk_table` rung 307200: `DIV_ROUND_UP(307200, 1000)` = 308 MHz),
+/// and S3|S4's 2048 blocks split by width (B 1024, C 3840: C starts at
+/// 2048 * 1024 / 4864 = 431). The UHBR route stays lit while DDI B is
+/// unplugged (C alone on S3|S4) and replugged (HDMI beside the 128b/132b
+/// sibling); the teardown returns the panel's profile.
+fn smoke_mtl_two_routes_uhbr_beside_hdmi() -> TestResult {
+    let Some((io, panel)) = dual_uhbr() else {
+        return TestResult::Fail("the fixture must light the owned panel");
+    };
+    let dmc = DmcEvents::leak();
+    let mut service = service(panel, dmc);
+    service.set_uhbr(true);
+    let next = Cell::new(0);
+    let mut alloc = allocator(&next);
+    let hdmi = |service: &mut MtlExternalService,
+                alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>| {
+        matches!(
+            service.handle(
+                &io,
+                event(XeLpgPort::B, MtlHpdKind::Connected(LiveMode::Native)),
+                alloc
+            ),
+            ServiceOutcome::Activated {
+                protocol: MtlProtocol::Hdmi,
+                pipe: Pipe::B,
+                ..
+            }
+        )
+    };
+    if !hdmi(&mut service, &mut alloc) {
+        return TestResult::Fail("DDI B HDMI must light Pipe B first");
+    }
+    let uhbr_from = io.tc.writes.borrow().len();
+    match service.handle(
+        &io,
+        event(XeLpgPort::Tc1, MtlHpdKind::Connected(LiveMode::DpAlt)),
+        &mut alloc,
+    ) {
+        ServiceOutcome::Activated {
+            protocol: MtlProtocol::Dp,
+            pipe: Pipe::C,
+            ..
+        } => {}
+        other => {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "UHBR beside HDMI: {other:?}");
+            return TestResult::Fail("the 128b/132b route must light Pipe C beside HDMI");
+        }
+    }
+    let uhbr10x2 = uhbr::UhbrLink {
+        rate: uhbr::UhbrRate::Uhbr10,
+        lanes: 2,
+        pipe_bpp: 24,
+    };
+    match service.route_on(XeLpgPort::Tc1) {
+        Some(MtlRoute::Dp(r)) if r.probe.uhbr.as_deref().map(|p| p.link) == Some(uhbr10x2) => {}
+        _ => return TestResult::Fail("the second route must run UHBR10 x2"),
+    }
+    if !never_blanked(&io, PIPECONF_B, uhbr_from, SURFACES[0])
+        || io.read32(PLANE_SURF_1_C) != SURFACES[1]
+        || ddb_span(&io, 0) != (0, 2047)
+        || ddb_span(&io, 1) != (0, 430)
+        || ddb_span(&io, 2) != (431, 2047)
+        || !demand_at(&io, 3, 2, 1000)
+        || pmdemand(&io).cdclk_freq_mhz != 308
+    {
+        return TestResult::Fail("the joint plan must take the UHBR port clock and 4K pipe");
+    }
+    // DDI B unplugged: the 128b/132b route keeps scanning out.
+    let unplug_from = io.tc.writes.borrow().len();
+    if !matches!(
+        service.handle(
+            &io,
+            event(XeLpgPort::B, MtlHpdKind::Disconnected),
+            &mut alloc
+        ),
+        ServiceOutcome::Withdrawn { port: XeLpgPort::B }
+    ) || !never_blanked(&io, PIPECONF_C, unplug_from, SURFACES[1])
+        || ddb_span(&io, 2) != (0, 2047)
+        || !demand_at(&io, 2, 1, 1000)
+    {
+        return TestResult::Fail("the UHBR route must keep scanning out with the A|C plan");
+    }
+    // HDMI beside the live 128b/132b sibling.
+    let relight_from = io.tc.writes.borrow().len();
+    if !hdmi(&mut service, &mut alloc)
+        || !never_blanked(&io, PIPECONF_C, relight_from, SURFACES[1])
+        || ddb_span(&io, 1) != (0, 430)
+        || ddb_span(&io, 2) != (431, 2047)
+        || !demand_at(&io, 3, 2, 1000)
+    {
+        return TestResult::Fail("HDMI must light beside the 128b/132b route");
+    }
+    if !service.teardown(&io)
+        || io.read32(PIPECONF_C) & (ENABLE | STATE) != 0
+        || crate::intel_gpu_display_resources::Profile::capture(&io, &panel).is_err()
+        || !demand_matches(&io, 1, 1)
+    {
+        return TestResult::Fail("the teardown must return the panel's profile");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_two_routes_uhbr_beside_hdmi
+);

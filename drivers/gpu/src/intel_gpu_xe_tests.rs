@@ -12,10 +12,86 @@ struct Cpu {
     /// The process's VMAs: 0x4000 read/write and 0x6000 read-only. USERPTR
     /// intervals register here, so the real address-space operations on it
     /// (munmap, mprotect, MADV_DONTNEED) fire them.
-    space: narf_memory::AddressSpace,
+    space: Arc<narf_memory::AddressSpace>,
     /// Collections that fire an invalidation of 0x4000 before returning,
     /// modelling a racing munmap/remap during the pin.
     invalidate_on_pin: core::sync::atomic::AtomicU32,
+    /// What `remote_mm` grabs (`None`: the context offers none).
+    remote: IrqSafeSpinLock<Option<Arc<dyn narf_filesystem::RemoteMm>>>,
+}
+/// The modelled process's pins of `pages` from `address`: each page's VMA
+/// must be readable (and writable for a write pin), and every page is the
+/// one frame the process maps there.
+fn model_pins(
+    space: &narf_memory::AddressSpace,
+    frame: Option<u64>,
+    address: u64,
+    pages: u64,
+    writable: bool,
+) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
+    use narf_memory::RegionPerms;
+    let perms: Vec<_> = (0..pages)
+        .map(|page| {
+            space
+                .lookup(narf_memory::VirtAddr::new(address + page * 4096))
+                .map(|vma| vma.perms)
+        })
+        .collect();
+    let frame = frame.ok_or(FsError::BadAddress)?;
+    perms
+        .into_iter()
+        .map(|perms| match perms {
+            Some(perms) if writable && !perms.contains(RegionPerms::WRITE) => {
+                Err(FsError::OperationNotPermitted)
+            }
+            Some(perms) if perms.contains(RegionPerms::READ) => Ok(()),
+            _ => Err(FsError::BadAddress),
+        })
+        .map(|page| {
+            page.map(|()| {
+                // SAFETY: the caller's BO frame is a live allocator frame the
+                // fixture retains across this call.
+                unsafe {
+                    narf_memory::address_space::UserPagePin::retain_ram(
+                        narf_memory::PhysAddr::new(frame),
+                    )
+                }
+            })
+        })
+        .collect()
+}
+/// The modelled process's address space grabbed by a driver
+/// (`IoctlContext::remote_mm`): pins and intervals reach the same VMAs and
+/// the one frame of `frame` from any context.
+#[derive(Debug)]
+struct CpuMm {
+    space: Arc<narf_memory::AddressSpace>,
+    frame: u64,
+    pin_calls: core::sync::atomic::AtomicU32,
+}
+impl narf_filesystem::RemoteMm for CpuMm {
+    fn pin_user_pages(
+        &self,
+        address: u64,
+        pages: u64,
+        writable: bool,
+    ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
+        self.pin_calls
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        model_pins(&self.space, Some(self.frame), address, pages, writable)
+    }
+    fn mmu_interval_notifier(
+        &self,
+        address: u64,
+        length: u64,
+        ops: Arc<dyn narf_memory::mmu_notifier::MmuIntervalNotifierOps>,
+    ) -> Result<narf_memory::mmu_notifier::MmuIntervalNotifier, FsError> {
+        narf_memory::mmu_notifier::MmuIntervalNotifier::insert(&self.space, address, length, ops)
+            .map_err(|_| FsError::BadAddress)
+    }
+    fn identity(&self) -> u64 {
+        self.space.identity()
+    }
 }
 fn cpu_vma(base: u64, perms: narf_memory::RegionPerms) -> narf_memory::Region {
     narf_memory::Region {
@@ -40,9 +116,21 @@ impl Cpu {
             mapping: IrqSafeSpinLock::new(None),
             fail_report: core::sync::atomic::AtomicBool::new(false),
             pin_calls: core::sync::atomic::AtomicU32::new(0),
-            space,
+            space: Arc::new(space),
             invalidate_on_pin: core::sync::atomic::AtomicU32::new(0),
+            remote: IrqSafeSpinLock::new(None),
         }
+    }
+    /// Offer `remote_mm`: this process's address space, every page backed
+    /// by `frame`.
+    fn grab(&self, frame: u64) -> Arc<CpuMm> {
+        let mm = Arc::new(CpuMm {
+            space: self.space.clone(),
+            frame,
+            pin_calls: core::sync::atomic::AtomicU32::new(0),
+        });
+        *self.remote.lock() = Some(mm.clone());
+        mm
     }
 }
 impl IoctlContext for Cpu {
@@ -66,7 +154,6 @@ impl IoctlContext for Cpu {
         pages: u64,
         writable: bool,
     ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
-        use narf_memory::RegionPerms;
         self.pin_calls
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let racing = self
@@ -82,36 +169,9 @@ impl IoctlContext for Cpu {
                 .madvise_dontneed(narf_memory::VirtAddr::new(0x4000), 4096)
                 .unwrap();
         }
-        let perms: Vec<_> = (0..pages)
-            .map(|page| {
-                self.space
-                    .lookup(narf_memory::VirtAddr::new(address + page * 4096))
-                    .map(|vma| vma.perms)
-            })
-            .collect();
         let mapping = self.mapping.lock();
-        let frame = mapping.as_ref().ok_or(FsError::BadAddress)?.frames[0];
-        perms
-            .into_iter()
-            .map(|perms| match perms {
-                Some(perms) if writable && !perms.contains(RegionPerms::WRITE) => {
-                    Err(FsError::OperationNotPermitted)
-                }
-                Some(perms) if perms.contains(RegionPerms::READ) => Ok(()),
-                _ => Err(FsError::BadAddress),
-            })
-            .map(|page| {
-                page.map(|()| {
-                    // SAFETY: the mapping's BO frame is a live allocator frame
-                    // retained by `mapping` across this call.
-                    unsafe {
-                        narf_memory::address_space::UserPagePin::retain_ram(
-                            narf_memory::PhysAddr::new(frame),
-                        )
-                    }
-                })
-            })
-            .collect()
+        let frame = mapping.as_ref().map(|mapping| mapping.frames[0]);
+        model_pins(&self.space, frame, address, pages, writable)
     }
     fn mmu_interval_notifier(
         &self,
@@ -124,6 +184,9 @@ impl IoctlContext for Cpu {
     }
     fn address_space_identity(&self) -> Option<u64> {
         Some(self.space.identity())
+    }
+    fn remote_mm(&self) -> Option<Arc<dyn narf_filesystem::RemoteMm>> {
+        self.remote.lock().clone()
     }
     fn read_u64_acquire(&self, address: u64) -> Result<u64, FsError> {
         if address & 7 != 0 {

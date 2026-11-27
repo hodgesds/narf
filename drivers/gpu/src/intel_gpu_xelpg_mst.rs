@@ -14,8 +14,13 @@
 //! `intel_ddi_config_transcoder_func`); and each stream's payload follows
 //! `mst_stream_pre_enable` / `mst_stream_enable`: the DPCD payload table
 //! (`drm_dp_add_payload_part1`), the function, the ACT, the sink's ACT
-//! handled, then ALLOCATE_PAYLOAD (`drm_dp_add_payload_part2`). The 8b/10b
-//! MST route is unchanged.
+//! handled, then ALLOCATE_PAYLOAD (`drm_dp_add_payload_part2`). Through a
+//! DP tunnel (display-30+ Thunderbolt alt mode) each stream's
+//! `intel_dp_config_required_rate` is checked beside the live streams'
+//! ([`tunnel_stream`]) and the tunnel's allocation is their sum before each
+//! enable and after each stop. A failed 128b/132b training of the link
+//! retries every stream once at the BW-order reduction ([`mst_fallback`]).
+//! The 8b/10b MST route is unchanged.
 use super::*;
 use crate::dp_mst_mgr::{Manager, MstAux, Sink, Topology};
 use alloc::{boxed::Box, vec::Vec};
@@ -94,6 +99,9 @@ struct Stream {
     vcpi: u8,
     slot: u8,
     route: MtlExternalRoute,
+    /// The stream's bandwidth in the link's DP tunnel
+    /// (`drm_dp_tunnel_atomic_set_stream_bw`), 0 without one.
+    tunnel_bw: u32,
 }
 
 #[derive(Debug)]
@@ -105,6 +113,19 @@ pub struct MtlMstRoute {
     failed: Option<MtlExternalRoute>,
     first: Option<(Pipe, Mode, Framebuffer)>,
     stopped: bool,
+    /// The sibling route's Pipe B–D owner (`narf.intel.ext_routes=2`) the
+    /// first stream plans beside, until it has.
+    beside: Option<Pipes>,
+    /// The Pipe B–D owner the last stopped stream left, until a sibling
+    /// route adopts it ([`Self::take_shared_pipes`]).
+    retired: Option<Pipes>,
+    /// The DP tunnel with BW allocation enabled a 128b/132b link runs
+    /// through (display-30+ Thunderbolt alt mode), until it is handed back.
+    tunnel: Option<tunnel::Tunnel>,
+    /// `narf.intel.hdmi14_ext=1`: each stream reads its sink's whole EDID
+    /// and takes audio (`mst_stream_compute_config`'s
+    /// `intel_dp_audio_compute_config`).
+    audio: bool,
 }
 
 impl MtlMstRoute {
@@ -113,6 +134,12 @@ impl MtlMstRoute {
     }
     pub fn first(&self) -> Option<(Pipe, Mode, Framebuffer)> {
         self.first
+    }
+    /// The DP tunnel with BW allocation this route's 128b/132b link runs
+    /// through, if any (the second route's group check,
+    /// `mst_tunnel_group_admits`).
+    pub(crate) fn bw_tunnel(&self) -> Option<tunnel::Tunnel> {
+        self.tunnel.filter(|t| t.bw_alloc_enabled)
     }
     pub fn live(&self) -> bool {
         !self.stopped && !self.streams.is_empty() && self.failed.is_none()
@@ -142,6 +169,43 @@ impl MtlMstRoute {
         self.link.aux(io)
     }
 
+    /// The Pipe B–D owner a sibling route plans beside: the newest one this
+    /// route holds (a failed stream's reservation, else the last stream's;
+    /// every live stream holds the same owner).
+    pub(super) fn shared_pipes(&self) -> Option<&Pipes> {
+        self.failed
+            .as_ref()
+            .and_then(MtlExternalRoute::shared_pipes)
+            .or_else(|| self.streams.last().and_then(|s| s.route.shared_pipes()))
+    }
+
+    /// Every reserved stream adopts a sibling route's newer owner.
+    pub(super) fn adopt_shared_pipes(&mut self, pipes: &Pipes) {
+        for stream in &mut self.streams {
+            stream.route.adopt_shared_pipes(pipes);
+        }
+        if let Some(failed) = self.failed.as_mut() {
+            failed.adopt_shared_pipes(pipes);
+        }
+    }
+
+    /// The owner a sibling adopts after this route changed it: the held
+    /// one, or once every stream stopped the owner the last stop left.
+    pub(super) fn take_shared_pipes(&mut self) -> Option<Pipes> {
+        if let Some(pipes) = self.shared_pipes() {
+            return Some(pipes.clone());
+        }
+        self.failed
+            .as_mut()
+            .and_then(MtlExternalRoute::take_shared_pipes)
+            .or_else(|| self.retired.take())
+    }
+
+    /// `beside` is a live sibling route's Pipe B–D owner
+    /// (`narf.intel.ext_routes=2`): the first stream joins that layout, as
+    /// Linux's atomic check plans the MST CRTCs against every CRTC already
+    /// active (`intel_atomic_check`); the streams after it plan from the
+    /// stream before, as without a sibling.
     pub(super) fn connect<M: MmioWindow + ?Sized>(
         io: &M,
         link: LinkProbe,
@@ -149,9 +213,10 @@ impl MtlMstRoute {
         display: &MtlDisplay,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
         uhbr: Option<UhbrMstLink>,
+        beside: Option<Pipes>,
     ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
         let mut aux = crate::intel_gpu_mst::IntelMstAux::xelpdp(io, link.port, link.tbt());
-        Self::connect_aux_with(io, link, decl, display, alloc, &mut aux, uhbr)
+        Self::connect_aux_beside(io, link, decl, display, alloc, &mut aux, uhbr, beside)
     }
 
     #[cfg(feature = "kernel-test")]
@@ -166,6 +231,7 @@ impl MtlMstRoute {
         Self::connect_aux_with(io, link, decl, display, alloc, aux, None)
     }
 
+    #[cfg(feature = "kernel-test")]
     fn connect_aux_with<M: MmioWindow + ?Sized, A: MstAux>(
         io: &M,
         link: LinkProbe,
@@ -175,6 +241,52 @@ impl MtlMstRoute {
         aux: &mut A,
         uhbr: Option<UhbrMstLink>,
     ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
+        Self::connect_aux_beside(io, link, decl, display, alloc, aux, uhbr, None)
+    }
+
+    /// [`Self::connect`] over `aux`, the first stream beside `beside`; the
+    /// streams take audio under `narf.intel.hdmi14_ext=1`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn connect_aux_beside<M: MmioWindow + ?Sized, A: MstAux>(
+        io: &M,
+        link: LinkProbe,
+        decl: MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+        uhbr: Option<UhbrMstLink>,
+        beside: Option<Pipes>,
+    ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
+        let audio = super::color::opted_in();
+        Self::connect_owner(io, link, decl, display, alloc, aux, uhbr, beside, audio)
+    }
+
+    /// [`Self::connect_aux`] with the streams' audio on
+    /// (`narf.intel.hdmi14_ext=1`).
+    #[cfg(feature = "kernel-test")]
+    fn connect_aux_audio<M: MmioWindow + ?Sized, A: MstAux>(
+        io: &M,
+        link: LinkProbe,
+        decl: MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+    ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
+        Self::connect_owner(io, link, decl, display, alloc, aux, None, None, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_owner<M: MmioWindow + ?Sized, A: MstAux>(
+        io: &M,
+        link: LinkProbe,
+        decl: MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+        uhbr: Option<UhbrMstLink>,
+        beside: Option<Pipes>,
+        audio: bool,
+    ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
         let mut owner = Box::new(Self {
             link,
             manager: Manager::new(),
@@ -183,6 +295,10 @@ impl MtlMstRoute {
             failed: None,
             first: None,
             stopped: false,
+            beside,
+            retired: None,
+            tunnel: uhbr.and_then(|u| u.tunnel),
+            audio,
         });
         let result = owner.start(io, decl, display, alloc, aux, uhbr);
         match result {
@@ -218,12 +334,69 @@ impl MtlMstRoute {
         }
         let sinks = topology.sinks();
         self.topology = Some(topology);
+        let first = self.streams_at(io, &decl, display, alloc, aux, uhbr, None, &sinks, &ledger);
+        // intel_dp_start_link_train's failure on the link's first stream:
+        // intel_dp_get_link_train_fallback_values in the MST (BW) order and
+        // the modeset retry of every stream on the link, once, from the
+        // proven stop (no stream was enabled, no payload allocated).
+        match (first, uhbr) {
+            (Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Training(f))), Some(u))
+                if self.streams.is_empty()
+                    && self
+                        .failed
+                        .as_ref()
+                        .is_some_and(|r| r.state == RouteState::Stopped) =>
+            {
+                let Some(next) = mst_fallback(&u) else {
+                    return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Training(f)));
+                };
+                self.failed = None;
+                let (uhbr, forced) = match next {
+                    MstRetry::Uhbr(u) => (Some(u), None),
+                    MstRetry::EightTenB(rate, lanes) => {
+                        // The 8b/10b MST link does not speak BW allocation.
+                        tunnel_off(io, self.link, &mut self.tunnel);
+                        (None, Some((rate, lanes)))
+                    }
+                };
+                self.streams_at(
+                    io, &decl, display, alloc, aux, uhbr, forced, &sinks, &ledger,
+                )
+            }
+            (result, _) => result,
+        }
+    }
+
+    /// The stream loop of [`Self::start`] on one link: the 128b/132b link
+    /// `uhbr`, else 8b/10b at the source/sink maximum or at `forced` (an
+    /// MST retry's reduced configuration). `ledger` is each output port's
+    /// available PBN before any stream.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn streams_at<M: MmioWindow + ?Sized, A: MstAux>(
+        &mut self,
+        io: &M,
+        decl: &MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+        uhbr: Option<UhbrMstLink>,
+        forced: Option<(TrainRate, u8)>,
+        sinks: &[Sink],
+        ledger: &[(Sink, u16)],
+    ) -> Result<(), ExternalError> {
+        let mut ledger = ledger.to_vec();
         let caps = DpcdCaps::decode(&self.link.raw);
         let source = SourceCaps {
             max_rate: TrainRate::Hbr3,
             max_lanes: self.link.tc.map_or(4, |tc| tc.max_lanes),
         };
         let mut negotiated = negotiate(&source, &caps, u64::MAX);
+        if let Some((rate, lanes)) = forced {
+            negotiated.rate = rate;
+            negotiated.lanes = lanes;
+            negotiated.payload_kbps = rate.payload_kbps(lanes);
+        }
         let link_kbps = negotiated.rate.payload_kbps(negotiated.lanes) as u32;
         if let Some(u) = uhbr {
             negotiated.lanes = u.lanes;
@@ -234,7 +407,7 @@ impl MtlMstRoute {
         } else {
             1u8
         };
-        for sink in sinks {
+        for &sink in sinks {
             let topology = self.topology.as_ref().expect("probed");
             let edid = complete(self.manager.read_edid_block(aux, topology, sink, 0))?;
             let mode = crate::intel_gpu_dp::mode_from_edid(&edid)
@@ -244,10 +417,25 @@ impl MtlMstRoute {
             if uhbr.is_some() && stream.is_none() {
                 continue;
             }
+            // Through a DP tunnel: the stream's bandwidth beside the live
+            // streams' must pass the tunnel's check ([`tunnel_stream`]).
+            let live_bw: u32 = self.streams.iter().map(|s| s.tunnel_bw).sum();
+            let (stream, tunnel_bw) = match (uhbr, self.tunnel) {
+                (Some(u), Some(t)) => match tunnel_stream(&t, &u, &mode, live_bw) {
+                    Some((s, bw)) => (Some(s), bw),
+                    None => continue,
+                },
+                _ => (stream, 0),
+            };
             let (pbn, slots) = match &stream {
                 Some(s) => (s.pbn, u32::from(s.slots)),
                 None => {
-                    let pbn = crate::dp_mst::calc_pbn_mode(mode.pixel_clock_khz, 24 * 16);
+                    // intel_dp_compute_config_limits: MST streams stop at
+                    // 8 bpc (deep colour is not taken over MST).
+                    let pbn = crate::dp_mst::calc_pbn_mode(
+                        mode.pixel_clock_khz,
+                        super::color::MST_MAX_PIPE_BPP * 16,
+                    );
                     (
                         pbn,
                         crate::dp_mst::time_slots(pbn, crate::dp_mst::pbn_div(link_kbps)),
@@ -299,17 +487,25 @@ impl MtlMstRoute {
                 edid: Box::new([0; EDID_CAPACITY]),
                 edid_len: 128,
                 dsc: None,
-                pipe_bpp: stream.as_ref().map_or(24, |s| s.pipe_bpp),
+                pipe_bpp: stream
+                    .as_ref()
+                    .map_or(super::color::MST_MAX_PIPE_BPP, |s| s.pipe_bpp),
                 uhbr: uhbr.zip(stream.as_ref()).map(|(u, s)| uhbr_plan(&u, s)),
                 output: super::color::DpOutput::default(),
                 audio: None,
                 c20_uhbr_vspeo: decl.c20_uhbr_vspeo.filter(|_| uhbr.is_some()).map(Box::new),
+                dp14_vspeo: decl.dp14_vspeo,
+                // The 8b/10b MST link trains end to end.
+                lttpr_per_hop: false,
             };
             // Copy the EDID straight into the probe's own buffer: a
             // separate 512-byte staging array is a second stack slot in
             // this frame, and `connect` is 120 bytes over the 8 KiB
             // budget (CI run 43627487921).
             probe.edid[..128].copy_from_slice(&edid);
+            if self.audio {
+                stream_audio(&mut self.manager, aux, topology, sink, &mut probe)?;
+            }
             crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &mode)?;
             let branch = topology.branches[sink.branch].clone();
             let sdp_streams = topology
@@ -327,6 +523,11 @@ impl MtlMstRoute {
                     slot,
                     slots as u8,
                 ))?;
+            }
+            // intel_dp_tunnel_atomic_alloc_bw before the stream's enable: the
+            // tunnel's allocation becomes the streams' sum.
+            if tunnel_bw != 0 {
+                tunnel_alloc(io, self.link, &mut self.tunnel, live_bw + tunnel_bw)?;
             }
             let start_slot = slot;
             let mut allocate = |_: Transcoder, step: PayloadStep| {
@@ -359,7 +560,9 @@ impl MtlMstRoute {
                 }
             };
             let result = match self.streams.last() {
-                None => activate_with_payload(io, probe, fb, display, None, &mut allocate),
+                None => {
+                    activate_with_payload(io, probe, fb, display, self.beside.take(), &mut allocate)
+                }
                 Some(previous) => activate_secondary(
                     io,
                     probe,
@@ -400,6 +603,7 @@ impl MtlMstRoute {
                 vcpi,
                 slot,
                 route,
+                tunnel_bw,
             });
             slot += slots as u8;
         }
@@ -415,7 +619,7 @@ impl MtlMstRoute {
         self.stop_aux(io, &mut aux)
     }
 
-    fn stop_aux<M: MmioWindow + ?Sized, A: MstAux>(
+    pub(super) fn stop_aux<M: MmioWindow + ?Sized, A: MstAux>(
         &mut self,
         io: &M,
         aux: &mut A,
@@ -435,6 +639,10 @@ impl MtlMstRoute {
                     }
                 }
             }
+            // A sibling route plans from what the stop left.
+            if let Some(pipes) = failed.take_shared_pipes() {
+                self.retired = Some(pipes);
+            }
         }
         while !self.streams.is_empty() {
             let index = self.streams.len() - 1;
@@ -443,7 +651,10 @@ impl MtlMstRoute {
             source_payload(io, stream.route.pipe.transcoder(), master, false)?;
             stop_stream(io, &mut stream.route, index != 0)?;
             let pipes = stream.route.reservation.as_ref().map(|rp| rp.pipes.clone());
-            let stream = self.streams.pop().expect("selected");
+            let mut stream = self.streams.pop().expect("selected");
+            if let Some(left) = stream.route.take_shared_pipes() {
+                self.retired = Some(left);
+            }
             if let Some(topology) = &self.topology {
                 if let Some(branch) = topology.branches.get(stream.sink.branch) {
                     let request = crate::dp_mst::Request::AllocatePayload {
@@ -464,6 +675,11 @@ impl MtlMstRoute {
                 stream.slot,
                 0,
             ));
+            // atomic_decrease_bw after the stream's disable (best effort).
+            if stream.tunnel_bw != 0 {
+                let remaining: u32 = self.streams.iter().map(|s| s.tunnel_bw).sum();
+                let _ = tunnel_alloc(io, self.link, &mut self.tunnel, remaining);
+            }
             if let Some(pipes) = pipes {
                 for remaining in &mut self.streams {
                     if let Some(rp) = remaining.route.reservation.as_mut() {
@@ -476,6 +692,7 @@ impl MtlMstRoute {
             self.manager.stop(aux).await;
             Ok::<(), ()>(())
         })?;
+        tunnel_off(io, self.link, &mut self.tunnel);
         self.stopped = true;
         Ok(())
     }
@@ -505,6 +722,145 @@ impl MtlMstRoute {
     }
 }
 
+/// A 128b/132b MST stream through a DP tunnel
+/// (`intel_dp_tunnel_atomic_compute_stream_bw`): its
+/// `intel_dp_config_required_rate` beside the `live` streams' must pass the
+/// tunnel's check (`intel_dp_tunnel_atomic_check_link`,
+/// [`tunnel::Tunnel::check_stream_bws`]); when it does not,
+/// `intel_link_bw_reduce_bpp` lowers the stream's bpp limit below its pipe
+/// bpp and `mst_stream_compute_link_config` recomputes it (24, then 18
+/// bpp). `None` when even 18 bpp does not fit. Linux reduces the
+/// highest-bpp stream of the whole commit (the lowest pipe on a tie); this
+/// owner lights streams one at a time and never re-modesets a live one (as
+/// its PBN admission), so the new stream is the one reduced, and one that
+/// cannot fit is left dark instead of failing the others.
+#[inline(never)]
+fn tunnel_stream(
+    t: &tunnel::Tunnel,
+    link: &UhbrMstLink,
+    mode: &Mode,
+    live: u32,
+) -> Option<(uhbr::MstUhbrStream, u32)> {
+    let mut max_bpp = dsc::PIPE_BPP;
+    loop {
+        let s = uhbr::mst_stream(link.rate, link.lanes, mode, max_bpp)?;
+        // intel_dp_config_required_rate: intel_dp_link_required at the
+        // stream's pipe bpp, no BW overhead flags.
+        let bw = uhbr::link_required(
+            u32::from(link.lanes),
+            mode.pixel_clock_khz,
+            u32::from(mode.h_active),
+            s.pipe_bpp * 16,
+        );
+        let bw = u32::try_from(bw).unwrap_or(u32::MAX);
+        if t.check_stream_bws(live.saturating_add(bw)) {
+            return Some((s, bw));
+        }
+        if s.pipe_bpp <= dsc::MIN_PIPE_BPP {
+            return None;
+        }
+        max_bpp = s.pipe_bpp - 1;
+    }
+}
+
+/// `intel_dp_tunnel_atomic_alloc_bw` for the link's streams: the tunnel's
+/// allocation set to `total` kBps (`drm_dp_tunnel_alloc_bw`). Linux only
+/// queues a re-detect after a failed request and enables the stream anyway;
+/// this owner refuses it ([`uhbr::UhbrRefusal::Tunnel`]), as the SST route
+/// does.
+fn tunnel_alloc<M: MmioWindow + ?Sized>(
+    io: &M,
+    link: LinkProbe,
+    found: &mut Option<tunnel::Tunnel>,
+    total: u32,
+) -> Result<(), ExternalError> {
+    let Some(t) = found.as_mut() else {
+        return Ok(());
+    };
+    let mut aux = link.aux(io);
+    tunnel::alloc_bw(&mut aux, &mut uhbr::SystemClock, t, total)
+        .map_err(|e| ExternalError::Uhbr(uhbr::UhbrRefusal::Tunnel(e)))
+}
+
+/// The tunnel handed back with the link: the streams' allocation freed and
+/// BW allocation disabled (`drm_dp_tunnel_disable_bw_alloc`), as the SST
+/// route's stop. Best effort, as the hub may be gone.
+fn tunnel_off<M: MmioWindow + ?Sized>(io: &M, link: LinkProbe, found: &mut Option<tunnel::Tunnel>) {
+    let Some(mut t) = found.take() else {
+        return;
+    };
+    let mut aux = link.aux(io);
+    if t.allocated_bw.is_some_and(|bw| bw != 0) {
+        let _ = tunnel::alloc_bw(&mut aux, &mut uhbr::SystemClock, &mut t, 0);
+    }
+    let _ = tunnel::disable_bw_alloc(&mut aux, &mut t);
+}
+
+/// The link an MST retry runs ([`mst_fallback`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MstRetry {
+    /// 128b/132b at the reduced configuration.
+    Uhbr(UhbrMstLink),
+    /// 8b/10b at this rate and lane count.
+    EightTenB(TrainRate, u8),
+}
+
+/// `intel_dp_get_link_train_fallback_values` after the 128b/132b MST link
+/// failed to train: [`uhbr::LinkCaps::fallback`] in
+/// `intel_dp_link_caps_connector_fallback_order(is_mst)`
+/// (`INTEL_DP_LINK_CAPS_ORDER_KEY_BW`, descending), then the retry's link,
+/// `intel_dp_get_connector_max_link_config`: the highest-bandwidth
+/// configuration still allowed (with the reduced maximum limits, the
+/// fallback's own). `None` when nothing follows (Linux marks the link
+/// `INTEL_DP_LINK_RECOVERY_NO_FALLBACK`).
+fn mst_fallback(link: &UhbrMstLink) -> Option<MstRetry> {
+    let mut caps = link.caps;
+    caps.fallback(link.rate.link_rate(), link.lanes, true)?;
+    let (order, n) = caps.ordered(uhbr::FallbackOrder::Bw);
+    let &(rate, lanes) = order[..n]
+        .iter()
+        .rev()
+        .find(|&&(r, l)| caps.allowed(r, l))?;
+    Some(match uhbr::UhbrRate::from_link_rate(rate) {
+        Some(rate) => MstRetry::Uhbr(UhbrMstLink {
+            rate,
+            lanes,
+            caps,
+            ..*link
+        }),
+        None => MstRetry::EightTenB(train_rate_for(rate)?, lanes),
+    })
+}
+
+/// `narf.intel.hdmi14_ext=1` for one MST stream whose base EDID block
+/// `probe` holds: `drm_dp_mst_edid_read`'s extension blocks (as many as
+/// block 0 announces and the probe's buffer holds), then
+/// `intel_dp_audio_compute_config`'s `intel_dp_has_audio` (every display-12+
+/// port; a sink that declares audio) and the connector ELD
+/// (`drm_edid_to_eld`). Out of line: the connect loop's frame stays small.
+#[inline(never)]
+fn stream_audio<A: MstAux>(
+    manager: &mut Manager,
+    aux: &mut A,
+    topology: &Topology,
+    sink: Sink,
+    probe: &mut MtlSinkProbe,
+) -> Result<(), ExternalError> {
+    let blocks = (1 + usize::from(probe.edid[126])).min(EDID_CAPACITY / 128);
+    for block in 1..blocks {
+        let data = complete(manager.read_edid_block(aux, topology, sink, block as u8))?;
+        probe.edid[block * 128..(block + 1) * 128].copy_from_slice(&data);
+    }
+    probe.edid_len = blocks * 128;
+    let edid = &probe.edid[..probe.edid_len];
+    if super::audio::edid_has_audio(edid) {
+        let mut eld = Box::new([0u8; super::audio::MAX_ELD_BYTES]);
+        *eld = super::audio::eld_from_edid(edid, true);
+        probe.audio = Some(eld);
+    }
+    Ok(())
+}
+
 /// The stream of [`uhbr::mst_stream`] for `mode` on the 128b/132b link
 /// (out of line: the connect loop's frame stays small).
 #[inline(never)]
@@ -526,6 +882,7 @@ fn uhbr_plan(link: &UhbrMstLink, stream: &uhbr::MstUhbrStream) -> Box<UhbrPlan> 
         tunnel: None,
         caps: link.caps,
         max_bpp: dsc::PIPE_BPP as u8,
+        dsc_sink: None,
     })
 }
 
@@ -559,6 +916,9 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
     if probe.uhbr.is_some() && probe.display_ip.is_display30() {
         ext.min_hblank = uhbr::min_hblank(&probe.mode, probe.pipe_bpp);
     }
+    // intel_dp_audio_compute_config: the stream's audio joins the CDCLK
+    // floor (intel_audio_min_cdclk).
+    ext.audio = probe.audio.is_some();
     if let Err(error) = choice.pipes.admit(io, &ext) {
         return Err(ActivateError::Refused(probe, error.into()));
     }
@@ -577,11 +937,17 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
         awaiting_fec_stop: false,
         state: RouteState::Stopped,
         uhbr: None,
+        lttprs: 0,
         audio: None,
     };
     let result = (|| {
         request_pipe_wells(io, pipe)?;
-        route.reservation = Some(reserve_pipe(io, choice, &ext, display.pipe_dmc)?);
+        route.reservation = Some(crate::intel_gpu_xelpg_hdmi::reserve_audio_pipe(
+            io,
+            choice,
+            &ext,
+            display.pipe_dmc,
+        )?);
         write(
             io,
             trans_clk_sel(pipe.transcoder()),
@@ -620,6 +986,11 @@ fn stop_stream<M: MmioWindow + ?Sized>(
     if !shared {
         stop_local(io, route)?;
     } else if let Some(rp) = route.reservation.as_mut() {
+        // mst_stream_disable: intel_audio_codec_disable before the planes
+        // go (best effort: the stop proof is the pipe's).
+        if let Some(stream) = route.audio.take() {
+            let _ = super::audio::audio_codec_disable(io, &stream);
+        }
         rp.pipes.disable_primary(io, rp.pipe)?;
         rp.pipes.disable(io, rp.pipe)?;
         let trans = rp.transcoder();
@@ -635,20 +1006,23 @@ fn stop_stream<M: MmioWindow + ?Sized>(
             write(io, trans_dp2_ctl(trans), 0)?;
         }
         write(io, trans_clk_sel(trans), 0)?;
-        rp.pipes.release(io, rp.pipe, rp.dmc)?;
+        release_audio_pipe(io, rp, route.probe.audio.is_some())?;
     }
     route.state = RouteState::Stopped;
     Ok(())
 }
 
 #[cfg(feature = "kernel-test")]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::dp_mst_mgr::tests::Hub;
     use crate::intel_gpu_xelpg_external::tests::{edid_for, ExtFake, Sink as DpSink};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    struct Branch<'a> {
+    /// The fake hub's sideband, with its ACT-handled bit following the
+    /// source's ACT sent (`DP_TP_STATUS`) on `io` (also the two-route
+    /// fixtures').
+    pub(crate) struct Branch<'a> {
         hub: Hub,
         io: &'a ExtFake,
     }
@@ -672,7 +1046,8 @@ mod tests {
     fn edid() -> Vec<u8> {
         edid_for(65_000, 1024, 320, 24, 136, 768, 38, 3, 6)
     }
-    fn branch(io: &ExtFake) -> Branch<'_> {
+    /// A two-sink hub whose sinks report 1024x768 at 65 MHz.
+    pub(crate) fn branch(io: &ExtFake) -> Branch<'_> {
         let mut hub = Hub::new();
         hub.edid[..128].copy_from_slice(&edid());
         Branch { hub, io }
@@ -736,6 +1111,157 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xelpg_mst",
         smoke_mtl_mst_two_streams_share_transport_and_stop_in_reverse
+    );
+
+    /// DP MST audio (`narf.intel.hdmi14_ext=1`, Linux 7.4 `intel_dp_mst.c`
+    /// `mst_stream_compute_config` / `mst_stream_enable` /
+    /// `mst_stream_disable`, `intel_audio.c`): the hub's sinks carry a CTA
+    /// extension with an LPCM SAD, so each stream reads its EDID's
+    /// extension block (`drm_dp_mst_edid_read`), takes audio
+    /// (`intel_dp_has_audio`) and its connector ELD, and enables it on its
+    /// own transcoder: `AUDIO_OUTPUT_ENABLE` and `AUD_CONFIG`'s
+    /// `N_VALUE_INDEX` for B and C, `HBLANK_EARLY_ENABLE_TGL` for both, and
+    /// `pin_eld_notify(PORT_TC1 = PORT_D = 3, cpu_transcoder)` per stream
+    /// (`intel_audio_needs_cpu_transcoder_id`). `find_audio_state` answers
+    /// (3, 1) and (3, 2) with the streams' ELDs and the legacy lookups (3,
+    /// -1) and (3, 0) with nothing. The stop disables both and notifies
+    /// again. Without the option no extension is read and no audio runs.
+    fn smoke_mtl_mst_streams_take_audio_per_transcoder() -> TestResult {
+        use narf_drivers_sound::display_audio as acomp;
+        super::audio::reset_for_test();
+        acomp::register_display_audio_codec(&super::audio::tests::SCRIPTED_HDA);
+        let result = mst_audio_sequence();
+        acomp::unregister_display_audio_codec();
+        super::audio::reset_for_test();
+        result
+    }
+
+    fn mst_audio_sequence() -> TestResult {
+        use super::audio::tests::{NOTIFY_COUNT, NOTIFY_PIPE, NOTIFY_PORT};
+        use super::audio::{component_get_eld, AUD_CONFIG_BE};
+        use crate::intel_gpu_audio::{aud_eld_valid, aud_output_enable, HSW_AUD_PIN_ELD_CP_VLD};
+        use core::sync::atomic::Ordering;
+        // An audio data block: LPCM, 2 channels, 32/44.1/48 kHz, 16/20/24 bit.
+        let audio_edid = crate::intel_gpu_xelpg_external::color::tests::with_cta(
+            edid(),
+            &[(1 << 5) | 3, 0x09, 0x07, 0x07],
+        );
+        let connect = |io: &ExtFake, aux: &mut Branch<'_>, audio: bool, index: &mut u32| {
+            let link = probe_link(io, Generation::MeteorLake, XeLpgPort::Tc1, false).ok()?;
+            let alloc = &mut |mode: &Mode| Some(fb(mode, index));
+            let owner = if audio {
+                MtlMstRoute::connect_aux_audio(
+                    io,
+                    link,
+                    MtlPortDecl::USB_C,
+                    &MtlDisplay::NONE,
+                    alloc,
+                    aux,
+                )
+            } else {
+                MtlMstRoute::connect_aux(
+                    io,
+                    link,
+                    MtlPortDecl::USB_C,
+                    &MtlDisplay::NONE,
+                    alloc,
+                    aux,
+                )
+            };
+            owner.ok()
+        };
+        let io = ExtFake::new(XeLpgPort::Tc1, DpSink::new(0x14, edid()));
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        let mut aux = branch(&io);
+        aux.hub.edid.copy_from_slice(&audio_edid);
+        let mut index = 0;
+        let before = NOTIFY_COUNT.load(Ordering::SeqCst);
+        let Some(mut owner) = connect(&io, &mut aux, true, &mut index) else {
+            return TestResult::Fail("MST must light two audio sinks");
+        };
+        let i2c_reads = aux
+            .hub
+            .bodies
+            .iter()
+            .filter(|b| b.first() == Some(&crate::dp_mst::REMOTE_I2C_READ))
+            .count();
+        if owner.stream_count() != 2
+            || i2c_reads != 4
+            || owner
+                .streams
+                .iter()
+                .any(|s| s.route.probe.edid_len != 256 || s.route.audio.is_none())
+        {
+            return TestResult::Fail("each stream must read its extension block and take audio");
+        }
+        let pin = io.read32(HSW_AUD_PIN_ELD_CP_VLD);
+        let both = aud_output_enable(Transcoder::B) | aud_output_enable(Transcoder::C);
+        if pin & both != both
+            || pin & (aud_eld_valid(Transcoder::B) | aud_eld_valid(Transcoder::C)) != 0
+            || io.read32(crate::intel_gpu_audio::aud_cfg_off(Transcoder::B))
+                & crate::intel_gpu_audio::AUD_CONFIG_N_VALUE_INDEX
+                == 0
+            || io.read32(crate::intel_gpu_audio::aud_cfg_off(Transcoder::C))
+                & crate::intel_gpu_audio::AUD_CONFIG_N_VALUE_INDEX
+                == 0
+            || io.read32(AUD_CONFIG_BE) & ((1 << 25) | (1 << 26)) != (1 << 25) | (1 << 26)
+        {
+            return TestResult::Fail("each MST transcoder must run its own audio enable");
+        }
+        if NOTIFY_COUNT.load(Ordering::SeqCst) != before + 2
+            || NOTIFY_PORT.load(Ordering::SeqCst) != 3
+            || NOTIFY_PIPE.load(Ordering::SeqCst) != 2
+        {
+            return TestResult::Fail("each stream must notify pin_eld_notify(3, its transcoder)");
+        }
+        let mut buf = [0u8; 128];
+        let eld_of = |pipe: i32, buf: &mut [u8; 128]| component_get_eld(3, pipe, buf);
+        if eld_of(1, &mut buf).map(|(on, n)| on && n > 20 && buf[5] >> 4 == 1) != Ok(true)
+            || eld_of(2, &mut buf).map(|(on, _)| on) != Ok(true)
+            || eld_of(-1, &mut buf).is_ok()
+            || eld_of(0, &mut buf).is_ok()
+        {
+            return TestResult::Fail("find_audio_state must address MST streams by transcoder");
+        }
+        if owner.stop_aux(&io, &mut aux).is_err()
+            || io.read32(HSW_AUD_PIN_ELD_CP_VLD) & both != 0
+            || NOTIFY_COUNT.load(Ordering::SeqCst) != before + 4
+            || eld_of(1, &mut buf).is_ok()
+            || eld_of(2, &mut buf).is_ok()
+            || owner.release(&io).is_err()
+        {
+            return TestResult::Fail("the stop must disable each stream's audio and notify");
+        }
+        // narf.intel.hdmi14_ext off: block 0 only, no audio.
+        let io = ExtFake::new(XeLpgPort::Tc1, DpSink::new(0x14, edid()));
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        let mut aux = branch(&io);
+        aux.hub.edid.copy_from_slice(&audio_edid);
+        let before = NOTIFY_COUNT.load(Ordering::SeqCst);
+        let Some(mut owner) = connect(&io, &mut aux, false, &mut index) else {
+            return TestResult::Fail("MST must light without the option");
+        };
+        let i2c_reads = aux
+            .hub
+            .bodies
+            .iter()
+            .filter(|b| b.first() == Some(&crate::dp_mst::REMOTE_I2C_READ))
+            .count();
+        let quiet = i2c_reads == 2
+            && owner.streams.iter().all(|s| s.route.audio.is_none())
+            && NOTIFY_COUNT.load(Ordering::SeqCst) == before
+            && io.read32(HSW_AUD_PIN_ELD_CP_VLD) == 0;
+        let _ = owner.stop_aux(&io, &mut aux);
+        let _ = owner.release(&io);
+        if quiet {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("without the option MST must take no audio")
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_mtl_mst_streams_take_audio_per_transcoder
     );
 
     fn smoke_mtl_mst_missing_act_retains_failed_route_and_blocks_release() -> TestResult {
@@ -1051,6 +1577,266 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xelpg_mst",
         smoke_mtl_mst_128b132b_two_streams_on_uhbr20
+    );
+
+    /// The reduced-parameter retry of a 128b/132b MST link
+    /// (`intel_dp_get_link_train_fallback_values` with `is_mst`, then the
+    /// modeset retry of the link's streams): the UHBR10/20 hub of
+    /// [`smoke_mtl_mst_128b132b_two_streams_on_uhbr20`] reports
+    /// `DP_128B132B_LT_FAILED` on four lanes, so the primary's UHBR20 x4
+    /// training fails and the route stops before any payload. In
+    /// `INTEL_DP_LINK_CAPS_ORDER_KEY_BW` order (descending) the next
+    /// configuration is UHBR20 x2 (4835500 kBps, above UHBR10 x4's equal
+    /// bandwidth by rate): UHBR20 x4 is disabled and the maximum limits are
+    /// UHBR20 x2. Both 1024x768 65 MHz streams run there (Linux 7.4's
+    /// formulas): `drm_dp_get_vc_payload_bw(2000000, 2)` = 366781, the
+    /// remote TU 4 (aligned to 4 / 2 lanes), the allocated PBN 358 and four
+    /// slots each, from slot 0 and slot 4, `DATA_M` = `TU_SIZE(4)` |
+    /// 0x05296d, `LINK_M` 0xd4fd at N 0x80000. Training writes UHBR20 with
+    /// four lanes, then with two.
+    fn smoke_mtl_mst_128b132b_training_fallback_retry() -> TestResult {
+        let mut hub = DpSink::dp20(0x14, edid(), uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+        hub.uhbr_lt_fail_lanes = 2;
+        let io = ExtFake::new(XeLpgPort::Tc1, hub);
+        let Ok(link) = probe_link(&io, Generation::MeteorLake, XeLpgPort::Tc1, false) else {
+            return TestResult::Fail("the DP 2.0 hub must answer its DPCD");
+        };
+        let u = match uhbr_mst_link(&io, &link) {
+            Ok(Some(u)) if u.rate == uhbr::UhbrRate::Uhbr20 && u.lanes == 4 => u,
+            _ => return TestResult::Fail("Linux runs MST at the highest bandwidth: UHBR20 x4"),
+        };
+        let mut aux = Logged {
+            inner: branch(&io),
+            payload: Vec::new(),
+        };
+        let mut index = 0;
+        let mut owner = match MtlMstRoute::connect_aux_with(
+            &io,
+            link,
+            MtlPortDecl::USB_C,
+            &MtlDisplay::NONE,
+            &mut |mode| Some(fb(mode, &mut index)),
+            &mut aux,
+            Some(u),
+        ) {
+            Ok(owner) => owner,
+            Err((_, error)) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "128b/132b MST retry: {error:?}");
+                return TestResult::Fail("the reduced retry must light both streams");
+            }
+        };
+        let mn = [(3 << 25) | 0x05_296d, 0x80_0000, 0xd4fd, 0x8_0000];
+        if owner.stream_count() != 2
+            || owner.streams[0].route.pipe != Pipe::B
+            || owner.streams[0].slot != 0
+            || owner.streams[1].slot != 4
+            || owner.streams.iter().any(|s| {
+                s.route.probe.mst.map(|m| m.slots) != Some(4)
+                    || s.route.probe.uhbr.as_deref().map(|p| {
+                        (
+                            p.link,
+                            p.stream.tu,
+                            p.stream.m_n,
+                            p.caps.allowed(2_000_000, 4),
+                            p.caps.max_limits(),
+                        )
+                    }) != Some((
+                        uhbr::UhbrLink {
+                            rate: uhbr::UhbrRate::Uhbr20,
+                            lanes: 2,
+                            pipe_bpp: 24,
+                        },
+                        4,
+                        mn,
+                        false,
+                        (2_000_000, 2),
+                    ))
+            })
+        {
+            return TestResult::Fail("the retry runs both streams at UHBR20 x2 with Linux's slots");
+        }
+        let tables: Vec<[u8; 3]> = aux.payload.iter().map(|&(t, _)| t).collect();
+        if tables != [[0, 0, 0x3f], [2, 0, 4], [3, 4, 4]] {
+            return TestResult::Fail("only the retry allocates payloads: slots 0..4 and 4..8");
+        }
+        {
+            let sink = io.sink.borrow();
+            let bw: Vec<u8> = sink
+                .uhbr_log
+                .iter()
+                .filter_map(|&(a, v)| (a == 0x100).then_some(v))
+                .collect();
+            if bw != [0x02, 0x02] || sink.training_writes_to(0x101) != [4, 2] {
+                return TestResult::Fail("training must try UHBR20 x4, then UHBR20 x2");
+            }
+        }
+        if owner.stop_aux(&io, &mut aux).is_err() || !owner.stopped() || owner.release(&io).is_err()
+        {
+            return TestResult::Fail("the retried MST link must stop and release");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_mtl_mst_128b132b_training_fallback_retry
+    );
+
+    /// 128b/132b MST through a DP tunnel (Panther Lake TC2 in Thunderbolt
+    /// alt mode, `narf.intel.uhbr=1`): the hub reports no 128b/132b rate in
+    /// its own DPCD; after the unconditional `DP_128B132B_SUPPORTED_LINK_RATES`
+    /// read, `drm_dp_tunnel_detect` and BW allocation (0xc0) the USB4
+    /// adapter's UHBR10 x2 DPRX is the highest-bandwidth configuration
+    /// (2417750 kBps over HBR3 x2's 1620000). Each 1024x768 65 MHz stream
+    /// there (Linux 7.4's formulas): `drm_dp_get_vc_payload_bw(1000000, 2)` =
+    /// 366781, the remote TU and slots 6 (PBN 268), `DATA_M` = `TU_SIZE(6)` |
+    /// 0x0a52da, `LINK_M` 0x1a9fb at N 0x80000, and a tunnel bandwidth of
+    /// 195000 kBps (`intel_dp_config_required_rate`). With 72 units
+    /// (2250000 kBps) estimated both streams fit and `drm_dp_tunnel_alloc_bw`
+    /// asks for the sum before each enable: 7, then 13 units of 31250 kBps;
+    /// the stop decreases to 7, frees the rest, then disables BW allocation.
+    /// With 6 units (187500 kBps) and one sink the stream's
+    /// `DIV_ROUND_UP`-to-granularity 218750 kBps fails
+    /// `drm_dp_tunnel_atomic_check_stream_bws`, so `intel_link_bw_reduce_bpp`
+    /// takes it to 18 bpp: TU 4, `DATA_M` = `TU_SIZE(4)` | 0x07be23, 146250
+    /// kBps, a request of 5 units.
+    fn smoke_ptl_mst_128b132b_through_dp_tunnel() -> TestResult {
+        use crate::intel_gpu_xelpg_external::tests::usb4_adapter;
+        let ctl = tunnel::DP_DPTX_BW_ALLOCATION_MODE_CONTROL;
+        let cases: [(u8, bool, u32, u8, [u32; 4], &[u8], &[u8]); 2] = [
+            (
+                72,
+                false,
+                24,
+                6,
+                [(5 << 25) | 0x0a_52da, 0x80_0000, 0x1_a9fb, 0x8_0000],
+                &[7, 13],
+                &[7, 13, 7, 0],
+            ),
+            (
+                6,
+                true,
+                18,
+                4,
+                [(3 << 25) | 0x07_be23, 0x80_0000, 0x1_a9fb, 0x8_0000],
+                &[5],
+                &[5, 0],
+            ),
+        ];
+        for (estimated, one_sink, bpp, tu, mn, requests, after_stop) in cases {
+            let mut hub = DpSink::new(0x14, edid());
+            let mut adapter = usb4_adapter();
+            adapter[0x23] = estimated;
+            hub.tunnel = Some(adapter);
+            let io = ExtFake::new(XeLpgPort::Tc2, hub);
+            let Some(panel) = io.light_panel_ip(DisplayIp::Xe3Lpd) else {
+                return TestResult::Fail("the fixture must light the display-30 panel");
+            };
+            io.pica_isr
+                .set(crate::intel_gpu_xelpg_hpd::pica_tbt_hotplug(1));
+            let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd);
+            let Ok(link) = probe_link_profile(&io, profile, XeLpgPort::Tc2, false) else {
+                return TestResult::Fail("the tunnelled hub must answer its DPCD");
+            };
+            let u = match uhbr_mst_link(&io, &link) {
+                Ok(Some(u))
+                    if link.tbt()
+                        && u.rate == uhbr::UhbrRate::Uhbr10
+                        && u.lanes == 2
+                        && u.tunnel.is_some_and(|t| t.bw_alloc_enabled) =>
+                {
+                    u
+                }
+                other => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(narf_console::Writer, "tunnel MST link: {other:?}");
+                    return TestResult::Fail("the tunnel's UHBR10 x2 is the hub's MST link");
+                }
+            };
+            if io.sink.borrow().tunnel_log != [(ctl, 0xc0)] {
+                return TestResult::Fail("the MST link keeps the tunnel's BW allocation");
+            }
+            let mut aux = branch(&io);
+            aux.hub.child_present = !one_sink;
+            let display = MtlDisplay {
+                panel: Some(panel),
+                pipe_dmc: &NoPipeDmc,
+            };
+            let mut index = 0;
+            let mut owner = match MtlMstRoute::connect_aux_with(
+                &io,
+                link,
+                MtlPortDecl::USB_C,
+                &display,
+                &mut |mode| Some(fb(mode, &mut index)),
+                &mut aux,
+                Some(u),
+            ) {
+                Ok(owner) => owner,
+                Err((_, error)) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(narf_console::Writer, "tunnel MST connect: {error:?}");
+                    return TestResult::Fail("128b/132b MST must light through the tunnel");
+                }
+            };
+            let streams = if one_sink { 1 } else { 2 };
+            if owner.stream_count() != streams
+                || owner.streams.iter().any(|s| {
+                    s.route.probe.uhbr.as_deref().map(|p| {
+                        (
+                            p.link.pipe_bpp,
+                            p.stream.tu,
+                            p.stream.m_n,
+                            p.tunnel.is_none(),
+                        )
+                    }) != Some((bpp, tu, mn, true))
+                })
+            {
+                return TestResult::Fail("each stream runs Linux's UHBR10 x2 MTP at its bpp");
+            }
+            let bw_requests = |io: &ExtFake| -> Vec<u8> {
+                io.sink
+                    .borrow()
+                    .tunnel_log
+                    .iter()
+                    .filter_map(|&(a, v)| (a == tunnel::DP_REQUEST_BW).then_some(v))
+                    .collect()
+            };
+            if bw_requests(&io) != requests {
+                return TestResult::Fail("the tunnel allocation is the streams' sum before each");
+            }
+            let clock = io.read32(XeLpgPort::Tc2.port_clock_ctl());
+            if clock & crate::intel_gpu_xelpg::XE3_DDI_CLOCK_SELECT_MASK
+                != crate::intel_gpu_xelpg::DDI_CLOCK_SELECT_TBT_312_5 << 12
+            {
+                return TestResult::Fail("UHBR10 over TBT runs the fabric's 312.5 MHz select");
+            }
+            if owner.stop_aux(&io, &mut aux).is_err() || !owner.stopped() {
+                return TestResult::Fail("the tunnelled MST link must stop");
+            }
+            {
+                let sink = io.sink.borrow();
+                let last_request = sink
+                    .tunnel_log
+                    .iter()
+                    .rposition(|&(a, _)| a == tunnel::DP_REQUEST_BW);
+                let off = sink.tunnel_log.iter().rposition(|&w| w == (ctl, 0x00));
+                if !matches!((last_request, off), (Some(r), Some(o)) if r < o) {
+                    return TestResult::Fail("stop: the allocation freed, then BWA disabled");
+                }
+            }
+            if bw_requests(&io) != after_stop || owner.tunnel.is_some() {
+                return TestResult::Fail("each stream's stop decreases the allocation to 0");
+            }
+            if owner.release(&io).is_err() {
+                return TestResult::Fail("the tunnelled MST link must release");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_ptl_mst_128b132b_through_dp_tunnel
     );
 
     /// What keeps a hub off 128b/132b MST under `narf.intel.uhbr=1`: no

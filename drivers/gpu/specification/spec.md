@@ -1320,8 +1320,9 @@ Broader parallel queues and additional native Xe query/property families
 remain refused until their ownership and hardware contracts are implemented;
 LR_MODE/FAULT_MODE VMs are `intel_gpu.md` "Completion of Intel iGPU and
 Discrete Arc Support". CPU-address-mirror binds behind `narf.intel.svm=1`
-(`UserBackend::cpu_addr_mirror`, default off) are `intel_gpu.md` "Xe
-CPU-address-mirror VMs". OA observation is limited to the main-GT OAG
+(`UserBackend::cpu_addr_mirror`, default off), with ASIDs and the GPU
+page-fault service (`UserBackend::usm`, `intel_gpu_xe_usm`) and
+`DRM_IOCTL_XE_MADVISE`, are `intel_gpu.md` "Xe CPU-address-mirror VMs". OA observation is limited to the main-GT OAG
 profile described below.
 
 **BMG and exact LNL EU-stall observation.** The exact boot opt-in

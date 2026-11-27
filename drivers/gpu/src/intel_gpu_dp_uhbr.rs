@@ -40,17 +40,21 @@
 //!   (`intel_dp_init_lttpr_and_dprx_caps`, `drm_dp_lttpr_init`), grants their
 //!   extended wake timeout and trains with the repeater count (the CDS
 //!   budget). 128b/132b training has no per-hop phase: Linux trains the
-//!   whole path from the DPRX's status. The 8b/10b route keeps the repeaters
-//!   transparent (the per-hop `intel_dp_link_train_all_phys` is not
-//!   implemented), so a 128b/132b route hands them back to transparent mode
-//!   when it stops.
+//!   whole path from the DPRX's status. Under the same option the 8b/10b SST
+//!   route trains through them hop by hop (`super::lttpr`,
+//!   `intel_dp_link_train_all_phys`); the 8b/10b MST route keeps them
+//!   transparent and trains end to end, so a route that switched them hands
+//!   them back to transparent mode when it stops.
 //!
 //! - **Fallback** ([`LinkCaps`]): `intel_dp_link_caps.c`'s configuration
 //!   orders, `intel_dp_get_link_train_fallback_values` after a failed
 //!   128b/132b training (the failed configuration disabled, the maximum
 //!   limits reduced), and the modeset retry's
 //!   `intel_dp_compute_link_config_wide` over what is still allowed
-//!   ([`wide_search`]), which may land on 8b/10b.
+//!   ([`wide_search`]), which may land on 8b/10b; with a DSC sink the
+//!   retry's DSC search ([`LinkCaps::limits_8b10b`] and the allowed
+//!   128b/132b configurations), and for MST the BW-order reduction with
+//!   every stream retried at the new link.
 //!
 //! - **DSC** ([`dsc_mtp_tu`]): Linux 7.4's `dsc_compute_link_config` with
 //!   the 128b/132b configurations (`intel_dp_mtp_tu_compute_config` with
@@ -61,10 +65,13 @@
 //!   `drm_dp_get_vc_payload_bw`'s 128b/132b PBN divider, the remote PBN
 //!   with the SSC margin and the remote TU.
 //!
-//! Not implemented, refused typed ([`UhbrRefusal`]) instead of running a
-//! link Linux would not: 128b/132b MST over Thunderbolt (the tunnel's
-//! per-stream bandwidth), and Thunderbolt-alt UHBR on display 14/20 (no TBT
-//! UHBR clock select).
+//! - **MST through a DP tunnel** (display 30+ Thunderbolt alt mode): the
+//!   tunnel supplies the hub's 128b/132b link as for SST, and the MST owner
+//!   accounts each stream's `intel_dp_config_required_rate` in the tunnel
+//!   ([`super::tunnel::Tunnel::check_stream_bws`]) and allocates their sum.
+//!
+//! Refused typed ([`UhbrRefusal`]) instead of running a link Linux would
+//! not: Thunderbolt-alt UHBR on display 14/20 (no TBT UHBR clock select).
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_modeset::Mode;
@@ -168,7 +175,7 @@ pub const DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED: u8 = 1 << 0;
 /// (`__DP_LTTPR2_BASE - __DP_LTTPR1_BASE`).
 pub const DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1: u32 = 0xf_0020;
 pub const DP_LTTPR_STRIDE: u32 = 0x50;
-const DP_LTTPR_PHY_CAP_SIZE: usize = 3;
+pub const DP_LTTPR_PHY_CAP_SIZE: usize = 3;
 
 /// `DP_LINK_STATUS_SIZE`.
 pub const LINK_STATUS_SIZE: usize = 6;
@@ -285,6 +292,7 @@ pub const fn lttpr_count(caps: &[u8; 8]) -> Option<u8> {
 /// `DP_128B132B_SUPPORTED_LINK_RATES` when `DP_CAP_ANSI_128B132B` is set,
 /// and the LTTPR common capabilities (`drm_dp_read_lttpr_common_caps`; a
 /// failed read is Linux's zeroed caps, no repeater).
+#[cfg(any(test, feature = "kernel-test"))]
 pub fn read_sink<A: AuxChannel + ?Sized>(
     aux: &mut A,
     raw: &[u8; 16],
@@ -387,6 +395,10 @@ pub struct LttprInit {
     /// `intel_dp->lttpr_common_caps` afterwards: its `DP_PHY_REPEATER_MODE`
     /// byte holds the mode Linux set (`intel_dp_set_lttpr_transparent_mode`).
     pub caps: [u8; 8],
+    /// `intel_dp->lttpr_phy_caps[i]` of `DP_PHY_LTTPR(i)` for the repeaters
+    /// in non-transparent mode (`drm_dp_read_lttpr_phy_caps`; a failed read
+    /// leaves zeros, as Linux's).
+    pub phy_caps: [[u8; DP_LTTPR_PHY_CAP_SIZE]; 8],
 }
 
 impl LttprInit {
@@ -417,6 +429,7 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
     }
     let mut caps = read_lttpr_caps(aux, dpcd[0]);
     let mut count = 0;
+    let mut phy_caps = [[0u8; DP_LTTPR_PHY_CAP_SIZE]; 8];
     let found = lttpr_count(&caps);
     if found != Some(0) {
         // intel_dp_init_lttpr_phys with LTTPRs (or a malformed count).
@@ -444,9 +457,9 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
         if non_transparent {
             caps[DP_PHY_REPEATER_MODE_INDEX] = DP_PHY_REPEATER_MODE_NON_TRANSPARENT;
             count = found.unwrap_or(0);
-            for i in 0..u32::from(count) {
+            for (i, slot) in (0..u32::from(count)).zip(phy_caps.iter_mut()) {
                 let base = DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1 + i * DP_LTTPR_STRIDE;
-                let mut phy = [0u8; DP_LTTPR_PHY_CAP_SIZE];
+                let phy = slot;
                 if dpcd[0] < 0x14 {
                     for (j, b) in phy.iter_mut().enumerate() {
                         if aux
@@ -456,8 +469,8 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
                             break;
                         }
                     }
-                } else {
-                    let _ = aux.dpcd_read(base, &mut phy);
+                } else if aux.dpcd_read(base, phy).is_err() {
+                    *phy = [0; DP_LTTPR_PHY_CAP_SIZE];
                 }
             }
         } else {
@@ -470,7 +483,11 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
     if aux.dpcd_read(0x000, &mut dpcd).is_err() {
         return LttprInit::default();
     }
-    LttprInit { count, caps }
+    LttprInit {
+        count,
+        caps,
+        phy_caps,
+    }
 }
 
 /// `drm_dp_lttpr_wake_timeout_setup`: in transparent mode the DPRX's
@@ -649,7 +666,9 @@ pub fn wide_search(
     cap: Option<u64>,
 ) -> Option<dsc::UncompressedLink> {
     let capped = |rate: u64| cap.map_or(rate, |cap| rate.min(cap));
-    let max_bpp = max_bpp.min(dsc::PIPE_BPP);
+    // intel_display_max_pipe_bpp: a deep-colour pipe maximum (30 or 36 bpp
+    // under narf.intel.hdmi14_ext=1) is searched as given.
+    let max_bpp = max_bpp.min(36);
     let (clock, hdisplay) = (mode.pixel_clock_khz, u32::from(mode.h_active));
     let (order, n) = caps.ordered(FallbackOrder::RateLane);
     let mut bpp = max_bpp - max_bpp % 6;
@@ -789,6 +808,26 @@ impl LinkCaps {
     /// The maximum link limits (`intel_dp_link_caps_get_max_limits`).
     pub fn max_limits(&self) -> (u32, u8) {
         (self.max_rate, self.max_lane_count)
+    }
+
+    /// The 8b/10b configurations the maximum link limits allow, as the DSC
+    /// search's 8b/10b limits: the common 8b/10b rates up to the maximum
+    /// rate and the lane counts up to the maximum lane count (a fallback
+    /// only disables the failed configuration, a 128b/132b one here).
+    pub fn limits_8b10b(&self) -> dsc::LinkLimits {
+        let mut rates = [0u32; 9];
+        let allowed = self.rates[..usize::from(self.num_rates)]
+            .iter()
+            .copied()
+            .filter(|&r| r < 1_000_000 && r <= self.max_rate);
+        for (dst, r) in rates.iter_mut().zip(allowed) {
+            *dst = r;
+        }
+        dsc::LinkLimits {
+            rates,
+            max_lanes: self.max_lane_count.min(self.max_lanes),
+            use_max: false,
+        }
     }
 
     /// Every supported configuration, ascending in `order`.
@@ -1053,6 +1092,72 @@ pub fn mst_stream(rate: UhbrRate, lanes: u8, mode: &Mode, max_bpp: u32) -> Optio
         bpp -= 6;
     }
     None
+}
+
+/// `intel_dp_mtp_tu_compute_config(dsc = true)` for one compressed bpp of a
+/// 128b/132b MST stream (`mst_stream_dsc_compute_link_config`): no FEC,
+/// display 14's DSC->DPT limit (as [`dsc_mtp_tu`]), the slice-aware local
+/// M/N, the remote PBN with the SSC margin and the slices, the remote TU
+/// aligned to `4 / lanes`, the PBN realigned to it and the slots
+/// `drm_dp_atomic_find_time_slots` derives, at most 64. `None` without a
+/// slice count, past the DPT limit or past the slots.
+///
+/// The MST route does not take it yet: a stream's DSC capabilities live
+/// behind its decompression AUX (`drm_dp_mst_dsc_aux_for_port`), which this
+/// tree has only inside the amdgpu MST owner.
+#[cfg(any(test, feature = "kernel-test"))]
+pub fn mst_dsc_stream(
+    rate: UhbrRate,
+    lanes: u8,
+    mode: &Mode,
+    bpp_x16: u32,
+    dsc_slices: u8,
+    display14: bool,
+) -> Option<MstUhbrStream> {
+    let l = u32::from(lanes);
+    if dsc_slices == 0 || !matches!(l, 1 | 2 | 4) {
+        return None;
+    }
+    if display14 {
+        let dpt = u64::from(rate.symbol_clock_khz()) * 72 * 967_100
+            / (u64::from(mode.pixel_clock_khz) * 1_030_000).max(1);
+        if dpt != 0 && u64::from(bpp_x16) > dpt * 16 {
+            return None;
+        }
+    }
+    let div = vc_payload_bw(rate, lanes);
+    let data_n = max_link_data_rate(rate, l);
+    if div == 0 || data_n == 0 {
+        return None;
+    }
+    let (clock, hactive) = (mode.pixel_clock_khz, u32::from(mode.h_active));
+    let slices = u32::from(dsc_slices);
+    let local = bw_overhead_with(l, hactive, slices, bpp_x16, true, false);
+    let data_m = effective_data_rate(clock, bpp_x16, local);
+    let remote = bw_overhead_with(l, hactive, slices, bpp_x16, true, true);
+    let pbn = (effective_data_rate(clock, bpp_x16, remote) * 64).div_ceil(54 * 1000);
+    let align = u64::from(4 / l);
+    let tu = (pbn << 12).div_ceil(div).div_ceil(align) * align;
+    let pbn_alloc = (tu * div) >> 12;
+    let slots = (pbn_alloc << 12).div_ceil(div);
+    if tu == 0 || tu > 64 || slots == 0 || slots > u64::from(MST_TOTAL_SLOTS) {
+        return None;
+    }
+    let (dm, dn) = compute_m_n(data_m, data_n, 0x800_0000);
+    let (lm, ln) = compute_m_n(
+        u64::from(clock),
+        u64::from(rate.symbol_clock_khz()),
+        0x8_0000,
+    );
+    Some(MstUhbrStream {
+        pipe_bpp: 0,
+        pbn: pbn_alloc as u32,
+        slots: slots as u8,
+        stream: UhbrStream {
+            tu: tu as u8,
+            m_n: [((tu as u32 - 1) << 25) | dm, dn, lm, ln],
+        },
+    })
 }
 
 /// `intel_dp_compute_min_hblank` for an uncompressed 128b/132b SST stream
@@ -1516,10 +1621,6 @@ pub fn poll_act_handled<A: AuxChannel + ?Sized, C: Clock>(aux: &mut A, clock: &m
 /// (nothing was programmed unless noted).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UhbrRefusal {
-    /// A 128b/132b MST link over Thunderbolt alt mode: Linux accounts each
-    /// stream's bandwidth in the DP tunnel's group
-    /// (`drm_dp_tunnel_atomic_set_stream_bw`), which is not implemented.
-    Mst,
     /// The stream needs UHBR over Thunderbolt alt mode on display 14 or 20:
     /// `intel_mtl_tbt_clock_select` has no UHBR10/20 select below display
     /// 30 (Linux WARNs and programs the 162 MHz one).

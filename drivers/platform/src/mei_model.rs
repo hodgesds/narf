@@ -126,6 +126,8 @@ struct State {
     ignore_connect: bool,
     ignore_disconnect: bool,
     props_addr_skew: u8,
+    /// Firmware's highest HBM version (major, minor).
+    fw_hbm: (u8, u8),
     clients: Vec<ModelClient>,
     enum_only: Vec<u8>,
     conns: Vec<Conn>,
@@ -238,7 +240,12 @@ impl State {
         let arg = |k: usize| b.get(k).copied().unwrap_or(0);
         match arg(0) {
             HOST_START_REQ_CMD => {
-                self.push_hbm(&[HOST_START_RES_CMD, 1, HBM_MINOR_VERSION, HBM_MAJOR_VERSION]);
+                // struct hbm_host_version_response: host_version_supported
+                // when firmware runs the requested {minor, major}, and
+                // firmware's highest version.
+                let (major, minor) = self.fw_hbm;
+                let supported = (arg(3), arg(2)) <= (major, minor);
+                self.push_hbm(&[HOST_START_RES_CMD, u8::from(supported), minor, major]);
             }
             HOST_ENUM_REQ_CMD => {
                 let mut r = vec![HOST_ENUM_RES_CMD, 0, 0, 0];
@@ -417,6 +424,7 @@ impl HeciModel {
                 ignore_connect: false,
                 ignore_disconnect: false,
                 props_addr_skew: 0,
+                fw_hbm: (HBM_MAJOR_VERSION, HBM_MINOR_VERSION),
                 clients,
                 enum_only: Vec::new(),
                 conns: Vec::new(),
@@ -518,6 +526,12 @@ impl HeciModel {
     /// Properties responses report `addr + skew` instead of `addr`.
     pub fn set_props_addr_skew(&self, skew: u8) {
         self.st.lock().props_addr_skew = skew;
+    }
+
+    /// Firmware's highest HBM version; a host request above it is
+    /// answered `host_version_supported = 0`.
+    pub fn set_fw_hbm_version(&self, major: u8, minor: u8) {
+        self.st.lock().fw_hbm = (major, minor);
     }
 
     /// Set `addr` in the enumeration bitmap without a client behind it

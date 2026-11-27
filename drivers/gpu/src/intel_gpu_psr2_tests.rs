@@ -69,6 +69,7 @@ fn smoke_psr2_qualifies_like_intel_sel_update_config_valid() -> TestResult {
         frames_before_su: 3,
         tp2_wakeup_us: 2500,
         a0_to_b0: false,
+        su_region_et: false,
         width: 2880,
         height: 1800,
     };
@@ -559,6 +560,7 @@ fn small(g: u16) -> Psr2 {
         frames_before_su: 3,
         tp2_wakeup_us: 0,
         a0_to_b0: false,
+        su_region_et: false,
         width: 64,
         height: 32,
     }

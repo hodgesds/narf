@@ -230,10 +230,11 @@ kernel_test_in!(
     smoke_ccs_and_xe2_scanout_plane_registers
 );
 
-/// The scanout view of a compressed framebuffer: origin zero only, a
-/// mapping that covers the AUX plane, and on display 20 the DPT remap at the
-/// whole source stride (`calc_plane_remap_info` keeps `src_stride` for CCS
-/// before `plane_view_dst_stride_tiles` rounds it to a power of two).
+/// The scanout view of a compressed framebuffer: a mapping that covers the
+/// AUX plane, Linux's placement for a panned view (below), and on display
+/// 20 the DPT remap at the whole source stride (`calc_plane_remap_info`
+/// keeps `src_stride` for CCS before `plane_view_dst_stride_tiles` rounds it
+/// to a power of two).
 fn smoke_ccs_view_footprint_and_xe2_dpt_stride() -> TestResult {
     use crate::intel_gpu_scanout::{DptLayout, Geometry, Layout, View, Viewport};
     let planes = mtl_planes(Ccs::MtlRc).expect("planes");
@@ -251,13 +252,21 @@ fn smoke_ccs_view_footprint_and_xe2_dpt_stride() -> TestResult {
         origin: Viewport { x: 32, y: 0 },
         ..view
     };
+    let linear = View {
+        layout: Layout::Linear,
+        ..panned
+    };
     // Tile4 1080 lines -> 34 tile rows x 7680 = 0x7f8000; the AUX plane
-    // ends at 0x807000.
-    if view.footprint(geometry).map(|(_, _, bytes)| bytes) != Ok(0x80_7000)
-        || panned.footprint(geometry) != Err(crate::intel_gpu_scanout::ScanoutError::Unsupported)
+    // ends at 0x807000. Panned by one Tile4 column the main surface stays
+    // at offset 0 with x 32, as the AUX plane's x/y (32, 0) require.
+    if view.footprint(geometry) != Ok((0, 0, 0x80_7000))
+        || panned.footprint(geometry) != Ok((0, 0x20, 0x80_7000))
+        || panned.footprint_aligned(geometry, 4096) != Ok((0, 0x20, 0x80_7000))
+        || panned.ccs_aux_dist(geometry) != Some(0x7f_8000)
         || view.tiled() != 0xb400
+        || linear.footprint(geometry) != Err(crate::intel_gpu_scanout::ScanoutError::Unsupported)
     {
-        return TestResult::Fail("a CCS view maps its AUX plane and never pans");
+        return TestResult::Fail("a CCS view maps its AUX plane at Linux's placement");
     }
     // 1024 visible pixels (32 Tile4 columns) of a 7680-byte (60-tile)
     // pitch: plain Tile4 remaps to roundup_pow_of_two(32) = 32 < 60 and is
@@ -280,4 +289,114 @@ fn smoke_ccs_view_footprint_and_xe2_dpt_stride() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_scanout",
     smoke_ccs_view_footprint_and_xe2_dpt_stride
+);
+
+/// `skl_check_plane_surface` for panned compressed views, worked from Linux
+/// 7.4's `intel_compute_aligned_offset` / `intel_adjust_tile_offset`
+/// arithmetic.
+///
+/// Display 14 (`_RC_CCS` 1920x1080 above, in GGTT): main pitch 7680 = 60
+/// Tile4 tiles; the AUX plane at 0x7f8000 is AUX tile 2040 of a 960-byte
+/// pitch (15 AUX tiles), normal-view x/y (0, 2040 / 15 * 64 = 8704). The
+/// AUX tile is chosen first, then the main surface is stepped back 16 KiB
+/// at a time until x/y match:
+///
+/// | pan        | AUX tile, x/y             | main offset, x/y   | AUX_DIST |
+/// |------------|---------------------------|--------------------|----------|
+/// | (160, 0)   | 0x7f9000, (32, 0)         | 0x4000, (32, 0)    | 0x7f5000 |
+/// | (0, 40)    | 0x7f8000, (0, 40)         | 0, (0, 40)         | 0x7f8000 |
+/// | (160, 40)  | 0x7f9000, (32, 40)        | 0x4000, (32, 40)   | 0x7f5000 |
+/// | (33, 33)   | 0x7f8000, (33, 33)        | 0, (33, 33)        | 0x7f8000 |
+///
+/// At (0, 40) the main tile (row 1) is 0x3c000 with x/y (0, 8); the AUX y
+/// 40 is below it, so every 16 KiB step back to offset 0 is needed.
+///
+/// Display 20 (`_LNL_CCS`, the same framebuffer through its DPT): the
+/// remapped view keeps the 60-tile source stride rounded to 64 (8192-byte
+/// mapping rows) and the main surface aligns to 2 MiB (512 DPT entries).
+/// A 1024x64 view at (160, 300) covers 37 x 12 tiles from origin zero; the
+/// main tile (9 * 64 + 5) * 4096 = 0x245000 rounds down to 0x200000, the
+/// 69 tiles between move into x/y (160, 12 + 32 = 44): `PLANE_SURF` is
+/// 0x200000 >> 9 = 0x1000 into the table and `PLANE_OFFSET` 0x2c00a0.
+fn smoke_ccs_panned_views_take_linux_offsets() -> TestResult {
+    use crate::intel_gpu_scanout::{DptLayout, Geometry, Layout, View, Viewport};
+    let planes = mtl_planes(Ccs::MtlRc).expect("planes");
+    let place = |x, y| planes.place(7680, MAIN_ALIGNMENT, x, y);
+    let at = |main, x, y, aux| {
+        Some(CcsPlacement {
+            main,
+            x,
+            y,
+            aux: Some(aux),
+        })
+    };
+    if place(160, 0) != at(0x4000, 32, 0, 0x7f_9000)
+        || place(0, 40) != at(0, 0, 40, 0x7f_8000)
+        || place(160, 40) != at(0x4000, 32, 40, 0x7f_9000)
+        || place(33, 33) != at(0, 33, 33, 0x7f_8000)
+        || place(160, 0).and_then(|p| p.aux_dist()) != Some(0x7f_5000)
+        || place(160, 40).map(|p| p.plane_offset()) != Some(0x0028_0020)
+    {
+        return TestResult::Fail("panned AuxCCS views must take Linux's main and AUX offsets");
+    }
+    let geometry = Geometry {
+        width: 1024,
+        height: 64,
+        pitch: 7680,
+    };
+    let view = View {
+        origin: Viewport { x: 160, y: 40 },
+        layout: Layout::Tile4,
+        ccs: Some(planes),
+        ..View::default()
+    };
+    // The mapping covers main rows 0..ceil(104 / 32) * 32 = 128 (0xf0000
+    // bytes) and the whole AUX plane (0x807000).
+    if view.footprint(geometry) != Ok((0x4000, 0x0028_0020, 0x80_7000))
+        || view.ccs_aux_dist(geometry) != Some(0x7f_5000)
+        || view.surface_alignment(4096) != MAIN_ALIGNMENT
+        || View::default().surface_alignment(4096) != 4096
+    {
+        return TestResult::Fail("the presenter view must carry the placement");
+    }
+    let flat = check_planes(
+        Ccs::Xe2,
+        XRGB8888,
+        1080,
+        [7, 0, 0, 0],
+        [7680, 0, 0, 0],
+        [0, 0, 0, 0],
+        OBJECT_SIZE,
+    )
+    .expect("flat");
+    let (layout, surf, offset) =
+        DptLayout::ccs(geometry, Viewport { x: 160, y: 300 }, &flat).expect("flat CCS DPT");
+    if (layout.src, layout.width, layout.dst, layout.rows) != (60, 37, 64, 12)
+        || surf != 0x1000
+        || offset != 0x002c_00a0
+        || flat.place(8192, DPT_MAIN_ALIGNMENT, 160, 300)
+            != Some(CcsPlacement {
+                main: 0x20_0000,
+                x: 160,
+                y: 44,
+                aux: None,
+            })
+    {
+        return TestResult::Fail("a panned flat-CCS view must take Linux's DPT offset");
+    }
+    // Unpanned, the table and the plane start at origin zero as before.
+    let whole = Geometry {
+        width: 1920,
+        height: 1080,
+        pitch: 7680,
+    };
+    match DptLayout::ccs(whole, Viewport::default(), &flat) {
+        Some((l, 0, 0)) if (l.src, l.width, l.dst, l.rows) == (60, 60, 64, 34) => {}
+        _ => return TestResult::Fail("an unpanned flat-CCS view starts at entry 0"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout",
+    smoke_ccs_panned_views_take_linux_offsets
 );

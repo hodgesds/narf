@@ -350,6 +350,12 @@ pub(crate) trait Platform:
     fn suspend_panel_off(&self) -> bool {
         false
     }
+    /// A vblank reference on Pipe A through a display interrupt owner
+    /// (`drm_vblank_get`, its interrupt unmasked while held). Default: no
+    /// display interrupt owner, and vblank waits read the frame counter.
+    fn vblank_irq(&self) -> Option<Box<dyn crate::intel_gpu_gen9_irq::VblankIrq + Send>> {
+        None
+    }
 }
 
 /// The Pipe-A eDP sink as an AUX channel over a platform window.
@@ -631,10 +637,18 @@ impl Physical {
         // No Card spinlock spans console PTE/resource validation. Qualification
         // grants CTM only; display12 and13 have different native LUT layouts.
         let family = self.gen12_family();
-        let ctm_only = family.is_some_and(|family| {
-            gen12_primary::Owner::capture(self, console, family, self.bar.len).is_ok()
-                && crate::intel_gpu_color::Owner::capture_gen12(self, family).is_ok()
-        });
+        // Color, the cursor and tiled views stay unadvertised on Rocket
+        // Lake (not qualified there) and on a discrete display (no
+        // integrated primary owner); their primary flips remain.
+        let ctm_only = family
+            .filter(|family| {
+                *family != crate::intel_gpu_gt::Gen12Platform::RocketLake
+                    && self.discrete_display.is_none()
+            })
+            .is_some_and(|family| {
+                gen12_primary::Owner::capture(self, console, family, self.bar.len).is_ok()
+                    && crate::intel_gpu_color::Owner::capture_gen12(self, family).is_ok()
+            });
         let timing = crate::drm_registry::mode_state(self.index).and_then(|card| {
             let card = card.lock();
             let mode = card.crtcs.first()?.mode?;
@@ -1026,6 +1040,16 @@ impl Platform for Physical {
     fn suspend_panel_off(&self) -> bool {
         self.nova()
     }
+    /// Display 9 with the Gen9 interrupt owner (`narf.intel.gen9_irq=1`):
+    /// Pipe A's vblank interrupt (`bdw_enable_vblank`). Display 11 and
+    /// later have no display interrupt owner.
+    fn vblank_irq(&self) -> Option<Box<dyn crate::intel_gpu_gen9_irq::VblankIrq + Send>> {
+        if !matches!(self.generation, Generation::Skylake | Generation::Broxton) {
+            return None;
+        }
+        crate::intel_gpu_gen9_irq::vblank_get(&self.bar, Pipe::A)
+            .map(|vblank| Box::new(vblank) as Box<dyn crate::intel_gpu_gen9_irq::VblankIrq + Send>)
+    }
 }
 
 pub(crate) fn panel_generation_supported(generation: Generation, has_display30: bool) -> bool {
@@ -1235,13 +1259,16 @@ fn fetchers_with_cursor(
         }
     }
     // All admitted ADL-S/P/N source families have four sprites; TGL has
-    // six. ADL-S is display12 with HAS_D12_PLANE_MINIMIZATION. Display 13+
-    // (MTL's 14, LNL's 20) has four.
+    // six. ADL-S and RKL are display12 with HAS_D12_PLANE_MINIMIZATION.
+    // Display 13+ (MTL's 14, LNL's 20) has four.
     let count = if display_ip.is_some() {
         5
     } else {
         match generation {
-            Generation::MeteorLake | Generation::AlderLake | Generation::LunarLake => 5,
+            Generation::MeteorLake
+            | Generation::AlderLake
+            | Generation::LunarLake
+            | Generation::RocketLake => 5,
             _ => 7,
         }
     };
@@ -1251,7 +1278,15 @@ fn fetchers_with_cursor(
     let external = display_ip.and_then(|ip| {
         crate::intel_gpu_xelpg_pipes::published_layout().filter(|l| l.state.ip == ip)
     });
-    let pipe_count = display_ip.map_or(4, crate::intel_gpu_xe2lpd::DisplayIp::pipe_count);
+    // rkl_desc: pipe_mask A-C; every other display here has four pipes.
+    let pipe_count = display_ip.map_or(
+        if generation == Generation::RocketLake {
+            3
+        } else {
+            4
+        },
+        crate::intel_gpu_xe2lpd::DisplayIp::pipe_count,
+    );
     for pipe in 0..pipe_count as u64 {
         let cursor = mmio.read32(0x70080 + pipe * 0x1000);
         if cursor == u32::MAX {
@@ -2732,7 +2767,7 @@ impl<M: Platform> Guard<'_, M> {
     fn acquire_gen12_resources(&mut self) -> Result<(), FsError> {
         if !matches!(
             self.device.generation,
-            Generation::TigerLake | Generation::AlderLake
+            Generation::TigerLake | Generation::AlderLake | Generation::RocketLake
         ) {
             return Ok(());
         }
@@ -2743,20 +2778,40 @@ impl<M: Platform> Guard<'_, M> {
                 self.state.cursor.as_ref().is_some_and(|c| c.exposed()),
             );
         }
-        // The retained Gen12 primary is the integrated panel console; a
-        // discrete display (DG1 reports a Gen12 family too) has none, so it
-        // is refused as DG2's is.
+        // The retained Gen12 primary is the integrated panel console. DG1
+        // (`narf.intel.dg1_kms=1`) reports a Gen12 family too, but its
+        // display is discrete: no panel route to retain. Its presenter
+        // flips the firmware-lit Pipe A as Battlemage's does, behind the
+        // takeover's fetcher inventory and PollIo's console qualification
+        // (Tiger Lake's display 12, `dg1_desc`'s `XE_D_DISPLAY`), from VRAM
+        // only (the presenter's DG1 backing rule). Any other discrete
+        // display (DG2) is refused.
+        if self.device.platform.discrete_display()
+            == Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg1)
+        {
+            if self.device.platform.gen12_family() != Some(crate::intel_gpu_gt::Gen12Platform::Dg1)
+                || self.device.generation != Generation::TigerLake
+            {
+                self.state.failed = true;
+                return Err(FsError::NoDevice);
+            }
+            return Ok(());
+        }
         let family = self
             .device
             .platform
             .gen12_family()
             .filter(|_| self.device.platform.discrete_display().is_none())
             .ok_or(FsError::Unsupported)?;
-        if (self.device.generation == Generation::TigerLake)
-            != (family == crate::intel_gpu_gt::Gen12Platform::TigerLake)
-        {
+        if self.device.generation != crate::intel_gpu_scanout_io::gen12_generation(family) {
             self.state.failed = true;
             return Err(FsError::NoDevice);
+        }
+        // Rocket Lake's panel is owned only behind `narf.intel.rkl_edp=1`.
+        if family == crate::intel_gpu_gt::Gen12Platform::RocketLake
+            && !crate::intel_gpu_modeset::rkl_edp()
+        {
+            return Err(FsError::Unsupported);
         }
         let owner = gen12_primary::Owner::capture(
             &self.device.platform,
@@ -3210,9 +3265,9 @@ impl<M: Platform> Guard<'_, M> {
         let caps = pr::Caps::read(&mut aux, true, false)?;
         let port_clock =
             crate::intel_gpu_psr::sink_link_rate(&mut aux).ok_or(Refusal::Unavailable)?;
-        let mut feature = [0u8];
-        let as_sdp = crate::intel_gpu_psr::read(&mut aux, 0x2214, &mut feature).is_ok()
-            && feature[0] & 1 != 0;
+        let mut rev = [0u8];
+        crate::intel_gpu_psr::read(&mut aux, 0x000, &mut rev).map_err(Refusal::Aux)?;
+        let as_sdp = pr::as_sdp_needed(&mut aux, rev[0], &caps);
         let mut edp_rev = [0u8];
         crate::intel_gpu_psr::read(&mut aux, 0x700, &mut edp_rev).map_err(Refusal::Aux)?;
         let func = platform.read32(crate::intel_gpu_psr::TRANS_DDI_FUNC_CTL_A);
@@ -4852,6 +4907,32 @@ impl<M: Platform> Guard<'_, M> {
     pub(crate) async fn wait_vblank(&mut self) -> Result<FlipStamp, FsError> {
         if self.state.presenter.is_some() || self.state.failed || self.state.mixed_unpublished {
             return Err(FsError::Busy);
+        }
+        // drm_crtc_wait_one_vblank on a display interrupt owner: a vblank
+        // reference (drm_vblank_get), then the next vblank its handler
+        // counts (drm_crtc_handle_vblank), stamped as handled. Linux gives
+        // up after 100 ms ("vblank wait timed out"); a lost interrupt falls
+        // back to the frame counter below.
+        if let Some(vblank) = self.device.platform.vblank_irq() {
+            let start = vblank.last().map(|(count, _)| count);
+            let deadline = self.device.platform.now().saturating_add(100_000_000);
+            loop {
+                if !self.device.platform.console_access_ok() {
+                    return Err(FsError::NoDevice);
+                }
+                if let Some((count, stamp)) = vblank.last() {
+                    if Some(count) != start {
+                        return Ok(FlipStamp {
+                            ns: stamp.ns,
+                            sequence: stamp.frame,
+                        });
+                    }
+                }
+                if self.device.platform.now() >= deadline {
+                    break;
+                }
+                self.device.platform.tick().await;
+            }
         }
         let start = self.device.platform.read32(0x70040);
         let deadline = self

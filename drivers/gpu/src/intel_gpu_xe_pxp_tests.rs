@@ -602,3 +602,137 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_media_gt",
     smoke_xe_pxp_enabled_queues_objects_and_stale_key_checks
 );
+
+/// MIT Linux 7.4-rc4, a protected queue's LRC through the GuC: an HWDRM
+/// exec queue on MTL (graphics 12.70) gets XE_LRC_CREATE_RUNALONE from
+/// xe_exec_queue.c::__xe_exec_queue_init when its class is RENDER or COMPUTE
+/// (Xe2 would take XE_LRC_CREATE_PXP instead), and xe_lrc.c::xe_lrc_init ORs
+/// REG_MASKED_FIELD_ENABLE(CTX_CTRL_RUN_ALONE) (regs/xe_engine_regs.h bit 7:
+/// 0x00800080) into CTX_CONTEXT_CONTROL after the ring registers;
+/// xe_guc_submit.c::register_exec_queue then names that LRC in
+/// REGISTER_CONTEXT with nothing PXP-specific. The unprotected value is
+/// i915 intel_lrc.c::init_common_regs for a context that restores its state
+/// (`_MASKED_BIT_ENABLE(CTX_CTRL_INHIBIT_SYN_CTX_SWITCH)` 0x00080008 |
+/// `_MASKED_BIT_DISABLE(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT)` 0x00010000).
+/// So the image the GuC model registers carries 0x00890088 at
+/// RCS0/CCS0's CTX_CONTEXT_CONTROL (engine base + 0x244) and 0x00090008 on
+/// a protected BCS0 queue and an unprotected RCS0 one, and every batch runs.
+/// Without a published `xe->pxp` the HWDRM queue is -ENODEV first.
+fn smoke_xe_pxp_protected_queue_lrc_registers_run_alone_through_the_guc() -> TestResult {
+    use crate::intel_gpu_gt::media::pxp::Pxp;
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (mailbox, mut info) = setup(&mut gt, &w, platform);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let vm = create_vm(&file, &info, &user);
+    let create = |info: &DeviceInfo, class: u8, protected: bool| {
+        user.wire.store(512, &[class, 0, 0, 0, 0, 0, 0, 0]);
+        pxp_extension(&user, 8192, 0, 0, 2, u64::from(protected));
+        let mut wire = [0; 48];
+        put64(&mut wire, 0, 8192);
+        put32(&mut wire, 8, 0x00010001);
+        put32(&mut wire, 12, vm);
+        put64(&mut wire, 24, 512);
+        user.wire.store(64, &wire);
+        let result = invoke(&file, info, &user, xe::EXEC_QUEUE_CREATE);
+        (result, u32_at(&user.wire.load(64, 48), 20))
+    };
+    // PXP disabled (xe->pxp NULL): HWDRM is -ENODEV and creates nothing.
+    assert_eq!(create(&info, 0, true), (Err(FsError::NoDevice), 0));
+
+    let pxp = Pxp::new();
+    info.backend = Some(Arc::new(PxpNative {
+        native: Native {
+            mailbox: mailbox.clone(),
+            facts: gt.device_facts().unwrap(),
+            media: None,
+        },
+        pxp: pxp.clone(),
+    }));
+    pxp.activate_for_test();
+    let handles = buffers(&file, &info, &user, vm);
+    // (class, HWDRM, CTX_CONTEXT_CONTROL register, its LRC value).
+    let cases = [
+        (0u8, true, 0x2244u32, 0x0089_0088u32),
+        (4, true, 0x1a244, 0x0089_0088),
+        (1, true, 0x22244, 0x0009_0008),
+        (0, false, 0x2244, 0x0009_0008),
+    ];
+    let mut queues = Vec::new();
+    for &(class, protected, _, _) in &cases {
+        let (result, queue) = create(&info, class, protected);
+        assert_eq!(result, Ok(0));
+        assert_ne!(queue, 0);
+        queues.push(queue);
+    }
+    // xe_pxp_exec_queue_add: the three HWDRM queues are on the PXP list.
+    assert_eq!(pxp.queues(), 3);
+
+    let mut now = 100;
+    for (&queue, &(_, _, register, control)) in queues.iter().zip(&cases) {
+        exec_wire(&user, queue, true, &[]);
+        let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let (_, fence) = mailbox.accept(&mut gt, now);
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(Ok(0)))
+        );
+        // Every image REGISTER_CONTEXT named, read while it is registered.
+        let mut registered = BTreeMap::new();
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        for t in now + 1..now + 60 {
+            assert_eq!(gt.poll(t), Poll::Ready(Ok(GtState::SchedulingReady)));
+            service_contexts(&w, &mut registered, true);
+            for base in registered.values() {
+                let image = w.0.borrow().memory[base].clone();
+                let words = image.borrow();
+                let slot = (words[1024 + 2], words[1024 + 3]);
+                if !seen.contains(&slot) {
+                    seen.push(slot);
+                }
+            }
+            now = t;
+            if fence.result().is_some() {
+                break;
+            }
+        }
+        assert_eq!(fence.result(), Some(Ok(())));
+        assert!(registered.is_empty());
+        // The queue's LRC on its engine, with nothing else registered there.
+        assert!(seen.contains(&(register, control)));
+        assert!(seen.iter().all(|&(at, value)| at != register || value == control));
+        now += 10;
+    }
+    // The batch's MI_STORE_DATA_IMM ran.
+    assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
+
+    for queue in queues {
+        assert_eq!(
+            close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+            Ok(0)
+        );
+    }
+    assert_eq!(pxp.queues(), 0);
+    for handle in handles {
+        assert_eq!(close(&file, &info, &user, abi::GEM_CLOSE, handle), Ok(0));
+    }
+    user.mapping.lock().take();
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+    drop(file);
+    drop(info);
+    drop(mailbox);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_media_gt",
+    smoke_xe_pxp_protected_queue_lrc_registers_run_alone_through_the_guc
+);

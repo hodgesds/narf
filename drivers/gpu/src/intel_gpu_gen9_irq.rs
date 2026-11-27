@@ -59,13 +59,47 @@
 //! master off before the Gen9 display suspend owner and the DC
 //! service need it off (Gen9 LP DC9), and on again after resume.
 //!
+//! Pipes B and C sit in PW_2 (`skl_power_wells`, `bxt_power_wells`,
+//! `glk_power_wells`: `irq_pipe_mask = BIT(PIPE_B) | BIT(PIPE_C)`). The
+//! install programs them when PW_2 is up; a modeset that brings PW_2 up
+//! afterwards programs them then (`hsw_power_well_post_enable` →
+//! `gen8_irq_power_well_post_enable`, [`power_well_post_enable`]).
+//!
+//! The per-pipe sources reach their consumers as `gen8_de_irq_handler`
+//! dispatches them, with each pipe's IMR kept as
+//! `display->irq.de_pipe_imr_mask` ([`Gen9IrqCore::update_pipe_irq`],
+//! `bdw_update_pipe_irq`):
+//!
+//! - VBLANK is unmasked while a vblank reference is held
+//!   (`bdw_enable_vblank` / `bdw_disable_vblank`, disabled at the last
+//!   reference: `vblank_disable_immediate`); each one handled records the
+//!   pipe's hardware frame counter and time (`drm_crtc_handle_vblank`,
+//!   `g4x_get_vblank_counter`). The KMS owner's vblank wait
+//!   (`drm_crtc_wait_one_vblank`) takes a reference ([`vblank_get`]).
+//! - The plane-1 flip done (`GEN9_PIPE_PLANE1_FLIP_DONE`) is unmasked by
+//!   [`Gen9IrqCore::enable_flip_done`] (`skl_plane_enable_flip_done`) and
+//!   records the stamp `flip_done_handler` sends its event with. Linux
+//!   enables it only for an async flip (`intel_crtc_enable_flip_done`); the
+//!   Intel KMS offers no async flip, so nothing enables it today.
+//! - FIFO underrun reporting follows `intel_fifo_underrun.c`: armed per
+//!   pipe by the modeset (`intel_ddi_pre_enable`'s
+//!   `intel_set_cpu_fifo_underrun_reporting(pipe, true)`,
+//!   [`set_fifo_underrun_reporting`]), reported once and then disabled
+//!   (`intel_cpu_fifo_underrun_irq_handler`: "CPU pipe %c FIFO underrun")
+//!   until the next modeset arms it again. Display 9 has no underrun debug
+//!   registers (`HAS_UNDERRUN_DBG_INFO` is display 35) and NARF runs no FBC
+//!   on display 9, so `intel_fbc_handle_fifo_underrun_irq` has nothing to
+//!   do.
+//!
 //! Stricter than Linux, and why: the SPT-class SDE block stays
 //! the monitor's (no `ibx_irq_postinstall`, only its owned pins
 //! unmasked); the service pass reads display registers under a
-//! Gen9 `DC_off` reference; pipes B/C are programmed only when
-//! PW_2 is up at install or resume (no
-//! `gen8_irq_power_well_post_enable`); vblank, flip-done and
-//! underrun stay masked (no consumer asks for them).
+//! Gen9 `DC_off` reference. Linux installs its interrupts before the
+//! first modeset; this owner installs at the end of probe, after the
+//! panel's modeset, so the install applies the underrun reporting and the
+//! vblank references already asked for (on resume too, where the relight
+//! precedes `intel_irq_resume`). NARF never drops PW_2 on display 9, so
+//! [`Gen9IrqCore::power_well_pre_disable`] has no caller.
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_ddi::Ddi;
@@ -224,6 +258,26 @@ pub const DE_PIPE_CDCLK_CRC_DONE: u32 = 1 << 28;
 pub const DE_PIPE_CDCLK_CRC_ERROR: u32 = 1 << 29;
 /// `GEN8_PIPE_FIFO_UNDERRUN` (bit 31).
 pub const DE_PIPE_FIFO_UNDERRUN: u32 = 1 << 31;
+/// `GEN9_PIPE_PLANE1_FLIP_DONE` (bit 3, `gen8_de_pipe_flip_done_mask` on
+/// display 9 and later).
+pub const GEN9_PIPE_PLANE1_FLIP_DONE: u32 = de_pipe_plane_flip_done(1);
+
+/// `PIPE_FRMCOUNT_G4X(pipe)`: `_PIPEA_FRMCOUNT_G4X` (0x70040) in each pipe's
+/// block (`display/intel_display_regs.h`), the hardware vblank counter
+/// `g4x_get_vblank_counter` reads.
+pub const fn pipe_frmcount(pipe: Pipe) -> u64 {
+    pipe.base() + 0x40
+}
+
+/// `gen8_irq_power_well_post_enable`'s `extra_ier`: `GEN8_PIPE_VBLANK |
+/// GEN8_PIPE_FIFO_UNDERRUN | gen8_de_pipe_flip_done_mask(display)`.
+pub const POWER_WELL_EXTRA_IER: u32 =
+    DE_PIPE_VBLANK | DE_PIPE_FIFO_UNDERRUN | GEN9_PIPE_PLANE1_FLIP_DONE;
+
+/// PW_2's `irq_pipe_mask` in `skl_power_wells`, `bxt_power_wells` and
+/// `glk_power_wells` (`intel_display_power_map.c`): `BIT(PIPE_B) |
+/// BIT(PIPE_C)`.
+pub const PW_2_IRQ_PIPE_MASK: u8 = (1 << 1) | (1 << 2);
 
 // ── DE port registers ───────────────────────────────────────────
 
@@ -757,12 +811,43 @@ pub struct Gen9IrqEvents {
     /// Master bits whose IIR read zero ("The master control interrupt
     /// lied").
     pub lied: u32,
+    /// Pipes (bit per pipe A-C) whose vblank was handled
+    /// (`intel_handle_vblank`).
+    pub vblank: u8,
+    /// Pipes whose plane-1 flip done was handled (`flip_done_handler`).
+    pub flip_done: u8,
+    /// Pipes whose FIFO underrun was reported, their reporting now disabled
+    /// (`intel_cpu_fifo_underrun_irq_handler`).
+    pub underruns: u8,
 }
 
 impl Gen9IrqEvents {
     /// Any GT bank acknowledged.
     pub fn gt_any(&self) -> bool {
         self.gt.iter().any(|iir| *iir != 0)
+    }
+}
+
+/// One handled vblank (`drm_crtc_handle_vblank`): the pipe's hardware
+/// frame counter (`g4x_get_vblank_counter`) and CLOCK_MONOTONIC ns when
+/// the service pass handled it. A flip-done event carries the pipe's last
+/// one (`drm_crtc_send_vblank_event`'s `drm_vblank_count_and_time`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VblankStamp {
+    /// `PIPE_FRMCOUNT_G4X` at the vblank.
+    pub frame: u32,
+    /// When it was handled.
+    pub ns: u64,
+}
+
+/// The pipe's index in the owner's per-pipe state (A-C); `None` for a
+/// pipe display 9 does not have.
+const fn pipe_index(pipe: Pipe) -> Option<usize> {
+    match pipe {
+        Pipe::A => Some(0),
+        Pipe::B => Some(1),
+        Pipe::C => Some(2),
+        Pipe::D => None,
     }
 }
 
@@ -793,6 +878,17 @@ pub struct Gen9IrqCore {
     pending: u32,
     /// The owned hotplug pins are unmasked.
     hotplug_unmasked: bool,
+    /// `display->irq.de_pipe_imr_mask[pipe]`, pipes A-C.
+    de_pipe_imr: [u32; 3],
+    /// Vblank references per pipe (`drm_vblank_get` / `drm_vblank_put`).
+    vblank_refs: [u32; 3],
+    /// Vblanks handled per pipe, and the last one.
+    vblanks: [u64; 3],
+    last_vblank: [Option<VblankStamp>; 3],
+    /// The last plane-1 flip done per pipe, not yet taken.
+    flip_done: [Option<VblankStamp>; 3],
+    /// `!crtc->cpu_fifo_underrun_disabled`, bit per pipe A-C.
+    underrun_reporting: u8,
 }
 
 impl Gen9IrqCore {
@@ -802,7 +898,218 @@ impl Gen9IrqCore {
             enabled: false,
             pending: 0,
             hotplug_unmasked: false,
+            de_pipe_imr: [u32::MAX; 3],
+            vblank_refs: [0; 3],
+            vblanks: [0; 3],
+            last_vblank: [None; 3],
+            flip_done: [None; 3],
+            underrun_reporting: 0,
         }
+    }
+
+    /// The owner created with the underrun reporting already asked for
+    /// (`pipes`, bit per pipe A-C) before it existed: the probe-time
+    /// modeset's `intel_set_cpu_fifo_underrun_reporting`, whose
+    /// `bdw_update_pipe_irq` found no interrupts enabled. The install
+    /// applies it.
+    pub const fn with_underrun_reporting(mut self, pipes: u8) -> Self {
+        self.underrun_reporting = pipes & 0b111;
+        self
+    }
+
+    /// Whether `pipe`'s FIFO underruns are reported
+    /// (`!crtc->cpu_fifo_underrun_disabled`).
+    pub fn underrun_reporting(&self, pipe: Pipe) -> bool {
+        pipe_index(pipe).is_some_and(|i| self.underrun_reporting & (1 << i) != 0)
+    }
+
+    /// `pipe`'s IMR as this owner keeps it (`de_pipe_imr_mask`).
+    pub fn pipe_imr(&self, pipe: Pipe) -> Option<u32> {
+        pipe_index(pipe).map(|i| self.de_pipe_imr[i])
+    }
+
+    /// The number of vblanks handled on `pipe` and the last one.
+    pub fn last_vblank(&self, pipe: Pipe) -> Option<(u64, VblankStamp)> {
+        let i = pipe_index(pipe)?;
+        self.last_vblank[i].map(|stamp| (self.vblanks[i], stamp))
+    }
+
+    /// The stamp of `pipe`'s last plane-1 flip done, taken once
+    /// (`flip_done_handler` sends `crtc->flip_done_event` and clears it).
+    pub fn take_flip_done(&mut self, pipe: Pipe) -> Option<VblankStamp> {
+        pipe_index(pipe).and_then(|i| self.flip_done[i].take())
+    }
+
+    /// `bdw_update_pipe_irq`: `pipe`'s IMR with the `interrupt_mask` bits
+    /// unmasked where `enabled_irq_mask` has them and masked elsewhere,
+    /// written (with a posting read) only when it changes. Nothing while
+    /// interrupts are disabled (`drm_WARN_ON(!intel_parent_irq_enabled)`).
+    pub fn update_pipe_irq(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+        pipe: Pipe,
+        interrupt_mask: u32,
+        enabled_irq_mask: u32,
+    ) {
+        let Some(i) = pipe_index(pipe) else {
+            return;
+        };
+        if !self.enabled {
+            return;
+        }
+        let enabled_irq_mask = enabled_irq_mask & interrupt_mask;
+        let new_val =
+            (self.de_pipe_imr[i] & !interrupt_mask) | (!enabled_irq_mask & interrupt_mask);
+        if new_val != self.de_pipe_imr[i] {
+            self.de_pipe_imr[i] = new_val;
+            io.write32(de_pipe_imr(pipe), new_val);
+            let _ = io.read32(de_pipe_imr(pipe));
+        }
+    }
+
+    /// `drm_vblank_get` → `bdw_enable_vblank`: a vblank reference on
+    /// `pipe`, `GEN8_PIPE_VBLANK` unmasked at the first. `false` (no
+    /// reference) while interrupts are disabled.
+    pub fn enable_vblank(&mut self, io: &(impl MmioWindow + ?Sized), pipe: Pipe) -> bool {
+        let Some(i) = pipe_index(pipe) else {
+            return false;
+        };
+        if !self.enabled {
+            return false;
+        }
+        self.vblank_refs[i] += 1;
+        if self.vblank_refs[i] == 1 {
+            self.update_pipe_irq(io, pipe, DE_PIPE_VBLANK, DE_PIPE_VBLANK);
+        }
+        true
+    }
+
+    /// `drm_vblank_put` → `bdw_disable_vblank`: the reference
+    /// [`Self::enable_vblank`] took dropped, `GEN8_PIPE_VBLANK` masked at
+    /// the last (i915 sets `vblank_disable_immediate`).
+    pub fn disable_vblank(&mut self, io: &(impl MmioWindow + ?Sized), pipe: Pipe) {
+        let Some(i) = pipe_index(pipe) else {
+            return;
+        };
+        if self.vblank_refs[i] == 0 {
+            return;
+        }
+        self.vblank_refs[i] -= 1;
+        if self.vblank_refs[i] == 0 {
+            self.update_pipe_irq(io, pipe, DE_PIPE_VBLANK, 0);
+        }
+    }
+
+    /// `skl_plane_enable_flip_done` for the primary (plane 1):
+    /// `GEN9_PIPE_PLANE1_FLIP_DONE` unmasked.
+    pub fn enable_flip_done(&mut self, io: &(impl MmioWindow + ?Sized), pipe: Pipe) {
+        self.update_pipe_irq(
+            io,
+            pipe,
+            GEN9_PIPE_PLANE1_FLIP_DONE,
+            GEN9_PIPE_PLANE1_FLIP_DONE,
+        );
+    }
+
+    /// `skl_plane_disable_flip_done` for the primary: masked again.
+    pub fn disable_flip_done(&mut self, io: &(impl MmioWindow + ?Sized), pipe: Pipe) {
+        self.update_pipe_irq(io, pipe, GEN9_PIPE_PLANE1_FLIP_DONE, 0);
+    }
+
+    /// `__intel_set_cpu_fifo_underrun_reporting` on display 9: the pipe's
+    /// software flag set to `enable`, then `bdw_set_fifo_underrun_reporting`
+    /// (`GEN8_PIPE_FIFO_UNDERRUN` unmasked or masked; nothing while
+    /// interrupts are disabled). Returns the previous state.
+    pub fn set_fifo_underrun_reporting(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+        pipe: Pipe,
+        enable: bool,
+    ) -> bool {
+        let Some(i) = pipe_index(pipe) else {
+            return false;
+        };
+        let old = self.underrun_reporting & (1 << i) != 0;
+        if enable {
+            self.underrun_reporting |= 1 << i;
+        } else {
+            self.underrun_reporting &= !(1 << i);
+        }
+        self.update_pipe_irq(
+            io,
+            pipe,
+            DE_PIPE_FIFO_UNDERRUN,
+            if enable { DE_PIPE_FIFO_UNDERRUN } else { 0 },
+        );
+        old
+    }
+
+    /// `gen8_irq_power_well_post_enable`: after a power well with
+    /// `irq_pipe_mask` came up, each of its pipes' quartet set up again with
+    /// its kept IMR and `IER = ~imr | POWER_WELL_EXTRA_IER`. Nothing while
+    /// interrupts are disabled (the install programs every powered pipe).
+    pub fn power_well_post_enable(&mut self, io: &(impl MmioWindow + ?Sized), pipe_mask: u8) {
+        if !self.enabled {
+            return;
+        }
+        for (i, pipe) in PIPES.into_iter().enumerate() {
+            if pipe_mask & (1 << i) != 0 {
+                let imr = self.de_pipe_imr[i];
+                irq_init(io, pipe_regs(pipe), imr, !imr | POWER_WELL_EXTRA_IER);
+            }
+        }
+    }
+
+    /// `gen8_irq_power_well_pre_disable`: before a power well with
+    /// `irq_pipe_mask` goes down, each of its pipes' quartet reset (the
+    /// caller then synchronizes the vector, `intel_parent_irq_synchronize`).
+    /// Nothing while interrupts are disabled.
+    pub fn power_well_pre_disable(&mut self, io: &(impl MmioWindow + ?Sized), pipe_mask: u8) {
+        if !self.enabled {
+            return;
+        }
+        for (i, pipe) in PIPES.into_iter().enumerate() {
+            if pipe_mask & (1 << i) != 0 {
+                irq_reset(io, pipe_regs(pipe));
+            }
+        }
+    }
+
+    /// `gen8_de_irq_handler`'s per-pipe dispatch of an acknowledged `iir`,
+    /// in its order: vblank (`intel_handle_vblank`), the plane-1 flip done
+    /// (`flip_done_handler`), the FIFO underrun
+    /// (`intel_cpu_fifo_underrun_irq_handler`). CRC and fault bits have no
+    /// consumer here (no `display_pipe_crc_irq_handler`; Linux only logs
+    /// the faults). `Err` on an all-ones frame counter.
+    fn dispatch_pipe(
+        &mut self,
+        io: &(impl MmioWindow + ?Sized),
+        pipe: Pipe,
+        iir: u32,
+        now: u64,
+        events: &mut Gen9IrqEvents,
+    ) -> Result<(), Gen9IrqError> {
+        let Some(i) = pipe_index(pipe) else {
+            return Ok(());
+        };
+        if iir & DE_PIPE_VBLANK != 0 {
+            let frame = io.read32(pipe_frmcount(pipe));
+            if frame == u32::MAX {
+                return Err(Gen9IrqError::Unavailable);
+            }
+            self.vblanks[i] = self.vblanks[i].wrapping_add(1);
+            self.last_vblank[i] = Some(VblankStamp { frame, ns: now });
+            events.vblank |= 1 << i;
+        }
+        if iir & GEN9_PIPE_PLANE1_FLIP_DONE != 0 {
+            self.flip_done[i] =
+                Some(self.last_vblank[i].unwrap_or(VblankStamp { frame: 0, ns: now }));
+            events.flip_done |= 1 << i;
+        }
+        if iir & DE_PIPE_FIFO_UNDERRUN != 0 && self.set_fifo_underrun_reporting(io, pipe, false) {
+            events.underruns |= 1 << i;
+        }
+        Ok(())
     }
 
     pub fn enabled(&self) -> bool {
@@ -839,6 +1146,12 @@ impl Gen9IrqCore {
     /// `gen8_irq_postinstall` (the GT banks, `gen8_de_irq_postinstall` on
     /// every powered pipe, DE port and DE misc), the owned hotplug pins
     /// unmasked through the monitor, and the master enabled.
+    ///
+    /// Each pipe's kept IMR starts at `gen8_de_irq_postinstall`'s
+    /// `~de_pipe_masked`; the vblank references held and the underrun
+    /// reporting armed before this install (Linux's interrupts come up
+    /// before the modeset that arms them) are unmasked in it before the
+    /// powered pipes are programmed.
     pub fn install(
         &mut self,
         io: &dyn MmioWindow,
@@ -854,9 +1167,17 @@ impl Gen9IrqCore {
             irq_init(io, gt_regs(bank), imr, ier);
         }
         let (imr, ier) = gen9_de_pipe_init();
-        for pipe in PIPES {
+        for (i, pipe) in PIPES.into_iter().enumerate() {
+            let mut kept = imr;
+            if self.vblank_refs[i] != 0 {
+                kept &= !DE_PIPE_VBLANK;
+            }
+            if self.underrun_reporting & (1 << i) != 0 {
+                kept &= !DE_PIPE_FIFO_UNDERRUN;
+            }
+            self.de_pipe_imr[i] = kept;
             if pipe_powered(io, pipe) {
-                irq_init(io, pipe_regs(pipe), imr, ier);
+                irq_init(io, pipe_regs(pipe), kept, ier);
             }
         }
         let (imr, ier) = gen9_de_port_init(self.lp);
@@ -920,11 +1241,14 @@ impl Gen9IrqCore {
     /// `display` is asked for display access (the Gen9 `DC_off` reference)
     /// only when a display source is pending, and its guard is held through
     /// the display half; refused, the display sources stay latched with the
-    /// master off for the next pass.
+    /// master off for the next pass. Each acknowledged pipe IIR is
+    /// dispatched (vblank, flip done, underrun) with `now` as the time of
+    /// any vblank it handles.
     pub fn service<G>(
         &mut self,
         io: &dyn MmioWindow,
         hotplug: &dyn Gen9Hotplug,
+        now: u64,
         display: impl FnOnce() -> Option<G>,
     ) -> Result<Gen9IrqEvents, Gen9IrqError> {
         let mut events = Gen9IrqEvents::default();
@@ -1013,6 +1337,7 @@ impl Gen9IrqCore {
             if iir != 0 {
                 io.write32(de_pipe_iir(pipe), iir);
                 events.pipes[index] = iir;
+                self.dispatch_pipe(io, pipe, iir, now, &mut events)?;
             } else {
                 events.lied |= gen8_de_pipe_irq(pipe);
             }
@@ -1092,6 +1417,98 @@ pub(crate) fn irqs_enabled_for_bar(bar: &narf_bus::MmioRegion) -> bool {
         .is_some_and(|installed| installed.controller.inner.lock().1.enabled())
 }
 
+/// The underrun reporting the modeset armed (bit per pipe A-C) while no
+/// owner was installed: the crtc's software flag, which the owner's install
+/// takes over ([`Gen9IrqCore::with_underrun_reporting`]).
+static EARLY_UNDERRUN_REPORTING: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// `intel_set_cpu_fifo_underrun_reporting` for a display-9 pipe: the crtc's
+/// software flag set and, with the owner installed and enabled,
+/// `GEN8_PIPE_FIFO_UNDERRUN` unmasked or masked (under a `DC_off`
+/// reference). Returns the previous state. The Gen9 modeset arms it at its
+/// `intel_ddi_pre_enable` point; inert on every other display.
+pub(crate) fn set_fifo_underrun_reporting(pipe: Pipe, enable: bool) -> bool {
+    let Some(i) = pipe_index(pipe) else {
+        return false;
+    };
+    let Some(installed) = owner() else {
+        use core::sync::atomic::Ordering;
+        let old = if enable {
+            EARLY_UNDERRUN_REPORTING.fetch_or(1 << i, Ordering::AcqRel)
+        } else {
+            EARLY_UNDERRUN_REPORTING.fetch_and(!(1 << i), Ordering::AcqRel)
+        };
+        return old & (1 << i) != 0;
+    };
+    let _dc = display_access(&installed.bar);
+    let mut guard = installed.controller.inner.lock();
+    let (io, core) = &mut *guard;
+    core.set_fifo_underrun_reporting(&*io, pipe, enable)
+}
+
+/// `hsw_power_well_post_enable` for display 9's PW_2: after the modeset
+/// brought the well up, pipes B and C are set up again
+/// (`gen8_irq_power_well_post_enable` with `PW_2_IRQ_PIPE_MASK`). Inert
+/// without an enabled owner (its install programs every powered pipe).
+pub(crate) fn power_well_2_post_enable() {
+    let Some(installed) = owner() else {
+        return;
+    };
+    let _dc = display_access(&installed.bar);
+    let mut guard = installed.controller.inner.lock();
+    let (io, core) = &mut *guard;
+    core.power_well_post_enable(&*io, PW_2_IRQ_PIPE_MASK);
+}
+
+/// A vblank reference on one pipe of the installed owner (`drm_vblank_get`,
+/// `bdw_enable_vblank`); dropping it is `drm_vblank_put`.
+pub(crate) struct VblankRef {
+    installed: alloc::sync::Arc<Installed>,
+    pipe: Pipe,
+}
+
+/// A held vblank reference as a waiter sees it (`drm_crtc_wait_one_vblank`
+/// waits for `drm_crtc_vblank_count` to move).
+pub(crate) trait VblankIrq {
+    /// The vblanks handled on the pipe and the last one.
+    fn last(&self) -> Option<(u64, VblankStamp)>;
+}
+
+impl VblankIrq for VblankRef {
+    fn last(&self) -> Option<(u64, VblankStamp)> {
+        self.installed
+            .controller
+            .inner
+            .lock()
+            .1
+            .last_vblank(self.pipe)
+    }
+}
+
+impl Drop for VblankRef {
+    fn drop(&mut self) {
+        let _dc = display_access(&self.installed.bar);
+        let mut guard = self.installed.controller.inner.lock();
+        let (io, core) = &mut *guard;
+        core.disable_vblank(&*io, self.pipe);
+    }
+}
+
+/// A vblank reference on `pipe` of the owner installed for `bar`, with its
+/// interrupt unmasked; `None` without an owner for this BAR, while its
+/// interrupts are disabled, or when DC states cannot be exited.
+pub(crate) fn vblank_get(bar: &narf_bus::MmioRegion, pipe: Pipe) -> Option<VblankRef> {
+    let installed = owner().filter(|installed| installed.bar.phys == bar.phys)?;
+    let taken = {
+        let _dc = display_access(&installed.bar)?;
+        let mut guard = installed.controller.inner.lock();
+        let (io, core) = &mut *guard;
+        core.enable_vblank(&*io, pipe)
+    };
+    taken.then_some(VblankRef { installed, pipe })
+}
+
 /// End of probe, with `narf.intel.gen9_irq=1` on a Gen9 display: allocate a
 /// vector, install the hard handler, program and enable MSI, then
 /// `gen8_irq_reset` + `gen8_irq_postinstall` with the owned hotplug pins
@@ -1117,8 +1534,11 @@ pub(crate) fn install(
         return false;
     };
     let window = Window::new(bar, cap);
+    let core = Gen9IrqCore::new(platform.is_lp()).with_underrun_reporting(
+        EARLY_UNDERRUN_REPORTING.load(core::sync::atomic::Ordering::Acquire),
+    );
     let controller = alloc::sync::Arc::new(Controller {
-        inner: narf_lib::sync::IrqSafeSpinLock::new((window, Gen9IrqCore::new(platform.is_lp()))),
+        inner: narf_lib::sync::IrqSafeSpinLock::new((window, core)),
     });
     if route.program(vector).is_err() {
         // Uncertain PCI delivery (the disable did not take) keeps its vector.
@@ -1209,10 +1629,16 @@ async fn service_task(installed: alloc::sync::Arc<Installed>) {
             // (stricter than Linux, whose handler takes no power domain);
             // the reference is taken only when a display source is pending,
             // so the idle watchdog never brings the display out of DC6.
+            let now = narf_time::monotonic_ns();
             let mut guard = installed.controller.inner.lock();
             let (io, core) = &mut *guard;
-            core.service(&*io, &MonitorHotplug, || display_access(&installed.bar))
+            core.service(&*io, &MonitorHotplug, now, || {
+                display_access(&installed.bar)
+            })
         };
+        if let Ok(events) = &result {
+            report_underruns(events.underruns);
+        }
         match result {
             Ok(events) if events.hotplug => crate::intel_gpu::poll_dp_hpd_events(),
             Ok(_) => {}
@@ -1222,6 +1648,21 @@ async fn service_task(installed: alloc::sync::Arc<Installed>) {
             }
         }
         let _ = wait.await;
+    }
+}
+
+/// `intel_cpu_fifo_underrun_irq_handler`'s report for each pipe whose
+/// underrun was reported this pass (its reporting is now off until the
+/// next modeset arms it).
+fn report_underruns(pipes: u8) {
+    for (i, name) in ['A', 'B', 'C'].into_iter().enumerate() {
+        if pipes & (1 << i) != 0 {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "intel-gpu: CPU pipe {name} FIFO underrun"
+            );
+        }
     }
 }
 
@@ -1913,7 +2354,7 @@ pub mod tests {
         if !core.hard_irq(&hw) || hw.log() != alloc::vec![(GEN8_MASTER_IRQ, 0)] {
             return TestResult::Fail("the hard handler only masks the master");
         }
-        let Ok(events) = core.service(&hw, &hotplug, || Some(())) else {
+        let Ok(events) = core.service(&hw, &hotplug, 0, || Some(())) else {
             return TestResult::Fail("the service pass must run");
         };
         if events.gt != [GT_RENDER_USER_IRQ, 0, 0, 0]
@@ -1950,7 +2391,7 @@ pub mod tests {
             return TestResult::Fail("no source: the master on again, not handled");
         }
         hw.set(DE_MISC_IIR, DE_MISC_EDP_PSR);
-        match core.service(&hw, &hotplug, || Some(())) {
+        match core.service(&hw, &hotplug, 0, || Some(())) {
             Ok(events) if events.misc == DE_MISC_EDP_PSR && !events.hotplug => {}
             _ => return TestResult::Fail("a lost edge is drained by the service pass"),
         }
@@ -1963,7 +2404,7 @@ pub mod tests {
         hw.set(de_pipe_iir(Pipe::A), DE_PIPE_VBLANK);
         let _ = core.hard_irq(&hw);
         let mut asked = false;
-        match core.service(&hw, &hotplug, || {
+        match core.service(&hw, &hotplug, 0, || {
             asked = true;
             None::<()>
         }) {
@@ -1973,12 +2414,12 @@ pub mod tests {
         if !asked || hw.read32(GEN8_MASTER_IRQ) & GEN8_MASTER_IRQ_CONTROL != 0 {
             return TestResult::Fail("the display sources wait with the master off");
         }
-        match core.service(&hw, &hotplug, || Some(())) {
+        match core.service(&hw, &hotplug, 0, || Some(())) {
             Ok(events) if events.pipes == [DE_PIPE_VBLANK, 0, 0] => {}
             _ => return TestResult::Fail("the next pass takes the latched display sources"),
         }
         let mut asked = false;
-        let _ = core.service(&hw, &hotplug, || {
+        let _ = core.service(&hw, &hotplug, 0, || {
             asked = true;
             Some(())
         });
@@ -2003,7 +2444,7 @@ pub mod tests {
         hw.set(DE_PORT_IIR, (1 << 4) | DE_PORT_AUX_A);
         hw.clear_log();
         let _ = core.hard_irq(&hw);
-        match core.service(&hw, &hotplug, || Some(())) {
+        match core.service(&hw, &hotplug, 0, || Some(())) {
             Ok(events) if events.hotplug && events.aux && !events.gmbus => {}
             _ => return TestResult::Fail("port B's hotplug beside AUX A"),
         }
@@ -2041,7 +2482,7 @@ pub mod tests {
         hw.set(gt_iir(0), GT_RENDER_USER_IRQ);
         hw.clear_log();
         if core.hard_irq(&hw)
-            || core.service(&hw, &hotplug, || Some(())) != Ok(Gen9IrqEvents::default())
+            || core.service(&hw, &hotplug, 0, || Some(())) != Ok(Gen9IrqEvents::default())
             || !hw.log().is_empty()
         {
             return TestResult::Fail("a suspended owner touches nothing");
@@ -2057,7 +2498,7 @@ pub mod tests {
             return TestResult::Fail("the resume installs again on a clean block");
         }
         hw.dead.set(true);
-        if core.service(&hw, &hotplug, || Some(())) != Err(Gen9IrqError::Unavailable) {
+        if core.service(&hw, &hotplug, 0, || Some(())) != Err(Gen9IrqError::Unavailable) {
             return TestResult::Fail("lost access fails the service pass");
         }
         let mut fresh = Gen9IrqCore::new(false);
@@ -2077,5 +2518,296 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gen9_irq",
         smoke_gen9_irq_owner_suspend_and_resume
+    );
+
+    /// `gen8_irq_power_well_post_enable` for PW_2 (`irq_pipe_mask =
+    /// BIT(PIPE_B) | BIT(PIPE_C)`, `intel_display_power_map.c`): with PW_2
+    /// off at the install pipes B/C are untouched; once it comes up each
+    /// pipe's quartet is set up with its kept IMR (`de_pipe_imr_mask`, here
+    /// pipe B's with the VBLANK a reference unmasked while the well was
+    /// down) and `IER = ~imr | GEN8_PIPE_VBLANK | GEN8_PIPE_FIFO_UNDERRUN |
+    /// GEN9_PIPE_PLANE1_FLIP_DONE` = 0x90000F89, a stale identity cleared
+    /// first (`assert_iir_is_zero`). `gen8_irq_power_well_pre_disable`
+    /// resets both quartets (`gen2_irq_reset`); a suspended owner does
+    /// neither.
+    fn smoke_gen9_irq_pw2_post_enable_programs_pipes_b_c() -> TestResult {
+        if PW_2_IRQ_PIPE_MASK != 0b110 || POWER_WELL_EXTRA_IER != 0x8000_0009 {
+            return TestResult::Fail("PW_2's irq_pipe_mask and extra_ier");
+        }
+        let hw = Gen9Hw::default();
+        let hotplug = Hotplug::default();
+        let mut core = Gen9IrqCore::new(false);
+        if core.install(&hw, &hotplug).is_err() || !hw.writes_to(de_pipe_ier(Pipe::B)).is_empty() {
+            return TestResult::Fail("PW_2 off at the install: pipes B/C untouched");
+        }
+        if !core.enable_vblank(&hw, Pipe::B) || core.pipe_imr(Pipe::B) != Some(0xEFFF_F07E) {
+            return TestResult::Fail("the kept IMR follows bdw_enable_vblank while PW_2 is down");
+        }
+        hw.set(de_pipe_iir(Pipe::C), DE_PIPE_VBLANK);
+        hw.clear_log();
+        core.power_well_post_enable(&hw, PW_2_IRQ_PIPE_MASK);
+        let expected = alloc::vec![
+            (de_pipe_ier(Pipe::B), 0x9000_0F89),
+            (de_pipe_imr(Pipe::B), 0xEFFF_F07E),
+            (de_pipe_iir(Pipe::C), u32::MAX),
+            (de_pipe_iir(Pipe::C), u32::MAX),
+            (de_pipe_ier(Pipe::C), 0x9000_0F89),
+            (de_pipe_imr(Pipe::C), 0xEFFF_F07F),
+        ];
+        if hw.log() != expected {
+            return TestResult::Fail("pipes B and C set up with their kept IMRs");
+        }
+        hw.clear_log();
+        core.power_well_pre_disable(&hw, PW_2_IRQ_PIPE_MASK);
+        let mut reset = Vec::new();
+        for pipe in [Pipe::B, Pipe::C] {
+            reset.extend([
+                (de_pipe_imr(pipe), u32::MAX),
+                (de_pipe_ier(pipe), 0),
+                (de_pipe_iir(pipe), u32::MAX),
+                (de_pipe_iir(pipe), u32::MAX),
+            ]);
+        }
+        if hw.log() != reset {
+            return TestResult::Fail("pre-disable resets both quartets");
+        }
+        core.suspend(&hw, &hotplug);
+        hw.clear_log();
+        core.power_well_post_enable(&hw, PW_2_IRQ_PIPE_MASK);
+        core.power_well_pre_disable(&hw, PW_2_IRQ_PIPE_MASK);
+        if !hw.log().is_empty() {
+            return TestResult::Fail("a suspended owner leaves the pipes to its install");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen9_irq",
+        smoke_gen9_irq_pw2_post_enable_programs_pipes_b_c
+    );
+
+    /// `bdw_enable_vblank` / `bdw_disable_vblank` under the drm_vblank
+    /// reference count (`vblank_disable_immediate`): the first reference
+    /// unmasks `GEN8_PIPE_VBLANK` (IMR 0xEFFFF07F -> 0xEFFFF07E, one write),
+    /// further ones write nothing, the last one masks it again; no
+    /// reference while interrupts are disabled. A handled vblank
+    /// (`drm_crtc_handle_vblank`) counts and stamps the pipe with its
+    /// `PIPE_FRMCOUNT_G4X` (0x70040 / 0x71040 / 0x72040) and the pass's
+    /// time; an all-ones counter is lost access. A reference held across a
+    /// suspend is applied by the resume's install.
+    fn smoke_gen9_irq_vblank_reference_counts_and_stamps() -> TestResult {
+        if pipe_frmcount(Pipe::A) != 0x70040
+            || pipe_frmcount(Pipe::B) != 0x71040
+            || pipe_frmcount(Pipe::C) != 0x72040
+        {
+            return TestResult::Fail("PIPE_FRMCOUNT_G4X");
+        }
+        let hw = Gen9Hw::default();
+        let hotplug = Hotplug::default();
+        let mut core = Gen9IrqCore::new(false);
+        if core.enable_vblank(&hw, Pipe::A) || !hw.log().is_empty() {
+            return TestResult::Fail("no vblank reference while interrupts are disabled");
+        }
+        let _ = core.install(&hw, &hotplug);
+        hw.clear_log();
+        if !core.enable_vblank(&hw, Pipe::A)
+            || hw.log() != alloc::vec![(de_pipe_imr(Pipe::A), 0xEFFF_F07E)]
+        {
+            return TestResult::Fail("the first reference unmasks VBLANK");
+        }
+        hw.clear_log();
+        if !core.enable_vblank(&hw, Pipe::A) || !hw.log().is_empty() {
+            return TestResult::Fail("a second reference writes nothing");
+        }
+        hw.set(pipe_frmcount(Pipe::A), 0x1234);
+        hw.set(de_pipe_iir(Pipe::A), DE_PIPE_VBLANK);
+        let _ = core.hard_irq(&hw);
+        match core.service(&hw, &hotplug, 5_000, || Some(())) {
+            Ok(events)
+                if events.vblank == 0b001 && events.flip_done == 0 && events.underruns == 0 => {}
+            _ => return TestResult::Fail("pipe A's vblank is handled"),
+        }
+        if core.last_vblank(Pipe::A)
+            != Some((
+                1,
+                VblankStamp {
+                    frame: 0x1234,
+                    ns: 5_000,
+                },
+            ))
+            || core.last_vblank(Pipe::B).is_some()
+        {
+            return TestResult::Fail("the vblank counted with its frame counter and time");
+        }
+        hw.clear_log();
+        core.disable_vblank(&hw, Pipe::A);
+        if !hw.log().is_empty() {
+            return TestResult::Fail("one reference is still held");
+        }
+        core.disable_vblank(&hw, Pipe::A);
+        if hw.log() != alloc::vec![(de_pipe_imr(Pipe::A), 0xEFFF_F07F)] {
+            return TestResult::Fail("the last reference masks VBLANK");
+        }
+        hw.clear_log();
+        core.disable_vblank(&hw, Pipe::A);
+        if !hw.log().is_empty() {
+            return TestResult::Fail("an unbalanced put writes nothing");
+        }
+        let _ = core.enable_vblank(&hw, Pipe::A);
+        core.suspend(&hw, &hotplug);
+        if core.install(&hw, &hotplug).is_err()
+            || hw.writes_to(de_pipe_imr(Pipe::A)).last() != Some(&0xEFFF_F07E)
+        {
+            return TestResult::Fail("the resume applies a reference held across it");
+        }
+        hw.set(pipe_frmcount(Pipe::A), u32::MAX);
+        hw.set(de_pipe_iir(Pipe::A), DE_PIPE_VBLANK);
+        let _ = core.hard_irq(&hw);
+        if core.service(&hw, &hotplug, 6_000, || Some(())) != Err(Gen9IrqError::Unavailable) {
+            return TestResult::Fail("an all-ones frame counter is lost access");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen9_irq",
+        smoke_gen9_irq_vblank_reference_counts_and_stamps
+    );
+
+    /// The plane-1 flip done (`skl_plane_enable_flip_done`: IMR bit 3,
+    /// 0xEFFFF077) handled after the vblank of the same IIR, so its event
+    /// carries that vblank (`flip_done_handler`'s
+    /// `drm_crtc_send_vblank_event`), sent once. FIFO underrun reporting
+    /// (`intel_fifo_underrun.c`): arming returns the old state and unmasks
+    /// `GEN8_PIPE_FIFO_UNDERRUN` (0x6FFFF07F); the first underrun is
+    /// reported and disables reporting (masked again); a later one is not
+    /// reported until the next modeset arms it. Reporting armed before the
+    /// owner existed is applied by its install; a suspended owner keeps
+    /// only the flag.
+    fn smoke_gen9_irq_flip_done_and_underrun_report_once() -> TestResult {
+        let hw = Gen9Hw::default();
+        let hotplug = Hotplug::default();
+        let mut core = Gen9IrqCore::new(false);
+        let _ = core.install(&hw, &hotplug);
+        hw.clear_log();
+        core.enable_flip_done(&hw, Pipe::A);
+        if GEN9_PIPE_PLANE1_FLIP_DONE != 1 << 3
+            || hw.log() != alloc::vec![(de_pipe_imr(Pipe::A), 0xEFFF_F077)]
+        {
+            return TestResult::Fail("skl_plane_enable_flip_done unmasks plane 1's flip done");
+        }
+        hw.set(pipe_frmcount(Pipe::A), 77);
+        hw.set(
+            de_pipe_iir(Pipe::A),
+            DE_PIPE_VBLANK | GEN9_PIPE_PLANE1_FLIP_DONE,
+        );
+        let _ = core.hard_irq(&hw);
+        match core.service(&hw, &hotplug, 9_000, || Some(())) {
+            Ok(events) if events.vblank == 1 && events.flip_done == 1 => {}
+            _ => return TestResult::Fail("the vblank and the flip done are handled"),
+        }
+        if core.take_flip_done(Pipe::A)
+            != Some(VblankStamp {
+                frame: 77,
+                ns: 9_000,
+            })
+            || core.take_flip_done(Pipe::A).is_some()
+        {
+            return TestResult::Fail("the flip-done event carries that vblank, once");
+        }
+        hw.clear_log();
+        core.disable_flip_done(&hw, Pipe::A);
+        if hw.log() != alloc::vec![(de_pipe_imr(Pipe::A), 0xEFFF_F07F)] {
+            return TestResult::Fail("skl_plane_disable_flip_done masks it again");
+        }
+        hw.clear_log();
+        if core.set_fifo_underrun_reporting(&hw, Pipe::A, true)
+            || hw.log() != alloc::vec![(de_pipe_imr(Pipe::A), 0x6FFF_F07F)]
+        {
+            return TestResult::Fail("arming unmasks the underrun and returns the old state");
+        }
+        hw.set(de_pipe_iir(Pipe::A), DE_PIPE_FIFO_UNDERRUN);
+        let _ = core.hard_irq(&hw);
+        match core.service(&hw, &hotplug, 10_000, || Some(())) {
+            Ok(events) if events.underruns == 0b001 => {}
+            _ => return TestResult::Fail("the first underrun is reported"),
+        }
+        if core.underrun_reporting(Pipe::A)
+            || core.pipe_imr(Pipe::A) != Some(0xEFFF_F07F)
+            || hw.writes_to(de_pipe_imr(Pipe::A)).last() != Some(&0xEFFF_F07F)
+        {
+            return TestResult::Fail("then reporting is off and the underrun masked");
+        }
+        hw.set(de_pipe_iir(Pipe::A), DE_PIPE_FIFO_UNDERRUN);
+        let _ = core.hard_irq(&hw);
+        match core.service(&hw, &hotplug, 11_000, || Some(())) {
+            Ok(events) if events.underruns == 0 && events.pipes[0] == DE_PIPE_FIFO_UNDERRUN => {}
+            _ => return TestResult::Fail("no second report until the next modeset"),
+        }
+        if core.set_fifo_underrun_reporting(&hw, Pipe::A, true)
+            || !core.underrun_reporting(Pipe::A)
+            || core.pipe_imr(Pipe::A) != Some(0x6FFF_F07F)
+        {
+            return TestResult::Fail("the next modeset arms it again");
+        }
+        let hw = Gen9Hw::default();
+        let mut early = Gen9IrqCore::new(false).with_underrun_reporting(0b001);
+        if early.install(&hw, &hotplug).is_err()
+            || hw.writes_to(de_pipe_imr(Pipe::A)).last() != Some(&0x6FFF_F07F)
+            || !early.underrun_reporting(Pipe::A)
+            || early.underrun_reporting(Pipe::B)
+        {
+            return TestResult::Fail("the install applies reporting armed before it");
+        }
+        early.suspend(&hw, &hotplug);
+        hw.clear_log();
+        if !early.set_fifo_underrun_reporting(&hw, Pipe::A, false) || !hw.log().is_empty() {
+            return TestResult::Fail("a suspended owner keeps the flag and writes nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen9_irq",
+        smoke_gen9_irq_flip_done_and_underrun_report_once
+    );
+
+    /// Without `narf.intel.gen9_irq=1` no owner is installed (`install`
+    /// refuses before allocating anything): the KMS vblank wait gets no
+    /// reference and reads the frame counter, PW_2's post-enable does
+    /// nothing, and the modeset's underrun arming only keeps the crtc's
+    /// software flag for an owner installed later.
+    fn smoke_gen9_irq_consumers_inert_without_the_owner() -> TestResult {
+        let mut memory = alloc::vec![0u8; 4096];
+        let bar = narf_bus::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0xb200_0000),
+            virt: memory.as_mut_ptr() as u64,
+            len: memory.len() as u64,
+            kind: narf_bus::BarKind::Mmio64 {
+                prefetchable: false,
+            },
+        };
+        if owner().is_some() {
+            // A production owner (real Gen9 silicon opted in): nothing to
+            // prove about its absence.
+            return TestResult::Pass;
+        }
+        if vblank_get(&bar, Pipe::A).is_some() {
+            return TestResult::Fail("no vblank reference without the owner");
+        }
+        power_well_2_post_enable();
+        let saved = EARLY_UNDERRUN_REPORTING.load(core::sync::atomic::Ordering::Acquire);
+        let was = set_fifo_underrun_reporting(Pipe::B, true);
+        let armed = set_fifo_underrun_reporting(Pipe::B, false);
+        let unknown = set_fifo_underrun_reporting(Pipe::D, true);
+        EARLY_UNDERRUN_REPORTING.store(saved, core::sync::atomic::Ordering::Release);
+        if was != (saved & 0b010 != 0) || !armed || unknown {
+            return TestResult::Fail("the crtc's software flag alone, pipes A-C only");
+        }
+        if memory.iter().any(|byte| *byte != 0) {
+            return TestResult::Fail("nothing is written without the owner");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gen9_irq",
+        smoke_gen9_irq_consumers_inert_without_the_owner
     );
 }

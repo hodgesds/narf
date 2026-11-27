@@ -208,6 +208,10 @@ pub(super) fn prepare<A: BootAllocator>(
             let root = spec.resident.space().root_descriptor();
             image.write32(REGS + (second + 16) * 4, (root >> 32) as u32);
             image.write32(REGS + (second + 18) * 4, root as u32);
+            // xe_lrc_init: CTX_ASID, two dwords before CTX_PDP0_UDW.
+            if spec.resident.asid() != 0 {
+                image.write32(REGS + (second + 14) * 4, spec.resident.asid());
+            }
             let address = (!spec.resident.skip_batch()).then_some(addresses[index]);
             let mut words = if lane.engine.is_media() {
                 crate::intel_gpu_engine::media_ring(

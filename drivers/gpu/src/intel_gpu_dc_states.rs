@@ -227,9 +227,11 @@ pub const DC_WRITE_MAX_REWRITES: u32 = 100;
 /// (`intel_display_power_put_async_delay(.., 17)`), in ns.
 pub const DC_REENABLE_DELAY_NS: u64 = 17_000_000;
 /// The DC targets this driver may program on display 14: the DC6
-/// component of `get_allowed_dc_mask`. DC3CO (a PSR2 exit-line
-/// feature this driver does not configure) and DC9 (the display-core
-/// uninit path this driver does not run) are never targeted.
+/// component of `get_allowed_dc_mask`. DC3CO is in Linux 7.4-rc4's mask
+/// (`max_dc` 4) but never selected there (`HAS_DC3CO` is display 35+, see
+/// [`has_dc3co`]; the Tiger Lake PSR2 exit-line DC3CO is gone), and DC9
+/// (the display-core uninit path this driver does not run) is never
+/// targeted.
 pub const XELPDP_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
 /// The display-20 targets: `get_allowed_dc_mask` caps display >= 20 at
 /// `max_dc` 2 (DC6, no DC3CO); DC9 stays untargeted as on display 14.
@@ -240,10 +242,13 @@ pub const XE2LPD_ALLOWED_DC_MASK: u32 = DC_STATE_EN_UPTO_DC6;
 /// `intel_display_power_select_target_dc_state` moves to DC3CO only for a
 /// DC3CO trigger (LOBF, panel replay or PSR2 selective update on a 1:1 CMTG
 /// pipe/port), none of which this driver configures on display 35: Panel
-/// Replay (`narf.intel.panel_replay=1`) is qualified on display 20/30 only
-/// and never with the AS SDP its trigger needs
-/// (`has_panel_replay && as_sdp_supported`), and the CMTG it would then
-/// need (`intel_cmtg.c`) is not implemented. The owned Nova panel
+/// Replay (`narf.intel.panel_replay=1`, with the AS SDP the trigger needs,
+/// `has_panel_replay && as_sdp_supported`) is qualified on display 20/30
+/// only (display 35's replay adds the PR tunneling optimization, the AS SDP
+/// skip frames, `PR_ALPM_CTL`'s DC3CO idle protocol and Wa_14026643300),
+/// there is no display-35 PSR2 or LOBF, and the CMTG DC3CO would then need
+/// (`intel_cmtg.c`: `intel_cmtg_program`, its DC3CO hardware guardband and
+/// the restore after DC6) is not implemented. The owned Nova panel
 /// is refused DC3CO with [`Dc3coRefusal::NoTrigger`]
 /// ([`xe3plpd_dc3co_refusal`] of [`Dc3coState::OWNED_NOVA_PANEL`]), so DC6
 /// stays the runtime target. DC9 belongs to display-core uninit, which this
@@ -285,7 +290,7 @@ impl Dc3coState {
     /// The owned Nova Lake-S route (`narf.intel.nvl_modeset=1`): the eDP
     /// panel alone on Pipe A and port A, with no PSR, panel replay or LOBF
     /// on display 35 (`crate::intel_gpu_psr::panel_replay` refuses display
-    /// 35 and the AS SDP).
+    /// 35).
     pub const OWNED_NOVA_PANEL: Self = Self {
         active_pipes: 1,
         edp: true,
@@ -299,9 +304,14 @@ impl Dc3coState {
     };
 }
 
-/// Why display 35 does not target DC3CO.
+/// Why a display does not target DC3CO.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dc3coRefusal {
+    /// `HAS_DC3CO` (Linux 7.4-rc4) is display 35+: below it
+    /// `intel_display_power_dc3co_supported` is false and
+    /// `intel_display_power_select_target_dc_state` keeps DC6, whatever
+    /// PSR2, replay or LOBF runs.
+    SourceUnsupported,
     /// More or fewer than one active pipe.
     NotSinglePipe,
     /// An encoder on the active pipe is not eDP.
@@ -362,6 +372,20 @@ pub const fn xe3plpd_dc3co_refusal(state: &Dc3coState) -> Dc3coRefusal {
         Ok(_) => Dc3coRefusal::CmtgUnowned,
         Err(refusal) => refusal,
     }
+}
+
+/// `HAS_DC3CO` (`intel_display_device.h`, Linux 7.4-rc4).
+pub const fn has_dc3co(display_ver: u16) -> bool {
+    display_ver >= 35
+}
+
+/// Any display's DC3CO answer: display 14 to 30 have no DC3CO source
+/// ([`has_dc3co`]), display 35 answers [`xe3plpd_dc3co_refusal`].
+pub const fn dc3co_refusal(display_ver: u16, state: &Dc3coState) -> Dc3coRefusal {
+    if !has_dc3co(display_ver) {
+        return Dc3coRefusal::SourceUnsupported;
+    }
+    xe3plpd_dc3co_refusal(state)
 }
 /// `DC_STATE_EN_CSR_MASK_CMTG_1` (display >= 20).
 pub const DC_STATE_EN_CSR_MASK_CMTG_1: u32 = 1 << 11;

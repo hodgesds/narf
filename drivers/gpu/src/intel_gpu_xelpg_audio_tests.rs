@@ -83,6 +83,8 @@ fn hdmi_stream() -> AudioStream {
         dsc_bpp_x16: None,
         ycbcr420: false,
         wa_14020863754: false,
+        mst: false,
+        sst_split_sdp: false,
     }
 }
 
@@ -220,8 +222,14 @@ fn smoke_xelpg_audio_codec_enable_disable_dp() -> TestResult {
     {
         return TestResult::Fail("hsw_audio_codec_disable's DP sequence differs from Linux");
     }
-    // UHBR: the SDP split, and the CPU transcoder in the notification.
-    let uhbr = AudioStream { uhbr: true, ..s };
+    // UHBR (intel_dp_audio_compute_config): the SDP split for MST and for an
+    // SST sink with DP_SST_SPLIT_SDP_CAP, none for one without; the CPU
+    // transcoder in the notification for UHBR SST and for MST at any rate.
+    let uhbr = AudioStream {
+        uhbr: true,
+        sst_split_sdp: true,
+        ..s
+    };
     let io = AudioFake::new();
     if codec_enable(&io, &uhbr, 307_200, 0).is_err()
         || io.writes_to(aud_dp_2dot0_ctrl(Transcoder::B)) != [AUD_ENABLE_SDP_SPLIT]
@@ -229,6 +237,21 @@ fn smoke_xelpg_audio_codec_enable_disable_dp() -> TestResult {
         || s.notify_pipe() != -1
     {
         return TestResult::Fail("UHBR audio must split SDPs and name its transcoder");
+    }
+    let no_split = AudioStream { uhbr: true, ..s };
+    let mst_uhbr = AudioStream {
+        uhbr: true,
+        mst: true,
+        ..s
+    };
+    let mst = AudioStream { mst: true, ..s };
+    if no_split.sdp_split_enable()
+        || !mst_uhbr.sdp_split_enable()
+        || mst.sdp_split_enable()
+        || mst.notify_pipe() != 1
+        || no_split.notify_pipe() != 1
+    {
+        return TestResult::Fail("the SDP split and transcoder id differ from Linux");
     }
     // The compressed 4K hblank workaround.
     let dsc = AudioStream {
@@ -542,4 +565,29 @@ fn scripted_hda_sequence() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_audio",
     smoke_xelpg_audio_component_with_scripted_hda
+);
+
+/// The display side of `snd_hdac_i915_init`'s deferral: the driver names,
+/// at its registration, the display functions whose probe binds the audio
+/// component (display 14, 20 and 30 under `narf.intel.hdmi14_ext=1`, the
+/// generations `bind_production_component` runs for), so an HDA controller
+/// probed first waits for the bind. Without the option, on a Tiger Lake
+/// display (no display-14+ component) and for another vendor it names none.
+fn smoke_xelpg_audio_component_provider_names_bound_displays() -> TestResult {
+    use crate::intel_gpu::audio_component_provided_for as provided;
+    use crate::intel_gpu::{MTL_7D55, TGL_U_GT2_9A49};
+    if !provided(true, 0x8086, MTL_7D55) || !provided(true, 0x8086, 0x64a0) {
+        return TestResult::Fail("Meteor and Lunar Lake bind the component under the option");
+    }
+    if provided(false, 0x8086, MTL_7D55)
+        || provided(true, 0x8086, TGL_U_GT2_9A49)
+        || provided(true, 0x1002, MTL_7D55)
+    {
+        return TestResult::Fail("no option, a pre-14 display or another vendor binds none");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_audio",
+    smoke_xelpg_audio_component_provider_names_bound_displays
 );

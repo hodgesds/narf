@@ -1546,3 +1546,62 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_vbt",
     vbt_firmware_copy_refuses_unmapped_ranges_before_access
 );
+
+/// `intel_bios_get_c10_vspeo`: the same rows as the C20 lookup, from table 0
+/// for a DP link at or below HBR (`port_clock <= 270000`), table 1 above it,
+/// and for eDP table 2 at or below HBR2 (`port_clock <= 540000`) and table 3
+/// above it. A child without `use_vbt_vswing` has none.
+fn vbt_c10_vspeo_tables_follow_intel_bios() -> TestResult {
+    use crate::intel_gpu_xelpg_external::tests::vspeo_block;
+    let vbt = |bit: bool| {
+        let child = Child::new(device_type::DP, dvo_port::DPB)
+            .aux(dp_aux::B)
+            .byte(23, if bit { 1 << 5 } else { 0 });
+        let image = VbtImage::new(250)
+            .block(
+                block::GENERAL_DEFINITIONS,
+                general_definitions(44, &[child]),
+            )
+            .block(block::VSWING_PREEMPH, vspeo_block(6, 3))
+            .build();
+        Vbt::parse(&image).ok()
+    };
+    let rows = |t: u8| {
+        let mut want = [(0u8, 0u8, 0u8); VSPEO_ROWS_DISPLAY14];
+        for (r, w) in want.iter_mut().enumerate() {
+            *w = (20 + r as u8 + t, t, r as u8);
+        }
+        want
+    };
+    let (Some(on), Some(off)) = (vbt(true), vbt(false)) else {
+        return TestResult::Fail("the VBTs must parse");
+    };
+    let Some(e) = on.encoder(VbtPlatform::MeteorLake, 1) else {
+        return TestResult::Fail("DDI B's DP child must be an encoder");
+    };
+    for (clock, edp, table) in [
+        (162_000, false, 0),
+        (270_000, false, 0),
+        (540_000, false, 1),
+        (810_000, false, 1),
+        (270_000, true, 2),
+        (540_000, true, 2),
+        (675_000, true, 3),
+        (810_000, true, 3),
+    ] {
+        if on.c10_vspeo(&e, clock, edp) != Some(rows(table)) {
+            return TestResult::Fail("the C10 table follows the port clock and eDP");
+        }
+    }
+    let Some(e) = off.encoder(VbtPlatform::MeteorLake, 1) else {
+        return TestResult::Fail("DDI B's DP child must be an encoder");
+    };
+    if off.c10_vspeo(&e, 162_000, false).is_some() {
+        return TestResult::Fail("no use_vbt_vswing: no C10 override");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_vbt",
+    vbt_c10_vspeo_tables_follow_intel_bios
+);

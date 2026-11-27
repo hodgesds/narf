@@ -413,7 +413,7 @@ impl LinkLimits {
     }
 
     /// The rates `limits->min_rate..=max_rate` admits, ascending.
-    fn rates(&self) -> impl Iterator<Item = u32> + '_ {
+    pub(crate) fn rates(&self) -> impl Iterator<Item = u32> + '_ {
         let max = self.max_rate();
         self.rates
             .iter()
@@ -433,7 +433,7 @@ impl LinkLimits {
     }
 
     /// `limits->min_lane_count..=max_lane_count`, doubling.
-    fn lanes(&self) -> impl Iterator<Item = u32> {
+    pub(crate) fn lanes(&self) -> impl Iterator<Item = u32> {
         let max = u32::from(self.max_lanes);
         let min = if self.use_max { max } else { 1 };
         [1u32, 2, 4]
@@ -1151,6 +1151,17 @@ fn min_compressed_bpp_x16(dpcd: &DscDpcd) -> u32 {
 /// `compute_max_compressed_bpp_x16` for one pipe, RGB, no throughput quirk
 /// (a non-branch sink: `dsc_throughput_quirk_max_bpp_x16` is `INT_MAX`).
 fn max_compressed_bpp_x16(dpcd: &DscDpcd, hdisplay: u32, pipe_max_bpp: u32, link_max: u32) -> u32 {
+    max_compressed_bpp_x16_step(dpcd, hdisplay, pipe_max_bpp, link_max, bpp_step_x16(dpcd))
+}
+
+/// [`max_compressed_bpp_x16`] aligned to `step` (`intel_dp_dsc_bpp_step_x16`).
+fn max_compressed_bpp_x16_step(
+    dpcd: &DscDpcd,
+    hdisplay: u32,
+    pipe_max_bpp: u32,
+    link_max: u32,
+    step: u32,
+) -> u32 {
     // get_max_compressed_bpp_with_joiner: small_joiner_ram_max_bpp, one pipe.
     let joiner = SMALL_JOINER_RAM_BITS / hdisplay;
     // intel_dp_dsc_sink_max_compressed_bpp: the bpp delta, else
@@ -1161,7 +1172,7 @@ fn max_compressed_bpp_x16(dpcd: &DscDpcd, hdisplay: u32, pipe_max_bpp: u32, link
         (delta, _) => u32::from(delta) >> 4,
     };
     let dsc_max = sink.min(SRC_MAX_COMPRESSED_BPP).min(joiner);
-    align_max_compressed_bpp_x16(bpp_step_x16(dpcd), pipe_max_bpp, link_max.min(dsc_max * 16))
+    align_max_compressed_bpp_x16(step, pipe_max_bpp, link_max.min(dsc_max * 16))
 }
 
 /// `intel_dp_dsc_get_slice_count` for one pipe and a non-branch sink.
@@ -1339,6 +1350,91 @@ pub fn compute_with(
         slice_count,
         num_streams,
         fec,
+        config,
+    })
+}
+
+/// Linux 7.4's DSC configuration of a DP MST stream on one pipe, RGB, at
+/// the link the MST route runs (`mst_stream_compute_link_for_joined_pipes`
+/// with DSC):
+///
+/// 1. `intel_dp_supports_dsc` and `mst_stream_compute_config_limits(dsc =
+///    true)`: the DSC pipe bpp limits from MST's 24 bpp maximum, the
+///    compressed range aligned to `intel_dp_dsc_bpp_step_x16`, which is one
+///    whole bpp for an MST connector (no forced fractional bpp);
+/// 2. `mst_stream_dsc_compute_link_config`: the pipe at its maximum and
+///    `intel_dp_mtp_tu_compute_config(dsc = true)` walking the compressed bpp
+///    down in whole steps; `fits(bpp_x16, slices)` is one bpp's MTP test at
+///    the link (`intel_dp_mst_dsc_get_slice_count` slices);
+/// 3. `intel_dp_dsc_compute_config` for MST, which keeps that link and bpp:
+///    `intel_dp_dsc_get_slice_config` and `intel_dp_dsc_compute_params`.
+///
+/// FEC follows `intel_dp_needs_8b10b_fec`: off on a 128b/132b link (8b/10b
+/// MST DSC is not a route here). The MST route does not take it yet (see
+/// `crate::intel_gpu_xelpg_external` on the stream's decompression AUX).
+#[cfg(any(test, feature = "kernel-test"))]
+pub fn compute_mst(
+    sink: &DscSink,
+    mode: &Mode,
+    max_bpp: u32,
+    link_rate: u32,
+    lanes: u8,
+    fits: &dyn Fn(u32, u8) -> bool,
+) -> Result<DscPlan, DscRefusal> {
+    let dpcd = &sink.dpcd;
+    if !dpcd.supports_dsc() {
+        return Err(DscRefusal::SinkUnsupported);
+    }
+    if !sink.fec_capable {
+        return Err(DscRefusal::FecUnsupported);
+    }
+    let hdisplay = u32::from(mode.h_active);
+    let clock = mode.pixel_clock_khz;
+    if hdisplay == 0 || clock == 0 {
+        return Err(DscRefusal::NoBppRange);
+    }
+    let (_, pipe_max) =
+        pipe_bpp_limits(dpcd, max_bpp.min(PIPE_BPP)).ok_or(DscRefusal::NoBppRange)?;
+    // intel_dp_dsc_bpp_step_x16 for an MST connector: one whole bpp.
+    let step = 16;
+    let min_x16 = round_up(
+        SRC_MIN_COMPRESSED_BPP.max(SINK_MIN_COMPRESSED_BPP) * 16,
+        step,
+    );
+    let max_x16 = max_compressed_bpp_x16_step(dpcd, hdisplay, pipe_max, pipe_max * 16, step);
+    if min_x16 == 0 || min_x16 > max_x16 {
+        return Err(DscRefusal::NoBppRange);
+    }
+    if !dpcd.supports_rgb() {
+        return Err(DscRefusal::FormatUnsupported);
+    }
+    let slices = dp_slice_count(dpcd, clock, hdisplay);
+    if slices == 0 {
+        return Err(DscRefusal::NoSliceCount);
+    }
+    let mut bpp = max_x16;
+    let bpp_x16 = loop {
+        if fits(bpp, slices) {
+            break bpp;
+        }
+        if bpp < min_x16 + step {
+            return Err(DscRefusal::NoLinkConfig);
+        }
+        bpp -= step;
+    };
+    if slices > 4 {
+        return Err(DscRefusal::SliceCountUnqualified);
+    }
+    let num_streams = if slices > 1 { 2 } else { 1 };
+    let config = compute_params(dpcd, mode, slices, pipe_max, bpp_x16 as u16)?;
+    Ok(DscPlan {
+        link_rate,
+        lanes,
+        pipe_bpp: pipe_max,
+        compressed_bpp_x16: bpp_x16 as u16,
+        slice_count: slices,
+        num_streams,
+        fec: link_rate < 1_000_000,
         config,
     })
 }

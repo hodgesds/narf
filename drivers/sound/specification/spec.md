@@ -151,7 +151,12 @@ with `register_display_audio_codec`, and the display side calls
 for `-ENODEV`, `Invalid` for `-EINVAL`). No lock is held across a call into
 either half. The Intel display-14+ routes bind a component under
 `narf.intel.hdmi14_ext=1`, and the HDA driver's Intel HDMI codec registers
-the codec half when it binds to it.
+the codec half when it binds to it. The bind order follows
+`snd_hdac_i915_init`'s -EPROBE_DEFER: the display driver states at its
+registration which display functions it binds a component for
+(`register_display_audio_provider`, read with `display_audio_provided`),
+and an HDA probe that finds such a display unbound waits for
+`DisplayAudioBound`, which `bind_display_audio_component` completes.
 
 ### 3.1 Linux ALSA PCM and control ABI
 

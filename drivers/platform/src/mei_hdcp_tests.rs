@@ -90,19 +90,30 @@ fn smoke_mei_hdcp_component_match() -> TestResult {
     }
     // Display 12/13 PCHs, then the claimed display 9 PCHs whose platforms
     // is_hdcp2_supported admits (CNP-H 0xA360, CMP-LP 0x02E0, CMP-H
-    // 0x06E0): Meteor Lake and later use the GSC.
+    // 0x06E0), then the display 9-11 PCHs the MEI driver claims with the
+    // option (SPT 0x9D3A, SPT-H 0xA13A, KBP 0xA2BA, CNP-LP 0x9DE0, ICP-LP
+    // 0x34E0, ICP-N 0x38E0, JSP-N 0x4DE0, MCC 0x4B70): Meteor Lake and
+    // later use the GSC.
     if hdcp::HDCP_HECI_IDS
         != [
-            0xA0E0, 0x43E0, 0x7AE8, 0x7A60, 0x51E0, 0x54E0, 0x7A68, 0xA360, 0x02E0, 0x06E0,
+            0xA0E0, 0x43E0, 0x7AE8, 0x7A60, 0x51E0, 0x54E0, 0x7A68, 0xA360, 0x02E0, 0x06E0, 0x9D3A,
+            0xA13A, 0xA2BA, 0x9DE0, 0x34E0, 0x38E0, 0x4DE0, 0x4B70,
         ]
     {
-        return TestResult::Fail("HDCP HECI ids differ from TGP / ADP / RPL / CNP-H / CMP");
+        return TestResult::Fail(
+            "HDCP HECI ids differ from TGP / ADP / RPL / CNP / CMP / SPT / KBP / ICP / JSP / MCC",
+        );
     }
+    // Every one is claimed by the MEI driver once the option is on, the
+    // display 9-11 ones only then.
     if hdcp::HDCP_HECI_IDS
         .iter()
-        .any(|&did| !mei::is_supported_device(did))
+        .any(|&did| !mei::claims(did, true))
+        || hdcp::HDCP_HECI_IDS[10..]
+            .iter()
+            .any(|&did| mei::claims(did, false))
     {
-        return TestResult::Fail("HDCP HECI id the MEI driver does not claim");
+        return TestResult::Fail("HDCP HECI id the MEI driver does not claim with the option");
     }
     if hdcp::heci_carries_hdcp(mei::MEI_DEV_MTL_M) || hdcp::heci_carries_hdcp(mei::MEI_DEV_PTL_H) {
         return TestResult::Fail("HDCP client bound on a GSC-era HECI");
@@ -252,3 +263,63 @@ fn smoke_mei_hdcp_refusals() -> TestResult {
     r
 }
 kernel_test_in!("drivers/platform/mei", smoke_mei_hdcp_refusals);
+
+/// The MEI HDCP client on the display 9-11 PCHs (`mei_hdcp.c`'s
+/// `mei_hdcp_probe` is the same on every HECI that carries the UUID): on
+/// each HECI-1 the MEI driver claims with the option, over firmware that
+/// runs HBM 2.0 only, the client binds the built-in display and relays a
+/// display 9-11 command unchanged (`hdcp_port_id` {INTEGRATED, HDCP_DDI_B,
+/// no transcoder}: `initialize_hdcp_port_data` below display 12). An
+/// iTouch function (SPT_3 0x9D3E) is refused before any I/O.
+fn hdcp_binds_on_display9_11_pchs() -> TestResult {
+    for &did in mei::HDCP_GATED_DEVICE_IDS {
+        let model = HeciModel::new(32, 32, vec![client()]);
+        model.set_fw_hbm_version(2, 0);
+        let Some(dev) = up_as(&model, did) else {
+            return TestResult::Fail("bring-up failed at HBM 2.0");
+        };
+        let bound = match hdcp::probe(&dev) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("HDCP probe failed on a display 9-11 PCH"),
+        };
+        let Some(b) = registry::lookup(&igpu()) else {
+            return TestResult::Fail("built-in display did not bind");
+        };
+        let mut command = header(0x0003_1000, 5, [1, 1, 0, 0]);
+        command.push(2);
+        let mut reply = header(0x0003_1000, 15, [1, 1, 0, 0]);
+        reply.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1, 2, 0, 0]);
+        model.set_reply(HDCP, Reply::Bytes(reply.clone()));
+        let mut out = [0u8; 31];
+        if b.exchange(&command, &mut out) != Ok(31)
+            || out[..] != reply[..]
+            || model.delivered() != [(HDCP, bound.client.handle().host_addr, command)]
+        {
+            return TestResult::Fail("display 9-11 command did not round-trip");
+        }
+        if hdcp::remove(&bound).is_err() || registry::lookup(&igpu()).is_some() {
+            return TestResult::Fail("remove did not unbind");
+        }
+    }
+    let model = HeciModel::new(32, 32, vec![client()]);
+    let Some(dev) = up_as(&model, 0x9D3E) else {
+        return TestResult::Fail("bring-up failed");
+    };
+    if hdcp::probe(&dev).err() != Some(HdcpProbeError::NotHdcpHeci(0x9D3E))
+        || model.conn_count() != 0
+    {
+        return TestResult::Fail("HDCP client bound on an iTouch function");
+    }
+    TestResult::Pass
+}
+
+fn smoke_mei_hdcp_binds_on_display9_11_pchs() -> TestResult {
+    registry::__reset_for_test();
+    let r = hdcp_binds_on_display9_11_pchs();
+    registry::__reset_for_test();
+    r
+}
+kernel_test_in!(
+    "drivers/platform/mei",
+    smoke_mei_hdcp_binds_on_display9_11_pchs
+);

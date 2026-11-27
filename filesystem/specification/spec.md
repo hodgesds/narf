@@ -582,6 +582,19 @@ fn install_sync_file(
 fn restart_after(&self, repoll_ns: u64) -> bool; // default false
 fn pin_user_pages(&self, address: u64, pages: u64, writable: bool)
     -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError>; // default Unsupported
+fn remote_mm(&self) -> Option<Arc<dyn RemoteMm>>; // default None (Linux mmgrab)
+
+/// A driver's hold on the caller's address space, usable from any context
+/// while it has users (mmget_not_zero): pin_user_pages faults in and resolves
+/// COW remotely, mmu_interval_notifier watches it, identity names it.
+pub trait RemoteMm: Send + Sync + Debug {
+    fn pin_user_pages(&self, address: u64, pages: u64, writable: bool)
+        -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError>;
+    fn mmu_interval_notifier(&self, address: u64, length: u64,
+        ops: Arc<dyn narf_memory::mmu_notifier::MmuIntervalNotifierOps>)
+        -> Result<narf_memory::mmu_notifier::MmuIntervalNotifier, FsError>;
+    fn identity(&self) -> u64;
+}
 
 pub trait MmapLifetime: Any + Send + Sync {} // blanket impl; providers downcast
 
