@@ -139,10 +139,11 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Subsys, "mt76", || {
         #[cfg(not(feature = "mt76-module-only"))]
         mt76::register();
-        // mt76.ko owns the CONNAC2 PCI ids; the private copy-mode family
-        // host stays registered for frontends built against it.
+        // mt76.ko owns the CONNAC2 PCI ids and runs the driver in-module
+        // over the generic WIFI host; nothing is registered built in (the
+        // retired copy-mode family host is gone).
         #[cfg(feature = "mt76-module-only")]
-        mt76::register_host_only();
+        {}
         // Actual S0Idle/S3 targets reach the retained mt76 wake owner.
         narf_power::system_pm::register_async_system_pm(
             "mt76",

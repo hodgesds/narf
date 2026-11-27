@@ -297,36 +297,6 @@ fn probe_with_policy(
     Ok(())
 }
 
-/// Loadable frontend discovery uses the exact existing bus probe cap. It may
-/// not alias a built-in binding, and firmware starts only from its retained
-/// INITIALIZE operation. No module-supplied address manufactures a PCI grant.
-pub(crate) fn module_discover(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<u64, i32> {
-    if is_probed() || FIRMWARE_BINDING.lock().is_some() {
-        return Err(-16);
-    }
-    probe_with_policy(device, cap, false).map_err(|_| -5)?;
-    let binding = *FIRMWARE_BINDING.lock();
-    if !binding.is_some_and(|(bound, authority)| {
-        bound.addr == device.addr && authority.slot() == cap.slot()
-    }) {
-        return Err(-19);
-    }
-    Ok(generation())
-}
-
-pub(crate) fn module_generation_current(expected: u64) -> bool {
-    expected & 1 != 0 && generation() == expected
-}
-
-/// Close only this exact generation. The established remove path withdraws
-/// publication first and either proves retirement or retains uncertain DMA.
-pub(crate) fn module_remove(device: BusDevice, cap: Cap<BusDeviceCap, Write>, expected: u64) {
-    remove_expected(device, cap, Some(expected));
-}
-
 /// Stage-0 + Stage-1: BAR0 map, chip-ID read, driver-own latch,
 /// firmware-load stub, EFUSE read.
 ///

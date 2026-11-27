@@ -81,8 +81,9 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # in; QCA6390 and QCN9074 have no claimant in this configuration.
 ath11k-module-only = []
 # Leave the built-in mt76's PCI ids (MT7921/MT7922/MT7961/MT7920) unclaimed so
-# an early-loaded mt76.ko owns the function. The private mt76 copy-mode family
-# host stays registered.
+# an early-loaded mt76.ko owns the function. Nothing is registered built in:
+# the retired copy-mode family host is gone and the module runs over the
+# generic WIFI host.
 mt76-module-only = []
 
 # Leave the built-in ath10k's PCI ids (and its system-PM hook) unregistered
