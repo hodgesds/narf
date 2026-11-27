@@ -386,7 +386,12 @@ impl MtlMstRoute {
             let (pbn, slots) = match &stream {
                 Some(s) => (s.pbn, u32::from(s.slots)),
                 None => {
-                    let pbn = crate::dp_mst::calc_pbn_mode(mode.pixel_clock_khz, 24 * 16);
+                    // intel_dp_compute_config_limits: MST streams stop at
+                    // 8 bpc (deep colour is not taken over MST).
+                    let pbn = crate::dp_mst::calc_pbn_mode(
+                        mode.pixel_clock_khz,
+                        super::color::MST_MAX_PIPE_BPP * 16,
+                    );
                     (
                         pbn,
                         crate::dp_mst::time_slots(pbn, crate::dp_mst::pbn_div(link_kbps)),
@@ -438,7 +443,9 @@ impl MtlMstRoute {
                 edid: Box::new([0; EDID_CAPACITY]),
                 edid_len: 128,
                 dsc: None,
-                pipe_bpp: stream.as_ref().map_or(24, |s| s.pipe_bpp),
+                pipe_bpp: stream
+                    .as_ref()
+                    .map_or(super::color::MST_MAX_PIPE_BPP, |s| s.pipe_bpp),
                 uhbr: uhbr.zip(stream.as_ref()).map(|(u, s)| uhbr_plan(&u, s)),
                 output: super::color::DpOutput::default(),
                 audio: None,

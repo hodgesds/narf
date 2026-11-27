@@ -413,7 +413,7 @@ impl LinkLimits {
     }
 
     /// The rates `limits->min_rate..=max_rate` admits, ascending.
-    fn rates(&self) -> impl Iterator<Item = u32> + '_ {
+    pub(crate) fn rates(&self) -> impl Iterator<Item = u32> + '_ {
         let max = self.max_rate();
         self.rates
             .iter()
@@ -433,7 +433,7 @@ impl LinkLimits {
     }
 
     /// `limits->min_lane_count..=max_lane_count`, doubling.
-    fn lanes(&self) -> impl Iterator<Item = u32> {
+    pub(crate) fn lanes(&self) -> impl Iterator<Item = u32> {
         let max = u32::from(self.max_lanes);
         let min = if self.use_max { max } else { 1 };
         [1u32, 2, 4]

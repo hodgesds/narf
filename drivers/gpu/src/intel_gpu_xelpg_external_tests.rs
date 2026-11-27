@@ -6861,6 +6861,150 @@ kernel_test_in!(
     smoke_mtl_external_dp_ycbcr444_pcon_route
 );
 
+/// The DP YCbCr 4:2:0 route (`narf.intel.hdmi14_ext=1`): a native DP sink
+/// whose 4K60 mode is 4:2:0-only (a Y420VDB naming VIC 97) and that
+/// advertises `DP_VSC_SDP_EXT_FOR_COLORIMETRY_SUPPORTED` (DPCD 0x2210 bit
+/// 3). `intel_dp_output_format` drives YCbCr 4:2:0 on the link and
+/// `intel_dp_compute_link_config_wide` runs at 12 link bpp: 891000 kBps on
+/// HBR x4. The route carries it in the MSA (8 bpc | `SYNC_CLOCK` |
+/// `DP_MSA_MISC_COLOR_VSC_SDP` = 0x4021), `intel_link_compute_m_n` at 12
+/// bpp (data M/N 891000/1080000 at N 0x8000000 reduced to 0x699999 /
+/// 0x800000 with TU 64; link M/N 594000/270000 at N 0x80000), `PIPE_MISC`
+/// YUV 4:2:0, the 1:1 scaler and the BT.709 output CSC, and the VSC SDP
+/// (`drm_dp_vsc_sdp_pack`: HB 00 07 05 13, DB16 0x31, DB17 0x81) with
+/// `VIDEO_DIP_ENABLE_VSC_HSW | VSC_DIP_HW_DATA_SW_HEA`; the stop clears the
+/// VSC enable, the scaler, the CSC and the YUV encoding and restores the
+/// 8 bpc RGB MSA. Without the option the sink runs RGB on HBR2 x4.
+fn smoke_mtl_external_dp_ycbcr420_route() -> TestResult {
+    use crate::intel_gpu_xelpg_external::color::tests;
+    let edid = tests::edid_4k60_with(&[(7 << 5) | 2, 0x0E, 97]);
+    let mut sink = Sink::new(0x14, edid.clone());
+    sink.extra.push((0x2210, 0x08));
+    let io = ExtFake::new(XeLpgPort::B, sink);
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let probe = match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, true) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("the 4:2:0 DP sink must probe"),
+    };
+    if !probe.output.ycbcr420
+        || probe.output.ycbcr444
+        || probe.output.pcon.is_some()
+        || !probe.output.vsc_colorimetry()
+        || probe.pipe_bpp != 24
+        || (probe.negotiated.rate, probe.negotiated.lanes) != (TrainRate::Hbr, 4)
+    {
+        return TestResult::Fail("the sink must take YCbCr 4:2:0 at 24 bpp on HBR x4");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the YCbCr 4:2:0 route must light"),
+    };
+    let pipe = Pipe::B;
+    let misc = pipe.base() + crate::intel_gpu_xelpg_dsc::PIPE_MISC_OFFSET;
+    let csc_mode = 0x4_9028 + 0x100 * pipe as u64;
+    let ps_ctrl = crate::intel_gpu_xelpg_scaler::ps_ctrl(pipe, 0);
+    let yuv = crate::intel_gpu_modeset::PIPE_MISC_YCBCR420;
+    if io.writes_to(0x6_1410) != [0x4021]
+        || io.writes_to(0x6_1030) != [(63 << 25) | 0x69_9999]
+        || io.writes_to(0x6_1034) != [0x80_0000]
+        || io.writes_to(0x6_1040) != [1_153_433]
+        || io.writes_to(0x6_1044) != [0x8_0000]
+    {
+        return TestResult::Fail("the MSA and M/N must carry 4:2:0 at 12 link bpp");
+    }
+    if io.read32(misc) & yuv != yuv
+        || io.read32(csc_mode) & (1 << 30) == 0
+        || io.read32(ps_ctrl) & (1 << 31) == 0
+    {
+        return TestResult::Fail("the pipe must run PIPE_MISC YUV 4:2:0, the scaler and CSC");
+    }
+    let vsc_on = (1 << 20) | (2 << 25);
+    if io.read32(0x6_1320) != 0x1305_0700
+        || io.read32(0x6_1334) != 0x8131
+        || (0x6_1324..0x6_1344)
+            .step_by(4)
+            .filter(|&r| r != 0x6_1334)
+            .any(|r| io.read32(r) != 0)
+        || io.writes_to(0x6_1320 + 32).len() != 1
+        || io.read32(0x6_1200) & vsc_on != vsc_on
+    {
+        return TestResult::Fail("the VSC SDP must carry the 4:2:0 colorimetry");
+    }
+    if route.stop(&io).is_err()
+        || io.read32(0x6_1410) != 0x21
+        || io.read32(0x6_1200) & (1 << 20) != 0
+        || io.read32(misc) & yuv != 0
+        || io.read32(csc_mode) & (1 << 30) != 0
+        || io.read32(ps_ctrl) != 0
+    {
+        return TestResult::Fail("the stop must clear the VSC SDP, the 4:2:0 pipe and the MSA");
+    }
+    // narf.intel.hdmi14_ext off: the 4:2:0-only mode runs RGB (Linux's
+    // second pass) at 24 bpp on HBR2 x4.
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x14, edid));
+    match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, false) {
+        Ok(p) if !p.output.ycbcr420
+            && (p.negotiated.rate, p.negotiated.lanes) == (TrainRate::Hbr2, 4) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("without the option the 4:2:0-only mode runs RGB"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_ycbcr420_route
+);
+
+/// `intel_dp_compute_formats`' 4:2:0 fallback on the DP route
+/// (`narf.intel.hdmi14_ext=1`): a 4:2:0-also 4K60 sink (a Y420CMDB marking
+/// VIC 97) on an HBR x4 link (1080000 kBps) carries no RGB (24 bpp needs
+/// 1782000, 18 bpp 1336500), so the second try takes YCbCr 4:2:0 at 24 bpp
+/// (891000). Without the sink's VSC SDP colorimetry the MSA has no VSC
+/// delegation (0x21) and no VSC SDP is sent (`intel_dp_needs_vsc_colorimetry`).
+/// Without the option the RGB route is over budget.
+fn smoke_mtl_external_dp_ycbcr420_also_fallback() -> TestResult {
+    use crate::intel_gpu_xelpg_external::color::tests;
+    let edid = tests::edid_4k60_with(&tests::DP_420_ALSO_BLOCKS);
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x0A, edid.clone()));
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let probe = match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, true) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("the 4:2:0-also sink must fall back to 4:2:0"),
+    };
+    if !probe.output.ycbcr420
+        || probe.output.vsc_colorimetry()
+        || probe.pipe_bpp != 24
+        || (probe.negotiated.rate, probe.negotiated.lanes) != (TrainRate::Hbr, 4)
+    {
+        return TestResult::Fail("the fallback must take 4:2:0 at 24 bpp on HBR x4");
+    }
+    let fb = fb_for(&probe.mode).unwrap();
+    let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+        Ok(route) if route.state() == RouteState::Live => route,
+        _ => return TestResult::Fail("the 4:2:0 fallback route must light"),
+    };
+    if io.writes_to(0x6_1410) != [0x21]
+        || !io.writes_to(0x6_1320).is_empty()
+        || io.read32(0x6_1200) & (1 << 20) != 0
+    {
+        return TestResult::Fail("a sink without VSC colorimetry gets no VSC SDP");
+    }
+    if route.stop(&io).is_err() {
+        return TestResult::Fail("the fallback route must stop");
+    }
+    let io = ExtFake::new(XeLpgPort::B, Sink::new(0x0A, edid));
+    match probe_sink_profile_ext(&io, profile, XeLpgPort::B, false, false) {
+        Err(ExternalError::OverBudget { .. }) => TestResult::Pass,
+        _ => TestResult::Fail("without the option the RGB route is over budget"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_dp_ycbcr420_also_fallback
+);
+
 /// The DP route's ELD/audio enable sequence with a scripted HDA side
 /// (`narf.intel.hdmi14_ext=1`): after the plane update the route runs
 /// `enable_audio_dsc_wa`'s `HBLANK_EARLY_ENABLE_TGL` for Transcoder B,

@@ -203,7 +203,8 @@ pub(crate) fn edid_4k60_with(blocks: &[u8]) -> Vec<u8> {
 
 /// `drm_dp_downstream_420_passthrough` / `_444_to_420_conversion` /
 /// `_rgb_to_ycbcr_conversion`, then `intel_dp_compute_formats`,
-/// `intel_dp_output_format` and `intel_dp_configure_protocol_converter`'s
+/// `intel_dp_output_format` (RGB, YCbCr 4:4:4 into a converting PCON, or
+/// YCbCr 4:2:0 on the link) and `intel_dp_configure_protocol_converter`'s
 /// decisions, and `intel_ddi_set_dp_msa`'s 4:4:4 colorimetry.
 fn smoke_xelpg_dp_ycbcr444_output_format() -> TestResult {
     // DPCD 1.4 branch with detailed downstream capabilities; DFP 0 HDMI.
@@ -228,57 +229,73 @@ fn smoke_xelpg_dp_ycbcr444_output_format() -> TestResult {
     let Ok(mode) = crate::intel_gpu_dp::mode_from_edid(&edid) else {
         return TestResult::Fail("the 4K60 EDID must give its preferred mode");
     };
+    // An HDMI DFP: drm_dp_downstream_min_tmds_clock is 25 MHz.
     let output = |dpcd: &[u8], byte3: u8, edid: &[u8]| {
-        dp_output(dpcd, dfp_caps(dpcd, &hdmi(byte3)), edid, &mode)
+        let min_tmds = if dp_is_branch(dpcd) { 25_000 } else { 0 };
+        dp_output(dpcd, dfp_caps(dpcd, &hdmi(byte3)), min_tmds, edid, &mode)
     };
     // 4:4:4->4:2:0 only: the pipe drives YCbCr 4:4:4, the PCON converts.
     if output(&dpcd, 0x10, &edid)
-        != Ok(DpOutput {
+        != (DpOutput {
             ycbcr444: true,
             pcon: Some(PconConfig {
                 hdmi_sink: true,
                 ycbcr444_to_420: true,
                 rgb_to_ycbcr: false,
             }),
+            ..DpOutput::default()
         })
     {
         return TestResult::Fail("a 4:4:4->4:2:0 PCON must take a YCbCr 4:4:4 pipe");
     }
     // RGB->YCbCr and 4:4:4->4:2:0: RGB out, both conversions on.
     if output(&dpcd, 0x50, &edid)
-        != Ok(DpOutput {
-            ycbcr444: false,
+        != (DpOutput {
             pcon: Some(PconConfig {
                 hdmi_sink: true,
                 ycbcr444_to_420: true,
                 rgb_to_ycbcr: true,
             }),
+            ..DpOutput::default()
         })
     {
         return TestResult::Fail("an RGB->YCbCr PCON must keep the pipe RGB");
     }
-    // A passthrough DFP or a native sink would need DP 4:2:0: refused.
+    // A passthrough DFP or a native sink: YCbCr 4:2:0 on the DP link
+    // (intel_dp_output_format's last case); the PCON converts nothing.
     let native = [0x14u8, 0, 0, 0, 0, 0];
-    if output(&dpcd, 0x04, &edid) != Err(ColorRefusal::Ycbcr420Output)
-        || output(&native, 0, &edid) != Err(ColorRefusal::Ycbcr420Output)
-    {
-        return TestResult::Fail("a DP 4:2:0 output must refuse");
-    }
-    // No conversion and no passthrough: 4:2:0 is not allowed, so RGB.
-    if output(&dpcd, 0x00, &edid)
-        != Ok(DpOutput {
-            ycbcr444: false,
+    if output(&dpcd, 0x04, &edid)
+        != (DpOutput {
+            ycbcr420: true,
             pcon: Some(PconConfig {
                 hdmi_sink: true,
                 ..PconConfig::default()
             }),
+            ..DpOutput::default()
+        })
+        || output(&native, 0, &edid)
+            != (DpOutput {
+                ycbcr420: true,
+                ..DpOutput::default()
+            })
+    {
+        return TestResult::Fail("a native or passthrough 4:2:0 sink must take DP 4:2:0");
+    }
+    // No conversion and no passthrough: 4:2:0 is not allowed, so RGB.
+    if output(&dpcd, 0x00, &edid)
+        != (DpOutput {
+            pcon: Some(PconConfig {
+                hdmi_sink: true,
+                ..PconConfig::default()
+            }),
+            ..DpOutput::default()
         })
     {
         return TestResult::Fail("a 4:2:0 sink the DFP cannot feed must fall back to RGB");
     }
     // A mode that is not 4:2:0-only stays RGB on a native sink, no PCON.
     let rgb = edid_4k60_with(&HDMI_420_ONLY_BLOCKS[..6]);
-    if output(&native, 0, &rgb) != Ok(DpOutput::default()) {
+    if output(&native, 0, &rgb) != DpOutput::default() {
         return TestResult::Fail("a native RGB sink must keep RGB without PCON writes");
     }
     // DP_MSA_MISC_COLOR_YCBCR_444_BT709 = 0x1C beside SYNC_CLOCK | 8_BPC.
@@ -290,4 +307,208 @@ fn smoke_xelpg_dp_ycbcr444_output_format() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_color",
     smoke_xelpg_dp_ycbcr444_output_format
+);
+
+/// A 4K60 DP sink that takes VIC 97 in YCbCr 4:2:0 too
+/// (`drm_mode_is_420_also`): a Video Data Block with SVD 97 and a
+/// YCbCr 4:2:0 Capability Map Data Block naming its first SVD.
+pub(crate) const DP_420_ALSO_BLOCKS: [u8; 5] = [(2 << 5) | 1, 97, (7 << 5) | 2, 0x0F, 0x01];
+
+/// DP YCbCr 4:2:0 output (`narf.intel.hdmi14_ext=1`), from Linux 7.4
+/// `intel_dp.c` and `drm_dp_helper.c`:
+/// - `intel_dp_output_format_link_bpp_x16` halves the pipe's bits, and
+///   `intel_dp_compute_link_config_wide` walks the pipe bpp from the
+///   maximum down to `intel_dp_min_bpp` (24 for YCbCr): 4K60 (594 MHz)
+///   4:2:0 at 24 bpp needs 594000 * 12 / 8 = 891000 kBps, so HBR x4
+///   (1080000) carries it where RGB needs HBR2 x4; a 10 bpc pipe (15 link
+///   bpp, 1113750 kBps) takes HBR2 x4.
+/// - `intel_dp_needs_vsc_colorimetry`: only with the sink's
+///   `DP_VSC_SDP_EXT_FOR_COLORIMETRY_SUPPORTED`; `intel_ddi_set_dp_msa`
+///   then adds `DP_MSA_MISC_COLOR_VSC_SDP` (1 << 14).
+/// - `intel_dp_compute_vsc_colorimetry` / `drm_dp_vsc_sdp_pack`: HB1 7,
+///   revision 5, length 0x13, DB16 = YUV420 (3) << 4 | BT709_YCC (1), DB17 =
+///   the bpc code | CTA range (0x81 at 8 bpc, 0x82 at 10, 0x83 at 12).
+/// - `intel_dp_compute_formats`' fallback: a 4:2:0-also mode takes the
+///   4:2:0 sink format only as the second try; a 4:2:0-only mode never
+///   offers it.
+fn smoke_xelpg_dp_ycbcr420_link_msa_vsc() -> TestResult {
+    let mode = match crate::intel_gpu_dp::mode_from_edid(&edid_4k60_with(&HDMI_420_ONLY_BLOCKS))
+    {
+        Ok(mode) => mode,
+        Err(_) => return TestResult::Fail("the 4K60 EDID must give its preferred mode"),
+    };
+    let y420 = DpOutput {
+        ycbcr420: true,
+        ..DpOutput::default()
+    };
+    let limits = dsc::LinkLimits::standard(810_000, 4);
+    match (
+        output_link(&limits, &mode, 24, &y420),
+        output_link(&limits, &mode, 30, &y420),
+        output_link(&limits, &mode, 24, &DpOutput::default()),
+    ) {
+        (Some(a), Some(b), Some(rgb))
+            if (a.pipe_bpp, a.link_rate, a.lanes) == (24, 270_000, 4)
+                && (b.pipe_bpp, b.link_rate, b.lanes) == (30, 540_000, 4)
+                && (rgb.pipe_bpp, rgb.link_rate, rgb.lanes) == (24, 540_000, 4) => {}
+        _ => return TestResult::Fail("the 4:2:0 link search must run at half the pipe bpp"),
+    }
+    // Nothing below 24 bpp for YCbCr: RBR x4 (648000) carries no 4K60 4:2:0.
+    if output_link(&dsc::LinkLimits::standard(162_000, 4), &mode, 36, &y420).is_some()
+        || y420.min_bpp() != 24
+        || DpOutput::default().min_bpp() != 18
+        || y420.link_bpp(30) != 15
+    {
+        return TestResult::Fail("intel_dp_min_bpp is 24 for a YCbCr output");
+    }
+    let vsc = DpOutput {
+        dprx: DP_VSC_SDP_EXT_FOR_COLORIMETRY_SUPPORTED,
+        ..y420
+    };
+    if y420.vsc_colorimetry()
+        || !vsc.vsc_colorimetry()
+        || msa_misc_output(24, &vsc) != 0x4021
+        || msa_misc_output(24, &y420) != 0x21
+        || msa_misc_output(30, &vsc) != 0x4041
+    {
+        return TestResult::Fail("the VSC SDP delegation needs the sink's colorimetry support");
+    }
+    let mut want = [0u8; 36];
+    want[1] = 0x07;
+    want[2] = 0x05;
+    want[3] = 0x13;
+    want[20] = 0x31;
+    for (bpp, db17) in [(24u32, 0x81u8), (30, 0x82), (36, 0x83)] {
+        want[21] = db17;
+        if vsc_sdp_ycbcr420(bpp) != want {
+            return TestResult::Fail("the VSC SDP differs from drm_dp_vsc_sdp_pack");
+        }
+    }
+    // A 4:2:0-also mode: RGB first, 4:2:0 as the fallback; a 4:2:0-only
+    // mode has no fallback; an RGB-only mode none either.
+    let native = [0x14u8, 0, 0, 0, 0, 0];
+    let also = edid_4k60_with(&DP_420_ALSO_BLOCKS);
+    let only = edid_4k60_with(&HDMI_420_ONLY_BLOCKS);
+    let rgb = edid_4k60_with(&HDMI_420_ONLY_BLOCKS[..6]);
+    if dp_output(&native, DfpCaps::default(), 0, &also, &mode) != DpOutput::default()
+        || dp_output_420_also(&native, DfpCaps::default(), 0, &also, &mode) != Some(y420)
+        || dp_output_420_also(&native, DfpCaps::default(), 0, &only, &mode).is_some()
+        || dp_output_420_also(&native, DfpCaps::default(), 0, &rgb, &mode).is_some()
+    {
+        return TestResult::Fail("intel_dp_compute_formats' 4:2:0 fallback differs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_color",
+    smoke_xelpg_dp_ycbcr420_link_msa_vsc
+);
+
+/// Deep colour through a branch device (`narf.intel.hdmi14_ext=1`):
+/// `drm_dp_downstream_max_bpc`, `_min_tmds_clock`, `_max_tmds_clock` and
+/// `_max_dotclock` of DFP 0, then `intel_dp_max_bpp` with
+/// `intel_dp_hdmi_compute_bpc` (`intel_hdmi_sink_bpc_possible`,
+/// `intel_dp_tmds_clock_valid` against the DFP and the sink's
+/// `max_tmds_clock`), and Linux's 8 bpc MST ceiling.
+fn smoke_xelpg_dp_branch_dfp_limits_and_depth() -> TestResult {
+    use crate::intel_gpu_hdmi::SinkFormat;
+    let mut detailed = [0u8; 16];
+    detailed[0] = 0x14;
+    detailed[DP_DOWNSTREAMPORT_PRESENT] = 0x11;
+    let mut plain = detailed;
+    plain[DP_DOWNSTREAMPORT_PRESENT] = 0x01;
+    let edid = edid_with(4, 0x80 | (4 << 4), &hdmi_vsdb(0x30, 0));
+    // HDMI DFP, 300 MHz (0x78 * 2.5 MHz), 12 bpc (DP_DS_12BPC).
+    let hdmi = [3u8, 0x78, 2, 0];
+    let lim = |dpcd: &[u8], cap: [u8; 4], edid: &[u8]| dfp_limits(dpcd, &cap, edid);
+    let dp_input = edid_with(4, 0x80 | (2 << 4) | 5, &[]);
+    if lim(&detailed, hdmi, &edid)
+        != (DfpLimits {
+            max_bpc: 12,
+            max_dotclock: 0,
+            min_tmds_clock: 25_000,
+            max_tmds_clock: 300_000,
+        })
+        // No detailed caps: 8 bpc; 300 MHz for HDMI, 165 MHz for DVI.
+        || lim(&plain, hdmi, &edid).max_bpc != 8
+        || lim(&plain, hdmi, &edid).max_tmds_clock != 300_000
+        || lim(&plain, [2, 0, 0, 0], &edid).max_tmds_clock != 165_000
+        // VGA: the dot clock in 8 MHz units, no TMDS.
+        || lim(&detailed, [1, 30, 1, 0], &edid)
+            != (DfpLimits {
+                max_bpc: 10,
+                max_dotclock: 240_000,
+                ..DfpLimits::default()
+            })
+        // A DP DFP, or a dual-mode one before an EDID 1.4 DP sink: none.
+        || lim(&detailed, [0, 0x78, 2, 0], &edid) != DfpLimits::default()
+        || lim(&detailed, [5, 0x78, 2, 0], &dp_input) != DfpLimits::default()
+        || lim(&detailed, [5, 0x78, 2, 0], &edid) != lim(&detailed, hdmi, &edid)
+        // DPCD 1.0: the port type in DP_DOWNSTREAMPORT_PRESENT.
+        || lim(&[0x10, 0, 0, 0, 0, 0x05], [0; 4], &edid)
+            != (DfpLimits {
+                max_bpc: 8,
+                max_dotclock: 0,
+                min_tmds_clock: 25_000,
+                max_tmds_clock: 165_000,
+            })
+        || lim(&[0x10, 0, 0, 0, 0, 0x01], [0; 4], &edid) != DfpLimits::default()
+        || lim(&[0x10, 0, 0, 0, 0, 0x03], [0; 4], &edid).max_bpc != 8
+        || lim(&[0x14, 0, 0, 0, 0, 0x00], hdmi, &edid) != DfpLimits::default()
+    {
+        return TestResult::Fail("the drm_dp_downstream_* limits differ from Linux");
+    }
+    // A native sink: the EDID's depth (no DFP limits).
+    let none = DfpLimits::default();
+    for (bpc, bpp) in [(0u8, 24u32), (6, 18), (10, 30), (12, 36), (16, 36)] {
+        if dp_max_bpp(bpc, &none, &edid, 148_500, SinkFormat::Rgb, 18) != Ok(bpp) {
+            return TestResult::Fail("a native sink's pipe maximum is compute_sink_pipe_bpp's");
+        }
+    }
+    // A 12 bpc HDMI sink (DC_30 | DC_36) at 1080p60 behind the HDMI DFP:
+    // its 12 bpc and 300 MHz pass (222.75 MHz TMDS) -> 36 bpp; a 10 bpc
+    // DFP -> 30; a 165 MHz DFP -> 10 bpc's 185.625 MHz fails, 8 bpc -> 24.
+    let dfp = lim(&detailed, hdmi, &edid);
+    let ten = DfpLimits { max_bpc: 10, ..dfp };
+    let slow = DfpLimits {
+        max_tmds_clock: 165_000,
+        ..dfp
+    };
+    if dp_max_bpp(12, &dfp, &edid, 148_500, SinkFormat::Rgb, 18) != Ok(36)
+        || dp_max_bpp(12, &ten, &edid, 148_500, SinkFormat::Rgb, 18) != Ok(30)
+        || dp_max_bpp(12, &slow, &edid, 148_500, SinkFormat::Rgb, 18) != Ok(24)
+    {
+        return TestResult::Fail("intel_dp_max_bpp must take the DFP's bpc and TMDS limits");
+    }
+    // The sink's own flags: DC_30 only stops at 10; a DVI sink (no HDMI
+    // VSDB) is 8 bpc; the sink's max TMDS (44 * 5 MHz) bounds the DFP's
+    // below 12 bpc's 222.75 MHz.
+    let dc30 = edid_with(4, 0x80 | (4 << 4), &hdmi_vsdb(0x10, 0));
+    let dvi = edid_with(4, 0x80 | (4 << 4), &[]);
+    let capped = edid_with(4, 0x80 | (4 << 4), &hdmi_vsdb(0x30, 44));
+    if dp_max_bpp(12, &dfp, &dc30, 148_500, SinkFormat::Rgb, 18) != Ok(30)
+        || dp_max_bpp(12, &dfp, &dvi, 148_500, SinkFormat::Rgb, 18) != Ok(24)
+        || dp_max_bpp(12, &dfp, &capped, 148_500, SinkFormat::Rgb, 18) != Ok(30)
+    {
+        return TestResult::Fail("intel_dp_hdmi_compute_bpc must follow the sink's limits");
+    }
+    // 4K60 at 8 bpc is 594 MHz of TMDS, above the DFP's 300: refused; its
+    // 4:2:0 TMDS clock (297 MHz) passes. A YCbCr output's 24 bpp minimum
+    // above a 6 bpc sink is invalid.
+    if dp_max_bpp(8, &dfp, &edid, 594_000, SinkFormat::Rgb, 18) != Err(ColorRefusal::DfpBpc)
+        || dp_max_bpp(8, &dfp, &edid, 594_000, SinkFormat::Ycbcr420, 24) != Ok(24)
+        || dp_max_bpp(6, &none, &edid, 148_500, SinkFormat::Rgb, 24)
+            != Err(ColorRefusal::Ycbcr444Bpp)
+    {
+        return TestResult::Fail("the DFP TMDS window and the YCbCr minimum must refuse");
+    }
+    // intel_dp_compute_config_limits: an MST stream is at most 24 bpp.
+    if MST_MAX_PIPE_BPP != max_pipe_bpp(12).min(24) {
+        return TestResult::Fail("Linux limits MST streams to 8 bpc");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_color",
+    smoke_xelpg_dp_branch_dfp_limits_and_depth
 );

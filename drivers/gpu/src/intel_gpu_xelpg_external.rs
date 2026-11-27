@@ -1898,14 +1898,26 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
             crate::intel_gpu_dp::DpError::Modeset(e) => ExternalError::Modeset(e),
         })
     })?;
-    // narf.intel.hdmi14_ext=1: intel_dp_update_420's DFP facts and
-    // intel_dp_compute_formats' output format (YCbCr 4:4:4 into a PCON that
-    // converts it to 4:2:0).
-    let output = if ext {
-        let dfp = color::read_dfp_caps(&mut aux, &raw)
+    // narf.intel.hdmi14_ext=1: intel_dp_update_sink_caps' DFP facts
+    // (drm_dp_read_downstream_info, intel_dp_update_420, the DFP limits),
+    // intel_dp_read_dprx_feature_enum and intel_dp_compute_formats' output
+    // format (YCbCr 4:4:4 into a PCON that converts it to 4:2:0, or YCbCr
+    // 4:2:0 on the link).
+    let (dfp, dfp_limits) = if ext {
+        let port_cap = color::read_dfp_port_cap(&mut aux, &raw)
             .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
-        color::dp_output(&raw, dfp, &edid[..edid_len], &mode)
-            .map_err(|e| rollback(ExternalError::Color(e)))?
+        (
+            color::dfp_caps(&raw, &port_cap),
+            color::dfp_limits(&raw, &port_cap, &edid[..edid_len]),
+        )
+    } else {
+        Default::default()
+    };
+    let mut output = if ext {
+        let mut output =
+            color::dp_output(&raw, dfp, dfp_limits.min_tmds_clock, &edid[..edid_len], &mode);
+        output.dprx = color::read_dprx_feature_enum(&mut aux);
+        output
     } else {
         color::DpOutput::default()
     };
@@ -1921,12 +1933,20 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     let sink = dsc::read_dp_sink(&mut aux, &raw)
         .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
     let max_bpp = dsc::max_pipe_bpp(dsc::edid_display_bpc(&edid[..edid_len]), 0);
-    // narf.intel.hdmi14_ext=1: Linux's pipe maximum without the 8 bpc
-    // ceiling (compute_sink_pipe_bpp with max_requested_bpc 12). A branch
-    // device keeps the 8 bpc search: Linux bounds its depth by the DFP's
-    // max bpc and TMDS clock (intel_dp_hdmi_compute_bpc), not modelled.
-    let deep_bpp = if ext && !color::dp_is_branch(&raw) {
-        color::max_pipe_bpp(color::sink_display_bpc(&edid[..edid_len]))
+    // narf.intel.hdmi14_ext=1: intel_dp_max_bpp, Linux's pipe maximum
+    // without the 8 bpc ceiling (compute_sink_pipe_bpp with
+    // max_requested_bpc 12), bounded by a branch's DFP: its max bpc and,
+    // behind an HDMI/DVI DFP, intel_dp_hdmi_compute_bpc at the TMDS limits.
+    let deep_bpp = if ext {
+        color::dp_max_bpp(
+            color::sink_display_bpc(&edid[..edid_len]),
+            &dfp_limits,
+            &edid[..edid_len],
+            mode.pixel_clock_khz,
+            output.sink_format(),
+            output.min_bpp(),
+        )
+        .map_err(|e| rollback(ExternalError::Color(e)))?
     } else {
         max_bpp
     };
@@ -1941,15 +1961,17 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     );
     let mut plan = None;
     let mut pipe_bpp = dsc::PIPE_BPP;
-    // narf.intel.uhbr=1: the same search over the UHBR common rates too.
-    let choice = if uhbr_on {
+    // narf.intel.uhbr=1: the same search over the UHBR common rates too, at
+    // the deep pipe maximum under narf.intel.hdmi14_ext=1. A YCbCr 4:2:0
+    // output stays on the 8b/10b rates ([`color::ColorRefusal::Ycbcr420Link`]).
+    let choice = if uhbr_on && !output.ycbcr420 {
         plan_uhbr(
             &mut aux,
             &link,
             c10_phy(io, port),
             &limits,
             &mode,
-            max_bpp,
+            deep_bpp,
             Some(&sink).filter(|s| s.dsc.dpcd.supports_dsc()),
         )
         .map_err(rollback)?
@@ -1994,14 +2016,33 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
     // intel_dp_compute_link_config_wide above 24 bpp (deep colour): the
     // deepest bpp an 8b/10b link carries, before any DSC. UHBR keeps its
     // 24 bpp search (a deep stream is never planned onto 128b/132b here).
-    let deep = if uhbr_plan.is_none() && deep_bpp > dsc::PIPE_BPP {
+    let deep = if uhbr_plan.is_none() && !output.ycbcr420 && deep_bpp > dsc::PIPE_BPP {
         dsc::uncompressed_link_upto(&limits, &mode, deep_bpp)
             .filter(|link| link.pipe_bpp > dsc::PIPE_BPP)
     } else {
         None
     };
+    // A YCbCr 4:2:0 link: intel_dp_compute_link_config_wide at half the
+    // pipe's bits per pixel, from the deep maximum down to 24 bpp.
+    let ycbcr_link = |link: dsc::UncompressedLink, output: &color::DpOutput| {
+        let rate = train_rate_for(link.link_rate)?;
+        Some(NegotiatedLink {
+            rate,
+            lanes: link.lanes,
+            demand_kbps: stream_demand_kbps(mode.pixel_clock_khz, output.link_bpp(link.pipe_bpp)),
+            payload_kbps: rate.payload_kbps(link.lanes),
+            over_budget: false,
+        })
+    };
     if uhbr_plan.is_some() {
         // The 128b/132b link above is Linux's choice.
+    } else if output.ycbcr420 {
+        let link = color::output_link(&limits, &mode, deep_bpp, &output).ok_or_else(|| {
+            rollback(ExternalError::Color(color::ColorRefusal::Ycbcr420Link))
+        })?;
+        negotiated = ycbcr_link(link, &output)
+            .ok_or_else(|| rollback(ExternalError::Dsc(DscRefusal::LinkRateUnqualified)))?;
+        pipe_bpp = link.pipe_bpp;
     } else if let Some(link) = deep {
         negotiated = six_bpc(link)
             .ok_or_else(|| rollback(ExternalError::Dsc(DscRefusal::LinkRateUnqualified)))?;
@@ -2043,6 +2084,36 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
                 plan = Some(p);
             }
             Err(refusal) => return Err(rollback(ExternalError::Dsc(refusal))),
+        }
+    }
+    // intel_dp_compute_formats: a 4:2:0-also mode that no RGB link
+    // configuration carries takes the YCbCr 4:2:0 sink format
+    // (narf.intel.hdmi14_ext=1).
+    if ext && negotiated.over_budget && plan.is_none() && uhbr_plan.is_none() {
+        if let Some(mut fallback) = color::dp_output_420_also(
+            &raw,
+            dfp,
+            dfp_limits.min_tmds_clock,
+            &edid[..edid_len],
+            &mode,
+        ) {
+            fallback.dprx = output.dprx;
+            let found = color::dp_max_bpp(
+                color::sink_display_bpc(&edid[..edid_len]),
+                &dfp_limits,
+                &edid[..edid_len],
+                mode.pixel_clock_khz,
+                fallback.sink_format(),
+                fallback.min_bpp(),
+            )
+            .ok()
+            .and_then(|max| color::output_link(&limits, &mode, max, &fallback))
+            .and_then(|link| Some((link, ycbcr_link(link, &fallback)?)));
+            if let Some((link, carried)) = found {
+                negotiated = carried;
+                pipe_bpp = link.pipe_bpp;
+                output = fallback;
+            }
         }
     }
     if negotiated.over_budget {
@@ -2487,6 +2558,10 @@ fn activate_once<M: MmioWindow + ?Sized>(
         };
     }
     ext.audio = probe.audio.is_some() && probe.mst.is_none();
+    // A 4:2:0 stream's 1:1 scaler joins the pipe's prefill term.
+    if probe.output.ycbcr420 {
+        ext.scaler = Some(crate::intel_gpu_modeset::ycbcr420_scaler(&probe.mode));
+    }
     if let Err(e) = choice.pipes.admit(io, &ext) {
         return Err(ActivateError::Refused(probe, e.into()));
     }
@@ -3250,16 +3325,17 @@ fn finish<M: MmioWindow + ?Sized>(
     }
     let lost = |_| ExternalError::AccessLost;
     let pipe_bpp = route.probe.pipe_bpp;
-    let ycbcr444 = route.probe.output.ycbcr444;
+    let output = route.probe.output;
+    let ycbcr444 = output.ycbcr444;
     // intel_ddi_set_dp_msa, the last step of intel_ddi_pre_enable_dp. The
     // 8 bpc RGB route keeps its write stream (and leaves the MSA as it is);
-    // any other depth or a YCbCr 4:4:4 output writes its MSA, and its stop
+    // any other depth or a YCbCr output writes its MSA, and its stop
     // restores the 8 bpc RGB one.
-    if pipe_bpp != dsc::PIPE_BPP || ycbcr444 {
+    if pipe_bpp != dsc::PIPE_BPP || ycbcr444 || output.ycbcr420 {
         write(
             io,
             trans.base() + dsc::TRANS_MSA_MISC_OFFSET,
-            color::msa_misc(pipe_bpp, ycbcr444),
+            color::msa_misc_output(pipe_bpp, &output),
         )?;
     }
     let plan = route.probe.dsc;
@@ -3279,7 +3355,8 @@ fn finish<M: MmioWindow + ?Sized>(
         // compressed MTP under DSC.
         (_, Some(u)) => dsc::write_m_n(io, trans, &u.stream.m_n).map_err(lost)?,
         (Some(plan), None) => dsc::write_m_n(io, trans, &plan.m_n(&mode)).map_err(lost)?,
-        (None, None) => program_mn(io, trans, &mode, pll_rate, lanes, pipe_bpp)?,
+        // intel_link_compute_m_n at the link bpp (half the pipe's for 4:2:0).
+        (None, None) => program_mn(io, trans, &mode, pll_rate, lanes, output.link_bpp(pipe_bpp))?,
     }
     rp.pipes.program_timings(io, pipe)?;
     // A YCbCr 4:4:4 output: bdw_set_pipe_misc's YUV colorspace and the
@@ -3289,6 +3366,15 @@ fn finish<M: MmioWindow + ?Sized>(
         let cur = read(io, misc)?;
         write(io, misc, cur | color::PIPE_MISC_OUTPUT_COLORSPACE_YUV)?;
         crate::intel_gpu_modeset::program_output_csc_ycbcr(io, pipe);
+    }
+    // A YCbCr 4:2:0 output: bdw_set_pipe_misc's YUV 4:2:0 encoding,
+    // skl_pfit_enable's 1:1 downsampler and the BT.709 output CSC, the
+    // HDMI 4:2:0 pipe path, pipe off.
+    if output.ycbcr420 {
+        let misc = pipe.base() + dsc::PIPE_MISC_OFFSET;
+        let cur = read(io, misc)?;
+        write(io, misc, cur | crate::intel_gpu_modeset::PIPE_MISC_YCBCR420)?;
+        crate::intel_gpu_modeset::program_ycbcr420_pipe(io, pipe, &mode);
     }
     // intel_ddi_enable: 128b/132b SST's TRANS_DP2_VFREQ pair (the pixel
     // clock in Hz, bits 31:8 of each), function, then the transcoder.
@@ -3357,6 +3443,11 @@ fn finish<M: MmioWindow + ?Sized>(
         } else if route.probe.display_ip.is_display30() {
             return Err(ExternalError::FecNotReady);
         }
+    }
+    // intel_enable_ddi_dp: intel_dp_set_infoframes, the VSC SDP with the
+    // 4:2:0 colorimetry (intel_dp_compute_vsc_sdp) once the transcoder runs.
+    if route.probe.output.vsc_colorimetry() {
+        color::write_vsc_sdp(io, trans, &color::vsc_sdp_ycbcr420(pipe_bpp));
     }
     rp.pipes.arm_primary(io, pipe)?;
     observe_live(io, route, func, start)?;
@@ -3513,17 +3604,24 @@ fn disable_port<M: MmioWindow + ?Sized>(
     // the 8 bpc route does not write it (its write stream predates the
     // MSA), and Linux's intel_ddi_set_dp_msa would write it at its next
     // enable.
-    if route.probe.pipe_bpp != dsc::PIPE_BPP || route.probe.output.ycbcr444 {
+    if route.probe.pipe_bpp != dsc::PIPE_BPP
+        || route.probe.output.ycbcr444
+        || route.probe.output.ycbcr420
+    {
         write(
             io,
             trans.base() + dsc::TRANS_MSA_MISC_OFFSET,
             dsc::msa_misc(dsc::PIPE_BPP),
         )?;
     }
-    // intel_dsc_disable, then intel_dp_set_infoframes(false)'s PPS SDP.
+    // intel_dsc_disable, then intel_dp_set_infoframes(false)'s PPS and VSC
+    // SDPs.
     let pipe = route_pipe(route)?.pipe;
     dsc::disable_engines(io, pipe).map_err(|_| ExternalError::AccessLost)?;
     dsc::disable_pps_sdp(io, trans).map_err(|_| ExternalError::AccessLost)?;
+    if route.probe.output.vsc_colorimetry() {
+        color::disable_vsc_sdp(io, trans);
+    }
     let fec = route.probe.dsc.is_some_and(|p| p.fec);
     let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
     // The 8b/10b route never runs intel_dp_link_training_set_mode, so a
@@ -3661,9 +3759,13 @@ fn stop_local<M: MmioWindow + ?Sized>(
             PipeEnableError::Timeout => stop_failed,
             e => e.into(),
         })?;
-        // The YCbCr 4:4:4 output CSC and PIPE_MISC encoding, pipe off.
+        // The YCbCr 4:4:4 output CSC and PIPE_MISC encoding, pipe off; for
+        // 4:2:0 also the downsampler (skl_scaler_disable).
         if route.probe.output.ycbcr444 {
             crate::intel_gpu_modeset::clear_output_csc_ycbcr(io, pipe);
+        }
+        if route.probe.output.ycbcr420 {
+            crate::intel_gpu_modeset::clear_ycbcr420_pipe(io, pipe);
         }
         disable_port(io, route)?;
     }
