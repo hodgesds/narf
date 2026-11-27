@@ -2778,9 +2778,25 @@ impl<M: Platform> Guard<'_, M> {
                 self.state.cursor.as_ref().is_some_and(|c| c.exposed()),
             );
         }
-        // The retained Gen12 primary is the integrated panel console; a
-        // discrete display (DG1 reports a Gen12 family too) has none, so it
-        // is refused as DG2's is.
+        // The retained Gen12 primary is the integrated panel console. DG1
+        // (`narf.intel.dg1_kms=1`) reports a Gen12 family too, but its
+        // display is discrete: no panel route to retain. Its presenter
+        // flips the firmware-lit Pipe A as Battlemage's does, behind the
+        // takeover's fetcher inventory and PollIo's console qualification
+        // (Tiger Lake's display 12, `dg1_desc`'s `XE_D_DISPLAY`), from VRAM
+        // only (the presenter's DG1 backing rule). Any other discrete
+        // display (DG2) is refused.
+        if self.device.platform.discrete_display()
+            == Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg1)
+        {
+            if self.device.platform.gen12_family() != Some(crate::intel_gpu_gt::Gen12Platform::Dg1)
+                || self.device.generation != Generation::TigerLake
+            {
+                self.state.failed = true;
+                return Err(FsError::NoDevice);
+            }
+            return Ok(());
+        }
         let family = self
             .device
             .platform

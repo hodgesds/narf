@@ -109,6 +109,8 @@ struct Hardware {
     vblank_irq_stuck: bool,
     /// Vblank references held.
     vblank_refs: usize,
+    /// The discrete display IP the install proved (`DiscreteDisplayIp`).
+    discrete: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
 }
 /// Sink AUX writes are logged in the MMIO write log at this pseudo offset
 /// plus the DPCD address, so register and sink order can be compared.
@@ -204,6 +206,7 @@ impl MockPlatform {
                 vblank_irq: false,
                 vblank_irq_stuck: false,
                 vblank_refs: 0,
+                discrete: None,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -233,6 +236,21 @@ impl MockPlatform {
             hw.display13 = false;
         }
         Device::new(platform, Generation::RocketLake, 0x1000000, console())
+    }
+    /// DG1's display behind `narf.intel.dg1_kms=1`: Tiger Lake's display 12
+    /// (`dg1_desc`'s `XE_D_DISPLAY`: four pipes, seven planes) on a discrete
+    /// card that scans out of VRAM.
+    pub(crate) fn dg1(&self) -> Device<Self> {
+        let mut platform = self.clone();
+        platform.3 = Some(crate::intel_gpu_gt::Gen12Platform::Dg1);
+        {
+            let mut hw = self.0.lock();
+            hw.gen12_display = true;
+            hw.gen12_planes = 7;
+            hw.display13 = false;
+            hw.discrete = Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg1);
+        }
+        Device::new(platform, Generation::TigerLake, 0x1000000, console())
     }
     pub(crate) fn gen12(&self, family: crate::intel_gpu_gt::Gen12Platform) -> Device<Self> {
         // Select a literal source family when converting the initial generic
@@ -1106,6 +1124,10 @@ unsafe impl DisplayAccess for MockPlatform {
     fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
         self.0.lock().display_ip
     }
+
+    fn discrete_display(&self) -> Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp> {
+        self.0.lock().discrete
+    }
 }
 impl Platform for MockPlatform {
     fn published_epoch(&self) -> Option<u64> {
@@ -1132,6 +1154,9 @@ impl Platform for MockPlatform {
     }
     fn gen12_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         self.3
+    }
+    fn vram_scanout(&self) -> bool {
+        self.0.lock().discrete.is_some()
     }
     fn takeover(&self, _owned_cursor: bool) -> Result<(), FsError> {
         if self.reset_lost() {

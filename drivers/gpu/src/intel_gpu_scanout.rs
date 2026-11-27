@@ -847,6 +847,16 @@ impl<M: ScanoutIo> Presenter<M> {
     /// (another card's memory or BAR), only on an integrated display and
     /// only once `intel_gpu_prime::pin_for_scanout` pinned and mapped it.
     fn scanout_backing_ok(&self, object: &GemObject) -> bool {
+        // i915_fb_pin.c intel_fb_pin_to_ggtt: with HAS_LMEM (DG1) a
+        // framebuffer is migrated to LMEM_0 before the display pins it. This
+        // owner migrates nothing, so DG1 scans out VRAM objects only.
+        if self.gen12_family == Some(crate::intel_gpu_gt::Gen12Platform::Dg1) {
+            return object.scanout()
+                && !object.is_userptr()
+                && !object.restore_pending()
+                && self.vram_scanout
+                && object.is_vram();
+        }
         object.scanout()
             && !object.is_userptr()
             && !object.restore_pending()
