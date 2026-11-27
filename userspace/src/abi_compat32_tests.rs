@@ -2733,3 +2733,236 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_native_entries_pass_through
 );
+
+// ── Time, limits, filesystem information, select/poll, split offsets ─
+
+/// The i386 calls glibc and Steam make whose compat structure, 32-bit time
+/// or split 64-bit argument differs from the native call:
+///
+///   * `time` (13, an `old_time32_t` returned and stored), `gettimeofday`
+///     (78, an `old_timeval32`), `times` (43, four 32-bit `compat_clock_t`s
+///     and nothing past them);
+///   * `ugetrlimit` (191) / `setrlimit` (75) with a `compat_rlimit`, the old
+///     `getrlimit` (76) clamping to 0x7FFFFFFF; `getrusage` (77) writing the
+///     72-byte `compat_rusage`;
+///   * `statfs64` / `fstatfs64` (268/269, the packed 84-byte
+///     `compat_statfs64`; any other size is EINVAL), `statfs` (99, the
+///     64-byte `compat_statfs`), `sysinfo` (116, the 64-byte
+///     `compat_sysinfo`);
+///   * `ftruncate64` / `truncate64` (194/193) and `fadvise64_64` (272) with
+///     their offsets in two registers; `preadv` (333) with `compat_iovec`s
+///     and a split offset; `sendfile` (187) with a `compat_off_t`;
+///   * `sigaltstack` (186) with a 12-byte `compat_stack_t`;
+///   * `pselect6_time64` (413) and `_newselect` (142) with 32-bit-word
+///     `fd_set`s (only `ceil(n/32)` words written back), `ppoll_time64`
+///     (414);
+///   * `signalfd4` (327), `rt_sigpending` (176) and `sched_setaffinity`
+///     (241) with a 4-byte mask length.
+fn smoke_compat32_table_time_limits_statfs_select_and_offsets() -> TestResult {
+    const RLIMIT_NOFILE: u64 = 7;
+    const RLIMIT_STACK: u64 = 3;
+    const O_RDWR: u64 = 2;
+    const SEEK_END: u64 = 2;
+    const POLLIN: u16 = 1;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["e"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-e", "compat32-e", &[("f", b"abcdef")], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let sp = base + 0x1000;
+            let b32 = |off: u64| (base + off) as u32;
+            let mut fds = Vec::new();
+            let result = (|| {
+                // time / gettimeofday / times.
+                let now = call32_sp(13, [base + 0x100, 0, 0, 0, 0, 0], sp);
+                if now <= 0 || i64::from(get_u32(base + 0x100)? as i32) != now {
+                    return Err("i386 time did not return and store an old_time32_t");
+                }
+                if call32_sp(78, [base + 0x110, 0, 0, 0, 0, 0], sp) != 0
+                    || i64::from(get_u32(base + 0x110)? as i32) < now
+                    || get_u32(base + 0x114)? >= 1_000_000
+                {
+                    return Err("i386 gettimeofday did not write an old_timeval32");
+                }
+                poison(base + 0x120, 32)?;
+                if call32_sp(43, [base + 0x120, 0, 0, 0, 0, 0], sp) == i64::MIN
+                    || !untouched(base + 0x120, 16, 32)?
+                {
+                    return Err("i386 times did not write a 16-byte compat_tms");
+                }
+                // Limits and usage.
+                if call32_sp(191, [RLIMIT_NOFILE, base + 0x140, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 ugetrlimit(RLIMIT_NOFILE) failed");
+                }
+                let (cur, max) = (get_u32(base + 0x140)?, get_u32(base + 0x144)?);
+                if cur == 0 || cur > max {
+                    return Err("i386 ugetrlimit did not write a compat_rlimit");
+                }
+                if call32_sp(75, [RLIMIT_NOFILE, base + 0x140, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 setrlimit of the same compat_rlimit failed");
+                }
+                if call32_sp(76, [RLIMIT_STACK, base + 0x148, 0, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x148)? > 0x7FFF_FFFF
+                    || get_u32(base + 0x14C)? > 0x7FFF_FFFF
+                {
+                    return Err("i386 old getrlimit did not clamp to 0x7FFFFFFF");
+                }
+                poison(base + 0x180, 144)?;
+                if call32_sp(77, [0, base + 0x180, 0, 0, 0, 0], sp) != 0
+                    || !untouched(base + 0x180, 72, 144)?
+                {
+                    return Err("i386 getrusage did not write a 72-byte compat_rusage");
+                }
+                // statfs64 / fstatfs64 / statfs / sysinfo.
+                put_user(base + 0x220, b"/compat32-e/f\0")?;
+                poison(base + 0x240, 128)?;
+                if call32_sp(268, [base + 0x220, 84, base + 0x240, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x244)? == 0
+                    || !untouched(base + 0x240, 84, 128)?
+                {
+                    return Err("i386 statfs64 did not write an 84-byte compat_statfs64");
+                }
+                if call32_sp(268, [base + 0x220, 88, base + 0x240, 0, 0, 0], sp) != EINVAL {
+                    return Err("i386 statfs64 with a size other than 84 must be EINVAL");
+                }
+                let fd = call32(5, [base + 0x220, O_RDWR, 0, 0, 0, 0]);
+                if fd < 0 {
+                    return Err("opening the fixture file failed");
+                }
+                fds.push(fd as u64);
+                let fd = fd as u64;
+                if call32_sp(269, [fd, 84, base + 0x240, 0, 0, 0], sp) != 0 {
+                    return Err("i386 fstatfs64 failed");
+                }
+                poison(base + 0x2C0, 128)?;
+                if call32_sp(99, [base + 0x220, base + 0x2C0, 0, 0, 0, 0], sp) != 0
+                    || !untouched(base + 0x2C0, 64, 128)?
+                {
+                    return Err("i386 statfs did not write a 64-byte compat_statfs");
+                }
+                poison(base + 0x340, 128)?;
+                if call32_sp(116, [base + 0x340, 0, 0, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x340 + 16)? == 0
+                    || get_u32(base + 0x340 + 52)? == 0
+                    || !untouched(base + 0x340, 64, 128)?
+                {
+                    return Err("i386 sysinfo did not write a 64-byte compat_sysinfo");
+                }
+                // Split offsets: preadv at 1 first (the file is "abcdef").
+                put_user(base + 0x3C0, &words(&[b32(0x3E0), 2, b32(0x3E2), 2]))?;
+                if call32_sp(333, [fd, base + 0x3C0, 2, 1, 0, 0], sp) != 4
+                    || get_user(base + 0x3E0, 4)? != b"bcde"
+                {
+                    return Err("i386 preadv with compat_iovecs at a split offset failed");
+                }
+                if call32_sp(194, [fd, 0x1000, 0, 0, 0, 0], sp) != 0
+                    || call32(19, [fd, 0, SEEK_END, 0, 0, 0]) != 0x1000
+                {
+                    return Err("i386 ftruncate64 did not join its offset words");
+                }
+                if call32_sp(193, [base + 0x220, 0x10, 0, 0, 0, 0], sp) != 0
+                    || call32(19, [fd, 0, SEEK_END, 0, 0, 0]) != 0x10
+                {
+                    return Err("i386 truncate64 did not join its offset words");
+                }
+                if call32_sp(272, [fd, 0, 0, 0x10, 0, 0], sp) != 0 {
+                    return Err("i386 fadvise64_64 failed");
+                }
+                // sendfile from offset 1 into a pipe: the compat_off_t moves to 3.
+                if call32(42, [base + 0x400, 0, 0, 0, 0, 0]) != 0 {
+                    return Err("i386 pipe failed");
+                }
+                let (rfd, wfd) = (
+                    u64::from(get_u32(base + 0x400)?),
+                    u64::from(get_u32(base + 0x404)?),
+                );
+                fds.extend([rfd, wfd]);
+                put_user(base + 0x408, &1u32.to_le_bytes())?;
+                if call32_sp(187, [wfd, fd, base + 0x408, 2, 0, 0], sp) != 2
+                    || get_u32(base + 0x408)? != 3
+                {
+                    return Err("i386 sendfile did not read and update its compat_off_t");
+                }
+                // pselect6_time64 / _newselect / ppoll_time64 on the readable pipe.
+                let n = rfd + 1;
+                let bit = |set: u64| -> Result<(), &'static str> {
+                    poison(set, 8)?;
+                    let mut b = alloc::vec![0u8; 4];
+                    b[(rfd / 8) as usize] = 1 << (rfd % 8);
+                    put_user(set, &b)
+                };
+                bit(base + 0x420)?;
+                put_user(base + 0x440, &[0u8; 16])?;
+                if call32_sp(413, [n, base + 0x420, 0, 0, base + 0x440, 0], sp) != 1
+                    || get_user(base + 0x420, 4)?[(rfd / 8) as usize] & (1 << (rfd % 8)) == 0
+                    || !untouched(base + 0x420, 4, 8)?
+                {
+                    return Err("i386 pselect6_time64 did not use 32-bit fd_set words");
+                }
+                bit(base + 0x420)?;
+                put_user(base + 0x450, &[0u8; 8])?;
+                if call32_sp(142, [n, base + 0x420, 0, 0, base + 0x450, 0], sp) != 1 {
+                    return Err("i386 _newselect with an old_timeval32 failed");
+                }
+                let mut pfd = (rfd as u32).to_le_bytes().to_vec();
+                pfd.extend_from_slice(&POLLIN.to_le_bytes());
+                pfd.extend_from_slice(&0u16.to_le_bytes());
+                put_user(base + 0x460, &pfd)?;
+                if call32_sp(414, [base + 0x460, 1, base + 0x440, 0, 8, 0], sp) != 1 {
+                    return Err("i386 ppoll_time64 failed");
+                }
+                // sigaltstack: set, then read back through a compat_stack_t.
+                put_user(base + 0x480, &words(&[0x0800_0000, 0, 0x4000]))?;
+                if call32_sp(186, [base + 0x480, 0, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 sigaltstack(set) of a compat_stack_t failed");
+                }
+                poison(base + 0x4A0, 24)?;
+                if call32_sp(186, [0, base + 0x4A0, 0, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x4A0)? != 0x0800_0000
+                    || get_u32(base + 0x4A8)? != 0x4000
+                    || !untouched(base + 0x4A0, 12, 24)?
+                {
+                    return Err("i386 sigaltstack did not report a 12-byte compat_stack_t");
+                }
+                let mut disable = words(&[0, 2, 0]); // SS_DISABLE
+                disable.truncate(12);
+                put_user(base + 0x480, &disable)?;
+                let _ = call32_sp(186, [base + 0x480, 0, 0, 0, 0, 0], sp);
+                // signalfd4, rt_sigpending, sched_setaffinity.
+                put_user(base + 0x4C0, &(1u64 << 9).to_le_bytes())?; // SIGUSR1
+                let sfd = call32(327, [0xFFFF_FFFF, base + 0x4C0, 8, 0, 0, 0]);
+                if sfd < 0 {
+                    return Err("i386 signalfd4(-1) failed");
+                }
+                fds.push(sfd as u64);
+                if call32(176, [base + 0x4D0, 8, 0, 0, 0, 0]) != 0 {
+                    return Err("i386 rt_sigpending failed");
+                }
+                // A 4-byte compat mask of every CPU answers as the native call
+                // does on the same 4 bytes (`compat_get_user_cpu_mask`).
+                put_user(base + 0x4E0, &u32::MAX.to_le_bytes())?;
+                same_as_native(
+                    241,
+                    Syscall::SchedSetaffinity,
+                    [0, 4, base + 0x4E0, 0, 0, 0],
+                )?;
+                Ok(())
+            })();
+            for fd in fds {
+                let _ = call32(6, [fd, 0, 0, 0, 0, 0]);
+            }
+            result
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_time_limits_statfs_select_and_offsets
+);
