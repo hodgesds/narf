@@ -220,8 +220,27 @@ pub struct Sources {
     pub legacy_scan: bool,
 }
 
+/// The entry point `dmi_present` keeps in `smbios_entry_point` for a table
+/// it found through `buf`: the `_SM_` header, `buf[5]` bytes, when it is
+/// valid and names a version; otherwise (legacy DMI) the 15-byte `_DMI_`
+/// header at `buf[16]`.
+fn dmi_entry_point(buf: &[u8; 32]) -> &[u8] {
+    let n = buf[5] as usize;
+    let smbios = &buf[0..4] == b"_SM_"
+        && (30..=32).contains(&n)
+        && dmi_checksum(buf, n)
+        && u16::from_be_bytes([buf[6], buf[7]]) != 0;
+    if smbios {
+        &buf[..n]
+    } else {
+        &buf[16..31]
+    }
+}
+
 /// `dmi_scan_machine` + `dmi_walk_early`: locate the structure table and
-/// copy it out.
+/// copy it out, with the entry point it was found through
+/// (`smbios_entry_point`: `buf[6]` bytes of an `_SM3_` one, see
+/// [`dmi_entry_point`] for the 32-bit ones).
 ///
 /// 1. EFI (system table signature valid): `efi.smbios3` first, then
 ///    `efi.smbios` — the 64-bit entry point has precedence and a
@@ -231,10 +250,15 @@ pub struct Sources {
 /// 3. Only when EFI is not enabled, the 0xF0000 anchor scan.
 pub fn scan_machine(src: &Sources, mem: &dyn PhysRead) -> Option<RawTable> {
     let try_sm3 = |buf: &[u8; 32], source| {
-        smbios3_present(buf).and_then(|loc| RawTable::read(loc, source, mem))
+        smbios3_present(buf)
+            .and_then(|loc| RawTable::read(loc, source, mem))
+            .map(|t| t.with_entry_point(&buf[..buf[6] as usize]))
     };
-    let try_sm =
-        |buf: &[u8; 32], source| dmi_present(buf).and_then(|loc| RawTable::read(loc, source, mem));
+    let try_sm = |buf: &[u8; 32], source| {
+        dmi_present(buf)
+            .and_then(|loc| RawTable::read(loc, source, mem))
+            .map(|t| t.with_entry_point(dmi_entry_point(buf)))
+    };
     let read32 = |phys: u64| {
         let mut b = [0u8; 32];
         mem.read(phys, &mut b).then_some(b)
@@ -339,6 +363,8 @@ pub struct RawTable {
     num: u16,
     version: u32,
     source: Option<Source>,
+    /// `smbios_entry_point`: the entry point the table was found through.
+    entry_point: Vec<u8>,
 }
 
 /// `dmi_decode_table`'s walk: `(start, end)` of each structure that
@@ -387,7 +413,14 @@ impl RawTable {
             num,
             version: 0,
             source: None,
+            entry_point: Vec::new(),
         }
+    }
+
+    /// The table with the entry point it was found through.
+    fn with_entry_point(mut self, entry_point: &[u8]) -> Self {
+        self.entry_point = entry_point.to_vec();
+        self
     }
 
     /// `dmi_walk_early`: copy `loc.len` bytes at `loc.base` (bounded by
@@ -421,6 +454,14 @@ impl RawTable {
     /// [`RawTable::from_bytes`].
     pub fn source(&self) -> Option<Source> {
         self.source
+    }
+    /// The entry point the scan found the table through, as `dmi_scan.c`
+    /// keeps it in `smbios_entry_point` for
+    /// `/sys/firmware/dmi/tables/smbios_entry_point`: an `_SM3_` or `_SM_`
+    /// header (its own length) or a legacy 15-byte `_DMI_` header. Empty
+    /// when built with [`RawTable::from_bytes`] or [`RawTable::read`].
+    pub fn entry_point(&self) -> &[u8] {
+        &self.entry_point
     }
 
     /// Every structure `dmi_walk` passes to its callback, in table

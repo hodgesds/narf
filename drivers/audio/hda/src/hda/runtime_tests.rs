@@ -4647,3 +4647,87 @@ fn intel_end_to_end() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda", native_hda_intel_hdmi_component_end_to_end);
+
+/// The HDA spec counts SDnLPIB "from 0 to the value in the Cyclic Buffer
+/// Length register and then wrap to 0", so an LPIB equal to CBL is a valid
+/// reading at the end of every lap; Linux `azx_get_position` reads any
+/// position at or past the buffer size as 0 (`if (pos >= bufsize) pos =
+/// 0`), and `snd_pcm_update_hw_ptr0` adds the delta modulo the buffer, so
+/// hw_ptr keeps advancing across every wrap. NARF treated LPIB == CBL as an
+/// xrun and stopped the DMA engine without telling the sound core: on the
+/// RX 6750 XT's HDMI PCM (S32_LE stereo, 32 x 1024 frames) hw_ptr froze at
+/// buffer_size - 3 while the stream stayed RUNNING, so playback stalled
+/// after one buffer. This plays the host's geometry for three laps with
+/// LPIB reading CBL at each lap's end.
+fn native_hda_pointer_advances_across_lpib_wraps() -> TestResult {
+    use narf_drivers_sound::format::SampleFormat;
+    let fixture = match Fixture::with(false, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 3) else {
+        return TestResult::Fail("open");
+    };
+    let mut params = super::super::stream::default_params();
+    params.format = SampleFormat::S32LE;
+    params.periods = 32;
+    if playback.configure(params).is_err()
+        || playback.free_running(true).is_err()
+        || playback.prepare().is_err()
+        || playback.start().is_err()
+    {
+        return TestResult::Fail("S32_LE 32 x 1024 HDMI playback");
+    }
+    let frame = 8u64;
+    let buffer = u64::from(params.period_size) * u64::from(params.periods);
+    let cbl = buffer * frame;
+    let step = u64::from(params.period_size) * frame / 2;
+    let lpib = sd_base(dev.output_stream_idx()) + SD_LPIB;
+    let chunk = alloc::vec![0u8; step as usize];
+    let mut played = 0u64;
+    let mut last = 0u64;
+    while played < 3 * cbl {
+        played += step;
+        // The lap's last reading is CBL itself, not 0.
+        let position = if played % cbl == 0 { cbl } else { played % cbl };
+        // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
+        unsafe { dev.bar0.write32(lpib, position as u32) };
+        let pointer = playback.pointer();
+        if pointer < last || pointer != played / frame {
+            return TestResult::Fail("hw_ptr follows LPIB across every wrap, CBL included");
+        }
+        last = pointer;
+        if playback.write(&chunk).is_err() {
+            return TestResult::Fail("playback keeps taking data after a wrap");
+        }
+    }
+    if last != 3 * buffer || !dev.streams[0].lock().is_running() {
+        return TestResult::Fail("three buffers played and the DMA engine still runs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda/pointer-wrap",
+    native_hda_pointer_advances_across_lpib_wraps
+);
+
+/// Linux `azx_pcm_hw`: HDA PCMs are interleaved only (no
+/// SNDRV_PCM_INFO_NONINTERLEAVED), analog and HDMI alike.
+fn native_hda_pcms_are_interleaved_only() -> TestResult {
+    let builds: [fn() -> Result<Fixture, &'static str>; 2] =
+        [Fixture::new, || Fixture::with(false, true)];
+    for build in builds {
+        let fixture = match build() {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let card = super::super::stream::Card(fixture.controller.as_ref().unwrap().clone());
+        if card.noninterleaved() {
+            return TestResult::Fail("HDA PCMs offer interleaved access only");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda/access", native_hda_pcms_are_interleaved_only);

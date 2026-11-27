@@ -188,6 +188,24 @@ its canonical `/sys/devices/.../net/<name>` kobject, and any wireless
 `/sys/class/ieee80211/phy0` entry (emitting `ADD`/`CHANGE` when `emit` is set),
 and `sysfs::unpublish_net_iface(name)` tears them down with `REMOVE`.
 
+`sysfs::kobject_add_attr_mode(kobj, name, mode, show)` declares a text
+attribute with a mode other than the default 0444 (0644 with a store), and
+`sysfs::kobject_add_sized_bin_attr(kobj, name, mode, size, read)` a binary one
+with its `bin_attribute` mode and size, which `stat` reports
+(`sysfs::bin_blob_read(bytes)` reads a fixed blob). sysfs nodes are owned by
+root, so the open path's mode check keeps a 0400 attribute root-only.
+
+`sysfs::publish_dmi(&RawTable)` projects an SMBIOS table as Linux's
+`dmi-id.c` and `dmi_scan.c::dmi_init` do, and the built-in `dmi` provider
+(`sysfs::populate_dmi`) publishes the boot table:
+`/sys/devices/virtual/dmi/id` (linked from `/sys/class/dmi/id`) carries one
+attribute per `DmiIdent` field the table has, "%s\n" of the saved bytes, with
+`product_serial`, `product_uuid`, `board_serial` and `chassis_serial` 0400
+and the rest 0444; `modalias` is `get_modalias`'s `dmi:bvn…:…:pfa…:` with each
+value `ascii_filter`ed; the writable `uevent` carries `MODALIAS=`; and
+`/sys/firmware/dmi/tables/{smbios_entry_point,DMI}` are the entry point and
+the walked table, 0400 and sized as them.
+
 `sysfs::kobject_notify(kobj, attribute)` publishes a text-attribute change
 after its value changes. Each open has an independent event cursor (shared
 by dup/fork): `poll`/`epoll` report `POLLPRI|POLLERR` until that open reads

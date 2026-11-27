@@ -2873,6 +2873,121 @@ user_desc` at `tls` through `compat32::tls::clone_settls` — an explicit
 slot, no allocation — and fails the clone with its EINVAL/EFAULT before any
 child state is built; from a 64-bit call `tls` stays the FS base.
 
+**Events and nodes.** epoll_create (254), epoll_create1 (329), epoll_ctl
+(255), epoll_wait (256), epoll_pwait (319), epoll_pwait2 (441), eventfd
+(323), eventfd2 (328), mknod (14) and mknodat (297) pass through with their
+`int` arguments sign-extended: `struct epoll_event` is packed on x86, and
+epoll_pwait2's compat entry takes the 64-bit `__kernel_timespec`. (An
+S_IFIFO node is created as NARF creates every non-directory node, as a
+regular file.)
+
+**System V IPC.** The direct calls semget (393), semctl (394), shmget
+(395), shmctl (396), shmat (397), shmdt (398), msgget (399), msgsnd (400),
+msgrcv (401), msgctl (402) and semtimedop_time64 (420), and the `ipc`
+multiplexer (117, `compat_sys_ipc`) that an i386 libc built for kernels
+before 5.1 uses. `ipc` decodes its version and call: SEMCTL reads the `union
+semun` word through `ptr`, version-0 MSGRCV its buffer and type from a
+`struct compat_ipc_kludge`, SEMTIMEDOP takes an `old_timespec32`
+(`Ia32Abi::time32` in `sys_semtimedop`), and SHMAT stores the address as a
+4-byte `compat_ulong_t` through `third` and returns 0. The control commands
+strip IPC_64 (`compat_ipc_parse_version`). Those with an IPC_64 structure
+move it in its compat layout through `sysvipc::ipc_ds_to_user` /
+`ipc_ds_from_user` (`compat32::ipc`): `compat_semid64_ds`,
+`compat_msqid64_ds`, `compat_shmid64_ds`, `compat_shminfo64` (shmmax
+clamped to INT_MAX) and `compat_shm_info`. The same commands without IPC_64
+mean the pre-2.4 layouts and answer EINVAL. msgsnd and msgrcv use `struct
+compat_msgbuf`, whose `mtype` is a 4-byte `compat_long_t`
+(`sysvipc::msg_long_bytes`).
+
+**Sockets.** The direct calls socket (359), socketpair (360), bind (361),
+connect (362), listen (363), accept4 (364), getsockname (367), getpeername
+(368), sendto (369), recvfrom (371) and shutdown (373) pass through, since
+`struct sockaddr` is shared. sendmsg (370), recvmsg (372), sendmmsg (345),
+recvmmsg (337, `old_timespec32`) and recvmmsg_time64 (417) convert `struct
+compat_msghdr` / `compat_mmsghdr`, their `compat_iovec`s and their
+`compat_cmsghdr` control messages (`compat32::socket`):
+
+- Going in, the conversion follows `cmsghdr_from_user_compat_to_kern`.
+- Coming out, it follows `put_cmsg_compat`, narrowing the old SCM_TIMESTAMP*
+  payloads, and `scm_detach_fds_compat`. A cut SCM_RIGHTS record sets
+  MSG_CTRUNC, and the fds that did not fit are closed again.
+
+setsockopt (366) and getsockopt (365) move the old SO_RCVTIMEO/SO_SNDTIMEO
+as an `old_timeval32`. `socketcall` (102) reads its 32-bit argument words
+(`nas[]`) and serves each call as its direct entry.
+
+The native handlers read and write a `struct msghdr` through user pointers.
+So these conversions build the native structures on the caller's own stack,
+below its stack pointer, skipping a 64-bit caller's red zone
+(`compat32::stage`, Linux's `compat_alloc_user_space` before 5.11). They run
+the native handler against them and copy the results back. A call that
+parks is re-staged when it is re-issued.
+
+**Native entries.** Every other `syscall_32.tbl` row whose entry point is
+the x86_64 one (the same `sys_*`, no compat entry) and has a NARF handler
+passes through with its signed C arguments sign-extended. The masks are
+generated from `include/linux/syscalls.h`. That covers the process,
+scheduling, credential (`*32`), xattr, inotify, timerfd, timer and clock
+`*_time64`, mount-API, pidfd, landlock, futex2 and *at families.
+
+Twelve such rows stay -ENOSYS because Linux's native handler converts
+internally under `in_compat_syscall()` and NARF's does not yet:
+
+- quotactl (131) and quotactl_fd (443): `compat_if_dqblk` alignment.
+- mbind (274), get_mempolicy (275), set_mempolicy (276) and migrate_pages
+  (294): `compat_ulong_t` node masks.
+- move_pages (317): a `compat_uptr_t` page array.
+- vmsplice (316), process_vm_readv (347), process_vm_writev (348) and
+  process_madvise (440): `compat_iovec`s.
+- seccomp (354): `struct compat_sock_fprog`.
+
+**Compat structures, 32-bit times, split offsets.** `compat32::misc` serves:
+
+- Time: time (13, an `old_time32_t` returned and stored), gettimeofday /
+  settimeofday (78/79, `old_timeval32`) and times (43, `compat_tms`).
+- Limits and usage: ugetrlimit (191) and the old getrlimit (76)
+  (`compat_rlimit`, clamped to `COMPAT_RLIM_INFINITY` / 0x7FFFFFFF);
+  setrlimit (75, `COMPAT_RLIM_INFINITY` widened); getrusage (77) and wait4
+  (114) (`compat_rusage`); waitid (284) (the `compat_siginfo` fields
+  `compat_sys_waitid` writes, plus `compat_rusage`).
+- Filesystem and system information: statfs / fstatfs (99/100,
+  `compat_statfs` with `put_compat_statfs`'s EOVERFLOW); statfs64 /
+  fstatfs64 (268/269, the packed 84-byte `compat_statfs64`, any other size
+  EINVAL); sysinfo (116, `compat_sysinfo` rescaled through `mem_unit`).
+- Split offsets: truncate / ftruncate (92/93, `compat_off_t`); the
+  `sys_ia32_*` forms of truncate64, ftruncate64, fallocate, fadvise64,
+  fadvise64_64, readahead and sync_file_range (193/194/324/250/272/225/314,
+  each 64-bit value as two registers).
+- Vectored and offset I/O: preadv / pwritev / preadv2 / pwritev2
+  (333/334/378/379, `compat_iovec`s and a split offset); sendfile (187, a
+  `compat_off_t`).
+- sigaltstack (186, `compat_stack_t`).
+- Select and poll: select (82, `compat_sel_arg_struct`), _newselect (142),
+  pselect6 (308) and pselect6_time64 (413), with 32-bit-word `fd_set`s.
+  `ceil(n/32)` words are copied back. A 32-bit timeout gets the time left.
+  pselect's `{ ss, ss_len }` sigset pack is widened. ppoll (309) takes an
+  `old_timespec32`.
+
+Native structures go through `compat32::stage`. ppoll_time64 (414),
+rt_sigpending (176), rt_sigsuspend (179), signalfd / signalfd4 (321/327)
+and sched_setaffinity (241) pass through: their compat sigsets and CPU
+masks have the native bytes.
+
+**32-bit times and 16-bit ids.** `compat32::legacy` serves the `*_time32` entries
+by widening their `old_timespec32` / `old_timeval32` / `old_utimbuf32`
+inputs and narrowing their outputs (a sleep's `rem` only when it was
+interrupted, and not for an absolute `clock_nanosleep`): nanosleep (162),
+clock_nanosleep (267), clock_settime (264), clock_getres (266),
+timer_settime / timer_gettime (260/261), timerfd_settime / timerfd_gettime
+(325/326), utimensat (320), futimesat (299), utimes (271), utime (30),
+sched_rr_get_interval (161), io_getevents (247) and mq_timedsend /
+mq_timedreceive (279/280). It also serves the 16-bit id calls of
+`kernel/uid16.c` by widening ids with `low2highuid` (0xFFFF is -1) and narrowing
+them with `high2lowuid` (65534 past 16 bits): chown (182), lchown (16), fchown (95),
+setuid (23), setgid (46), setreuid / setregid (70/71), setresuid /
+setresgid (164/170), setfsuid / setfsgid (138/139), getresuid / getresgid
+(165/171), getgroups (80) and setgroups (81).
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

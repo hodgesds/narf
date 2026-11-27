@@ -1925,3 +1925,1189 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_io_counts_in_proc_pid_io
 );
+
+// ── Steam's event and FIFO calls ─────────────────────────────────────
+
+/// The i386 epoll, eventfd and node-creation calls Steam's
+/// `CCompletionPortManager` and named-pipe setup make, all native entries
+/// in `syscall_32.tbl` (`struct epoll_event` is packed on x86, so i386 and
+/// x86_64 share its 12-byte layout):
+///
+///   * `epoll_create` (254) and `epoll_create1` (329); `epoll_create(-1)`
+///     is EINVAL because `size` is an `int`;
+///   * `eventfd` (323) and `eventfd2` (328);
+///   * `epoll_ctl` (255) registering the eventfd, then `epoll_wait` (256),
+///     `epoll_pwait` (319) and `epoll_pwait2` (441, a `__kernel_timespec`)
+///     reporting it readable with the 64-bit `data` intact;
+///     `epoll_wait(maxevents = -1)` is EINVAL;
+///   * `mknodat` (297, `AT_FDCWD` sign-extended) and `mknod` (14) creating
+///     an S_IFIFO node that `open` (5) then opens.
+fn smoke_compat32_table_epoll_eventfd_and_fifo_nodes() -> TestResult {
+    const EPOLL_CTL_ADD: u64 = 1;
+    const EPOLLIN: u32 = 0x1;
+    const S_IFIFO_0600: u64 = 0o010_600;
+    const O_RDWR: u64 = 2;
+    const DATA: u64 = 0x1122_3344_5566_7788;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["ev"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-ev", "compat32-ev", &[], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let mut fds = Vec::new();
+            let epfd = call32(329, [0, 0, 0, 0, 0, 0]);
+            let legacy = call32(254, [1, 0, 0, 0, 0, 0]);
+            if epfd < 0 || legacy < 0 {
+                return Err("i386 epoll_create1 / epoll_create failed");
+            }
+            fds.extend([epfd, legacy]);
+            if call32(254, [0xFFFF_FFFF, 0, 0, 0, 0, 0]) != EINVAL {
+                return Err("i386 epoll_create(-1) must be EINVAL: size is an int");
+            }
+            let efd = call32(328, [0, 0, 0, 0, 0, 0]);
+            let efd_legacy = call32(323, [0, 0, 0, 0, 0, 0]);
+            if efd < 0 || efd_legacy < 0 {
+                return Err("i386 eventfd2 / eventfd failed");
+            }
+            fds.extend([efd, efd_legacy]);
+            let mut event = Vec::new();
+            event.extend_from_slice(&EPOLLIN.to_le_bytes());
+            event.extend_from_slice(&DATA.to_le_bytes());
+            put_user(base + 0x100, &event)?;
+            if call32(
+                255,
+                [epfd as u64, EPOLL_CTL_ADD, efd as u64, base + 0x100, 0, 0],
+            ) != 0
+            {
+                return Err("i386 epoll_ctl(ADD) of an eventfd failed");
+            }
+            put_user(base + 0x200, &1u64.to_le_bytes())?;
+            if call32(4, [efd as u64, base + 0x200, 8, 0, 0, 0]) != 8 {
+                return Err("i386 write to the eventfd failed");
+            }
+            put_user(base + 0x400, &[0u8; 16])?;
+            for (nr, regs) in [
+                (256u32, [epfd as u64, base + 0x300, 4, 0, 0, 0]),
+                (319, [epfd as u64, base + 0x300, 4, 0, 0, 8]),
+                (441, [epfd as u64, base + 0x300, 4, base + 0x400, 0, 8]),
+            ] {
+                put_user(base + 0x300, &[0u8; 12])?;
+                if call32(nr, regs) != 1 {
+                    return Err("an i386 epoll wait did not report the readable eventfd");
+                }
+                let got = get_user(base + 0x300, 12)?;
+                let events = u32::from_le_bytes([got[0], got[1], got[2], got[3]]);
+                let data = u64::from_le_bytes(got[4..12].try_into().unwrap_or([0; 8]));
+                if events & EPOLLIN == 0 || data != DATA {
+                    return Err("an i386 epoll wait did not write the packed 12-byte epoll_event");
+                }
+            }
+            if call32(256, [epfd as u64, base + 0x300, 0xFFFF_FFFF, 0, 0, 0]) != EINVAL {
+                return Err("i386 epoll_wait(maxevents = -1) must be EINVAL");
+            }
+            put_user(base + 0x600, b"/compat32-ev/fifo\0")?;
+            put_user(base + 0x640, b"/compat32-ev/fifo2\0")?;
+            if call32(297, [AT_FDCWD32, base + 0x600, S_IFIFO_0600, 0, 0, 0]) != 0 {
+                return Err("i386 mknodat(AT_FDCWD, S_IFIFO) failed");
+            }
+            if call32(14, [base + 0x640, S_IFIFO_0600, 0, 0, 0, 0]) != 0 {
+                return Err("i386 mknod(S_IFIFO) failed");
+            }
+            for path in [base + 0x600, base + 0x640] {
+                let fd = call32(5, [path, O_RDWR, 0, 0, 0, 0]);
+                if fd < 0 {
+                    return Err("opening the i386-created node failed");
+                }
+                fds.push(fd);
+            }
+            for fd in fds {
+                let _ = call32(6, [fd as u64, 0, 0, 0, 0, 0]);
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_epoll_eventfd_and_fifo_nodes
+);
+
+// ── System V IPC ─────────────────────────────────────────────────────
+
+const IPC_CREAT_0600: u64 = 0o1000 | 0o600;
+const IPC_NOWAIT: u64 = 0o4000;
+const IPC_RMID: u64 = 0;
+const IPC_STAT: u64 = 2;
+const IPC_INFO: u64 = 3;
+const IPC_64: u64 = 0x100;
+const GETVAL: u64 = 12;
+const SETVAL: u64 = 16;
+
+/// A `struct sembuf { u16 sem_num; s16 sem_op; s16 sem_flg; }`.
+fn sembuf(num: u16, op: i16, flg: i16) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&num.to_le_bytes());
+    b.extend_from_slice(&op.to_le_bytes());
+    b.extend_from_slice(&flg.to_le_bytes());
+    b
+}
+
+/// A `struct compat_msgbuf { compat_long_t mtype; char mtext[]; }`.
+fn compat_msgbuf(mtype: i32, text: &[u8]) -> Vec<u8> {
+    let mut b = mtype.to_le_bytes().to_vec();
+    b.extend_from_slice(text);
+    b
+}
+
+/// Fill `len` bytes at `va` with 0xAA, so a test can see how much a call
+/// wrote.
+fn poison(va: u64, len: usize) -> Result<(), &'static str> {
+    put_user(va, &alloc::vec![0xAA; len])
+}
+
+/// Whether `[va + from, va + to)` still holds the 0xAA poison.
+fn untouched(va: u64, from: usize, to: usize) -> Result<bool, &'static str> {
+    Ok(get_user(va + from as u64, to - from)?
+        .iter()
+        .all(|b| *b == 0xAA))
+}
+
+/// i386 System V semaphores through the direct calls (`semget` 393,
+/// `semctl` 394, `semtimedop_time64` 420) and the `ipc` multiplexer (117,
+/// `compat_sys_ipc`) a pre-5.1 i386 glibc uses — Steam's
+/// `CThreadSemaphore`:
+///
+///   * SETVAL/GETVAL pass the `union semun` word, by value directly and by
+///     reference through `ipc(SEMCTL)`;
+///   * IPC_STAT | IPC_64 writes the 64-byte `compat_semid64_ds` (sem_nsems
+///     at 52) and nothing past it; IPC_STAT without IPC_64 (the old layout)
+///     is EINVAL;
+///   * `ipc(SEMOP)` applies a `struct sembuf` (same layout on both ABIs);
+///   * `ipc(SEMTIMEDOP)` reads an `old_timespec32`, so tv_nsec =
+///     1000000000 in its second word is EINVAL.
+fn smoke_compat32_table_sysv_semaphores() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["sem"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let semid = call32(393, [0, 1, IPC_CREAT_0600, 0, 0, 0]);
+            if semid < 0 {
+                return Err("i386 semget(IPC_PRIVATE) failed");
+            }
+            let id = semid as u64;
+            let result = (|| {
+                if call32(394, [id, 0, SETVAL, 5, 0, 0]) != 0
+                    || call32(394, [id, 0, GETVAL, 0, 0, 0]) != 5
+                {
+                    return Err("i386 semctl SETVAL/GETVAL did not round-trip");
+                }
+                poison(base + 0x100, 128)?;
+                if call32(394, [id, 0, IPC_STAT | IPC_64, base + 0x100, 0, 0]) != 0 {
+                    return Err("i386 semctl(IPC_STAT | IPC_64) failed");
+                }
+                let ds = get_user(base + 0x100, 64)?;
+                let nsems = u32::from_le_bytes([ds[52], ds[53], ds[54], ds[55]]);
+                let mode = u16::from_le_bytes([ds[20], ds[21]]);
+                if nsems != 1 || mode & 0o777 != 0o600 {
+                    return Err("i386 semctl(IPC_STAT) did not write a compat_semid64_ds");
+                }
+                if !untouched(base + 0x100, 64, 128)? {
+                    return Err("i386 semctl(IPC_STAT) wrote past the 64-byte compat_semid64_ds");
+                }
+                if call32(394, [id, 0, IPC_STAT, base + 0x100, 0, 0]) != EINVAL {
+                    return Err("i386 semctl(IPC_STAT) without IPC_64 must be EINVAL");
+                }
+                // ipc(SEMOP, semid, nsops = 1, 0, sops): 5 - 2 = 3.
+                put_user(base + 0x200, &sembuf(0, -2, 0))?;
+                if call32(117, [1, id, 1, 0, base + 0x200, 0]) != 0 {
+                    return Err("i386 ipc(SEMOP) failed");
+                }
+                // ipc(SEMCTL, semid, 0, GETVAL, &semun).
+                put_user(base + 0x240, &0u32.to_le_bytes())?;
+                if call32(117, [3, id, 0, GETVAL | IPC_64, base + 0x240, 0]) != 3 {
+                    return Err("i386 ipc(SEMCTL, GETVAL) did not see the ipc(SEMOP)");
+                }
+                // ipc(SEMTIMEDOP, semid, 1, 0, sops, timeout): an
+                // old_timespec32 { 0, 1000000000 } is out of range.
+                put_user(base + 0x280, &sembuf(0, -10, 0))?;
+                let mut ts = 0i32.to_le_bytes().to_vec();
+                ts.extend_from_slice(&1_000_000_000i32.to_le_bytes());
+                ts.extend_from_slice(&[0u8; 8]);
+                put_user(base + 0x2C0, &ts)?;
+                if call32(117, [4, id, 1, 0, base + 0x280, base + 0x2C0]) != EINVAL {
+                    return Err("i386 ipc(SEMTIMEDOP) did not read an old_timespec32 timeout");
+                }
+                // semtimedop_time64 with IPC_NOWAIT on a value that cannot go
+                // negative: EAGAIN.
+                put_user(base + 0x280, &sembuf(0, -10, IPC_NOWAIT as i16))?;
+                if call32(420, [id, base + 0x280, 1, 0, 0, 0]) != EAGAIN {
+                    return Err("i386 semtimedop_time64(IPC_NOWAIT) did not answer EAGAIN");
+                }
+                Ok(())
+            })();
+            let removed = call32(117, [3, id, 0, IPC_RMID, base + 0x240, 0]);
+            result?;
+            if removed != 0 {
+                return Err("i386 ipc(SEMCTL, IPC_RMID) failed");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!("userspace/compat32", smoke_compat32_table_sysv_semaphores);
+
+/// i386 System V message queues: `msgsnd` (400) and `msgrcv` (401) move a
+/// `struct compat_msgbuf` whose `mtype` is a 4-byte `compat_long_t`
+/// (`compat_ksys_msgsnd`, `compat_do_msg_fill`), so the text starts 4 bytes
+/// in; `ipc(MSGSND)` and a version-0 `ipc(MSGRCV)` (buffer and type in a
+/// `struct compat_ipc_kludge`) do the same; `msgctl(IPC_STAT | IPC_64)`
+/// writes the 88-byte `compat_msqid64_ds` (msg_qnum at 64, msg_qbytes at
+/// 68) and nothing past it.
+fn smoke_compat32_table_sysv_message_queues() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["msg"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let qid = call32(399, [0, IPC_CREAT_0600, 0, 0, 0, 0]);
+            if qid < 0 {
+                return Err("i386 msgget(IPC_PRIVATE) failed");
+            }
+            let id = qid as u64;
+            let result = (|| {
+                put_user(base + 0x100, &compat_msgbuf(7, b"ia32"))?;
+                if call32(400, [id, base + 0x100, 4, 0, 0, 0]) != 0 {
+                    return Err("i386 msgsnd of a compat_msgbuf failed");
+                }
+                poison(base + 0x200, 16)?;
+                if call32(401, [id, base + 0x200, 16, 0, IPC_NOWAIT, 0]) != 4 {
+                    return Err("i386 msgrcv did not return the 4-byte message");
+                }
+                let got = get_user(base + 0x200, 8)?;
+                if got[..4] != 7i32.to_le_bytes() || &got[4..8] != b"ia32" {
+                    return Err("i386 msgrcv did not write a compat_msgbuf (4-byte mtype)");
+                }
+                // ipc(MSGSND, msqid, msgsz, msgflg, ptr).
+                put_user(base + 0x300, &compat_msgbuf(9, b"abc"))?;
+                if call32(117, [11, id, 3, 0, base + 0x300, 0]) != 0 {
+                    return Err("i386 ipc(MSGSND) failed");
+                }
+                // ipc(MSGRCV) version 0: { msgp, msgtyp } at ptr.
+                let mut kludge = (base as u32 + 0x340).to_le_bytes().to_vec();
+                kludge.extend_from_slice(&9i32.to_le_bytes());
+                put_user(base + 0x380, &kludge)?;
+                if call32(117, [12, id, 16, IPC_NOWAIT, base + 0x380, 0]) != 3 {
+                    return Err("i386 ipc(MSGRCV) through the compat_ipc_kludge failed");
+                }
+                let got = get_user(base + 0x340, 7)?;
+                if got[..4] != 9i32.to_le_bytes() || &got[4..7] != b"abc" {
+                    return Err("i386 ipc(MSGRCV) did not write a compat_msgbuf");
+                }
+                poison(base + 0x400, 128)?;
+                if call32(402, [id, IPC_STAT | IPC_64, base + 0x400, 0, 0, 0]) != 0 {
+                    return Err("i386 msgctl(IPC_STAT | IPC_64) failed");
+                }
+                let ds = get_user(base + 0x400, 88)?;
+                let qnum = u32::from_le_bytes([ds[64], ds[65], ds[66], ds[67]]);
+                let qbytes = u32::from_le_bytes([ds[68], ds[69], ds[70], ds[71]]);
+                if qnum != 0 || qbytes == 0 {
+                    return Err("i386 msgctl(IPC_STAT) did not write a compat_msqid64_ds");
+                }
+                if !untouched(base + 0x400, 88, 128)? {
+                    return Err("i386 msgctl(IPC_STAT) wrote past the 88-byte compat_msqid64_ds");
+                }
+                Ok(())
+            })();
+            let removed = call32(402, [id, IPC_RMID, 0, 0, 0, 0]);
+            result?;
+            if removed != 0 {
+                return Err("i386 msgctl(IPC_RMID) failed");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_sysv_message_queues
+);
+
+/// i386 System V shared memory: `shmget` (395) and `shmat` (397) attach
+/// below `TASK_SIZE_32`; `ipc(SHMAT)` stores the address through `third` as
+/// a 4-byte `compat_ulong_t` and returns 0; `shmctl(IPC_STAT | IPC_64)`
+/// writes the 84-byte `compat_shmid64_ds` (shm_segsz at 36, shm_nattch at
+/// 72) and nothing past it; `shmctl(IPC_INFO | IPC_64)` writes the 36-byte
+/// `compat_shminfo64` with shmmax clamped to INT_MAX; `shmdt` (398) and
+/// `ipc(SHMDT)` detach and `ipc(SHMCTL, IPC_RMID)` removes.
+fn smoke_compat32_table_sysv_shared_memory() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["shm"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let shmid = call32(395, [0, 4096, IPC_CREAT_0600, 0, 0, 0]);
+            if shmid < 0 {
+                return Err("i386 shmget(IPC_PRIVATE) failed");
+            }
+            let id = shmid as u64;
+            let result = (|| {
+                let addr = call32(397, [id, 0, 0, 0, 0, 0]) as u32 as u64;
+                if addr == 0 || addr >= TASK_SIZE_32 || addr & 0xFFF != 0 {
+                    return Err("i386 shmat did not attach below TASK_SIZE_32");
+                }
+                if call32(117, [21, id, 0, base + 0x100, 0, 0]) != 0 {
+                    return Err("i386 ipc(SHMAT) did not return 0");
+                }
+                let raddr = u64::from(get_u32(base + 0x100)?);
+                if raddr == 0 || raddr >= TASK_SIZE_32 || raddr == addr {
+                    return Err("i386 ipc(SHMAT) did not store a second 32-bit address");
+                }
+                poison(base + 0x200, 128)?;
+                if call32(396, [id, IPC_STAT | IPC_64, base + 0x200, 0, 0, 0]) != 0 {
+                    return Err("i386 shmctl(IPC_STAT | IPC_64) failed");
+                }
+                let ds = get_user(base + 0x200, 84)?;
+                let segsz = u32::from_le_bytes([ds[36], ds[37], ds[38], ds[39]]);
+                let nattch = u32::from_le_bytes([ds[72], ds[73], ds[74], ds[75]]);
+                if segsz != 4096 || nattch != 2 {
+                    return Err("i386 shmctl(IPC_STAT) did not write a compat_shmid64_ds");
+                }
+                if !untouched(base + 0x200, 84, 128)? {
+                    return Err("i386 shmctl(IPC_STAT) wrote past the 84-byte compat_shmid64_ds");
+                }
+                poison(base + 0x300, 80)?;
+                if call32(396, [id, IPC_INFO | IPC_64, base + 0x300, 0, 0, 0]) < 0 {
+                    return Err("i386 shmctl(IPC_INFO | IPC_64) failed");
+                }
+                let shmmax = get_u32(base + 0x300)?;
+                if shmmax == 0 || shmmax > i32::MAX as u32 || !untouched(base + 0x300, 36, 80)? {
+                    return Err("i386 shmctl(IPC_INFO) did not write a clamped compat_shminfo64");
+                }
+                if call32(398, [addr, 0, 0, 0, 0, 0]) != 0 {
+                    return Err("i386 shmdt failed");
+                }
+                if call32(117, [22, 0, 0, 0, raddr, 0]) != 0 {
+                    return Err("i386 ipc(SHMDT) failed");
+                }
+                Ok(())
+            })();
+            let removed = call32(117, [24, id, IPC_RMID, 0, 0, 0]);
+            result?;
+            if removed != 0 {
+                return Err("i386 ipc(SHMCTL, IPC_RMID) failed");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_sysv_shared_memory
+);
+
+// ── Sockets ──────────────────────────────────────────────────────────
+
+/// [`Ia32Ctx`] with the caller's user stack pointer: the conversions that
+/// stage native structures below it (`compat32::stage`) need one.
+struct Ia32StackCtx {
+    args: SyscallArgs,
+    ret: Option<SyscallReturn>,
+    sp: u64,
+}
+
+impl TrapContext for Ia32StackCtx {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, r: SyscallReturn) {
+        self.ret = Some(r);
+    }
+    fn user_rsp(&self) -> u64 {
+        self.sp
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
+    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        false
+    }
+    fn in_ia32_syscall(&self) -> bool {
+        true
+    }
+    fn in_compat_mode(&self) -> bool {
+        true
+    }
+}
+
+/// [`call32`] from a task whose stack pointer is `sp`.
+fn call32_sp(nr: u32, regs: [u64; 6], sp: u64) -> i64 {
+    let reg = |i: usize| u64::from(regs[i] as u32);
+    let mut ctx = Ia32StackCtx {
+        args: SyscallArgs {
+            arg0: reg(0),
+            arg1: reg(1),
+            arg2: reg(2),
+            arg3: reg(3),
+            arg4: reg(4),
+            arg5: reg(5),
+        },
+        ret: None,
+        sp,
+    };
+    let _ = crate::compat32::table::dispatch(nr, &mut ctx);
+    match ctx.ret {
+        Some(r) => i64::from(r.value as u32 as i32),
+        None => i64::MIN,
+    }
+}
+
+/// Little-endian `u32` words, as an i386 structure lays them out.
+fn words(ws: &[u32]) -> Vec<u8> {
+    ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+const AF_UNIX: u64 = 1;
+const SOCK_DGRAM: u64 = 2;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_CTRUNC: u32 = 0x8;
+
+/// The i386 socket calls with their own structure layouts (`net/compat.c`)
+/// on an AF_UNIX datagram socketpair (360):
+///
+///   * `sendmsg` (370) of a `struct compat_msghdr` with two `compat_iovec`s
+///     and a `compat_cmsghdr` SCM_RIGHTS record (12-byte header);
+///   * `recvmsg` (372) into a `compat_msghdr` whose 16-byte control buffer
+///     receives that record in compat form — cmsg_len 16, a live fd —
+///     with msg_controllen 16 and no MSG_CTRUNC; a control buffer too small
+///     for the fd sets MSG_CTRUNC;
+///   * `sendmmsg` (345) / `recvmmsg_time64` (417) over `compat_mmsghdr`s,
+///     each entry's `msg_len` written back at offset 28;
+///   * SO_RCVTIMEO through `setsockopt` (366) / `getsockopt` (365) as an
+///     `old_timeval32`;
+///   * `socketcall` (102): SYS_SOCKETPAIR, SYS_SEND and SYS_RECV.
+fn smoke_compat32_table_socket_msghdr_and_socketcall() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["sock"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            // The staged native structures go below the "stack pointer": the
+            // end of the data segment's first page, clear of the fixtures.
+            let sp = base + 0x1000;
+            let b32 = |off: u64| (base + off) as u32;
+            let mut fds = Vec::new();
+            if call32(360, [AF_UNIX, SOCK_DGRAM, 0, base + 0x100, 0, 0]) != 0 {
+                return Err("i386 socketpair(AF_UNIX, SOCK_DGRAM) failed");
+            }
+            let (s0, s1) = (get_u32(base + 0x100)?, get_u32(base + 0x104)?);
+            fds.extend([u64::from(s0), u64::from(s1)]);
+            let result = (|| {
+                // sendmsg: iovecs "ab" + "cd", SCM_RIGHTS carrying s0.
+                put_user(base + 0x200, b"abcd")?;
+                put_user(base + 0x220, &words(&[b32(0x200), 2, b32(0x202), 2]))?;
+                put_user(base + 0x240, &words(&[16, 1, 1, s0]))?;
+                let msg = words(&[0, 0, b32(0x220), 2, b32(0x240), 16, 0]);
+                put_user(base + 0x260, &msg)?;
+                if call32_sp(370, [u64::from(s0), base + 0x260, 0, 0, 0, 0], sp) != 4 {
+                    return Err("i386 sendmsg of a compat_msghdr with SCM_RIGHTS failed");
+                }
+                // recvmsg into one 16-byte compat_iovec and a 16-byte control buffer.
+                put_user(base + 0x300, &words(&[b32(0x320), 16]))?;
+                put_user(base + 0x340, &[0u8; 16])?;
+                let msg = words(&[0, 0, b32(0x300), 1, b32(0x340), 16, 0]);
+                put_user(base + 0x380, &msg)?;
+                if call32_sp(372, [u64::from(s1), base + 0x380, 0, 0, 0, 0], sp) != 4
+                    || get_user(base + 0x320, 4)? != b"abcd"
+                {
+                    return Err("i386 recvmsg did not fill its compat_iovec");
+                }
+                let ctrl = get_user(base + 0x340, 16)?;
+                let w = |i: usize| {
+                    u32::from_le_bytes([
+                        ctrl[i * 4],
+                        ctrl[i * 4 + 1],
+                        ctrl[i * 4 + 2],
+                        ctrl[i * 4 + 3],
+                    ])
+                };
+                if w(0) != 16 || w(1) != 1 || w(2) != 1 || w(3) > 0xFFFF {
+                    return Err("i386 recvmsg did not write a compat_cmsghdr SCM_RIGHTS record");
+                }
+                fds.push(u64::from(w(3)));
+                if get_u32(base + 0x380 + 20)? != 16
+                    || get_u32(base + 0x380 + 24)? & MSG_CTRUNC != 0
+                {
+                    return Err("i386 recvmsg did not report msg_controllen 16 without MSG_CTRUNC");
+                }
+                // A 12-byte control buffer holds no fd: MSG_CTRUNC.
+                if call32_sp(370, [u64::from(s0), base + 0x260, 0, 0, 0, 0], sp) != 4 {
+                    return Err("i386 sendmsg (second) failed");
+                }
+                let msg = words(&[0, 0, b32(0x300), 1, b32(0x340), 12, 0]);
+                put_user(base + 0x380, &msg)?;
+                if call32_sp(372, [u64::from(s1), base + 0x380, 0, 0, 0, 0], sp) != 4
+                    || get_u32(base + 0x380 + 24)? & MSG_CTRUNC == 0
+                {
+                    return Err(
+                        "i386 recvmsg into a too-small control buffer did not set MSG_CTRUNC",
+                    );
+                }
+                // sendmmsg / recvmmsg_time64: two datagrams, msg_len at +28.
+                put_user(base + 0x400, b"xyz")?;
+                put_user(base + 0x410, &words(&[b32(0x400), 1, b32(0x401), 2]))?;
+                let mut vec = words(&[0, 0, b32(0x410), 1, 0, 0, 0, 0]);
+                vec.extend(words(&[0, 0, b32(0x418), 1, 0, 0, 0, 0]));
+                put_user(base + 0x440, &vec)?;
+                if call32_sp(345, [u64::from(s0), base + 0x440, 2, 0, 0, 0], sp) != 2
+                    || get_u32(base + 0x440 + 28)? != 1
+                    || get_u32(base + 0x460 + 28)? != 2
+                {
+                    return Err("i386 sendmmsg did not send both compat_mmsghdrs");
+                }
+                put_user(base + 0x500, &words(&[b32(0x520), 8, b32(0x530), 8]))?;
+                let mut vec = words(&[0, 0, b32(0x500), 1, 0, 0, 0, 0]);
+                vec.extend(words(&[0, 0, b32(0x508), 1, 0, 0, 0, 0]));
+                put_user(base + 0x540, &vec)?;
+                if call32_sp(
+                    417,
+                    [u64::from(s1), base + 0x540, 2, MSG_DONTWAIT, 0, 0],
+                    sp,
+                ) != 2
+                    || get_u32(base + 0x540 + 28)? != 1
+                    || get_u32(base + 0x560 + 28)? != 2
+                    || get_user(base + 0x530, 2)? != b"yz"
+                {
+                    return Err("i386 recvmmsg_time64 did not fill both compat_mmsghdrs");
+                }
+                // SO_RCVTIMEO as an old_timeval32 { 1, 500000 }.
+                put_user(base + 0x600, &words(&[1, 500_000]))?;
+                if call32_sp(366, [u64::from(s0), 1, 20, base + 0x600, 8, 0], sp) != 0 {
+                    return Err("i386 setsockopt(SO_RCVTIMEO) of an old_timeval32 failed");
+                }
+                put_user(base + 0x610, &[0u8; 8])?;
+                put_user(base + 0x620, &8u32.to_le_bytes())?;
+                if call32_sp(
+                    365,
+                    [u64::from(s0), 1, 20, base + 0x610, base + 0x620, 0],
+                    sp,
+                ) != 0
+                    || get_user(base + 0x610, 8)? != words(&[1, 500_000])
+                    || get_u32(base + 0x620)? != 8
+                {
+                    return Err("i386 getsockopt(SO_RCVTIMEO) did not return the old_timeval32");
+                }
+                // socketcall(SYS_SOCKETPAIR / SYS_SEND / SYS_RECV).
+                put_user(base + 0x700, &words(&[1, 2, 0, b32(0x740)]))?;
+                if call32_sp(102, [8, base + 0x700, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 socketcall(SYS_SOCKETPAIR) failed");
+                }
+                let (t0, t1) = (get_u32(base + 0x740)?, get_u32(base + 0x744)?);
+                fds.extend([u64::from(t0), u64::from(t1)]);
+                put_user(base + 0x760, b"sc")?;
+                put_user(base + 0x700, &words(&[t0, b32(0x760), 2, 0]))?;
+                if call32_sp(102, [9, base + 0x700, 0, 0, 0, 0], sp) != 2 {
+                    return Err("i386 socketcall(SYS_SEND) failed");
+                }
+                put_user(
+                    base + 0x700,
+                    &words(&[t1, b32(0x780), 8, MSG_DONTWAIT as u32]),
+                )?;
+                if call32_sp(102, [10, base + 0x700, 0, 0, 0, 0], sp) != 2
+                    || get_user(base + 0x780, 2)? != b"sc"
+                {
+                    return Err("i386 socketcall(SYS_RECV) failed");
+                }
+                if call32_sp(102, [0, base + 0x700, 0, 0, 0, 0], sp) != EINVAL {
+                    return Err("socketcall(0) must be EINVAL");
+                }
+                Ok(())
+            })();
+            for fd in fds {
+                let _ = call32(6, [fd, 0, 0, 0, 0, 0]);
+            }
+            result
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_socket_msghdr_and_socketcall
+);
+
+// ── The native entries ───────────────────────────────────────────────
+
+/// `call32(nr, regs)` answers exactly as the native `native` handler does
+/// on the same registers.
+fn same_as_native(nr: u32, native: Syscall, regs: [u64; 6]) -> Result<(), &'static str> {
+    let args = SyscallArgs {
+        arg0: regs[0],
+        arg1: regs[1],
+        arg2: regs[2],
+        arg3: regs[3],
+        arg4: regs[4],
+        arg5: regs[5],
+    };
+    let want = call(native.raw(), args).ok_or("native call failed")?;
+    if call32(nr, regs) != want {
+        return Err("an i386 native-entry call does not answer as its native handler");
+    }
+    Ok(())
+}
+
+/// The i386 rows whose entry point is the x86_64 one (`syscall_32.tbl`
+/// names the same `sys_*`) answer as their native handler does, with their
+/// signed C arguments sign-extended. A sample across the families:
+///
+///   * process and scheduling: getpgrp (65), getsid (147), getpgid (132),
+///     getpriority (96), sched_get_priority_max / _min (159/160),
+///     sched_getscheduler (157), prctl(PR_GET_DUMPABLE) (172), getcpu (318),
+///     alarm (27);
+///   * files: memfd_create (356), then fchmod (94), flock (143), fsync (118)
+///     and fdatasync (148) on it; symlinkat (304), renameat (302) and
+///     fchmodat (306) with AT_FDCWD as the 32-bit register 0xFFFFFF9C,
+///     which only sign-extension makes AT_FDCWD;
+///   * inotify_init1 (332), inotify_add_watch (292), inotify_rm_watch (293);
+///   * timerfd_create (322), timerfd_settime64 (411) and timerfd_gettime64
+///     (410) with the 64-bit `itimerspec`; clock_getres_time64 (406).
+fn smoke_compat32_table_native_entries_pass_through() -> TestResult {
+    const PRIO_PROCESS: u64 = 0;
+    const SCHED_FIFO: u64 = 1;
+    const PR_GET_DUMPABLE: u64 = 3;
+    const LOCK_EX: u64 = 2;
+    const LOCK_UN: u64 = 8;
+    const IN_CREATE: u64 = 0x100;
+    const CLOCK_MONOTONIC: u64 = 1;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["native"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-nat", "compat32-nat", &[("f", b"abc")], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            for (nr, native, regs) in [
+                (65u32, Syscall::Getpgrp, [0u64; 6]),
+                (147, Syscall::Getsid, [0; 6]),
+                (132, Syscall::Getpgid, [0; 6]),
+                (96, Syscall::Getpriority, [PRIO_PROCESS, 0, 0, 0, 0, 0]),
+                (
+                    159,
+                    Syscall::SchedGetPriorityMax,
+                    [SCHED_FIFO, 0, 0, 0, 0, 0],
+                ),
+                (
+                    160,
+                    Syscall::SchedGetPriorityMin,
+                    [SCHED_FIFO, 0, 0, 0, 0, 0],
+                ),
+                (157, Syscall::SchedGetScheduler, [0; 6]),
+                (172, Syscall::Prctl, [PR_GET_DUMPABLE, 0, 0, 0, 0, 0]),
+            ] {
+                same_as_native(nr, native, regs)?;
+            }
+            if call32(159, [SCHED_FIFO, 0, 0, 0, 0, 0]) != 99 {
+                return Err("i386 sched_get_priority_max(SCHED_FIFO) must be 99");
+            }
+            if call32(318, [base + 0x100, base + 0x104, 0, 0, 0, 0]) != 0 {
+                return Err("i386 getcpu failed");
+            }
+            if call32(27, [0, 0, 0, 0, 0, 0]) < 0 {
+                return Err("i386 alarm(0) failed");
+            }
+            put_user(base + 0x200, b"m\0")?;
+            let mfd = call32(356, [base + 0x200, 0, 0, 0, 0, 0]);
+            if mfd < 0 {
+                return Err("i386 memfd_create failed");
+            }
+            let mfd = mfd as u64;
+            for (nr, native, regs) in [
+                (94u32, Syscall::Fchmod, [mfd, 0o600, 0, 0, 0, 0]),
+                (143, Syscall::Flock, [mfd, LOCK_EX, 0, 0, 0, 0]),
+                (143, Syscall::Flock, [mfd, LOCK_UN, 0, 0, 0, 0]),
+                (118, Syscall::Fsync, [mfd, 0, 0, 0, 0, 0]),
+                (148, Syscall::Fdatasync, [mfd, 0, 0, 0, 0, 0]),
+            ] {
+                same_as_native(nr, native, regs)?;
+            }
+            let _ = call32(6, [mfd, 0, 0, 0, 0, 0]);
+            put_user(base + 0x300, b"/compat32-nat/f\0")?;
+            put_user(base + 0x320, b"/compat32-nat/l\0")?;
+            put_user(base + 0x340, b"/compat32-nat/g\0")?;
+            if call32(304, [base + 0x300, AT_FDCWD32, base + 0x320, 0, 0, 0]) != 0 {
+                return Err("i386 symlinkat(AT_FDCWD) failed");
+            }
+            if call32(305, [AT_FDCWD32, base + 0x320, base + 0x400, 64, 0, 0]) != 15
+                || get_user(base + 0x400, 15)? != b"/compat32-nat/f"
+            {
+                return Err("i386 readlinkat(AT_FDCWD) did not read the new link");
+            }
+            if call32(
+                302,
+                [AT_FDCWD32, base + 0x300, AT_FDCWD32, base + 0x340, 0, 0],
+            ) != 0
+            {
+                return Err("i386 renameat(AT_FDCWD) failed");
+            }
+            if call32(306, [AT_FDCWD32, base + 0x340, 0o640, 0, 0, 0]) != 0 {
+                return Err("i386 fchmodat(AT_FDCWD) failed");
+            }
+            let ifd = call32(332, [0, 0, 0, 0, 0, 0]);
+            if ifd < 0 {
+                return Err("i386 inotify_init1 failed");
+            }
+            put_user(base + 0x380, b"/compat32-nat\0")?;
+            let wd = call32(292, [ifd as u64, base + 0x380, IN_CREATE, 0, 0, 0]);
+            if wd < 0 || call32(293, [ifd as u64, wd as u64, 0, 0, 0, 0]) != 0 {
+                return Err("i386 inotify_add_watch / inotify_rm_watch failed");
+            }
+            let _ = call32(6, [ifd as u64, 0, 0, 0, 0, 0]);
+            let tfd = call32(322, [CLOCK_MONOTONIC, 0, 0, 0, 0, 0]);
+            if tfd < 0 {
+                return Err("i386 timerfd_create failed");
+            }
+            // struct itimerspec64 { it_interval, it_value }: a 5 s one-shot.
+            let mut its = [0u8; 32];
+            its[16..24].copy_from_slice(&5i64.to_le_bytes());
+            put_user(base + 0x500, &its)?;
+            if call32(411, [tfd as u64, 0, base + 0x500, 0, 0, 0]) != 0
+                || call32(410, [tfd as u64, base + 0x540, 0, 0, 0, 0]) != 0
+            {
+                return Err("i386 timerfd_settime64 / timerfd_gettime64 failed");
+            }
+            let left = get_u64(base + 0x540 + 16)?;
+            if left > 5 || (left == 0 && get_u64(base + 0x540 + 24)? == 0) {
+                return Err("i386 timerfd_gettime64 did not report the 64-bit it_value");
+            }
+            let _ = call32(6, [tfd as u64, 0, 0, 0, 0, 0]);
+            put_user(base + 0x580, &[0xFFu8; 16])?;
+            if call32(406, [CLOCK_MONOTONIC, base + 0x580, 0, 0, 0, 0]) != 0
+                || get_u64(base + 0x580)? != 0
+            {
+                return Err("i386 clock_getres_time64 did not write a __kernel_timespec");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_native_entries_pass_through
+);
+
+// ── Time, limits, filesystem information, select/poll, split offsets ─
+
+/// The i386 calls glibc and Steam make whose compat structure, 32-bit time
+/// or split 64-bit argument differs from the native call:
+///
+///   * `time` (13, an `old_time32_t` returned and stored), `gettimeofday`
+///     (78, an `old_timeval32`), `times` (43, four 32-bit `compat_clock_t`s
+///     and nothing past them);
+///   * `ugetrlimit` (191) / `setrlimit` (75) with a `compat_rlimit`, the old
+///     `getrlimit` (76) clamping to 0x7FFFFFFF; `getrusage` (77) writing the
+///     72-byte `compat_rusage`;
+///   * `statfs64` / `fstatfs64` (268/269, the packed 84-byte
+///     `compat_statfs64`; any other size is EINVAL), `statfs` (99, the
+///     64-byte `compat_statfs`), `sysinfo` (116, the 64-byte
+///     `compat_sysinfo`);
+///   * `ftruncate64` / `truncate64` (194/193) and `fadvise64_64` (272) with
+///     their offsets in two registers; `preadv` (333) with `compat_iovec`s
+///     and a split offset; `sendfile` (187) with a `compat_off_t`;
+///   * `sigaltstack` (186) with a 12-byte `compat_stack_t`;
+///   * `pselect6_time64` (413) and `_newselect` (142) with 32-bit-word
+///     `fd_set`s (only `ceil(n/32)` words written back), `ppoll_time64`
+///     (414);
+///   * `signalfd4` (327), `rt_sigpending` (176) and `sched_setaffinity`
+///     (241) with a 4-byte mask length.
+fn smoke_compat32_table_time_limits_statfs_select_and_offsets() -> TestResult {
+    const RLIMIT_NOFILE: u64 = 7;
+    const RLIMIT_STACK: u64 = 3;
+    const O_RDWR: u64 = 2;
+    const SEEK_END: u64 = 2;
+    const POLLIN: u16 = 1;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["e"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-e", "compat32-e", &[("f", b"abcdef")], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let sp = base + 0x1000;
+            let b32 = |off: u64| (base + off) as u32;
+            let mut fds = Vec::new();
+            let result = (|| {
+                // time / gettimeofday / times.
+                let now = call32_sp(13, [base + 0x100, 0, 0, 0, 0, 0], sp);
+                if now <= 0 || i64::from(get_u32(base + 0x100)? as i32) != now {
+                    return Err("i386 time did not return and store an old_time32_t");
+                }
+                if call32_sp(78, [base + 0x110, 0, 0, 0, 0, 0], sp) != 0
+                    || i64::from(get_u32(base + 0x110)? as i32) < now
+                    || get_u32(base + 0x114)? >= 1_000_000
+                {
+                    return Err("i386 gettimeofday did not write an old_timeval32");
+                }
+                poison(base + 0x120, 32)?;
+                if call32_sp(43, [base + 0x120, 0, 0, 0, 0, 0], sp) == i64::MIN
+                    || !untouched(base + 0x120, 16, 32)?
+                {
+                    return Err("i386 times did not write a 16-byte compat_tms");
+                }
+                // Limits and usage.
+                if call32_sp(191, [RLIMIT_NOFILE, base + 0x140, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 ugetrlimit(RLIMIT_NOFILE) failed");
+                }
+                let (cur, max) = (get_u32(base + 0x140)?, get_u32(base + 0x144)?);
+                if cur == 0 || cur > max {
+                    return Err("i386 ugetrlimit did not write a compat_rlimit");
+                }
+                if call32_sp(75, [RLIMIT_NOFILE, base + 0x140, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 setrlimit of the same compat_rlimit failed");
+                }
+                if call32_sp(76, [RLIMIT_STACK, base + 0x148, 0, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x148)? > 0x7FFF_FFFF
+                    || get_u32(base + 0x14C)? > 0x7FFF_FFFF
+                {
+                    return Err("i386 old getrlimit did not clamp to 0x7FFFFFFF");
+                }
+                poison(base + 0x180, 144)?;
+                if call32_sp(77, [0, base + 0x180, 0, 0, 0, 0], sp) != 0
+                    || !untouched(base + 0x180, 72, 144)?
+                {
+                    return Err("i386 getrusage did not write a 72-byte compat_rusage");
+                }
+                // statfs64 / fstatfs64 / statfs / sysinfo.
+                put_user(base + 0x220, b"/compat32-e/f\0")?;
+                poison(base + 0x240, 128)?;
+                if call32_sp(268, [base + 0x220, 84, base + 0x240, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x244)? == 0
+                    || !untouched(base + 0x240, 84, 128)?
+                {
+                    return Err("i386 statfs64 did not write an 84-byte compat_statfs64");
+                }
+                if call32_sp(268, [base + 0x220, 88, base + 0x240, 0, 0, 0], sp) != EINVAL {
+                    return Err("i386 statfs64 with a size other than 84 must be EINVAL");
+                }
+                let fd = call32(5, [base + 0x220, O_RDWR, 0, 0, 0, 0]);
+                if fd < 0 {
+                    return Err("opening the fixture file failed");
+                }
+                fds.push(fd as u64);
+                let fd = fd as u64;
+                if call32_sp(269, [fd, 84, base + 0x240, 0, 0, 0], sp) != 0 {
+                    return Err("i386 fstatfs64 failed");
+                }
+                poison(base + 0x2C0, 128)?;
+                if call32_sp(99, [base + 0x220, base + 0x2C0, 0, 0, 0, 0], sp) != 0
+                    || !untouched(base + 0x2C0, 64, 128)?
+                {
+                    return Err("i386 statfs did not write a 64-byte compat_statfs");
+                }
+                poison(base + 0x340, 128)?;
+                if call32_sp(116, [base + 0x340, 0, 0, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x340 + 16)? == 0
+                    || get_u32(base + 0x340 + 52)? == 0
+                    || !untouched(base + 0x340, 64, 128)?
+                {
+                    return Err("i386 sysinfo did not write a 64-byte compat_sysinfo");
+                }
+                // Split offsets: preadv at 1 first (the file is "abcdef").
+                put_user(base + 0x3C0, &words(&[b32(0x3E0), 2, b32(0x3E2), 2]))?;
+                if call32_sp(333, [fd, base + 0x3C0, 2, 1, 0, 0], sp) != 4
+                    || get_user(base + 0x3E0, 4)? != b"bcde"
+                {
+                    return Err("i386 preadv with compat_iovecs at a split offset failed");
+                }
+                if call32_sp(194, [fd, 0x1000, 0, 0, 0, 0], sp) != 0
+                    || call32(19, [fd, 0, SEEK_END, 0, 0, 0]) != 0x1000
+                {
+                    return Err("i386 ftruncate64 did not join its offset words");
+                }
+                if call32_sp(193, [base + 0x220, 0x10, 0, 0, 0, 0], sp) != 0
+                    || call32(19, [fd, 0, SEEK_END, 0, 0, 0]) != 0x10
+                {
+                    return Err("i386 truncate64 did not join its offset words");
+                }
+                if call32_sp(272, [fd, 0, 0, 0x10, 0, 0], sp) != 0 {
+                    return Err("i386 fadvise64_64 failed");
+                }
+                // sendfile from offset 1 into a pipe: the compat_off_t moves to 3.
+                if call32(42, [base + 0x400, 0, 0, 0, 0, 0]) != 0 {
+                    return Err("i386 pipe failed");
+                }
+                let (rfd, wfd) = (
+                    u64::from(get_u32(base + 0x400)?),
+                    u64::from(get_u32(base + 0x404)?),
+                );
+                fds.extend([rfd, wfd]);
+                put_user(base + 0x408, &1u32.to_le_bytes())?;
+                if call32_sp(187, [wfd, fd, base + 0x408, 2, 0, 0], sp) != 2
+                    || get_u32(base + 0x408)? != 3
+                {
+                    return Err("i386 sendfile did not read and update its compat_off_t");
+                }
+                // pselect6_time64 / _newselect / ppoll_time64 on the readable pipe.
+                let n = rfd + 1;
+                let bit = |set: u64| -> Result<(), &'static str> {
+                    poison(set, 8)?;
+                    let mut b = alloc::vec![0u8; 4];
+                    b[(rfd / 8) as usize] = 1 << (rfd % 8);
+                    put_user(set, &b)
+                };
+                bit(base + 0x420)?;
+                put_user(base + 0x440, &[0u8; 16])?;
+                if call32_sp(413, [n, base + 0x420, 0, 0, base + 0x440, 0], sp) != 1
+                    || get_user(base + 0x420, 4)?[(rfd / 8) as usize] & (1 << (rfd % 8)) == 0
+                    || !untouched(base + 0x420, 4, 8)?
+                {
+                    return Err("i386 pselect6_time64 did not use 32-bit fd_set words");
+                }
+                bit(base + 0x420)?;
+                put_user(base + 0x450, &[0u8; 8])?;
+                if call32_sp(142, [n, base + 0x420, 0, 0, base + 0x450, 0], sp) != 1 {
+                    return Err("i386 _newselect with an old_timeval32 failed");
+                }
+                let mut pfd = (rfd as u32).to_le_bytes().to_vec();
+                pfd.extend_from_slice(&POLLIN.to_le_bytes());
+                pfd.extend_from_slice(&0u16.to_le_bytes());
+                put_user(base + 0x460, &pfd)?;
+                if call32_sp(414, [base + 0x460, 1, base + 0x440, 0, 8, 0], sp) != 1 {
+                    return Err("i386 ppoll_time64 failed");
+                }
+                // sigaltstack: set, then read back through a compat_stack_t.
+                put_user(base + 0x480, &words(&[0x0800_0000, 0, 0x4000]))?;
+                if call32_sp(186, [base + 0x480, 0, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 sigaltstack(set) of a compat_stack_t failed");
+                }
+                poison(base + 0x4A0, 24)?;
+                if call32_sp(186, [0, base + 0x4A0, 0, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x4A0)? != 0x0800_0000
+                    || get_u32(base + 0x4A8)? != 0x4000
+                    || !untouched(base + 0x4A0, 12, 24)?
+                {
+                    return Err("i386 sigaltstack did not report a 12-byte compat_stack_t");
+                }
+                let mut disable = words(&[0, 2, 0]); // SS_DISABLE
+                disable.truncate(12);
+                put_user(base + 0x480, &disable)?;
+                let _ = call32_sp(186, [base + 0x480, 0, 0, 0, 0, 0], sp);
+                // signalfd4, rt_sigpending, sched_setaffinity.
+                put_user(base + 0x4C0, &(1u64 << 9).to_le_bytes())?; // SIGUSR1
+                let sfd = call32(327, [0xFFFF_FFFF, base + 0x4C0, 8, 0, 0, 0]);
+                if sfd < 0 {
+                    return Err("i386 signalfd4(-1) failed");
+                }
+                fds.push(sfd as u64);
+                if call32(176, [base + 0x4D0, 8, 0, 0, 0, 0]) != 0 {
+                    return Err("i386 rt_sigpending failed");
+                }
+                // A 4-byte compat mask of every CPU answers as the native call
+                // does on the same 4 bytes (`compat_get_user_cpu_mask`).
+                put_user(base + 0x4E0, &u32::MAX.to_le_bytes())?;
+                same_as_native(
+                    241,
+                    Syscall::SchedSetaffinity,
+                    [0, 4, base + 0x4E0, 0, 0, 0],
+                )?;
+                Ok(())
+            })();
+            for fd in fds {
+                let _ = call32(6, [fd, 0, 0, 0, 0, 0]);
+            }
+            result
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_time_limits_statfs_select_and_offsets
+);
+
+// ── 32-bit times and 16-bit ids ──────────────────────────────────────
+
+/// The i386 entries that predate 64-bit time and 32-bit ids:
+///
+///   * `nanosleep` (162), `clock_getres` (266), `timerfd_settime` /
+///     `timerfd_gettime` (325/326, an `old_itimerspec32` of two
+///     `old_timespec32`s written and nothing past it), `sched_rr_get_interval`
+///     (161);
+///   * `utimensat` (320, `old_timespec32[2]`), `utimes` (271,
+///     `old_timeval32[2]`) and `utime` (30, `old_utimbuf32`) setting the
+///     mtime `stat64` then reads back;
+///   * the 16-bit ids (`kernel/uid16.c`): `getresuid` (165) narrowing with
+///     `high2lowuid`, `setresuid` (164) / `chown` (182) / `lchown` (16) /
+///     `fchown` (95) with 0xFFFF widened to -1 ("unchanged"), `setfsuid`
+///     (138) answering as the native call, `getgroups` (80) counting and
+///     filling 16-bit groups.
+fn smoke_compat32_table_time32_and_uid16_calls() -> TestResult {
+    const CLOCK_MONOTONIC: u64 = 1;
+    const O_RDWR: u64 = 2;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["old"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-old", "compat32-old", &[("f", b"x")], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let sp = base + 0x1000;
+            let mut fds = Vec::new();
+            let result = (|| {
+                put_user(base + 0x100, &words(&[0, 1000]))?;
+                if call32_sp(162, [base + 0x100, base + 0x108, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 nanosleep of an old_timespec32 failed");
+                }
+                poison(base + 0x110, 16)?;
+                if call32_sp(266, [CLOCK_MONOTONIC, base + 0x110, 0, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x114)? == 0
+                    || !untouched(base + 0x110, 8, 16)?
+                {
+                    return Err("i386 clock_getres did not write an old_timespec32");
+                }
+                let tfd = call32(322, [CLOCK_MONOTONIC, 0, 0, 0, 0, 0]);
+                if tfd < 0 {
+                    return Err("i386 timerfd_create failed");
+                }
+                fds.push(tfd as u64);
+                put_user(base + 0x120, &words(&[0, 0, 5, 0]))?;
+                poison(base + 0x140, 32)?;
+                if call32_sp(325, [tfd as u64, 0, base + 0x120, 0, 0, 0], sp) != 0
+                    || call32_sp(326, [tfd as u64, base + 0x140, 0, 0, 0, 0], sp) != 0
+                {
+                    return Err("i386 timerfd_settime/gettime of an old_itimerspec32 failed");
+                }
+                let left = get_u32(base + 0x148)?;
+                if left > 5 || !untouched(base + 0x140, 16, 32)? {
+                    return Err("i386 timerfd_gettime did not write a 16-byte old_itimerspec32");
+                }
+                poison(base + 0x160, 16)?;
+                if call32_sp(161, [0, base + 0x160, 0, 0, 0, 0], sp) != 0
+                    || !untouched(base + 0x160, 8, 16)?
+                {
+                    return Err("i386 sched_rr_get_interval did not write an old_timespec32");
+                }
+                // utimensat / utimes / utime, checked through stat64's st_mtime.
+                put_user(base + 0x200, b"/compat32-old/f\0")?;
+                let mtime = || -> Result<u32, &'static str> {
+                    if call32(195, [base + 0x200, base + 0x300, 0, 0, 0, 0]) != 0 {
+                        return Err("i386 stat64 failed");
+                    }
+                    get_u32(base + 0x300 + 72)
+                };
+                put_user(base + 0x220, &words(&[1, 0, 2, 0]))?;
+                if call32_sp(320, [AT_FDCWD32, base + 0x200, base + 0x220, 0, 0, 0], sp) != 0
+                    || mtime()? != 2
+                {
+                    return Err("i386 utimensat of old_timespec32[2] did not set the mtime");
+                }
+                put_user(base + 0x220, &words(&[3, 0, 4, 0]))?;
+                if call32_sp(271, [base + 0x200, base + 0x220, 0, 0, 0, 0], sp) != 0
+                    || mtime()? != 4
+                {
+                    return Err("i386 utimes of old_timeval32[2] did not set the mtime");
+                }
+                put_user(base + 0x220, &words(&[5, 6]))?;
+                if call32_sp(30, [base + 0x200, base + 0x220, 0, 0, 0, 0], sp) != 0 || mtime()? != 6
+                {
+                    return Err("i386 utime of an old_utimbuf32 did not set the mtime");
+                }
+                // 16-bit ids.
+                let ruid = call32(199, [0; 6]);
+                poison(base + 0x400, 8)?;
+                if call32_sp(165, [base + 0x400, base + 0x402, base + 0x404, 0, 0, 0], sp) != 0 {
+                    return Err("i386 getresuid16 failed");
+                }
+                let got = get_user(base + 0x400, 2)?;
+                let r16 = u16::from_le_bytes([got[0], got[1]]);
+                let want = if ruid > 0xFFFF { 65534 } else { ruid as u16 };
+                if r16 != want || !untouched(base + 0x400, 6, 8)? {
+                    return Err("i386 getresuid16 did not write three high2lowuid old_uid_ts");
+                }
+                if call32_sp(164, [0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0], sp) != 0
+                    || call32(199, [0; 6]) != ruid
+                {
+                    return Err("i386 setresuid16(0xFFFF, ...) must leave the ids unchanged");
+                }
+                if call32_sp(182, [base + 0x200, 0xFFFF, 0xFFFF, 0, 0, 0], sp) != 0
+                    || call32_sp(16, [base + 0x200, 0xFFFF, 0xFFFF, 0, 0, 0], sp) != 0
+                {
+                    return Err("i386 chown16/lchown16(-1, -1) failed");
+                }
+                let fd = call32(5, [base + 0x200, O_RDWR, 0, 0, 0, 0]);
+                if fd < 0 {
+                    return Err("opening the fixture file failed");
+                }
+                fds.push(fd as u64);
+                if call32_sp(95, [fd as u64, 0xFFFF, 0xFFFF, 0, 0, 0], sp) != 0 {
+                    return Err("i386 fchown16(-1, -1) failed");
+                }
+                same_as_native(138, Syscall::Setfsuid, [0xFFFF_FFFF, 0, 0, 0, 0, 0])
+                    .map_err(|_| "i386 setfsuid16(-1) did not answer as setfsuid(-1)")?;
+                let n = call32_sp(80, [0, 0, 0, 0, 0, 0], sp);
+                if n < 0 || n != call32(205, [0, 0, 0, 0, 0, 0]) {
+                    return Err("i386 getgroups16(0) did not count the groups");
+                }
+                if n > 0 && call32_sp(80, [n as u64, base + 0x500, 0, 0, 0, 0], sp) != n {
+                    return Err("i386 getgroups16 did not fill its 16-bit list");
+                }
+                Ok(())
+            })();
+            for fd in fds {
+                let _ = call32(6, [fd, 0, 0, 0, 0, 0]);
+            }
+            result
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_time32_and_uid16_calls
+);

@@ -3220,6 +3220,7 @@ dependencies = [
  "narf-crypto",
  "narf-drivers-serial",
  "narf-efi",
+ "narf-firmware-smbios",
  "narf-init",
  "narf-input",
  "narf-interrupts",

@@ -129,6 +129,7 @@ mod page_cache_tests;
 mod posix_acl_tests;
 mod procsys_e2e_tests;
 mod random_e2e_tests;
+mod sysfs_dmi_tests;
 mod sysfs_e2e_tests;
 mod sysfs_tests;
 mod tests;

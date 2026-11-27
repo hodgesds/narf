@@ -24,6 +24,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 mod discover;
 mod discover_tests;
+mod ident;
 mod tests;
 
 pub use discover::{
@@ -33,6 +34,7 @@ pub use discover::{
     SMBIOS3_TABLE_GUID, SMBIOS_ENTRY_POINT_SCAN_LEN, SMBIOS_ENTRY_POINT_SCAN_START,
     SMBIOS_TABLE_GUID,
 };
+pub use ident::{DmiField, DmiIdent};
 
 /// Register the boot-time scan (`dmi-scan`, `Stage::Core`). Linux runs
 /// `dmi_setup` from `setup_arch`, long before any driver probes, so

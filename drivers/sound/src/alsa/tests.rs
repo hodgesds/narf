@@ -78,6 +78,7 @@ struct Backend {
     paused: [AtomicBool; 2],
     fail_start: AtomicBool,
     batch: AtomicBool,
+    interleaved_only: AtomicBool,
     samples: IrqSafeSpinLock<Vec<u8>>,
 }
 impl Default for Backend {
@@ -90,6 +91,7 @@ impl Default for Backend {
             paused: core::array::from_fn(|_| AtomicBool::new(false)),
             fail_start: AtomicBool::new(false),
             batch: AtomicBool::new(false),
+            interleaved_only: AtomicBool::new(false),
             samples: IrqSafeSpinLock::new(Vec::new()),
         }
     }
@@ -120,6 +122,9 @@ impl PcmDevice for Device {
         let mut caps = PcmCapabilities::fixed(defaults());
         caps.batch = self.0.batch.load(Ordering::Acquire);
         caps
+    }
+    fn noninterleaved(&self) -> bool {
+        !self.0.interleaved_only.load(Ordering::Acquire)
     }
     fn open(&self, capture: bool, _: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
         if self.0.claimed[usize::from(capture)].swap(true, Ordering::AcqRel) {
@@ -1438,3 +1443,46 @@ fn card_components_and_pcm_names(card: u32) -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/sound/alsa", alsa_card_components_and_pcm_names);
+
+/// Linux HDA advertises interleaved access only (`azx_pcm_hw`: MMAP,
+/// MMAP_VALID, INTERLEAVED, ...; no SNDRV_PCM_INFO_NONINTERLEAVED), so
+/// HW_REFINE leaves MMAP_INTERLEAVED and RW_INTERLEAVED and PipeWire maps
+/// the buffer. NARF offered RW_NONINTERLEAVED on every device, and PipeWire
+/// drove the RX 6750 XT's HDMI PCM as planar RW (hw_params "access:
+/// RW_NONINTERLEAVED", S32P in pw-top).
+fn alsa_interleaved_only_device_offers_no_planar_access() -> TestResult {
+    let fixture = Fixture::new();
+    fixture
+        .backend
+        .interleaved_only
+        .store(true, Ordering::Release);
+    let f = fixture.pcm(false);
+    let m = Memory::new();
+    // MMAP_INTERLEAVED (0), RW_INTERLEAVED (3) and RW_NONINTERLEAVED (4).
+    let mut b = any_params(0);
+    put32(&mut b, 4, 1 | (1 << 3) | (1 << 4));
+    m.put(128, &b);
+    if ioctl(f.as_ref(), &m, 0x10, 3, 608, 128) != Ok(0) {
+        return TestResult::Fail("HW_REFINE");
+    }
+    let (access, info_bits) = {
+        let bytes = m.bytes.lock();
+        (get32(&bytes, 128 + 4), get32(&bytes, 128 + 520))
+    };
+    if access != (1 | (1 << 3)) || info_bits & 0x200 != 0 || info_bits & 0x101 != 0x101 {
+        return TestResult::Fail("interleaved-only: MMAP and RW interleaved access only");
+    }
+    m.put(128, &any_params(4));
+    if ioctl(f.as_ref(), &m, 0x11, 3, 608, 128).is_ok() {
+        return TestResult::Fail("HW_PARAMS refuses RW_NONINTERLEAVED");
+    }
+    m.put(128, &any_params(3));
+    if ioctl(f.as_ref(), &m, 0x11, 3, 608, 128).is_err() {
+        return TestResult::Fail("HW_PARAMS takes RW_INTERLEAVED");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sound/alsa",
+    alsa_interleaved_only_device_offers_no_planar_access
+);

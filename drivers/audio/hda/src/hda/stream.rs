@@ -181,13 +181,22 @@ impl Stream {
         }
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
         let position = unsafe { dev.bar0.read32(sd_base(self.index) + SD_LPIB) };
+        // LPIB counts "from 0 to the value in CBL and then wraps to 0" (HDA
+        // spec, SDnLPIB): CBL itself ends a lap. Linux azx_get_position reads
+        // any position at or past the buffer size as 0.
+        let position = if position >= ring.bytes as u32 {
+            0
+        } else {
+            position
+        };
         let now = narf_time::now_cycles();
         // One trip around the ring at the stream's own rate.
         let wrap_ns = ring.bytes as u64 * 1_000_000_000
             / (u64::from(ring.params.rate.hz()) * ring.frame_bytes as u64);
-        if position >= ring.bytes as u32
-            || (!ring.free_running
-                && now.wrapping_sub(self.last_sample) >= narf_time::wall::ns_to_cycles(wrap_ns))
+        // A stream that is not free-running stops when a whole lap passes
+        // unsampled: its queued data cannot be told from a replay.
+        if !ring.free_running
+            && now.wrapping_sub(self.last_sample) >= narf_time::wall::ns_to_cycles(wrap_ns)
         {
             ring.xrun = true;
             let _ = self.stop(dev);
@@ -300,6 +309,10 @@ impl PcmDevice for Card {
     }
     fn components(&self) -> Option<alloc::string::String> {
         self.0.components()
+    }
+    fn noninterleaved(&self) -> bool {
+        // azx_pcm_hw: SNDRV_PCM_INFO_INTERLEAVED, never NONINTERLEAVED.
+        false
     }
     fn pcm_name(&self, capture: bool, device: u32) -> Option<alloc::string::String> {
         // patch_hdmi: "HDMI %d" by PCM index.

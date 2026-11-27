@@ -441,6 +441,30 @@ fn unicast_oif(o: &SockOptions) -> u32 {
     }
 }
 
+/// The device of the local route that delivers `daddr`, one of this host's
+/// own addresses, as IP_PKTINFO reports it. The packet loops through lo,
+/// but `ip_route_output_key_hash_rcu` sets `orig_oif = FIB_RES_OIF(*res)`
+/// for an RTN_LOCAL route ("make sure orig_oif points to fib result device
+/// even though packet rx/tx happens over loopback"), and
+/// `ipv4_pktinfo_prepare` reports that `rt_iif` for a packet that arrived
+/// on lo: lo for 127.0.0.0/8, else the device that owns the address.
+fn local_route_ifindex(ns: u64, daddr: u32) -> u32 {
+    let ip = daddr.to_be_bytes();
+    if ip[0] == 127 {
+        return super::sockopt::LOOPBACK_IFINDEX;
+    }
+    narf_net::iface::snapshot_all_in(ns)
+        .into_iter()
+        .find(|i| {
+            i.ipv4 == ip
+                || narf_net::ifaddr::iface_addrs(&i.name)
+                    .iter()
+                    .any(|a| a.addr.0 == ip)
+        })
+        .and_then(|i| narf_net::iface::ifindex_of(&i.name))
+        .unwrap_or(super::sockopt::LOOPBACK_IFINDEX)
+}
+
 pub(super) fn select_source(ns: u64, daddr: u32, dev: u32) -> Result<u32, SockError> {
     let d = daddr.to_be_bytes();
     if d[0] == 127 {
@@ -915,6 +939,13 @@ impl SocketFile {
         addr: Option<&SockAddr>,
     ) -> SocketOpResult {
         let ns = self.net_ns_id();
+        // This send's IP_PKTINFO (`ip_cmsg_send`), taken before any early
+        // return so it never outlives the sendmsg that carried it. A nonzero
+        // `ipi_ifindex` is the output device (`ipc->oif`, which otherwise
+        // starts as `sk_bound_dev_if`); `ipi_spec_dst` the source.
+        let pktinfo = self.take_send_pktinfo().filter(|pi| !pi.v6);
+        let cmsg_oif = pktinfo.map_or(0, |pi| pi.ifindex);
+        let src_override = pktinfo.and_then(|pi| pi.src_v4());
         // `inet_send_prepare` autobinds first; failure → EAGAIN
         // (`net/ipv4/af_inet.c:838-840`).
         {
@@ -971,14 +1002,30 @@ impl SocketFile {
             Ok(g) => g,
             Err(e) => return SocketOpResult::Err(e),
         };
+        if cmsg_oif != 0 && !super::sockopt::ifindex_exists(ns, cmsg_oif) {
+            // `ip_route_output_key_hash_rcu`: the flow's oif names no device.
+            return SocketOpResult::Err(SockError::NoDevice);
+        }
         if super::sockopt::is_multicast_v4(dest.0) {
-            return self
-                .inet_dgram_send_mcast(buf, local_addr, local_port, dest, connected, gso_size);
+            return self.inet_dgram_send_mcast(
+                buf,
+                local_addr,
+                local_port,
+                dest,
+                connected,
+                gso_size,
+                cmsg_oif,
+                src_override,
+            );
         }
         let (dev, broadcast, ip_ttl, ip_tos, ip_pmtudisc, no_check) = {
             let o = self.options.lock();
             (
-                unicast_oif(&o),
+                if cmsg_oif != 0 {
+                    cmsg_oif
+                } else {
+                    unicast_oif(&o)
+                },
                 o.broadcast,
                 o.ip_ttl,
                 o.ip_tos,
@@ -1031,9 +1078,6 @@ impl SocketFile {
         // An IP_PKTINFO ipi_spec_dst (sendmsg) overrides the source address for
         // this datagram — both the looped-back copy and the wire send — so a
         // reply leaves from the address the peer saw (QUIC source pinning).
-        let src_override = self.take_send_pktinfo().and_then(|pi| {
-            (!pi.v6).then(|| u32::from_be_bytes([pi.addr[0], pi.addr[1], pi.addr[2], pi.addr[3]]))
-        });
         let from = match src_override {
             Some(a) => a,
             None if local_addr == INADDR_ANY => src,
@@ -1047,16 +1091,23 @@ impl SocketFile {
         if dest_is_broadcast {
             // The looped copy arrives on the output device carrying the
             // sent header; its spec_dst is the route back to the sender,
-            // i.e. the sender's own address.
+            // i.e. the sender's own address. The output device is the
+            // broadcast route's (lo for 127.255.255.255), never none.
             let rx = super::Inet4RxInfo {
                 dst: dest.0,
                 dport: dest.1,
                 ifindex: if dev != 0 {
                     dev
                 } else {
-                    narf_net::iface::for_dst_in(ns, dest.0.to_be_bytes())
-                        .map(|i| i.ifindex)
-                        .unwrap_or(0)
+                    narf_net::route::route_lookup_in(
+                        ns,
+                        narf_net::ipv4::Ipv4Addr(dest.0.to_be_bytes()),
+                    )
+                    .and_then(|r| narf_net::iface::ifindex_of(&r.iface))
+                    .or_else(|| {
+                        narf_net::iface::for_dst_in(ns, dest.0.to_be_bytes()).map(|i| i.ifindex)
+                    })
+                    .unwrap_or(super::sockopt::LOOPBACK_IFINDEX)
                 },
                 spec_dst: from,
                 ttl: ip_ttl.min(255) as u8,
@@ -1156,16 +1207,12 @@ impl SocketFile {
         match dest_sock {
             Some(d) => {
                 // Local delivery goes through lo: `ipv4_pktinfo_prepare`
-                // reports the output route's `rt_iif` (the sender's bound
-                // device) or else lo, and spec_dst is the local daddr.
+                // reports the output route's `rt_iif`, which is the local
+                // route's own device, and spec_dst is the local daddr.
                 let rx = super::Inet4RxInfo {
                     dst: dest.0,
                     dport: dest.1,
-                    ifindex: if dev != 0 {
-                        dev
-                    } else {
-                        super::sockopt::LOOPBACK_IFINDEX
-                    },
+                    ifindex: local_route_ifindex(ns, dest.0),
                     spec_dst: dest.0,
                     ttl: ip_ttl.min(255) as u8,
                     tos: ip_tos.min(255) as u8,
@@ -1254,6 +1301,13 @@ impl SocketFile {
     /// local members while `IP_MULTICAST_LOOP` is set, and a datagram sent
     /// out lo comes back in through lo whatever the flag says (the lo route
     /// outputs through plain `ip_output`).
+    ///
+    /// `cmsg_oif` and `src_override` are the send's IP_PKTINFO
+    /// `ipi_ifindex` and `ipi_spec_dst`: `udp_sendmsg` takes `mc_index` only
+    /// when `ipc.oif` is 0, and `mc_addr` only when no source was given.
+    /// avahi names every mDNS packet's interface this way and never sets
+    /// IP_MULTICAST_IF.
+    #[allow(clippy::too_many_arguments)]
     fn inet_dgram_send_mcast(
         self: &Arc<Self>,
         buf: &[u8],
@@ -1262,12 +1316,18 @@ impl SocketFile {
         dest: (u32, u16),
         connected: Option<(u32, u16)>,
         gso_size: u16,
+        cmsg_oif: u32,
+        src_override: Option<u32>,
     ) -> SocketOpResult {
         let ns = self.net_ns_id();
         let (egress, mc_loop, mc_ttl, ip_tos, ip_pmtudisc, no_check) = {
             let o = self.options.lock();
             (
-                super::sockopt::mc_egress_v4(ns, &o, dest.0),
+                if cmsg_oif != 0 {
+                    Some(cmsg_oif)
+                } else {
+                    super::sockopt::mc_egress_v4(ns, &o, dest.0)
+                },
                 o.ext.ip_mc_loop,
                 o.ip_multicast_ttl,
                 o.ip_tos,
@@ -1301,10 +1361,10 @@ impl SocketFile {
             Ok(g) => g,
             Err(e) => return SocketOpResult::Err(e),
         };
-        let from = if local_addr == INADDR_ANY {
-            super::sockopt::mc_source_v4(ns, egress)
-        } else {
-            local_addr
+        let from = match src_override {
+            Some(a) => a,
+            None if local_addr == INADDR_ANY => super::sockopt::mc_source_v4(ns, egress),
+            None => local_addr,
         };
         let via_lo = egress == super::sockopt::LOOPBACK_IFINDEX;
         // `ip_mc_output`'s looped copy arrives on the egress device with the
@@ -1352,6 +1412,8 @@ impl SocketFile {
             ip_ttl: mc_ttl.min(255) as u8,
             ip_tos: ip_tos.min(255) as u8,
             ip_pmtudisc,
+            // An IP_PKTINFO source is the wire packet's source as well.
+            ip_src_override: src_override.map(u32::to_be_bytes),
             sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
             gso_size,
             no_check_tx: no_check,
