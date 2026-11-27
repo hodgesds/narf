@@ -3341,19 +3341,19 @@ mod tests {
         if !ep.ctl_add(FD, &file_ops, 0, EPOLLIN, 0x11, &ep_ops) {
             return TestResult::Fail("CTL_ADD failed");
         }
-        if ep.inner.lock().interest.get(&FD).is_none() {
+        if !ep.inner.lock().interest.contains_key(&FD) {
             return TestResult::Fail("CTL_ADD must insert the interest record");
         }
         if !ep.ctl_mod(FD, &file_ops, EPOLLOUT, 0x22, &ep_ops) {
             return TestResult::Fail("CTL_MOD failed");
         }
-        if ep.inner.lock().interest.get(&FD).is_none() {
+        if !ep.inner.lock().interest.contains_key(&FD) {
             return TestResult::Fail("CTL_MOD must keep the interest record");
         }
         if !ep.ctl_del(FD, &file_ops) {
             return TestResult::Fail("CTL_DEL failed");
         }
-        if ep.inner.lock().interest.get(&FD).is_some() {
+        if ep.inner.lock().interest.contains_key(&FD) {
             return TestResult::Fail("CTL_DEL must remove the interest record");
         }
         if ep.ctl_del(FD, &file_ops) {
