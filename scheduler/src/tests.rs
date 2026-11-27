@@ -18,6 +18,63 @@ fn smoke_scheduler_direct_handoff_is_local_only() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_direct_handoff_is_local_only);
 
+/// A live `sleep_pumps::NestedBlock` keeps nested waits on its CPU from
+/// running the nested-only pumps (the executor step), and nothing else:
+/// the IO/timer pumps still run, blocks nest, and the last drop lets the
+/// nested-only pumps run again.
+fn smoke_scheduler_nested_block_skips_nested_only_pumps() -> TestResult {
+    use crate::sleep_pumps;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static NESTED_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static IO_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static REGISTERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    fn nested_pump() {
+        NESTED_RUNS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn io_pump() {
+        IO_RUNS.fetch_add(1, Ordering::Relaxed);
+    }
+    if !REGISTERED.swap(true, Ordering::AcqRel) {
+        sleep_pumps::register_nested_only(nested_pump);
+        sleep_pumps::register(io_pump);
+    }
+    let counts = || {
+        (
+            IO_RUNS.load(Ordering::Relaxed),
+            NESTED_RUNS.load(Ordering::Relaxed),
+        )
+    };
+    if sleep_pumps::nested_blocked() {
+        return TestResult::Fail("a NestedBlock was already live on this CPU");
+    }
+    let (io0, nested0) = counts();
+    sleep_pumps::run();
+    let (io1, nested1) = counts();
+    if io1 == io0 || nested1 == nested0 {
+        return TestResult::Fail("an unblocked run() must run both kinds of pump");
+    }
+    let outer = sleep_pumps::block_nested();
+    let inner = sleep_pumps::block_nested();
+    sleep_pumps::run();
+    drop(inner);
+    sleep_pumps::run();
+    let (io2, nested2) = counts();
+    if !sleep_pumps::nested_blocked() || nested2 != nested1 || io2 != io1 + 2 {
+        return TestResult::Fail("while blocked only the IO/timer pumps may run");
+    }
+    drop(outer);
+    sleep_pumps::run();
+    let (_, nested3) = counts();
+    if sleep_pumps::nested_blocked() || nested3 == nested2 {
+        return TestResult::Fail("the last drop must let the nested-only pumps run again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_nested_block_skips_nested_only_pumps
+);
+
 fn smoke_scheduler_steal_leaves_runnable_on_victim() -> TestResult {
     if crate::victim_has_stealable_surplus(false, 0)
         || crate::victim_has_stealable_surplus(false, 1)

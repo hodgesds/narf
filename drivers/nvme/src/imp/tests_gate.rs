@@ -153,6 +153,113 @@ kernel_test_in!(
     smoke_nvme_gate_services_masked_work
 );
 
+/// The executor step boot-init's nested waits run in production
+/// (`scheduler_step_pump`, registered only after the kernel tests): poll
+/// one round from the boot context. Enabled only by the smoke below.
+static NESTED_STEP_ON: AtomicBool = AtomicBool::new(false);
+
+fn nested_step_pump() {
+    if NESTED_STEP_ON.load(Ordering::Acquire) && narf_scheduler::current_task_id().raw() == 0 {
+        let _ = narf_scheduler::poll_one_round_nested();
+    }
+}
+
+/// Spawn (on the boot CPU, a default spawn like the task on the laptop) a
+/// task that takes `slot`'s gate, recording the outcome in `taken`.
+fn spawn_contender(slot: &'static super::InstalledController, taken: &'static AtomicUsize) {
+    taken.store(NOT_RUN, Ordering::Release);
+    narf_scheduler::spawn(async move {
+        let got = acquire(slot);
+        taken.store(
+            if got.is_ok() { GOT_GATE } else { TIMED_OUT },
+            Ordering::Release,
+        );
+    });
+}
+
+/// Run the pumps as a held command wait does (`wait_cqe_ms` ->
+/// `responsive_spin_until` -> `bridge_pump`), until `taken` changes or
+/// `ms` pass.
+fn pump_while(taken: &AtomicUsize, ms: u64) -> usize {
+    let deadline = narf_time::Deadline::after_ms(ms);
+    while taken.load(Ordering::Acquire) == NOT_RUN && !deadline.expired() {
+        narf_scheduler::sleep_pumps::run();
+    }
+    taken.load(Ordering::Acquire)
+}
+
+const NOT_RUN: usize = 0;
+const GOT_GATE: usize = 1;
+const TIMED_OUT: usize = 2;
+
+/// Turns the nested step off, and releases a bare gate, on every exit.
+struct NestedStep(&'static super::InstalledController);
+
+impl Drop for NestedStep {
+    fn drop(&mut self) {
+        NESTED_STEP_ON.store(false, Ordering::Release);
+        self.0.req_gate.store(false, Ordering::Release);
+    }
+}
+
+/// The wedge seen on the P14s Gen 5 boot: boot-init (task 0) held the gate
+/// across a polled read, and that wait's `sleep_pumps::run()` stepped the
+/// executor, polling a boot-CPU task that wanted the same controller. The
+/// task spun on top of the holder's stack, which could not resume, until
+/// `GateTimeout` 60 s later (an I/O error for the task, 60 s for the read).
+///
+/// - Control: a gate held bare (no guard) still wedges that way here, so
+///   this setup reproduces it.
+/// - A `ControllerGuard` holder's waits poll no task while it is held;
+///   once it drops, the next wait runs the task and it takes the gate.
+fn smoke_nvme_gate_holder_wait_polls_no_contender() -> TestResult {
+    static TAKEN: AtomicUsize = AtomicUsize::new(NOT_RUN);
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    if narf_scheduler::current_task_id().raw() != 0 {
+        return TestResult::Skip("needs the boot context, whose sync waits step the executor");
+    }
+    if !REGISTERED.swap(true, Ordering::AcqRel) {
+        narf_scheduler::sleep_pumps::register_nested_only(nested_step_pump);
+    }
+    // A wedge ends in 200 ms instead of 60 s.
+    let _bounds = StallBounds::set(20, 200);
+    let slot = leak_slot(u32::MAX - 1, None, Controller::new(0));
+    let _step = NestedStep(slot);
+    NESTED_STEP_ON.store(true, Ordering::Release);
+
+    // Control: the bare gate, no guard.
+    if !super::hold_gate_for_test(slot) {
+        return TestResult::Fail("an uncontended gate was not taken");
+    }
+    spawn_contender(slot, &TAKEN);
+    if pump_while(&TAKEN, 2_000) != TIMED_OUT {
+        return TestResult::Fail(
+            "control: a task polled under a bare holder's wait did not wedge to GateTimeout",
+        );
+    }
+    slot.req_gate.store(false, Ordering::Release);
+
+    // The guard.
+    let Ok(held) = acquire(slot) else {
+        return TestResult::Fail("an uncontended gate was not acquired");
+    };
+    spawn_contender(slot, &TAKEN);
+    let while_held = pump_while(&TAKEN, 400);
+    drop(held);
+    match (while_held, pump_while(&TAKEN, 2_000)) {
+        (NOT_RUN, GOT_GATE) => TestResult::Pass,
+        (TIMED_OUT, _) => TestResult::Fail(
+            "a task polled under the holder's wait spun on the gate to GateTimeout",
+        ),
+        (NOT_RUN, NOT_RUN) => TestResult::Fail("after the release the contending task never ran"),
+        _ => TestResult::Fail("the contending task did not take the gate after its release"),
+    }
+}
+kernel_test_in!(
+    "drivers/nvme/req_gate/nested",
+    smoke_nvme_gate_holder_wait_polls_no_contender
+);
+
 /// Shortened stall bounds for the smoke below, restored on every exit.
 struct StallBounds;
 

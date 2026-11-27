@@ -10015,10 +10015,62 @@ pub mod sleep_pumps {
 
     /// Full run: IO/timer pumps + nested-only pumps. Called from nested
     /// sync-waits (boot-init, blocking syscalls) where the executor loop is
-    /// blocked and cannot advance peers itself.
+    /// blocked and cannot advance peers itself. While a [`NestedBlock`] is
+    /// live on this CPU, only the IO/timer pumps run.
     pub fn run() {
         run_slots(&SLOTS);
-        run_slots(&NESTED_SLOTS);
+        if !nested_blocked() {
+            run_slots(&NESTED_SLOTS);
+        }
+    }
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO_BLOCKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    /// Live [`NestedBlock`]s, per CPU.
+    static NESTED_BLOCKS: [core::sync::atomic::AtomicU32; narf_lib::percpu::MAX_CPUS] =
+        [ZERO_BLOCKS; narf_lib::percpu::MAX_CPUS];
+
+    fn this_cpu() -> usize {
+        narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)
+    }
+
+    /// Held by a caller that owns a lock another task may want, for as long
+    /// as it owns it: a driver's request gate held across a polled command
+    /// wait. Until it drops, a sync wait on this CPU runs the IO/timer pumps
+    /// only, never the nested-only ones, so no task is polled on top of the
+    /// holder's stack.
+    ///
+    /// Such a task that wanted the lock could only spin: the holder resumes
+    /// only when the task's poll returns. That deadlock held the NVMe gate
+    /// for 60 s on hardware (boot-init's polled read; a nested task's read
+    /// of the same controller failed with `GateTimeout`). Linux never
+    /// schedules while a spinlock is held.
+    ///
+    /// Blocks nest. Each is released on the CPU that took it, wherever it is
+    /// dropped.
+    #[must_use = "dropping the block immediately lets nested waits poll tasks again"]
+    #[derive(Debug)]
+    pub struct NestedBlock {
+        cpu: usize,
+    }
+
+    impl Drop for NestedBlock {
+        fn drop(&mut self) {
+            let previous = NESTED_BLOCKS[self.cpu].fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous != 0, "sleep_pumps: NestedBlock underflow");
+        }
+    }
+
+    /// Start a [`NestedBlock`] on this CPU.
+    pub fn block_nested() -> NestedBlock {
+        let cpu = this_cpu();
+        NESTED_BLOCKS[cpu].fetch_add(1, Ordering::AcqRel);
+        NestedBlock { cpu }
+    }
+
+    /// Whether a [`NestedBlock`] is live on this CPU.
+    pub fn nested_blocked() -> bool {
+        NESTED_BLOCKS[this_cpu()].load(Ordering::Acquire) != 0
     }
 
     /// IO/timer pumps ONLY — excludes nested-only pumps. Called from
