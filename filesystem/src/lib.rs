@@ -1051,6 +1051,30 @@ pub struct FsIoctlReply {
     pub output: Vec<u8>,
 }
 
+/// A driver's hold on one process's address space ([`IoctlContext::remote_mm`],
+/// Linux `mmgrab`), usable outside that process's syscalls. It keeps the
+/// address space's identity, not its memory: once the address space has no
+/// user left (`mmget_not_zero` fails) every pin is `BadAddress`.
+pub trait RemoteMm: Send + Sync + core::fmt::Debug {
+    /// [`IoctlContext::pin_user_pages`] in the held address space, faulting
+    /// pages in and resolving COW there (`get_user_pages_remote`).
+    fn pin_user_pages(
+        &self,
+        address: u64,
+        pages: u64,
+        writable: bool,
+    ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError>;
+    /// [`IoctlContext::mmu_interval_notifier`] in the held address space.
+    fn mmu_interval_notifier(
+        &self,
+        address: u64,
+        length: u64,
+        ops: Arc<dyn narf_memory::mmu_notifier::MmuIntervalNotifierOps>,
+    ) -> Result<narf_memory::mmu_notifier::MmuIntervalNotifier, FsError>;
+    /// [`narf_memory::AddressSpace::identity`] of the held address space.
+    fn identity(&self) -> u64;
+}
+
 /// Fault-contained userspace access for device ioctls, including nested
 /// pointers. Implemented by the syscall boundary; devices never dereference
 /// process addresses. The context is valid only during the calling syscall.
@@ -1102,6 +1126,14 @@ pub trait IoctlContext: Sync {
     /// address space, so a driver can tell whether the caller may re-collect
     /// a range another process registered. `None` without one.
     fn address_space_identity(&self) -> Option<u64> {
+        None
+    }
+    /// Linux `mmgrab(current->mm)` for a driver that mirrors the calling
+    /// process's address space into a device (`drm_gpusvm_init`'s
+    /// `gpusvm->mm`): a hold that pins and watches that address space later
+    /// from any context, as a GPU page-fault worker does. The default has no
+    /// address space.
+    fn remote_mm(&self) -> Option<Arc<dyn RemoteMm>> {
         None
     }
     /// Resolve a descriptor in the calling process without exposing its table
