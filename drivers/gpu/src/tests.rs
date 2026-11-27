@@ -6872,6 +6872,89 @@ fn smoke_amdgpu_navi31_fw_table() -> TestResult {
 #[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/amdgpu", smoke_amdgpu_navi31_fw_table);
 
+/// The Navi31 per-SKU firmware tables: every non-kicker Navi31 DID
+/// (0x7448 Pro W7900, 0x7449 Pro W7800 48GB, 0x744A Pro W7900 Dual
+/// Slot, 0x744C RX 7900 XT/XTX/GRE, 0x745E Pro W7800) gets the audited
+/// base table — Linux selects these blobs by GC 11.0.0 IP version, not
+/// by board id — while 0x744B (Pro W7900D, the only Navi31 entry in
+/// Linux's `kicker_device_list`, rev 0x00) gets the kicker table,
+/// identical except RLC + TA. Navi32/33 and the 0x7446 USB function
+/// stay on the empty `UNAUDITED_FW` placeholder.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_navi31_sku_fw_tables() -> TestResult {
+    use crate::amdgpu::{AMD_VENDOR, NAVI31, SMU_LOAD_PMFW_MP1};
+    use crate::amdgpu_psp::{PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC};
+    let base: [&str; 12] = [
+        "amdgpu/gc_11_0_0_toc.bin",
+        "amdgpu/sdma_6_0_0.bin",
+        "amdgpu/gc_11_0_0_pfp.bin",
+        "amdgpu/gc_11_0_0_me.bin",
+        "amdgpu/gc_11_0_0_mec.bin",
+        "amdgpu/gc_11_0_0_mes.bin",
+        "amdgpu/gc_11_0_0_mes_2.bin",
+        "amdgpu/gc_11_0_0_mes1.bin",
+        "amdgpu/gc_11_0_0_rlc.bin",
+        "amdgpu/vcn_4_0_0.bin",
+        "amdgpu/dcn_3_2_0_dmcub.bin",
+        "amdgpu/psp_13_0_0_ta.bin",
+    ];
+    let mut kicker = base;
+    kicker[8] = "amdgpu/gc_11_0_0_rlc_kicker.bin";
+    kicker[11] = "amdgpu/psp_13_0_0_ta_kicker.bin";
+    // Non-kicker Navi31 SKUs share the base table, kicker entry included.
+    for (did, expected) in [
+        (0x7448u16, &base),
+        (0x7449, &base),
+        (0x744A, &base),
+        (NAVI31, &base),
+        (0x745E, &base),
+        (0x744B, &kicker),
+    ] {
+        let chip = match crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, did) {
+            Some(chip) => chip,
+            None => return TestResult::Fail("Navi31 SKU must be in the probe table"),
+        };
+        let list = chip.fw_list;
+        if list.is_empty() {
+            return TestResult::Fail("Navi31 SKU fw_list must not be empty (UNAUDITED_FW)");
+        }
+        let names: alloc::vec::Vec<&str> = list.iter().map(|e| e.name).collect();
+        if names.as_slice() != expected.as_slice() {
+            return TestResult::Fail("Navi31 SKU fw table names/order wrong");
+        }
+        if list[0].cmd != PSP_CMD_LOAD_TOC || list[11].cmd != PSP_CMD_LOAD_TA {
+            return TestResult::Fail("Navi31 SKU table must open with TOC and close with TA");
+        }
+        if list.iter().any(|e| e.cmd == SMU_LOAD_PMFW_MP1) {
+            return TestResult::Fail("Navi31 SKU must not route SMU PMFW through MP1");
+        }
+        if names.iter().any(|n| n.contains("rlc_1")) {
+            return TestResult::Fail("rev-gated rlc_1 must not be in a Navi31 SKU table");
+        }
+    }
+    // The kicker variants belong to 0x744B alone.
+    for did in [0x7448u16, 0x7449, 0x744A, NAVI31, 0x745E] {
+        let chip = crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, did)
+            .expect("Navi31 SKU must be in the probe table");
+        if chip.fw_list.iter().any(|e| e.name.contains("kicker")) {
+            return TestResult::Fail("kicker blobs must not be in a non-kicker Navi31 table");
+        }
+    }
+    // Navi32/33 and the USB function stay unaudited.
+    for did in [0x7446u16, 0x747E, 0x7480] {
+        let chip = match crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, did) {
+            Some(chip) => chip,
+            None => return TestResult::Fail("Navi3 DID must be in the probe table"),
+        };
+        if !chip.fw_list.is_empty() {
+            return TestResult::Fail("Navi32/33 and the USB function stay on UNAUDITED_FW");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!("drivers/gpu/amdgpu", smoke_amdgpu_navi31_sku_fw_tables);
+
 /// Navi31 MP0/MP1 bases + SMU driver-IF version, resolved from a
 /// synthetic discovery blob. The static `Family::mp0_base()` stays
 /// `None` for Navi3 by design (discovery-sourced); the device-level
