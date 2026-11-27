@@ -108,7 +108,6 @@ fn build_process(code: &[u8]) -> Result<(UserProcess, PhysAddr), &'static str> {
         entry_arg: None,
         loaded_mappings: Vec::new(),
         program_bias: 0,
-        page_in_plan: Vec::new(),
         ia32: false,
         segs: narf_userspace::UserSegments::default(),
     };

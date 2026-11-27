@@ -8275,6 +8275,72 @@ fn smoke_memory_rmap_tracks_materialized_region() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_rmap_tracks_materialized_region);
 
+/// `rmap::remove_batch` retires many owners with one pass per shard and
+/// keeps `remove`'s semantics: entries it names are gone, entries it
+/// does not name survive, and a batch that empties a shard's last keys
+/// still retires them.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_rmap_remove_batch() -> TestResult {
+    use crate::{PhysAddr, VirtAddr};
+
+    crate::rmap::__reset_for_test();
+    let root = PhysAddr::new(0x1000);
+    // Eight frames in eight distinct shards: shard = pfn & 63, so
+    // consecutive pfns land in consecutive shards.
+    let frames: alloc::vec::Vec<PhysAddr> = (0..8)
+        .map(|i| PhysAddr::new((0x20000 + i as u64) << 12))
+        .collect();
+    for (i, p) in frames.iter().enumerate() {
+        crate::rmap::add(*p, root, VirtAddr::new(0x8000_0000 + (i as u64) * 4096));
+    }
+    // One frame keeps a second owner under another root: removing only
+    // the first root's entry must leave the second intact.
+    let shared = frames[3];
+    crate::rmap::add(shared, PhysAddr::new(0x2000), VirtAddr::new(0x9000_0000));
+
+    let result = (|| {
+        for p in &frames {
+            if crate::rmap::owner_count(*p) != if *p == shared { 2 } else { 1 } {
+                return TestResult::Fail("setup did not record the expected owners");
+            }
+        }
+        // Retire every first-root owner in one batch.
+        let batch: alloc::vec::Vec<(PhysAddr, PhysAddr, VirtAddr)> = frames
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (*p, root, VirtAddr::new(0x8000_0000 + (i as u64) * 4096)))
+            .collect();
+        crate::rmap::remove_batch(&batch);
+        for (i, p) in frames.iter().enumerate() {
+            let _ = i;
+            let want = if *p == shared { 1 } else { 0 };
+            if crate::rmap::owner_count(*p) != want {
+                return TestResult::Fail("remove_batch left or dropped an owner");
+            }
+        }
+        // The surviving second owner is still exactly that owner.
+        let mut matched = false;
+        crate::rmap::for_each_owner(shared, |o| {
+            if o.root == PhysAddr::new(0x2000) && o.va.as_u64() == 0x9000_0000 {
+                matched = true;
+            }
+        });
+        if !matched {
+            return TestResult::Fail("remove_batch disturbed an unnamed owner");
+        }
+        // Removing an already-gone entry is a no-op, not a miscount.
+        crate::rmap::remove_batch(&batch);
+        if crate::rmap::owner_count(shared) != 1 {
+            return TestResult::Fail("re-removing a retired batch changed the count");
+        }
+        TestResult::Pass
+    })();
+    crate::rmap::__reset_for_test();
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_rmap_remove_batch);
+
 /// rmap across fork + COW-split: a fork-shared frame must gain a second owner,
 /// and a COW write-split must MOVE the writer's owner to its private copy while
 /// the other sharer keeps the original.

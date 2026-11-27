@@ -1,21 +1,21 @@
-//! Exec page-in clustering (#740): the loader records the new image's
-//! demand-paged PT_LOAD spans as a plan, and `loader::page_in_plan`
-//! installs them through the bulk fault API (#738) instead of leaving
-//! every page to fault individually at first touch.
+//! Demand-paged exec: the loader maps a file-backed image's PT_LOAD
+//! segments as FILE_DEMAND regions and reads nothing inside execve —
+//! every page faults in on first touch after the new image starts,
+//! like Linux's `binfmt_elf`.
 //!
 //! The witnesses are the two that cannot be faked, mirroring
 //! `smoke_userspace_exec_reads_headers_not_whole_file` and
 //! `abi_faultaround_tests`: after the load, the segment's pages are
 //! NOT backed and the counting `FileOps` has seen header bytes only;
-//! after one `page_in_plan` drive, the pages ARE backed
-//! (`mapped_frame` finds frames with no further fault call) and the
-//! counter grew by exactly the clustered pages' bytes — the batch
-//! read each page once, as one clustered operation, not as N faults.
+//! after a first touch, exactly that page IS backed
+//! (`mapped_frame` finds its frame with no further fault call) and the
+//! counter grew by exactly one page's bytes — the fault read the page
+//! once, as one fault, not as an eager bulk copy.
 //!
 //! The fixture is a synthetic in-memory `FileOps` whose reads are
 //! byte-counted, loaded through the real type `execve` hands the
 //! loader (`ExecSource::File`) — no device, no filesystem, so the
-//! counts isolate the loader/batch behaviour exactly.
+//! counts isolate the loader behaviour exactly.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -77,7 +77,7 @@ impl FileOps for CountingFile {
 }
 
 /// The loaded fixture's address space, published for the demand hook's
-/// lookup while a test drives the batch — the same install the sibling
+/// lookup while a test drives a fault — the same install the sibling
 /// demand smokes perform.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static PAGEIN_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
@@ -194,7 +194,7 @@ fn mapped_frame(aspace: &AddressSpace, va: u64) -> Option<u64> {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn assert_backed(aspace: &AddressSpace, base: u64, index: u64) -> Result<(), &'static str> {
     if mapped_frame(aspace, base + index * PAGE).is_none() {
-        return Err("a page the batch should have installed is not backed");
+        return Err("a page first touch should have installed is not backed");
     }
     Ok(())
 }
@@ -202,7 +202,7 @@ fn assert_backed(aspace: &AddressSpace, base: u64, index: u64) -> Result<(), &'s
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn assert_unbacked(aspace: &AddressSpace, base: u64, index: u64) -> Result<(), &'static str> {
     if mapped_frame(aspace, base + index * PAGE).is_some() {
-        return Err("a page outside the batch's work is unexpectedly backed");
+        return Err("a page no first touch reached is unexpectedly backed");
     }
     Ok(())
 }
@@ -231,16 +231,24 @@ fn mapped_bytes(
     Ok(out)
 }
 
-/// A 32-page demand segment loads with its whole span as the plan,
-/// nothing resident and nothing but headers read; one batch drive
-/// installs all 32 pages, reads exactly their bytes once, serves the
-/// file's content, and is a no-op when driven again.
+/// Fault a single page in through the ordinary first-touch path.
+/// The fixture published the process AS as the harness's lookup
+/// target (the sibling demand smokes' pattern); the caller passes
+/// the page to fault.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn smoke_execve_pagein_clusters_demand_segment() -> TestResult {
+fn fault_page(aspace: &AddressSpace, va: u64) -> Result<(), narf_memory::AddressSpaceError> {
+    // SAFETY: the fixture published this AS for the demand hook, the
+    // same live-root arrangement the production fault path runs under.
+    unsafe { aspace.demand_alloc_page(VirtAddr::new(va)) }
+}
+
+/// A 32-page demand segment loads with nothing resident and nothing but
+/// headers read; a first touch faults exactly that page in, reads its
+/// bytes once, and serves the file's content — while untouched pages
+/// stay out, and re-faulting a resident page reads nothing.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_execve_pagein_demand_segment_faults_on_first_touch() -> TestResult {
     with_loaded(build_exec_elf(32, 32, 32), |proc| {
-        if proc.page_in_plan.as_slice() != [(SEG_VA, 32)] {
-            return Err("the plan is not the demand segment's whole span");
-        }
         assert_unbacked(&proc.address_space, SEG_VA, 0)?;
         assert_unbacked(&proc.address_space, SEG_VA, 31)?;
         let before = READ_BYTES.load(Ordering::Relaxed);
@@ -250,120 +258,89 @@ fn smoke_execve_pagein_clusters_demand_segment() -> TestResult {
         if before >= PAGE {
             return Err("the load already read a segment page — the image is not demand-paged");
         }
-        // SAFETY: this fixture published the process AS as the
-        // harness's lookup target (the sibling demand smokes' pattern);
-        // the production call sites run this post-activation, which is
-        // the same live-root arrangement the batch contract asks for.
-        let installed =
-            unsafe { crate::loader::page_in_plan(&proc.address_space, &proc.page_in_plan) };
-        if installed != 32 {
-            return Err("the batch did not install the whole segment");
+        if fault_page(&proc.address_space, SEG_VA).is_err() {
+            return Err("first touch did not fault the page in");
         }
-        if READ_BYTES.load(Ordering::Relaxed) - before != 32 * PAGE {
-            return Err("the batch did not read exactly the segment's bytes, once each");
+        if READ_BYTES.load(Ordering::Relaxed) - before != PAGE {
+            return Err("the first touch read more or less than one page");
         }
-        for index in 0..32 {
-            assert_backed(&proc.address_space, SEG_VA, index)?;
-        }
+        assert_backed(&proc.address_space, SEG_VA, 0)?;
+        assert_unbacked(&proc.address_space, SEG_VA, 1)?;
         if mapped_bytes(&proc.address_space, SEG_VA, PAGE as usize)?
             != alloc::vec![0x41u8; PAGE as usize]
         {
-            return Err("the first clustered page does not serve the file's bytes");
+            return Err("the faulted page does not serve the file's bytes");
         }
+        // A distant page faults in independently; untouched pages stay out.
+        if fault_page(&proc.address_space, SEG_VA + 31 * PAGE).is_err() {
+            return Err("a later page did not fault in on first touch");
+        }
+        assert_backed(&proc.address_space, SEG_VA, 31)?;
+        assert_unbacked(&proc.address_space, SEG_VA, 30)?;
         if mapped_bytes(&proc.address_space, SEG_VA + 31 * PAGE, PAGE as usize)?
             != alloc::vec![0x41u8.wrapping_add(31); PAGE as usize]
         {
-            return Err("the last clustered page does not serve the file's bytes");
+            return Err("the last faulted page does not serve the file's bytes");
         }
-        // Re-driving the plan installs nothing and reads nothing: the
-        // batch is a pure accelerator over pages already resident.
+        // Re-faulting a resident page reads nothing: the fault is a pure
+        // accelerator over pages already resident.
         let before = READ_BYTES.load(Ordering::Relaxed);
-        // SAFETY: same arrangement as the first drive.
-        let again = unsafe { crate::loader::page_in_plan(&proc.address_space, &proc.page_in_plan) };
-        if again != 0 || READ_BYTES.load(Ordering::Relaxed) != before {
-            return Err("re-driving the plan was not a no-op");
+        if fault_page(&proc.address_space, SEG_VA).is_err() {
+            return Err("re-faulting a resident page failed");
+        }
+        if READ_BYTES.load(Ordering::Relaxed) != before {
+            return Err("re-faulting a resident page re-read it");
         }
         Ok(())
     })
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
-    "syscall_abi/execve_pagein/clusters_demand_segment",
-    smoke_execve_pagein_clusters_demand_segment
+    "syscall_abi/execve_pagein/demand_segment_faults_on_first_touch",
+    smoke_execve_pagein_demand_segment_faults_on_first_touch
 );
 
-/// The budget binds: a 400-page segment's plan is clamped to
-/// EXEC_PAGEIN_MAX_PAGES (256), the batch installs exactly that head,
-/// and the unclustered remainder still faults in on demand — the split
-/// the cap promises (large images pay bounded exec cost, never
-/// correctness).
+/// A 400-page segment loads with nothing resident: there is no eager
+/// page-in budget clamping the head any more, and a page anywhere in
+/// the span faults in through the ordinary single-page path.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn smoke_execve_pagein_budget_bounds_large_segment() -> TestResult {
+fn smoke_execve_pagein_large_segment_faults_on_first_touch() -> TestResult {
     with_loaded(build_exec_elf(400, 400, 400), |proc| {
-        if proc.page_in_plan.as_slice() != [(SEG_VA, 256)] {
-            return Err("the plan was not clamped to the exec page-in budget");
-        }
-        let before = READ_BYTES.load(Ordering::Relaxed);
-        // SAFETY: see the sibling test's note on the live-root fixture.
-        let installed =
-            unsafe { crate::loader::page_in_plan(&proc.address_space, &proc.page_in_plan) };
-        if installed != 256 {
-            return Err("the batch did not install exactly the budgeted head");
-        }
-        if READ_BYTES.load(Ordering::Relaxed) - before != 256 * PAGE {
-            return Err("the batch read more or less than the budgeted pages");
-        }
-        assert_backed(&proc.address_space, SEG_VA, 0)?;
-        assert_backed(&proc.address_space, SEG_VA, 255)?;
+        assert_unbacked(&proc.address_space, SEG_VA, 0)?;
+        assert_unbacked(&proc.address_space, SEG_VA, 255)?;
         assert_unbacked(&proc.address_space, SEG_VA, 256)?;
         assert_unbacked(&proc.address_space, SEG_VA, 399)?;
-        // A page past the budget faults in through the ordinary
-        // single-page path, unchanged.
-        // SAFETY: `SEG_VA + 300 pages` lies in this process's
-        // FILE_DEMAND region, inside the file.
-        if unsafe {
-            proc.address_space
-                .demand_alloc_page(VirtAddr::new(SEG_VA + 300 * PAGE))
-        }
-        .is_err()
-        {
-            return Err("a page past the budget no longer faults in on demand");
+        if fault_page(&proc.address_space, SEG_VA + 300 * PAGE).is_err() {
+            return Err("a page past the old budget no longer faults in on demand");
         }
         assert_backed(&proc.address_space, SEG_VA, 300)?;
+        assert_unbacked(&proc.address_space, SEG_VA, 299)?;
         Ok(())
     })
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
-    "syscall_abi/execve_pagein/budget_bounds_large_segment",
-    smoke_execve_pagein_budget_bounds_large_segment
+    "syscall_abi/execve_pagein/large_segment_faults_on_first_touch",
+    smoke_execve_pagein_large_segment_faults_on_first_touch
 );
 
 /// A demand segment truncated after the headers still LOADS — the
-/// deferred failure is today's documented demand behaviour — and the
-/// batch installs only the pages the file actually has. The missing
-/// tail stays unbacked: it will SIGBUS on touch, exactly as it did
-/// before clustering existed.
+/// deferred failure is today's documented demand behaviour — and a
+/// present page still faults in, while a page past EOF refuses the
+/// fault and stays unbacked: it will SIGBUS on touch, exactly as a
+/// truncated `mmap`ped text segment does on Linux.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_execve_pagein_truncated_demand_defers_failure() -> TestResult {
     with_loaded(build_exec_elf(20, 32, 32), |proc| {
-        if proc.page_in_plan.as_slice() != [(SEG_VA, 32)] {
-            return Err("the plan does not cover the declared segment span");
-        }
-        let before = READ_BYTES.load(Ordering::Relaxed);
-        // SAFETY: see the sibling test's note on the live-root fixture.
-        let installed =
-            unsafe { crate::loader::page_in_plan(&proc.address_space, &proc.page_in_plan) };
-        if installed != 20 {
-            return Err("the batch installed pages the truncated file does not have");
-        }
-        if READ_BYTES.load(Ordering::Relaxed) - before != 20 * PAGE {
-            return Err("the batch read bytes other than the present pages");
+        if fault_page(&proc.address_space, SEG_VA).is_err() {
+            return Err("a present truncated-segment page did not fault in");
         }
         assert_backed(&proc.address_space, SEG_VA, 0)?;
-        assert_backed(&proc.address_space, SEG_VA, 19)?;
         assert_unbacked(&proc.address_space, SEG_VA, 20)?;
-        assert_unbacked(&proc.address_space, SEG_VA, 31)?;
+        if fault_page(&proc.address_space, SEG_VA + 20 * PAGE).is_ok() {
+            return Err("a page past EOF faulted in");
+        }
+        assert_unbacked(&proc.address_space, SEG_VA, 20)?;
         Ok(())
     })
 }
@@ -376,8 +353,8 @@ kernel_test_in!(
 /// The regression guard for exec semantics: a segment BELOW the
 /// demand floor loads eagerly, so a truncated one keeps failing the
 /// load synchronously — with the same error it produced before
-/// clustering. Clustering must never convert a synchronous ENOEXEC
-/// into a deferred fault.
+/// demand paging existed. Dropping the eager page-in must never
+/// convert a synchronous ENOEXEC into a deferred fault.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_execve_pagein_truncated_eager_fails_load() -> TestResult {
     // 8 declared pages (32 KiB) is under the 64 KiB demand floor, so

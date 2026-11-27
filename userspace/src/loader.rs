@@ -226,22 +226,10 @@ pub unsafe fn load_elf_into_at(
     vaddr_bias: u64,
 ) -> Result<u64, LoadBytesError> {
     // SAFETY: forwarding this function's own contract; `None` selects the
-    // historical eager-copy path unchanged. The page-in plan is dropped:
-    // with no file there is no demand-paged segment, so it is empty by
-    // construction.
-    let (entry, _page_in_plan) =
-        unsafe { load_elf_into_at_file(bytes, addr_space, vaddr_bias, None) }?;
-    Ok(entry)
+    // historical eager-copy path unchanged — with no file there is no
+    // demand-paged segment. The writable flag is moot without a file.
+    unsafe { load_elf_into_at_file(bytes, addr_space, vaddr_bias, None, true) }
 }
-
-/// Exec page-in plan (#740): `(region base, pages)` runs over an
-/// image's demand-paged `PT_LOAD` segments, in segment order. The
-/// loader produces the plan as data — the address space is not live
-/// on any CPU yet, and the bulk fault API requires a live root — and
-/// an exec completion path drives it once the new image has been
-/// activated (see [`page_in_plan`]). Empty unless a segment
-/// demand-paged, which requires a file-backed load.
-pub type PageInPlan = alloc::vec::Vec<(u64, u64)>;
 
 /// [`load_elf_into_at`], optionally demand-paging the file image.
 ///
@@ -250,11 +238,25 @@ pub type PageInPlan = alloc::vec::Vec<(u64, u64)>;
 /// having its pages allocated and copied: exactly the registration `mmap`
 /// builds for a `MAP_PRIVATE` file mapping, so faults are served by the same
 /// `mapped_file::demand_frame` hook. Pages are then read once, on first touch,
-/// rather than every exec paying for the whole image.
+/// rather than every exec paying for the whole image. There is no eager
+/// page-in: like Linux's `binfmt_elf`, which maps with `elf_map` and reads
+/// zero file bytes inside `execve`, every demand-paged page faults in after
+/// the new image starts — the exec path itself pays only for the pages the
+/// image touches before it can run.
 ///
 /// Segments that are not congruent, or carry no file bytes, keep the eager
 /// path — as does every caller passing `None` (the in-memory execve flavour,
 /// the interpreter, and the tests).
+///
+/// `demand_writable_segments` selects whether writable segments may be
+/// demand-paged too. The program image passes `true`: nothing in the exec
+/// path writes its pages before first touch. The interpreter passes `false`:
+/// the kernel applies the interpreter's own `PT_DYNAMIC` relocations after
+/// the load, and that pass writes its targets through page-table translation
+/// (`user_vaddr_to_kernel_ptr`), which cannot fault a demand-paged page in —
+/// an absent writable page would fail the exec with `RelocTargetUnmapped`.
+/// Keeping the interpreter's writable segments eager while its (much larger)
+/// read-only text stays demand-paged preserves the relocation pass exactly.
 ///
 /// The BSS suffix deliberately stays OUTSIDE the `FILE_DEMAND` region:
 /// `load_file_demand_page` reports no page past EOF, so a BSS page routed to
@@ -273,16 +275,15 @@ pub type PageInPlan = alloc::vec::Vec<(u64, u64)>;
 /// # Safety
 /// Same contract as [`load_elf_into_at`].
 ///
-/// Returns the entry point and the exec page-in plan (#740) — the
-/// `(region base, pages)` runs an exec completion path may cluster
-/// once the address space is live (see [`page_in_plan`]). The plan is
-/// empty unless a segment demand-paged, which requires `file`.
+/// Returns the entry point. Demand-paged segments fault in on first touch
+/// after the new image starts; there is no eager page-in.
 pub unsafe fn load_elf_into_at_file<S: crate::elf::ExecBytes + ?Sized>(
     src: &S,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
-) -> Result<(u64, PageInPlan), LoadBytesError> {
+    demand_writable_segments: bool,
+) -> Result<u64, LoadBytesError> {
     let image = crate::elf::parse_from(src)?;
     // An image goes only into an address space laid out for its class: an
     // i386 object into a `TASK_SIZE_32` one, a 64-bit object into a native
@@ -293,22 +294,17 @@ pub unsafe fn load_elf_into_at_file<S: crate::elf::ExecBytes + ?Sized>(
         return Err(LoadBytesError::Elf(crate::ElfError::WrongMachine));
     }
     // SAFETY: forwarding this function's own contract.
-    unsafe { load_image_into_at(&image, src, addr_space, vaddr_bias, file) }
+    unsafe {
+        load_image_into_at(
+            &image,
+            src,
+            addr_space,
+            vaddr_bias,
+            file,
+            demand_writable_segments,
+        )
+    }
 }
-
-/// Total pages one exec may page in ahead of first touch, shared
-/// across all of the image's demand-paged segments (#740).
-///
-/// The bound exists for the same reason the loader refuses to allocate
-/// BSS frames up front: an exec must not pay, in proportion to image
-/// size, for pages the process may never touch. 256 pages (1 MiB)
-/// covers the startup working set of a typical demand-paged image —
-/// the entry segment's text and the RW segment's file-backed head —
-/// while a 100 MiB binary clusters only its first mebibyte and faults
-/// the rest in on demand, exactly as it did before clustering existed.
-/// The batch is advisory, so the cap is a latency / frame-budget
-/// policy, never a correctness boundary.
-const EXEC_PAGEIN_MAX_PAGES: u64 = 256;
 
 /// [`load_elf_into_at_file`] for a caller that has already parsed the image.
 ///
@@ -327,7 +323,8 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
     addr_space: &AddressSpace,
     vaddr_bias: u64,
     file: Option<&alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
-) -> Result<(u64, PageInPlan), LoadBytesError> {
+    demand_writable_segments: bool,
+) -> Result<u64, LoadBytesError> {
     if image.segments.is_empty() {
         return Err(LoadBytesError::Load(LoadError::NoSegments));
     }
@@ -397,6 +394,12 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
             file.is_some()
                 && seg.file_size >= DEMAND_MIN_FILE_BYTES
                 && (seg.vaddr.wrapping_add(vaddr_bias) & 0xFFF) == (seg.file_off & 0xFFF)
+                // A caller that writes an image's pages before first touch
+                // (the interpreter's kernel relocation pass) must keep the
+                // segments it writes eager: translation cannot fault a
+                // demand-paged page in. See `load_elf_into_at_file`.
+                && (demand_writable_segments
+                    || !seg.flags.contains(crate::SegmentFlags::WRITE))
         })
         .collect();
     if file.is_some() && demand.iter().any(|d| *d) {
@@ -576,40 +579,6 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
         }
     }
 
-    // Exec page-in plan (#740): for every demand-paged segment, one run
-    // covering the segment's whole page span, in segment order, sharing
-    // one budget (EXEC_PAGEIN_MAX_PAGES). The run is deliberately just
-    // (region_base, pages): the batch's claim logic splits the
-    // file-backed head (batch fill hook) from the BSS tail (demand-zero
-    // frames) inside the run — the API's fill-source split — so the
-    // loader does not re-derive the boundary it already encoded in the
-    // region table. A segment the budget runs out inside contributes
-    // its head; later segments contribute nothing, and every page the
-    // plan omits faults on first touch exactly as it did before
-    // clustering.
-    //
-    // The plan is DATA at this point, not action: this address space
-    // is not live on any CPU yet, and the batch's safety contract
-    // requires a live root, so an exec completion path drives the plan
-    // after activating the new image (see `page_in_plan`).
-    let mut page_in_plan = PageInPlan::new();
-    let mut page_in_budget: u64 = EXEC_PAGEIN_MAX_PAGES;
-    for (index, &(_, memory_pages)) in page_counts.iter().enumerate() {
-        if page_in_budget == 0 {
-            break;
-        }
-        if !demand[index] {
-            continue;
-        }
-        let seg = &image.segments[index];
-        let region_base = seg.vaddr.wrapping_add(vaddr_bias) & !0xFFF;
-        let take = (memory_pages as u64).min(page_in_budget);
-        if take > 0 {
-            page_in_plan.push((region_base, take));
-            page_in_budget -= take;
-        }
-    }
-
     // Copy segment data. The frames may not be physically contiguous
     // (alloc_frame is a freelist), so we have to copy page by page,
     // routing each 4 KiB chunk into its own backing frame. The
@@ -665,7 +634,7 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
         }
     }
 
-    Ok((image.entry.wrapping_add(vaddr_bias), page_in_plan))
+    Ok(image.entry.wrapping_add(vaddr_bias))
 }
 
 /// Everything [`load_elf_bytes_file`] hands back for a loaded image.
@@ -685,9 +654,6 @@ pub struct LoadedElf {
     pub program_bias: u64,
     /// The parsed image the address space was built from.
     pub image: ExecImage,
-    /// Exec page-in plan (#740) for the image's demand-paged
-    /// segments; empty on the eager path.
-    pub page_in_plan: PageInPlan,
 }
 
 /// One-shot: parse ELF bytes, allocate a fresh user `AddressSpace`, map every
@@ -747,8 +713,9 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
         compat32_check_image_window(&image, &addr_space, bias)?;
         // SAFETY: forwarding the caller's identity-map + allocator contract;
         // the bias was chosen and checked against the compat window above.
-        let (entry, page_in_plan) =
-            unsafe { load_image_into_at(&image, src, &addr_space, bias, file) }?;
+        // The program image demand-pages writable segments too: nothing
+        // writes its pages before first touch (see `load_elf_into_at_file`).
+        let entry = unsafe { load_image_into_at(&image, src, &addr_space, bias, file, true) }?;
         // SAFETY: AS constructed by `new_for_user_compat32`; regions just
         // pushed by `load_image_into_at`.
         unsafe { addr_space.materialize() }
@@ -760,7 +727,6 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
             program_entry: EntryPoint(VirtAddr::new(entry)),
             program_bias: bias,
             image,
-            page_in_plan,
         });
     }
     // An image is placed inside one PML4 slot. Check it fits before mapping
@@ -786,8 +752,9 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
     // SAFETY: forwarding the caller's identity-map + allocator
     // contract; bias derived from the ELF type above.
     // SAFETY: Valid memory or trusted environment
-    let (entry, page_in_plan) =
-        unsafe { load_image_into_at(&image, src, &addr_space, bias, file) }?;
+    // The program image demand-pages writable segments too: nothing
+    // writes its pages before first touch (see `load_elf_into_at_file`).
+    let entry = unsafe { load_image_into_at(&image, src, &addr_space, bias, file, true) }?;
 
     // Install PTEs.
     // SAFETY: AS constructed by `new_for_user`; regions just pushed
@@ -803,40 +770,7 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
         program_entry: EntryPoint(VirtAddr::new(entry)),
         program_bias: bias,
         image,
-        page_in_plan,
     })
-}
-
-/// Drive an exec page-in plan (built by [`load_image_into_at`], #740)
-/// through the bulk fault API: one
-/// [`AddressSpace::demand_alloc_range`] call per run, in plan order.
-///
-/// Advisory by construction. The batch reports a count, never an
-/// error, and a page it skips — a fill refusal at or past EOF, reclaim
-/// pressure, a page another path is mid-fault on — faults later
-/// through the unchanged single-page path with its usual semantics.
-/// Clustering therefore cannot fail an exec and cannot change what a
-/// successful exec means; it only decides which of the new image's
-/// pages are already resident when the image first touches them.
-/// Returns the total number of pages installed.
-///
-/// # Safety
-/// Forwards [`AddressSpace::demand_alloc_range`]'s contract:
-/// `addr_space`'s root must be the root live on this CPU (the exec
-/// completion paths call this immediately after activating the new
-/// image), and `plan` must come from loading the image that is mapped
-/// in `addr_space`.
-pub unsafe fn page_in_plan(addr_space: &AddressSpace, plan: &[(u64, u64)]) -> usize {
-    let mut installed = 0usize;
-    for &(base, pages) in plan {
-        if pages == 0 {
-            continue;
-        }
-        // SAFETY: forwarded caller contract (live root); the batch is
-        // advisory and skips any page it cannot claim or fill.
-        installed += unsafe { addr_space.demand_alloc_range(VirtAddr::new(base), pages) };
-    }
-    installed
 }
 
 /// PML4 slot 2 (1 TiB) — the nominal bottom of the ET_DYN load window, and

@@ -20,8 +20,8 @@ use alloc::sync::Arc;
 use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
 use crate::{
-    alloc_pid, interp, loader::apply_relocations, loader::load_elf_into_at, loader::LoadBytesError,
-    AuxEntry, EntryPoint, ProcessId,
+    alloc_pid, interp, loader::apply_relocations, loader::load_elf_into_at,
+    loader::load_elf_into_at_file, loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
 };
 
 /// Eagerly-committed top-of-stack window: 128 KiB of real frames at the
@@ -116,16 +116,6 @@ pub struct UserProcess {
     pub entry_arg: Option<u64>,
     /// Exact PT_LOAD and stack VMAs committed by the loader.
     pub loaded_mappings: alloc::vec::Vec<LoadedMapping>,
-    /// Exec page-in plan (#740): `(region base, pages)` runs over the
-    /// image's demand-paged PT_LOAD segments, built by the loader and
-    /// driven through the bulk fault API by an exec completion path
-    /// once the new address space is live (see `loader::page_in_plan`).
-    /// Empty unless the image was loaded file-backed with a
-    /// demand-paged segment — in particular, fork/clone children and
-    /// test fixtures construct it empty: a child's pages are the
-    /// parent's, already resident or shared, so there is nothing to
-    /// cluster.
-    pub page_in_plan: crate::loader::PageInPlan,
     /// Load bias applied to the program image: 0 for ET_EXEC, and the
     /// randomised PML4[1] base for ET_DYN. Callers that need to know
     /// where a PIE actually landed (auxv construction, `/proc` maps, a
@@ -301,7 +291,6 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         program_entry,
         program_bias,
         image,
-        page_in_plan,
     } = unsafe { crate::loader::load_elf_bytes_file(src, file) }?;
 
     // An i386 ELF32 image runs under the IA-32 compat ABI in a `TASK_SIZE_32`
@@ -492,14 +481,38 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             if compat32 {
                 interp_bias = compat32_interp_bias(interp_bytes, &address_space)?;
             }
-            let interp_entry =
-                // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
-                // interp_bias is a randomised user-range base well-separated from the
-                // program's load range (for an IA-32 image, a span reserved from the
-                // compat mmap cursor), so appending the interp's segments here
-                // cannot collide with pages already mapped.
-                // SAFETY: Valid memory or trusted environment
-                unsafe { load_elf_into_at(interp_bytes, &address_space, interp_bias) }?;
+            // Demand-page the interpreter when it came from the filesystem:
+            // its read-only segments — the bulk of ld.so — fault in on first
+            // touch like the program's, instead of being read page-by-page
+            // into fresh frames inside execve. Writable segments stay eager
+            // (`demand_writable_segments = false`) so the kernel relocation
+            // pass below, which writes its targets through page-table
+            // translation, always finds them present. A registered
+            // interpreter has no file behind it and keeps the eager
+            // in-memory load.
+            //
+            // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
+            // interp_bias is a randomised user-range base well-separated from the
+            // program's load range (for an IA-32 image, a span reserved from the
+            // compat mmap cursor), so appending the interp's segments here
+            // cannot collide with pages already mapped.
+            // SAFETY: Valid memory or trusted environment
+            let interp_entry = match interp_fs_owned.as_ref() {
+                // SAFETY: Live AS, well-separated `interp_bias` (argument
+                // above): the interp segments cannot collide with pages
+                // already mapped.
+                Some((_, ops)) => unsafe {
+                    load_elf_into_at_file(
+                        interp_bytes,
+                        &address_space,
+                        interp_bias,
+                        Some(ops),
+                        false,
+                    )
+                }?,
+                // SAFETY: As above.
+                None => unsafe { load_elf_into_at(interp_bytes, &address_space, interp_bias) }?,
+            };
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
             // we just appended interp regions and materialize is
             // idempotent for the program pages already installed.
@@ -1056,7 +1069,6 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         entry_arg: None,
         loaded_mappings,
         program_bias,
-        page_in_plan,
         // An i386 ELF32 image is entered in compatibility mode, CS =
         // `__USER32_CS` (Linux `start_thread_ia32`); a fresh image starts
         // with no TLS descriptors and null FS/GS.

@@ -9227,11 +9227,21 @@ impl AddressSpace {
     /// Live-range teardown uses this complete walk because it may retire an
     /// arbitrary subrange independently of page-table-tree lifetime.
     fn remove_region_rmaps(&self, region: &Region) {
+        // Same batched retirement as the tree-walk path in `Drop`:
+        // one shard lock per flush instead of one per page.
+        let mut batch: Vec<(PhysAddr, PhysAddr, VirtAddr)> = Vec::new();
         for (i, p) in region.phys.indexed() {
             if p.raw() != 0 {
                 let va = VirtAddr::new(region.base.as_u64() + (i as u64) * 4096);
-                crate::rmap::remove(*p, self.root, va);
+                batch.push((*p, self.root, va));
+                if batch.len() >= RETIRE_BATCH_PAGES {
+                    crate::rmap::remove_batch(&batch);
+                    batch.clear();
+                }
             }
+        }
+        if !batch.is_empty() {
+            crate::rmap::remove_batch(&batch);
         }
     }
 
@@ -15684,6 +15694,11 @@ impl AddressSpace {
     }
 }
 
+/// Entries per `rmap::remove_batch` flush during address-space teardown.
+/// Bounds the buffer the tree walk accumulates before retiring a batch of
+/// reverse-map owners under one lock per touched shard.
+const RETIRE_BATCH_PAGES: usize = 128;
+
 impl Drop for AddressSpace {
     /// Process-exit teardown: log + (eventually) release every
     /// still-mapped region's data frames, free the per-AS page-
@@ -15774,18 +15789,30 @@ impl Drop for AddressSpace {
                 // ownership authority even if a failed/partial leaf rewrite
                 // left the descriptor lagging behind it. Removing the mapped
                 // frame as well makes stale descriptor/rmap state fail closed.
+                // Batched rmap retirement (exit_mmap-style): the tree walk
+                // visits one present leaf at a time, but retiring each
+                // owner's rmap entry under its own shard lock costs a lock
+                // acquisition per page. Buffer the retirements and flush
+                // them through `rmap::remove_batch`, which locks each
+                // touched shard once per flush. The flush threshold bounds
+                // the buffer; the remainder is flushed after the walk.
+                let mut retire_batch: Vec<(PhysAddr, PhysAddr, VirtAddr)> = Vec::new();
                 let mut retire_leaf = |mapped_phys: PhysAddr, va: VirtAddr| {
                     let authoritative = regions.containing(va.as_u64()).and_then(|region| {
                         let index = ((va.as_u64() - region.base.as_u64()) >> 12) as usize;
                         region.phys.get(index).copied()
                     });
                     if let Some(phys) = authoritative.filter(|phys| phys.raw() != 0) {
-                        crate::rmap::remove(phys, self.root, va);
+                        retire_batch.push((phys, self.root, va));
                         if phys != mapped_phys {
-                            crate::rmap::remove(mapped_phys, self.root, va);
+                            retire_batch.push((mapped_phys, self.root, va));
                         }
                     } else {
-                        crate::rmap::remove(mapped_phys, self.root, va);
+                        retire_batch.push((mapped_phys, self.root, va));
+                    }
+                    if retire_batch.len() >= RETIRE_BATCH_PAGES {
+                        crate::rmap::remove_batch(&retire_batch);
+                        retire_batch.clear();
                     }
                 };
                 #[cfg(target_arch = "x86_64")]
@@ -15806,6 +15833,10 @@ impl Drop for AddressSpace {
                         self.root,
                         &mut retire_leaf,
                     );
+                }
+                // Flush the buffered remainder (see above).
+                if !retire_batch.is_empty() {
+                    crate::rmap::remove_batch(&retire_batch);
                 }
             }
 

@@ -846,6 +846,90 @@ fn resolve_create_fast(expanded: &str) -> Option<FastCreateResolution> {
     })
 }
 
+/// Resolve an exec image in one forward VFS walk and retain the leaf.
+///
+/// `read_exec` used to pay for two walks of the same path: the scoped
+/// symlink expansion (`resolve_vfs_symlink_path_scoped`, which walks
+/// every component to prove none needs expanding) and then
+/// `current_resolve_absolute` + `resolve_async_dentry`, which walks the
+/// same components again to open the file. Linux's `do_open_execat`
+/// does one `link_path_walk`. This is the same single-walk shape as
+/// `resolve_create_fast` for open: when the path stays in one mount and
+/// contains no symlink, the fast walk already holds the final node's
+/// `FileOps`, so `read_exec` can open it without a second walk.
+///
+/// Returns `None` — deliberately conservative — for anything the single
+/// walk cannot prove: a symlink anywhere on the path (the slow walk
+/// expands it), a mount crossing, a lookup failure, a dir-only leaf, a
+/// path that is a mount root, or an active resolve scope
+/// (`RESOLVE_BENEATH` / `RESOLVE_IN_ROOT` / `RESOLVE_NO_XDEV`), whose
+/// enforcement lives in the scoped resolver. `None` takes the existing
+/// two-walk path with all of its semantics, including its errnos.
+fn resolve_exec_fast(
+    path: &str,
+) -> Option<(
+    alloc::string::String,
+    alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+)> {
+    // A scoped resolution may forbid symlinks, magic links, or leaving
+    // the starting mount; the fast walk enforces none of that, so any
+    // scope at all defers to the scoped resolver.
+    if current_resolve_scope().is_some() {
+        return None;
+    }
+    let expanded = normalize_abs(path);
+    let (root, rel, _) = current_single_mount_root(&expanded)?;
+    let components: alloc::vec::Vec<&str> = rel
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    if components.is_empty() {
+        return None;
+    }
+    let mut current_dir = root.directory()?;
+    for (index, component) in components.iter().enumerate() {
+        let is_final = index + 1 == components.len();
+        // NOFOLLOW single-component lookup: `lookup_async` returns the raw
+        // node so a symlink is SEEN, not followed — the same primitive the
+        // scoped fast walk uses.
+        let node = poll_blocking(current_dir.lookup_async(component)).and_then(|r| r.ok());
+        let Some(node) = node else {
+            // Not a file-shaped node. It may be a dir-only child (e.g.
+            // `/dev/pts`): descend if we can. Anything else is a miss or
+            // a non-traversable component — the slow walk reports it.
+            if is_final {
+                return None;
+            }
+            match poll_blocking(current_dir.lookup_dir_async(component)).and_then(|r| r.ok()) {
+                Some(next) => {
+                    current_dir = next;
+                    continue;
+                }
+                None => return None,
+            }
+        };
+        // Any symlink at all defers to the slow walk, which expands it
+        // (and enforces ELOOP / scope refusals) — the fast walk never
+        // rewrites a path.
+        if node.stat().mode.file_type == narf_filesystem::FileType::Symlink {
+            return None;
+        }
+        if is_final {
+            return Some((expanded, node));
+        }
+        // Intermediate component: it must be a real directory to keep
+        // walking; anything else is the slow walk's error to report.
+        if node.stat().mode.file_type != narf_filesystem::FileType::Dir {
+            return None;
+        }
+        match poll_blocking(current_dir.lookup_dir_async(component)).and_then(|r| r.ok()) {
+            Some(next) => current_dir = next,
+            None => return None,
+        }
+    }
+    None
+}
+
 /// Expand symlinks component-by-component through the current task's mount
 /// table. This supplies the VFS boundary that a filesystem-local resolver
 /// cannot cross after an absolute symlink target.
@@ -2872,71 +2956,94 @@ fn do_execve_resolved(
         // The scoped resolver already reports negative (wire) errnos, the
         // same convention as this closure; negating them again made a
         // symlink loop exec return +ELOOP (40) instead of -ELOOP.
-        let ep = resolve_vfs_symlink_path_scoped(&apply_chroot(p), true)?;
+        // One walk, not two: `resolve_exec_fast` walks the path once and
+        // retains the leaf when it proves symlink-free in a single mount;
+        // only a path it cannot prove falls through to the scoped expansion
+        // plus a second resolving walk below, with all of its semantics.
+        let chrooted = apply_chroot(p);
         // Linux checks path_noexec on the file it opened, including each
         // script interpreter, rather than the mount containing a symlink.
         // Anonymous fd images never enter this path and have no mount.
-        if narf_filesystem::any_restricted_mounts()
-            && current_mount_flags_at(&ep) & narf_filesystem::mnt_flags::NOEXEC != 0
-        {
-            return Err(-EACCES);
-        }
-        // Resolve through the caller's PRIVATE mount namespace, not the global
-        // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
-        // its rootfs onto /run/systemd/mount-rootfs, and pivot_roots into it, so
-        // the binary is reachable ONLY via that task's private mount table. The
-        // O_PATH open in find_executable already resolves namespace-aware
-        // (current_resolve_absolute); execve must match, or a pivoted service's
-        // binary (e.g. systemd-udevd → ../../bin/udevadm) is invisible → ENOENT
-        // → 203/EXIT_EXEC. (Global resolution only worked while a pivot_root bug
-        // leaked the bind into the global registry.)
-        // Pump every FS future with `poll_io_to_completion`, NOT the
-        // budget-capped `poll_blocking`: the image read streams the whole
-        // binary, and under concurrent block I/O (KDE startup streams tens of
-        // MB of DSOs while services exec) one healthy read legitimately takes
-        // more re-polls than poll_blocking's budget. The overrun surfaced as
-        // execve(2) = EIO for large binaries exec'd at busy moments
-        // (plasmashell, xdg-desktop-portal-kde, systemd-executor) while the
-        // same binaries exec'd fine when quiet. Overrunning ALSO drops the
-        // in-flight read future, abandoning a virtio-blk request that is
-        // still DMA'ing into a scratch buffer Drop just returned to the pool
-        // — the exact hazard poll_io_to_completion exists for, and which the
-        // PT_INTERP read (read_path_from_vfs) already avoids the same way.
-        let ops = match current_resolve_absolute(&ep, |_fs, root, rel| {
-            poll_io_to_completion(narf_filesystem::resolve_async_dentry(root, rel))
-        }) {
-            Some(Some(Ok(o))) => o,
-            None => return Err(-ENOENT),
-            Some(Some(Err(narf_filesystem::FsError::NotFound | narf_filesystem::FsError::InvalidPath))) => {
-                // This resolver opens files only: a directory (including a
-                // mount root) is InvalidPath, not a storage failure. Linux's
-                // do_open_execat/may_open rejects non-regular files as EACCES.
-                if stat_path_dir_aware(&ep)
-                    .is_some_and(|st| st.mode.file_type == narf_filesystem::FileType::Dir)
-                {
-                    return Err(-EACCES);
-                }
-                return Err(-path_lookup_errno(&ep, None));
+        // One gate for both arms below, so the fast and slow paths cannot
+        // drift on which mount the check reads.
+        let check_noexec = |ep: &str| -> Result<(), i64> {
+            if narf_filesystem::any_restricted_mounts()
+                && current_mount_flags_at(ep) & narf_filesystem::mnt_flags::NOEXEC != 0
+            {
+                return Err(-EACCES);
             }
-            // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
-            // Loud: a silent EIO here cost a full debugging session (bash
-            // reports only "Input/output error").
-            Some(None) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(narf_console::Writer, "EXECVE-EIO resolve overrun path={ep}");
-                return Err(-EIO);
+            Ok(())
+        };
+        let (ep, ops) = match resolve_exec_fast(&chrooted) {
+            Some((ep, ops)) => {
+                check_noexec(&ep)?;
+                (ep, ops)
             }
-            // Preserve filesystem errors; only actual I/O failures are EIO.
-            Some(Some(Err(e))) => {
-                let errno = copy_fs_errno(e);
-                if errno == EIO {
-                    use core::fmt::Write as _;
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "EXECVE-EIO resolve err={e:?} path={ep}"
-                    );
-                }
-                return Err(-errno);
+            None => {
+                let ep = resolve_vfs_symlink_path_scoped(&chrooted, true)?;
+                check_noexec(&ep)?;
+                // Resolve through the caller's PRIVATE mount namespace, not the global
+                // registry: a systemd service sandbox unshare(NEWNS)s, recursively binds
+                // its rootfs onto /run/systemd/mount-rootfs, and pivot_roots into it, so
+                // the binary is reachable ONLY via that task's private mount table. The
+                // O_PATH open in find_executable already resolves namespace-aware
+                // (current_resolve_absolute); execve must match, or a pivoted service's
+                // binary (e.g. systemd-udevd → ../../bin/udevadm) is invisible → ENOENT
+                // → 203/EXIT_EXEC. (Global resolution only worked while a pivot_root bug
+                // leaked the bind into the global registry.)
+                // Pump every FS future with `poll_io_to_completion`, NOT the
+                // budget-capped `poll_blocking`: the image read streams the whole
+                // binary, and under concurrent block I/O (KDE startup streams tens of
+                // MB of DSOs while services exec) one healthy read legitimately takes
+                // more re-polls than poll_blocking's budget. The overrun surfaced as
+                // execve(2) = EIO for large binaries exec'd at busy moments
+                // (plasmashell, xdg-desktop-portal-kde, systemd-executor) while the
+                // same binaries exec'd fine when quiet. Overrunning ALSO drops the
+                // in-flight read future, abandoning a virtio-blk request that is
+                // still DMA'ing into a scratch buffer Drop just returned to the pool
+                // — the exact hazard poll_io_to_completion exists for, and which the
+                // PT_INTERP read (read_path_from_vfs) already avoids the same way.
+                let ops = match current_resolve_absolute(&ep, |_fs, root, rel| {
+                    poll_io_to_completion(narf_filesystem::resolve_async_dentry(root, rel))
+                }) {
+                    Some(Some(Ok(o))) => o,
+                    None => return Err(-ENOENT),
+                    Some(Some(Err(
+                        narf_filesystem::FsError::NotFound | narf_filesystem::FsError::InvalidPath,
+                    ))) => {
+                        // This resolver opens files only: a directory (including a
+                        // mount root) is InvalidPath, not a storage failure. Linux's
+                        // do_open_execat/may_open rejects non-regular files as EACCES.
+                        if stat_path_dir_aware(&ep)
+                            .is_some_and(|st| st.mode.file_type == narf_filesystem::FileType::Dir)
+                        {
+                            return Err(-EACCES);
+                        }
+                        return Err(-path_lookup_errno(&ep, None));
+                    }
+                    // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
+                    // Loud: a silent EIO here cost a full debugging session (bash
+                    // reports only "Input/output error").
+                    Some(None) => {
+                        use core::fmt::Write as _;
+                        let _ =
+                            writeln!(narf_console::Writer, "EXECVE-EIO resolve overrun path={ep}");
+                        return Err(-EIO);
+                    }
+                    // Preserve filesystem errors; only actual I/O failures are EIO.
+                    Some(Some(Err(e))) => {
+                        let errno = copy_fs_errno(e);
+                        if errno == EIO {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "EXECVE-EIO resolve err={e:?} path={ep}"
+                            );
+                        }
+                        return Err(-errno);
+                    }
+                };
+                (ep, ops)
             }
         };
         let stat = ops.stat();
@@ -3276,11 +3383,6 @@ fn do_execve_resolved(
         // persistent reference that keeps the new AS alive while the task
         // runs; this local clone only bridges the activate() below.
         let new_as = new_proc.address_space.clone();
-        // The exec page-in plan (#740), cloned out before `new_proc` is
-        // hand-dropped below: a partial move would break the manual
-        // drop sequence, and the plan is a handful of (base, pages)
-        // pairs, so the clone is the cheap honest option.
-        let page_in_plan = new_proc.page_in_plan.clone();
         // Borrow-holders first, then owners.
         drop(argv_refs);
         drop(envp_refs);
@@ -3315,19 +3417,10 @@ fn do_execve_resolved(
             );
         }
         });
-        // Exec page-in clustering (#740): the new root is live on this
-        // CPU and published for scheduler resumes before any I/O can
-        // park this task — the bulk batch's contract. The exec is long
-        // past its point of no return, so the advisory batch runs here:
-        // pages it installs are resident at first touch instead of
-        // faulting, and any page it skips faults exactly as it would
-        // have without the cluster. The installed count is deliberately
-        // discarded, and the plan is dropped by hand right after use,
-        // like every heap local on this diverging path.
-        // SAFETY: activate() above made `new_as` the live root, and
-        // the plan came from loading the image mapped in it.
-        unsafe { crate::loader::page_in_plan(&new_as, &page_in_plan) };
-        drop(page_in_plan);
+        // Demand-paged pages fault in on first touch after the jump below —
+        // there is no eager page-in inside execve, matching Linux's
+        // `binfmt_elf`, which maps with `elf_map` and reads zero file
+        // bytes before the new image starts.
         // execve empties the TLS slots and nulls DS/ES/FS/GS (Linux
         // `flush_thread` clears `tls_array`, `start_thread_common` loads null
         // selectors) before the new image's FS/GS bases below: an i386
@@ -3420,11 +3513,6 @@ fn do_execve_resolved(
         stack_top: new_proc.stack_top.as_u64(),
         fs_base: new_proc.fs_base,
         ia32: new_proc.ia32,
-        // The loader's page-in plan (#740) rides along: the polling
-        // routine drives it when it applies this request and first
-        // enters the new image. Cloned — `new_proc` is still live here
-        // and is hand-dropped on the hook path below.
-        page_in_plan: new_proc.page_in_plan.clone(),
     });
     let uctx_ptr = match crate::user_task::current_user_task() {
         Some(p) => p,
