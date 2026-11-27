@@ -515,8 +515,11 @@ impl VmidManager {
     /// reports whether a ticket has completed.
     pub fn grab(&self, req: GrabRequest, done: &dyn Fn(u64) -> bool) -> Option<Grant> {
         // amdgpu_vmid_grab_idle: with concurrent flushes, idle means no
-        // unfinished job on any ring (most recently used first).
-        let idle = self.lru.iter().rev().copied().find(|&i| {
+        // unfinished job on any ring (least recently used first, as Linux
+        // walks `ids_lru` forward from its head; the first grant from a
+        // fresh manager is the first client VMID). The reuse search below
+        // stays most-recently-used-first, as `amdgpu_vmid_grab_used` does.
+        let idle = self.lru.iter().copied().find(|&i| {
             self.ids[usize::from(i)]
                 .active
                 .iter()

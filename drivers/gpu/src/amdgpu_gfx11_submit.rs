@@ -1061,12 +1061,21 @@ impl Navi31Submitter {
     }
 
     /// Every ring's completed sequence, retiring what completed jobs held.
-    /// `None` when the device stopped answering.
+    /// `None` when the device stopped answering. A dark sample finishes
+    /// the ledger with `NoDevice`: the loss is terminal, so `error()`
+    /// must surface it and later submissions must refuse, instead of
+    /// leaving every waiter to re-discover the loss on its own poll.
     fn progress(&self) -> Option<[u32; RING_IDS]> {
         if self.jobs.lock().terminal.is_some() {
             return None;
         }
-        let (completed, _) = self.sample()?;
+        let (completed, _) = match self.sample() {
+            Some(sample) => sample,
+            None => {
+                self.jobs.lock().finish(FsError::NoDevice);
+                return None;
+            }
+        };
         {
             let mut jobs = self.jobs.lock();
             if jobs.terminal.is_some() {
