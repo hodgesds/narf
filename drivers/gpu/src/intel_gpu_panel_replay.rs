@@ -35,6 +35,10 @@
 //! Panel Replay runs with selective fetch (display 14+ have no PSR HW
 //! tracking) at the sink's granularity, through the PSR owner's
 //! selective-fetch programming ([`crate::intel_gpu_psr::Psr`]).
+//!
+//! The owned external DP SST routes run this owner behind their own option,
+//! `narf.intel.ext_panel_replay=1`, with frontbuffer tracking for their
+//! console scanout ([`crate::intel_gpu_xelpg_external::replay`]).
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_aux::MmioWindow;
@@ -239,6 +243,13 @@ pub enum Refusal {
     ExitTimeout,
     /// Wa_14015648006's `wm_level_disabled` is not known (display 14).
     WmLevelUnknown,
+    /// `_intel_psr_min_set_context_latency`: the lit transcoder's
+    /// `TRANS_SET_CONTEXT_LATENCY` is below what replay needs (DP on display
+    /// 20 reads `SRD_STATUS`, which needs the delayed vblank a line after
+    /// the undelayed one; Wa_14015401596 on display 13/14). Linux sets it in
+    /// the modeset that computes replay; an external route lit before
+    /// replay qualifies is refused instead.
+    SetContextLatency,
 }
 
 // ── Sink capability ──────────────────────────────────────────────
@@ -361,6 +372,31 @@ pub fn enabled_at_training<A: AuxChannel + ?Sized>(aux: &mut A) -> Result<bool, 
     let mut config = [0u8];
     read(aux, PANEL_REPLAY_CONFIG, &mut config).map_err(Refusal::Aux)?;
     Ok(config[0] & DP_PANEL_REPLAY_ENABLE != 0)
+}
+
+/// `_intel_psr_min_set_context_latency` (Linux 7.4-rc4) for a stream with
+/// PSR or replay: the delayed-vblank lines the transcoder's set context
+/// latency must reach. `vrr_possible` is `intel_vrr_possible` (every
+/// progressive DP stream on display 11+ in 7.4-rc4, whose fixed refresh
+/// rate sets a flipline), `edp` the output type.
+pub const fn min_set_context_latency(
+    display_ver: u16,
+    edp: bool,
+    panel_replay: bool,
+    sel_update: bool,
+    vrr_possible: bool,
+) -> u32 {
+    // Wa_14015401596.
+    if vrr_possible && (display_ver == 13 || display_ver == 14) {
+        return 1;
+    }
+    if display_ver < 20 || sel_update || (display_ver < 30 && edp) {
+        return 0;
+    }
+    if display_ver >= 30 && panel_replay {
+        return 0;
+    }
+    1
 }
 
 /// `intel_psr_init`'s `source_panel_replay_support`, narrowed to the

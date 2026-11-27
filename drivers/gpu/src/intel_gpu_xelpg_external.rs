@@ -215,6 +215,8 @@ pub(crate) mod tunnel;
 
 #[path = "intel_gpu_dp_lttpr.rs"]
 pub(crate) mod lttpr;
+#[path = "intel_gpu_xelpg_replay.rs"]
+pub mod replay;
 
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
@@ -2722,6 +2724,13 @@ fn enable_port<M: MmioWindow + ?Sized>(
     let port = route.probe.port;
     let trans = route_pipe(route)?.transcoder();
     let pll_rate = crate::intel_gpu_modeset::to_pll_rate(rate);
+    // intel_ddi_pre_enable_dp: "Panel replay has to be enabled in sink dpcd
+    // before link training" (`narf.intel.ext_panel_replay=1`, SST only).
+    replay::pretrain(
+        &mut IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt()),
+        route.probe.display_version(),
+        route.probe.mst.is_some(),
+    );
     // 5. Port PLL (intel_cx0pll_enable) for the planned width.
     // A legacy-mode C20 port also clears the MPLLB CAL_DONE banks first
     // (intel_c20_protocol_switch_valid).
@@ -3015,6 +3024,8 @@ fn enable_port_uhbr<M: MmioWindow + ?Sized>(
         uhbr::DP_SDP_ERROR_DETECTION_CONFIGURATION,
         &[uhbr::DP_SDP_CRC16_128B132B_EN],
     );
+    // intel_psr_panel_replay_enable_sink (`narf.intel.ext_panel_replay=1`).
+    replay::pretrain(&mut aux, probe.display_version(), probe.mst.is_some());
     // 3./5. TBT deselect and the port PLL.
     enable_clock_uhbr(io, probe, rate, lanes)?;
     // 6.a TRANS_CLK_SEL; 6.b TRANS_DP2_CTL; 6.c TRANS_DDI_FUNC_CTL.
@@ -4538,6 +4549,8 @@ pub struct MtlExternalService {
     /// The `narf.intel.ext_routes=2` decision; `None` reads the boot option
     /// at each connect.
     two_routes: Option<bool>,
+    /// Panel Replay on the SST DP routes (`narf.intel.ext_panel_replay=1`).
+    replay: replay::Replays,
 }
 
 impl Default for MtlExternalService {
@@ -4563,6 +4576,7 @@ impl MtlExternalService {
             presence: None,
             uhbr: None,
             two_routes: None,
+            replay: replay::Replays::new(),
         }
     }
 
@@ -4615,6 +4629,32 @@ impl MtlExternalService {
         self.two_routes.unwrap_or_else(ext_routes_opted_in)
     }
 
+    /// Decide `narf.intel.ext_panel_replay=1` instead of reading the boot
+    /// option (fixtures).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn set_panel_replay(&mut self, on: bool) {
+        self.replay.set_opted_in(on);
+    }
+
+    /// The Panel Replay running on `slot`'s route, and why the slot's last
+    /// activation runs none.
+    pub fn panel_replay(
+        &self,
+        slot: usize,
+    ) -> (
+        Option<replay::ExtReplay>,
+        Option<crate::intel_gpu_psr::panel_replay::Refusal>,
+    ) {
+        (self.replay.get(slot).copied(), self.replay.refusal(slot))
+    }
+
+    /// One runtime pass of the routes' Panel Replays: the console flushes
+    /// in `dirty` (one bit per slot), then their re-arm work.
+    pub(crate) fn replay_pass<M: MmioWindow + ?Sized>(&mut self, io: &M, dirty: u8, now_ns: u64) {
+        self.replay.pass(io, dirty, now_ns);
+        self.publish();
+    }
+
     /// Replace the display context (the owned panel, the pipe-DMC sink)
     /// used by later activations; a live route keeps the pipe-DMC sink it
     /// reported to.
@@ -4632,6 +4672,7 @@ impl MtlExternalService {
                 .filter(|route| route.live())
                 .fold(0u8, |mask, route| mask | 1u8 << (route.pipe() as u8));
             crate::intel_gpu_psr::set_non_psr_pipes(non_psr_pipes);
+            replay::publish_live(self.replay.live_mask());
         }
     }
 
@@ -4939,6 +4980,7 @@ impl MtlExternalService {
             }
         };
         let beside = self.beside(slot);
+        let _pretrain = replay::Pretrain::set(self.replay.opted_in());
         match activate_beside(io, probe, fb, &self.display, beside) {
             Ok(route) => {
                 let outcome = ServiceOutcome::Activated {
@@ -5055,6 +5097,8 @@ impl MtlExternalService {
             return ServiceOutcome::Unchanged;
         };
         let port = route.port();
+        // intel_ddi_disable_dp: intel_psr_disable before the pipe goes off.
+        self.replay.disable(io, slot);
         let stopped = route.stop(io);
         // The post-plane repartition without this pipe (or whatever a
         // failed stop left reserved) is what the sibling now plans from.
@@ -5081,7 +5125,12 @@ impl MtlExternalService {
         event: MtlHpdEvent,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
+        // intel_psr_pause around the event's PHY, CDCLK and modeset work;
+        // the survivors resume after it and a newly lit SST DP route takes
+        // its replay.
+        self.replay.pause_all(io);
         let outcome = self.handle_event(io, event, alloc);
+        self.replay.after_event(io, &self.routes, &outcome);
         self.publish();
         outcome
     }
@@ -5185,6 +5234,7 @@ impl MtlExternalService {
             }
         };
         let port = route.port();
+        self.replay.disable(io, slot);
         let stopped = route.stop(io);
         let pipes = route.take_shared_pipes();
         self.share(slot, pipes);
@@ -5197,6 +5247,7 @@ impl MtlExternalService {
         }
         let fb = route.fb;
         let beside = self.beside(slot);
+        let _pretrain = replay::Pretrain::set(self.replay.opted_in());
         match activate_beside(io, route.probe.clone(), fb, &self.display, beside) {
             Ok(live) => {
                 let (mode, pipe) = (live.probe.mode, live.pipe());
@@ -5370,6 +5421,21 @@ pub(crate) fn handle_mtl_event_for_profile<M: MmioWindow + ?Sized>(
             }
         }),
     )
+}
+
+/// The process-wide service's Panel Replay pass (inside the DC-off bracket):
+/// the console flushes queued since the last runtime pass, then the re-arm
+/// work. Returns at once when no route runs replay or a service pass holds
+/// the service (the flushes stay queued).
+pub(crate) fn service_replay<M: MmioWindow + ?Sized>(io: &M) {
+    if !replay::any_live() {
+        return;
+    }
+    let Some(mut service) = SERVICE.try_lock() else {
+        return;
+    };
+    let dirty = replay::take_dirty();
+    let _ = with_dc_off(|| service.replay_pass(io, dirty, narf_time::monotonic_ns()));
 }
 
 /// Poll the process-wide MTL/LNL/PTL hotplug owner once (inside the DC-off

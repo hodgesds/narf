@@ -2103,6 +2103,26 @@ fn publish_scanout_owned(scanout: Option<narf_graphics_driver::generic::GenericF
     }
 }
 
+/// The fb console flushed the Intel scanout it draws to (Linux's fbdev
+/// damage worker, `intelfb_dirty`): queue a frontbuffer flush for the MTL
+/// external route slot whose image is the published one, which exits Panel
+/// Replay there at the next runtime pass. Lock-free past the published
+/// serial; a no-op while no external route runs replay.
+pub fn flush_active_scanout() {
+    if !crate::intel_gpu_xelpg_external::replay::any_live() {
+        return;
+    }
+    let serial = ACTIVE_GENERIC.lock().0;
+    if serial == 0 {
+        return;
+    }
+    for slot in 0..2 {
+        if mtl_slot_serial(slot).load(Ordering::Acquire) == serial {
+            crate::intel_gpu_xelpg_external::replay::frontbuffer_flush(slot);
+        }
+    }
+}
+
 /// Reserve a nonzero identity for an external display publication.
 ///
 /// Gen12 SST, the USB-C DP bridge and the Display-14 external route share one
@@ -3185,6 +3205,9 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     publication: &mut dyn FnMut(MtlPublication),
 ) -> bool {
     use crate::intel_gpu_xelpg_external::ServiceOutcome;
+    // The external routes' Panel Replay: queued console flushes and re-arm
+    // work (`narf.intel.ext_panel_replay=1`; inert otherwise).
+    crate::intel_gpu_xelpg_external::service_replay(io);
     let Some(event) = crate::intel_gpu_xelpg_external::poll_mtl_event_for_profile(io, profile)
     else {
         return false;

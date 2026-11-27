@@ -84,6 +84,9 @@ pub struct Sink {
     pub tunnel: Option<[u8; 0x32]>,
     /// Native writes to the tunnel registers, in order.
     pub tunnel_log: Vec<(u32, u8)>,
+    /// Native writes to `PANEL_REPLAY_CONFIG`, `_CONFIG2` and `_CONFIG3`,
+    /// in order; each also reads back (through `extra`).
+    pub pr_log: Vec<(u32, u8)>,
 }
 
 impl Sink {
@@ -127,6 +130,7 @@ impl Sink {
             pcon_log: Vec::new(),
             tunnel: None,
             tunnel_log: Vec::new(),
+            pr_log: Vec::new(),
         }
     }
     /// A DP 2.0 sink: `DP_CAP_ANSI_128B132B` with `uhbr_rates`.
@@ -333,6 +337,13 @@ impl Sink {
                 }
             }
             0x3050..=0x3052 => self.pcon_log.push((addr, value)),
+            0x1b0 | 0x1b1 | 0x11a => {
+                self.pr_log.push((addr, value));
+                match self.extra.iter_mut().find(|(a, _)| *a == addr) {
+                    Some(entry) => entry.1 = value,
+                    None => self.extra.push((addr, value)),
+                }
+            }
             0x600 => {
                 self.power_log.push(value);
                 self.powered = value & 0x3 == 1;
