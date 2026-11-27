@@ -153,8 +153,10 @@
 //! configuration. Thunderbolt UHBR on display 14/20 and 128b/132b MST over
 //! Thunderbolt are refused typed
 //! ([`ExternalError::Uhbr`]). HDCP takes a 128b/132b SST route as DP SST
-//! ([`hdcp_route_of`]). Without the option no 128b/132b register is
-//! touched.
+//! ([`hdcp_route_of`]). The same option gives an 8b/10b link on a C10 or C20
+//! port the VBT's DP 1.4 vswing/pre-emphasis override ([`Dp14Vspeo`]).
+//! Without the option no 128b/132b register is touched and the DP 1.4
+//! tables are the built-in ones.
 //!
 //! ## DSC with FEC
 //!
@@ -982,13 +984,20 @@ fn port_levels<M: MmioWindow + ?Sized>(
             )
             .map_err(phy_err)
         }
-        None => set_signal_levels(
-            &Cx0Phy::with_lanes(io, probe.port, probe.phy_lanes()?),
-            rate,
-            lanes,
-            levels,
-        )
-        .map_err(phy_err),
+        None => {
+            let phy = Cx0Phy::with_lanes(io, probe.port, probe.phy_lanes()?);
+            // intel_ddi_buf_trans_get: the VBT's DP 1.4 override first
+            // (mtl_get_c10/c20_buf_trans_override), under narf.intel.uhbr=1.
+            let vspeo = crate::intel_gpu_xelpg::dp_port_clock_khz(rate)
+                .and_then(|clock| Some((clock, probe.dp14_vspeo?.table(phy.kind(), clock)?)));
+            match vspeo {
+                Some((clock, table)) => crate::intel_gpu_xelpg::set_signal_levels_khz_table(
+                    &phy, clock, lanes, levels, table,
+                ),
+                None => set_signal_levels(&phy, rate, lanes, levels),
+            }
+            .map_err(phy_err)
+        }
     }
 }
 
@@ -1061,6 +1070,10 @@ pub struct MtlSinkProbe {
     /// The port's VBT C20 UHBR override ([`MtlPortDecl::c20_uhbr_vspeo`]),
     /// applied by the service; `None` takes `mtl_c20_trans_uhbr`.
     pub c20_uhbr_vspeo: Option<alloc::boxed::Box<[crate::intel_gpu_xelpg::SnpsTrans; 16]>>,
+    /// The port's VBT DP 1.4 overrides ([`MtlPortDecl::dp14_vspeo`]), applied
+    /// by the service under `narf.intel.uhbr=1`; `None` takes the C10/C20
+    /// `mtl_c*_trans_dp14` tables.
+    pub dp14_vspeo: Option<&'static Dp14Vspeo>,
 }
 
 /// A 128b/132b SST route (`intel_dp_is_uhbr`).
@@ -1980,6 +1993,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         output,
         audio,
         c20_uhbr_vspeo: None,
+        dp14_vspeo: None,
     })
 }
 
@@ -3589,6 +3603,54 @@ pub struct MtlPortDecl {
     /// (`intel_bios_get_c20_vspeo(devdata, has_dp, true)`), which a
     /// 128b/132b link on a C20 port takes instead of `mtl_c20_trans_uhbr`.
     pub c20_uhbr_vspeo: Option<[crate::intel_gpu_xelpg::SnpsTrans; 16]>,
+    /// The VBT's DP 1.4 (8b/10b) overrides for the port ([`Dp14Vspeo`]),
+    /// which the route takes under `narf.intel.uhbr=1`. Leaked once per VBT
+    /// parse (a boot-time board fact), so the declaration stays small.
+    pub dp14_vspeo: Option<&'static Dp14Vspeo>,
+}
+
+/// The VBT's DP 1.4 vswing/pre-emphasis overrides for one DP child with
+/// `use_vbt_vswing` (`BDB_VSWING_PREEMPH`, version 218+):
+/// `intel_bios_get_c10_vspeo` for a DP (non-eDP) link at or below HBR
+/// (table 0) and above it (table 1), and `intel_bios_get_c20_vspeo(...,
+/// is_uhbr = false)` (table 4). A table the block does not hold is `None`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Dp14Vspeo {
+    /// Tables 0 and 1 (`port_clock` at most 270000, above it).
+    pub c10: [Option<[crate::intel_gpu_xelpg::SnpsTrans; 16]>; 2],
+    /// Table 4.
+    pub c20: Option<[crate::intel_gpu_xelpg::SnpsTrans; 16]>,
+}
+
+impl Dp14Vspeo {
+    /// The VBT's DP 1.4 tables for `encoder`, `None` when it has none.
+    pub fn from_vbt(vbt: &Vbt, encoder: &VbtEncoder) -> Option<Self> {
+        let rows = |rows: [(u8, u8, u8); 16]| {
+            rows.map(|(v, pre, post)| crate::intel_gpu_xelpg::snps(v, pre, post))
+        };
+        let vspeo = Self {
+            c10: [
+                vbt.c10_vspeo(encoder, 270_000, false).map(rows),
+                vbt.c10_vspeo(encoder, 540_000, false).map(rows),
+            ],
+            c20: vbt.c20_vspeo(encoder, false).map(rows),
+        };
+        (vspeo.c10 != [None, None] || vspeo.c20.is_some()).then_some(vspeo)
+    }
+
+    /// `intel_ddi_buf_trans_get`'s override for a DP 1.4 link at
+    /// `port_clock_khz` on a `kind` PHY (`mtl_get_c10_buf_trans_override`,
+    /// `mtl_get_c20_buf_trans_override`).
+    pub fn table(
+        &self,
+        kind: PhyKind,
+        port_clock_khz: u32,
+    ) -> Option<&[crate::intel_gpu_xelpg::SnpsTrans; 16]> {
+        match kind {
+            PhyKind::C10 => self.c10[usize::from(port_clock_khz > 270_000)].as_ref(),
+            PhyKind::C20 => self.c20.as_ref(),
+        }
+    }
 }
 
 impl MtlPortDecl {
@@ -3600,6 +3662,7 @@ impl MtlPortDecl {
         legacy: false,
         ddc_pin: None,
         c20_uhbr_vspeo: None,
+        dp14_vspeo: None,
     };
     /// `init_vbt_missing_defaults` for a non-TC port other than A and E:
     /// `DEVICE_TYPE_TMDS_DVI_SIGNALING | DEVICE_TYPE_DISPLAYPORT_OUTPUT`.
@@ -3610,6 +3673,7 @@ impl MtlPortDecl {
         legacy: false,
         ddc_pin: None,
         c20_uhbr_vspeo: None,
+        dp14_vspeo: None,
     };
     /// A USB-C connector: DP-alt only.
     pub const USB_C: Self = Self {
@@ -3619,6 +3683,7 @@ impl MtlPortDecl {
         legacy: false,
         ddc_pin: None,
         c20_uhbr_vspeo: None,
+        dp14_vspeo: None,
     };
     /// A Type-C PHY wired to a native HDMI connector.
     pub const LEGACY_HDMI: Self = Self {
@@ -3628,6 +3693,7 @@ impl MtlPortDecl {
         legacy: true,
         ddc_pin: None,
         c20_uhbr_vspeo: None,
+        dp14_vspeo: None,
     };
 
     /// `intel_ddi_init`: a Type-C port declared non-legacy but with HDMI
@@ -3689,6 +3755,9 @@ impl MtlPortPolicy {
                 decl.c20_uhbr_vspeo = vbt.c20_vspeo(&encoder, true).map(|rows| {
                     rows.map(|(v, pre, post)| crate::intel_gpu_xelpg::snps(v, pre, post))
                 });
+                // mtl_get_c10/c20_buf_trans_override on an 8b/10b link.
+                decl.dp14_vspeo = Dp14Vspeo::from_vbt(vbt, &encoder)
+                    .map(|v| &*alloc::boxed::Box::leak(alloc::boxed::Box::new(v)));
             }
             match port.tc_index() {
                 Some(tc) => policy.tc[tc as usize] = decl,
@@ -3761,6 +3830,7 @@ pub fn decl_from_encoder(port: XeLpgPort, encoder: &VbtEncoder) -> MtlPortDecl {
         legacy: type_c && encoder.tc_legacy,
         ddc_pin: encoder.hdmi_ddc,
         c20_uhbr_vspeo: None,
+        dp14_vspeo: None,
     }
 }
 
@@ -4402,10 +4472,14 @@ impl MtlExternalService {
             // (`intel_dp_mst.c` runs MST on this port while the other port
             // keeps its own stream; only the joint plan is shared).
             let beside = self.beside(slot);
+            // The VBT's DP 1.4 override reaches the MST primary's 8b/10b
+            // levels under narf.intel.uhbr=1 only.
+            let mut decl = self.policy.decl(port);
+            decl.dp14_vspeo = decl.dp14_vspeo.filter(|_| uhbr_on);
             match MtlMstRoute::connect(
                 io,
                 link,
-                self.policy.decl(port),
+                decl,
                 &self.display,
                 alloc,
                 mst_uhbr,
@@ -4448,6 +4522,7 @@ impl MtlExternalService {
                         .decl(port)
                         .c20_uhbr_vspeo
                         .map(alloc::boxed::Box::new);
+                    probe.dp14_vspeo = self.policy.decl(port).dp14_vspeo.filter(|_| uhbr_on);
                     probe.ssc = dp_ssc_enabled(self.policy.use_ssc, probe.max_downspread);
                     self.connect_dp(io, slot, probe, alloc)
                 }

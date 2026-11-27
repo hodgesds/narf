@@ -366,6 +366,7 @@ impl MtlMstRoute {
                 output: super::color::DpOutput::default(),
                 audio: None,
                 c20_uhbr_vspeo: decl.c20_uhbr_vspeo.filter(|_| uhbr.is_some()).map(Box::new),
+                dp14_vspeo: decl.dp14_vspeo,
             };
             // Copy the EDID straight into the probe's own buffer: a
             // separate 512-byte staging array is a second stack slot in

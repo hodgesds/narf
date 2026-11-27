@@ -2377,6 +2377,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
                 legacy: true,
                 ddc_pin: None,
                 c20_uhbr_vspeo: None,
+                dp14_vspeo: None,
             },
             Legacy,
             RoutePlan::DpThenHdmi,
@@ -2404,6 +2405,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
         legacy: false,
         ddc_pin: None,
         c20_uhbr_vspeo: None,
+        dp14_vspeo: None,
     };
     if !hdmi_only.legacy_effective() || MtlPortDecl::COMBO_DP_HDMI.legacy_effective() {
         return TestResult::Fail("effective legacy flag must follow intel_ddi_init");
@@ -2797,6 +2799,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
             legacy: false,
             ddc_pin: Some(PinPair::Pin2Bxt),
             c20_uhbr_vspeo: None,
+            dp14_vspeo: None,
         },
         tc: [
             MtlPortDecl::USB_C,
@@ -2807,6 +2810,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
                 legacy: true,
                 ddc_pin: Some(PinPair::Pin10Tc2),
                 c20_uhbr_vspeo: None,
+                dp14_vspeo: None,
             },
             MtlPortDecl {
                 lane_reversal: false,
@@ -2815,6 +2819,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
                 legacy: false,
                 ddc_pin: Some(PinPair::Pin11Tc3),
                 c20_uhbr_vspeo: None,
+                dp14_vspeo: None,
             },
             MtlPortDecl::NONE,
         ],
@@ -4956,6 +4961,97 @@ fn smoke_mtl_external_uhbr_vbt_c20_override() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_uhbr_vbt_c20_override
+);
+
+/// The VBT's DP 1.4 overrides on 8b/10b links (`mtl_get_c10_buf_trans_override`,
+/// `mtl_get_c20_buf_trans_override` with `is_uhbr` false): DP children on
+/// DDI B (C10 on Meteor Lake) and TC1 (C20) with `use_vbt_vswing` and a
+/// six-table `BDB_VSWING_PREEMPH` (table `t` row 0 is vswing 20 + t,
+/// pre-cursor t, post-cursor 0). Under `narf.intel.uhbr=1` the trained level
+/// (swing 0, pre-emphasis 0: row 0) on PHY lane 0 is [pre, swing, post] =
+/// [0, 20, 0] from table 0 at RBR on DDI B (`intel_bios_get_c10_vspeo`:
+/// `port_clock <= 270000`), [1, 21, 0] from table 1 at HBR2, and [4, 24, 0]
+/// from table 4 on TC1 (`intel_bios_get_c20_vspeo`). Without the option the
+/// same routes keep `mtl_c10_trans_dp14` row 0 [0, 26, 0] and
+/// `mtl_c20_trans_dp14` row 0 [0, 20, 0], and the probe carries no override.
+fn smoke_mtl_external_vbt_dp14_overrides() -> TestResult {
+    use crate::intel_gpu_vbt::tests::{general_definitions, Child, VbtImage};
+    use crate::intel_gpu_vbt::{block, device_type, dp_aux, dvo_port, Vbt};
+    let ddi_b = Child::new(device_type::DP, dvo_port::DPB)
+        .aux(dp_aux::B)
+        .byte(23, 1 << 5);
+    let tc1 = Child::new(device_type::DP, dvo_port::DPF)
+        .aux(dp_aux::F)
+        .typec()
+        .byte(23, 1 << 5);
+    let image = VbtImage::new(250)
+        .block(
+            block::GENERAL_DEFINITIONS,
+            general_definitions(44, &[ddi_b, tc1]),
+        )
+        .block(block::VSWING_PREEMPH, vspeo_block(6, 3))
+        .build();
+    let Ok(vbt) = Vbt::parse(&image) else {
+        return TestResult::Fail("the VBT must parse");
+    };
+    let policy = MtlPortPolicy::from_vbt(&vbt);
+    let row0 = |t: u8| crate::intel_gpu_xelpg::snps(20 + t, t, 0);
+    let Some(b) = policy.ddi_b.dp14_vspeo else {
+        return TestResult::Fail("DDI B's DP child must carry the DP 1.4 overrides");
+    };
+    if b.c10.map(|t| t.map(|t| t[0])) != [Some(row0(0)), Some(row0(1))]
+        || b.c20.map(|t| t[0]) != Some(row0(4))
+        || policy.tc[0].dp14_vspeo.is_none()
+        || policy.tc[1].dp14_vspeo.is_some()
+    {
+        return TestResult::Fail("tables 0, 1 and 4 for each requesting DP child");
+    }
+    let b = ddi_b_event(MtlHpdKind::Connected(LiveMode::Native));
+    let tc = MtlHpdEvent {
+        pin: MtlHpdPin::Tc1,
+        kind: MtlHpdKind::Connected(LiveMode::DpAlt),
+    };
+    let cases: [(XeLpgPort, MtlHpdEvent, Vec<u8>, bool, [u8; 3]); 5] = [
+        (XeLpgPort::B, b, edid_1024(), true, [0, 20, 0]),
+        (XeLpgPort::B, b, edid_uhd(594_000), true, [1, 21, 0]),
+        (XeLpgPort::B, b, edid_1024(), false, [0, 26, 0]),
+        (XeLpgPort::Tc1, tc, edid_1024(), true, [4, 24, 0]),
+        (XeLpgPort::Tc1, tc, edid_1024(), false, [0, 20, 0]),
+    ];
+    for (port, event, edid, uhbr_on, want) in cases {
+        let io = ExtFake::new(port, Sink::new(0x14, edid));
+        let mut service = MtlExternalService::new();
+        service.set_generation(Generation::MeteorLake);
+        service.set_uhbr(uhbr_on);
+        if !service.set_policy(policy) {
+            return TestResult::Fail("the policy must install with no route");
+        }
+        match service.handle(&io, event, &mut fb_for) {
+            ServiceOutcome::Activated { .. } => {}
+            other => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "DP 1.4 override route: {other:?}");
+                return TestResult::Fail("the 8b/10b route must light");
+            }
+        }
+        let vdr = |a: u16| io.phy.vdr_get(0, a);
+        if [vdr(0xD80), vdr(0xD81), vdr(0xD82)] != want {
+            return TestResult::Fail("the trained level takes the override only with the option");
+        }
+        match service.route() {
+            Some(MtlRoute::Dp(r))
+                if r.probe.uhbr.is_none() && r.probe.dp14_vspeo.is_some() == uhbr_on => {}
+            _ => return TestResult::Fail("the probe holds the override only with the option"),
+        }
+        if !service.teardown(&io) {
+            return TestResult::Fail("the route must stop and release");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_vbt_dp14_overrides
 );
 
 /// HDCP on a live 128b/132b SST route (`_intel_hdcp_enable` outside

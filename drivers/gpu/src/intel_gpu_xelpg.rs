@@ -2491,10 +2491,33 @@ pub fn set_signal_levels_khz<M: MmioWindow + ?Sized>(
     lane_count: u8,
     levels: &[(u8, u8); 4],
 ) -> Result<(), Cx0Error> {
+    set_signal_levels_khz_table(
+        phy,
+        port_clock_khz,
+        lane_count,
+        levels,
+        trans_table(phy.kind()),
+    )
+}
+
+/// [`set_signal_levels_khz`] from `table`: `intel_ddi_buf_trans_get`
+/// returns the VBT's override (`mtl_get_c10_buf_trans_override`,
+/// `mtl_get_c20_buf_trans_override`) when the port has one, else
+/// [`trans_table`]. A level past the table takes its last entry
+/// (`intel_ddi_level`'s clamp).
+pub fn set_signal_levels_khz_table<M: MmioWindow + ?Sized>(
+    phy: &Cx0Phy<'_, M>,
+    port_clock_khz: u32,
+    lane_count: u8,
+    levels: &[(u8, u8); 4],
+    table: &[SnpsTrans],
+) -> Result<(), Cx0Error> {
     if !phy.lanes.admits(lane_count) {
         return Err(Cx0Error::ProtocolMismatch);
     }
-    let table = trans_table(phy.kind());
+    let Some(&last) = table.last() else {
+        return Err(Cx0Error::ProtocolMismatch);
+    };
     phy.program_msgbus_timer();
     phy.msgbus_access_begin(phy.lanes.owned)?;
     if phy.kind() == PhyKind::C10 {
@@ -2521,7 +2544,10 @@ pub fn set_signal_levels_khz<M: MmioWindow + ?Sized>(
     }
     let mut entries = [table[0]; 4];
     for (entry, &(swing, pre_emph)) in entries.iter_mut().zip(levels) {
-        *entry = table[preset_index(swing, pre_emph)];
+        *entry = table
+            .get(preset_index(swing, pre_emph))
+            .copied()
+            .unwrap_or(last);
     }
     program_lane_levels(phy, lane_count, &entries)
 }
