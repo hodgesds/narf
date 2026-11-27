@@ -1560,10 +1560,22 @@ fn rdna2_gfx_golden_sequences_preserve_masks_and_run_ring_ib_proofs() -> TestRes
             return TestResult::Fail("RDNA2 GFX clear-state/ring/IB proof failed");
         }
     }
-    for version in [(10, 3, 1), (10, 3, 3), (10, 3, 7), (11, 0, 1), (12, 0, 1)] {
+    // Rembrandt (10, 3, 3) and Raphael (10, 3, 6) are real APU tables, not
+    // guesses: `for_gc` dispatches them to their own golden sequences, and
+    // they resolve through `Layout::resolve_rembrandt` / `resolve_raphael`,
+    // never through the discrete `resolve_rdna2` path above — so they stay
+    // out of this denylist and are pinned here instead.
+    for version in [(10, 3, 1), (10, 3, 7), (11, 0, 1), (12, 0, 1)] {
         if crate::amdgpu_rdna2::golden::for_gc(version).is_some() {
             return TestResult::Fail("golden sequence guessed for another architecture/APU");
         }
+    }
+    if crate::amdgpu_rdna2::golden::for_gc((10, 3, 3))
+        != Some(crate::amdgpu_rdna2::golden::REMBRANDT)
+        || crate::amdgpu_rdna2::golden::for_gc((10, 3, 6))
+            != Some(crate::amdgpu_rdna2::golden::RAPHAEL)
+    {
+        return TestResult::Fail("APU golden sequence missing for Rembrandt or Raphael");
     }
     TestResult::Pass
 }
