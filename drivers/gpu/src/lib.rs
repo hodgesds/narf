@@ -411,6 +411,8 @@ pub mod amdgpu_rdna2_info;
 #[cfg(feature = "amdgpu")]
 pub use amdgpu_rdna2_info as amdgpu_info_navi22;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_jpeg_navi31;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_jpeg_navi48;
 #[path = "amdgpu_kiq_navi22.rs"]
 #[cfg(feature = "amdgpu")]
@@ -764,6 +766,8 @@ mod amdgpu_media_reservation;
 #[path = "amdgpu_video_caps_navi22.rs"]
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_rdna2_video_caps;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_vcn_navi31;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_vcn_navi48;
 #[cfg(feature = "amdgpu")]
