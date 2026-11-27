@@ -507,6 +507,7 @@ fn tcp_adapter(net_ns_id: u64) -> alloc::vec::Vec<narf_filesystem::procfs::net::
                 inode,
             }
         })
+        .chain(narf_userspace::socket::tcp4_loopback_snapshot_in(net_ns_id))
         .collect()
 }
 
@@ -707,8 +708,20 @@ fn tcp6_adapter(net_ns_id: u64) -> alloc::vec::Vec<narf_filesystem::procfs::net:
                 inode,
             }
         })
+        .chain(narf_userspace::socket::tcp6_loopback_snapshot_in(net_ns_id))
         .collect()
 }
+
+#[cfg(feature = "kernel-test")]
+fn smoke_proc_tcp_loopback_identity() -> narf_kernel_test::TestResult {
+    narf_filesystem::procfs::net::__test_with_tcp_hooks(
+        tcp_adapter,
+        tcp6_adapter,
+        narf_userspace::__test_proc_tcp_loopback_identity,
+    )
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("userspace/proc_tcp", smoke_proc_tcp_loopback_identity);
 
 fn udp6_adapter(
     net_ns_id: u64,

@@ -191,6 +191,9 @@ mod abi_remount_tests;
 mod abi_sched_tests;
 mod abi_signal_tests;
 mod abi_socket_errno_tests;
+
+#[cfg(feature = "kernel-test")]
+pub use tests::proc_tcp::__test_proc_tcp_loopback_identity;
 mod abi_socket_tests;
 mod abi_sound_tests;
 mod abi_sync_file_tests;

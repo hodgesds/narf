@@ -1,6 +1,6 @@
-//! Live Unix and raw IP sockets for the Linux procfs sequence files.
+//! Live Unix, loopback TCP and raw IP sockets for Linux procfs sequence files.
 
-use super::{SocketFile, SocketState, UnixAddr, AF_INET, AF_INET6, AF_UNIX, SOCK_RAW};
+use super::{SocketFile, SocketState, UnixAddr, AF_INET, AF_INET6, AF_UNIX, SOCK_RAW, SOCK_STREAM};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -11,7 +11,8 @@ static SOCKETS: IrqSafeSpinLock<BTreeMap<(u16, u64), Weak<SocketFile>>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
 pub(super) fn tracked(domain: u16, kind: u32) -> bool {
-    domain == AF_UNIX || (matches!(domain, AF_INET | AF_INET6) && kind == SOCK_RAW)
+    domain == AF_UNIX
+        || (matches!(domain, AF_INET | AF_INET6) && matches!(kind, SOCK_RAW | SOCK_STREAM))
 }
 
 pub(super) fn track(socket: &Arc<SocketFile>) {
@@ -44,6 +45,117 @@ fn sockets_in(domain: u16, namespace: u64) -> impl Iterator<Item = Arc<SocketFil
         .into_iter()
         .filter_map(|socket| socket.upgrade())
         .filter(move |socket| socket.net_ns_id() == namespace)
+}
+
+/// TCP endpoints implemented by local rings rather than the network stack.
+/// Wired listeners/connections already appear in the stack's snapshot; a
+/// bound-only socket has not entered the TCP hash tables and is omitted too.
+pub fn tcp4_loopback_snapshot_in(namespace: u64) -> Vec<narf_filesystem::procfs::net::TcbSnapshot> {
+    sockets_in(AF_INET, namespace)
+        .filter_map(|socket| {
+            let state = socket.state.lock();
+            let (local_addr, local_port, remote_addr, remote_port, state_code, rx_queue) =
+                match &*state {
+                    SocketState::InetListener {
+                        addr,
+                        port,
+                        listening: true,
+                        listen_id: None,
+                        pending,
+                        ..
+                    } => (*addr, *port, 0, 0, 0x0a, pending.len() as u32),
+                    SocketState::InetConnected {
+                        local_addr,
+                        local_port,
+                        peer_addr,
+                        peer_port,
+                        rx,
+                        ..
+                    } => (
+                        *local_addr,
+                        *local_port,
+                        *peer_addr,
+                        *peer_port,
+                        1, // ESTABLISHED, as in the ring path's TCP_INFO.
+                        rx.len() as u32,
+                    ),
+                    _ => return None,
+                };
+            Some(narf_filesystem::procfs::net::TcbSnapshot {
+                local_addr: local_addr.to_be_bytes(),
+                local_port,
+                remote_addr: remote_addr.to_be_bytes(),
+                remote_port,
+                state_code,
+                // Ring writes are delivered directly to the peer's receive
+                // queue: there are no unacknowledged packets or TCP timers.
+                tx_queue: 0,
+                rx_queue,
+                retrnsmt: 0,
+                timer_active: 0,
+                timer_expires: 0,
+                probes_out: 0,
+                rto: 0,
+                ack_timeout: 0,
+                snd_cwnd: 0,
+                snd_ssthresh: 0,
+                uid: socket.sk_uid,
+                timeout: 0,
+                inode: socket.inode.ino,
+            })
+        })
+        .collect()
+}
+
+/// IPv6 counterpart of [`tcp4_loopback_snapshot_in`].
+pub fn tcp6_loopback_snapshot_in(
+    namespace: u64,
+) -> Vec<narf_filesystem::procfs::net::Tcb6Snapshot> {
+    sockets_in(AF_INET6, namespace)
+        .filter_map(|socket| {
+            let state = socket.state.lock();
+            let (local_addr, local_port, remote_addr, remote_port, state_code, rx_queue) =
+                match &*state {
+                    SocketState::Inet6Listener {
+                        addr,
+                        port,
+                        listening: true,
+                        listen_id: None,
+                        pending,
+                        ..
+                    } => (*addr, *port, [0; 16], 0, 0x0a, pending.len() as u32),
+                    SocketState::Inet6Connected {
+                        local_addr,
+                        local_port,
+                        peer_addr,
+                        peer_port,
+                        rx,
+                        ..
+                    } => (
+                        *local_addr,
+                        *local_port,
+                        *peer_addr,
+                        *peer_port,
+                        1,
+                        rx.len() as u32,
+                    ),
+                    _ => return None,
+                };
+            Some(narf_filesystem::procfs::net::Tcb6Snapshot {
+                local_addr,
+                local_port,
+                remote_addr,
+                remote_port,
+                state_code,
+                tx_queue: 0,
+                rx_queue,
+                retrnsmt: 0,
+                uid: socket.sk_uid,
+                timeout: 0,
+                inode: socket.inode.ino,
+            })
+        })
+        .collect()
 }
 
 pub fn raw4_snapshot_in(namespace: u64) -> Vec<narf_filesystem::procfs::net::RawSocketSnapshot> {

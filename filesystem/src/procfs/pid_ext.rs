@@ -1084,6 +1084,9 @@ impl FileOps for ProcFdFile {
 }
 
 impl DirOps for ProcFdDir {
+    fn dir_owners(&self) -> (u32, u32) {
+        super::task_file_owners(self.pid)
+    }
     fn ino(&self) -> u64 {
         Self::dir_ino(self.pid)
     }
@@ -1188,6 +1191,9 @@ impl FileOps for ProcFdInfoFile {
 }
 
 impl DirOps for ProcFdInfoDir {
+    fn dir_owners(&self) -> (u32, u32) {
+        super::task_file_owners(self.pid)
+    }
     fn ino(&self) -> u64 {
         pid_entry_ino(self.pid, "fdinfo")
     }
@@ -1419,6 +1425,9 @@ impl FileOps for ProcTaskTidSyscall {
 }
 
 impl DirOps for ProcTaskTidDir {
+    fn dir_owners(&self) -> (u32, u32) {
+        super::task_file_owners(self.pid)
+    }
     fn ino(&self) -> u64 {
         self.ino
     }
@@ -1450,9 +1459,10 @@ impl DirOps for ProcTaskTidDir {
                 ino: proc_pid_ino(self.ino, name),
                 wchan: name == "wchan",
             })),
-            "fd" | "fdinfo" | "ns" | "net" => {
-                Some(Arc::new(ProcDirMarker::new(proc_pid_ino(self.ino, name))))
-            }
+            "fd" | "fdinfo" | "ns" | "net" => Some(Arc::new(ProcDirMarker::for_task(
+                proc_pid_ino(self.ino, name),
+                self.pid,
+            ))),
             _ => None,
         }
     }
@@ -1542,6 +1552,9 @@ impl ProcTaskDir {
 }
 
 impl DirOps for ProcTaskDir {
+    fn dir_owners(&self) -> (u32, u32) {
+        super::task_file_owners(self.pid)
+    }
     fn ino(&self) -> u64 {
         pid_entry_ino(self.pid, "task")
     }
@@ -1562,7 +1575,10 @@ impl DirOps for ProcTaskDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let tid: u64 = name.parse().ok()?;
         if self.tids().contains(&tid) {
-            Some(Arc::new(ProcDirMarker::new(self.tid_dir_ino(tid))))
+            Some(Arc::new(ProcDirMarker::for_task(
+                self.tid_dir_ino(tid),
+                self.pid,
+            )))
         } else {
             None
         }

@@ -41,7 +41,9 @@ pub(crate) mod proc_sockets;
 mod sockopt;
 pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
 pub use packet::{AF_PACKET, SOCK_PACKET, SOL_PACKET};
-pub use proc_sockets::{raw4_snapshot_in, raw6_snapshot_in};
+pub use proc_sockets::{
+    raw4_snapshot_in, raw6_snapshot_in, tcp4_loopback_snapshot_in, tcp6_loopback_snapshot_in,
+};
 pub use sockopt::{igmp6_snapshot_in, igmp_snapshot_in};
 pub use sockopt::{timeo_ns, SockOptExt};
 
@@ -10433,7 +10435,12 @@ impl SocketFile {
                 };
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
-                let server_end = SocketFile::new(AF_INET, SOCK_STREAM);
+                let server_end =
+                    SocketFile::with_protocol_in(AF_INET, SOCK_STREAM, 0, self.net_ns_id(), false);
+                #[cfg(feature = "container")]
+                if let Some(namespace) = listener.net_namespace.lock().clone() {
+                    server_end.set_net_namespace(namespace);
+                }
                 {
                     let mut srv_state = server_end.state.lock();
                     *srv_state = SocketState::InetConnected {
@@ -11671,7 +11678,12 @@ impl SocketFile {
                 };
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
-                let server_end = SocketFile::new(AF_INET6, SOCK_STREAM);
+                let server_end =
+                    SocketFile::with_protocol_in(AF_INET6, SOCK_STREAM, 0, self.net_ns_id(), false);
+                #[cfg(feature = "container")]
+                if let Some(namespace) = listener.net_namespace.lock().clone() {
+                    server_end.set_net_namespace(namespace);
+                }
                 {
                     let mut srv_state = server_end.state.lock();
                     *srv_state = SocketState::Inet6Connected {

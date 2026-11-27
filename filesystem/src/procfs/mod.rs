@@ -2067,6 +2067,8 @@ pub(crate) struct ProcDirMarker {
     /// Most procfs directories report the untracked defaults; `task` reports
     /// its live `2 + nr_threads` link count.
     pub(crate) attrs: crate::InodeAttrs,
+    /// Resolve task credentials at stat time, including after setuid/setgid.
+    pub(crate) owner_pid: Option<u64>,
 }
 
 impl ProcDirMarker {
@@ -2074,11 +2076,22 @@ impl ProcDirMarker {
         Self {
             ino,
             attrs: proc_attrs(),
+            owner_pid: None,
+        }
+    }
+
+    pub(crate) fn for_task(ino: u64, pid: u64) -> Self {
+        Self {
+            owner_pid: Some(pid),
+            ..Self::new(ino)
         }
     }
 }
 
 impl FileOps for ProcDirMarker {
+    fn owners(&self) -> (u32, u32) {
+        self.owner_pid.map_or((0, 0), task_file_owners)
+    }
     fn ino(&self) -> u64 {
         self.ino
     }
@@ -2135,10 +2148,14 @@ impl ProcPidDir {
                 return try_proc_file_node(ProcDirMarker {
                     ino: pid_entry_ino(self.pid, name),
                     attrs: crate::DirOps::inode_attrs(&dir),
+                    owner_pid: Some(self.pid),
                 });
             }
             "fd" | "fdinfo" | "ns" | "attr" | "net" => {
-                return try_proc_file_node(ProcDirMarker::new(pid_entry_ino(self.pid, name)));
+                return try_proc_file_node(ProcDirMarker::for_task(
+                    pid_entry_ino(self.pid, name),
+                    self.pid,
+                ));
             }
             _ => {}
         }
@@ -2197,6 +2214,9 @@ impl ProcPidDir {
 }
 
 impl DirOps for ProcPidDir {
+    fn dir_owners(&self) -> (u32, u32) {
+        task_file_owners(self.pid)
+    }
     fn ino(&self) -> u64 {
         pid_dir_ino(self.pid)
     }
@@ -2441,6 +2461,9 @@ const NS_NAMES: &[(&str, u8)] = &[
 ];
 
 impl DirOps for ProcNsDir {
+    fn dir_owners(&self) -> (u32, u32) {
+        task_file_owners(self.pid)
+    }
     fn ino(&self) -> u64 {
         pid_entry_ino(self.pid, "ns")
     }
@@ -2521,6 +2544,9 @@ struct ProcAttrDir {
 }
 
 impl DirOps for ProcAttrDir {
+    fn dir_owners(&self) -> (u32, u32) {
+        task_file_owners(self.pid)
+    }
     fn ino(&self) -> u64 {
         pid_entry_ino(self.pid, "attr")
     }
@@ -2727,12 +2753,12 @@ impl DirOps for ProcRoot {
                     // A non-leader thread's id (see `thread_group_of_visible_tid`).
                     // First: the process lookup's raw-task fallback would
                     // otherwise answer for it as a one-thread process.
-                    if thread_group_of_visible_tid(n).is_some() {
-                        return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(n))));
+                    if let Some(tgid) = thread_group_of_visible_tid(n) {
+                        return Some(Arc::new(ProcDirMarker::for_task(pid_dir_ino(n), tgid)));
                     }
                     if let Some(pid) = pid_resolve(n) {
                         if task_info(pid, TaskInfoQuery::Identity).is_some() {
-                            return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(pid))));
+                            return Some(Arc::new(ProcDirMarker::for_task(pid_dir_ino(pid), pid)));
                         }
                     }
                 }
@@ -2968,6 +2994,9 @@ struct ProcPidNetDir {
 }
 
 impl DirOps for ProcPidNetDir {
+    fn dir_owners(&self) -> (u32, u32) {
+        task_file_owners(self.outer_id)
+    }
     fn ino(&self) -> u64 {
         pid_entry_ino(self.outer_id, "net")
     }
@@ -6014,4 +6043,77 @@ fn smoke_procfs_inode_identity_is_stable_and_distinct() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs",
     smoke_procfs_inode_identity_is_stable_and_distinct
+);
+
+/// lsof gets a process's UID from its proc directory. Directory markers
+/// (path stat) and DirOps (open/fstat) must both follow live credentials.
+fn smoke_procfs_directory_ownership_tracks_task() -> TestResult {
+    const PID: u64 = 0x5354_4541;
+    static OWNER: AtomicUsize = AtomicUsize::new(1000);
+    fn snapshot(pid: u64, _query: TaskInfoQuery) -> Option<ProcTaskInfo> {
+        (pid == PID).then(|| ProcTaskInfo {
+            pid,
+            uid: OWNER.load(Ordering::Relaxed) as u32,
+            gid: OWNER.load(Ordering::Relaxed) as u32 + 1,
+            ..sample_task_info()
+        })
+    }
+    struct Restore {
+        info: usize,
+        pidns: (usize, usize, usize, usize),
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TASK_INFO_HOOK.store(self.info, Ordering::Release);
+            __test_pidns_hooks_restore(self.pidns);
+        }
+    }
+    let _restore = Restore {
+        info: TASK_INFO_HOOK.swap(snapshot as TaskInfoFn as usize, Ordering::AcqRel),
+        pidns: __test_pidns_hooks_snapshot(),
+    };
+    install_proc_pidns_hooks(|| PID, Some, Some, || PID);
+    let name = PID.to_string();
+    let (Some(marker), Some(dir)) = (ProcRoot.lookup(&name), ProcRoot.lookup_dir(&name)) else {
+        return TestResult::Fail("mock process directory missing");
+    };
+    let mut pairs = alloc::vec![(marker, dir.clone())];
+    for name in ["fd", "fdinfo", "task", "ns", "attr", "net"] {
+        let (Some(marker), Some(child)) = (dir.lookup(name), dir.lookup_dir(name)) else {
+            return TestResult::Fail("process subdirectory missing");
+        };
+        pairs.push((marker, child));
+    }
+    let task = dir
+        .lookup_dir("task")
+        .expect("task directory checked above");
+    let (Some(marker), Some(tid)) = (task.lookup(&name), task.lookup_dir(&name)) else {
+        return TestResult::Fail("thread directory missing");
+    };
+    pairs.push((marker, tid.clone()));
+    for name in ["fd", "fdinfo", "ns", "net"] {
+        let (Some(marker), Some(child)) = (tid.lookup(name), tid.lookup_dir(name)) else {
+            return TestResult::Fail("thread subdirectory missing");
+        };
+        pairs.push((marker, child));
+    }
+    for uid in [1000, 4242] {
+        OWNER.store(uid, Ordering::Relaxed);
+        let expected = (uid as u32, uid as u32 + 1);
+        for (marker, dir) in &pairs {
+            if marker.owners() != expected || dir.dir_owners() != expected {
+                return TestResult::Fail("proc directory did not follow task credentials");
+            }
+        }
+    }
+    if ProcRoot.dir_owners() != (0, 0)
+        || ProcRoot.lookup("pressure").map(|f| f.owners()) != Some((0, 0))
+    {
+        return TestResult::Fail("static proc directory acquired task ownership");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_procfs_directory_ownership_tracks_task
 );
