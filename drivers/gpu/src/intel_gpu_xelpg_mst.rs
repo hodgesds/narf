@@ -444,6 +444,8 @@ impl MtlMstRoute {
                 audio: None,
                 c20_uhbr_vspeo: decl.c20_uhbr_vspeo.filter(|_| uhbr.is_some()).map(Box::new),
                 dp14_vspeo: decl.dp14_vspeo,
+                // The 8b/10b MST link trains end to end.
+                lttpr_per_hop: false,
             };
             // Copy the EDID straight into the probe's own buffer: a
             // separate 512-byte staging array is a second stack slot in
@@ -853,6 +855,7 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
         awaiting_fec_stop: false,
         state: RouteState::Stopped,
         uhbr: None,
+        lttprs: 0,
         audio: None,
     };
     let result = (|| {

@@ -40,10 +40,11 @@
 //!   (`intel_dp_init_lttpr_and_dprx_caps`, `drm_dp_lttpr_init`), grants their
 //!   extended wake timeout and trains with the repeater count (the CDS
 //!   budget). 128b/132b training has no per-hop phase: Linux trains the
-//!   whole path from the DPRX's status. The 8b/10b route keeps the repeaters
-//!   transparent (the per-hop `intel_dp_link_train_all_phys` is not
-//!   implemented), so a 128b/132b route hands them back to transparent mode
-//!   when it stops.
+//!   whole path from the DPRX's status. Under the same option the 8b/10b SST
+//!   route trains through them hop by hop (`super::lttpr`,
+//!   `intel_dp_link_train_all_phys`); the 8b/10b MST route keeps them
+//!   transparent and trains end to end, so a route that switched them hands
+//!   them back to transparent mode when it stops.
 //!
 //! - **Fallback** ([`LinkCaps`]): `intel_dp_link_caps.c`'s configuration
 //!   orders, `intel_dp_get_link_train_fallback_values` after a failed
@@ -174,7 +175,7 @@ pub const DP_DPRX_SLEEP_WAKE_TIMEOUT_PERIOD_GRANTED: u8 = 1 << 0;
 /// (`__DP_LTTPR2_BASE - __DP_LTTPR1_BASE`).
 pub const DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1: u32 = 0xf_0020;
 pub const DP_LTTPR_STRIDE: u32 = 0x50;
-const DP_LTTPR_PHY_CAP_SIZE: usize = 3;
+pub const DP_LTTPR_PHY_CAP_SIZE: usize = 3;
 
 /// `DP_LINK_STATUS_SIZE`.
 pub const LINK_STATUS_SIZE: usize = 6;
@@ -394,6 +395,10 @@ pub struct LttprInit {
     /// `intel_dp->lttpr_common_caps` afterwards: its `DP_PHY_REPEATER_MODE`
     /// byte holds the mode Linux set (`intel_dp_set_lttpr_transparent_mode`).
     pub caps: [u8; 8],
+    /// `intel_dp->lttpr_phy_caps[i]` of `DP_PHY_LTTPR(i)` for the repeaters
+    /// in non-transparent mode (`drm_dp_read_lttpr_phy_caps`; a failed read
+    /// leaves zeros, as Linux's).
+    pub phy_caps: [[u8; DP_LTTPR_PHY_CAP_SIZE]; 8],
 }
 
 impl LttprInit {
@@ -424,6 +429,7 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
     }
     let mut caps = read_lttpr_caps(aux, dpcd[0]);
     let mut count = 0;
+    let mut phy_caps = [[0u8; DP_LTTPR_PHY_CAP_SIZE]; 8];
     let found = lttpr_count(&caps);
     if found != Some(0) {
         // intel_dp_init_lttpr_phys with LTTPRs (or a malformed count).
@@ -451,9 +457,9 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
         if non_transparent {
             caps[DP_PHY_REPEATER_MODE_INDEX] = DP_PHY_REPEATER_MODE_NON_TRANSPARENT;
             count = found.unwrap_or(0);
-            for i in 0..u32::from(count) {
+            for (i, slot) in (0..u32::from(count)).zip(phy_caps.iter_mut()) {
                 let base = DP_TRAINING_AUX_RD_INTERVAL_PHY_REPEATER1 + i * DP_LTTPR_STRIDE;
-                let mut phy = [0u8; DP_LTTPR_PHY_CAP_SIZE];
+                let phy = slot;
                 if dpcd[0] < 0x14 {
                     for (j, b) in phy.iter_mut().enumerate() {
                         if aux
@@ -463,8 +469,8 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
                             break;
                         }
                     }
-                } else {
-                    let _ = aux.dpcd_read(base, &mut phy);
+                } else if aux.dpcd_read(base, phy).is_err() {
+                    *phy = [0; DP_LTTPR_PHY_CAP_SIZE];
                 }
             }
         } else {
@@ -477,7 +483,11 @@ pub fn init_lttpr_and_dprx_caps<A: AuxChannel + ?Sized>(aux: &mut A) -> LttprIni
     if aux.dpcd_read(0x000, &mut dpcd).is_err() {
         return LttprInit::default();
     }
-    LttprInit { count, caps }
+    LttprInit {
+        count,
+        caps,
+        phy_caps,
+    }
 }
 
 /// `drm_dp_lttpr_wake_timeout_setup`: in transparent mode the DPRX's

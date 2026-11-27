@@ -134,6 +134,19 @@ impl ReceiverTraining {
             equalization_delay_us: if interval == 0 { 400 } else { interval_us },
         }
     }
+
+    /// The channel-equalization pattern (`intel_dp_training_pattern` for
+    /// the DPRX, with `DP_LINK_SCRAMBLING_DISABLE` for TPS2/3).
+    #[cfg(feature = "intel")]
+    pub(crate) fn equalization_pattern(&self) -> u8 {
+        self.equalization
+    }
+
+    /// The DPRX's clock-recovery and channel-equalization delays, us.
+    #[cfg(feature = "intel")]
+    pub(crate) fn delays_us(&self) -> (u32, u32) {
+        (self.clock_recovery_delay_us, self.equalization_delay_us)
+    }
 }
 
 /// Link-training state.

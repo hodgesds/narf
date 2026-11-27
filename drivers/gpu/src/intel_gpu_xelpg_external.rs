@@ -147,7 +147,8 @@
 //! and caps the link, the stream's bandwidth is requested before the port
 //! and freed after it, and the port clock is the fabric's UHBR select.
 //! LTTPRs in the path are switched to non-transparent mode for the
-//! 128b/132b training and handed back transparent at the stop.
+//! 128b/132b training, and an 8b/10b SST link trains through them hop by
+//! hop ([`lttpr`]); both hand them back transparent at the stop.
 //! A stream that fits nothing uncompressed compresses over 128b/132b
 //! when Linux 7.4's DSC search lands there (FEC implicit: no
 //! `DP_FEC_READY`, no `DP_TP_CTL` FEC). A UHBR-capable MST hub runs
@@ -211,6 +212,9 @@ pub mod color;
 pub mod audio;
 #[path = "intel_gpu_dp_tunnel.rs"]
 pub(crate) mod tunnel;
+
+#[path = "intel_gpu_dp_lttpr.rs"]
+pub(crate) mod lttpr;
 
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
@@ -1076,6 +1080,10 @@ pub struct MtlSinkProbe {
     /// by the service under `narf.intel.uhbr=1`; `None` takes the C10/C20
     /// `mtl_c*_trans_dp14` tables.
     pub dp14_vspeo: Option<&'static Dp14Vspeo>,
+    /// `narf.intel.uhbr=1`: an 8b/10b link through LTTPRs switches them to
+    /// non-transparent mode and trains hop by hop ([`lttpr`]); without it
+    /// the repeaters stay transparent and the link trains end to end.
+    pub lttpr_per_hop: bool,
 }
 
 /// A 128b/132b SST route (`intel_dp_is_uhbr`).
@@ -2076,6 +2084,7 @@ fn probe_sink_link<M: MmioWindow + ?Sized>(
         audio,
         c20_uhbr_vspeo: None,
         dp14_vspeo: None,
+        lttpr_per_hop: uhbr_on,
     })
 }
 
@@ -2124,6 +2133,9 @@ pub struct MtlExternalRoute {
     awaiting_fec_stop: bool,
     /// A 128b/132b route's trained TX FFE presets and payload state.
     pub uhbr: Option<UhbrTrained>,
+    /// The LTTPRs an 8b/10b route's per-hop training switched to
+    /// non-transparent mode ([`MtlSinkProbe::lttpr_per_hop`]).
+    lttprs: u8,
     /// The audio stream `intel_audio_codec_enable` started, until its
     /// disable.
     audio: Option<audio::AudioStream>,
@@ -2493,6 +2505,7 @@ fn activate_once<M: MmioWindow + ?Sized>(
         retired: None,
         awaiting_fec_stop: false,
         uhbr: route_uhbr,
+        lttprs: 0,
         audio: None,
     };
     match program(io, &mut route, choice, &ext, display.pipe_dmc, payload) {
@@ -2596,7 +2609,7 @@ fn route_pipe(route: &MtlExternalRoute) -> Result<&RoutePipe, ExternalError> {
 /// link trained at.
 fn enable_port<M: MmioWindow + ?Sized>(
     io: &M,
-    route: &MtlExternalRoute,
+    route: &mut MtlExternalRoute,
     rate: TrainRate,
     lanes: u8,
 ) -> Result<TrainedLink, ExternalError> {
@@ -2612,6 +2625,17 @@ fn enable_port<M: MmioWindow + ?Sized>(
     // 6.c TRANS_DDI_FUNC_CTL configured without ENABLE.
     let func = stream_func(&route.probe, lanes);
     write(io, trans_ddi_func_ctl(trans), func & !TRANS_DDI_FUNC_ENABLE)?;
+    // narf.intel.uhbr=1: intel_dp_set_power(D0), the LTTPR mode Linux set
+    // at detect (intel_dp_init_lttpr_and_dprx_caps; this route defers it to
+    // here) and drm_dp_lttpr_wake_timeout_setup, as mtl_ddi_pre_enable_dp
+    // runs them (best effort).
+    if route.probe.lttpr_per_hop && route.probe.mst.is_none() {
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
+        let _ = aux.dpcd_write(dsc::DP_SET_POWER, &[dsc::DP_SET_POWER_D0]);
+        let lttpr = uhbr::init_lttpr_and_dprx_caps(&mut aux);
+        uhbr::wake_timeout_setup(&mut aux, lttpr.transparent());
+        route.lttprs = route.lttprs.max(lttpr.count);
+    }
     // intel_dp_set_power(D0) and intel_dp_configure_protocol_converter for
     // a PCON under narf.intel.hdmi14_ext=1 (best effort, as in Linux).
     if let Some(pcon) = route.probe.output.pcon {
@@ -2671,6 +2695,18 @@ fn enable_port<M: MmioWindow + ?Sized>(
         ddi_enable_value(route.probe.display_ip, lanes),
     )?;
     wait_port_buf_active(io, port).map_err(phy_err)?;
+    // intel_dp_start_link_train under narf.intel.uhbr=1: the LTTPRs
+    // re-initialized ("to ensure that they are switched to non-transparent
+    // mode"); with repeaters in non-transparent mode the link trains hop by
+    // hop (intel_dp_link_train_all_phys), else end to end.
+    let lttpr = if route.probe.lttpr_per_hop && route.probe.mst.is_none() {
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
+        uhbr::init_lttpr_and_dprx_caps(&mut aux)
+    } else {
+        uhbr::LttprInit::default()
+    };
+    route.lttprs = route.lttprs.max(lttpr.count);
+    let route = &*route;
     // 6.k DisplayPort training over the owned AUX channel.
     let aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
     let mut failure = None;
@@ -2683,13 +2719,26 @@ fn enable_port<M: MmioWindow + ?Sized>(
                 crate::dp_aux::AuxError::Nacked
             })
         },
-    );
-    let result = train_link_with_receiver(&mut aux, rate, lanes, Some(receiver), |us| {
-        let _ = narf_scheduler::responsive_spin_until(
-            || false,
-            narf_time::Deadline::after_ns(us as u64 * 1_000),
-        );
-    })
+    )
+    .with_lttprs(lttpr.count);
+    let result = if lttpr.count != 0 {
+        lttpr::train_link(
+            &mut aux,
+            &mut uhbr::SystemClock,
+            rate,
+            lanes,
+            &receiver,
+            route.probe.caps.dpcd_rev,
+            lttpr,
+        )
+    } else {
+        train_link_with_receiver(&mut aux, rate, lanes, Some(receiver), |us| {
+            let _ = narf_scheduler::responsive_spin_until(
+                || false,
+                narf_time::Deadline::after_ns(us as u64 * 1_000),
+            );
+        })
+    }
     .map_err(ExternalError::Link);
     match failure {
         Some(error) => Err(error),
@@ -3485,15 +3534,22 @@ fn disable_port<M: MmioWindow + ?Sized>(
             uhbr::DP_MAIN_LINK_CHANNEL_CODING_SET,
             &[uhbr::DP_SET_ANSI_8B10B],
         );
-        // The 8b/10b route trains end to end: the repeaters this route made
-        // non-transparent go back to transparent mode (Linux keeps them
-        // non-transparent and trains 8b/10b per hop).
+        // The 8b/10b MST route (and any route without narf.intel.uhbr=1)
+        // trains end to end: the repeaters this route made non-transparent go
+        // back to transparent mode (Linux keeps them non-transparent and
+        // trains 8b/10b per hop).
         if route.uhbr.is_some_and(|state| state.lttpr_count != 0) {
             let _ = aux.dpcd_write(
                 uhbr::DP_PHY_REPEATER_MODE,
                 &[uhbr::DP_PHY_REPEATER_MODE_TRANSPARENT],
             );
         }
+    } else if route.lttprs != 0 {
+        // The same for an 8b/10b route that trained per hop.
+        let _ = aux.dpcd_write(
+            uhbr::DP_PHY_REPEATER_MODE,
+            &[uhbr::DP_PHY_REPEATER_MODE_TRANSPARENT],
+        );
     }
     // Sink to D3 before the port goes down (a NACK never replaces the
     // local idle proof).

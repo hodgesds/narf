@@ -316,6 +316,14 @@ impl Sink {
                 self.uhbr_log.push((addr, value));
                 self.payload_status &= !value;
             }
+            // The PHY repeaters' training registers (per-hop 8b/10b): logged,
+            // the pattern sets also in order with the DPRX's.
+            0xf_0010..=0xf_02ff => {
+                self.uhbr_log.push((addr, value));
+                if (addr - 0xf_0010) % 0x50 == 0 {
+                    self.training_writes.push((addr, value));
+                }
+            }
             0x120 | 0x160 | 0x280 => {
                 self.dsc_log.push((addr, value));
                 match addr {
@@ -5021,6 +5029,119 @@ fn smoke_mtl_external_uhbr_lttpr_non_transparent_route() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_mtl_external_uhbr_lttpr_non_transparent_route
+);
+
+/// An 8b/10b DPRX (HBR2 x4) behind one LTTPR (`DP_PHY_REPEATER_CNT` 0x80,
+/// revision 1.4, HBR2 x4) whose PHY status reports CR, channel EQ, symbol
+/// lock and alignment.
+fn lttpr_8b10b_sink() -> Sink {
+    let mut sink = Sink::new(0x14, edid_1024());
+    for (i, b) in [0x14u8, 0x14, 0x80, 0x55, 4, 0, 0, 0].into_iter().enumerate() {
+        sink.extra.push((uhbr::DP_LTTPR_COMMON_CAPS + i as u32, b));
+    }
+    sink.extra.push((0xf_0030, 0x77));
+    sink.extra.push((0xf_0031, 0x77));
+    sink.extra.push((0xf_0032, 0x01));
+    sink
+}
+
+/// Per-hop 8b/10b training through an LTTPR (`narf.intel.uhbr=1`, Meteor
+/// Lake TC1, RBR x4): `mtl_ddi_pre_enable_dp` switches the repeater
+/// non-transparent (`DP_PHY_REPEATER_MODE` 0x55, then 0xaa) before
+/// `drm_dp_lttpr_wake_timeout_setup`, `intel_dp_start_link_train`
+/// re-initializes it (0x55, 0xaa), then `intel_dp_link_train_all_phys`
+/// trains the LTTPR at `DP_TRAINING_PATTERN_SET_PHY_REPEATER1` (TPS1 without
+/// scrambling 0x21, TPS4 0x07, disabled) and then the DPRX at
+/// `DP_TRAINING_PATTERN_SET` (0x21, its TPS3 without scrambling 0x23,
+/// disabled). The source's `DP_TP_CTL` follows every pattern but the
+/// repeater's disable (`intel_dp_disable_dpcd_training_pattern` is DPCD
+/// only): PAT1 at the port enable, PAT1, PAT4, PAT1, PAT3, normal, then
+/// the normal of `intel_dp_stop_link_train`. The stop hands the repeater
+/// back transparent. Without the option the repeater keeps its mode and
+/// the link trains end to end at the DPRX (0x21, 0x23, 0).
+fn smoke_mtl_external_lttpr_per_hop_8b10b_route() -> TestResult {
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let mode = uhbr::DP_PHY_REPEATER_MODE;
+    for uhbr_on in [true, false] {
+        let io = ExtFake::new(XeLpgPort::Tc1, lttpr_8b10b_sink());
+        let Ok(probe) = probe_sink_profile_uhbr(&io, profile, XeLpgPort::Tc1, false, uhbr_on)
+        else {
+            return TestResult::Fail("the DPRX must probe through its LTTPR");
+        };
+        if probe.uhbr.is_some() || probe.lttpr_per_hop != uhbr_on {
+            return TestResult::Fail("an 8b/10b probe trains per hop only with the option");
+        }
+        let fb = fb_for(&probe.mode).unwrap();
+        let mut route = match activate(&io, probe, fb, &MtlDisplay::NONE) {
+            Ok(route) if route.state() == RouteState::Live => route,
+            _ => return TestResult::Fail("the 8b/10b route must light through the LTTPR"),
+        };
+        {
+            let sink = io.sink.borrow();
+            let modes: Vec<u8> = sink
+                .uhbr_log
+                .iter()
+                .filter_map(|&(a, v)| (a == mode).then_some(v))
+                .collect();
+            let patterns: Vec<(u32, u8)> = sink
+                .training_writes
+                .iter()
+                .copied()
+                .filter(|&(a, _)| a != 0x101)
+                .collect();
+            let (want_modes, want_patterns): (&[u8], &[(u32, u8)]) = if uhbr_on {
+                (
+                    &[0x55, 0xaa, 0x55, 0xaa],
+                    &[
+                        (0xf_0010, 0x21),
+                        (0xf_0010, 0x07),
+                        (0xf_0010, 0x00),
+                        (0x102, 0x21),
+                        (0x102, 0x23),
+                        (0x102, 0x00),
+                    ],
+                )
+            } else {
+                (&[], &[(0x102, 0x21), (0x102, 0x23), (0x102, 0x00)])
+            };
+            if modes != want_modes || patterns != want_patterns {
+                return TestResult::Fail("the LTTPR trains first, only with the option");
+            }
+        }
+        let fields: Vec<u32> = io
+            .writes_to(DP_TP_CTL_B)
+            .iter()
+            .filter(|&&v| v & DP_TP_CTL_ENABLE != 0)
+            .map(|v| (v >> 8) & 7)
+            .collect();
+        let want: &[u32] = if uhbr_on {
+            &[0, 0, 5, 0, 4, 3, 3]
+        } else {
+            &[0, 0, 4, 3, 3]
+        };
+        if fields != want || route.lttprs != u8::from(uhbr_on) {
+            return TestResult::Fail("the source pattern follows each hop's training");
+        }
+        if route.stop(&io).is_err() || route.release(&io).is_err() {
+            return TestResult::Fail("the route must stop and release");
+        }
+        let last_mode = io
+            .sink
+            .borrow()
+            .uhbr_log
+            .iter()
+            .rev()
+            .find(|&&(a, _)| a == mode)
+            .map(|&(_, v)| v);
+        if last_mode != uhbr_on.then_some(uhbr::DP_PHY_REPEATER_MODE_TRANSPARENT) {
+            return TestResult::Fail("the stop hands a per-hop repeater back transparent");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_lttpr_per_hop_8b10b_route
 );
 
 /// `BDB_VSWING_PREEMPH` with `tables` tables of sixteen rows and `columns`
