@@ -637,10 +637,18 @@ impl Physical {
         // No Card spinlock spans console PTE/resource validation. Qualification
         // grants CTM only; display12 and13 have different native LUT layouts.
         let family = self.gen12_family();
-        let ctm_only = family.is_some_and(|family| {
-            gen12_primary::Owner::capture(self, console, family, self.bar.len).is_ok()
-                && crate::intel_gpu_color::Owner::capture_gen12(self, family).is_ok()
-        });
+        // Color, the cursor and tiled views stay unadvertised on Rocket
+        // Lake (not qualified there) and on a discrete display (no
+        // integrated primary owner); their primary flips remain.
+        let ctm_only = family
+            .filter(|family| {
+                *family != crate::intel_gpu_gt::Gen12Platform::RocketLake
+                    && self.discrete_display.is_none()
+            })
+            .is_some_and(|family| {
+                gen12_primary::Owner::capture(self, console, family, self.bar.len).is_ok()
+                    && crate::intel_gpu_color::Owner::capture_gen12(self, family).is_ok()
+            });
         let timing = crate::drm_registry::mode_state(self.index).and_then(|card| {
             let card = card.lock();
             let mode = card.crtcs.first()?.mode?;
@@ -1251,13 +1259,16 @@ fn fetchers_with_cursor(
         }
     }
     // All admitted ADL-S/P/N source families have four sprites; TGL has
-    // six. ADL-S is display12 with HAS_D12_PLANE_MINIMIZATION. Display 13+
-    // (MTL's 14, LNL's 20) has four.
+    // six. ADL-S and RKL are display12 with HAS_D12_PLANE_MINIMIZATION.
+    // Display 13+ (MTL's 14, LNL's 20) has four.
     let count = if display_ip.is_some() {
         5
     } else {
         match generation {
-            Generation::MeteorLake | Generation::AlderLake | Generation::LunarLake => 5,
+            Generation::MeteorLake
+            | Generation::AlderLake
+            | Generation::LunarLake
+            | Generation::RocketLake => 5,
             _ => 7,
         }
     };
@@ -1267,7 +1278,15 @@ fn fetchers_with_cursor(
     let external = display_ip.and_then(|ip| {
         crate::intel_gpu_xelpg_pipes::published_layout().filter(|l| l.state.ip == ip)
     });
-    let pipe_count = display_ip.map_or(4, crate::intel_gpu_xe2lpd::DisplayIp::pipe_count);
+    // rkl_desc: pipe_mask A-C; every other display here has four pipes.
+    let pipe_count = display_ip.map_or(
+        if generation == Generation::RocketLake {
+            3
+        } else {
+            4
+        },
+        crate::intel_gpu_xe2lpd::DisplayIp::pipe_count,
+    );
     for pipe in 0..pipe_count as u64 {
         let cursor = mmio.read32(0x70080 + pipe * 0x1000);
         if cursor == u32::MAX {
@@ -2748,7 +2767,7 @@ impl<M: Platform> Guard<'_, M> {
     fn acquire_gen12_resources(&mut self) -> Result<(), FsError> {
         if !matches!(
             self.device.generation,
-            Generation::TigerLake | Generation::AlderLake
+            Generation::TigerLake | Generation::AlderLake | Generation::RocketLake
         ) {
             return Ok(());
         }
@@ -2768,11 +2787,15 @@ impl<M: Platform> Guard<'_, M> {
             .gen12_family()
             .filter(|_| self.device.platform.discrete_display().is_none())
             .ok_or(FsError::Unsupported)?;
-        if (self.device.generation == Generation::TigerLake)
-            != (family == crate::intel_gpu_gt::Gen12Platform::TigerLake)
-        {
+        if self.device.generation != crate::intel_gpu_scanout_io::gen12_generation(family) {
             self.state.failed = true;
             return Err(FsError::NoDevice);
+        }
+        // Rocket Lake's panel is owned only behind `narf.intel.rkl_edp=1`.
+        if family == crate::intel_gpu_gt::Gen12Platform::RocketLake
+            && !crate::intel_gpu_modeset::rkl_edp()
+        {
+            return Err(FsError::Unsupported);
         }
         let owner = gen12_primary::Owner::capture(
             &self.device.platform,

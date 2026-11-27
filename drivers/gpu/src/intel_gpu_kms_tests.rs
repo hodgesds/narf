@@ -220,6 +220,20 @@ impl MockPlatform {
     pub(crate) fn tiger(&self) -> Device<Self> {
         self.gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake)
     }
+    /// Rocket Lake's panel route (`narf.intel.rkl_edp=1`): display 12 with
+    /// three pipes and five planes (`rkl_desc`, HAS_D12_PLANE_MINIMIZATION),
+    /// the Tiger Lake XR24 literal. Pipe D's registers do not exist.
+    pub(crate) fn rocket(&self) -> Device<Self> {
+        let mut platform = self.clone();
+        platform.3 = Some(crate::intel_gpu_gt::Gen12Platform::RocketLake);
+        {
+            let mut hw = self.0.lock();
+            hw.gen12_display = true;
+            hw.gen12_planes = 5;
+            hw.display13 = false;
+        }
+        Device::new(platform, Generation::RocketLake, 0x1000000, console())
+    }
     pub(crate) fn gen12(&self, family: crate::intel_gpu_gt::Gen12Platform) -> Device<Self> {
         // Select a literal source family when converting the initial generic
         // linear fixture. Preserve deliberately corrupted non-baseline CTLs.
@@ -711,6 +725,12 @@ impl MmioWindow for MockPlatform {
             hw.forbidden_display_reads += 1;
             return u32::MAX;
         }
+        if self.3 == Some(crate::intel_gpu_gt::Gen12Platform::RocketLake)
+            && (0x73000..0x74000).contains(&offset)
+        {
+            hw.forbidden_display_reads += 1;
+            return u32::MAX;
+        }
         if hw.gen12_display && !hw.display13 && offset == 0x42084 {
             hw.forbidden_display_reads += 1;
             return u32::MAX;
@@ -1151,11 +1171,10 @@ impl Platform for MockPlatform {
         }
         fetchers_with_cursor(
             &fresh,
-            match self.3 {
-                Some(crate::intel_gpu_gt::Gen12Platform::TigerLake) => Generation::TigerLake,
-                Some(_) => Generation::AlderLake,
-                None => Generation::MeteorLake,
-            },
+            self.3.map_or(
+                Generation::MeteorLake,
+                crate::intel_gpu_scanout_io::gen12_generation,
+            ),
             fresh.display_ip(),
             owned_dsb,
             owned_cursor,
@@ -2100,3 +2119,5 @@ mod multipipe;
 mod psr;
 #[path = "intel_gpu_xe2lpd_kms_tests.rs"]
 mod xe2lpd;
+#[path = "intel_gpu_gen12_legacy_kms_tests.rs"]
+mod gen12_legacy;

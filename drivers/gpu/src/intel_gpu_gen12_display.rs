@@ -178,7 +178,13 @@ impl Owner {
             }
         };
         fetchers_with_cursor(io, generation, None, owned_dsb, owned_cursor)?;
-        for pipe in 1..4 {
+        // TRANSCONF B-D off; Rocket Lake has no transcoder D (rkl_desc).
+        let pipes = if self.family == Gen12Platform::RocketLake {
+            3
+        } else {
+            4
+        };
+        for pipe in 1..pipes {
             if read(io, 0x70008 + pipe * 0x1000)? & 0xc0000000 != 0 {
                 return Err(FsError::NoDevice);
             }

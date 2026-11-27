@@ -1497,9 +1497,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // (Gen9 Lane 5): `PsrLayout::from_generation` falls back
     // to the TigerLake table for Skylake too, and programming
     // the TGL-layout PSR registers on SKL silicon is not a
-    // modeset this lane can stand behind.
+    // modeset this lane can stand behind. Rocket Lake's panel
+    // (`narf.intel.rkl_edp=1`) is display 12 with the Tiger Lake
+    // layout; Wa_16011181250 keeps it on PSR1.
     if let Some(mode) = panel_mode.filter(|_| {
-        dev.chip.generation.display_supported()
+        crate::intel_gpu_modeset::panel_route(dev.chip.generation)
             && dev.chip.generation != Generation::MeteorLake
             && dev.chip.generation != Generation::IceLake
             && dev.chip.generation != Generation::Skylake
