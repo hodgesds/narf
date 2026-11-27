@@ -59,6 +59,7 @@ pub mod nr {
     pub const READLINK: u32 = 85;
     pub const MMAP: u32 = 90;
     pub const MUNMAP: u32 = 91;
+    pub const SOCKETCALL: u32 = 102;
     pub const IPC: u32 = 117;
     pub const CLONE: u32 = 120;
     pub const UNAME: u32 = 122;
@@ -113,9 +114,26 @@ pub mod nr {
     pub const EPOLL_CREATE1: u32 = 329;
     pub const DUP3: u32 = 330;
     pub const PIPE2: u32 = 331;
+    pub const RECVMMSG: u32 = 337;
     pub const PRLIMIT64: u32 = 340;
+    pub const SENDMMSG: u32 = 345;
     pub const GETRANDOM: u32 = 355;
     pub const EXECVEAT: u32 = 358;
+    pub const SOCKET: u32 = 359;
+    pub const SOCKETPAIR: u32 = 360;
+    pub const BIND: u32 = 361;
+    pub const CONNECT: u32 = 362;
+    pub const LISTEN: u32 = 363;
+    pub const ACCEPT4: u32 = 364;
+    pub const GETSOCKOPT: u32 = 365;
+    pub const SETSOCKOPT: u32 = 366;
+    pub const GETSOCKNAME: u32 = 367;
+    pub const GETPEERNAME: u32 = 368;
+    pub const SENDTO: u32 = 369;
+    pub const SENDMSG: u32 = 370;
+    pub const RECVFROM: u32 = 371;
+    pub const RECVMSG: u32 = 372;
+    pub const SHUTDOWN: u32 = 373;
     pub const STATX: u32 = 383;
     pub const ARCH_PRCTL: u32 = 384;
     pub const RSEQ: u32 = 386;
@@ -130,6 +148,7 @@ pub mod nr {
     pub const MSGRCV: u32 = 401;
     pub const MSGCTL: u32 = 402;
     pub const CLOCK_GETTIME64: u32 = 403;
+    pub const RECVMMSG_TIME64: u32 = 417;
     pub const SEMTIMEDOP_TIME64: u32 = 420;
     pub const FUTEX_TIME64: u32 = 422;
     pub const CLONE3: u32 = 435;
@@ -331,6 +350,45 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
             let a = *ctx.args();
             compat_shmctl(ctx, a.arg0, a.arg1, a.arg2)
         }
+        // net/socket.c, net/compat.c: the direct socket calls (i386 has had
+        // them since 4.3) and the `socketcall` multiplexer before them.
+        // `struct sockaddr` is the same on both ABIs; msghdr/mmsghdr, their
+        // iovecs and control messages, and the old SO_*TIMEO timevals are
+        // converted in `compat32::socket`.
+        SOCKETCALL => super::socket::compat_socketcall(ctx),
+        SOCKET => forward_sx(ctx, Syscall::SocketOpen, 0b111),
+        SOCKETPAIR => forward_sx(ctx, Syscall::SocketPair, 0b111),
+        BIND => forward_sx(ctx, Syscall::SocketBind, 0b101),
+        CONNECT => forward_sx(ctx, Syscall::SocketConnect, 0b101),
+        LISTEN => forward_sx(ctx, Syscall::SocketListen, 0b11),
+        ACCEPT4 => forward_sx(ctx, Syscall::SocketAccept4, 0b1001),
+        GETSOCKNAME => forward_sx(ctx, Syscall::SocketGetSockName, 0b1),
+        GETPEERNAME => forward_sx(ctx, Syscall::SocketGetPeerName, 0b1),
+        SENDTO => forward_sx(ctx, Syscall::SocketSend, 0b100001),
+        RECVFROM => forward_sx(ctx, Syscall::SocketRecv, 0b1),
+        SHUTDOWN => forward_sx(ctx, Syscall::SocketShutdown, 0b11),
+        GETSOCKOPT => super::socket::compat_sockopt(ctx, false),
+        SETSOCKOPT => super::socket::compat_sockopt(ctx, true),
+        SENDMSG => {
+            let a = *ctx.args();
+            super::socket::compat_sendmsg(ctx, a.arg0, a.arg1, a.arg2)
+        }
+        RECVMSG => {
+            let a = *ctx.args();
+            super::socket::compat_recvmsg(ctx, a.arg0, a.arg1, a.arg2)
+        }
+        SENDMMSG => {
+            let a = *ctx.args();
+            super::socket::compat_sendmmsg(ctx, a.arg0, a.arg1, a.arg2, a.arg3)
+        }
+        RECVMMSG => {
+            let a = *ctx.args();
+            super::socket::compat_recvmmsg(ctx, a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, true)
+        }
+        RECVMMSG_TIME64 => {
+            let a = *ctx.args();
+            super::socket::compat_recvmmsg(ctx, a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, false)
+        }
         _ => {
             ctx.set_return(SyscallReturn::not_implemented());
             None
@@ -369,7 +427,7 @@ fn forward_abi(
 }
 
 /// Serve an i386 call with `variant`'s native handler on `args`.
-fn forward_args(
+pub(super) fn forward_args(
     ctx: &mut dyn TrapContext,
     variant: Syscall,
     args: SyscallArgs,
@@ -383,7 +441,7 @@ fn forward_args(
 /// Run `variant`'s native handler on `args` and hand back its return
 /// without writing it to `ctx` (`None`: it set none and parked to
 /// re-execute the call).
-fn call_native(
+pub(super) fn call_native(
     ctx: &mut dyn TrapContext,
     variant: Syscall,
     args: SyscallArgs,
@@ -448,7 +506,7 @@ fn signed_args(args: &SyscallArgs, signed: u8) -> SyscallArgs {
 
 /// Is `ret` a success (not an errno)?
 #[inline]
-fn succeeded(ret: &SyscallReturn) -> bool {
+pub(super) fn succeeded(ret: &SyscallReturn) -> bool {
     ret.status == SyscallReturn::OK && (ret.value as i64) >= 0
 }
 

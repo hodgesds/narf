@@ -2899,6 +2899,30 @@ mean the pre-2.4 layouts and answer EINVAL. msgsnd and msgrcv use `struct
 compat_msgbuf`, whose `mtype` is a 4-byte `compat_long_t`
 (`sysvipc::msg_long_bytes`).
 
+**Sockets.** The direct calls socket (359), socketpair (360), bind (361),
+connect (362), listen (363), accept4 (364), getsockname (367), getpeername
+(368), sendto (369), recvfrom (371) and shutdown (373) pass through, since
+`struct sockaddr` is shared. sendmsg (370), recvmsg (372), sendmmsg (345),
+recvmmsg (337, `old_timespec32`) and recvmmsg_time64 (417) convert `struct
+compat_msghdr` / `compat_mmsghdr`, their `compat_iovec`s and their
+`compat_cmsghdr` control messages (`compat32::socket`):
+
+- Going in, the conversion follows `cmsghdr_from_user_compat_to_kern`.
+- Coming out, it follows `put_cmsg_compat`, narrowing the old SCM_TIMESTAMP*
+  payloads, and `scm_detach_fds_compat`. A cut SCM_RIGHTS record sets
+  MSG_CTRUNC, and the fds that did not fit are closed again.
+
+setsockopt (366) and getsockopt (365) move the old SO_RCVTIMEO/SO_SNDTIMEO
+as an `old_timeval32`. `socketcall` (102) reads its 32-bit argument words
+(`nas[]`) and serves each call as its direct entry.
+
+The native handlers read and write a `struct msghdr` through user pointers.
+So these conversions build the native structures on the caller's own stack,
+below its stack pointer, skipping a 64-bit caller's red zone
+(`compat32::stage`, Linux's `compat_alloc_user_space` before 5.11). They run
+the native handler against them and copy the results back. A call that
+parks is re-staged when it is re-issued.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.
