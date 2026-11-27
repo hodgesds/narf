@@ -20,7 +20,7 @@ fn frame_valid(p: &PlaneFrame) -> bool {
         || p.width == 0
         || p.height == 0
         || p.pitch % 4 != 0
-        || p.pitch < p.width.checked_mul(4).unwrap_or(u32::MAX)
+        || p.pitch < p.width.saturating_mul(4)
         || p.offsets[0] % 4 != 0
     {
         return false;

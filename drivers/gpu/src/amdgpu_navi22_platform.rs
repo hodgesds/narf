@@ -3240,7 +3240,7 @@ async fn presenter() {
                     else {
                         return Ok(None);
                     };
-                    FlipPlan::Single(update)
+                    FlipPlan::Single(update.map(alloc::boxed::Box::new))
                 }
             };
             // Taken for the present: a failed copy or flip leaves both
@@ -3334,7 +3334,9 @@ enum Latch {
 /// the stream lit then: while an overlay is live, `plan_plane` refuses
 /// every primary update, so the paths cannot plan one before calling.
 enum FlipPlan {
-    Single(Option<crate::amdgpu_navi22_plane::Update>),
+    /// Boxed: `Update` is ~712 bytes (the DML30 plan); an inline payload
+    /// trips `clippy::large_enum_variant` and bloats the flip future.
+    Single(Option<alloc::boxed::Box<crate::amdgpu_navi22_plane::Update>>),
     Two {
         primary: crate::amdgpu_navi22_plane::Request,
         overlay: OverlayArm,
@@ -3518,7 +3520,7 @@ async fn present_direct(
             let Ok(update) = plane_update(boot, &request) else {
                 return Ok(Direct::Refused);
             };
-            FlipPlan::Single(update)
+            FlipPlan::Single(update.map(alloc::boxed::Box::new))
         }
     };
     // No HDP step: display fetch reads VRAM through the MMHUB, not the
@@ -3654,7 +3656,7 @@ async fn present_blit(
             let Some(update) = plane_update(boot, &request).map_err(trace_refusal).ok() else {
                 return Ok(Blitted::Dropped);
             };
-            FlipPlan::Single(update)
+            FlipPlan::Single(update.map(alloc::boxed::Box::new))
         }
     };
     let (before, after, latched) = match flip_unlocked(owner, ArmedKind::Back, 0, plan).await {
