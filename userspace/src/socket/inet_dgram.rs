@@ -587,12 +587,21 @@ pub(super) fn deliver_wire(
 ) -> bool {
     let saddr = u32::from_be_bytes(src);
     let daddr = u32::from_be_bytes(dst);
-    // `fib_compute_spec_dst`: a plain local destination is its own spec_dst;
-    // for a broadcast or multicast one it is the preferred source for
-    // replying to the sender.
+    // `fib_compute_spec_dst`: a plain local destination is its own spec_dst.
+    // For a broadcast or multicast one it is the preferred source of the
+    // route back to the sender, which `fib_lookup` finds with no output
+    // device (`flowi4_iif = LOOPBACK_IFINDEX`). Only when no route exists,
+    // or the sender is 0.0.0.0, is it the arrival device's address
+    // (`inet_select_addr(dev, ..)`).
     let spec_dst =
         if super::sockopt::is_multicast_v4(daddr) || narf_net::iface::is_broadcast_in(ns, dst) {
-            select_source(ns, saddr, in_ifindex).unwrap_or(0)
+            (saddr != 0)
+                .then(|| narf_net::route::route_lookup_in(ns, narf_net::ipv4::Ipv4Addr(src)))
+                .flatten()
+                .map(|r| u32::from_be_bytes(r.src.0))
+                .filter(|a| *a != 0)
+                .or_else(|| select_source(ns, saddr, in_ifindex).ok())
+                .unwrap_or(0)
         } else {
             daddr
         };
