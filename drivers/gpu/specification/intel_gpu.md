@@ -3259,6 +3259,22 @@ notification and rebind, suspend of a pinned export, import mmap, import
 scanout and the `begin_cpu_access` migration
 (`smoke_xe_prime_begin_cpu_access_migrates_vram_for_cpu_reads`).
 
+A live CPU mapping of a VRAM export keeps it in VRAM on every migration
+path above unless `narf.intel.prime_mmap_migrate=1` (strict, default off).
+With it, `xe_dma_buf_pin`, a host importer's map and the CPU-read
+`begin_cpu_access` move a mapped export as Linux's
+`ttm_bo_handle_move_mem` does (`ttm_bo_unmap_virtual` before the move, the
+new placement faulted in after it):
+`narf_filesystem::mmap_relocation::relocate` freezes every CPU alias, the
+bytes are copied by the CPU through the BAR's kernel mapping (the
+transaction cannot await a GPU copy) into new system frames, and every
+alias is rebound to them; dynamic importers are notified first. A DG2 export (Flat-CCS metadata a CPU copy cannot carry),
+a closed BAR, a mapping not yet installed, an alias outside the VM
+snapshot, or work, a pin or scanout on the object refuse with EBUSY and
+nothing moved. Fixtures:
+`smoke_xe_prime_mmapped_vram_export_migrates_with_its_mappings` and
+`smoke_xe_prime_mmapped_dg2_export_with_flat_ccs_stays_in_vram`.
+
 Native terminal fences now back the shared per-object dma-buf reservation.
 GuC and Gen12 resident admission check synchronous conflicts across the
 whole residency list before adding READ/WRITE fences. Readers can overlap;
@@ -3812,7 +3828,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
 | VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20). Swap, lazy-free and compaction now refuse pinned pages, and VRAM CPU mappings are revoked and refaulted across runtime suspend (§20); i915 GEM_USERPTR (`i915_gem_userptr_ioctl`) and the Xe LR_MODE/FAULT_MODE VM flags with PREFETCH are admitted ("Completion of Intel iGPU and Discrete Arc Support"); CPU-address-mirror VMs are admitted on USM devices behind `narf.intel.svm=1`, populated by PREFETCH and by the fault service, zapped by CPU invalidations and refaulted at EXEC (§20, native fixtures added); routing hardware GPU faults to that service (ASIDs, the GuC G2H fault path) and VRAM migration remain |
-| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations | Open; DG2/BMG evict VRAM to system memory (flat-CCS saved) and migrate it back, evict under OOM at GEM_CREATE, re-migrate at exec and drain for suspend ("Completion of Intel iGPU and Discrete Arc Support"); CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20); DG1 publishes VRAM below `GSMBASE` (§5); cross-device VRAM PRIME runs with static attachments, and peer-to-peer behind `narf.intel.prime_p2p=1` (§19), unvalidated on hardware. Dynamic (move-notify) importers, in-place suspend of a pinned VRAM export, import mmap through the exporter and integrated-display scanout of an import are implemented with native fixtures (§19); alias revocation and nonvisible allocation beyond the BMG headless profile remain |
+| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations | Open; DG2/BMG evict VRAM to system memory (flat-CCS saved) and migrate it back, evict under OOM at GEM_CREATE, re-migrate at exec and drain for suspend ("Completion of Intel iGPU and Discrete Arc Support"); CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20); DG1 publishes VRAM below `GSMBASE` (§5); cross-device VRAM PRIME runs with static attachments, and peer-to-peer behind `narf.intel.prime_p2p=1` (§19), unvalidated on hardware. Dynamic (move-notify) importers, in-place suspend of a pinned VRAM export, import mmap through the exporter and integrated-display scanout of an import are implemented with native fixtures (§19), and a CPU-mapped VRAM export migrates with its mappings behind `narf.intel.prime_mmap_migrate=1` (§19; DG2 Flat-CCS exports stay in VRAM); alias revocation and nonvisible allocation beyond the BMG headless profile remain |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
@@ -6930,13 +6946,15 @@ Fixtures:
 - `drivers/gpu/intel_gpu_media_gt`:
   `smoke_mtl_media_gt_kcr_irq_enables_decodes_and_resets` (the IRQ model),
   `smoke_media_gt_pxp_jobs_run_on_gsccs_ppgtt_and_the_first_vcs` (the media
-  GuC model) and `smoke_xe_pxp_enabled_queues_objects_and_stale_key_checks`
-  (native Xe with a published `xe->pxp`).
+  GuC model), `smoke_xe_pxp_enabled_queues_objects_and_stale_key_checks`
+  (native Xe with a published `xe->pxp`) and
+  `smoke_xe_pxp_protected_queue_lrc_registers_run_alone_through_the_guc`
+  (HWDRM queues executed through the GuC model: the registered LRC's
+  CTX_CONTEXT_CONTROL is 0x00890088 on RCS0/CCS0, 0x00090008 on BCS0).
 The packet bytes, termination words, register values and errnos are the
 Linux ABI's, never recorded from this implementation. Nothing here has run
-on physical Intel hardware. Not covered natively: a protected queue's LRC
-submitted through the GuC model (the fixture pins the value the submit path
-computes), the runtime's real GSC worker and media GuC behind the
+on physical Intel hardware. Not covered natively: the runtime's real GSC
+worker and media GuC behind the
 `pxp::Runtime` model, and the real GSC firmware's acceptance of NARF's PPGTT
 address and inline VCS termination.
 
@@ -8259,9 +8277,12 @@ firmware command set), `intel_hdcp_shim` (DP and HDMI sinks) and
   check every 500 ms. Firmware: the MEI HDCP client
   (`narf_drivers_platform::mei_hdcp`, joined through
   `narf_drivers::hdcp_component`) below display 14, bound on the TGP, ADP
-  and RPL PCHs and, for Coffee and Comet Lake, on CNP-H and CMP-LP/H (the
-  other display 9-11 PCHs are not claimed by the MEI driver, so they fall
-  back to HDCP 1.4); the media GT's GSC on
+  and RPL PCHs, for Coffee and Comet Lake on CNP-H and CMP-LP/H, and on the
+  display 9-11 PCHs SPT, SPT-H, KBP, CNP-LP, ICP-LP/N, JSP-N and MCC, which
+  the MEI driver claims only with `narf.intel.hdcp=1` (Linux always does).
+  Firmware below HBM 2.2 runs at its own 2.0 or 2.1 (`mei_hbm_dispatch`;
+  1.x is refused), and SPS or IGN firmware on SPT-H, CNP-H, TGP-H and RPL-S
+  leaves the HECI unclaimed (`mei_me_quirk_probe`); the media GT's GSC on
   14+ (with `narf.intel.media_gt=1 narf.intel.gsc=1`), whose worker
   submits each framed command from its packet object. Without the firmware
   type-0 content falls back to HDCP 1.4 and type 1 is refused.
@@ -8280,11 +8301,16 @@ firmware command set), `intel_hdcp_shim` (DP and HDMI sinks) and
   `smoke_intel_hdcp_gen9_gen11_port_layout`,
   `smoke_intel_hdcp14_gen9_port_registers_and_pcode_key_load`,
   `smoke_intel_hdcp_gen11_hdmi14_and_hdcp22_mei_port_data`,
+  `smoke_intel_hdcp22_mst_gen9_port_block_and_pipe_stream_status`,
+  `smoke_intel_hdcp14_mst_gen11_port_status_carries_every_stream`,
   `smoke_intel_hdcp_debugfs_names_texts_and_bool_grammar` and
-  `smoke_intel_hdcp_debugfs_capability_and_force_through_the_service`.
-- Not done: Gen9/Gen11 MST HDCP has no fixture of its own (its registers
-  are the layout fixture's), HDCP 2.2 on the Gen9/Gen11 PCHs the MEI driver
-  does not claim, and any silicon run.
+  `smoke_intel_hdcp_debugfs_capability_and_force_through_the_service`;
+  `drivers/platform/mei` runs
+  `smoke_mei_display9_11_pch_ids_and_fw_sku_quirks`,
+  `smoke_mei_hbm_version_falls_back_to_the_firmware_version` and
+  `smoke_mei_hdcp_binds_on_display9_11_pchs`.
+- Not done: CP_IRQ on the firmware-lit Gen12 route (its HDCP service would
+  have to own that display's hotplug) and any silicon run.
 
 ### DP 2.0 UHBR on display 14+ external DP (`narf.intel.uhbr=1`) — native fixtures added
 

@@ -95,25 +95,30 @@ work had.
   KMS presenter on the Rocket Lake panel, and the DG1 presenter (refused,
   as DG2's is, by the integrated Gen12 primary owner).
 - PXP: protected planes decrypt or go black in every layout the plane
-  takes (CPU and DSB arms), and the runtime wiring and the RUN_ALONE value
-  have native models; open are a protected queue's LRC submitted through
-  the GuC model, the KMS CPU-copy path for protected frames (refused), and
-  a silicon run.
+  takes (CPU and DSB arms), and the runtime wiring, the RUN_ALONE value and
+  a protected queue's LRC through the GuC model have native fixtures; open
+  are the KMS CPU-copy path for protected frames (refused) and a silicon
+  run.
 - HDCP: Gen9/Gen11 use the port-indexed registers (pcode key load on Gen9
-  big core, MEI HDCP 2.2 on Coffee/Comet Lake and Gen11 where the MEI
-  driver binds) and the per-connector debugfs files exist; open are HDCP
-  2.2 on the Gen9/Gen11 PCHs the MEI driver does not claim (SPT, KBP,
-  CNP-LP, ICP, JSP, MCC), a Gen9/Gen11 MST fixture, and a silicon run (the NUC12's GOP-lit route is the first
-  target). The firmware-lit Gen12 route has no hotplug owner, so its HDCP
-  2.2 waits still poll RxStatus every 10 ms.
+  big core, MEI HDCP 2.2 on Kaby/Coffee/Comet Lake and Gen11, the MEI
+  driver claiming the SPT, KBP, CNP-LP, ICP, JSP and MCC PCHs with
+  `narf.intel.hdcp=1`) with Gen9/Gen11 MST fixtures, and the per-connector
+  debugfs files exist; open is a silicon run (the NUC12's GOP-lit route is
+  the first target). The firmware-lit Gen12 route has no hotplug owner, so
+  its HDCP 2.2 waits still poll RxStatus every 10 ms: CP_IRQ there needs
+  the HDCP service to own that display's hotplug (SDE latches and acks,
+  what a long pulse does to a route NARF did not light), which is not a
+  small change.
 - VRAM PRIME/P2P beyond `intel_gpu_prime` (dynamic move-notify
   importers, peer-to-peer LMEM BAR mapping behind
   `narf.intel.prime_p2p=1`, migration fallback, in-place suspend of a
   pinned VRAM export, import mmap through the exporter, integrated-display
   scanout of an import, the `xe_dma_buf_begin_cpu_access` migration for
-  CPU reads): AMD exporters and importers, migration of an export a
-  process has mmapped (a live BAR mapping keeps it in VRAM), and
-  validation of the P2P, suspend and migration paths on hardware.
+  CPU reads, and migration of an export a process has mmapped behind
+  `narf.intel.prime_mmap_migrate=1`): AMD exporters and importers, a
+  mapped DG2 export's move (its Flat-CCS needs the GPU copy the alias
+  freeze cannot await), and validation of the P2P, suspend and migration
+  paths on hardware.
 - CPU-address-mirror VMs behind `narf.intel.svm=1`: routing hardware GPU
   faults to the fault service (ASIDs, the GuC G2H 0x6002 path, updating a
   running job's tables), VRAM migration (`drm_pagemap`) on Battlemage,
