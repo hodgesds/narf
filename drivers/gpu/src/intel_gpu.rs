@@ -3056,18 +3056,20 @@ fn legacy_external_routes_stopped(bar: &MmioRegion) -> bool {
 // Type-C ownership, hotplug, link, local stop — is owned by
 // `intel_gpu_xelpg_external`; this glue owns its scanout allocation and
 // the serial-matched publication. The GTT allocator has no free path, so
-// one allocation is retained per BAR and reused whenever the next mode
-// fits; it lives in the pipe-B console GGTT window so it can never remap
-// the internal panel's pipe-A window. Every other concurrently lit surface
-// (MST streams, a second route) takes its own window
-// (`mtl_scanout_window`), never a shared one. Gen12 never reaches this glue: every
+// one allocation is retained per BAR and window and reused whenever the
+// next mode fits. Each surface lives in the console GGTT window of the
+// Pipe B–D it scans out on, so it can never remap the internal panel's
+// pipe-A window or another lit surface's (MST streams, a second route,
+// either one MST). Gen12 never reaches this glue: every
 // entry returns before register access unless the probed generation is
 // Meteor Lake.
 
-/// Retained MTL external scanout allocation: (BAR physical base, allocation).
+/// Retained MTL external scanout allocation in Pipe B's window: (BAR
+/// physical base, allocation).
 static MTL_SCANOUT: IrqSafeSpinLock<Option<(u64, ScanoutAllocation)>> = IrqSafeSpinLock::new(None);
-// MST secondary surfaces have separate GGTT and physical backing. The
-// boot-console publication remains the first stream, as with SST.
+// Surfaces in Pipe C's and D's windows (keyed by the window's pipe) have
+// separate GGTT and physical backing. A route's publication is its first
+// stream, as with SST.
 static MTL_EXTRA_SCANOUTS: IrqSafeSpinLock<alloc::vec::Vec<(u64, u8, ScanoutAllocation)>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 /// Serial of the published MTL external image (0 = none published).
@@ -3083,26 +3085,18 @@ static MTL_SLOT_IMAGES: IrqSafeSpinLock<
         crate::intel_gpu_pipes::Pipe,
     )>; 2],
 > = IrqSafeSpinLock::new([None, None]);
-/// `MTL_EXTRA_SCANOUTS` key of the second route's surface (slot 1 never
-/// carries MST streams, which take keys 1..).
-const MTL_SECOND_SCANOUT_KEY: u8 = 0x80;
-
-/// The console GGTT window (`scanout_gtt_offset`) of stream `stream` of the
-/// route in slot `slot`. Every surface lit at the same time needs its own
-/// window: an allocation at a window's offset rewrites that window's PTEs,
-/// so two surfaces in one window would scan out the last one's pages. Slot
-/// 0's streams (one SST/HDMI route, or up to three MST streams) take Pipe
-/// B, C and D's windows in order; slot 1 (a second concurrent route, never
-/// beside MST) takes Pipe C's. `None` past the last window.
-fn mtl_scanout_window(slot: usize, stream: u8) -> Option<crate::intel_gpu_pipes::Pipe> {
-    use crate::intel_gpu_pipes::Pipe;
-    match (slot, stream) {
-        (0, 0) => Some(Pipe::B),
-        (0, 1) => Some(Pipe::C),
-        (0, 2) => Some(Pipe::D),
-        (1, 0) => Some(Pipe::C),
-        _ => None,
-    }
+/// The console GGTT window (`scanout_gtt_offset`) of the next surface the
+/// route owner allocates: that of the Pipe B–D it scans out on, the lowest
+/// free one, which the route's activation (or MST stream) takes next
+/// ([`crate::intel_gpu_xelpg_external::next_external_pipe`]). Every surface
+/// lit at the same time needs its own window: an allocation at a window's
+/// offset rewrites that window's PTEs, so two surfaces in one window would
+/// scan out the last one's pages. `None` when every pipe is lit.
+fn mtl_scanout_window<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
+    io: &M,
+    profile: crate::intel_gpu_xelpg_external::ExternalDisplayProfile,
+) -> Option<crate::intel_gpu_pipes::Pipe> {
+    crate::intel_gpu_xelpg_external::next_external_pipe(io, profile)
 }
 
 /// The publication serial of route slot `slot`.
@@ -3176,23 +3170,15 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     };
     before_event();
     // The route slot this event lights (or relights) a route in: slot 1 is
-    // a second concurrent route (`narf.intel.ext_routes=2`) with its own
-    // retained surface in its own GGTT window.
+    // a second concurrent route (`narf.intel.ext_routes=2`), published
+    // under its own serial.
     let slot = crate::intel_gpu_xelpg_external::event_slot(event.pin.port());
-    let mut next_scanout = if slot == 0 {
-        0u8
-    } else {
-        MTL_SECOND_SCANOUT_KEY
-    };
-    let mut stream = 0u8;
     let mut alloc_fb = |mode: &crate::intel_gpu_modeset::Mode| {
-        let index = next_scanout;
-        next_scanout = next_scanout.checked_add(1)?;
-        let window = mtl_scanout_window(slot, stream)?;
-        stream += 1;
+        let window = mtl_scanout_window(io, profile)?;
+        let index = window as u8;
         let width = u32::from(mode.h_active);
         let size = scanout_size_bytes(width, u32::from(mode.v_active));
-        let reuse = if index == 0 {
+        let reuse = if window == crate::intel_gpu_pipes::Pipe::B {
             (*MTL_SCANOUT.lock())
                 .filter(|(owner, retained)| *owner == bar && retained.size_bytes >= size)
                 .map(|(_, retained)| retained)
@@ -3209,7 +3195,7 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
             Some(retained) => retained,
             None => {
                 let fresh = alloc(window, size)?;
-                if index == 0 {
+                if window == crate::intel_gpu_pipes::Pipe::B {
                     *MTL_SCANOUT.lock() = Some((bar, fresh));
                 } else {
                     let mut surfaces = MTL_EXTRA_SCANOUTS.lock();
@@ -3240,23 +3226,22 @@ fn mtl_external_pass_profile<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
     );
     after_event();
     if let Some(ServiceOutcome::Activated { mode, fb, pipe, .. }) = outcome {
-        let phys = if slot == 0 {
-            (*MTL_SCANOUT.lock())
-                .filter(|(owner, retained)| {
-                    *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
-                })
-                .map(|(_, retained)| retained.phys_base)
-        } else {
-            MTL_EXTRA_SCANOUTS
-                .lock()
-                .iter()
-                .find(|(owner, key, retained)| {
-                    *owner == bar
-                        && *key == MTL_SECOND_SCANOUT_KEY
-                        && u64::from(retained.gtt_offset) == fb.phys_addr
-                })
-                .map(|(_, _, retained)| retained.phys_base)
-        };
+        // The retained allocation behind the route's first surface, in
+        // whichever window it was placed.
+        let phys = (*MTL_SCANOUT.lock())
+            .filter(|(owner, retained)| {
+                *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
+            })
+            .map(|(_, retained)| retained.phys_base)
+            .or_else(|| {
+                MTL_EXTRA_SCANOUTS
+                    .lock()
+                    .iter()
+                    .find(|(owner, _, retained)| {
+                        *owner == bar && u64::from(retained.gtt_offset) == fb.phys_addr
+                    })
+                    .map(|(_, _, retained)| retained.phys_base)
+            });
         let serial = next_external_scanout_serial();
         if let (Some(phys), Some(serial)) = (phys, serial) {
             let image = narf_graphics_driver::generic::GenericFb::new(
@@ -5089,20 +5074,41 @@ pub mod tests {
     );
 
     /// Every concurrently lit MTL external surface gets its own console
-    /// GGTT window: an MST route's streams in slot 0 take Pipe B, C and D's
-    /// (`alloc_contiguous_scanout_with_format` maps at the window's offset,
-    /// so a shared window would remap the earlier stream's pages), and a
-    /// second concurrent route takes Pipe C's, which MST never shares with
-    /// it (MST is refused beside a sibling route).
+    /// GGTT window (`alloc_contiguous_scanout_with_format` maps at the
+    /// window's offset, so a shared window would remap the earlier
+    /// surface's pages): the window of the Pipe B–D it scans out on, the
+    /// lowest one whose transcoder, primary and function are off, whichever
+    /// route slot or MST stream asks (a second route beside an MST route,
+    /// or MST streams beside a second route, never share one).
     fn smoke_mtl_external_streams_take_distinct_ggtt_windows() -> TestResult {
+        use crate::intel_gpu_aux::MmioWindow as _;
         use crate::intel_gpu_multipipe::scanout_gtt_offset;
         use crate::intel_gpu_pipes::Pipe;
-        let windows: alloc::vec::Vec<_> = (0..4).map(|s| mtl_scanout_window(0, s)).collect();
-        if windows != [Some(Pipe::B), Some(Pipe::C), Some(Pipe::D), None]
-            || mtl_scanout_window(1, 0) != Some(Pipe::C)
-            || mtl_scanout_window(1, 1).is_some()
+        use crate::intel_gpu_xelpg_external::tests::{edid_for, ExtFake, Sink};
+        use crate::intel_gpu_xelpg_external::ExternalDisplayProfile;
+        let io = ExtFake::new(
+            crate::intel_gpu_xelpg::XeLpgPort::Tc1,
+            Sink::new(0x14, edid_for(65_000, 1024, 320, 24, 136, 768, 38, 3, 6)),
+        );
+        let mtl = ExternalDisplayProfile::for_ip(crate::intel_gpu_xe2lpd::DisplayIp::Xelpdp);
+        let wcl = ExternalDisplayProfile::WILDCAT_LAKE;
+        let first = mtl_scanout_window(&io, mtl);
+        // TRANSCONF(B) lit: the next surface takes C's window; C's primary
+        // on (mid-arm): D's; D's TRANS_DDI_FUNC_CTL enabled: none is free.
+        io.write32(0x7_1008, (1 << 31) | (1 << 30));
+        let second = mtl_scanout_window(&io, mtl);
+        io.write32(0x7_2180, 1 << 31);
+        let third = mtl_scanout_window(&io, mtl);
+        // Wildcat Lake's three pipes end at C.
+        let wcl_third = mtl_scanout_window(&io, wcl);
+        io.write32(0x6_3400, 1 << 31);
+        if first != Some(Pipe::B)
+            || second != Some(Pipe::C)
+            || third != Some(Pipe::D)
+            || wcl_third.is_some()
+            || mtl_scanout_window(&io, mtl).is_some()
         {
-            return TestResult::Fail("streams must take Pipe B, C, D windows; slot 1 Pipe C");
+            return TestResult::Fail("each surface must take its scanning pipe's window");
         }
         // 16 MiB + 32 MiB per pipe: B, C, D at 48, 80 and 112 MiB, each a
         // whole 32 MiB console window below the GEM scanout arena (160 MiB).

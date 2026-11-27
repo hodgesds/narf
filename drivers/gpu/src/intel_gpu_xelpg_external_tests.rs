@@ -5486,6 +5486,99 @@ kernel_test_in!(
     smoke_external_uhbr_tbt_tunnel_refusals
 );
 
+/// A second 128b/132b route (`narf.intel.ext_routes=2`) whose tunnel shares
+/// a BW allocation group with the sibling's (`lookup_or_alloc_group`: driver
+/// 1, group 1, `drv_group_id` 9). The new tunnel is the Panther Lake TC2
+/// probe's (0.25 Gbps = 31250 kBps units, 72 units = 2250000 kBps estimated,
+/// nothing allocated, a UHBR10 x2 DPRX: `get_max_dprx_bw` =
+/// roundup(2417750, 31250) = 2437500); its 4K60 stream needs 1782000 kBps
+/// at UHBR10 x2 and 24 bpp. The sibling carries the same stream with 58
+/// units (1812500) allocated. `calc_group_available_bw` = 1812500 +
+/// (2250000 - 0) = 4062500; `drm_dp_tunnel_atomic_check_group_bw` sums
+/// roundup(1782000, 31250) twice = 3625000: admitted, and Linux's first
+/// link choice at the group cap is the probe's (HBR3 x2 and UHBR10 x1 carry
+/// 1620000 and 1208875). With only 50 units (1562500) free the group has
+/// 3375000 < 3625000 available and Linux would reduce the bpp of the
+/// group's highest-bpp pipe, the lit sibling's (`intel_link_bw_reduce_bpp`):
+/// refused typed. Tunnels in different groups, or with group ID 0, never
+/// share; a probe whose link Linux's group-capped search would not pick is
+/// refused too.
+fn smoke_ptl_second_route_tunnel_group_bw() -> TestResult {
+    let port = XeLpgPort::Tc2;
+    let mut sink = Sink::new(0x14, edid_uhd(594_000));
+    sink.caps[2] = 2 | 0x40 | 0x80;
+    sink.tunnel = Some(usb4_adapter());
+    let io = ExtFake::new(port, sink);
+    if io.light_panel_ip(DisplayIp::Xe3Lpd).is_none() {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    }
+    io.pica_isr.set(pica_tbt_hotplug(1));
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xe3Lpd);
+    let Ok(probe) = probe_sink_profile_uhbr(&io, profile, port, false, true) else {
+        return TestResult::Fail("the tunnelled DP 2.0 sink must probe with UHBR on");
+    };
+    let Some((new, required)) = probe_tunnel_stream(&probe) else {
+        return TestResult::Fail("the probe must run through the BW-allocation tunnel");
+    };
+    if required != 1_782_000 || new.drv_group_id != 9 || new.estimated_bw != 2_250_000 {
+        return TestResult::Fail("the tunnel's stream and group facts must be the probe's");
+    }
+    let sibling = tunnel::Tunnel {
+        allocated_bw: Some(58 * 31_250),
+        ..new
+    };
+    if !tunnels_share_group(&sibling, &new)
+        || group_available_bw(&sibling, &new) != 4_062_500
+        || !group_bw_fits([(&sibling, 1_782_000), (&new, 1_782_000)], 3_625_000)
+        || group_bw_fits([(&sibling, 1_782_000), (&new, 1_782_000)], 3_624_999)
+        || group_bw_fits([(&sibling, 1_782_000), (&new, 2_437_501)], u32::MAX)
+        || tunnel_group_admits(Some((sibling, 1_782_000)), &probe).is_err()
+    {
+        return TestResult::Fail("one group: 4062500 available carries both 1812500 shares");
+    }
+    // 50 units free: 3375000 available, the group check fails.
+    let mut short = probe.clone();
+    let mut plan = *short.uhbr.as_deref().expect("UHBR plan");
+    plan.tunnel = Some(tunnel::Tunnel {
+        estimated_bw: 50 * 31_250,
+        ..new
+    });
+    short.uhbr = Some(alloc::boxed::Box::new(plan));
+    let other_group = tunnel::Tunnel {
+        drv_group_id: (1 << 3) | 2,
+        ..sibling
+    };
+    let group_zero = tunnel::Tunnel {
+        drv_group_id: 1 << 3,
+        ..sibling
+    };
+    if plan.tunnel.map(|t| group_available_bw(&sibling, &t)) != Some(3_375_000)
+        || tunnel_group_admits(Some((sibling, 1_782_000)), &short)
+            != Err(SecondRouteRefusal::TunnelGroupBw)
+        || tunnel_group_admits(Some((other_group, 1_782_000)), &short).is_err()
+        || tunnels_share_group(&group_zero, &group_zero)
+        || tunnel_group_admits(None, &short).is_err()
+    {
+        return TestResult::Fail("an overallocated group refuses; other groups never share");
+    }
+    // A probe at 18 bpp where the group cap admits 24: not Linux's choice.
+    let mut low = probe.clone();
+    let mut plan = *low.uhbr.as_deref().expect("UHBR plan");
+    plan.link.pipe_bpp = 18;
+    low.uhbr = Some(alloc::boxed::Box::new(plan));
+    if tunnel_group_admits(Some((sibling, 1_782_000)), &low)
+        != Err(SecondRouteRefusal::TunnelGroupBw)
+    {
+        return TestResult::Fail("a link Linux's group-capped search would not pick refuses");
+    }
+    let _ = release_probe(&io, &probe);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ptl_second_route_tunnel_group_bw
+);
+
 // ── Nova Lake-S display 35: the routes through the LT PHY ───────────
 
 #[cfg(feature = "kernel-test")]

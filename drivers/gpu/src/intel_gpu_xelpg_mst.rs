@@ -105,6 +105,12 @@ pub struct MtlMstRoute {
     failed: Option<MtlExternalRoute>,
     first: Option<(Pipe, Mode, Framebuffer)>,
     stopped: bool,
+    /// The sibling route's Pipe B–D owner (`narf.intel.ext_routes=2`) the
+    /// first stream plans beside, until it has.
+    beside: Option<Pipes>,
+    /// The Pipe B–D owner the last stopped stream left, until a sibling
+    /// route adopts it ([`Self::take_shared_pipes`]).
+    retired: Option<Pipes>,
 }
 
 impl MtlMstRoute {
@@ -142,6 +148,43 @@ impl MtlMstRoute {
         self.link.aux(io)
     }
 
+    /// The Pipe B–D owner a sibling route plans beside: the newest one this
+    /// route holds (a failed stream's reservation, else the last stream's;
+    /// every live stream holds the same owner).
+    pub(super) fn shared_pipes(&self) -> Option<&Pipes> {
+        self.failed
+            .as_ref()
+            .and_then(MtlExternalRoute::shared_pipes)
+            .or_else(|| self.streams.last().and_then(|s| s.route.shared_pipes()))
+    }
+
+    /// Every reserved stream adopts a sibling route's newer owner.
+    pub(super) fn adopt_shared_pipes(&mut self, pipes: &Pipes) {
+        for stream in &mut self.streams {
+            stream.route.adopt_shared_pipes(pipes);
+        }
+        if let Some(failed) = self.failed.as_mut() {
+            failed.adopt_shared_pipes(pipes);
+        }
+    }
+
+    /// The owner a sibling adopts after this route changed it: the held
+    /// one, or once every stream stopped the owner the last stop left.
+    pub(super) fn take_shared_pipes(&mut self) -> Option<Pipes> {
+        if let Some(pipes) = self.shared_pipes() {
+            return Some(pipes.clone());
+        }
+        self.failed
+            .as_mut()
+            .and_then(MtlExternalRoute::take_shared_pipes)
+            .or_else(|| self.retired.take())
+    }
+
+    /// `beside` is a live sibling route's Pipe B–D owner
+    /// (`narf.intel.ext_routes=2`): the first stream joins that layout, as
+    /// Linux's atomic check plans the MST CRTCs against every CRTC already
+    /// active (`intel_atomic_check`); the streams after it plan from the
+    /// stream before, as without a sibling.
     pub(super) fn connect<M: MmioWindow + ?Sized>(
         io: &M,
         link: LinkProbe,
@@ -149,9 +192,10 @@ impl MtlMstRoute {
         display: &MtlDisplay,
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
         uhbr: Option<UhbrMstLink>,
+        beside: Option<Pipes>,
     ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
         let mut aux = crate::intel_gpu_mst::IntelMstAux::xelpdp(io, link.port, link.tbt());
-        Self::connect_aux_with(io, link, decl, display, alloc, &mut aux, uhbr)
+        Self::connect_aux_beside(io, link, decl, display, alloc, &mut aux, uhbr, beside)
     }
 
     #[cfg(feature = "kernel-test")]
@@ -166,6 +210,7 @@ impl MtlMstRoute {
         Self::connect_aux_with(io, link, decl, display, alloc, aux, None)
     }
 
+    #[cfg(feature = "kernel-test")]
     fn connect_aux_with<M: MmioWindow + ?Sized, A: MstAux>(
         io: &M,
         link: LinkProbe,
@@ -175,6 +220,21 @@ impl MtlMstRoute {
         aux: &mut A,
         uhbr: Option<UhbrMstLink>,
     ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
+        Self::connect_aux_beside(io, link, decl, display, alloc, aux, uhbr, None)
+    }
+
+    /// [`Self::connect`] over `aux`, the first stream beside `beside`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn connect_aux_beside<M: MmioWindow + ?Sized, A: MstAux>(
+        io: &M,
+        link: LinkProbe,
+        decl: MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+        uhbr: Option<UhbrMstLink>,
+        beside: Option<Pipes>,
+    ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
         let mut owner = Box::new(Self {
             link,
             manager: Manager::new(),
@@ -183,6 +243,8 @@ impl MtlMstRoute {
             failed: None,
             first: None,
             stopped: false,
+            beside,
+            retired: None,
         });
         let result = owner.start(io, decl, display, alloc, aux, uhbr);
         match result {
@@ -359,7 +421,9 @@ impl MtlMstRoute {
                 }
             };
             let result = match self.streams.last() {
-                None => activate_with_payload(io, probe, fb, display, None, &mut allocate),
+                None => {
+                    activate_with_payload(io, probe, fb, display, self.beside.take(), &mut allocate)
+                }
                 Some(previous) => activate_secondary(
                     io,
                     probe,
@@ -415,7 +479,7 @@ impl MtlMstRoute {
         self.stop_aux(io, &mut aux)
     }
 
-    fn stop_aux<M: MmioWindow + ?Sized, A: MstAux>(
+    pub(super) fn stop_aux<M: MmioWindow + ?Sized, A: MstAux>(
         &mut self,
         io: &M,
         aux: &mut A,
@@ -435,6 +499,10 @@ impl MtlMstRoute {
                     }
                 }
             }
+            // A sibling route plans from what the stop left.
+            if let Some(pipes) = failed.take_shared_pipes() {
+                self.retired = Some(pipes);
+            }
         }
         while !self.streams.is_empty() {
             let index = self.streams.len() - 1;
@@ -443,7 +511,10 @@ impl MtlMstRoute {
             source_payload(io, stream.route.pipe.transcoder(), master, false)?;
             stop_stream(io, &mut stream.route, index != 0)?;
             let pipes = stream.route.reservation.as_ref().map(|rp| rp.pipes.clone());
-            let stream = self.streams.pop().expect("selected");
+            let mut stream = self.streams.pop().expect("selected");
+            if let Some(left) = stream.route.take_shared_pipes() {
+                self.retired = Some(left);
+            }
             if let Some(topology) = &self.topology {
                 if let Some(branch) = topology.branches.get(stream.sink.branch) {
                     let request = crate::dp_mst::Request::AllocatePayload {
@@ -642,13 +713,16 @@ fn stop_stream<M: MmioWindow + ?Sized>(
 }
 
 #[cfg(feature = "kernel-test")]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::dp_mst_mgr::tests::Hub;
     use crate::intel_gpu_xelpg_external::tests::{edid_for, ExtFake, Sink as DpSink};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    struct Branch<'a> {
+    /// The fake hub's sideband, with its ACT-handled bit following the
+    /// source's ACT sent (`DP_TP_STATUS`) on `io` (also the two-route
+    /// fixtures').
+    pub(crate) struct Branch<'a> {
         hub: Hub,
         io: &'a ExtFake,
     }
@@ -672,7 +746,8 @@ mod tests {
     fn edid() -> Vec<u8> {
         edid_for(65_000, 1024, 320, 24, 136, 768, 38, 3, 6)
     }
-    fn branch(io: &ExtFake) -> Branch<'_> {
+    /// A two-sink hub whose sinks report 1024x768 at 65 MHz.
+    pub(crate) fn branch(io: &ExtFake) -> Branch<'_> {
         let mut hub = Hub::new();
         hub.edid[..128].copy_from_slice(&edid());
         Branch { hub, io }

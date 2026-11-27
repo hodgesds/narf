@@ -522,22 +522,22 @@ pub enum ExternalError {
 }
 
 /// Why a second concurrent external route is refused under
-/// `narf.intel.ext_routes=2`. Nothing was programmed.
+/// `narf.intel.ext_routes=2`. Nothing was programmed. Either route may be
+/// SST, HDMI, MST or 128b/132b: what they share is planned jointly (the
+/// Pipe B–D owner's DBUF/DDB/WM/MBUS/CDCLK/PM-demand transaction), and
+/// each port keeps its own PLL (`mtl_port_to_pll_id`: DPLL0/1 for the
+/// non-Type-C ports, one TC PLL per Type-C port; the always-on TBT PLL
+/// serves every Thunderbolt port at the DDI clock mux).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SecondRouteRefusal {
     /// The owned route is not live (quarantined, or stopped and retained):
     /// its reservation is not a proven layout to plan beside.
     SiblingNotLive,
-    /// The owned route is DP MST, which already shares its pipes among its
-    /// own streams; a second independent route beside it is not qualified.
-    SiblingMst,
-    /// The owned route runs 128b/132b; a second route beside it is not
-    /// qualified.
-    SiblingUhbr,
-    /// The new sink is a DP MST branch.
-    Mst,
-    /// The new sink needs a 128b/132b link.
-    Uhbr,
+    /// Both routes run 128b/132b through DP tunnels of one BW allocation
+    /// group and Linux's group check (`drm_dp_tunnel_atomic_check_group_bw`)
+    /// would fail for its first link choice, or the new stream compresses
+    /// (see [`tunnel_group_admits`]).
+    TunnelGroupBw,
 }
 
 /// `narf.intel.ext_routes=2`: the strict default-off option for a second
@@ -745,6 +745,17 @@ fn free_pipe<M: MmioWindow + ?Sized>(
         }
     }
     Err(ExternalError::NoFreePipe)
+}
+
+/// The Pipe B–D the next activation (or MST stream) lights: the lowest
+/// free one ([`free_pipe`]), read before the route allocates its
+/// framebuffer so the caller can place it in that pipe's scanout window.
+/// `None` when none is free or the registers are unreadable.
+pub(crate) fn next_external_pipe<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+) -> Option<Pipe> {
+    free_pipe(io, profile).ok()
 }
 
 fn pll_clock_mask(lanes: PhyLaneConfig) -> u32 {
@@ -1586,6 +1597,119 @@ fn uhbr_mst_link<M: MmioWindow + ?Sized>(
     }))
 }
 
+/// The tunnel bandwidth a 128b/132b SST stream on `plan` requires
+/// (`intel_dp_tunnel_atomic_compute_stream_bw`: `intel_dp_config_required_rate`,
+/// the compressed bpp under DSC), kBps.
+fn tunnel_required_bw(probe: &MtlSinkProbe, plan: &UhbrPlan) -> u32 {
+    let mode = probe.mode;
+    let link_bpp_x16 = probe
+        .dsc
+        .map_or(plan.link.pipe_bpp * 16, |d| u32::from(d.compressed_bpp_x16));
+    let required = uhbr::link_required(
+        u32::from(plan.link.lanes),
+        mode.pixel_clock_khz,
+        u32::from(mode.h_active),
+        link_bpp_x16,
+    );
+    u32::try_from(required).unwrap_or(u32::MAX)
+}
+
+/// The DP tunnel with BW allocation a 128b/132b SST probe runs through and
+/// the bandwidth its stream requires ([`tunnel_required_bw`]).
+fn probe_tunnel_stream(probe: &MtlSinkProbe) -> Option<(tunnel::Tunnel, u32)> {
+    let plan = probe.uhbr.as_deref()?;
+    let t = plan.tunnel.filter(|t| t.bw_alloc_enabled)?;
+    Some((t, tunnel_required_bw(probe, plan)))
+}
+
+/// Whether two BW-allocating tunnels share one group
+/// (`lookup_or_alloc_group`: a nonzero group ID and the same driver and
+/// group IDs; a zero group ID always gets a group of its own).
+pub(crate) fn tunnels_share_group(a: &tunnel::Tunnel, b: &tunnel::Tunnel) -> bool {
+    a.drv_group_id & 0x7 != 0 && a.drv_group_id == b.drv_group_id
+}
+
+/// `calc_group_available_bw` for `new` once it joined `sibling`'s group:
+/// `group_allocated_bw` (every BW-allocating tunnel's `tunnel_allocated_bw`,
+/// an undetermined allocation counting 0) plus `group_free_bw(new)` (its
+/// estimate, which includes its own allocation, minus that allocation).
+pub(crate) fn group_available_bw(sibling: &tunnel::Tunnel, new: &tunnel::Tunnel) -> u32 {
+    let allocated = |t: &tunnel::Tunnel| {
+        if t.bw_alloc_enabled {
+            t.allocated_bw.unwrap_or(0)
+        } else {
+            0
+        }
+    };
+    let own = new.allocated_bw.unwrap_or(0);
+    (allocated(sibling) + allocated(new)).saturating_add(new.estimated_bw.saturating_sub(own))
+}
+
+/// `get_max_dprx_bw`: the DPRX data rate rounded up to the granularity,
+/// at most `MAX_DP_REQUEST_BW` units.
+fn max_dprx_bw(t: &tunnel::Tunnel) -> u64 {
+    let g = u64::from(t.granularity.max(1));
+    let rate = tunnel::max_dprx_data_rate(t.max_dprx_rate, u32::from(t.max_dprx_lanes));
+    rate.next_multiple_of(g).min(u64::from(tunnel::MAX_DP_REQUEST_BW) * g)
+}
+
+/// `drm_dp_tunnel_atomic_check_group_bw` over the two tunnels of one group,
+/// each carrying one stream of `required` kBps: no tunnel above its DPRX
+/// limit, and the sum of each tunnel's requirement rounded up to its
+/// granularity (at most its DPRX limit) within `available`.
+pub(crate) fn group_bw_fits(streams: [(&tunnel::Tunnel, u32); 2], available: u32) -> bool {
+    let mut group = 0u64;
+    for (t, required) in streams {
+        let max = max_dprx_bw(t);
+        let required = u64::from(required);
+        if required > max {
+            return false;
+        }
+        group += required.next_multiple_of(u64::from(t.granularity.max(1))).min(max);
+    }
+    group <= u64::from(available)
+}
+
+/// The second route's tunnel against its sibling's when both allocate
+/// bandwidth in one group (`intel_dp_tunnel_atomic_check_link`). The probe
+/// capped the new link at the new tunnel's own estimate, the group's free
+/// bandwidth; Linux caps it at the group's available bandwidth
+/// ([`group_available_bw`], `intel_dp_max_link_data_rate`) and then checks
+/// the group. Whenever Linux's first choice there passes the group check it
+/// is the probe's (every configuration the smaller cap admits, the larger
+/// does too, in the same order). When it does not, Linux reduces the link
+/// bpp of the group's highest-bpp pipe and recomputes
+/// (`intel_link_bw_reduce_bpp`), which may modeset the lit sibling; this
+/// driver never replans a lit route and refuses instead, as it does for a
+/// compressed stream (its group-capped DSC search is not rerun here).
+fn tunnel_group_admits(
+    sibling: Option<(tunnel::Tunnel, u32)>,
+    probe: &MtlSinkProbe,
+) -> Result<(), SecondRouteRefusal> {
+    let (Some((t1, s1)), Some((t2, s2))) = (sibling, probe_tunnel_stream(probe)) else {
+        return Ok(());
+    };
+    if !tunnels_share_group(&t1, &t2) {
+        return Ok(());
+    }
+    let Some(plan) = probe.uhbr.as_deref().filter(|_| probe.dsc.is_none()) else {
+        return Err(SecondRouteRefusal::TunnelGroupBw);
+    };
+    let available = group_available_bw(&t1, &t2);
+    let first = uhbr::wide_link_caps(
+        &plan.caps,
+        &probe.mode,
+        u32::from(plan.max_bpp),
+        Some(u64::from(available)),
+    );
+    if first != uhbr::WideLink::Uhbr(plan.link)
+        || !group_bw_fits([(&t1, s1), (&t2, s2)], available)
+    {
+        return Err(SecondRouteRefusal::TunnelGroupBw);
+    }
+    Ok(())
+}
+
 /// `intel_dp_tunnel_atomic_alloc_bw` before the 128b/132b port is
 /// programmed: the stream's `intel_dp_config_required_rate`. Linux only
 /// queues a re-detect after a failed request and enables the stream
@@ -1601,18 +1725,7 @@ fn tunnel_alloc<M: MmioWindow + ?Sized>(
     let Some(mut t) = plan.tunnel else {
         return Ok(());
     };
-    let mode = route.probe.mode;
-    // intel_dp_config_required_rate: the compressed bpp under DSC.
-    let link_bpp_x16 = route
-        .probe
-        .dsc
-        .map_or(plan.link.pipe_bpp * 16, |d| u32::from(d.compressed_bpp_x16));
-    let required = uhbr::link_required(
-        u32::from(plan.link.lanes),
-        mode.pixel_clock_khz,
-        u32::from(mode.h_active),
-        link_bpp_x16,
-    );
+    let required = tunnel_required_bw(&route.probe, &plan);
     let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
     // A retry after a stop (which handed the tunnel back) enables it again.
     let result = if t.bw_alloc_enabled {
@@ -1625,7 +1738,7 @@ fn tunnel_alloc<M: MmioWindow + ?Sized>(
             &mut aux,
             &mut uhbr::SystemClock,
             &mut t,
-            u32::try_from(required).unwrap_or(u32::MAX),
+            required,
         )
     });
     plan.tunnel = Some(t);
@@ -3774,12 +3887,13 @@ impl MtlRoute {
         }
     }
 
-    /// The Pipe B–D owner a sibling SST or HDMI route plans beside.
+    /// The Pipe B–D owner a sibling route plans beside (an MST route's
+    /// streams all hold the same one).
     fn shared_pipes(&self) -> Option<&Pipes> {
         match self {
             MtlRoute::Dp(r) => r.shared_pipes(),
             MtlRoute::Hdmi(r) => r.shared_pipes(),
-            MtlRoute::Mst(_) => None,
+            MtlRoute::Mst(r) => r.shared_pipes(),
         }
     }
 
@@ -3787,7 +3901,7 @@ impl MtlRoute {
         match self {
             MtlRoute::Dp(r) => r.adopt_shared_pipes(pipes),
             MtlRoute::Hdmi(r) => r.adopt_shared_pipes(pipes),
-            MtlRoute::Mst(_) => {}
+            MtlRoute::Mst(r) => r.adopt_shared_pipes(pipes),
         }
     }
 
@@ -3795,19 +3909,27 @@ impl MtlRoute {
         match self {
             MtlRoute::Dp(r) => r.take_shared_pipes(),
             MtlRoute::Hdmi(r) => r.take_shared_pipes(),
-            MtlRoute::Mst(_) => None,
+            MtlRoute::Mst(r) => r.take_shared_pipes(),
         }
     }
 
-    /// Whether a second independent route may be planned beside this one.
+    /// Whether a second independent route may be planned beside this one:
+    /// a live route of any protocol (SST, HDMI, MST, 8b/10b or 128b/132b),
+    /// as Linux's atomic check admits a CRTC beside every active one and
+    /// leaves the shared checks to the joint plan.
     fn admits_sibling(&self) -> Result<(), SecondRouteRefusal> {
+        if !self.live() || self.shared_pipes().is_none() {
+            return Err(SecondRouteRefusal::SiblingNotLive);
+        }
+        Ok(())
+    }
+
+    /// The live 128b/132b SST route's DP tunnel with BW allocation and the
+    /// bandwidth its stream requires (`intel_dp_config_required_rate`).
+    fn tunnel_stream(&self) -> Option<(tunnel::Tunnel, u32)> {
         match self {
-            MtlRoute::Mst(_) => Err(SecondRouteRefusal::SiblingMst),
-            MtlRoute::Dp(r) if r.probe.uhbr.is_some() => Err(SecondRouteRefusal::SiblingUhbr),
-            route if !route.live() || route.shared_pipes().is_none() => {
-                Err(SecondRouteRefusal::SiblingNotLive)
-            }
-            _ => Ok(()),
+            MtlRoute::Dp(r) => probe_tunnel_stream(&r.probe),
+            _ => None,
         }
     }
 
@@ -3963,9 +4085,14 @@ impl Default for RoutePresence {
 /// repartition keeps the sibling. Each route keeps its own port, PLL,
 /// hotplug pin, retrain and teardown; after every change the sibling adopts
 /// the owner the changed route left, so the two never plan from diverged
-/// layouts. A second route is refused typed ([`SecondRouteRefusal`]) beside
-/// an MST or 128b/132b route, beside a route that is not live, and when it
-/// would itself be MST or 128b/132b. HDCP follows the first owned route
+/// layouts. Either route may be DP MST (its first stream plans beside the
+/// sibling, every stream adopts the sibling's later owner, and its stop
+/// leaves the owner without its pipes) or 128b/132b (the joint PM demand
+/// takes the highest port clock, `intel_pmdemand_update_max_ddiclk`). A
+/// second route is refused typed ([`SecondRouteRefusal`]) beside a route
+/// that is not live, and when both run through DP tunnels of one BW
+/// allocation group that Linux's group check would not admit
+/// ([`tunnel_group_admits`]). HDCP follows the first owned route
 /// ([`hdcp_route`]).
 #[derive(Debug)]
 pub struct MtlExternalService {
@@ -4243,7 +4370,6 @@ impl MtlExternalService {
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let port = link.port;
-        let second = self.routes[1 - slot].is_some();
         let mut cap = [0];
         if link.raw[0] >= 0x12 {
             if let Err(error) = link.aux(io).dpcd_read(0x21, &mut cap) {
@@ -4253,13 +4379,6 @@ impl MtlExternalService {
                     error: RouteError::Dp(ExternalError::Link(LinkError::AuxFailure(error))),
                 };
             }
-        }
-        if cap[0] & 1 != 0 && second {
-            let _ = link.release(io);
-            return ServiceOutcome::Refused {
-                port,
-                error: RouteError::Dp(ExternalError::SecondRoute(SecondRouteRefusal::Mst)),
-            };
         }
         let uhbr_on = self.uhbr_on();
         // Linux runs an MST link at its highest common bandwidth
@@ -4279,6 +4398,10 @@ impl MtlExternalService {
             }
         }
         if cap[0] & 1 != 0 {
+            // Beside a sibling route the first stream joins its layout
+            // (`intel_dp_mst.c` runs MST on this port while the other port
+            // keeps its own stream; only the joint plan is shared).
+            let beside = self.beside(slot);
             match MtlMstRoute::connect(
                 io,
                 link,
@@ -4286,10 +4409,11 @@ impl MtlExternalService {
                 &self.display,
                 alloc,
                 mst_uhbr,
+                beside,
             ) {
                 Ok(route) => {
                     let (pipe, mode, fb) = route.first().expect("live MST has a first stream");
-                    self.routes[slot] = Some(MtlRoute::Mst(route));
+                    self.hold(slot, MtlRoute::Mst(route));
                     ServiceOutcome::Activated {
                         port,
                         protocol: MtlProtocol::DpMst,
@@ -4304,12 +4428,17 @@ impl MtlExternalService {
                 }
             }
         } else {
+            let sibling = self.routes[1 - slot]
+                .as_ref()
+                .and_then(MtlRoute::tunnel_stream);
             match probe_sink_link(io, link, uhbr_on, color::opted_in()) {
-                Ok(probe) if second && probe.uhbr.is_some() => {
+                Ok(probe) if tunnel_group_admits(sibling, &probe).is_err() => {
                     let _ = release_probe(io, &probe);
                     ServiceOutcome::Refused {
                         port,
-                        error: RouteError::Dp(ExternalError::SecondRoute(SecondRouteRefusal::Uhbr)),
+                        error: RouteError::Dp(ExternalError::SecondRoute(
+                            SecondRouteRefusal::TunnelGroupBw,
+                        )),
                     }
                 }
                 Ok(mut probe) => {
