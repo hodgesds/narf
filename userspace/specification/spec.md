@@ -2923,6 +2923,24 @@ below its stack pointer, skipping a 64-bit caller's red zone
 the native handler against them and copy the results back. A call that
 parks is re-staged when it is re-issued.
 
+**Native entries.** Every other `syscall_32.tbl` row whose entry point is
+the x86_64 one (the same `sys_*`, no compat entry) and has a NARF handler
+passes through with its signed C arguments sign-extended. The masks are
+generated from `include/linux/syscalls.h`. That covers the process,
+scheduling, credential (`*32`), xattr, inotify, timerfd, timer and clock
+`*_time64`, mount-API, pidfd, landlock, futex2 and *at families.
+
+Twelve such rows stay -ENOSYS because Linux's native handler converts
+internally under `in_compat_syscall()` and NARF's does not yet:
+
+- quotactl (131) and quotactl_fd (443): `compat_if_dqblk` alignment.
+- mbind (274), get_mempolicy (275), set_mempolicy (276) and migrate_pages
+  (294): `compat_ulong_t` node masks.
+- move_pages (317): a `compat_uptr_t` page array.
+- vmsplice (316), process_vm_readv (347), process_vm_writev (348) and
+  process_madvise (440): `compat_iovec`s.
+- seccomp (354): `struct compat_sock_fprog`.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.
