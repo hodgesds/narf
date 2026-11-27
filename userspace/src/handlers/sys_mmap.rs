@@ -1606,15 +1606,16 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
     if eager_file_population {
-        let end = base.saturating_add(len);
-        let mut page = base;
-        while page < end {
-            // SAFETY: the successful mapping owns a live user root. Population
-            // is best-effort, as Linux specifies for MAP_LOCKED/MCL_FUTURE;
-            // a racing unmap or file fault refusal simply leaves the page lazy.
-            let _ = unsafe { as_ref.demand_alloc_page(VirtAddr::new(page)) };
-            page = page.saturating_add(4096);
-        }
+        // SAFETY: the successful mapping owns a live user root. Population
+        // is best-effort, as Linux specifies for MAP_LOCKED/MCL_FUTURE;
+        // a racing unmap or file fault refusal simply leaves the page lazy.
+        // One advisory batch claim replaces the per-page demand_alloc_page
+        // loop: the batch reports a count, never an error, and a page it
+        // cannot claim, fill, or publish is skipped and faults later
+        // through the unchanged single-page path, which keeps its fatal
+        // semantics — a past-EOF page still SIGBUSes on first touch
+        // instead of being published as a zero page.
+        let _ = unsafe { as_ref.demand_alloc_range(VirtAddr::new(base), len >> 12) };
     }
     if let Some(publication) = shared_publication.take() {
         // map_region retained every SHARED frame before returning. Convert
@@ -2242,6 +2243,188 @@ mod tests {
     kernel_test_in!(
         "userspace",
         smoke_mmap_populate_and_nonblock_backing
+    );
+
+    /// Eager population of an anonymous shared mapping goes through one
+    /// advisory `demand_alloc_range` batch instead of a per-page
+    /// `demand_alloc_page` loop: MAP_POPULATE on a MAP_SHARED|MAP_ANONYMOUS
+    /// VMA leaves every page backed with a leaf installed, exactly as the
+    /// loop did. Pin both the authoritative Region backing and the
+    /// installed leaf, as the anonymous test does.
+    fn smoke_mmap_populate_shared_anon_uses_batch_fill() -> TestResult {
+        const BASE: u64 = 0x0000_3300_0000_0000;
+        const MAP_SHARED: u64 = 0x01;
+        const MAP_FIXED: u64 = 0x10;
+        const MAP_ANONYMOUS: u64 = 0x20;
+        const MAP_POPULATE: u64 = 0x8000;
+
+        // SAFETY: paging and the allocator are live in the kernel-test
+        // harness; this test owns the inactive user root until teardown.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+
+        let mut ctx = TestCtx {
+            args: SyscallArgs {
+                arg0: BASE,
+                arg1: 8192,
+                arg2: 3, // PROT_READ | PROT_WRITE
+                arg3: MAP_SHARED | MAP_FIXED | MAP_ANONYMOUS | MAP_POPULATE,
+                arg4: u64::MAX,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut ctx);
+        let ok = ctx
+            .ret
+            .is_some_and(|ret| ret.status == SyscallReturn::OK && ret.value == BASE);
+        let region = aspace.lookup(VirtAddr::new(BASE));
+        let backed = region.as_ref().is_some_and(|region| {
+            region.phys.len() >= 2
+                && region.phys[0].as_u64() != 0
+                && region.phys[1].as_u64() != 0
+        });
+        // SAFETY: this test exclusively owns the live root and queries only
+        // the user leaves it just requested through sys_mmap.
+        let mapped = unsafe {
+            narf_memory::x86_64::paging::translate(aspace.root, VirtAddr::new(BASE)).is_some()
+                && narf_memory::x86_64::paging::translate(
+                    aspace.root,
+                    VirtAddr::new(BASE + 4096),
+                )
+                .is_some()
+        };
+
+        *USER_AS.lock() = None;
+        if !ok || !backed || !mapped {
+            return TestResult::Fail("MAP_POPULATE left anonymous shared pages lazy");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mmap_populate_shared_anon_uses_batch_fill
+    );
+
+    /// Eager population of a future-locked private file mapping skips
+    /// pages at or past EOF instead of publishing them as zero pages:
+    /// the in-range page is populated with file contents through the
+    /// batch, the past-EOF page stays lazy, and a later fault on it
+    /// still fails through the unchanged single-page path (SIGBUS on
+    /// first touch, as Linux gives a truncated mmap).
+    fn smoke_mmap_future_locked_file_populate_skips_past_eof() -> TestResult {
+        const MAP_PRIVATE: u64 = 0x02;
+        const MCL_FUTURE: u64 = 2;
+
+        // One page of file, with a marker in the first word.
+        let mut image = alloc::vec![0u8; 4096];
+        image[..8].copy_from_slice(&0xF11E_0000_0000_0001u64.to_le_bytes());
+        let (aspace, _file, fd) = match fallback_test_setup(image) {
+            Ok(setup) => setup,
+            Err(result) => return result,
+        };
+
+        // Install the MCL_FUTURE policy first: later VMAs are
+        // future-locked, so this private file mapping is published lazy
+        // with LOCKED perms and the eager-population batch runs at mmap.
+        let mut mlockall = TestCtx {
+            args: SyscallArgs {
+                arg0: MCL_FUTURE,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        super::super::handler_sys_mlockall::sys_mlockall(&mut mlockall);
+        if !mlockall
+            .ret
+            .is_some_and(|ret| ret.status == SyscallReturn::OK)
+        {
+            fallback_test_teardown();
+            return TestResult::Fail("mlockall(MCL_FUTURE) did not install the policy");
+        }
+
+        let mut mmap = TestCtx {
+            args: SyscallArgs {
+                arg1: 8192,
+                arg2: 1, // PROT_READ
+                arg3: MAP_PRIVATE,
+                arg4: fd as u64,
+                arg5: 0,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut mmap);
+        let base = match mmap.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && ret.value != 0 => ret.value,
+            _ => {
+                fallback_test_teardown();
+                return TestResult::Fail("private file mmap did not return a base");
+            }
+        };
+
+        let region = aspace.lookup(VirtAddr::new(base));
+        let first_backed = region.as_ref().is_some_and(|region| {
+            region
+                .phys
+                .get(0)
+                .is_some_and(|phys| phys.as_u64() != 0)
+        });
+        let first_contents = region.as_ref().is_some_and(|region| {
+            region.phys.get(0).is_some_and(|phys| {
+                // SAFETY: the frame is this test's populated page,
+                // installed by the batch into a region this test owns;
+                // reading it through the kernel RAM accessor is the
+                // contents check.
+                let seen = unsafe { phys.kernel_ptr::<u64>().read_volatile() };
+                seen == 0xF11E_0000_0000_0001u64
+            })
+        });
+        // SAFETY: this test exclusively owns the live root and queries only
+        // the user leaves it just requested through sys_mmap.
+        let first_mapped = unsafe {
+            narf_memory::x86_64::paging::translate(aspace.root, VirtAddr::new(base)).is_some()
+        };
+        let second_lazy = region.as_ref().is_some_and(|region| {
+            region
+                .phys
+                .get(1)
+                .is_none_or(|phys| phys.as_u64() == 0)
+        });
+        // SAFETY: same test-owned live-root contract as above.
+        let second_unmapped = unsafe {
+            narf_memory::x86_64::paging::translate(aspace.root, VirtAddr::new(base + 4096))
+                .is_none()
+        };
+        // SAFETY: the mapping is live and the address space is this
+        // test's own; a past-EOF fault must refuse, as the single-page
+        // path has always done.
+        let past_eof_refused =
+            unsafe { aspace.demand_alloc_page(VirtAddr::new(base + 4096)) }.is_err();
+
+        fallback_test_teardown();
+        if !first_backed || !first_contents || !first_mapped {
+            return TestResult::Fail(
+                "eager population did not install the in-range file page with its contents",
+            );
+        }
+        if !second_lazy || !second_unmapped {
+            return TestResult::Fail("eager population published the past-EOF page");
+        }
+        if !past_eof_refused {
+            return TestResult::Fail("a fault past EOF no longer fails after eager population");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mmap_future_locked_file_populate_skips_past_eof
     );
 
     /// Anonymous shared mmap is an unlinked sparse shmem file: publishing a
