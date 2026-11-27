@@ -619,12 +619,19 @@ pub fn plan(
     // loader, so it has no frame unit-graph entry. Lint its host-safe API here;
     // the dedicated EFI gates compile its target use. Unlinked driver/module
     // crates still need bare-metal linting when they change.
+    // `narf-ext4-host` is likewise a std host binary (the ext4 write
+    // harness under verification/, judged by e2fsck/debugfs) — it must
+    // never be handed to the kernel-target clippy job, which has no `std`.
     p.host_clippy_crates = lint
         .iter()
         .filter(|c| {
             matches!(
                 c.as_str(),
-                "xtask" | "cargo-narf" | "narf-btrfs-host" | "narf-boot-protocol"
+                "xtask"
+                    | "cargo-narf"
+                    | "narf-btrfs-host"
+                    | "narf-boot-protocol"
+                    | "narf-ext4-host"
             )
         })
         .cloned()
@@ -1960,6 +1967,7 @@ mod tests {
         crates.push(ci("xtask", "build/xtask", &[]));
         crates.push(ci("cargo-narf", "build/cargo-narf", &[]));
         crates.push(ci("narf-boot-protocol", "boot/protocol", &[]));
+        crates.push(ci("narf-ext4-host", "verification/ext4-host", &[]));
         let p = plan(
             &["build/xtask/src/main.rs".into()],
             &crates,
@@ -1993,6 +2001,21 @@ mod tests {
         );
         assert!(p.run_uefi && p.run_boot_smoke && !p.run_clippy);
         assert_eq!(p.host_clippy_crates, strings(&["narf-boot-protocol"]));
+        // The ext4 host harness is a std binary: it routes to the host
+        // lint gate, never to the kernel-target clippy job (no `std`
+        // there — see the main-oracle E0463 break from merged #2549).
+        let p = plan(
+            &["verification/ext4-host/src/main.rs".into()],
+            &crates,
+            &tags(),
+            &BTreeMap::new(),
+            &LeafDriverMap::default(),
+            "pull_request",
+            false,
+        );
+        assert!(!p.run_clippy);
+        assert!(p.clippy_crates.is_empty());
+        assert_eq!(p.host_clippy_crates, strings(&["narf-ext4-host"]));
     }
 
     #[test]
