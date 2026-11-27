@@ -350,6 +350,12 @@ pub(crate) trait Platform:
     fn suspend_panel_off(&self) -> bool {
         false
     }
+    /// A vblank reference on Pipe A through a display interrupt owner
+    /// (`drm_vblank_get`, its interrupt unmasked while held). Default: no
+    /// display interrupt owner, and vblank waits read the frame counter.
+    fn vblank_irq(&self) -> Option<Box<dyn crate::intel_gpu_gen9_irq::VblankIrq + Send>> {
+        None
+    }
 }
 
 /// The Pipe-A eDP sink as an AUX channel over a platform window.
@@ -1025,6 +1031,16 @@ impl Platform for Physical {
     /// off.
     fn suspend_panel_off(&self) -> bool {
         self.nova()
+    }
+    /// Display 9 with the Gen9 interrupt owner (`narf.intel.gen9_irq=1`):
+    /// Pipe A's vblank interrupt (`bdw_enable_vblank`). Display 11 and
+    /// later have no display interrupt owner.
+    fn vblank_irq(&self) -> Option<Box<dyn crate::intel_gpu_gen9_irq::VblankIrq + Send>> {
+        if !matches!(self.generation, Generation::Skylake | Generation::Broxton) {
+            return None;
+        }
+        crate::intel_gpu_gen9_irq::vblank_get(&self.bar, Pipe::A)
+            .map(|vblank| Box::new(vblank) as Box<dyn crate::intel_gpu_gen9_irq::VblankIrq + Send>)
     }
 }
 
@@ -4852,6 +4868,32 @@ impl<M: Platform> Guard<'_, M> {
     pub(crate) async fn wait_vblank(&mut self) -> Result<FlipStamp, FsError> {
         if self.state.presenter.is_some() || self.state.failed || self.state.mixed_unpublished {
             return Err(FsError::Busy);
+        }
+        // drm_crtc_wait_one_vblank on a display interrupt owner: a vblank
+        // reference (drm_vblank_get), then the next vblank its handler
+        // counts (drm_crtc_handle_vblank), stamped as handled. Linux gives
+        // up after 100 ms ("vblank wait timed out"); a lost interrupt falls
+        // back to the frame counter below.
+        if let Some(vblank) = self.device.platform.vblank_irq() {
+            let start = vblank.last().map(|(count, _)| count);
+            let deadline = self.device.platform.now().saturating_add(100_000_000);
+            loop {
+                if !self.device.platform.console_access_ok() {
+                    return Err(FsError::NoDevice);
+                }
+                if let Some((count, stamp)) = vblank.last() {
+                    if Some(count) != start {
+                        return Ok(FlipStamp {
+                            ns: stamp.ns,
+                            sequence: stamp.frame,
+                        });
+                    }
+                }
+                if self.device.platform.now() >= deadline {
+                    break;
+                }
+                self.device.platform.tick().await;
+            }
         }
         let start = self.device.platform.read32(0x70040);
         let deadline = self
