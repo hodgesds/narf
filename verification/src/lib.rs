@@ -37,6 +37,8 @@ mod freezer_user;
 mod ia32_user;
 #[cfg(feature = "user-mode-e2e")]
 mod pipe_abi;
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+mod threads_user;
 #[cfg(target_arch = "x86_64")]
 mod timer_strand;
 

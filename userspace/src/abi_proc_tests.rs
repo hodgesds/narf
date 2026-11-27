@@ -3594,6 +3594,41 @@ fn set_nproc_limit(cur: u64) -> Result<(), &'static str> {
     }
 }
 
+/// `kernel/fork.c::fork_init`: init's RLIMIT_NPROC is `max_threads / 2`,
+/// soft and hard, so a single user can hold at most half the tasks the
+/// machine is sized for; every task inherits it. `max_threads` is
+/// `set_max_threads`' RAM-derived count (kernel stacks at most an eighth of
+/// RAM), which a later `threads-max` write does not change.
+fn smoke_abi_proc_rlimit_nproc_default_is_half_max_threads() -> TestResult {
+    with_setup(|| {
+        let stats = narf_memory::frame::stats();
+        let pages = stats.total.saturating_sub(stats.reserved) as u64;
+        let stack = narf_scheduler::stackful::DEFAULT_KERNEL_STACK_BYTES as u64;
+        let half = (pages * 4096 / (8 * stack)).clamp(20, 0x3fff_ffff) / 2;
+        let mut buf = [0u8; 16];
+        if call(
+            Syscall::Getrlimit.raw(),
+            a1(RLIMIT_NPROC_RES, buf.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("getrlimit(RLIMIT_NPROC) failed");
+        }
+        let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+        let max = u64::from_ne_bytes(buf[8..].try_into().unwrap());
+        if cur == u64::MAX || max == u64::MAX {
+            return Err("the default RLIMIT_NPROC is unlimited, not max_threads / 2");
+        }
+        if cur != half || max != half {
+            return Err("the default RLIMIT_NPROC is not max_threads / 2");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit_nproc",
+    smoke_abi_proc_rlimit_nproc_default_is_half_max_threads
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_rlimit_nproc_refuses_fork() -> TestResult {
     with_setup(|| {
