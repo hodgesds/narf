@@ -22,6 +22,7 @@
 pub(crate) mod conv;
 pub(crate) mod ctx;
 pub(crate) mod ipc;
+pub(crate) mod misc;
 pub mod mm;
 pub(crate) mod socket;
 pub(crate) mod stage;

@@ -39,6 +39,7 @@ pub mod nr {
     pub const UNLINK: u32 = 10;
     pub const EXECVE: u32 = 11;
     pub const CHDIR: u32 = 12;
+    pub const TIME: u32 = 13;
     pub const MKNOD: u32 = 14;
     pub const CHMOD: u32 = 15;
     pub const LSEEK: u32 = 19;
@@ -55,6 +56,7 @@ pub mod nr {
     pub const RMDIR: u32 = 40;
     pub const DUP: u32 = 41;
     pub const PIPE: u32 = 42;
+    pub const TIMES: u32 = 43;
     pub const BRK: u32 = 45;
     pub const GETGID: u32 = 47;
     pub const GETEUID: u32 = 49;
@@ -70,17 +72,29 @@ pub mod nr {
     pub const GETPGRP: u32 = 65;
     pub const SETSID: u32 = 66;
     pub const SETHOSTNAME: u32 = 74;
+    pub const SETRLIMIT: u32 = 75;
+    pub const GETRLIMIT: u32 = 76;
+    pub const GETRUSAGE: u32 = 77;
+    pub const GETTIMEOFDAY: u32 = 78;
+    pub const SETTIMEOFDAY: u32 = 79;
+    pub const SELECT: u32 = 82;
     pub const SYMLINK: u32 = 83;
     pub const READLINK: u32 = 85;
     pub const REBOOT: u32 = 88;
     pub const MMAP: u32 = 90;
     pub const MUNMAP: u32 = 91;
+    pub const TRUNCATE: u32 = 92;
+    pub const FTRUNCATE: u32 = 93;
     pub const FCHMOD: u32 = 94;
     pub const GETPRIORITY: u32 = 96;
     pub const SETPRIORITY: u32 = 97;
+    pub const STATFS: u32 = 99;
+    pub const FSTATFS: u32 = 100;
     pub const SOCKETCALL: u32 = 102;
     pub const SYSLOG: u32 = 103;
     pub const VHANGUP: u32 = 111;
+    pub const WAIT4: u32 = 114;
+    pub const SYSINFO: u32 = 116;
     pub const IPC: u32 = 117;
     pub const FSYNC: u32 = 118;
     pub const CLONE: u32 = 120;
@@ -93,6 +107,7 @@ pub mod nr {
     pub const FCHDIR: u32 = 133;
     pub const PERSONALITY: u32 = 136;
     pub const LLSEEK: u32 = 140;
+    pub const NEWSELECT: u32 = 142;
     pub const FLOCK: u32 = 143;
     pub const MSYNC: u32 = 144;
     pub const READV: u32 = 145;
@@ -115,13 +130,20 @@ pub mod nr {
     pub const PRCTL: u32 = 172;
     pub const RT_SIGACTION: u32 = 174;
     pub const RT_SIGPROCMASK: u32 = 175;
+    pub const RT_SIGPENDING: u32 = 176;
+    pub const RT_SIGSUSPEND: u32 = 179;
     pub const PREAD64: u32 = 180;
     pub const PWRITE64: u32 = 181;
     pub const GETCWD: u32 = 183;
     pub const CAPGET: u32 = 184;
     pub const CAPSET: u32 = 185;
+    pub const SIGALTSTACK: u32 = 186;
+    pub const SENDFILE: u32 = 187;
     pub const VFORK: u32 = 190;
+    pub const UGETRLIMIT: u32 = 191;
     pub const MMAP2: u32 = 192;
+    pub const TRUNCATE64: u32 = 193;
+    pub const FTRUNCATE64: u32 = 194;
     pub const STAT64: u32 = 195;
     pub const LSTAT64: u32 = 196;
     pub const FSTAT64: u32 = 197;
@@ -150,6 +172,7 @@ pub mod nr {
     pub const GETDENTS64: u32 = 220;
     pub const FCNTL64: u32 = 221;
     pub const GETTID: u32 = 224;
+    pub const READAHEAD: u32 = 225;
     pub const SETXATTR: u32 = 226;
     pub const LSETXATTR: u32 = 227;
     pub const FSETXATTR: u32 = 228;
@@ -165,9 +188,11 @@ pub mod nr {
     pub const TKILL: u32 = 238;
     pub const SENDFILE64: u32 = 239;
     pub const FUTEX: u32 = 240;
+    pub const SCHED_SETAFFINITY: u32 = 241;
     pub const SCHED_GETAFFINITY: u32 = 242;
     pub const IO_DESTROY: u32 = 246;
     pub const IO_CANCEL: u32 = 249;
+    pub const FADVISE64: u32 = 250;
     pub const EXIT_GROUP: u32 = 252;
     pub const EPOLL_CREATE: u32 = 254;
     pub const EPOLL_CTL: u32 = 255;
@@ -176,8 +201,12 @@ pub mod nr {
     pub const TIMER_GETOVERRUN: u32 = 262;
     pub const TIMER_DELETE: u32 = 263;
     pub const CLOCK_GETTIME: u32 = 265;
+    pub const STATFS64: u32 = 268;
+    pub const FSTATFS64: u32 = 269;
     pub const TGKILL: u32 = 270;
+    pub const FADVISE64_64: u32 = 272;
     pub const MQ_UNLINK: u32 = 278;
+    pub const WAITID: u32 = 284;
     pub const ADD_KEY: u32 = 286;
     pub const REQUEST_KEY: u32 = 287;
     pub const IOPRIO_SET: u32 = 289;
@@ -197,19 +226,27 @@ pub mod nr {
     pub const READLINKAT: u32 = 305;
     pub const FCHMODAT: u32 = 306;
     pub const FACCESSAT: u32 = 307;
+    pub const PSELECT6: u32 = 308;
+    pub const PPOLL: u32 = 309;
     pub const UNSHARE: u32 = 310;
     pub const SET_ROBUST_LIST: u32 = 311;
     pub const SPLICE: u32 = 313;
+    pub const SYNC_FILE_RANGE: u32 = 314;
     pub const TEE: u32 = 315;
     pub const GETCPU: u32 = 318;
     pub const EPOLL_PWAIT: u32 = 319;
+    pub const SIGNALFD: u32 = 321;
     pub const TIMERFD_CREATE: u32 = 322;
     pub const EVENTFD: u32 = 323;
+    pub const FALLOCATE: u32 = 324;
+    pub const SIGNALFD4: u32 = 327;
     pub const EVENTFD2: u32 = 328;
     pub const EPOLL_CREATE1: u32 = 329;
     pub const DUP3: u32 = 330;
     pub const PIPE2: u32 = 331;
     pub const INOTIFY_INIT1: u32 = 332;
+    pub const PREADV: u32 = 333;
+    pub const PWRITEV: u32 = 334;
     pub const PERF_EVENT_OPEN: u32 = 336;
     pub const RECVMMSG: u32 = 337;
     pub const FANOTIFY_INIT: u32 = 338;
@@ -245,6 +282,8 @@ pub mod nr {
     pub const MEMBARRIER: u32 = 375;
     pub const MLOCK2: u32 = 376;
     pub const COPY_FILE_RANGE: u32 = 377;
+    pub const PREADV2: u32 = 378;
+    pub const PWRITEV2: u32 = 379;
     pub const PKEY_MPROTECT: u32 = 380;
     pub const PKEY_ALLOC: u32 = 381;
     pub const PKEY_FREE: u32 = 382;
@@ -271,6 +310,8 @@ pub mod nr {
     pub const TIMERFD_GETTIME64: u32 = 410;
     pub const TIMERFD_SETTIME64: u32 = 411;
     pub const UTIMENSAT_TIME64: u32 = 412;
+    pub const PSELECT6_TIME64: u32 = 413;
+    pub const PPOLL_TIME64: u32 = 414;
     pub const RECVMMSG_TIME64: u32 = 417;
     pub const MQ_TIMEDSEND_TIME64: u32 = 418;
     pub const MQ_TIMEDRECEIVE_TIME64: u32 = 419;
@@ -720,6 +761,54 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
         FILE_GETATTR => forward_sx(ctx, Syscall::FileGetattr, 0b1),
         FILE_SETATTR => forward_sx(ctx, Syscall::FileSetattr, 0b1),
         LISTNS => forward(ctx, Syscall::Listns),
+        // Compat structures, 32-bit times and split 64-bit arguments
+        // (`compat_sys_*`, `sys_ia32_*`), converted in `compat32::misc`.
+        TIME => super::misc::time32(ctx),
+        GETTIMEOFDAY => super::misc::timeofday(ctx, false),
+        SETTIMEOFDAY => super::misc::timeofday(ctx, true),
+        TIMES => super::misc::times(ctx),
+        GETRLIMIT => super::misc::getrlimit(ctx, true),
+        UGETRLIMIT => super::misc::getrlimit(ctx, false),
+        SETRLIMIT => super::misc::setrlimit(ctx),
+        GETRUSAGE => super::misc::getrusage(ctx),
+        WAIT4 => super::misc::wait4(ctx),
+        WAITID => super::misc::waitid(ctx),
+        STATFS => super::misc::statfs(ctx, false, false),
+        FSTATFS => super::misc::statfs(ctx, true, false),
+        STATFS64 => super::misc::statfs(ctx, false, true),
+        FSTATFS64 => super::misc::statfs(ctx, true, true),
+        SYSINFO => super::misc::sysinfo(ctx),
+        TRUNCATE | FTRUNCATE | TRUNCATE64 | FTRUNCATE64 | FALLOCATE | FADVISE64 | FADVISE64_64
+        | READAHEAD | SYNC_FILE_RANGE => super::misc::split_offsets(ctx, nr),
+        PREADV => super::misc::preadv(ctx, Syscall::Preadv, false),
+        PWRITEV => super::misc::preadv(ctx, Syscall::Pwritev, false),
+        PREADV2 => super::misc::preadv(ctx, Syscall::Preadv2, true),
+        PWRITEV2 => super::misc::preadv(ctx, Syscall::Pwritev2, true),
+        SENDFILE => super::misc::sendfile32(ctx),
+        SIGALTSTACK => super::misc::sigaltstack(ctx),
+        SELECT | NEWSELECT | PSELECT6 | PSELECT6_TIME64 => super::misc::select(ctx, nr),
+        PPOLL => super::misc::ppoll_time32(ctx),
+        // `struct pollfd` and the sigset are shared; the timeout is 64-bit.
+        PPOLL_TIME64 => forward(ctx, Syscall::Ppoll),
+        // A `compat_sigset_t` has the bytes of the native 64-signal set.
+        RT_SIGPENDING => forward(ctx, Syscall::RtSigpending),
+        RT_SIGSUSPEND => forward(ctx, Syscall::RtSigsuspend),
+        SIGNALFD => {
+            let a = *ctx.args();
+            let args = SyscallArgs {
+                arg0: conv::sext(a.arg0),
+                arg1: a.arg1,
+                arg2: a.arg2,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            };
+            forward_args(ctx, Syscall::Signalfd, args, Ia32Abi::default())
+        }
+        SIGNALFD4 => forward_sx(ctx, Syscall::Signalfd, 0b1001),
+        // `compat_get_user_cpu_mask` reads `len` bytes of 32-bit words: the
+        // same bytes the native handler copies.
+        SCHED_SETAFFINITY => forward_sx(ctx, Syscall::SchedSetaffinity, 0b1),
         _ => {
             ctx.set_return(SyscallReturn::not_implemented());
             None

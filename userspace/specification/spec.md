@@ -2941,6 +2941,38 @@ internally under `in_compat_syscall()` and NARF's does not yet:
   process_madvise (440): `compat_iovec`s.
 - seccomp (354): `struct compat_sock_fprog`.
 
+**Compat structures, 32-bit times, split offsets.** `compat32::misc` serves:
+
+- Time: time (13, an `old_time32_t` returned and stored), gettimeofday /
+  settimeofday (78/79, `old_timeval32`) and times (43, `compat_tms`).
+- Limits and usage: ugetrlimit (191) and the old getrlimit (76)
+  (`compat_rlimit`, clamped to `COMPAT_RLIM_INFINITY` / 0x7FFFFFFF);
+  setrlimit (75, `COMPAT_RLIM_INFINITY` widened); getrusage (77) and wait4
+  (114) (`compat_rusage`); waitid (284) (the `compat_siginfo` fields
+  `compat_sys_waitid` writes, plus `compat_rusage`).
+- Filesystem and system information: statfs / fstatfs (99/100,
+  `compat_statfs` with `put_compat_statfs`'s EOVERFLOW); statfs64 /
+  fstatfs64 (268/269, the packed 84-byte `compat_statfs64`, any other size
+  EINVAL); sysinfo (116, `compat_sysinfo` rescaled through `mem_unit`).
+- Split offsets: truncate / ftruncate (92/93, `compat_off_t`); the
+  `sys_ia32_*` forms of truncate64, ftruncate64, fallocate, fadvise64,
+  fadvise64_64, readahead and sync_file_range (193/194/324/250/272/225/314,
+  each 64-bit value as two registers).
+- Vectored and offset I/O: preadv / pwritev / preadv2 / pwritev2
+  (333/334/378/379, `compat_iovec`s and a split offset); sendfile (187, a
+  `compat_off_t`).
+- sigaltstack (186, `compat_stack_t`).
+- Select and poll: select (82, `compat_sel_arg_struct`), _newselect (142),
+  pselect6 (308) and pselect6_time64 (413), with 32-bit-word `fd_set`s.
+  `ceil(n/32)` words are copied back. A 32-bit timeout gets the time left.
+  pselect's `{ ss, ss_len }` sigset pack is widened. ppoll (309) takes an
+  `old_timespec32`.
+
+Native structures go through `compat32::stage`. ppoll_time64 (414),
+rt_sigpending (176), rt_sigsuspend (179), signalfd / signalfd4 (321/327)
+and sched_setaffinity (241) pass through: their compat sigsets and CPU
+masks have the native bytes.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.
