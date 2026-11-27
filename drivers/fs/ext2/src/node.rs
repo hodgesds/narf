@@ -111,6 +111,11 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         })
     }
 
+    /// Whether the inode's release waits for this node's drop.
+    pub(crate) fn is_orphaned(&self) -> bool {
+        self.orphaned.load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// Defer this inode's release to the drop of the node (see `orphaned`).
     pub(crate) fn mark_orphaned(&self) {
         self.orphaned
@@ -656,7 +661,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         }
         let zeros = alloc::vec![0u8; (to - from) as usize];
         self.volume
-            .write_byte_range(phys * bs + from % bs, &zeros)
+            .write_data_range(phys * bs + from % bs, &zeros)
             .await
     }
 

@@ -517,24 +517,32 @@ cargo xtask efi-image --output target/narf-root-rw.efi \
 rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
 ```
 
-- **No journal.** NARF writes ext4 metadata in place and never writes the
-  journal. Its writes follow an order in which a crash leaves only what
-  e2fsck repairs: a leaked block, a directory entry reachable twice, a link
-  count one too high. A crash never leaves a name pointing at a freed inode,
-  or a block mapped by two files.
-- **Not clean while mounted.** Because nothing is journaled, a read-write
-  mount clears the clean bit and counts a mount, as Linux does without a
-  journal (`dumpe2fs -h` shows `Filesystem state: not clean`). A remount
-  read-only or an unmount sets it again. After a NARF crash the next CachyOS
-  boot finds the root not clean, and its fsck runs a full e2fsck.
+- **Journaled, as Linux.** On a root with a journal (the CachyOS default),
+  NARF writes metadata through it: each operation's changes commit
+  together, every few seconds and at every `fsync`, and file data reaches
+  the disk before the commit that references it (`data=ordered`).
+  - While NARF has the root read-write, `dumpe2fs -h` shows
+    `Filesystem state: clean` with `needs_recovery`, as under Linux.
+  - A remount read-only or an unmount empties the journal and clears
+    `needs_recovery`.
+  - After a NARF crash, the next mount, NARF's or CachyOS's, replays the
+    journal: the root comes back as of the last commit, with no full
+    e2fsck.
+- **Without a journal** (`^has_journal`), NARF writes metadata in place in an
+  order where a crash leaves only what e2fsck repairs: a leaked block, a
+  directory entry reachable twice, a link count one too high. A read-write
+  mount then clears the clean bit, as Linux does without a journal, and
+  after a crash the next fsck runs a full check.
 - **The gate.** The root mounts read-only instead, with the reason on the
   boot banner, when the filesystem:
   - has recorded errors or was not cleanly unmounted (run e2fsck);
-  - has a journal needing recovery (boot CachyOS once);
-  - has an orphan list that isn't empty;
   - has features NARF cannot write: quota, project, bigalloc, verity,
     legacy `gdt_csum`;
   - has a default directory hash other than legacy, half-MD4 or TEA.
+
+  A journal needing recovery is replayed at mount, and files a crash left
+  deleted-but-open (the orphan file) are released then, as CachyOS does at
+  its next mount.
 
   A root with an incompat feature NARF cannot read (`meta_bg`,
   `inline_data`, `encrypt`, `casefold`, `largedir`, `ea_inode`, `mmp`) does

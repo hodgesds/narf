@@ -13,7 +13,7 @@ NARF.
   feature set is supported mount read/write; inode, classic-directory,
   bitmap, group-descriptor, HTREE, and primary-superblock mutations regenerate
   the corresponding CRC32C before returning.
-- **Out of Scope (this iteration):** journal writes (ext3+), HTREE
+- **Out of Scope (this iteration):** fast commits (written or replayed), HTREE
   rebalancing on delete, `largedir` (a third HTREE level), converting a
   linear directory to an index (`make_indexed_dir`), and `fsck`-style
   repair.
@@ -149,8 +149,7 @@ A device without `BlockFeature::Discard` fails the ioctl with
   bitmap, classic-directory leaf, or HTREE index block before mutation. Writers
   install dependent bitmap/directory checksums first, then the
   group-descriptor/superblock checksum that names them. Unknown
-  read-only-compatible features and a non-empty orphan file keep the volume
-  read-only. One-level HTREE insertion into an existing leaf
+  read-only-compatible features keep the volume read-only. One-level HTREE insertion into an existing leaf
   and deletion from existing one-level HTREE leaves are supported; a full
   leaf or multi-level mutation is rejected before mutation.
 - **Directory names hash as Linux hashes them** (`htree::ext4fs_dirhash`,
@@ -164,21 +163,102 @@ A device without `BlockFeature::Discard` fails the ioctl with
   refuses: an on-disk version other than 0-2, `unused_flags` bit 0, and
   more than one dx-node level (two need `largedir`, which is refused at
   mount).
-- **A crash is never hidden** (Linux `ext4_setup_super` without a journal).
-  NARF writes metadata in place, never through the journal. So a
-  read-write mount first clears `EXT4_VALID_FS`, bumps `s_mnt_count`, sets
-  `s_mtime`, records the hash signedness, and repairs a stale
-  `RECOVER`/`ORPHAN_PRESENT` the gate found clean. That one superblock write
-  goes out with FUA and a flush before any other write. Remount read-only
-  and the last unmount (`Drop`, polled once in place) restore the mount-time
-  `s_state` after a full write-back, adding `EXT4_ERROR_FS` if an error was
-  recorded. `syncfs` never marks the filesystem clean. After a crash,
-  `e2fsck -p` sees an unclean filesystem and checks it fully.
+- **A crash is never hidden** (Linux `ext4_setup_super`). A read-write
+  mount bumps `s_mnt_count`, sets `s_mtime` and records the hash
+  signedness in one superblock write, with FUA and a flush, before any
+  other write. Remount read-only and the last unmount (`Drop`, polled once
+  in place) restore the mount-time `s_state` after a full write-back,
+  adding `EXT4_ERROR_FS` if an error was recorded. `syncfs` never marks the
+  filesystem clean.
+  - With a journal (the next bullet): `EXT4_VALID_FS` stays set, and
+    `RECOVER` (and `ORPHAN_PRESENT` with an orphan file) is set while
+    mounted read-write. The unmount commits, checkpoints and empties the log
+    before clearing them. After a crash, recovery replays the log.
+  - Without one (`^has_journal`, or `noload` on a filesystem that does not
+    need recovery): metadata is written in place in no-journal order,
+    `EXT4_VALID_FS` is cleared while mounted, and a stale
+    `RECOVER`/`ORPHAN_PRESENT` the gate found clean is repaired. After a
+    crash, `e2fsck -p` sees an unclean filesystem and checks it fully.
+- **Metadata goes through the journal** on a journaled read-write mount
+  (`volume/jbd.rs`; `fs/jbd2/commit.c`, `checkpoint.c`, `data=ordered`):
+  - A metadata write lands in the running transaction (whole blocks, the
+    latest copy of each), which every read consults first. The device keeps
+    the committed state until the commit.
+  - File data and the zero-fill of freshly allocated blocks go to the
+    device directly, inside the operation that writes them, so they are on
+    the device before the commit that references them.
+  - Each operation holds `inode_update_lock`, which is the jbd2 handle: a
+    commit runs only between operations.
+  - A commit writes the descriptors and copies, flushes, writes the commit
+    block with FUA, checkpoints (writes every block home, flushes) and
+    moves the log tail past it (FUA).
+  - It happens when an operation starts and the transaction is at its
+    limit (a quarter of the log, at most 4 MiB), on `fsync`/`syncfs`,
+    every 5 s (`JBD2_DEFAULT_MAX_COMMIT_AGE`), and at remount read-only and
+    unmount.
+  - The journal features are ext4's (`ext4_set_journal_csum_feature_set`:
+    csum v3 under `metadata_csum`, none without; 64-bit tags on a 64-bit
+    filesystem). A v1 journal superblock cannot carry them: EINVAL.
+  - Blocks freed in a transaction are not allocated again before it
+    commits, and `fitrim` skips them.
+  - A failed commit write aborts the journal (`jbd2_journal_abort`): the
+    volume goes read-only, `RECOVER` stays set, and nothing more is
+    written; the next mount recovers the last committed state. So does a
+    filesystem error that stops writing (`narf.disks=root-rw`,
+    `errors=remount-ro` or `panic`; `ext4_handle_error`), before the error
+    is recorded, so the failed operation's partial changes never commit.
+  - Whole device sectors go out several per request, so a journal block
+    (a commit block above all) is one write, as Linux submits it.
+  - LINUX-GAPs: one transaction at a time, committed and checkpointed in
+    one go (no committing/running overlap, no lazy checkpoint, so no
+    revoke records are ever needed); `commit=` is accepted but the interval
+    stays 5 s; an operation larger than the whole log fails with ENOSPC
+    (Linux splits large truncates across transactions, an orphan record
+    holding the inode in between); fast commits are not written.
+- **Orphans are recorded and finished as Linux does it** (`volume/orphan.rs`;
+  `fs/ext4/orphan.c`):
+  - An inode whose last link goes while it is still open is recorded in
+    the unlink's transaction (`ext4_orphan_add`), and only with a journal:
+    in a free slot of the orphan file (each block ends with
+    `EXT4_ORPHAN_BLOCK_MAGIC` and a crc32c over its block number and
+    entries, seeded with the orphan inode's checksum seed), or, with no
+    orphan file or a full one, at the head of the `s_last_orphan` list,
+    linked through `i_dtime`. Its release at the last close removes it
+    (`ext4_orphan_del`) in the same transaction that frees it, with a
+    directory's `bg_used_dirs_count` (`ext4_free_inode`).
+  - `rmdir` of a directory still open (a cwd) empties it (`i_size = 0`) and
+    records it the same way; nothing can be created in it (ENOENT, as
+    `IS_DEADDIR`). A directory a `rename` replaces is released likewise.
+  - At mount `ext4_init_orphan_info` reads every orphan file block; a bad
+    magic or checksum fails the mount with EIO before anything is written.
+  - Then `ext4_orphan_cleanup`, in Linux's order: nothing on a device that
+    cannot be written ("write access unavailable"), nothing with unknown
+    read-only-compatible features, and with `EXT4_ERROR_FS` nothing but,
+    on a read-write mount, clearing the list. Otherwise the list, head
+    first, then every orphan file slot: an inode with no links is deleted,
+    one with links (an interrupted truncate) is cut to `i_size` with the
+    rest of its last block zeroed. A slot or list entry naming an
+    unallocated, unreadable or untruncatable inode is a filesystem error
+    ("bad orphan inode"); on the list it ends the walk.
+  - A read-only mount of a writable device writes for the duration ("orphan
+    cleanup on readonly fs"), through the journal, which is flushed before
+    writing stops. Then `ext4_mark_recovery_complete` clears `RECOVER` and
+    `ORPHAN_PRESENT`; an orphan file entry still there is EFSCORRUPTED and
+    fails the mount.
+  - Remount read-only while an unlinked inode is open is EBUSY
+    (`s_remove_count`); remount read-write over an unprocessed orphan list
+    or file is EINVAL ("Please umount/remount instead"). The unmount keeps
+    `ORPHAN_PRESENT` while the orphan file is not empty.
+  - LINUX-GAP: on a read-only mount of a filesystem NARF's write gate
+    refuses for a feature Linux writes, or whose journal still needs
+    recovery under `noload`, the cleanup is skipped and `RECOVER` /
+    `ORPHAN_PRESENT` stay set while an orphan is recorded, for Linux.
 - **The write gate** refuses a read-write mount, and writes nothing, for:
   - an unknown or unwritable read-only-compatible feature;
   - legacy `gdt_csum`;
-  - a non-empty orphan file or `s_last_orphan` list;
   - a default directory hash other than 0-2.
+
+  Orphans are not refused: the mount finishes them (above).
 
   Under `narf.disks=root-rw` it also refuses a filesystem with
   `EXT4_ERROR_FS` or without `EXT4_VALID_FS`. LINUX-GAP: Linux mounts those
@@ -317,9 +397,9 @@ A device without `BlockFeature::Discard` fails the ioctl with
   classic directory mutation, checksum-aware bitmaps/descriptors, extent
   trees of any depth (growth, unwritten conversion, truncation, punch), and
   HTREE inserts with leaf and index splits up to two index levels persist.
-  Metadata is still written in place, not through the journal.
-  If the JBD2 superblock and orphan file are both clean, stale `RECOVER` and
-  `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
+  Without a journal, a stale `RECOVER` flag is cleared with a regenerated
+  superblock checksum, and a stale `ORPHAN_PRESENT` once nothing is
+  recorded as an orphan.
 - **The journal is recovered at mount, as Linux does it** (`journal.rs`;
   `fs/jbd2/recovery.c`, `fs/jbd2/journal.c`, `ext4_load_journal`). Before
   any inode but the journal's own is read:
@@ -344,11 +424,10 @@ A device without `BlockFeature::Discard` fails the ioctl with
   - Error fields the replay overwrote in the superblock are put back, and
     an error recorded in the journal (`s_errno`) becomes `EXT4_ERROR_FS`
     (`ext4_clear_journal_err`).
-  - Then `ext4_mark_recovery_complete`: the log is marked empty and, on a
-    read-only mount, `RECOVER` and `ORPHAN_PRESENT` are cleared.
+  - The replayed log is marked empty. After the orphan cleanup,
+    `ext4_mark_recovery_complete` flushes the journal and, on a read-only
+    mount, clears `RECOVER` and `ORPHAN_PRESENT` (orphans, above).
   - LINUX-GAPs:
-    - No orphan cleanup yet: a read-only mount whose orphan file still
-      holds inodes leaves `RECOVER` and `ORPHAN_PRESENT` set for Linux.
     - Fast commits are not replayed: a dirty journal with `FAST_COMMIT` is
       EOPNOTSUPP, before anything is written.
     - A pass that reads more block headers than one lap of the log holds

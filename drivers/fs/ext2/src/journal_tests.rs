@@ -846,6 +846,137 @@ kernel_test_in!(
     smoke_jbd2_read_error_fails_recovery
 );
 
+// ── The write side: transactions as NARF's commit encodes them ──────
+
+/// Place `t`'s blocks into `log`.
+fn place(log: &mut Log, t: &crate::journal::EncodedTransaction) {
+    for w in t.body.iter().chain(core::iter::once(&t.commit)) {
+        log.blocks[w.block as usize] = w.data.clone();
+    }
+}
+
+/// Transactions encoded by `Journal::encode_transaction` recover through
+/// the same passes as Linux-written ones, under every checksum and tag
+/// format: 130 blocks (at 1 KiB, two descriptors with 8-byte tags, three
+/// with csum v3's 16-byte ones) starting 30 blocks before `s_maxlen` so the
+/// log wraps, an escaped block, and a later
+/// transaction that revokes one of them.
+fn smoke_jbd2_encoded_transactions_recover() -> TestResult {
+    let formats = [
+        (0, V3),
+        (0, feature::INCOMPAT_CSUM_V2 | feature::INCOMPAT_64BIT),
+        (feature::COMPAT_CHECKSUM, 0),
+        (0, 0),
+        (0, feature::INCOMPAT_64BIT | feature::INCOMPAT_REVOKE),
+    ];
+    for (compat, incompat) in formats {
+        let head = MAXLEN - 30;
+        let mut log = Log::new(BS, MAXLEN, compat, incompat);
+        log.superblock(500, head, 0);
+        let Ok(writer) = Journal::load_superblock(&log.blocks[0], BS, MAXLEN) else {
+            return TestResult::Fail("superblock rejected");
+        };
+        let mut contents: Vec<(u64, Vec<u8>)> =
+            (0..130u64).map(|i| (1000 + i, block_of(i as u8))).collect();
+        contents[5].1[..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
+        let refs: Vec<(u64, &[u8])> = contents.iter().map(|(b, d)| (*b, &d[..])).collect();
+        let t1 = writer.encode_transaction(500, head, &refs, &[], 100, 0);
+        let second = block_of(0xee);
+        let t2 = writer.encode_transaction(501, t1.next_head, &[(2000, &second)], &[1003], 101, 0);
+        if t1.body.len() < 132 || t1.next_head >= head {
+            return TestResult::Fail("fixture: T1 should need two descriptors and wrap");
+        }
+        place(&mut log, &t1);
+        place(&mut log, &t2);
+        let mut mem = Mem::new(log);
+        let Ok((j, _)) = load(&mut mem) else {
+            return TestResult::Fail("an encoded transaction failed to recover");
+        };
+        for (block, data) in &contents {
+            let got = mem.home.get(block);
+            if *block == 1003 {
+                if got.is_some() {
+                    return TestResult::Fail("block revoked by a later transaction replayed");
+                }
+            } else if got != Some(data) {
+                return TestResult::Fail("encoded block did not round-trip");
+            }
+        }
+        if mem.home.get(&2000) != Some(&second) || j.transaction_sequence != 503 {
+            return TestResult::Fail("second transaction or restart id wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_jbd2_encoded_transactions_recover
+);
+
+/// `set_write_features` turns a feature-less v2 superblock into ext4's
+/// write format (csum v3 + 64-bit), and what is then encoded and written
+/// recovers with the checksums verified; without `metadata_csum` it clears
+/// every checksum feature. A v1 superblock cannot carry them (EINVAL).
+fn smoke_jbd2_write_features_as_ext4_sets_them() -> TestResult {
+    let mut log = Log::new(
+        BS,
+        MAXLEN,
+        feature::COMPAT_CHECKSUM,
+        feature::INCOMPAT_ASYNC_COMMIT,
+    );
+    log.superblock(9, 0, 0);
+    let mut mem = Mem::new(log);
+    let first = mem.log[0].clone();
+    let Ok(mut j) = Journal::load_superblock(&first, BS, MAXLEN) else {
+        return TestResult::Fail("superblock rejected");
+    };
+    if j.set_write_features(true, true).is_err() {
+        return TestResult::Fail("v2 superblock refused the write features");
+    }
+    let sb = j.superblock();
+    if !sb.has_csum3() || !sb.has_64bit() || sb.has_checksum_v1() || sb.has_async_commit() {
+        return TestResult::Fail("features differ from ext4's");
+    }
+    let data = block_of(0x42);
+    let t = j.encode_transaction(9, 1, &[(5_000_000_000, &data)], &[], 7, 0);
+    for w in t.body.iter().chain(core::iter::once(&t.commit)) {
+        mem.log[w.block as usize] = w.data.clone();
+    }
+    if run(j.update_sb_log_tail(&mut mem, 9, 1)).is_err() {
+        return TestResult::Fail("superblock write failed");
+    }
+    match load(&mut mem) {
+        Ok(_) if mem.home.get(&5_000_000_000) == Some(&data) => {}
+        _ => {
+            return TestResult::Fail(
+                "csum-v3 transaction written after set_write_features did not recover",
+            )
+        }
+    }
+    let Ok(mut plain) = Journal::load_superblock(&first, BS, MAXLEN) else {
+        return TestResult::Fail("superblock rejected");
+    };
+    if plain.set_write_features(false, false).is_err()
+        || plain.superblock().has_checksum_v1()
+        || plain.superblock().has_csum_v2or3()
+    {
+        return TestResult::Fail("without metadata_csum no checksum feature stays");
+    }
+    let mut v1 = first.clone();
+    put32(&mut v1, 4, block_type::SUPERBLOCK_V1);
+    let Ok(mut old) = Journal::load_superblock(&v1, BS, MAXLEN) else {
+        return TestResult::Fail("v1 superblock rejected");
+    };
+    if old.set_write_features(true, true) != Err(JournalError::Invalid) {
+        return TestResult::Fail("a v1 superblock must refuse features");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_jbd2_write_features_as_ext4_sets_them
+);
+
 // ── The journal at mount (ext4_load_journal) ────────────────────────
 
 use narf_block::ram::RamBlockDevice;
@@ -1090,6 +1221,202 @@ fn smoke_ext4_recovery_on_read_only_device_is_erofs() -> TestResult {
 kernel_test_in!(
     "drivers/fs/ext2/journal",
     smoke_ext4_recovery_on_read_only_device_is_erofs
+);
+
+/// An error that stops writing (`narf.disks=root-rw`, like
+/// `errors=remount-ro`) aborts the journal first (`ext4_handle_error` ->
+/// `jbd2_journal_abort`): the running transaction, a failed operation's
+/// partial changes included, is never committed, and `RECOVER` stays set
+/// through the unmount.
+fn smoke_ext4_error_that_stops_writes_aborts_the_journal() -> TestResult {
+    use narf_block::disk_policy::{self, DiskPolicy};
+    let mut image = ext3_image(false, 1, 0x8000 | 0o600);
+    empty_log(&mut image);
+    disk_policy::__set_policy_for_test(Some(DiskPolicy::RootRw));
+    let device = RamBlockDevice::from_image(512, image);
+    let result = (|| {
+        let volume = run(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)).ok()?;
+        if volume.is_read_only() {
+            return None;
+        }
+        let block = vec![0xA5u8; FS_BS];
+        run(volume.write_block(120, &block)).ok()?;
+        run(volume.fs_error(crate::volume::sb_state::ErrorSite {
+            func: "smoke_test",
+            ino: 0,
+            block: 120,
+            errno: narf_lib::errno::EIO,
+        }));
+        let committed = run(volume.journal_commit()).is_ok();
+        let on_disk = device.snapshot()[120 * FS_BS..121 * FS_BS] == block[..];
+        let ro = volume.is_read_only();
+        drop(volume);
+        Some((
+            committed,
+            on_disk,
+            ro,
+            incompat(&device.snapshot()) & 0x4 != 0,
+        ))
+    })();
+    disk_policy::__set_policy_for_test(None);
+    match result {
+        Some((false, false, true, true)) => TestResult::Pass,
+        Some((true, _, _, _)) | Some((_, true, _, _)) => {
+            TestResult::Fail("after an error that stops writing nothing may commit")
+        }
+        Some(_) => TestResult::Fail("the volume must be read-only with RECOVER kept"),
+        None => TestResult::Fail("mount or write failed"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_error_that_stops_writes_aborts_the_journal
+);
+
+// ── The orphan list at mount (`ext4_orphan_cleanup`) ────────────────
+
+/// [`ext3_image`] with its log empty plus inode 11: a regular file whose last
+/// link went while it was open, on the orphan list (`s_last_orphan`), as a
+/// crash with it open leaves it.
+fn ext3_orphan_image(recover: bool) -> Vec<u8> {
+    let mut img = ext3_image(recover, 1, 0x8000 | 0o600);
+    empty_log(&mut img);
+    put_le32(&mut img, 1024 + 84, 11); // s_first_ino
+    put_le32(&mut img, 1024 + 0xE8, 11); // s_last_orphan
+    img[4 * FS_BS + 1] |= 1 << 2; // inode 11 in use
+    put_le16(&mut img, 5 * FS_BS + 10 * 128, 0x8000 | 0o644);
+    img
+}
+
+/// `s_last_orphan`, and whether inode 11 is in use.
+fn orphan_state(img: &[u8]) -> (u32, bool) {
+    (
+        u32::from_le_bytes(img[1024 + 0xE8..1024 + 0xEC].try_into().unwrap()),
+        img[4 * FS_BS + 1] & (1 << 2) != 0,
+    )
+}
+
+fn sb_state(img: &[u8]) -> u16 {
+    u16::from_le_bytes([img[1024 + 58], img[1024 + 59]])
+}
+
+/// A read-write mount deletes the orphan (no links) and empties the list
+/// before anything else can see the filesystem.
+fn smoke_ext4_orphan_list_released_by_rw_mount() -> TestResult {
+    let device = RamBlockDevice::from_image(512, ext3_orphan_image(true));
+    let Ok(volume) = run(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) else {
+        return TestResult::Fail("read-write mount with an orphan list failed");
+    };
+    if volume.is_read_only() || orphan_state(&device.snapshot()) != (0, false) {
+        return TestResult::Fail("the mount must free the orphan and empty the list");
+    }
+    drop(volume);
+    if incompat(&device.snapshot()) & 0x4 != 0 {
+        return TestResult::Fail("the clean unmount must clear RECOVER");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_orphan_list_released_by_rw_mount
+);
+
+/// A read-only mount of a writable device does it too ("orphan cleanup on
+/// readonly fs"), stays read-only, and completes the recovery: `RECOVER`
+/// cleared, the log empty.
+fn smoke_ext4_orphan_list_released_by_ro_mount() -> TestResult {
+    let device = RamBlockDevice::from_image(512, ext3_orphan_image(true));
+    let Ok(volume) = run(Ext2Volume::mount_read_only(
+        device.clone(),
+        DomainId::DRIVER_0,
+    )) else {
+        return TestResult::Fail("read-only mount with an orphan list failed");
+    };
+    let img = device.snapshot();
+    if !volume.is_read_only() || orphan_state(&img) != (0, false) {
+        return TestResult::Fail("a read-only mount must still release the orphan");
+    }
+    if incompat(&img) & 0x4 != 0 || get32(jsb(&img), 0x1C) != 0 {
+        return TestResult::Fail("RECOVER must be cleared and the log empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_orphan_list_released_by_ro_mount
+);
+
+/// A device that cannot be written: "write access unavailable, skipping
+/// orphan cleanup", and not one byte written.
+fn smoke_ext4_orphan_list_kept_on_read_only_device() -> TestResult {
+    let image = ext3_orphan_image(false);
+    let ram = RamBlockDevice::from_image(512, image.clone());
+    let device = Arc::new(ReadOnlyRam(ram.clone()));
+    let Ok(volume) = run(Ext2Volume::mount_read_only(device, DomainId::DRIVER_0)) else {
+        return TestResult::Fail("read-only device mount with an orphan list failed");
+    };
+    drop(volume);
+    if ram.snapshot() != image {
+        return TestResult::Fail("the orphan cleanup must not write a read-only device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_orphan_list_kept_on_read_only_device
+);
+
+/// `ERROR_FS`: no cleanup. A read-write mount clears the list ("Errors on
+/// filesystem, clearing orphan list.") and leaves the inode to e2fsck; a
+/// read-only mount keeps the list.
+fn smoke_ext4_orphan_list_with_errors() -> TestResult {
+    let mut image = ext3_orphan_image(true);
+    put_le16(&mut image, 1024 + 58, 3);
+    let device = RamBlockDevice::from_image(512, image.clone());
+    let Ok(volume) = run(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) else {
+        return TestResult::Fail("read-write mount with errors failed");
+    };
+    if orphan_state(&device.snapshot()) != (0, true) {
+        return TestResult::Fail("with errors a read-write mount clears the list only");
+    }
+    drop(volume);
+    let device = RamBlockDevice::from_image(512, image);
+    let Ok(volume) = run(Ext2Volume::mount_read_only(
+        device.clone(),
+        DomainId::DRIVER_0,
+    )) else {
+        return TestResult::Fail("read-only mount with errors failed");
+    };
+    drop(volume);
+    if orphan_state(&device.snapshot()) != (11, true) {
+        return TestResult::Fail("with errors a read-only mount keeps the list");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_orphan_list_with_errors
+);
+
+/// A list naming an inode that is not allocated (`ext4_orphan_get`: "bad
+/// orphan inode"): a filesystem error, and the list ends there.
+fn smoke_ext4_bad_orphan_inode_ends_the_list() -> TestResult {
+    let mut image = ext3_orphan_image(true);
+    put_le32(&mut image, 1024 + 0xE8, 20);
+    let device = RamBlockDevice::from_image(512, image);
+    let Ok(volume) = run(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) else {
+        return TestResult::Fail("read-write mount with a bad orphan failed");
+    };
+    let img = device.snapshot();
+    drop(volume);
+    if orphan_state(&img) != (0, true) || sb_state(&img) & 2 == 0 {
+        return TestResult::Fail("a bad orphan must end the list and record an error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_bad_orphan_inode_ends_the_list
 );
 
 /// `noload` on a read-write mount of a filesystem that needs recovery:

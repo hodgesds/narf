@@ -6,7 +6,9 @@
 //! console prompt, the passphrase typed on the emulated PS/2 keyboard), this
 //! runs pacman- and systemd-shaped writes through the VFS on the mounted
 //! root, then remounts it read-only, which marks the filesystem clean, and
-//! prints one verdict line. The host decrypts the partition and lets
+//! prints one verdict line. `narf.ext4_interop=crash` instead leaves the
+//! journaled root mounted read-write with one synced file and one only the
+//! commit timer commits, for the host to kill NARF and recover the disk. The host decrypts the partition and lets
 //! e2fsprogs judge it. Every byte written here is a pure function of the
 //! mode, so the host checks content without a channel back.
 //!
@@ -209,6 +211,65 @@ async fn run_root(root: &Arc<dyn DirOps>) -> Result<(), (&'static str, FsError)>
     Ok(())
 }
 
+/// What `crash` mode writes; the host checks them
+/// (`build/xtask/src/ext4_interop.rs`).
+pub const CRASH_SYNCED_SEED: u32 = 0x5359_4e43;
+pub const CRASH_SYNCED_LEN: usize = 300_000;
+pub const CRASH_TIMER_SEED: u32 = 0x5449_4d52;
+pub const CRASH_TIMER_LEN: usize = 50_000;
+pub const CRASH_HELD_SEED: u32 = 0x4845_4c44;
+pub const CRASH_HELD_LEN: usize = 70_000;
+
+/// `narf.ext4_interop=crash`: the root is left mounted read-write for the
+/// host to kill NARF under it.
+/// - `/narf-crash/synced` is written, fsynced, renamed into place and
+///   `syncfs`'d;
+/// - `/narf-crash/timer` is written with no sync at all;
+/// - `/narf-crash/held` is written, fsynced, and unlinked while still open,
+///   and that synced: the orphan file (or list) records it until the kill;
+/// - then this waits past twice the journal's commit interval, so only the
+///   commit timer can have committed `timer`.
+async fn run_crash(root: &Arc<dyn DirOps>) -> Result<(), (&'static str, FsError)> {
+    let dir = root
+        .mkdir("narf-crash")
+        .await
+        .map_err(|e| ("mkdir /narf-crash", e))?;
+    replace(
+        &dir,
+        "synced",
+        &pattern(CRASH_SYNCED_SEED, CRASH_SYNCED_LEN),
+    )
+    .await
+    .map_err(|e| ("write /narf-crash/synced", e))?;
+    root.syncfs().await.map_err(|e| ("syncfs", e))?;
+    let timer = dir
+        .create("timer")
+        .await
+        .map_err(|e| ("create /narf-crash/timer", e))?;
+    write_all(&timer, 0, &pattern(CRASH_TIMER_SEED, CRASH_TIMER_LEN))
+        .await
+        .map_err(|e| ("write /narf-crash/timer", e))?;
+    let held = dir
+        .create("held")
+        .await
+        .map_err(|e| ("create /narf-crash/held", e))?;
+    write_all(&held, 0, &pattern(CRASH_HELD_SEED, CRASH_HELD_LEN))
+        .await
+        .map_err(|e| ("write /narf-crash/held", e))?;
+    held.fsync(false)
+        .await
+        .map_err(|e| ("fsync /narf-crash/held", e))?;
+    dir.unlink("held")
+        .await
+        .map_err(|e| ("unlink /narf-crash/held", e))?;
+    root.syncfs().await.map_err(|e| ("syncfs", e))?;
+    // Open until the kill, as a process holding it would keep it.
+    core::mem::forget(held);
+    let wait = 2 * crate::volume::jbd::COMMIT_INTERVAL_SECS + 2;
+    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(wait * 1_000_000_000)).await;
+    Ok(())
+}
+
 /// The root's filesystem UUID from its superblock (canonical lowercase).
 fn ext4_uuid(dev: &dyn narf_block::BlockDeviceSync) -> Option<String> {
     let lba = dev.lba_size() as usize;
@@ -256,19 +317,26 @@ pub fn run(mode: &str) -> narf_init::InitResult {
     let root = fs.root();
     let result = narf_scheduler::block_on(async {
         match mode {
-            "root" => run_root(&root)
+            "root" => {
+                run_root(&root)
+                    .await
+                    .map_err(|(what, e)| format!("{what}: {e:?}"))?;
+                // A remount read-only marks the filesystem clean, as an
+                // unmount does.
+                fs.reconfigure_sb_async(
+                    narf_filesystem::sb_flags::RDONLY,
+                    narf_filesystem::sb_flags::RDONLY,
+                    "",
+                )
                 .await
-                .map_err(|(what, e)| format!("{what}: {e:?}"))?,
-            _ => return Err(String::from("unknown mode")),
+                .map_err(|e| format!("remount read-only: {e:?}"))
+            }
+            // Left mounted read-write: the host kills NARF here.
+            "crash" => run_crash(&root)
+                .await
+                .map_err(|(what, e)| format!("{what}: {e:?}")),
+            _ => Err(String::from("unknown mode")),
         }
-        // A remount read-only marks the filesystem clean, as an unmount does.
-        fs.reconfigure_sb_async(
-            narf_filesystem::sb_flags::RDONLY,
-            narf_filesystem::sb_flags::RDONLY,
-            "",
-        )
-        .await
-        .map_err(|e| format!("remount read-only: {e:?}"))
     });
     match result {
         Ok(()) => {
