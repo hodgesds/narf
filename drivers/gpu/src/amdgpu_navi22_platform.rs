@@ -1604,6 +1604,10 @@ async unsafe fn light(
     let released = PRESENT.shown.lock().latched_owned();
     // Unpinned outside the IRQ-safe lock.
     drop(released);
+    // The relit pipe shows the owned surface: a live overlay's pin is
+    // unfetched too (the modeset tore the overlay down).
+    let released = PRESENT.shown_overlay.lock().latched_owned();
+    drop(released);
     *PRESENT.geometry.lock() = boot.display_scanout_ref().map(|s| s.front().fb);
     *PLANE_BASIS.lock() = boot.display_plane_basis();
     PRESENT.native.store(back.is_ok(), Ordering::Release);
@@ -1632,6 +1636,8 @@ async unsafe fn unlight(boot: &mut boot::ColdBoot) -> Result<(), boot::Error> {
         // The stopped HUBP fetches nothing.
         let released = PRESENT.shown.lock().latched_owned();
         // Unpinned outside the IRQ-safe lock.
+        drop(released);
+        let released = PRESENT.shown_overlay.lock().latched_owned();
         drop(released);
     }
     crate::amdgpu_navi22_kms::KMS.lock().crtc.shown = None;
@@ -2625,6 +2631,10 @@ struct PresentSlot {
     geometry: narf_lib::sync::IrqSafeSpinLock<Option<GenericFb>>,
     /// The client framebuffer the pipe may still fetch.
     shown: narf_lib::sync::IrqSafeSpinLock<frame_copy::ShownPin>,
+    /// The overlay framebuffer the slave pipe may still fetch, if an
+    /// overlay is live. Retired the same way as `shown`: a later flip
+    /// latches past it, or the overlay is released.
+    shown_overlay: narf_lib::sync::IrqSafeSpinLock<frame_copy::ShownPin>,
     /// The primary DRM last committed (its ticket and damage cleared), shown
     /// again on the new pipe after a relight: amdgpu_dm's modeset commit
     /// programs its new stream with the committed plane, and a compositor
@@ -2645,6 +2655,7 @@ static PRESENT: PresentSlot = PresentSlot {
     damage: narf_lib::sync::IrqSafeSpinLock::new(crate::amdgpu_present_damage::Damage::new()),
     geometry: narf_lib::sync::IrqSafeSpinLock::new(None),
     shown: narf_lib::sync::IrqSafeSpinLock::new(frame_copy::ShownPin::new()),
+    shown_overlay: narf_lib::sync::IrqSafeSpinLock::new(frame_copy::ShownPin::new()),
     committed: narf_lib::sync::IrqSafeSpinLock::new(None),
     direct: AtomicU64::new(0),
     copied: AtomicU64::new(0),
@@ -2739,6 +2750,11 @@ pub(crate) fn planes_admitted(
     mode: Option<(u32, u32)>,
     planes: &crate::drm_native_planes::DisplayPlanes,
 ) -> Result<(), &'static str> {
+    // Only CRTC 0 lights a slave pipe: an overlay on any other display
+    // has no stream to plan on.
+    if display != 0 && planes.setup.overlay_count() > 0 {
+        return Err(crate::amdgpu_navi22_plane::why::OVERLAY_DISPLAY);
+    }
     let basis = if display == 0 {
         *PLANE_BASIS.lock()
     } else {
@@ -2804,6 +2820,9 @@ async unsafe fn release_client_scanout(boot: &mut boot::ColdBoot) -> bool {
     let released = PRESENT.shown.lock().latched_owned();
     // Unpinned outside the IRQ-safe lock.
     drop(released);
+    // The overlay was released by the return to owned above.
+    let released = PRESENT.shown_overlay.lock().latched_owned();
+    drop(released);
     if crate::amdgpu_dcn_display::active_scanout().is_none() && !narf_console::fb_user_owned() {
         publish_console(boot);
     }
@@ -2864,10 +2883,42 @@ struct Frame {
     damage: Option<core::ops::Range<u32>>,
     /// A positioned or scaled primary's SRC and CRTC rectangles.
     placement: Option<crate::drm::card::Placement>,
+    /// The overlay shown beside this primary on the slave pipe, if the
+    /// commit carried one. The overlay is always fully re-presented (no
+    /// damage tracking), and its pin is retired by `PRESENT.shown_overlay`
+    /// when a later flip latches past it.
+    overlay: Option<frame_copy::OverlayFrame>,
 }
 
 #[path = "amdgpu_navi22_frame_copy.rs"]
 mod frame_copy;
+
+/// What a two-plane flip needs for the overlay: its fetch address, its
+/// placement request, and its blend config. Built under OWNER at flip
+/// time, from the mode lit then, and passed to the one flip funnel
+/// ([`flip_unlocked`]) so the direct, blit and copy paths all program
+/// both planes together.
+#[derive(Clone, Copy)]
+struct OverlayArm {
+    address: u64,
+    request: crate::amdgpu_navi22_plane::Request,
+    blend: crate::amdgpu_dcn_plane::BlendConfig,
+}
+
+/// The overlay arm for `overlay` on the mode `front` (width, height):
+/// its fetch address (None: not fetchable in place), placement request
+/// and blend config.
+fn overlay_arm(
+    overlay: Option<&frame_copy::OverlayFrame>,
+    front: (u32, u32),
+) -> Option<OverlayArm> {
+    let overlay = overlay?;
+    Some(OverlayArm {
+        address: frame_copy::overlay_direct(overlay).ok()?,
+        request: frame_copy::overlay_direct_request(overlay, front),
+        blend: overlay.blend_config(),
+    })
+}
 
 /// Whether `present_frame` would present through a hardware flip now.
 pub fn native_present_ready(display: u8) -> bool {
@@ -2956,6 +3007,44 @@ pub(crate) fn present_damaged(
         return false;
     };
     frame.damage = damage;
+    *PRESENT.committed.lock() = Some(committed_copy(&frame));
+    {
+        let mut next = PRESENT.next.lock();
+        frame.ticket = ticket.max(next.as_ref().and_then(|f| f.ticket));
+        if let Some(old) = next.as_ref() {
+            frame_copy::coalesce(old, &mut frame);
+        }
+        *next = Some(frame);
+    }
+    if !PRESENT.presenting.swap(true, Ordering::AcqRel) {
+        narf_scheduler::spawn(presenter());
+    }
+    true
+}
+
+/// As [`present_plane`], with one overlay beside the primary on the slave
+/// pipe. The overlay is a pinned GEM framebuffer in place (its frame is
+/// built from the plane's placement and blend); an overlay that is not
+/// one is dropped and the primary is shown alone. The ticket completes
+/// when the flip latches, or at once when the frame is replaced, refused
+/// or fails.
+pub(crate) fn present_planes(
+    display: u8,
+    primary: Option<crate::amdgpu_navi48_platform::PlaneFrame>,
+    overlay: Option<crate::amdgpu_navi48_platform::PlaneFrame>,
+    ticket: Option<u64>,
+) -> bool {
+    let Some(plane) = primary else {
+        complete_flip(display, ticket, None);
+        return true;
+    };
+    let Some(mut frame) =
+        Frame::from_plane(plane, ticket).filter(|_| native_present_ready(display))
+    else {
+        complete_flip(display, ticket, None);
+        return false;
+    };
+    frame.overlay = overlay.and_then(frame_copy::OverlayFrame::from_plane);
     *PRESENT.committed.lock() = Some(committed_copy(&frame));
     {
         let mut next = PRESENT.next.lock();
@@ -3067,17 +3156,48 @@ async fn presenter() {
         }
         let started = narf_time::monotonic_ns();
         phase(Phase::Start);
+        // The overlay this frame carries, if the slave HUBP can fetch it
+        // in place: a dumb overlay shows the primary alone (admit refuses
+        // it — this is defense in depth). The arm itself (placement,
+        // blend) is built under OWNER at flip time, from the mode lit
+        // then; only the fetchability is decided here, so a frame with no
+        // fetchable overlay releases a live one first.
+        let overlay = frame
+            .overlay
+            .as_ref()
+            .filter(|o| frame_copy::overlay_direct(o).is_ok());
         // In place when the pinned client framebuffer can be fetched at its
         // own pitch, size and placement (amdgpu_dm never copies a client
         // framebuffer).
         let plan = frame_copy::direct(&frame);
         let result = async {
+            if overlay.is_none() && PRESENT.shown_overlay.lock().is_live() {
+                // The commit carries no overlay: release the live one
+                // before any single-plane program (`plan_plane` refuses
+                // while one is live).
+                phase(Phase::Owner);
+                let mut owner = OWNER.lock().await;
+                let Some(boot) = owner.as_mut() else {
+                    return Ok::<_, ScanError>(None);
+                };
+                boot.release_display_overlay().await?;
+                let released = PRESENT.shown_overlay.lock().latched_owned();
+                // Unpinned outside the IRQ-safe lock.
+                drop(released);
+            }
+            if let Some(opin) = overlay.and_then(|o| o.bo.as_ref()) {
+                // Rendering of the overlay must finish before the slave
+                // HUBP fetches it; wait without OWNER (the producer may
+                // need it). The primary's own wait is in each path.
+                phase(Phase::Fence);
+                frame_copy::wait_rendered(opin).await?;
+            }
             if let (Ok(_), Some(pin)) = (plan, frame.bo.as_ref()) {
                 // Rendering must finish before the HUBP fetches it; wait
                 // without OWNER (the producer may need it).
                 phase(Phase::Fence);
                 frame_copy::wait_rendered(pin).await?;
-                if let Direct::Shown(latched) = present_direct(&frame, pin).await? {
+                if let Direct::Shown(latched) = present_direct(&frame, pin, overlay).await? {
                     return Ok::<_, ScanError>(latched);
                 }
             }
@@ -3085,7 +3205,7 @@ async fn presenter() {
             // copied by the GPU into the owned back surface (amdgpu_dm never
             // reads a client framebuffer with the CPU).
             if let Some(pin) = frame.bo.as_ref() {
-                match present_blit(&frame, pin).await? {
+                match present_blit(&frame, pin, overlay).await? {
                     Blitted::Flipped(latched) => return Ok(latched),
                     Blitted::Dropped => return Ok(None),
                     Blitted::Unavailable => {}
@@ -3100,13 +3220,28 @@ async fn presenter() {
             // The copy shows with the frame's placement: its SRC at the
             // owned surface's origin, in its CRTC rectangle.
             let back = boot.display_scanout()?.back().ok_or(ScanError::Invalid)?;
-            let Some(update) = frame_copy::copied_request(&frame, &back.fb)
+            let Some(request) = frame_copy::copied_request(&frame, &back.fb)
                 .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)
-                .and_then(|r| plane_update(boot, &r))
                 .map_err(trace_refusal)
                 .ok()
             else {
                 return Ok(None);
+            };
+            // With an overlay, both planes are planned jointly in the flip
+            // (see `present_direct`).
+            let arm = overlay_arm(frame.overlay.as_ref(), (back.fb.width, back.fb.height));
+            let plan = match arm {
+                Some(arm) => FlipPlan::Two {
+                    primary: request,
+                    overlay: arm,
+                },
+                None => {
+                    let Some(update) = plane_update(boot, &request).map_err(trace_refusal).ok()
+                    else {
+                        return Ok(None);
+                    };
+                    FlipPlan::Single(update)
+                }
             };
             // Taken for the present: a failed copy or flip leaves both
             // buffers unknown, so it is only put back after the latch.
@@ -3116,12 +3251,12 @@ async fn presenter() {
             // completed outside this lock.
             let copied =
                 unsafe { present_native(boot, &frame, source.as_deref(), &mut damage) }.await?;
-            match flip_unlocked(owner, ArmedKind::Back, 0, update).await? {
-                Latch::Done {
+            match flip_unlocked(owner, ArmedKind::Back, 0, plan).await {
+                Ok(Latch::Done {
                     before,
                     after,
                     latched,
-                } => {
+                }) => {
                     damage.presented(
                         copied.tracked,
                         frame.damage.as_ref(),
@@ -3134,10 +3269,25 @@ async fn presenter() {
                     let released = PRESENT.shown.lock().latched_owned();
                     // Unpinned outside the IRQ-safe lock.
                     drop(released);
+                    if arm.is_some() {
+                        if let Some(opin) = frame.overlay.as_ref().and_then(|o| o.bo.as_ref()) {
+                            let released =
+                                PRESENT.shown_overlay.lock().latched_external(opin.clone());
+                            drop(released);
+                        }
+                    }
                     follow_flip(before, after).await;
                     Ok(latched)
                 }
-                Latch::Dropped => Ok(None),
+                Ok(Latch::Dropped) => Ok(None),
+                Err(e) => {
+                    // The slave HUBP may still fetch the overlay after a
+                    // failed two-plane flip: keep its pin alive.
+                    if let Some(opin) = frame.overlay.as_ref().and_then(|o| o.bo.as_ref()) {
+                        core::mem::forget(opin.clone());
+                    }
+                    Err(e)
+                }
             }
         }
         .await;
@@ -3178,23 +3328,64 @@ enum Latch {
     Dropped,
 }
 
+/// What [`flip_unlocked`] programs: a single-plane update (or an
+/// address-only flip), or a two-plane flip with the primary's request and
+/// the overlay's arm. The two-plane plan is made inside the flip, against
+/// the stream lit then: while an overlay is live, `plan_plane` refuses
+/// every primary update, so the paths cannot plan one before calling.
+enum FlipPlan {
+    Single(Option<crate::amdgpu_navi22_plane::Update>),
+    Two {
+        primary: crate::amdgpu_navi22_plane::Request,
+        overlay: OverlayArm,
+    },
+}
+
 /// Arm a flip under `owner`, release OWNER, then poll the latch every
 /// `POLL_US`, retaking OWNER only for each non-blocking check (amdgpu_dm's
 /// commit worker waits for flip_done holding no display lock). Cursor,
 /// console and SDMA work can take OWNER meanwhile.
+///
+/// A two-plane flip leases the slave pipe first (a no-op when one is
+/// already live) and plans both planes jointly. A joint plan the lit
+/// stream refuses drops the frame (its event completes without a latch),
+/// as a refused single-plane update does — it is not a failed flip.
 async fn flip_unlocked(
     mut owner: narf_lib::mutex::MutexGuard<'static, Option<boot::ColdBoot>>,
     kind: ArmedKind,
     external: u64,
-    update: Option<crate::amdgpu_navi22_plane::Update>,
+    plan: FlipPlan,
 ) -> Result<Latch, ScanError> {
     let boot = owner.as_mut().ok_or(ScanError::Busy)?;
     let before = boot.display_scanout()?.front().fb;
+    // optimize_bandwidth: what the update lowered follows a latched flip
+    // with a new plan — a single update, or any two-plane one.
+    let optimize = match &plan {
+        FlipPlan::Single(update) => update.is_some(),
+        FlipPlan::Two { .. } => true,
+    };
     // A placement other than the one shown is a plane update latched with
     // the address (commit_planes_for_stream); otherwise only the address.
-    let armed = match update {
-        Some(u) => boot.arm_display_plane(kind, external, &u).await?,
-        None => boot.arm_display_flip(kind, external)?,
+    let armed = match plan {
+        FlipPlan::Single(Some(u)) => boot.arm_display_plane(kind, external, &u).await?,
+        FlipPlan::Single(None) => boot.arm_display_flip(kind, external)?,
+        FlipPlan::Two {
+            primary,
+            overlay: arm,
+        } => {
+            if boot.display_overlay_pipe().is_none() {
+                boot.lease_display_overlay()?;
+            }
+            let Some(two) = boot
+                .plan_display_two_planes(&primary, &arm.request)
+                .map_err(trace_refusal)
+                .ok()
+            else {
+                return Ok(Latch::Dropped);
+            };
+            boot.arm_display_two_planes(kind, external, arm.address, &two, &arm.blend)
+                .await?
+        }
     };
     drop(owner);
     phase(Phase::Latch);
@@ -3207,7 +3398,7 @@ async fn flip_unlocked(
         match latch_step(boot.poll_display_flip(&armed))? {
             LatchStep::Latched => {
                 // optimize_bandwidth: what the update lowered follows now.
-                if update.is_some() {
+                if optimize {
                     if let Err(e) = boot.optimize_display_plane() {
                         use core::fmt::Write;
                         let _ = writeln!(
@@ -3294,10 +3485,13 @@ enum Direct {
 
 /// Flip the lit pipe to `frame`'s pinned client framebuffer in place, with
 /// its pitch, size and placement, and keep that pin until a later flip
-/// latches. A frame whose pipe changed while armed is dropped.
+/// latches. A frame whose pipe changed while armed is dropped. With an
+/// overlay, both planes flip together, and the overlay's pin is kept the
+/// same way.
 async fn present_direct(
     frame: &Frame,
     pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
+    overlay: Option<&frame_copy::OverlayFrame>,
 ) -> Result<Direct, ScanError> {
     phase(Phase::Owner);
     let mut owner = OWNER.lock().await;
@@ -3311,14 +3505,27 @@ async fn present_direct(
     // The frame's pitch, size and placement on the mode lit now (it can
     // change between choosing and taking OWNER).
     let request = frame_copy::direct_request(frame, (front.width, front.height));
-    let Ok(update) = plane_update(boot, &request) else {
-        return Ok(Direct::Refused);
+    // With an overlay, both planes are planned jointly in the flip: while
+    // one is live, `plan_plane` refuses every primary update, so no
+    // single-plane update is planned here.
+    let arm = overlay_arm(overlay, (front.width, front.height));
+    let plan = match arm {
+        Some(arm) => FlipPlan::Two {
+            primary: request,
+            overlay: arm,
+        },
+        None => {
+            let Ok(update) = plane_update(boot, &request) else {
+                return Ok(Direct::Refused);
+            };
+            FlipPlan::Single(update)
+        }
     };
     // No HDP step: display fetch reads VRAM through the MMHUB, not the
     // HDP read path the CPU copy samples (amdgpu_dm programs the address
     // after the fence wait alone). Requiring verified queues here would
     // disable native present during recovery for no reason.
-    match flip_unlocked(owner, ArmedKind::External, address, update).await {
+    match flip_unlocked(owner, ArmedKind::External, address, plan).await {
         Ok(Latch::Done {
             before, latched, ..
         }) => {
@@ -3326,6 +3533,12 @@ async fn present_direct(
             let released = PRESENT.shown.lock().latched_external(pin.clone());
             // Unpinned outside the IRQ-safe lock.
             drop(released);
+            if arm.is_some() {
+                if let Some(opin) = overlay.and_then(|o| o.bo.as_ref()) {
+                    let released = PRESENT.shown_overlay.lock().latched_external(opin.clone());
+                    drop(released);
+                }
+            }
             // Owned surfaces are both stale now; DIRTYFB damage restarts.
             PRESENT.damage.lock().forget();
             phase(Phase::Follow);
@@ -3337,6 +3550,11 @@ async fn present_direct(
             // The HUBP may still fetch either client buffer after a failed
             // flip: keep this one alive (the previous stays in `shown`).
             core::mem::forget(pin.clone());
+            // The slave HUBP may still fetch the overlay after a failed
+            // two-plane flip: keep its pin alive too.
+            if let Some(opin) = overlay.and_then(|o| o.bo.as_ref()) {
+                core::mem::forget(opin.clone());
+            }
             Err(e)
         }
     }
@@ -3355,9 +3573,12 @@ enum Blitted {
 /// Copy a pinned client framebuffer into the owned back surface with the
 /// kernel SDMA queue, then flip to it. OWNER is held only to read the back
 /// surface and to flip, never across the copy (the queue's worker takes it).
+/// With an overlay, the overlay is fetched in place beside the copied
+/// primary, and its pin is kept the same way as the direct path's.
 async fn present_blit(
     frame: &Frame,
     pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
+    overlay: Option<&frame_copy::OverlayFrame>,
 ) -> Result<Blitted, ScanError> {
     frame_copy::wait_rendered(pin).await?;
     let back = {
@@ -3414,26 +3635,54 @@ async fn present_blit(
     if boot.display_scanout()?.back().map(|b| b.address) != Some(back.address) {
         return Ok(Blitted::Dropped);
     }
-    let Some(update) = frame_copy::copied_request(frame, &back.fb)
+    let Some(request) = frame_copy::copied_request(frame, &back.fb)
         .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)
-        .and_then(|r| plane_update(boot, &r))
         .map_err(trace_refusal)
         .ok()
     else {
         return Ok(Blitted::Dropped);
     };
-    let (before, after, latched) = match flip_unlocked(owner, ArmedKind::Back, 0, update).await? {
-        Latch::Done {
+    // With an overlay, both planes are planned jointly in the flip (see
+    // `present_direct`).
+    let arm = overlay_arm(overlay, (back.fb.width, back.fb.height));
+    let plan = match arm {
+        Some(arm) => FlipPlan::Two {
+            primary: request,
+            overlay: arm,
+        },
+        None => {
+            let Some(update) = plane_update(boot, &request).map_err(trace_refusal).ok() else {
+                return Ok(Blitted::Dropped);
+            };
+            FlipPlan::Single(update)
+        }
+    };
+    let (before, after, latched) = match flip_unlocked(owner, ArmedKind::Back, 0, plan).await {
+        Ok(Latch::Done {
             before,
             after,
             latched,
-        } => (before, after, latched),
-        Latch::Dropped => return Ok(Blitted::Dropped),
+        }) => (before, after, latched),
+        Ok(Latch::Dropped) => return Ok(Blitted::Dropped),
+        Err(e) => {
+            // The slave HUBP may still fetch the overlay after a failed
+            // two-plane flip: keep its pin alive.
+            if let Some(opin) = overlay.and_then(|o| o.bo.as_ref()) {
+                core::mem::forget(opin.clone());
+            }
+            return Err(e);
+        }
     };
     // An owned surface is shown: the client framebuffer the pipe left is
     // unfetched, and DIRTYFB damage no longer describes either surface.
     let released = PRESENT.shown.lock().latched_owned();
     drop(released);
+    if arm.is_some() {
+        if let Some(opin) = overlay.and_then(|o| o.bo.as_ref()) {
+            let released = PRESENT.shown_overlay.lock().latched_external(opin.clone());
+            drop(released);
+        }
+    }
     PRESENT.damage.lock().forget();
     static TRACED: AtomicBool = AtomicBool::new(false);
     if !TRACED.swap(true, Ordering::Relaxed) {
@@ -4003,5 +4252,60 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi22/monitor",
         navi22_display_monitor_sleeps_until_an_event
+    );
+
+    /// Only display 0 lights a slave pipe: an overlay on any other
+    /// display is refused, whatever the lit stream.
+    fn navi22_planes_admitted_refuses_overlays_off_display_zero() -> TestResult {
+        use crate::amdgpu_dcn401_otg::{Blend, PlaneSurface, SurfaceFormat};
+        use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+        use crate::amdgpu_navi48_boot::{OverlayPlane, PlaneGeometry, PlaneSetup};
+        use crate::drm_native_planes::DisplayPlanes;
+        let planes = DisplayPlanes {
+            crtc_id: 2,
+            setup: PlaneSetup {
+                primary: None,
+                overlays: [
+                    Some(OverlayPlane {
+                        geometry: PlaneGeometry {
+                            src_x: 0,
+                            src_y: 0,
+                            width: 480,
+                            height: 270,
+                            dst: Rect::new(0, 0, 480, 270),
+                            rotation: Rotation::R0,
+                            blend: Blend::default_for(SurfaceFormat::Argb8888),
+                            surface: PlaneSurface::LINEAR,
+                            fb_size: (480, 270),
+                            client: true,
+                        },
+                        format: SurfaceFormat::Argb8888,
+                        underlay: false,
+                        plane: 0x44,
+                    }),
+                    None,
+                    None,
+                ],
+                ..PlaneSetup::NONE
+            },
+            primary_format: SurfaceFormat::Xrgb8888.fourcc(),
+            overlays: [Some(0x44), None, None],
+            pitches: [1920 * 4, 480 * 4, 0, 0],
+        };
+        if planes_admitted(1, Some((1920, 1080)), &planes)
+            != Err(crate::amdgpu_navi22_plane::why::OVERLAY_DISPLAY)
+        {
+            return TestResult::Fail("overlay off display 0 admitted");
+        }
+        // Display 0 admits it on its static checks (an overlay-only
+        // commit plans two against the shown primary at present time).
+        if planes_admitted(0, Some((1920, 1080)), &planes).is_err() {
+            return TestResult::Fail("overlay on display 0 refused");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_planes_admitted_refuses_overlays_off_display_zero
     );
 }

@@ -6623,9 +6623,10 @@ fn atomic_commit(
                             .is_some_and(|current| current.connector == n.connector)
                     })
                     // A plane change only reaches the format search where
-                    // the search plans the planes (Navi48). Navi22's
-                    // validates the stream alone, which no plane changes,
-                    // and its display admitted the planes above.
+                    // the search plans the planes (Navi48). Navi22's search
+                    // checks the planes statically and budgets their pipes,
+                    // but no plane change alone triggers it — and its
+                    // display admitted the planes above, exactly.
                     || (crate::amdgpu_native_kms::output_search_admits_planes()
                         && native_displays.iter().any(|d| {
                             native_output_on_crtc(&card, d.crtc_id, None)
@@ -6991,9 +6992,11 @@ fn atomic_commit(
                         .find(|p| p.primary_of == Some(dp.crtc_id))
                         .and_then(|p| native_frame(&card, p.id))
                         .map(|f| placed_primary_frame(&card, f, dp));
-                    let overlays = dp
-                        .overlays
-                        .map(|id| id.and_then(|id| native_frame(&card, id)));
+                    let overlays = core::array::from_fn(|k| {
+                        dp.overlays[k]
+                            .and_then(|id| native_frame(&card, id))
+                            .map(|f| placed_overlay_frame(&card, f, dp, k))
+                    });
                     let ticket = flip_tickets
                         .iter()
                         .find(|(id, _)| *id == dp.crtc_id)
@@ -8906,9 +8909,11 @@ fn handle_setplane_decoded_native(
                 if let Some(f) = &primary {
                     crate::amdgpu_native_kms::request_display_format(display, f.format);
                 }
-                let overlays = dp.overlays.map(|id| {
-                    id.filter(|&id| id == plane_id)
+                let overlays = core::array::from_fn(|k| {
+                    dp.overlays[k]
+                        .filter(|&id| id == plane_id)
                         .and_then(|_| native_plane_frame(&card, &state.planes[0], &prepared))
+                        .map(|f| placed_overlay_frame(&card, f, dp, k))
                 });
                 frames.push((dp.crtc_id, primary, overlays));
             }
@@ -9010,6 +9015,33 @@ fn placed_primary_frame(
     }
 }
 
+/// `placed_primary_frame` for overlay `k`: its placement from the plane
+/// setup, and its blend state — the slave MPCC's blend config, which the
+/// presenter programs from the frame. Navi48's frames are left as they
+/// are: its presenter reads the setup itself.
+#[cfg(feature = "amdgpu")]
+fn placed_overlay_frame(
+    card: &crate::drm::card::Card,
+    frame: crate::drm::card::PlaneFrame,
+    planes: &crate::drm_native_planes::DisplayPlanes,
+    k: usize,
+) -> crate::drm::card::PlaneFrame {
+    if !crate::drm_native_planes::is_dcn30(card) {
+        return frame;
+    }
+    let Some(o) = planes.setup.overlays.get(k).and_then(|o| o.as_ref()) else {
+        return frame;
+    };
+    let blend = o.geometry.blend;
+    crate::drm::card::PlaneFrame {
+        placement: planes.overlay_placement(k),
+        per_pixel_alpha: blend.per_pixel_alpha,
+        premultiplied: blend.premultiplied,
+        global_alpha: blend.global_alpha,
+        ..frame
+    }
+}
+
 /// Framebuffer `fb` as the presenter shows it: a dumb buffer's backing, or
 /// its GEM buffer with the pin `prepared` took on it, which a plane scans
 /// out in place until a later flip latches past it. None without either.
@@ -9052,6 +9084,10 @@ fn fb_frame(fb: &crate::drm::card::Framebuffer, phys: u64) -> crate::drm::card::
         modifier: fb.modifier,
         bo: None,
         placement: None,
+        // Opaque until a placed frame fills the plane's blend state in.
+        per_pixel_alpha: false,
+        premultiplied: false,
+        global_alpha: None,
     }
 }
 

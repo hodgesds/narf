@@ -349,6 +349,23 @@ impl BlendConfig {
             ..Self::opaque()
         }
     }
+    /// The `dcn20_update_mpcc` composition for a DRM plane's blend state:
+    /// per-pixel alpha (with a plane-alpha gain when one is set), else the
+    /// opaque composition with the plane alpha in the global-alpha field.
+    /// linux: dcn20_hwseq.c:dcn20_update_mpcc (global_gain 0xff unless
+    /// per-pixel alpha with a gain; GLOBAL_ALPHA mode without per-pixel
+    /// alpha; the gain in both fields with per-pixel alpha).
+    pub const fn from_blend(blend: &crate::amdgpu_dcn401_otg::Blend) -> Self {
+        match (blend.per_pixel_alpha, blend.global_alpha) {
+            (true, None) => Self::per_pixel_alpha(blend.premultiplied),
+            (true, Some(gain)) => Self::per_pixel_alpha_with_gain(blend.premultiplied, gain),
+            (false, None) => Self::opaque(),
+            (false, Some(alpha)) => Self {
+                global_alpha: alpha,
+                ..Self::opaque()
+            },
+        }
+    }
 }
 /// `MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA` (`inc/hw/mpc.h`), which
 /// `dcn20_hwseq.c` selects for a plane with no per-pixel alpha, paired with

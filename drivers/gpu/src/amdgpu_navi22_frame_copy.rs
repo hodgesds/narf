@@ -8,43 +8,57 @@ use crate::amdgpu_present_damage as damage;
 use crate::{amdgpu_gem::GemPlacement, amdgpu_navi48_platform::PlaneFrame};
 use alloc::sync::Arc;
 
+/// The checks every plane frame a HUBP fetches passes: linear 8888,
+/// single-plane, non-zero, a pitch the HUBP holds, SRC inside the
+/// framebuffer, and the extent within the pinned buffer (or a
+/// 4-byte-aligned physical address for a dumb one).
+fn frame_valid(p: &PlaneFrame) -> bool {
+    if !matches!(p.format, 0x3432_5258 | 0x3432_5241)
+        || p.modifier != 0
+        || p.chroma_pitch != 0
+        || p.offsets[1] != 0
+        || p.width == 0
+        || p.height == 0
+        || p.pitch % 4 != 0
+        || p.pitch < p.width.checked_mul(4).unwrap_or(u32::MAX)
+        || p.offsets[0] % 4 != 0
+    {
+        return false;
+    }
+    let Some(end) = u64::from(p.offsets[0])
+        .checked_add(u64::from(p.height - 1) * u64::from(p.pitch))
+        .and_then(|e| e.checked_add(u64::from(p.width) * 4))
+    else {
+        return false;
+    };
+    if let Some(pin) = p.bo.as_ref() {
+        if end > pin.byte_len() {
+            return false;
+        }
+    } else if p.phys == 0 || p.phys % 4 != 0 || p.phys.checked_add(end).is_none() {
+        return false;
+    }
+    if let Some(placement) = p.placement {
+        let (sx, sy, sw, sh) = placement.src;
+        let (_, _, dw, dh) = placement.dst;
+        let fits = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
+        if sw == 0
+            || sh == 0
+            || dw == 0
+            || dh == 0
+            || !fits(sx, sw, p.width)
+            || !fits(sy, sh, p.height)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 impl Frame {
     pub(super) fn from_plane(p: PlaneFrame, ticket: Option<u64>) -> Option<Self> {
-        if !matches!(p.format, 0x3432_5258 | 0x3432_5241)
-            || p.modifier != 0
-            || p.chroma_pitch != 0
-            || p.offsets[1] != 0
-            || p.width == 0
-            || p.height == 0
-            || p.pitch % 4 != 0
-            || p.pitch < p.width.checked_mul(4)?
-            || p.offsets[0] % 4 != 0
-        {
+        if !frame_valid(&p) {
             return None;
-        }
-        let end = u64::from(p.offsets[0])
-            .checked_add(u64::from(p.height - 1) * u64::from(p.pitch))?
-            .checked_add(u64::from(p.width) * 4)?;
-        if let Some(pin) = p.bo.as_ref() {
-            if end > pin.byte_len() {
-                return None;
-            }
-        } else if p.phys == 0 || p.phys % 4 != 0 || p.phys.checked_add(end).is_none() {
-            return None;
-        }
-        if let Some(placement) = p.placement {
-            let (sx, sy, sw, sh) = placement.src;
-            let (_, _, dw, dh) = placement.dst;
-            let fits = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
-            if sw == 0
-                || sh == 0
-                || dw == 0
-                || dh == 0
-                || !fits(sx, sw, p.width)
-                || !fits(sy, sh, p.height)
-            {
-                return None;
-            }
         }
         Some(Self {
             phys: p.phys,
@@ -56,6 +70,51 @@ impl Frame {
             ticket,
             damage: None,
             placement: p.placement,
+            overlay: None,
+        })
+    }
+}
+
+/// One overlay plane's framebuffer, as the slave HUBP fetches it in
+/// place: the same linear 8888 framebuffer as a primary, with its own
+/// placement and blend state. A dumb overlay is valid here but never
+/// scanned out in place — [`overlay_direct`] refuses it, and the
+/// presenter shows the primary alone instead.
+#[derive(Clone, Debug)]
+pub(super) struct OverlayFrame {
+    pub(super) pitch: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) offset: u64,
+    pub(super) bo: Option<Arc<crate::amdgpu_gem::ScanoutPin>>,
+    pub(super) placement: Option<crate::drm::card::Placement>,
+    pub(super) per_pixel_alpha: bool,
+    pub(super) premultiplied: bool,
+    pub(super) global_alpha: Option<u8>,
+}
+impl OverlayFrame {
+    pub(super) fn from_plane(p: PlaneFrame) -> Option<Self> {
+        if !frame_valid(&p) {
+            return None;
+        }
+        Some(Self {
+            pitch: p.pitch,
+            width: p.width,
+            height: p.height,
+            offset: u64::from(p.offsets[0]),
+            bo: p.bo,
+            placement: p.placement,
+            per_pixel_alpha: p.per_pixel_alpha,
+            premultiplied: p.premultiplied,
+            global_alpha: p.global_alpha,
+        })
+    }
+    /// The slave MPCC's blend config for this overlay's DRM blend state.
+    pub(super) fn blend_config(&self) -> crate::amdgpu_dcn_plane::BlendConfig {
+        crate::amdgpu_dcn_plane::BlendConfig::from_blend(&crate::amdgpu_dcn401_otg::Blend {
+            per_pixel_alpha: self.per_pixel_alpha,
+            premultiplied: self.premultiplied,
+            global_alpha: self.global_alpha,
         })
     }
 }
@@ -100,6 +159,21 @@ pub(super) fn direct_request(frame: &Frame, mode: Mode) -> crate::amdgpu_navi22_
     }
 }
 
+/// What the slave pipe fetches for `overlay` scanned out in place: the
+/// same request, from the overlay's own framebuffer and placement.
+pub(super) fn overlay_direct_request(
+    overlay: &OverlayFrame,
+    mode: Mode,
+) -> crate::amdgpu_navi22_plane::Request {
+    crate::amdgpu_navi22_plane::Request {
+        pitch: overlay.pitch / 4,
+        width: overlay.width,
+        height: overlay.height,
+        src: overlay.placement.map_or((0, 0, mode.0, mode.1), |p| p.src),
+        dst: overlay.placement.map_or((0, 0, mode.0, mode.1), |p| p.dst),
+    }
+}
+
 /// Where a frame that cannot be fetched in place is copied: its SRC
 /// rectangle, unscaled, to the origin of the owned back surface `back`,
 /// which the pipe then shows in the frame's CRTC rectangle. None when the
@@ -132,12 +206,31 @@ pub(super) fn copied_request(
 /// placement.
 pub(super) fn direct(frame: &Frame) -> Result<u64, Ineligible> {
     let pin = frame.bo.as_ref().ok_or(Ineligible::NotGem)?;
-    if frame.pitch / 4 > crate::amdgpu_dcn_plane::MAX_DIMENSION + 1 {
+    direct_address(pin, frame.offset, frame.pitch)
+}
+
+/// The GPU address the slave HUBP fetches `overlay` from when it can be
+/// scanned out in place. A dumb overlay has no pin: refused, and the
+/// presenter shows the primary alone instead.
+pub(super) fn overlay_direct(overlay: &OverlayFrame) -> Result<u64, Ineligible> {
+    let pin = overlay.bo.as_ref().ok_or(Ineligible::NotGem)?;
+    direct_address(pin, overlay.offset, overlay.pitch)
+}
+
+/// The fetch address for a pinned framebuffer at `offset` with `pitch`:
+/// the pin's address plus the offset, on a 256-byte request boundary,
+/// with the pitch inside the HUBP's 14-bit field.
+fn direct_address(
+    pin: &crate::amdgpu_gem::ScanoutPin,
+    offset: u64,
+    pitch: u32,
+) -> Result<u64, Ineligible> {
+    if pitch / 4 > crate::amdgpu_dcn_plane::MAX_DIMENSION + 1 {
         return Err(Ineligible::Pitch);
     }
     let address = pin
         .address()
-        .checked_add(frame.offset)
+        .checked_add(offset)
         .ok_or(Ineligible::Alignment)?;
     if address == 0 || address % crate::amdgpu_dcn30_flip::ADDRESS_ALIGN != 0 {
         return Err(Ineligible::Alignment);
@@ -154,6 +247,11 @@ pub(super) struct ShownPin(Option<Arc<crate::amdgpu_gem::ScanoutPin>>);
 impl ShownPin {
     pub(super) const fn new() -> Self {
         Self(None)
+    }
+    /// Whether a client framebuffer is still fetched (an overlay is live,
+    /// for the overlay pin).
+    pub(super) fn is_live(&self) -> bool {
+        self.0.is_some()
     }
     /// A flip to `pin` latched; returns the pin it replaced, now unfetched.
     pub(super) fn latched_external(
@@ -550,6 +648,67 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/amdgpu/navi22", navi22_placed_primary_requests);
+
+    /// An overlay frame is the same linear 8888 framebuffer as a primary,
+    /// with its own placement and blend state: its request is its own
+    /// framebuffer's, and its fetch address is its pin's plus its offset.
+    /// A dumb overlay is valid as a frame but never fetched in place.
+    fn navi22_overlay_frame_requests() -> TestResult {
+        use crate::drm::card::Placement;
+        let fixture = Fixture::new();
+        let object = fixture.object();
+        let pin = Arc::new(object.pin_scanout().unwrap());
+        let mut plane = PlaneFrame::linear(0, 256, 32, 16, 0x3432_5258);
+        plane.bo = Some(pin.clone());
+        plane.placement = Some(Placement {
+            src: (0, 0, 32, 16),
+            dst: (100, 50, 64, 32),
+        });
+        plane.per_pixel_alpha = true;
+        plane.premultiplied = false;
+        plane.global_alpha = Some(0x80);
+        let Some(overlay) = OverlayFrame::from_plane(plane.clone()) else {
+            return TestResult::Fail("overlay frame refused");
+        };
+        let mode = (1920, 1080);
+        let r = overlay_direct_request(&overlay, mode);
+        if (r.pitch, r.width, r.height, r.src, r.dst)
+            != (64, 32, 16, (0, 0, 32, 16), (100, 50, 64, 32))
+        {
+            return TestResult::Fail("overlay request");
+        }
+        if overlay_direct(&overlay) != Ok(pin.address()) {
+            return TestResult::Fail("overlay fetch address");
+        }
+        if overlay.blend_config()
+            != crate::amdgpu_dcn_plane::BlendConfig::per_pixel_alpha_with_gain(false, 0x80)
+        {
+            return TestResult::Fail("overlay blend config");
+        }
+        // A dumb overlay is a valid frame, but no pin fetches it.
+        let dumb =
+            OverlayFrame::from_plane(PlaneFrame::linear(0x8000_0000, 256, 32, 16, 0x3432_5258))
+                .unwrap();
+        if overlay_direct(&dumb) != Err(Ineligible::NotGem) {
+            return TestResult::Fail("dumb overlay fetched in place");
+        }
+        // The same validation as a primary: a bad format or an SRC past
+        // the framebuffer is refused.
+        plane.format = 0x3033_5258;
+        if OverlayFrame::from_plane(plane.clone()).is_some() {
+            return TestResult::Fail("overlay accepted a 10-bit format");
+        }
+        plane.format = 0x3432_5258;
+        plane.placement = Some(Placement {
+            src: (10, 0, 32, 16),
+            dst: (0, 0, 32, 16),
+        });
+        if OverlayFrame::from_plane(plane).is_some() {
+            return TestResult::Fail("overlay SRC past the framebuffer accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/amdgpu/navi22", navi22_overlay_frame_requests);
 
     /// A relight lights the pipe on its cleared owned surface; the committed
     /// primary is shown again from a copy that completes no event and

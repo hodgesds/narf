@@ -387,38 +387,106 @@ kernel_test_in!(
     navi22_plane_admits_what_the_presenter_programs
 );
 
-/// An enabled overlay is refused at the check while the presenter lights
-/// no slave pipe from a commit: the compositor composites instead.
-fn navi22_plane_refuses_overlays_it_does_not_light() -> TestResult {
+/// One overlay is admitted on the lit stream when it is a GEM 8888
+/// framebuffer in place, unrotated, above the primary, and its joint
+/// two-plane plan fits the lit stream's clocks; anything else names why.
+fn navi22_plane_admits_one_overlay() -> TestResult {
     use crate::amdgpu_dcn401_otg::{Blend, PlaneSurface, SurfaceFormat};
     use crate::amdgpu_dcn401_spl::{Rect, Rotation};
     use crate::amdgpu_navi48_boot::{OverlayPlane, PlaneGeometry};
-    let mut planes = drm_planes((1920, 1080), None);
-    planes.setup.overlays[0] = Some(OverlayPlane {
-        geometry: PlaneGeometry {
-            src_x: 0,
-            src_y: 0,
-            width: 480,
-            height: 270,
-            dst: Rect::new(720, 405, 960, 540),
-            rotation: Rotation::R0,
-            blend: Blend::default_for(SurfaceFormat::Argb8888),
-            surface: PlaneSurface::LINEAR,
-            fb_size: (480, 270),
-            client: true,
-        },
-        format: SurfaceFormat::Argb8888,
-        underlay: false,
-        plane: 0x44,
-    });
-    planes.overlays[0] = Some(0x44);
-    planes.pitches[1] = 480 * 4;
-    if admit(None, None, &planes) != Err(why::OVERLAY) {
-        return TestResult::Fail("overlay admitted though nothing lights it");
+    let t = timing(148_500, (1920, 2200, 88, 44), (1080, 1125, 4, 5));
+    let basis = Basis {
+        timing: t,
+        vco_khz: 3_650_000,
+        soc: soc(),
+        lit: lit(&t),
+        odm: false,
+    };
+    let lit_mode = Some((1920, 1080));
+    // A 480x270 ARGB overlay upscaled 2x over the full-frame primary.
+    let with_overlay = |planes: crate::drm_native_planes::DisplayPlanes| {
+        let mut planes = planes;
+        planes.setup.overlays[0] = Some(OverlayPlane {
+            geometry: PlaneGeometry {
+                src_x: 0,
+                src_y: 0,
+                width: 480,
+                height: 270,
+                dst: Rect::new(720, 405, 960, 540),
+                rotation: Rotation::R0,
+                blend: Blend::default_for(SurfaceFormat::Argb8888),
+                surface: PlaneSurface::LINEAR,
+                fb_size: (480, 270),
+                client: true,
+            },
+            format: SurfaceFormat::Argb8888,
+            underlay: false,
+            plane: 0x44,
+        });
+        planes.overlays[0] = Some(0x44);
+        planes.pitches[1] = 480 * 4;
+        planes
+    };
+    let planes = with_overlay(drm_planes((1920, 1080), None));
+    if admit(Some(&basis), lit_mode, &planes) != Ok(()) {
+        return TestResult::Fail("valid overlay refused");
+    }
+    // An overlay-only commit is admitted on its static checks alone: the
+    // joint plan is against the shown primary.
+    let mut only = planes;
+    only.setup.primary = None;
+    if admit(Some(&basis), lit_mode, &only) != Ok(()) {
+        return TestResult::Fail("overlay-only commit refused");
+    }
+    // A second overlay: one slave per stream.
+    let mut two = planes;
+    two.setup.overlays[1] = two.setup.overlays[0];
+    two.overlays[1] = Some(0x45);
+    two.pitches[2] = 480 * 4;
+    if admit(Some(&basis), lit_mode, &two) != Err(why::OVERLAY_COUNT) {
+        return TestResult::Fail("second overlay admitted");
+    }
+    // Each static refusal names why.
+    let mut deep = planes;
+    deep.setup.overlays[0].as_mut().unwrap().format = SurfaceFormat::Xrgb2101010;
+    if admit(Some(&basis), lit_mode, &deep) != Err(why::OVERLAY_FORMAT) {
+        return TestResult::Fail("non-8888 overlay admitted");
+    }
+    let mut under = planes;
+    under.setup.overlays[0].as_mut().unwrap().underlay = true;
+    if admit(Some(&basis), lit_mode, &under) != Err(why::OVERLAY_UNDERLAY) {
+        return TestResult::Fail("underlay overlay admitted");
+    }
+    let mut turned = planes;
+    turned.setup.overlays[0].as_mut().unwrap().geometry.rotation = Rotation::R180;
+    if admit(Some(&basis), lit_mode, &turned) != Err(why::OVERLAY_ROTATION) {
+        return TestResult::Fail("rotated overlay admitted");
+    }
+    let mut dumb = planes;
+    dumb.setup.overlays[0].as_mut().unwrap().geometry.client = false;
+    if admit(Some(&basis), lit_mode, &dumb) != Err(why::OVERLAY_CLIENT) {
+        return TestResult::Fail("dumb overlay admitted");
+    }
+    // The joint plan refuses what the single plan would: a malformed
+    // overlay, and one needing more clock than the lit stream runs at.
+    let mut outside = planes;
+    outside.setup.overlays[0].as_mut().unwrap().geometry.src_x = 100;
+    if admit(Some(&basis), lit_mode, &outside) != Err(why::OVERLAY_MALFORMED) {
+        return TestResult::Fail("malformed overlay admitted");
+    }
+    let mut three = planes;
+    let o = three.setup.overlays[0].as_mut().unwrap();
+    o.geometry.fb_size = (5760, 3240);
+    o.geometry.width = 5760;
+    o.geometry.height = 3240;
+    o.geometry.dst = Rect::new(0, 0, 1920, 1080);
+    three.pitches[1] = 5760 * 4;
+    if admit(Some(&basis), lit_mode, &three) != Err(why::OVERLAY_CLOCK) {
+        return TestResult::Fail("over-clock overlay admitted");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-plane",
-    navi22_plane_refuses_overlays_it_does_not_light
+    navi22_plane_admits_one_overlay
 );

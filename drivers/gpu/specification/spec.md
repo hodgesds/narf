@@ -10626,13 +10626,36 @@ being the refusal trace's `why=`). Navi22's admission is
 presenter programs): a linear 8888 primary, unrotated, blended None or
 Pre-multiplied; a positioned or scaled one must plan on the lit pipe
 (`Basis::plan`: resource_build_scaling_params, then
-dcn30_validate_bandwidth), each refusal naming its rule; an enabled
-overlay is refused (LINUX-GAP: the slave-pipe programming of
-`Pipeline::program_two_planes` is not reached from a DRM commit). A
-plane change does not rerun Navi22's HDMI format search, which validates
-the stream alone. The presenter takes a primary's placement with its
+dcn30_validate_bandwidth), each refusal naming its rule; one overlay is
+admitted on display 0 beside the primary (see below). A
+plane change does not rerun Navi22's HDMI format search, which checks
+the planes statically and budgets their pipes (see below). The presenter
+takes a primary's placement with its
 frame (`DisplayPlanes::primary_placement`, and
 `committed_primary_placement` for a legacy PAGE_FLIP).
+
+One overlay is admitted on display 0 beside the primary, on the lit
+stream's single slave pipe (DCN30 `max_slave_planes = 2`, one slave per
+stream; `dcn30_resource.c` sets no explicit `max_streams`, and the
+four published CRTCs stand): a GEM 8888 framebuffer in place, LINEAR
+tiling, R0 rotation, above the primary in z-order (the slave MPCC links
+above the primary's, so an underlay is refused), with its joint
+two-plane DML30 plan fitting the lit stream's clock and watermark
+headroom (`Basis::plan_two`, `admit`). The presenter leases the free
+pipe at present time (`ColdBoot::lease_display_overlay`), arms both
+planes together through the one flip funnel (`FlipPlan::Two`), and
+releases the overlay when a commit carries none, on relight, on
+withdraw, and on the return to the owned front; while one is live, every
+primary update goes through the two-plane path (`plan_plane` refuses).
+The overlay's placement and blend ride its frame (`DisplayPlanes::
+overlay_placement`, `PlaneFrame` blend fields,
+`BlendConfig::from_blend` — `dcn20_update_mpcc`'s composition). Navi22's
+HDMI format search checks the planes statically (one overlay, same
+static rules) and budgets their pipes against DCN30's six, while the
+exact joint plan stays in `display_admits_planes`, which the atomic
+check always runs (`output_search_admits_planes` stays false for
+Navi22). Cursor planes take ids 0x46 and up, after the overlay ids
+0x44-0x45, with no gap. `MIN_VIEWPORT_SIZE` is 12 (`dc.h`).
 
 Color properties stay on any YUV plane including overlays (the tree's
 deviation from Linux, which attaches them to the primary only); matching

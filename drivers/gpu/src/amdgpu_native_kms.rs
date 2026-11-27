@@ -189,7 +189,9 @@ pub fn display_admits_planes(
 /// Whether the HDMI output format search ([`output_formats_supported`])
 /// also admits the output's planes, so a CRTC driving HDMI needs no
 /// separate [`display_admits_planes`]. Navi48's search plans the planes
-/// with each candidate format; Navi22's validates the stream alone.
+/// with each candidate format; Navi22's checks them statically and
+/// budgets their pipes, while the exact joint plan stays in
+/// [`display_admits_planes`], which the atomic check always runs.
 pub fn output_search_admits_planes() -> bool {
     !navi22()
 }
@@ -205,9 +207,9 @@ pub fn primary_placement_admitted(
     !navi22() || crate::amdgpu_navi22_platform::placement_admitted(fb, mode, src, dst)
 }
 /// Present an atomic commit's planes on display `display`. Navi22 shows
-/// its primary (with the frame's placement); an overlay frame is never
-/// admitted there ([`display_admits_planes`]), and one that arrives
-/// anyway completes its event without being shown.
+/// its primary (with the frame's placement) with one overlay beside it on
+/// the slave pipe; a second overlay completes its event without being
+/// shown (admission already refused it).
 pub fn present_planes(
     display: u8,
     primary: Option<crate::amdgpu_navi48_platform::PlaneFrame>,
@@ -216,11 +218,15 @@ pub fn present_planes(
     ticket: Option<u64>,
 ) -> bool {
     if navi22() {
-        if overlays.iter().any(Option::is_some) {
+        // One overlay rides the slave pipe beside the primary; more than
+        // one is refused at the check — this is defense in depth (the
+        // primary is still shown, the extra overlays dropped).
+        let overlay = overlays.iter().flatten().next().cloned();
+        if overlays.iter().flatten().count() > 1 {
             crate::drm::card::complete_flip_ticket(display, ticket);
             return false;
         }
-        crate::amdgpu_navi22_platform::present_plane(display, primary, ticket)
+        crate::amdgpu_navi22_platform::present_planes(display, primary, overlay, ticket)
     } else {
         crate::amdgpu_navi48_platform::present_planes(display, primary, overlays, ticket)
     }
