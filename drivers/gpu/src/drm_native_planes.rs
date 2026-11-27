@@ -751,6 +751,20 @@ impl DisplayPlanes {
             ),
         })
     }
+    /// Where overlay `k` shows: its SRC and CRTC rectangles. None for no
+    /// overlay at that slot, or one whose CRTC rectangle does not fit.
+    pub fn overlay_placement(&self, k: usize) -> Option<crate::drm::card::Placement> {
+        let g = self.setup.overlays.get(k)?.as_ref()?.geometry;
+        Some(crate::drm::card::Placement {
+            src: (g.src_x, g.src_y, g.width, g.height),
+            dst: (
+                g.dst.x,
+                g.dst.y,
+                u32::try_from(g.dst.width).ok()?,
+                u32::try_from(g.dst.height).ok()?,
+            ),
+        })
+    }
 }
 
 /// Plane `id` as the request leaves it: its requested state, else its
@@ -1871,6 +1885,16 @@ mod tests {
         assert_eq!(g.geometry.surface.color, YuvColor::Bt601);
         assert_eq!(g.geometry.surface.tiling, Tiling::LINEAR);
         assert!(g.geometry.whole_framebuffer(g.format));
+        // The overlay's placement is its SRC and CRTC rectangles, for
+        // the presenter to program the slave pipe with; no second slot.
+        assert_eq!(
+            out[0].overlay_placement(0),
+            Some(crate::drm::card::Placement {
+                src: (320, 180, 640, 360),
+                dst: (100, 50, 960, 540),
+            })
+        );
+        assert_eq!(out[0].overlay_placement(1), None);
         // The tiled primary shown whole at the mode is still placed.
         let mut st = AtomicState::default();
         st.crtcs.push(crate::drm::atomic::CrtcState {

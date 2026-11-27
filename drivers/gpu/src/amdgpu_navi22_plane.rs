@@ -322,7 +322,29 @@ pub mod why {
     pub const ODM: &str =
         "primary plane placement: DC refuses it on the lit stream (dc_validate_global_state): the stream is split across ODM pipes (LINUX-GAP)";
     pub const OVERLAY: &str =
-        "overlay plane: Navi22 does not light a slave pipe from a DRM commit yet (LINUX-GAP: dc_validate_global_state admits it)";
+        "primary plane placement: a slave overlay is live, so place through the two-plane path, not the single-plane one — the single plan's clocks and watermarks do not budget the overlay (dc_validate_global_state)";
+    pub const OVERLAY_COUNT: &str =
+        "overlay planes: Navi22 lights at most one slave pipe per stream (dc_validate_global_state: max_slave_planes = 2, one slave per stream)";
+    pub const OVERLAY_FORMAT: &str =
+        "overlay plane FB_ID: not a linear 8888 framebuffer (LINUX-GAP: Navi22 presents XRGB8888/ARGB8888 overlays only)";
+    pub const OVERLAY_UNDERLAY: &str =
+        "overlay plane 'zpos': below the primary's, but the slave MPCC links above the primary's in the tree (LINUX-GAP: dcn20_update_mpcc would place it below)";
+    pub const OVERLAY_ROTATION: &str =
+        "overlay plane 'rotation': Navi22 scans out unrotated planes only (LINUX-GAP: hubp2_program_rotation)";
+    pub const OVERLAY_CLIENT: &str =
+        "overlay plane FB_ID: a dumb-buffer overlay has no GEM pin to scan out in place (LINUX-GAP: no staging surface exists for a dumb overlay)";
+    pub const OVERLAY_DISPLAY: &str =
+        "overlay plane: only display 0 lights a slave pipe (dc_validate_global_state: one lit stream)";
+    pub const OVERLAY_MALFORMED: &str =
+        "overlay plane placement: DC refuses it on the lit stream (dc_validate_global_state): SRC outside the framebuffer or a pitch the HUBP cannot hold";
+    pub const OVERLAY_GEOMETRY: &str =
+        "overlay plane placement: DC refuses it on the lit stream (dc_validate_global_state): resource_build_scaling_params";
+    pub const OVERLAY_MODE: &str =
+        "overlay plane placement: DC refuses it on the lit stream (dc_validate_global_state): dcn30_validate_bandwidth";
+    pub const OVERLAY_CLOCK: &str =
+        "overlay plane placement: DC refuses it on the lit stream (dc_validate_global_state): needs more DISPCLK/DPPCLK than the stream runs at (LINUX-GAP: dcn3_update_clocks)";
+    pub const OVERLAY_ODM: &str =
+        "overlay plane placement: DC refuses it on the lit stream (dc_validate_global_state): the stream is split across ODM pipes (LINUX-GAP)";
 }
 
 /// The text for a placement [`Refusal`].
@@ -333,6 +355,19 @@ pub const fn refusal_why(refusal: Refusal) -> &'static str {
         Refusal::Mode(_) => why::MODE,
         Refusal::Clock => why::CLOCK,
         Refusal::Odm => why::ODM,
+        Refusal::Overlay => why::OVERLAY,
+    }
+}
+
+/// The text for an overlay placement [`Refusal`]: the same DC refusal,
+/// named for the overlay plane rather than the primary.
+pub const fn refusal_why_overlay(refusal: Refusal) -> &'static str {
+    match refusal {
+        Refusal::Invalid => why::OVERLAY_MALFORMED,
+        Refusal::Geometry(_) => why::OVERLAY_GEOMETRY,
+        Refusal::Mode(_) => why::OVERLAY_MODE,
+        Refusal::Clock => why::OVERLAY_CLOCK,
+        Refusal::Odm => why::OVERLAY_ODM,
         Refusal::Overlay => why::OVERLAY,
     }
 }
@@ -353,9 +388,21 @@ pub const fn refusal_why(refusal: Refusal) -> &'static str {
 /// the display has not lit yet), the placement is validated by the modeset
 /// that lights it.
 ///
-/// An enabled overlay is refused: the presenter does not lease and program
-/// the slave pipe from a commit ([`plan_two`] and
-/// `Pipeline::program_two_planes` exist; the frame path does not use them).
+/// One overlay is admitted on the same stream: DCN30's
+/// `max_slave_planes = 2` is one slave per stream, and the presenter
+/// leases the free pipe at present time, so a second overlay is refused
+/// here rather than raced there. The overlay is a GEM framebuffer in
+/// place (no staging surface exists for a dumb overlay), XRGB8888 or
+/// ARGB8888, LINEAR tiling, R0 rotation, and above the primary in
+/// z-order: the slave MPCC links above the primary's in the tree, so an
+/// underlay cannot be programmed. Its blend is not checked: per-pixel
+/// alpha, pre-multiplied and global alpha are all programmed by
+/// `program_two_planes`, unlike the primary's. The joint two-plane DML30
+/// plan ([`Basis::plan_two`]) must fit the lit stream's clock and
+/// watermark headroom. An overlay-only commit (no primary) is admitted
+/// on its static checks alone: the joint plan is against the shown
+/// primary, which this check does not know — the presenter plans two
+/// against it at present time.
 pub fn admit(
     basis: Option<&Basis>,
     mode: Option<(u32, u32)>,
@@ -380,8 +427,30 @@ pub fn admit(
     {
         return Err(why::TILED);
     }
-    if planes.setup.overlay_count() > 0 {
-        return Err(why::OVERLAY);
+    // One slave overlay per stream (see the doc comment above).
+    if planes.setup.overlay_count() > 1 {
+        return Err(why::OVERLAY_COUNT);
+    }
+    let overlay = planes
+        .setup
+        .overlays
+        .iter()
+        .enumerate()
+        .find_map(|(k, o)| o.as_ref().map(|o| (k, o)));
+    if let Some((_, o)) = overlay {
+        match o.format {
+            SurfaceFormat::Xrgb8888 | SurfaceFormat::Argb8888 => (),
+            _ => return Err(why::OVERLAY_FORMAT),
+        }
+        if o.underlay {
+            return Err(why::OVERLAY_UNDERLAY);
+        }
+        if o.geometry.rotation != Rotation::R0 {
+            return Err(why::OVERLAY_ROTATION);
+        }
+        if !o.geometry.client {
+            return Err(why::OVERLAY_CLIENT);
+        }
     }
     let Some(g) = planes.setup.primary else {
         return Ok(());
@@ -414,7 +483,31 @@ pub fn admit(
         src: (g.src_x, g.src_y, g.width, g.height),
         dst: (g.dst.x, g.dst.y, w, h),
     };
-    basis.plan(&request).map(|_| ()).map_err(refusal_why)
+    let Some((k, o)) = overlay else {
+        return basis.plan(&request).map(|_| ()).map_err(refusal_why);
+    };
+    let (Ok(ow), Ok(oh)) = (
+        u32::try_from(o.geometry.dst.width),
+        u32::try_from(o.geometry.dst.height),
+    ) else {
+        return Err(why::OVERLAY_MALFORMED);
+    };
+    let overlay_request = Request {
+        pitch: planes.pitches[1 + k] / 4,
+        width: o.geometry.fb_size.0,
+        height: o.geometry.fb_size.1,
+        src: (
+            o.geometry.src_x,
+            o.geometry.src_y,
+            o.geometry.width,
+            o.geometry.height,
+        ),
+        dst: (o.geometry.dst.x, o.geometry.dst.y, ow, oh),
+    };
+    basis
+        .plan_two(&request, &overlay_request)
+        .map(|_| ())
+        .map_err(refusal_why_overlay)
 }
 
 #[cfg(feature = "kernel-test")]

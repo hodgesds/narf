@@ -2900,6 +2900,10 @@ impl ColdBoot {
     pub fn display_plane_request(&self) -> Option<crate::amdgpu_navi22_plane::Request> {
         self.sequence.backend.modeset.as_ref()?.plane_request()
     }
+    /// The leased slave overlay pipe, if an overlay is live.
+    pub fn display_overlay_pipe(&self) -> Option<u8> {
+        self.sequence.backend.modeset.as_ref()?.overlay_pipe()
+    }
     /// [`crate::amdgpu_navi22_plane::plan`] on the lit stream.
     pub fn plan_display_plane(
         &self,
@@ -2926,6 +2930,72 @@ impl ColdBoot {
         let scanout = h.scanout.as_mut().ok_or(E::Invalid)?;
         let pipeline = h.modeset.as_mut().ok_or(E::Invalid)?;
         scanout.arm_plane(kind, external, pipeline, update).await
+    }
+    /// [`crate::amdgpu_navi22_plane::plan_two`] on the lit stream.
+    pub fn plan_display_two_planes(
+        &self,
+        primary: &crate::amdgpu_navi22_plane::Request,
+        overlay: &crate::amdgpu_navi22_plane::Request,
+    ) -> Result<crate::amdgpu_navi22_plane::TwoPlaneUpdate, crate::amdgpu_navi22_plane::Refusal>
+    {
+        self.sequence
+            .backend
+            .modeset
+            .as_ref()
+            .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)?
+            .plan_overlay(primary, overlay)
+    }
+    /// Lease the lit stream's slave overlay pipe and attach it to the
+    /// scanout's flip side, so a two-plane arm can program it. The single
+    /// path holds no other pipe leases — the lit pipe is the lease's
+    /// `primary`, and an ODM secondary refuses the lease outright — so the
+    /// used set is empty. Returns the leased pipe number.
+    pub fn lease_display_overlay(&mut self) -> Result<u8, crate::amdgpu_dcn_clk::Error> {
+        use crate::amdgpu_dcn_clk::Error as E;
+        let h = &mut self.sequence.backend;
+        let pipeline = h.modeset.as_mut().ok_or(E::Invalid)?;
+        let pipe = pipeline.lease_overlay(&[]).map_err(|_| E::Busy)?;
+        let scanout = h.scanout.as_mut().ok_or(E::Invalid)?;
+        // SAFETY: the lease is this stream's slave pipe, held by no other
+        // stream, ODM secondary or overlay; the caller's display ownership
+        // covers it (the same lease `Pipeline::lease_overlay` took). The
+        // attach cannot fail on a leased pipe: the lease excludes the
+        // primary pipe, any ODM pipe, and pipes past the pool.
+        unsafe { scanout.attach_overlay(&h.gpu, pipe).map_err(|_| E::Busy)? };
+        Ok(pipe)
+    }
+    /// Tear the live overlay down: detach the flip side first (no flip
+    /// completion waits on the parked HUBP), then release the slave pipe.
+    /// No overlay: a no-op.
+    pub async fn release_display_overlay(&mut self) -> Result<(), crate::amdgpu_dcn_clk::Error> {
+        use crate::amdgpu_dcn_clk::Error as E;
+        let h = &mut self.sequence.backend;
+        if let Some(scanout) = h.scanout.as_mut() {
+            scanout.detach_overlay();
+        }
+        if let Some(pipeline) = h.modeset.as_mut() {
+            pipeline.release_overlay().await.map_err(|_| E::Busy)?;
+        }
+        Ok(())
+    }
+    /// Arm a flip that also moves both planes to `update`
+    /// (`Scanout::arm_two_planes`).
+    pub async fn arm_display_two_planes(
+        &mut self,
+        kind: crate::amdgpu_navi22_scanout::ArmedKind,
+        external: u64,
+        overlay_address: u64,
+        update: &crate::amdgpu_navi22_plane::TwoPlaneUpdate,
+        blend: &crate::amdgpu_dcn_plane::BlendConfig,
+    ) -> Result<crate::amdgpu_navi22_scanout::Armed, crate::amdgpu_dcn_clk::Error> {
+        use crate::amdgpu_dcn_clk::Error as E;
+        self.display_lfc_preflip()?;
+        let h = &mut self.sequence.backend;
+        let scanout = h.scanout.as_mut().ok_or(E::Invalid)?;
+        let pipeline = h.modeset.as_mut().ok_or(E::Invalid)?;
+        scanout
+            .arm_two_planes(kind, external, overlay_address, pipeline, update, blend)
+            .await
     }
     /// `optimize_bandwidth` once a plane update latched: the watermarks it
     /// lowers.
@@ -2959,6 +3029,9 @@ impl ColdBoot {
     ) -> Result<Option<crate::amdgpu_navi22_scanout::FlipDone>, crate::amdgpu_dcn_clk::Error> {
         use crate::amdgpu_dcn_clk::Error as E;
         self.display_lfc_preflip()?;
+        // The owned front is the lit plane: a live overlay is released
+        // first, so the single-plane return programs no slave pipe.
+        self.release_display_overlay().await?;
         // The owned front is the lit plane: a client placement shown now is
         // undone with the flip back.
         let h = &mut self.sequence.backend;

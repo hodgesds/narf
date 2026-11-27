@@ -58,6 +58,14 @@ impl Kms {
     /// uses, against immutable observed EDID/board limits. Requests without a
     /// mode use the committed timing or the first admitted timing. No fallback
     /// hides an explicit unsupported color format.
+    ///
+    /// Joint plane admission: the planes a request is searched with are
+    /// checked statically (one overlay, a GEM 8888 overlay in place,
+    /// unrotated, above the primary), and the pipes the routes' planes
+    /// need (one per stream, one per overlay) are budgeted against DCN30's
+    /// six. The exact two-plane DML30 plan and the clock/watermark
+    /// headroom stay in `display_admits_planes`, which the atomic check
+    /// always runs (the format search is pitch-free and approximate).
     pub(super) fn formats_supported(
         &self,
         requests: &[OutputFormatRequest],
@@ -73,6 +81,19 @@ impl Kms {
                 return false;
             }
         }
+        let mut pipes = 0u32;
+        for route in routes {
+            pipes += 1;
+            if let Some((_, setup)) = &route.planes {
+                if setup.overlay_count() > 1 {
+                    return false;
+                }
+                pipes += setup.overlay_count() as u32;
+            }
+        }
+        if pipes > u32::from(crate::amdgpu_navi22_modeset::PIPES) {
+            return false;
+        }
         requests.iter().enumerate().all(|(n, request)| {
             if requests[..n].iter().any(|r| r.connector == request.connector || r.display == request.display)
                 || !routes.iter().any(|r| r.connector == request.connector && r.display == request.display)
@@ -81,6 +102,29 @@ impl Kms {
             let c = &self.connectors[index];
             let max_bpc = request.max_bpc.unwrap_or(c.output.max_bpc);
             if !c.lightable() || !(8..=16).contains(&max_bpc) { return false; }
+            // The planes this format is searched with: one overlay, a GEM
+            // 8888 overlay in place, unrotated, above the primary (see
+            // `amdgpu_navi22_plane::admit` for the same static checks).
+            if let Some((_, setup)) = &request.planes {
+                use crate::amdgpu_dcn401_otg::{SurfaceFormat, Tiling};
+                use crate::amdgpu_dcn401_spl::Rotation;
+                if setup.overlay_count() > 1 {
+                    return false;
+                }
+                for o in setup.overlays.iter().flatten() {
+                    let g = &o.geometry;
+                    if !matches!(
+                        o.format,
+                        SurfaceFormat::Xrgb8888 | SurfaceFormat::Argb8888
+                    ) || g.surface.tiling != Tiling::LINEAR
+                        || g.rotation != Rotation::R0
+                        || o.underlay
+                        || !g.client
+                    {
+                        return false;
+                    }
+                }
+            }
             // DP: RGB at the deepest depth within the cap the verified link
             // carries, down to 8 bpc, so any cap admits the stream
             // (LINUX-GAP: no YCbCr over DP).

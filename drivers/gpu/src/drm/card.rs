@@ -350,6 +350,13 @@ pub struct PlaneFrame {
     /// Where a primary that is not full-screen and unscaled shows: its
     /// SRC and CRTC rectangles. None for the full-screen unscaled frame.
     pub placement: Option<Placement>,
+    /// The DRM plane's blend state ("pixel blend mode", "alpha"): per-pixel
+    /// alpha, pre-multiplied, and the plane alpha. The primary is always
+    /// the bottom plane, so only an overlay's blend is programmed (the
+    /// slave MPCC's blend config); a primary's is ignored.
+    pub per_pixel_alpha: bool,
+    pub premultiplied: bool,
+    pub global_alpha: Option<u8>,
 }
 impl PlaneFrame {
     /// A linear single-plane framebuffer at `phys`.
@@ -365,6 +372,9 @@ impl PlaneFrame {
             modifier: 0,
             bo: None,
             placement: None,
+            per_pixel_alpha: false,
+            premultiplied: false,
+            global_alpha: None,
         }
     }
 }

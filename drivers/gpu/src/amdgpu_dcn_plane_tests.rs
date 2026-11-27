@@ -1008,3 +1008,49 @@ fn plane_dcn30_color_is_dcn30_only() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dcn-plane", plane_dcn30_color_is_dcn30_only);
+
+/// `BlendConfig::from_blend` is `dcn20_update_mpcc`'s composition for
+/// each DRM blend state: per-pixel alpha (with the gain in both fields
+/// when a plane alpha is set), else the opaque composition with the plane
+/// alpha in the global-alpha field.
+fn plane_blend_config_from_drm_blend() -> TestResult {
+    use crate::amdgpu_dcn401_otg::Blend;
+    let opaque = Blend {
+        per_pixel_alpha: false,
+        premultiplied: false,
+        global_alpha: None,
+    };
+    if BlendConfig::from_blend(&opaque) != BlendConfig::opaque() {
+        return TestResult::Fail("opaque blend is not the opaque config");
+    }
+    let per_pixel = Blend {
+        per_pixel_alpha: true,
+        premultiplied: true,
+        global_alpha: None,
+    };
+    if BlendConfig::from_blend(&per_pixel) != BlendConfig::per_pixel_alpha(true) {
+        return TestResult::Fail("per-pixel blend is not the per-pixel config");
+    }
+    let gain = Blend {
+        per_pixel_alpha: true,
+        premultiplied: false,
+        global_alpha: Some(0x80),
+    };
+    if BlendConfig::from_blend(&gain) != BlendConfig::per_pixel_alpha_with_gain(false, 0x80) {
+        return TestResult::Fail("per-pixel blend with gain is not the combined config");
+    }
+    let alpha = Blend {
+        per_pixel_alpha: false,
+        premultiplied: false,
+        global_alpha: Some(0x80),
+    };
+    let want = BlendConfig {
+        global_alpha: 0x80,
+        ..BlendConfig::opaque()
+    };
+    if BlendConfig::from_blend(&alpha) != want {
+        return TestResult::Fail("global-alpha blend is not the opaque config with the alpha");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn-plane", plane_blend_config_from_drm_blend);
