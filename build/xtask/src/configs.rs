@@ -81,10 +81,9 @@
 //! Per-driver census tables are a follow-up, not this lane.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
 /// Frame features that are not driver-group selections but members
 /// of frame's `default` — the always-on core a subset config must
@@ -174,15 +173,6 @@ impl DriverConfig {
         DriverConfig {
             net: NET_KEYS.iter().map(|k| (*k, Selection::Yes)).collect(),
             storage: STORAGE_KEYS.iter().map(|k| (*k, Selection::Yes)).collect(),
-        }
-    }
-
-    /// Every known key `"n"` — the effective selection of
-    /// `configs/minimal.toml`.
-    fn all_no() -> DriverConfig {
-        DriverConfig {
-            net: NET_KEYS.iter().map(|k| (*k, Selection::No)).collect(),
-            storage: STORAGE_KEYS.iter().map(|k| (*k, Selection::No)).collect(),
         }
     }
 }
@@ -414,6 +404,7 @@ pub fn translate(config: DriverConfig, source: PathBuf) -> Result<ResolvedConfig
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     /// Workspace root for tests: xtask's manifest dir is
     /// `build/xtask`, so the root is two levels up.
