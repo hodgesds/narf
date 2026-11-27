@@ -4,6 +4,7 @@ use core::{
     future::Future,
     task::{Context, Poll, Waker},
 };
+use narf_drivers_wireless_rtl_chip::ChipError;
 use narf_kernel_test::{kernel_test_in, TestResult};
 include!("golden.rs");
 include!("dcf_golden.rs");
@@ -483,4 +484,198 @@ fn smoke_rtw8822ce_disconnect_reservation_preserves_cleanup_then_cancel_allows_t
 kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw8822ce_disconnect_reservation_preserves_cleanup_then_cancel_allows_terminal_stop
+);
+
+fn smoke_rtl_chip_station_core_port_mac_dcf_byte_stream() -> TestResult {
+    let own = [2, 4, 6, 8, 10, 12];
+    let peer = [2, 3, 5, 7, 11, 13];
+    let mut io = Model::new();
+    // Pre-fill the DCF regs with garbage high bits (as the DCF smoke does)
+    // so the masked write is proven, and MS/AID/beacon with set bits so the
+    // clears are proven.
+    for register in [0x500usize, 0x504, 0x508, 0x50c] {
+        io.regs[register..register + 4].copy_from_slice(&0xf8ff_ffffu32.to_le_bytes());
+    }
+    io.regs[0x100..0x104].copy_from_slice(&0x0003_0000u32.to_le_bytes());
+    io.regs[0x6a8..0x6ac].copy_from_slice(&0x0000_07ffu32.to_le_bytes());
+    io.regs[0x550] = 0xff;
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::prepare_initial(&mut b, own).await
+    })
+    .is_err()
+        || io.regs[0x610..0x616] != own
+        || io.regs[0x618..0x61e] != [0; 6]
+        || io.word(0x100) & 0x30000 != 0
+        || io.word(0x6a8) & 0x7ff != 0
+        || io.regs[0x550] != 0xf7
+        || [0x500, 0x504, 0x508, 0x50c]
+            .iter()
+            .any(|r| io.word(*r) != LINUX_DCF[0][0])
+        || io.regs[0x51b] != LINUX_INITIAL_SLOT
+    {
+        return TestResult::Fail("chip station prepare_initial register stream differs");
+    }
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::prepare_peer(&mut b, peer).await
+    })
+    .is_err()
+        || io.regs[0x618..0x61e] != peer
+        || io.word(0x100) & 0x30000 != 0
+        || io.word(0x6a8) & 0x7ff != 0
+    {
+        return TestResult::Fail("chip station prepare_peer register stream differs");
+    }
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::commit_peer_tail(&mut b, 42, true, false).await
+    })
+    .is_err()
+        || io.word(0x6a8) & 0x7ff != 42
+        || [0x500, 0x504, 0x508, 0x50c]
+            .iter()
+            .any(|r| io.word(*r) != LINUX_DCF[1][0])
+        || io.regs[0x51b] != 9
+        || io.word(0x100) & 0x30000 != 2 << 16
+    {
+        return TestResult::Fail("chip station commit_peer_tail register stream differs");
+    }
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::disconnect(&mut b).await
+    })
+    .is_err()
+        || io.word(0x100) & 0x30000 != 0
+        || io.word(0x6a8) & 0x7ff != 0
+        || io.regs[0x618..0x61e] != [0; 6]
+    {
+        return TestResult::Fail("chip station disconnect register stream differs");
+    }
+    // Pure value checks: long/short slot and the 5 GHz SIFS16 + short slot.
+    if chip_station::dcf_params(false, false) != (0xa532, 20)
+        || chip_station::dcf_params(true, false) != (0xa51c, 9)
+        || chip_station::dcf_params(false, true) != (0xa522, 9)
+        || chip_station::dcf_params(true, true) != (0xa522, 9)
+    {
+        return TestResult::Fail("chip station DCF parameters differ from mac80211 defaults");
+    }
+    // Rejected inputs fail closed without touching registers.
+    let mut io = Model::new();
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::port_address(&mut b, [1, 2, 3, 4, 5, 6]).await
+    }) != Err(ChipError::Prerequisite)
+        || narf_scheduler::block_on(async {
+            let mut b = bridge(&mut io);
+            chip_station::port_address(&mut b, [0; 6]).await
+        }) != Err(ChipError::Prerequisite)
+        || narf_scheduler::block_on(async {
+            let mut b = bridge(&mut io);
+            chip_station::prepare_peer(&mut b, [3, 2, 3, 4, 5, 6]).await
+        }) != Err(ChipError::Prerequisite)
+        || narf_scheduler::block_on(async {
+            let mut b = bridge(&mut io);
+            chip_station::commit_peer_tail(&mut b, 0, false, false).await
+        }) != Err(ChipError::Unsupported)
+        || narf_scheduler::block_on(async {
+            let mut b = bridge(&mut io);
+            chip_station::commit_peer_tail(&mut b, 2008, false, false).await
+        }) != Err(ChipError::Unsupported)
+        || io.regs.iter().any(|v| *v != 0)
+    {
+        return TestResult::Fail("chip station rejected input mutated registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtl_chip_station_core_port_mac_dcf_byte_stream
+);
+
+fn smoke_rtl_chip_station_core_dcf_readback_and_idle_fail_closed() -> TestResult {
+    for lost in [0x500, 0x504, 0x508, 0x50c, 0x51b] {
+        let mut io = Model::new();
+        io.ignore_write = Some(lost);
+        if narf_scheduler::block_on(async {
+            let mut b = bridge(&mut io);
+            chip_station::configure_dcf(&mut b, false, false).await
+        }) != Err(ChipError::Prerequisite)
+            || io.writes.last() != Some(&lost)
+        {
+            return TestResult::Fail("lost chip DCF/slot write fabricated readiness");
+        }
+    }
+    // 5 GHz DCF: SIFS16 and the forced short slot.
+    let mut io = Model::new();
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::configure_dcf(&mut b, false, true).await
+    })
+    .is_err()
+        || [0x500, 0x504, 0x508, 0x50c]
+            .iter()
+            .any(|r| io.word(*r) & 0x07ff_ffff != 0xa522)
+        || io.regs[0x51b] != 9
+    {
+        return TestResult::Fail("chip station 5 GHz DCF must use SIFS16 and the short slot");
+    }
+    // Port-idle poll: set bit, clear bit, vanished device.
+    let mut io = Model::new();
+    io.regs[0x604..0x608].copy_from_slice(&0x0000_0080u32.to_le_bytes());
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::port_idle(&mut b).await
+    }) != Ok(false)
+    {
+        return TestResult::Fail("chip station port_idle missed the busy bit");
+    }
+    io.regs[0x604..0x608].copy_from_slice(&0u32.to_le_bytes());
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::port_idle(&mut b).await
+    }) != Ok(true)
+    {
+        return TestResult::Fail("chip station port_idle missed the idle bit");
+    }
+    io.regs[0x604..0x608].copy_from_slice(&u32::MAX.to_le_bytes());
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::port_idle(&mut b).await
+    }) != Err(ChipError::Gone)
+    {
+        return TestResult::Fail("chip station port_idle missed the vanished device");
+    }
+    // Mask validation mirrors radio::mask: empty mask and out-of-field
+    // values are Unsupported; a vanished device is Gone.
+    let mut io = Model::new();
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::mask(&mut b, 0x100, 0, 0).await
+    }) != Err(ChipError::Unsupported)
+        || narf_scheduler::block_on(async {
+            let mut b = bridge(&mut io);
+            chip_station::mask(&mut b, 0x100, 0x30000, 4).await
+        }) != Err(ChipError::Unsupported)
+        || narf_scheduler::block_on(async {
+            let mut b = bridge(&mut io);
+            chip_station::mask(&mut b, 0x100, 0x30000, 2).await
+        }) != Ok(())
+        || io.word(0x100) != 0x20000
+    {
+        return TestResult::Fail("chip station mask validation differs from radio::mask");
+    }
+    io.regs[0x100..0x104].copy_from_slice(&u32::MAX.to_le_bytes());
+    if narf_scheduler::block_on(async {
+        let mut b = bridge(&mut io);
+        chip_station::mask(&mut b, 0x100, 0x30000, 0).await
+    }) != Err(ChipError::Gone)
+    {
+        return TestResult::Fail("chip station mask missed the vanished device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtl_chip_station_core_dcf_readback_and_idle_fail_closed
 );

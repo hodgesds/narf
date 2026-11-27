@@ -73,8 +73,12 @@ impl Firmware {
         &self,
         permission: super::power_policy::Permission,
     ) -> Result<super::radio::Info, Error> {
-        self.lifecycle
-            .prepare_radio(&self.factory, permission)
-            .await
+        // The lifecycle/radio chain's fused poll frame is 8232 bytes on
+        // the branch (budget 8192): the 3424-byte prepare future plus the
+        // inlined preflight/calibration temporaries below it. Heap-retain
+        // the chain out of line, as the rtw89 bootstrap does for its
+        // (larger, 5048-byte) radio futures. Bring-up only, not a fast
+        // path, so the one heap future per radio prepare is negligible.
+        crate::future_heap::build(|| self.lifecycle.prepare_radio(&self.factory, permission)).await
     }
 }

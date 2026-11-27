@@ -31,6 +31,8 @@ pub mod mac;
 pub mod phy;
 pub mod phy_b22;
 pub mod radio;
+pub mod security_cam;
+pub mod station;
 
 /// Terminal result of a chip register operation. Register programming only
 /// needs to distinguish the handful of outcomes the bring-up acts on; richer
