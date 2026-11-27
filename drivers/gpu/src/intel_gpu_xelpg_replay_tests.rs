@@ -280,11 +280,14 @@ kernel_test_in!(
     smoke_ext_replay_display14_flush_force_updates
 );
 
+/// A minimum-set-context-latency case: (display, eDP, replay, selective update, VRR possible) -> lines.
+type MinSetContextLatencyCase = ((u16, bool, bool, bool, bool), u32);
+
 /// `_intel_psr_min_set_context_latency` (Linux 7.4-rc4), branch by branch.
 fn smoke_ext_replay_min_set_context_latency_follows_linux() -> TestResult {
     use crate::intel_gpu_psr::panel_replay::min_set_context_latency as scl;
     // (display, eDP, replay, selective update, VRR possible) -> lines.
-    let cases: [((u16, bool, bool, bool, bool), u32); 10] = [
+    let cases: [MinSetContextLatencyCase; 10] = [
         // Wa_14015401596.
         ((13, false, true, false, true), 1),
         ((14, false, true, false, true), 1),

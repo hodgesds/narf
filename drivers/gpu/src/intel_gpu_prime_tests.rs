@@ -1136,8 +1136,8 @@ fn smoke_xe_prime_mmapped_vram_export_migrates_with_its_mappings() -> TestResult
     assert_eq!(back, pattern(31));
     // The bytes the processes see are the system pages'.
     let mut first = [0u8; 8];
-    // SAFETY: the object's live system frame, read without a reference.
     for (i, byte) in first.iter_mut().enumerate() {
+        // SAFETY: the object's live system frame, read without a reference.
         *byte = unsafe {
             core::ptr::read_volatile(narf_memory::PhysAddr::new(pages[0]).kernel_ptr::<u8>().add(i))
         };

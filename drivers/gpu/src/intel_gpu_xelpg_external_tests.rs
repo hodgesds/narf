@@ -5322,6 +5322,9 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_vbt_c20_override
 );
 
+/// A VBT DP14 override case: (port, event, EDID, UHBR on, expected table row).
+type VbtDp14OverrideCase = (XeLpgPort, MtlHpdEvent, Vec<u8>, bool, [u8; 3]);
+
 /// The VBT's DP 1.4 overrides on 8b/10b links (`mtl_get_c10_buf_trans_override`,
 /// `mtl_get_c20_buf_trans_override` with `is_uhbr` false): DP children on
 /// DDI B (C10 on Meteor Lake) and TC1 (C20) with `use_vbt_vswing` and a
@@ -5370,7 +5373,7 @@ fn smoke_mtl_external_vbt_dp14_overrides() -> TestResult {
         pin: MtlHpdPin::Tc1,
         kind: MtlHpdKind::Connected(LiveMode::DpAlt),
     };
-    let cases: [(XeLpgPort, MtlHpdEvent, Vec<u8>, bool, [u8; 3]); 5] = [
+    let cases: [VbtDp14OverrideCase; 5] = [
         (XeLpgPort::B, b, edid_1024(), true, [0, 20, 0]),
         (XeLpgPort::B, b, edid_uhd(594_000), true, [1, 21, 0]),
         (XeLpgPort::B, b, edid_1024(), false, [0, 26, 0]),

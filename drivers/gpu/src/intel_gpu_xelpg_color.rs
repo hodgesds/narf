@@ -554,7 +554,7 @@ fn ycbcr420_valid(
     let can_420 = !branch || dfp.ycbcr420_passthrough || dfp.ycbcr_444_to_420;
     let y420 = parse_ycbcr420(edid);
     let vic = vic_for_mode(mode);
-    !(dfp_min_tmds_khz != 0 && !is_hdmi_sink(edid)) && can_420 && (y420.only(vic) || y420.also(vic))
+    (dfp_min_tmds_khz == 0 || is_hdmi_sink(edid)) && can_420 && (y420.only(vic) || y420.also(vic))
 }
 
 /// `intel_dp_compute_formats` and `intel_dp_output_format` on display 14+
@@ -658,7 +658,7 @@ fn dp_tmds_clock_valid(
 ) -> bool {
     let tmds = crate::intel_gpu_hdmi::tmds_clock_for(clock_khz, bpc, format);
     let max = dp_max_tmds_clock(dfp, edid);
-    !(dfp.min_tmds_clock != 0 && tmds < dfp.min_tmds_clock) && !(max != 0 && tmds > max)
+    !(dfp.min_tmds_clock != 0 && tmds < dfp.min_tmds_clock || max != 0 && tmds > max)
 }
 
 /// `intel_dp_hdmi_compute_bpc` with downstream limits: from `bpc` (at
