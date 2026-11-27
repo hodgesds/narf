@@ -3640,6 +3640,51 @@ kernel_test_in!(
     smoke_abi_proc_rlimit_nproc_default_is_half_max_threads
 );
 
+/// RLIMIT_NPROC's per-uid count (Linux `UCOUNT_RLIMIT_NPROC`) is the number
+/// of credential rows with that real uid: it follows a row into its uid,
+/// across a real-uid change, not on a same-uid write, and out at reap.
+fn smoke_abi_proc_nproc_ucount_follows_credential_rows() -> TestResult {
+    use crate::handlers::{
+        __test_nproc_count as count, __test_nproc_scan_count as scan,
+        __test_release_task_tables as reap, __test_set_fsids as set_ids,
+    };
+    const A: u32 = 4321;
+    const B: u32 = 4322;
+    const TASKS: [u64; 3] = [0x7100_0001, 0x7100_0002, 0x7100_0003];
+    with_setup(|| {
+        let (a0, b0) = (count(A), count(B));
+        for task in TASKS {
+            set_ids(task, A, A);
+        }
+        let joined = count(A) == a0 + 3 && count(A) == scan(A);
+        set_ids(TASKS[0], B, B);
+        let moved = count(A) == a0 + 2 && count(B) == b0 + 1 && count(B) == scan(B);
+        set_ids(TASKS[1], A, A);
+        let kept = count(A) == a0 + 2;
+        for task in TASKS {
+            reap(task);
+        }
+        let left = count(A) == a0 && count(B) == b0 && count(A) == scan(A) && count(B) == scan(B);
+        if !joined {
+            return Err("the per-uid count did not follow new rows into their uid");
+        }
+        if !moved {
+            return Err("the per-uid count did not follow a real-uid change");
+        }
+        if !kept {
+            return Err("a same-uid credential write changed the per-uid count");
+        }
+        if !left {
+            return Err("reaped rows stayed in the per-uid count");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/rlimit_nproc",
+    smoke_abi_proc_nproc_ucount_follows_credential_rows
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_rlimit_nproc_refuses_fork() -> TestResult {
     with_setup(|| {

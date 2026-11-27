@@ -15871,7 +15871,9 @@ fn release_task_tables(tid: u64) {
     // Identity / credentials / per-task knobs.
     let credential_shard = credential_shard(tid);
     if let Some(m) = CREDENTIAL_TABLES[credential_shard].uidgid.lock().as_mut() {
-        m.remove(&tid);
+        if let Some(row) = m.remove(&tid) {
+            nproc_ucount_adjust(row.uid, false);
+        }
     }
     if let Some(m) = CREDENTIAL_TABLES[credential_shard].groups.lock().as_mut() {
         m.remove(&tid);
@@ -17890,6 +17892,10 @@ pub fn uidgid_init() {
         *shard.uidgid.lock() = Some(BTreeMap::new());
         *shard.groups.lock() = Some(BTreeMap::new());
     }
+    // The rows are gone, so are the per-uid counts that summarize them.
+    for counts in NPROC_UCOUNTS.iter() {
+        *counts.lock() = BTreeMap::new();
+    }
     crate::task::reset_effective_ids();
 }
 
@@ -18799,8 +18805,17 @@ fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
         let Some(m) = g.as_mut() else {
             return false;
         };
+        let before = m.get(&task).map(|row| row.uid);
         let entry = m.entry(task).or_default();
         f(entry);
+        // The count moves with the row, under the row's shard lock: a new
+        // row joins its uid, a real-uid change leaves one uid for another.
+        if before != Some(entry.uid) {
+            if let Some(old) = before {
+                nproc_ucount_adjust(old, false);
+            }
+            nproc_ucount_adjust(entry.uid, true);
+        }
         (entry.euid, entry.egid)
     };
     // Do not nest the task registry lock under the credential shard lock.
@@ -19324,21 +19339,57 @@ fn rlimit_cpu_tick(task: u64) {
 /// CAP_SYS_ADMIN exempts a task from RLIMIT_NPROC.
 pub(crate) const CAP_SYS_RESOURCE: u32 = 24;
 
-/// Live tasks whose REAL uid is `uid`.
+/// Linux's `UCOUNT_RLIMIT_NPROC` ucounts: credential rows per REAL uid.
 ///
-/// Counted from the credential rows rather than from a maintained counter,
-/// on purpose. A per-uid counter has to be incremented at every task
-/// creation, decremented at every exit, and MOVED on every set*uid — and a
-/// single missed decrement wedges that uid's ability to fork for the rest
-/// of the boot, silently and permanently. The rows are removed at reap
-/// (see the teardown block), so each live or zombie task contributes
-/// exactly one, and counting them cannot drift from the truth it is
-/// supposed to describe.
+/// The count is not a separate truth that task creation, exit and set*uid
+/// must each remember to update — a missed decrement would wedge that uid's
+/// forks for the rest of the boot. It is a summary of the credential rows,
+/// changed only where a row is inserted, removed or given a new real uid,
+/// and inside that row's shard lock, so it always equals the number of rows
+/// with that uid. The rows are removed at reap (see the teardown block), so
+/// each live or zombie task contributes exactly one.
 ///
 /// Zombies count, matching Linux: the ucount is released in
 /// `release_task`, not at exit, so a process that has exited but not been
 /// reaped still occupies a slot.
+///
+/// Sharded by uid; a fork's limit check takes one shard lock, never a scan
+/// of every task (with RLIMIT_NPROC finite by default, every unprivileged
+/// fork and clone checks it).
+const NPROC_UCOUNT_SHARDS: usize = 32;
+
+static NPROC_UCOUNTS: [narf_lib::sync::IrqSafeSpinLock<BTreeMap<u32, u64>>; NPROC_UCOUNT_SHARDS] =
+    [const { narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new()) }; NPROC_UCOUNT_SHARDS];
+
+fn nproc_ucount_shard(uid: u32) -> &'static narf_lib::sync::IrqSafeSpinLock<BTreeMap<u32, u64>> {
+    let hash = u64::from(uid).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59;
+    &NPROC_UCOUNTS[hash as usize & (NPROC_UCOUNT_SHARDS - 1)]
+}
+
+/// One row joined (`inc`) or left `uid`. Called with that row's credential
+/// shard lock held; the ucount shard lock nests inside it and is never held
+/// while taking a credential lock.
+fn nproc_ucount_adjust(uid: u32, inc: bool) {
+    let mut counts = nproc_ucount_shard(uid).lock();
+    if inc {
+        *counts.entry(uid).or_insert(0) += 1;
+    } else if let Some(count) = counts.get_mut(&uid) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&uid);
+        }
+    }
+}
+
+/// Live tasks whose REAL uid is `uid`.
 fn nproc_count_for_uid(uid: u32) -> u64 {
+    nproc_ucount_shard(uid).lock().get(&uid).copied().unwrap_or(0)
+}
+
+/// Every credential row's real uid, counted by scanning — the definition
+/// the maintained ucounts must agree with.
+#[doc(hidden)]
+pub(crate) fn __test_nproc_scan_count(uid: u32) -> u64 {
     CREDENTIAL_TABLES.iter().fold(0u64, |total, shard| {
         let guard = shard.uidgid.lock();
         let n = guard
@@ -19346,6 +19397,11 @@ fn nproc_count_for_uid(uid: u32) -> u64 {
             .map_or(0, |m| m.values().filter(|ids| ids.uid == uid).count());
         total.saturating_add(n as u64)
     })
+}
+
+#[doc(hidden)]
+pub(crate) fn __test_nproc_count(uid: u32) -> u64 {
+    nproc_count_for_uid(uid)
 }
 
 /// Whether `uid` is at or over its RLIMIT_NPROC, as
