@@ -158,13 +158,14 @@ kernel_test_in!(
     navi31_thermal_irq_failures_never_rearm_or_ack_foreign_sources
 );
 fn navi31_thermal_fan_sequences_match_smu130() -> TestResult {
+    // Fixture register values must never be u32::MAX: checked() reads it as DeviceGone.
     let mut e = engine();
     let ctrl1 = L.thm + u64::from(FDO_CTRL1) * 4;
     let ctrl0 = L.thm + u64::from(FDO_CTRL0) * 4;
     let ctrl2 = L.thm + u64::from(FDO_CTRL2) * 4;
     let tach = L.thm + u64::from(TACH_CTRL) * 4;
     e.io.regs.insert(ctrl1, 200); // FMAX_DUTY100
-    e.io.regs.insert(ctrl2, 0xffff_ffff);
+    e.io.regs.insert(ctrl2, 0x0000_ffff);
     // duty = speed * duty100 / 255.
     assert_eq!(e.set_fan_pwm(255).unwrap(), 200);
     assert_eq!(e.io.regs[&ctrl0] & 0xff, 200);
