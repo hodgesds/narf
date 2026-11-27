@@ -3265,9 +3265,9 @@ impl<M: Platform> Guard<'_, M> {
         let caps = pr::Caps::read(&mut aux, true, false)?;
         let port_clock =
             crate::intel_gpu_psr::sink_link_rate(&mut aux).ok_or(Refusal::Unavailable)?;
-        let mut feature = [0u8];
-        let as_sdp = crate::intel_gpu_psr::read(&mut aux, 0x2214, &mut feature).is_ok()
-            && feature[0] & 1 != 0;
+        let mut rev = [0u8];
+        crate::intel_gpu_psr::read(&mut aux, 0x000, &mut rev).map_err(Refusal::Aux)?;
+        let as_sdp = pr::as_sdp_needed(&mut aux, rev[0], &caps);
         let mut edp_rev = [0u8];
         crate::intel_gpu_psr::read(&mut aux, 0x700, &mut edp_rev).map_err(Refusal::Aux)?;
         let func = platform.read32(crate::intel_gpu_psr::TRANS_DDI_FUNC_CTL_A);

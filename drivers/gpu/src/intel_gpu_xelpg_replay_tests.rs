@@ -500,3 +500,52 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_external",
     smoke_ext_replay_refusals_leave_the_route_lit
 );
+
+/// An AS SDP v2 monitor (`DP_DPRX_FEATURE_ENUMERATION_LIST_CONT_1` = 0x05:
+/// supported, FAVT parsing; no downstream port) on the display-30 route:
+/// `intel_dp_compute_as_sdp` at the EDID's 806-line vtotal (coasting at
+/// vmax: 0x0b1 keeps async video timing) reaches
+/// `ADL_TVIDEO_DIP_AS_SDP_DATA(B)` with `VIDEO_DIP_ENABLE_AS_ADL`, beside the
+/// replay VSC SDP; teardown clears both enables.
+fn smoke_ext_replay_display30_sends_the_as_sdp() -> TestResult {
+    let io = route_fake(true);
+    io.sink.borrow_mut().extra.push((0x2214, 0x05));
+    let Some(mut service) = service_on(&io, DisplayIp::Xe3Lpd, true) else {
+        return TestResult::Fail("the fixture must light the display-30 panel");
+    };
+    let outcome = service.handle(&io, tc2(MtlHpdKind::Connected(LiveMode::DpAlt)), &mut fb_for);
+    let ServiceOutcome::Activated { mode, .. } = outcome else {
+        return TestResult::Fail("the TC2 route must light");
+    };
+    if mode.v_total != 806 {
+        return TestResult::Fail("the EDID must give the 806-line DMT vtotal");
+    }
+    // HB 00 22 02 09; DB0 = 01 (FIXED_VTOTAL), DB1/2 = 26 03, DB7/8 = 26 03.
+    let want = [0x0902_2200, 0x0003_2601, 0x2600_0000, 0x0000_0003, 0, 0, 0, 0, 0];
+    for (i, w) in want.iter().enumerate() {
+        if io.writes_to(0x61484 + 4 * i as u64) != [*w] {
+            return TestResult::Fail("the AS SDP must be Linux's packing at transcoder B");
+        }
+    }
+    // VSC SDP header dword at HSW_TVIDEO_DIP_VSC_DATA(B) 0x61320; enables
+    // VSC_HSW | VSC_DIP_HW_DATA_SW_HEA | AS_ADL at HSW_TVIDEO_DIP_CTL(B).
+    if io.writes_to(0x61320) != [0x1006_0700]
+        || io.read32(0x61200) & 0x0790_0000 != 0x0490_0000
+        || service
+            .panel_replay(0)
+            .0
+            .and_then(|r| r.replay().config().as_sdp)
+            .is_none()
+        || !io.writes_to(0x61948).is_empty()
+    {
+        return TestResult::Fail("the replay SDPs must be enabled; DP takes no PR_ALPM_CTL");
+    }
+    if !service.teardown(&io) || io.read32(0x61200) & ((1 << 23) | (1 << 20)) != 0 {
+        return TestResult::Fail("teardown must clear the VSC and AS SDP enables");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_ext_replay_display30_sends_the_as_sdp
+);

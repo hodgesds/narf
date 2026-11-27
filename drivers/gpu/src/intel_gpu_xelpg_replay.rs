@@ -33,7 +33,11 @@
 //!   modeset committed. Selective update is not offered: the route's
 //!   primary is armed once and never programs selective fetch, so
 //!   `intel_sel_update_config_valid` fails as it does on display 14+
-//!   without selective fetch, and replay runs full frame.
+//!   without selective fetch, and replay runs full frame. The enable
+//!   sends the replay VSC SDP and, for an AS SDP v2 sink that is no branch
+//!   (`intel_dp_needs_as_sdp`), the fixed-vtotal Adaptive-Sync SDP
+//!   ([`crate::intel_gpu_psr::panel_replay::as_sdp_needed`]) on the AS SDP
+//!   timing the display-30 route programs (`TRANS_VRR_VSYNC`).
 //! - **Frontbuffer flush.** The route scans out the console surface, which
 //!   the kernel's fb console writes with the CPU. Each fb console flush of
 //!   the published image ([`frontbuffer_flush`]) queues the route's slot,
@@ -404,6 +408,10 @@ pub(crate) fn enable_route<M: MmioWindow + ?Sized>(
     pr::source_supported(stream.display_ver, false)?;
     let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
     let caps = pr::Caps::read(&mut aux, false, false)?;
+    let stream = pr::Stream {
+        as_sdp_v2: pr::as_sdp_needed(&mut aux, route.probe.caps.dpcd_rev, &caps),
+        ..stream
+    };
     // Wa_14015648006 (display 14): the route pipe's wm_level_disabled is
     // not published, so compute refuses WmLevelUnknown there.
     let config = pr::compute(&caps, &stream, None)?;
