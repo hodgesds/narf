@@ -2561,6 +2561,75 @@ kernel_test_in!(
     smoke_rx_handle_takes_no_registry_lock_per_batch
 );
 
+static UNNAMED_NATIVE: ::core::sync::atomic::AtomicU64 = ::core::sync::atomic::AtomicU64::new(0);
+static UNNAMED_RESOLVED: ::core::sync::atomic::AtomicU64 = ::core::sync::atomic::AtomicU64::new(0);
+
+fn unnamed_native(_name: &str, _frame: &mut [u8], _ts: Option<u64>) {
+    UNNAMED_NATIVE.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+}
+
+fn unnamed_resolved(_dev: &iface::NetIfaceSnapshot, _frame: &mut [u8], _ts: Option<u64>) {
+    UNNAMED_RESOLVED.fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+}
+
+/// A receive batch for a device that has no published name yet delivers
+/// nothing. A batch for the published device delivers with that device.
+/// Linux has no skb without `skb->dev`, NAPI is enabled only once the
+/// netdev is registered, and `publish::deliver_rx` drops the unpublished
+/// (empty) name.
+///
+/// igc spawns its receive pumps while the controller is built, before
+/// probe publishes the netdev. Each pump made its `RxHandle` from the
+/// driver's name at that moment, the empty string, and kept it. Every
+/// frame on the desktop's eth0 then reached the stack with no device: an
+/// mDNS datagram's IP_PKTINFO / IPV6_PKTINFO ifindex was 0 while wlan0's
+/// copy said 3, and avahi-daemon aborted ("dispatch_packet: Assertion
+/// 'iface > 0' failed").
+fn smoke_rx_handle_for_an_unpublished_device_delivers_nothing() -> TestResult {
+    use ::core::sync::atomic::Ordering;
+    let local = [10, 95, 0, 1];
+    let peer = reset("rxhandle-pub", local);
+    iface::install_native_rx_handler(unnamed_native);
+    iface::install_native_rx_resolved_handler(unnamed_resolved);
+    let seen = || {
+        (
+            UNNAMED_NATIVE.load(Ordering::Relaxed),
+            UNNAMED_RESOLVED.load(Ordering::Relaxed),
+        )
+    };
+    let start = seen();
+    // A pump that made its handle before probe named the device.
+    let mut early = iface::RxHandle::new("");
+    {
+        let mut batch = early.batch();
+        batch.receive(&mut arp_request(peer, local), None);
+    }
+    let unnamed = seen();
+    let mut named = iface::RxHandle::new("rxhandle-pub");
+    {
+        let mut batch = named.batch();
+        batch.receive(&mut arp_request(peer, local), None);
+    }
+    let published = seen();
+    iface::install_native_rx_handler(crate::tcp_stack::rx_handler_native);
+    iface::install_native_rx_resolved_handler(crate::tcp_stack::rx_handler_native_resolved);
+    if unnamed != start {
+        return TestResult::Fail(
+            "a batch for an unpublished device delivered a frame without a device",
+        );
+    }
+    if published != (unnamed.0, unnamed.1 + 1) {
+        return TestResult::Fail(
+            "a batch for the published device did not deliver with its device",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/iface-rx-handle-unnamed",
+    smoke_rx_handle_for_an_unpublished_device_delivers_nothing
+);
+
 /// Zero-copy hook of the `txpool-neigh` interface: a synchronous driver
 /// whose transmit completes at once and recycles into the frame's pool.
 fn txpool_neigh_send(frame: crate::Frame, _meta: crate::TxMeta) -> Result<(), ()> {
