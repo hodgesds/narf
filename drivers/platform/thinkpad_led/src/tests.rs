@@ -12,8 +12,8 @@
 //!   publishes all seven LEDs with the `LED_DEFS` maxima and the
 //!   default triggers (micmute's stays pending until the
 //!   `audio-micmute` module trigger registers). The AML paths are
-//!   still DSDT-UNVERIFIED — Daniel hardware-tests registration
-//!   on the P14s.
+//!   DSDT-verified (2026-11-26, P14s `dsdt.aml`); Daniel
+//!   hardware-tests registration on the P14s.
 //!
 //! The module backend's KABI calls are exercised by the `.ko` build
 //! (`cargo xtask build-module` compiles + `nm -u` gate) and by the
@@ -534,13 +534,13 @@ fn fx_method_wide(seg: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> 
 /// ```asl
 /// Scope (\_SB) {
 ///     Device (PCI0) {
-///         Device (LPCB) {
-///             Device (EC) {
+///         Device (LPC0) {
+///             Device (EC0) {
 ///                 Name (LEDI, 0xAA)   // sentinel: never written
 ///                 Name (LEDV, 0xAA)
 ///                 Method (LED, 2) {
-///                     Store (Arg0, \_SB.PCI0.LPCB.EC.LEDI)
-///                     Store (Arg1, \_SB.PCI0.LPCB.EC.LEDV)
+///                     Store (Arg0, \_SB.PCI0.LPC0.EC0.LEDI)
+///                     Store (Arg1, \_SB.PCI0.LPC0.EC0.LEDV)
 ///                 }
 ///                 Device (HKEY) {
 ///                     Name (MLVL, 0x200)  // bit 9 set, level 0
@@ -567,11 +567,11 @@ fn fx_thinkpad_leds() -> alloc::vec::Vec<u8> {
 
     /// Absolute path to a Name under the HKEY device.
     fn hkey_ref(name: &[u8; 4]) -> Vec<u8> {
-        fx_ref_multi(&[b"_SB_", b"PCI0", b"LPCB", b"EC__", b"HKEY", name])
+        fx_ref_multi(&[b"_SB_", b"PCI0", b"LPC0", b"EC0_", b"HKEY", name])
     }
     /// Absolute path to a Name under the EC device.
     fn ec_ref(name: &[u8; 4]) -> Vec<u8> {
-        fx_ref_multi(&[b"_SB_", b"PCI0", b"LPCB", b"EC__", name])
+        fx_ref_multi(&[b"_SB_", b"PCI0", b"LPC0", b"EC0_", name])
     }
 
     // Device (HKEY) { MLVL/SMUT/MMUT, MLCS/MLCG/SSMS/MMTS }
@@ -598,7 +598,7 @@ fn fx_thinkpad_leds() -> alloc::vec::Vec<u8> {
     hkey.extend_from_slice(&fx_method_wide(b"MMTS", 1, &mmts));
     let hkey_dev = fx_wrap(0x82, b"HKEY", &hkey);
 
-    // Device (EC) { LEDI/LEDV, Method (LED, 2), HKEY }
+    // Device (EC0) { LEDI/LEDV, Method (LED, 2), HKEY }
     let mut ec = Vec::new();
     ec.extend_from_slice(&fx_name_byte(b"LEDI", 0xAA));
     ec.extend_from_slice(&fx_name_byte(b"LEDV", 0xAA));
@@ -609,18 +609,18 @@ fn fx_thinkpad_leds() -> alloc::vec::Vec<u8> {
     led.extend_from_slice(&ec_ref(b"LEDV"));
     ec.extend_from_slice(&fx_method_wide(b"LED_", 2, &led));
     ec.extend_from_slice(&hkey_dev);
-    let ec_dev = fx_wrap(0x82, b"EC__", &ec);
+    let ec_dev = fx_wrap(0x82, b"EC0_", &ec);
 
-    // Device (LPCB) { EC } → Device (PCI0) { LPCB } → Scope (\_SB)
-    let lpcb = fx_wrap(0x82, b"LPCB", &ec_dev);
-    let pci0 = fx_wrap(0x82, b"PCI0", &lpcb);
+    // Device (LPC0) { EC0 } → Device (PCI0) { LPC0 } → Scope (\_SB)
+    let lpc0 = fx_wrap(0x82, b"LPC0", &ec_dev);
+    let pci0 = fx_wrap(0x82, b"PCI0", &lpc0);
     fx_scope(b"_SB_", &pci0)
 }
 
 #[cfg(feature = "kernel-test")]
 /// Parse the LED fixture into the (scoped) namespace; fail the
 /// test if the parse or any expected node is missing. Exactly 15
-/// nodes: Scope \_SB + Devices PCI0/LPCB/EC/HKEY + Names
+/// nodes: Scope \_SB + Devices PCI0/LPC0/EC0/HKEY + Names
 /// MLVL/SMUT/MMUT/LEDI/LEDV + Methods MLCS/MLCG/SSMS/MMTS/LED.
 fn install_thinkpad_led_fixture() -> Result<(), &'static str> {
     use crate::defs::{
@@ -681,8 +681,8 @@ fn smoke_thinkpad_generic_led_set_writes_index_and_arg() -> TestResult {
     if set_generic_led(0, LedState::On).is_err() {
         return TestResult::Fail("set_generic_led(0, On) failed");
     }
-    if fx_name_int("\\\\_SB.PCI0.LPCB.EC.LEDI") != Some(0)
-        || fx_name_int("\\\\_SB.PCI0.LPCB.EC.LEDV") != Some(0x80)
+    if fx_name_int("\\\\_SB.PCI0.LPC0.EC0.LEDI") != Some(0)
+        || fx_name_int("\\\\_SB.PCI0.LPC0.EC0.LEDV") != Some(0x80)
     {
         return TestResult::Fail("LED(0, On) did not write index 0 / arg 0x80");
     }
@@ -693,8 +693,8 @@ fn smoke_thinkpad_generic_led_set_writes_index_and_arg() -> TestResult {
     if set_generic_led(7, LedState::Blink).is_err() {
         return TestResult::Fail("set_generic_led(7, Blink) failed");
     }
-    if fx_name_int("\\\\_SB.PCI0.LPCB.EC.LEDI") != Some(7)
-        || fx_name_int("\\\\_SB.PCI0.LPCB.EC.LEDV") != Some(0xC0)
+    if fx_name_int("\\\\_SB.PCI0.LPC0.EC0.LEDI") != Some(7)
+        || fx_name_int("\\\\_SB.PCI0.LPC0.EC0.LEDV") != Some(0xC0)
     {
         return TestResult::Fail("LED(7, Blink) did not write index 7 / arg 0xC0");
     }
@@ -705,8 +705,8 @@ fn smoke_thinkpad_generic_led_set_writes_index_and_arg() -> TestResult {
     if set_generic_led(12, LedState::Off).is_err() {
         return TestResult::Fail("set_generic_led(12, Off) failed");
     }
-    if fx_name_int("\\\\_SB.PCI0.LPCB.EC.LEDI") != Some(12)
-        || fx_name_int("\\\\_SB.PCI0.LPCB.EC.LEDV") != Some(0x00)
+    if fx_name_int("\\\\_SB.PCI0.LPC0.EC0.LEDI") != Some(12)
+        || fx_name_int("\\\\_SB.PCI0.LPC0.EC0.LEDV") != Some(0x00)
     {
         return TestResult::Fail("LED(12, Off) did not write index 12 / arg 0x00");
     }
@@ -756,8 +756,8 @@ fn smoke_thinkpad_generic_led_rejects_restricted_and_oob() -> TestResult {
     }
     // No AML call happened: the LED argument cells still hold their
     // sentinels.
-    if fx_name_int("\\\\_SB.PCI0.LPCB.EC.LEDI") != Some(0xAA)
-        || fx_name_int("\\\\_SB.PCI0.LPCB.EC.LEDV") != Some(0xAA)
+    if fx_name_int("\\\\_SB.PCI0.LPC0.EC0.LEDI") != Some(0xAA)
+        || fx_name_int("\\\\_SB.PCI0.LPC0.EC0.LEDV") != Some(0xAA)
     {
         return TestResult::Fail("rejected set still wrote to the LED method");
     }
@@ -819,7 +819,7 @@ fn smoke_thinkpad_kbdlight_set_get_round_trip() -> TestResult {
     if set_kbdlight_level(3) != Err(LedError::InvalidLevel(3)) {
         return TestResult::Fail("kbdlight level 3 was not rejected");
     }
-    if fx_name_int("\\\\_SB.PCI0.LPCB.EC.HKEY.MLVL") != Some(0x200) {
+    if fx_name_int("\\\\_SB.PCI0.LPC0.EC0.HKEY.MLVL") != Some(0x200) {
         return TestResult::Fail("rejected kbdlight set still wrote MLVL");
     }
     TestResult::Pass
@@ -850,13 +850,13 @@ fn smoke_thinkpad_mute_micmute_set() -> TestResult {
     if !mute_available() || !micmute_available() {
         return TestResult::Fail("mute/micmute methods not reported available");
     }
-    if set_mute(true).is_err() || fx_name_int("\\\\_SB.PCI0.LPCB.EC.HKEY.SMUT") != Some(1) {
+    if set_mute(true).is_err() || fx_name_int("\\\\_SB.PCI0.LPC0.EC0.HKEY.SMUT") != Some(1) {
         return TestResult::Fail("SSMS(1) did not write mute on");
     }
-    if set_mute(false).is_err() || fx_name_int("\\\\_SB.PCI0.LPCB.EC.HKEY.SMUT") != Some(0) {
+    if set_mute(false).is_err() || fx_name_int("\\\\_SB.PCI0.LPC0.EC0.HKEY.SMUT") != Some(0) {
         return TestResult::Fail("SSMS(0) did not write mute off");
     }
-    if set_micmute(true).is_err() || fx_name_int("\\\\_SB.PCI0.LPCB.EC.HKEY.MMUT") != Some(2) {
+    if set_micmute(true).is_err() || fx_name_int("\\\\_SB.PCI0.LPC0.EC0.HKEY.MMUT") != Some(2) {
         return TestResult::Fail("MMTS(2) did not write micmute on");
     }
     if !micmute_state() {
@@ -864,17 +864,17 @@ fn smoke_thinkpad_mute_micmute_set() -> TestResult {
     }
     // 0x60C0 re-asserts the cached state through the shared handler.
     driver::on_notify(&crate::builtin::BuiltinBackend, 0x60C0);
-    if fx_name_int("\\\\_SB.PCI0.LPCB.EC.HKEY.MMUT") != Some(2) {
+    if fx_name_int("\\\\_SB.PCI0.LPC0.EC0.HKEY.MMUT") != Some(2) {
         return TestResult::Fail("0x60C0 notify did not re-assert micmute on");
     }
-    if set_micmute(false).is_err() || fx_name_int("\\\\_SB.PCI0.LPCB.EC.HKEY.MMUT") != Some(0) {
+    if set_micmute(false).is_err() || fx_name_int("\\\\_SB.PCI0.LPC0.EC0.HKEY.MMUT") != Some(0) {
         return TestResult::Fail("MMTS(0) did not write micmute off");
     }
     if micmute_state() {
         return TestResult::Fail("micmute cache did not record off");
     }
     driver::on_notify(&crate::builtin::BuiltinBackend, 0x60C0);
-    if fx_name_int("\\\\_SB.PCI0.LPCB.EC.HKEY.MMUT") != Some(0) {
+    if fx_name_int("\\\\_SB.PCI0.LPC0.EC0.HKEY.MMUT") != Some(0) {
         return TestResult::Fail("0x60C0 notify did not re-assert micmute off");
     }
     TestResult::Pass

@@ -5,37 +5,39 @@
 //! dependencies: both the builtin backend (AML direct) and the module
 //! backend (AML through the KABI quad stream) read this file.
 //!
-//! DSDT-UNVERIFIED: every path literal below is copied verbatim from
-//! lane 2's `drivers/platform/src/thinkpad_acpi.rs` and has NOT been
-//! verified against the P14s DSDT yet — the HKEY device may sit
-//! elsewhere than under the EC, and the EC path itself varies by
-//! machine (`LPCB` vs `LPC`, `EC` vs `EC0`). Do not submit a PR with
-//! these literals until the DSDT confirms them (tracker #2448,
-//! mechanism record §5). The builtin copy lives here now (moved from
-//! `thinkpad_acpi.rs` in lane 6 so the platform facade can depend on
-//! this crate without a cycle); the module build cannot depend on
-//! `drivers/platform`, so this is the single home for both builds.
+//! DSDT-VERIFIED (2026-11-26, Daniel's P14s dump: `dsdt.aml`, 99,139
+//! bytes, LENOVO / AMD_EDK2 rev 2, checksum valid; disassembled with
+//! iasl 20230628): the EC is `\_SB.PCI0.LPC0.EC0` (Device `EC0` at
+//! DSL line 5082, HID `PNP0C09`), the HKEY device is its child
+//! `\_SB.PCI0.LPC0.EC0.HKEY` (Device `HKEY` at DSL line 5753, HID
+//! `LEN0268`), `MLCS`/`MLCG` are methods of HKEY (DSL lines 6167 /
+//! 6161), `SSMS`/`MMTS` are methods of HKEY via `Scope (HKEY)`
+//! blocks (DSL lines 18364 / 18186, both inside
+//! `Scope (\_SB.PCI0.LPC0.EC0)`), and `LED` is a method of EC0 (DSL
+//! line 5404). The old `\_SB.PCI0.LPCB.EC.*` literals were wrong in
+//! the prefix (`LPCB` vs `LPC0`, `EC` vs `EC0`) and are corrected
+//! here. Mechanism record §5 items 1–6 resolved against this DSDT.
 
-/// HKEY device path — DSDT-UNVERIFIED (see above).
-pub const HKEY_PATH: &str = r"\_SB.PCI0.LPCB.EC.HKEY";
+/// HKEY device path — DSDT-verified (`dsdt.dsl:5753`, HID `LEN0268`).
+pub const HKEY_PATH: &str = r"\_SB.PCI0.LPC0.EC0.HKEY";
 
-/// EC device path — DSDT-UNVERIFIED (see above).
-pub const EC_PATH: &str = r"\_SB.PCI0.LPCB.EC";
+/// EC device path — DSDT-verified (`dsdt.dsl:5082`, HID `PNP0C09`).
+pub const EC_PATH: &str = r"\_SB.PCI0.LPC0.EC0";
 
-/// HKEY `MLCS` (kbdlight set) — DSDT-UNVERIFIED.
-pub const HKEY_MLCS_PATH: &str = r"\_SB.PCI0.LPCB.EC.HKEY.MLCS";
+/// HKEY `MLCS` (kbdlight set) — DSDT-verified (`dsdt.dsl:6167`).
+pub const HKEY_MLCS_PATH: &str = r"\_SB.PCI0.LPC0.EC0.HKEY.MLCS";
 
-/// HKEY `MLCG` (kbdlight get / support probe) — DSDT-UNVERIFIED.
-pub const HKEY_MLCG_PATH: &str = r"\_SB.PCI0.LPCB.EC.HKEY.MLCG";
+/// HKEY `MLCG` (kbdlight get / support probe) — DSDT-verified (`dsdt.dsl:6161`).
+pub const HKEY_MLCG_PATH: &str = r"\_SB.PCI0.LPC0.EC0.HKEY.MLCG";
 
-/// HKEY `SSMS` (speaker-mute LED) — DSDT-UNVERIFIED.
-pub const HKEY_SSMS_PATH: &str = r"\_SB.PCI0.LPCB.EC.HKEY.SSMS";
+/// HKEY `SSMS` (speaker-mute LED) — DSDT-verified (`dsdt.dsl:18364`).
+pub const HKEY_SSMS_PATH: &str = r"\_SB.PCI0.LPC0.EC0.HKEY.SSMS";
 
-/// HKEY `MMTS` (mic-mute LED) — DSDT-UNVERIFIED.
-pub const HKEY_MMTS_PATH: &str = r"\_SB.PCI0.LPCB.EC.HKEY.MMTS";
+/// HKEY `MMTS` (mic-mute LED) — DSDT-verified (`dsdt.dsl:18186`).
+pub const HKEY_MMTS_PATH: &str = r"\_SB.PCI0.LPC0.EC0.HKEY.MMTS";
 
-/// EC `LED` object (generic LEDs) — DSDT-UNVERIFIED.
-pub const EC_LED_PATH: &str = r"\_SB.PCI0.LPCB.EC.LED";
+/// EC `LED` object (generic LEDs) — DSDT-verified (`dsdt.dsl:5404`).
+pub const EC_LED_PATH: &str = r"\_SB.PCI0.LPC0.EC0.LED";
 
 /// HKEY HID table (`thinkpad_acpi.c::tpacpi_acpi_driver_init`):
 /// `LEN0268` (newer, post-2010), `IBM0068` (older, pre-2010),
@@ -66,8 +68,11 @@ pub const MICMUTE_NOTIFY: u64 = 0x60C0;
 pub const SAFE_GENERIC_LEDS: u16 = 0x1481;
 
 /// Keyboard-backlight classdev max (`tpacpi_led_kbdlight`,
-/// `thinkpad_acpi.c:5200`): levels 0-2. Whether the P14s 8840
-/// uses 0-1 or 0-2 is DSDT-dependent (mechanism record §5.7).
+/// `thinkpad_acpi.c:5200`): levels 0-2. The DSDT does not encode
+/// the max — `MLCS`/`MLCG` both forward to `KBLS`, which is an SMI
+/// trampoline (`dsdt.dsl:10629`), so the supported range is a
+/// runtime property, probed by `MLCG` (bit 9 + set/get round-trip,
+/// mechanism record §5.7). Linux's classdev max (2) stands.
 pub const KBDLIGHT_MAX_LEVEL: u8 = 2;
 
 /// Which of the three Linux mechanisms drives a LED (lane 1

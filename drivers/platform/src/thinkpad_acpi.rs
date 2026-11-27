@@ -103,7 +103,9 @@ pub fn set_battery_conservation(enable: bool) {
 }
 
 fn do_set_conservation(enable: bool) {
-    // Invoke `\_SB.PCI0.LPCB.EC.BCTG` (HBIF WMI index 0x44) via AML.
+    // Invoke `\_SB.PCI0.LPC0.EC0.HKEY.BCTG` (HBIF WMI index 0x44) via AML.
+    // DSDT-verified: BCTG is a method of HKEY (`dsdt.dsl:18854`, inside
+    // `Scope (HKEY)` under `Scope (\_SB.PCI0.LPC0.EC0)`), not of the EC.
     // ThinkPad BIOS WMI GUID: "3FC0DE0C-2A72-4B88-BDC5-1D24E64AB5C6"
     // Command byte: 0x21 = enable conservation, 0x20 = disable.
     // Reference: thinkpad_acpi.c `tpacpi_battery_conservation_mode_store`.
@@ -111,7 +113,7 @@ fn do_set_conservation(enable: bool) {
     // Best-effort: if the AML method doesn't exist on this system,
     // the state is still recorded in BATTERY_CONSERVATION.
     let _ = narf_aml::eval::evaluate_method(
-        r"\_SB.PCI0.LPCB.EC.BCTG",
+        r"\_SB.PCI0.LPC0.EC0.HKEY.BCTG",
         &[narf_aml::Value::Integer(cmd)],
     );
 }

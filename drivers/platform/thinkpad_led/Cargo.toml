@@ -22,10 +22,10 @@
 # (`defs.rs`) and the probe/register/set logic (`driver.rs`) behind
 # the `Backend` trait.
 #
-# DSDT-UNVERIFIED: every AML path literal below is copied verbatim
-# from lane 2's `thinkpad_acpi.rs` and has NOT been verified against
-# the P14s DSDT yet (mechanism record §5, tracker #2448). Do not
-# present them as grounded.
+# DSDT-VERIFIED (2026-11-26, P14s `dsdt.aml`): the AML path
+# literals in `defs.rs` are the DSDT's real paths
+# (`\_SB.PCI0.LPC0.EC0`, HKEY `LEN0268` under it); the old
+# `\_SB.PCI0.LPCB.EC.*` literals were corrected in the same change.
 
 [package]
 name         = "narf-drivers-platform-thinkpad-led"

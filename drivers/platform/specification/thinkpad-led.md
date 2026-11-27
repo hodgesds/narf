@@ -33,13 +33,15 @@ The audio-micmute trigger lives in a separate trigger-only module
 ## 2. Assumptions
 
 - The machine is a ThinkPad with the HKEY device
-  (`\_SB.PCI0.LPCB.EC.HKEY`, HID `LEN0268`) and the EC device
-  (`\_SB.PCI0.LPCB.EC`, HID `PNP0C09`). Without them the driver
+  (`\_SB.PCI0.LPC0.EC0.HKEY`, HID `LEN0268`) and the EC device
+  (`\_SB.PCI0.LPC0.EC0`, HID `PNP0C09`). Without them the driver
   registers nothing and probes report unavailable.
-- **DSDT-UNVERIFIED:** every AML path literal in `defs.rs` is copied
-  verbatim from lane 2's `thinkpad_acpi.rs` and has NOT been verified
-  against the P14s DSDT yet (mechanism record §5, tracker #2448).
-  The driver must not present them as grounded.
+- **DSDT-verified (2026-11-26):** the AML path literals in `defs.rs`
+  were verified against Daniel's P14s DSDT (`dsdt.aml`, LENOVO /
+  AMD_EDK2 rev 2): EC0 at DSL line 5082, HKEY at 5753, `LED` at
+  5404, `MLCG`/`MLCS` at 6161/6167, `MMTS`/`SSMS` at 18186/18364.
+  The old `\_SB.PCI0.LPCB.EC.*` literals were corrected in the
+  same change (mechanism record §5 items 1–6 resolved).
 - The kbdlight probe is the full Linux test: `MLCG` returns
   non-negative AND bit 9 is set. A machine without kbdlight reports
   unsupported; `MLCS` is called from exactly one place in Linux

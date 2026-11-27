@@ -20,9 +20,9 @@
 //! behind the `Backend` trait, so the two builds cannot drift apart
 //! in behavior — only in how they reach the hardware.
 //!
-//! DSDT-UNVERIFIED: every AML path literal in `defs.rs` is copied
-//! verbatim from lane 2 and has NOT been verified against the P14s
-//! DSDT yet (mechanism record §5). Do not present them as grounded.
+//! DSDT-VERIFIED (2026-11-26, P14s `dsdt.aml`): every AML path
+//! literal in `defs.rs` is the DSDT's real path
+//! (`\_SB.PCI0.LPC0.EC0`, HKEY `LEN0268` under it).
 
 #![no_std]
 
