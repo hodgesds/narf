@@ -339,13 +339,14 @@ pub fn index_update_bits<T: Transport>(
     index_write(bus, dev, nid, index, tmp as u16)
 }
 
-/// Attach-time codec init (`rt711_io_init`, minus the deferred
-/// DAC DC-offset calibration — see [`rt711_calibration`], which
-/// runs as deferred work in Linux and is not wired in here):
-/// reset, power D0, pin widgets, gain mutes, configuration
-/// defaults, data-port arrangement and index settings, then power
-/// D3. Runs at attach (Linux `update_status` → `io_init`); the
-/// ACP binding calls it for every enumerated RT711.
+/// Attach-time codec init (`rt711_io_init`, minus the DAC
+/// DC-offset calibration — the ACP binding runs
+/// [`rt711_calibration`] right after this for RT711, the Linux
+/// first-init path): reset, power D0, pin widgets, gain mutes,
+/// configuration defaults, data-port arrangement and index
+/// settings, then power D3. Runs at attach (Linux `update_status`
+/// → `io_init`); the ACP binding calls it for every enumerated
+/// RT711.
 pub fn io_init<T: Transport>(bus: &Bus<T>, dev: u8) -> Result<(), SdwError> {
     // Reset: function reset + hidden software reset (`rt711_reset`).
     verb_write(bus, dev, FUNC_RESET, 0)?;
@@ -407,10 +408,13 @@ pub fn io_init<T: Transport>(bus: &Bus<T>, dev: u8) -> Result<(), SdwError> {
 ///
 /// Call-site note: in Linux this runs at the end of `io_init`,
 /// synchronously on the first init and as deferred work
-/// (`calibration_work`) otherwise. It is NOT part of attach-time
-/// [`io_init`]: the caller runs it as deferred work, and must
-/// serialize it against other codec access (Linux holds
-/// `calibrate_mutex`).
+/// (`calibration_work`) otherwise. The ACP binding runs it
+/// synchronously right after [`io_init`] at attach — attach is
+/// always the first init here, there is no resume re-init, so
+/// this is Linux's first-init path. The caller must serialize it
+/// against other codec access (Linux holds `calibrate_mutex`);
+/// that holds trivially at attach, which is single-threaded
+/// enumeration with no concurrent codec access.
 pub fn rt711_calibration<T: Transport>(
     bus: &Bus<T>,
     dev: u8,
