@@ -44,6 +44,16 @@ runs:
         curl -fL "https://download.qemu.org/qemu-${{ inputs.version }}.tar.xz" -o /tmp/qemu.tar.xz
         tar -xf /tmp/qemu.tar.xz -C /tmp
         cd "/tmp/qemu-${{ inputs.version }}"
+        # The release tarball ships only subprojects/dtc.wrap (a Meson
+        # wrap-git pointer) — no subprojects/dtc/ source. Meson would
+        # fetch it at ./configure time, i.e. after the patch below runs,
+        # which is why the patch died with FileNotFoundError (run
+        # 45989443214, job 140499833050). Fetch the pinned revision
+        # ourselves first: QEMU 10.2.3's dtc.wrap pins b6910bec (dtc
+        # v1.6.1), so ./configure finds the source already in place and
+        # the patch applies to the same tree the build compiles.
+        git clone https://gitlab.com/qemu-project/dtc.git subprojects/dtc
+        git -C subprojects/dtc checkout b6910bec11614980a21e46fbccc35934b671bd81
         # GCC 15 + glibc 2.43 (the ubuntu-latest runner image is now
         # Ubuntu 26.04) rejects the vendored dtc's fdt_overlay.c: it
         # assigns memchr() — whose result is now const-propagating —
