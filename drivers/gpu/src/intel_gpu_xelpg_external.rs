@@ -1069,7 +1069,8 @@ pub struct MtlSinkProbe {
     /// (`narf.intel.hdmi14_ext=1`, [`color::dp_output`]); RGB with no PCON
     /// writes otherwise.
     pub output: color::DpOutput,
-    /// The sink's ELD (`drm_edid_to_eld`) when the SST route enables audio
+    /// The sink's ELD (`drm_edid_to_eld`) when the route (SST, or an MST
+    /// stream with its remote sink's EDID) enables audio
     /// (`narf.intel.hdmi14_ext=1`, `intel_dp_has_audio`: every display-12+
     /// port, a sink that declares basic audio or audio descriptors).
     pub audio: Option<alloc::boxed::Box<[u8; audio::MAX_ELD_BYTES]>>,
@@ -2571,7 +2572,7 @@ fn activate_once<M: MmioWindow + ?Sized>(
             None => uhbr::min_hblank(&probe.mode, probe.pipe_bpp),
         };
     }
-    ext.audio = probe.audio.is_some() && probe.mst.is_none();
+    ext.audio = probe.audio.is_some();
     // A 4:2:0 stream's 1:1 scaler joins the pipe's prefill term.
     if probe.output.ycbcr420 {
         ext.scaler = Some(crate::intel_gpu_modeset::ycbcr420_scaler(&probe.mode));
@@ -3465,13 +3466,9 @@ fn finish<M: MmioWindow + ?Sized>(
     }
     rp.pipes.arm_primary(io, pipe)?;
     observe_live(io, route, func, start)?;
-    // intel_post_plane_update: intel_encoders_audio_enable (SST only).
-    let Some(connector_eld) = route
-        .probe
-        .audio
-        .clone()
-        .filter(|_| route.probe.mst.is_none())
-    else {
+    // intel_post_plane_update: intel_encoders_audio_enable (SST, and each
+    // MST stream's mst_stream_enable).
+    let Some(connector_eld) = route.probe.audio.clone() else {
         return Ok(());
     };
     let stream = audio::AudioStream {
@@ -3493,6 +3490,8 @@ fn finish<M: MmioWindow + ?Sized>(
         dsc_bpp_x16: plan.map(|p| u32::from(p.compressed_bpp_x16)),
         ycbcr420: false,
         wa_14020863754: audio::needs_wa_14020863754(route.probe.display_ip),
+        mst: route.probe.mst.is_some(),
+        sst_split_sdp: route.probe.output.sst_split_sdp(),
     };
     let edid = &route.probe.edid[..route.probe.edid_len];
     let eld = audio::compute_eld(&connector_eld, edid, &stream);
@@ -3753,7 +3752,7 @@ fn stop_local<M: MmioWindow + ?Sized>(
     let stop_failed = ExternalError::Modeset(ModesetError::PipelineStopUnavailable);
     // intel_pre_plane_update: intel_encoders_audio_disable, before the
     // planes go (best effort: the stop proof is the pipe's).
-    let audio_pipe = route.probe.audio.is_some() && route.probe.mst.is_none();
+    let audio_pipe = route.probe.audio.is_some();
     if let Some(stream) = route.audio.take() {
         let _ = audio::audio_codec_disable(io, &stream);
     }

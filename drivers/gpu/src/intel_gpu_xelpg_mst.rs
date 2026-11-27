@@ -122,6 +122,10 @@ pub struct MtlMstRoute {
     /// The DP tunnel with BW allocation enabled a 128b/132b link runs
     /// through (display-30+ Thunderbolt alt mode), until it is handed back.
     tunnel: Option<tunnel::Tunnel>,
+    /// `narf.intel.hdmi14_ext=1`: each stream reads its sink's whole EDID
+    /// and takes audio (`mst_stream_compute_config`'s
+    /// `intel_dp_audio_compute_config`).
+    audio: bool,
 }
 
 impl MtlMstRoute {
@@ -234,7 +238,8 @@ impl MtlMstRoute {
         Self::connect_aux_beside(io, link, decl, display, alloc, aux, uhbr, None)
     }
 
-    /// [`Self::connect`] over `aux`, the first stream beside `beside`.
+    /// [`Self::connect`] over `aux`, the first stream beside `beside`; the
+    /// streams take audio under `narf.intel.hdmi14_ext=1`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn connect_aux_beside<M: MmioWindow + ?Sized, A: MstAux>(
         io: &M,
@@ -245,6 +250,36 @@ impl MtlMstRoute {
         aux: &mut A,
         uhbr: Option<UhbrMstLink>,
         beside: Option<Pipes>,
+    ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
+        let audio = super::color::opted_in();
+        Self::connect_owner(io, link, decl, display, alloc, aux, uhbr, beside, audio)
+    }
+
+    /// [`Self::connect_aux`] with the streams' audio on
+    /// (`narf.intel.hdmi14_ext=1`).
+    #[cfg(feature = "kernel-test")]
+    fn connect_aux_audio<M: MmioWindow + ?Sized, A: MstAux>(
+        io: &M,
+        link: LinkProbe,
+        decl: MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+    ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
+        Self::connect_owner(io, link, decl, display, alloc, aux, None, None, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_owner<M: MmioWindow + ?Sized, A: MstAux>(
+        io: &M,
+        link: LinkProbe,
+        decl: MtlPortDecl,
+        display: &MtlDisplay,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+        aux: &mut A,
+        uhbr: Option<UhbrMstLink>,
+        beside: Option<Pipes>,
+        audio: bool,
     ) -> Result<Box<Self>, (Box<Self>, ExternalError)> {
         let mut owner = Box::new(Self {
             link,
@@ -257,6 +292,7 @@ impl MtlMstRoute {
             beside,
             retired: None,
             tunnel: uhbr.and_then(|u| u.tunnel),
+            audio,
         });
         let result = owner.start(io, decl, display, alloc, aux, uhbr);
         match result {
@@ -459,6 +495,9 @@ impl MtlMstRoute {
             // this frame, and `connect` is 120 bytes over the 8 KiB
             // budget (CI run 43627487921).
             probe.edid[..128].copy_from_slice(&edid);
+            if self.audio {
+                stream_audio(&mut self.manager, aux, topology, sink, &mut probe)?;
+            }
             crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &mode)?;
             let branch = topology.branches[sink.branch].clone();
             let sdp_streams = topology
@@ -789,6 +828,35 @@ fn mst_fallback(link: &UhbrMstLink) -> Option<MstRetry> {
     })
 }
 
+/// `narf.intel.hdmi14_ext=1` for one MST stream whose base EDID block
+/// `probe` holds: `drm_dp_mst_edid_read`'s extension blocks (as many as
+/// block 0 announces and the probe's buffer holds), then
+/// `intel_dp_audio_compute_config`'s `intel_dp_has_audio` (every display-12+
+/// port; a sink that declares audio) and the connector ELD
+/// (`drm_edid_to_eld`). Out of line: the connect loop's frame stays small.
+#[inline(never)]
+fn stream_audio<A: MstAux>(
+    manager: &mut Manager,
+    aux: &mut A,
+    topology: &Topology,
+    sink: Sink,
+    probe: &mut MtlSinkProbe,
+) -> Result<(), ExternalError> {
+    let blocks = (1 + usize::from(probe.edid[126])).min(EDID_CAPACITY / 128);
+    for block in 1..blocks {
+        let data = complete(manager.read_edid_block(aux, topology, sink, block as u8))?;
+        probe.edid[block * 128..(block + 1) * 128].copy_from_slice(&data);
+    }
+    probe.edid_len = blocks * 128;
+    let edid = &probe.edid[..probe.edid_len];
+    if super::audio::edid_has_audio(edid) {
+        let mut eld = Box::new([0u8; super::audio::MAX_ELD_BYTES]);
+        *eld = super::audio::eld_from_edid(edid, true);
+        probe.audio = Some(eld);
+    }
+    Ok(())
+}
+
 /// The stream of [`uhbr::mst_stream`] for `mode` on the 128b/132b link
 /// (out of line: the connect loop's frame stays small).
 #[inline(never)]
@@ -844,6 +912,9 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
     if probe.uhbr.is_some() && probe.display_ip.is_display30() {
         ext.min_hblank = uhbr::min_hblank(&probe.mode, probe.pipe_bpp);
     }
+    // intel_dp_audio_compute_config: the stream's audio joins the CDCLK
+    // floor (intel_audio_min_cdclk).
+    ext.audio = probe.audio.is_some();
     if let Err(error) = choice.pipes.admit(io, &ext) {
         return Err(ActivateError::Refused(probe, error.into()));
     }
@@ -867,7 +938,12 @@ fn activate_secondary<M: MmioWindow + ?Sized>(
     };
     let result = (|| {
         request_pipe_wells(io, pipe)?;
-        route.reservation = Some(reserve_pipe(io, choice, &ext, display.pipe_dmc)?);
+        route.reservation = Some(crate::intel_gpu_xelpg_hdmi::reserve_audio_pipe(
+            io,
+            choice,
+            &ext,
+            display.pipe_dmc,
+        )?);
         write(
             io,
             trans_clk_sel(pipe.transcoder()),
@@ -906,6 +982,11 @@ fn stop_stream<M: MmioWindow + ?Sized>(
     if !shared {
         stop_local(io, route)?;
     } else if let Some(rp) = route.reservation.as_mut() {
+        // mst_stream_disable: intel_audio_codec_disable before the planes
+        // go (best effort: the stop proof is the pipe's).
+        if let Some(stream) = route.audio.take() {
+            let _ = super::audio::audio_codec_disable(io, &stream);
+        }
         rp.pipes.disable_primary(io, rp.pipe)?;
         rp.pipes.disable(io, rp.pipe)?;
         let trans = rp.transcoder();
@@ -921,7 +1002,7 @@ fn stop_stream<M: MmioWindow + ?Sized>(
             write(io, trans_dp2_ctl(trans), 0)?;
         }
         write(io, trans_clk_sel(trans), 0)?;
-        rp.pipes.release(io, rp.pipe, rp.dmc)?;
+        release_audio_pipe(io, rp, route.probe.audio.is_some())?;
     }
     route.state = RouteState::Stopped;
     Ok(())
@@ -1026,6 +1107,150 @@ pub(super) mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_xelpg_mst",
         smoke_mtl_mst_two_streams_share_transport_and_stop_in_reverse
+    );
+
+    /// DP MST audio (`narf.intel.hdmi14_ext=1`, Linux 7.4 `intel_dp_mst.c`
+    /// `mst_stream_compute_config` / `mst_stream_enable` /
+    /// `mst_stream_disable`, `intel_audio.c`): the hub's sinks carry a CTA
+    /// extension with an LPCM SAD, so each stream reads its EDID's
+    /// extension block (`drm_dp_mst_edid_read`), takes audio
+    /// (`intel_dp_has_audio`) and its connector ELD, and enables it on its
+    /// own transcoder: `AUDIO_OUTPUT_ENABLE` and `AUD_CONFIG`'s
+    /// `N_VALUE_INDEX` for B and C, `HBLANK_EARLY_ENABLE_TGL` for both, and
+    /// `pin_eld_notify(PORT_TC1 = PORT_D = 3, cpu_transcoder)` per stream
+    /// (`intel_audio_needs_cpu_transcoder_id`). `find_audio_state` answers
+    /// (3, 1) and (3, 2) with the streams' ELDs and the legacy lookups (3,
+    /// -1) and (3, 0) with nothing. The stop disables both and notifies
+    /// again. Without the option no extension is read and no audio runs.
+    fn smoke_mtl_mst_streams_take_audio_per_transcoder() -> TestResult {
+        use narf_drivers_sound::display_audio as acomp;
+        super::audio::reset_for_test();
+        acomp::register_display_audio_codec(&super::audio::tests::SCRIPTED_HDA);
+        let result = mst_audio_sequence();
+        acomp::unregister_display_audio_codec();
+        super::audio::reset_for_test();
+        result
+    }
+
+    fn mst_audio_sequence() -> TestResult {
+        use super::audio::tests::{NOTIFY_COUNT, NOTIFY_PIPE, NOTIFY_PORT};
+        use super::audio::{component_get_eld, AUD_CONFIG_BE};
+        use crate::intel_gpu_audio::{aud_eld_valid, aud_output_enable, HSW_AUD_PIN_ELD_CP_VLD};
+        use core::sync::atomic::Ordering;
+        // An audio data block: LPCM, 2 channels, 32/44.1/48 kHz, 16/20/24 bit.
+        let audio_edid = crate::intel_gpu_xelpg_external::color::tests::with_cta(
+            edid(),
+            &[(1 << 5) | 3, 0x09, 0x07, 0x07],
+        );
+        let connect = |io: &ExtFake, aux: &mut Branch<'_>, audio: bool, index: &mut u32| {
+            let link = probe_link(io, Generation::MeteorLake, XeLpgPort::Tc1, false).ok()?;
+            let alloc = &mut |mode: &Mode| Some(fb(mode, index));
+            let owner = if audio {
+                MtlMstRoute::connect_aux_audio(
+                    io,
+                    link,
+                    MtlPortDecl::USB_C,
+                    &MtlDisplay::NONE,
+                    alloc,
+                    aux,
+                )
+            } else {
+                MtlMstRoute::connect_aux(io, link, MtlPortDecl::USB_C, &MtlDisplay::NONE, alloc, aux)
+            };
+            owner.ok()
+        };
+        let io = ExtFake::new(XeLpgPort::Tc1, DpSink::new(0x14, edid()));
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        let mut aux = branch(&io);
+        aux.hub.edid.copy_from_slice(&audio_edid);
+        let mut index = 0;
+        let before = NOTIFY_COUNT.load(Ordering::SeqCst);
+        let Some(mut owner) = connect(&io, &mut aux, true, &mut index) else {
+            return TestResult::Fail("MST must light two audio sinks");
+        };
+        let i2c_reads = aux
+            .hub
+            .bodies
+            .iter()
+            .filter(|b| b.first() == Some(&crate::dp_mst::REMOTE_I2C_READ))
+            .count();
+        if owner.stream_count() != 2
+            || i2c_reads != 4
+            || owner
+                .streams
+                .iter()
+                .any(|s| s.route.probe.edid_len != 256 || s.route.audio.is_none())
+        {
+            return TestResult::Fail("each stream must read its extension block and take audio");
+        }
+        let pin = io.read32(HSW_AUD_PIN_ELD_CP_VLD);
+        let both = aud_output_enable(Transcoder::B) | aud_output_enable(Transcoder::C);
+        if pin & both != both
+            || pin & (aud_eld_valid(Transcoder::B) | aud_eld_valid(Transcoder::C)) != 0
+            || io.read32(crate::intel_gpu_audio::aud_cfg_off(Transcoder::B))
+                & crate::intel_gpu_audio::AUD_CONFIG_N_VALUE_INDEX
+                == 0
+            || io.read32(crate::intel_gpu_audio::aud_cfg_off(Transcoder::C))
+                & crate::intel_gpu_audio::AUD_CONFIG_N_VALUE_INDEX
+                == 0
+            || io.read32(AUD_CONFIG_BE) & ((1 << 25) | (1 << 26)) != (1 << 25) | (1 << 26)
+        {
+            return TestResult::Fail("each MST transcoder must run its own audio enable");
+        }
+        if NOTIFY_COUNT.load(Ordering::SeqCst) != before + 2
+            || NOTIFY_PORT.load(Ordering::SeqCst) != 3
+            || NOTIFY_PIPE.load(Ordering::SeqCst) != 2
+        {
+            return TestResult::Fail("each stream must notify pin_eld_notify(3, its transcoder)");
+        }
+        let mut buf = [0u8; 128];
+        let eld_of = |pipe: i32, buf: &mut [u8; 128]| component_get_eld(3, pipe, buf);
+        if eld_of(1, &mut buf).map(|(on, n)| on && n > 20 && buf[5] >> 4 == 1) != Ok(true)
+            || eld_of(2, &mut buf).map(|(on, _)| on) != Ok(true)
+            || eld_of(-1, &mut buf).is_ok()
+            || eld_of(0, &mut buf).is_ok()
+        {
+            return TestResult::Fail("find_audio_state must address MST streams by transcoder");
+        }
+        if owner.stop_aux(&io, &mut aux).is_err()
+            || io.read32(HSW_AUD_PIN_ELD_CP_VLD) & both != 0
+            || NOTIFY_COUNT.load(Ordering::SeqCst) != before + 4
+            || eld_of(1, &mut buf).is_ok()
+            || eld_of(2, &mut buf).is_ok()
+            || owner.release(&io).is_err()
+        {
+            return TestResult::Fail("the stop must disable each stream's audio and notify");
+        }
+        // narf.intel.hdmi14_ext off: block 0 only, no audio.
+        let io = ExtFake::new(XeLpgPort::Tc1, DpSink::new(0x14, edid()));
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        let mut aux = branch(&io);
+        aux.hub.edid.copy_from_slice(&audio_edid);
+        let before = NOTIFY_COUNT.load(Ordering::SeqCst);
+        let Some(mut owner) = connect(&io, &mut aux, false, &mut index) else {
+            return TestResult::Fail("MST must light without the option");
+        };
+        let i2c_reads = aux
+            .hub
+            .bodies
+            .iter()
+            .filter(|b| b.first() == Some(&crate::dp_mst::REMOTE_I2C_READ))
+            .count();
+        let quiet = i2c_reads == 2
+            && owner.streams.iter().all(|s| s.route.audio.is_none())
+            && NOTIFY_COUNT.load(Ordering::SeqCst) == before
+            && io.read32(HSW_AUD_PIN_ELD_CP_VLD) == 0;
+        let _ = owner.stop_aux(&io, &mut aux);
+        let _ = owner.release(&io);
+        if quiet {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("without the option MST must take no audio")
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_xelpg_mst",
+        smoke_mtl_mst_streams_take_audio_per_transcoder
     );
 
     fn smoke_mtl_mst_missing_act_retains_failed_route_and_blocks_release() -> TestResult {

@@ -1529,6 +1529,8 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         dsc_bpp_x16: None,
         ycbcr420: format == crate::intel_gpu_hdmi::SinkFormat::Ycbcr420,
         wa_14020863754: audio::needs_wa_14020863754(ip),
+        mst: false,
+        sst_split_sdp: false,
     };
     let edid = &route.probe.edid[..route.probe.edid_len];
     let eld = audio::compute_eld(&connector_eld, edid, &stream);

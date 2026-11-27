@@ -83,6 +83,8 @@ fn hdmi_stream() -> AudioStream {
         dsc_bpp_x16: None,
         ycbcr420: false,
         wa_14020863754: false,
+        mst: false,
+        sst_split_sdp: false,
     }
 }
 
@@ -220,8 +222,14 @@ fn smoke_xelpg_audio_codec_enable_disable_dp() -> TestResult {
     {
         return TestResult::Fail("hsw_audio_codec_disable's DP sequence differs from Linux");
     }
-    // UHBR: the SDP split, and the CPU transcoder in the notification.
-    let uhbr = AudioStream { uhbr: true, ..s };
+    // UHBR (intel_dp_audio_compute_config): the SDP split for MST and for an
+    // SST sink with DP_SST_SPLIT_SDP_CAP, none for one without; the CPU
+    // transcoder in the notification for UHBR SST and for MST at any rate.
+    let uhbr = AudioStream {
+        uhbr: true,
+        sst_split_sdp: true,
+        ..s
+    };
     let io = AudioFake::new();
     if codec_enable(&io, &uhbr, 307_200, 0).is_err()
         || io.writes_to(aud_dp_2dot0_ctrl(Transcoder::B)) != [AUD_ENABLE_SDP_SPLIT]
@@ -229,6 +237,21 @@ fn smoke_xelpg_audio_codec_enable_disable_dp() -> TestResult {
         || s.notify_pipe() != -1
     {
         return TestResult::Fail("UHBR audio must split SDPs and name its transcoder");
+    }
+    let no_split = AudioStream { uhbr: true, ..s };
+    let mst_uhbr = AudioStream {
+        uhbr: true,
+        mst: true,
+        ..s
+    };
+    let mst = AudioStream { mst: true, ..s };
+    if no_split.sdp_split_enable()
+        || !mst_uhbr.sdp_split_enable()
+        || mst.sdp_split_enable()
+        || mst.notify_pipe() != 1
+        || no_split.notify_pipe() != 1
+    {
+        return TestResult::Fail("the SDP split and transcoder id differ from Linux");
     }
     // The compressed 4K hblank workaround.
     let dsc = AudioStream {

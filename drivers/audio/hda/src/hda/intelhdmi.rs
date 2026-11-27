@@ -21,8 +21,10 @@
 //! Deviations, each a simplification: converters are assigned to pins once,
 //! at discovery (the first free converter in each pin's connection list),
 //! and each pin keeps its own PCM, where Linux picks a converter at PCM open
-//! and maps PCMs to pins dynamically; only device entry 0 of each pin is
-//! used (no DP MST audio, which Linux also leaves as a todo); the silent
+//! and maps PCMs to pins dynamically (`dyn_pcm_assign`): a pin's PCM sits on
+//! one of its device entries (`dev_num`; an MST or UHBR SST stream's entry is
+//! its CPU transcoder), so a second MST stream on the same pin gets no PCM
+//! of its own; the silent
 //! stream and keep-alive are not modelled; the vendor verbs are re-issued
 //! before the AFG's D0 at stream configuration, not at every power
 //! transition; display power is dropped at codec suspend.
@@ -33,6 +35,25 @@ use alloc::vec::Vec;
 use narf_bus::BusDevice;
 use narf_drivers_sound::display_audio::{self as acomp, DisplayAudioCodec, DisplayAudioComponent};
 use narf_lib::sync::IrqSafeSpinLock;
+
+/// `AC_VERB_GET_PARAMETERS`, `AC_PAR_DEVLIST_LEN` and `AC_DEV_LIST_LEN_MASK`;
+/// `AC_VERB_SET_DEVICE_SEL`.
+const GET_PARAMETER: u32 = 0xf00;
+const AC_PAR_DEVLIST_LEN: u32 = 0x15;
+const AC_DEV_LIST_LEN_MASK: u32 = 0x3f;
+const SET_DEVICE_SEL: u32 = 0x735;
+
+/// `spec->dev_num` of an Intel display codec: `intel_hsw_common_init`'s
+/// worst-case device entries per pin (`intel_hsw_fixup`: 3 for Haswell,
+/// Gemini Lake and Ice Lake, 4 from Tiger Lake on), 1 for the models
+/// without `codec->dp_mst` (Baytrail, the PCH codecs).
+pub(super) const fn dev_num(model: IntelHdmiModel) -> u8 {
+    match model {
+        IntelHdmiModel::Hsw | IntelHdmiModel::Glk | IntelHdmiModel::Icl => 3,
+        IntelHdmiModel::Tgl | IntelHdmiModel::Adlp => 4,
+        IntelHdmiModel::Byt | IntelHdmiModel::Cpt => 1,
+    }
+}
 
 /// `INTEL_GET_VENDOR_VERB` / `INTEL_SET_VENDOR_VERB` and their bits.
 pub(super) const INTEL_GET_VENDOR_VERB: u32 = 0xf81;
@@ -474,11 +495,12 @@ impl IntelHda {
         })
     }
 
-    /// `sync_eld_via_acomp` + `update_eld` for one Intel pin (device entry
-    /// 0): `snd_hdac_acomp_get_eld` through this codec's `pin2port`; the
-    /// monitor is present when the display reports audio enabled, and the
-    /// ELD is valid when it has a size, parses and carries a SAD.
-    pub(super) fn intel_sense(&self, graph: &Codec, pin: u8) -> (bool, Option<super::hdmi::Sink>) {
+    /// `sync_eld_via_acomp` + `update_eld` for one device entry of an Intel
+    /// pin: `snd_hdac_acomp_get_eld(pin, dev_id)` through this codec's
+    /// `pin2port`; the monitor is present when the display reports audio
+    /// enabled, and the ELD is valid when it has a size, parses and carries
+    /// a SAD.
+    fn intel_entry_eld(&self, graph: &Codec, pin: u8, dev_id: u8) -> (bool, Option<super::hdmi::Sink>) {
         let mut buf = [0u8; ELD_MAX_SIZE];
         let codec = IntelPin {
             model: hda_codec::intel_hdmi_model(graph),
@@ -488,7 +510,7 @@ impl IntelHda {
             component().map(|c| c as &dyn DisplayAudioComponent),
             Some(&codec as &dyn DisplayAudioCodec),
             u32::from(pin),
-            0,
+            i32::from(dev_id),
             &mut buf,
         ) {
             Ok((present, size)) if size > 0 => (
@@ -500,8 +522,56 @@ impl IntelHda {
         }
     }
 
-    /// `snd_hdac_sync_audio_rate` for `pin` (device entry 0) at `rate` Hz.
-    fn intel_sync_audio_rate(&self, graph: &Codec, pin: u8, rate: u32) {
+    /// The sense of an Intel pin over its device entries (`hdmi_add_pin`
+    /// allocates [`dev_num`] per pin; an MST or UHBR SST stream sits on the
+    /// entry of its CPU transcoder, `intel_pin_eld_notify`'s `dev_id =
+    /// pipe`). The pin's PCM (NARF keeps one per pin) stays on `current`
+    /// while its ELD is valid, as an attached PCM stays on its pin
+    /// (`update_eld`), else moves to the lowest entry with a valid ELD
+    /// (`hdmi_attach_hda_pcm`), else reports `current`. Returns presence,
+    /// sink and the entry.
+    pub(super) fn intel_sense(
+        &self,
+        graph: &Codec,
+        pin: u8,
+        current: u8,
+    ) -> (bool, Option<super::hdmi::Sink>, u8) {
+        let entries = hda_codec::intel_hdmi_model(graph).map_or(1, dev_num);
+        let (present, sink) = self.intel_entry_eld(graph, pin, current);
+        if sink.is_some() {
+            return (present, sink, current);
+        }
+        for dev in (0..entries).filter(|&dev| dev != current) {
+            let (on, other) = self.intel_entry_eld(graph, pin, dev);
+            if other.is_some() {
+                return (on, other, dev);
+            }
+        }
+        (present, None, current)
+    }
+
+    /// `snd_hda_set_dev_select` on an Intel pin: nothing without
+    /// `codec->dp_mst` (Baytrail and the PCH codecs) or for a pin whose
+    /// device list (`AC_PAR_DEVLIST_LEN`, 0-based) has one entry; a
+    /// `dev_id` past the list is refused (-EINVAL, nothing written); else
+    /// `AC_VERB_SET_DEVICE_SEL`.
+    fn intel_set_dev_select(&self, graph: &Codec, pin: u8, dev_id: u8) -> Result<(), HdaError> {
+        if hda_codec::intel_hdmi_model(graph).map_or(1, dev_num) == 1 {
+            return Ok(());
+        }
+        let parm = self.verb(graph.addr, pin, (GET_PARAMETER << 8) | AC_PAR_DEVLIST_LEN)?;
+        let parm = if parm == u32::MAX { 0 } else { parm };
+        let devices = (parm & AC_DEV_LIST_LEN_MASK) + 1;
+        if devices == 1 || devices <= u32::from(dev_id) {
+            return Ok(());
+        }
+        self.verb(graph.addr, pin, (SET_DEVICE_SEL << 8) | u32::from(dev_id))?;
+        Ok(())
+    }
+
+    /// `snd_hdac_sync_audio_rate` for `pin`'s device entry `dev_id` at
+    /// `rate` Hz.
+    fn intel_sync_audio_rate(&self, graph: &Codec, pin: u8, dev_id: u8, rate: u32) {
         let codec = IntelPin {
             model: hda_codec::intel_hdmi_model(graph),
             codec_id: codec_id(graph),
@@ -510,7 +580,7 @@ impl IntelHda {
             component().map(|c| c as &dyn DisplayAudioComponent),
             Some(&codec as &dyn DisplayAudioCodec),
             u32::from(pin),
-            0,
+            i32::from(dev_id),
             rate,
         );
     }
@@ -649,8 +719,12 @@ impl IntelHda {
             .hdmi_pcm_of_output(output)
             .ok_or(HdaError::NoOutputStream)?;
         let pcm = self.hdmi_state(index);
+        // snd_hda_set_dev_select: the pin's verbs below address the device
+        // entry its PCM sits on.
+        let dev_id = self.hdmi_dev_id_of_output(output);
+        self.intel_set_dev_select(graph, pin, dev_id)?;
         self.intel_pin_cvt_fixup(graph, nodes)?;
-        self.intel_sync_audio_rate(graph, pin, rate);
+        self.intel_sync_audio_rate(graph, pin, dev_id, rate);
         let sink = self.hdmi_sink(output);
         let ca = self.intel_hdmi_infoframe(graph, nodes, channels, sink.as_ref(), &pcm)?;
         self.update_hdmi_state(index, |state| {

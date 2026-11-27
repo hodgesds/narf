@@ -583,6 +583,9 @@ impl Model {
             }
             (_, 0xf2d, _) if converter => 1,
             (_, 0xf07, _) if pin => 0x40,
+            // AC_PAR_DEVLIST_LEN: four device entries (0-based 3), a
+            // Tiger Lake+ pin behind an MST-capable receiver.
+            (_, 0xf00, 0x15) if pin => 3,
             _ => 0,
         }
     }
@@ -4854,3 +4857,131 @@ fn native_hda_i915_init_defers_until_display_binds() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda", native_hda_i915_init_defers_until_display_binds);
+
+/// A scripted Intel display whose only audio stream is a DP MST (or UHBR
+/// SST) stream on port B's CPU transcoder C: `find_audio_state` answers it
+/// at (PORT_B, 2) alone.
+#[derive(Debug)]
+struct MstScriptedDisplay {
+    state: IrqSafeSpinLock<ScriptedState>,
+}
+
+impl narf_drivers_sound::display_audio::DisplayAudioComponent for MstScriptedDisplay {
+    fn get_power(&self) -> u64 {
+        1
+    }
+    fn put_power(&self, _cookie: u64) {}
+    fn codec_wake_override(&self, _enable: bool) {}
+    fn get_cdclk_freq(&self) -> Result<u32, narf_drivers_sound::display_audio::ComponentError> {
+        Ok(307_200)
+    }
+    fn sync_audio_rate(
+        &self,
+        port: i32,
+        pipe: i32,
+        rate: u32,
+    ) -> Result<(), narf_drivers_sound::display_audio::ComponentError> {
+        self.state.lock().calls.push(("rate", port, pipe, rate));
+        Ok(())
+    }
+    fn get_eld(
+        &self,
+        port: i32,
+        pipe: i32,
+        buf: &mut [u8],
+    ) -> Result<(bool, usize), narf_drivers_sound::display_audio::ComponentError> {
+        let state = self.state.lock();
+        match (&state.eld, port, pipe) {
+            (Some(eld), 1, 2) => {
+                let n = eld.len().min(buf.len());
+                buf[..n].copy_from_slice(&eld[..n]);
+                Ok((true, eld.len()))
+            }
+            _ => Err(narf_drivers_sound::display_audio::ComponentError::Invalid),
+        }
+    }
+}
+
+static MST_DISPLAY: MstScriptedDisplay = MstScriptedDisplay {
+    state: IrqSafeSpinLock::new(ScriptedState {
+        eld: None,
+        calls: Vec::new(),
+    }),
+};
+
+/// DP MST audio on the Intel HDMI codec (sound/hda/codecs/hdmi/hdmi.c,
+/// intelhdmi.c, sound/hda/common/codec.c): the display lights an MST
+/// stream on port B's transcoder C and calls `pin_eld_notify(PORT_B, 2)`;
+/// the pin's sense reads its device entries (`dev_num` 4 for this
+/// Meteor Lake codec) through `snd_hdac_acomp_get_eld(pin 6, dev_id)` and
+/// finds the ELD on entry 2 (`dev_id = pipe`). At stream setup
+/// `snd_hda_set_dev_select` reads the pin's `AC_PAR_DEVLIST_LEN` (3: four
+/// entries) and selects entry 2 (`AC_VERB_SET_DEVICE_SEL`) before the
+/// pin's converter select and InfoFrame, and `snd_hdac_sync_audio_rate`
+/// names (PORT_B, 2).
+fn native_hda_intel_hdmi_mst_device_entry() -> TestResult {
+    use narf_drivers_sound::display_audio as acomp;
+    acomp::unbind_display_audio_component();
+    *MST_DISPLAY.state.lock() = ScriptedState::default();
+    super::super::intelhdmi::reset_display_power_for_test();
+    if !acomp::bind_display_audio_component(&MST_DISPLAY) {
+        return TestResult::Fail("the scripted MST display must bind");
+    }
+    let result = intel_mst_entry();
+    acomp::unbind_display_audio_component();
+    acomp::unregister_display_audio_codec();
+    super::super::intelhdmi::reset_display_power_for_test();
+    result
+}
+
+fn intel_mst_entry() -> TestResult {
+    let fixture = match intel_fixture() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    super::super::intelhdmi::register_notifier(&dev);
+    MST_DISPLAY.state.lock().eld = Some(INTEL_SINK_ELD.to_vec());
+    dev.jack_dirty.store(false, Ordering::Release);
+    narf_drivers_sound::display_audio::notify_pin_eld(1, 2);
+    if !dev.jack_dirty.load(Ordering::Acquire) {
+        return TestResult::Fail("pin_eld_notify(PORT_B, 2) must mark the codec's jack dirty");
+    }
+    if dev.refresh_hdmi(false).is_err() {
+        return TestResult::Fail("the jack re-read must run");
+    }
+    let (jack, eld) = dev.hdmi_jack();
+    if !jack || eld != INTEL_SINK_ELD || dev.hdmi.lock()[0].dev_id != 2 {
+        return TestResult::Fail("the pin must sit on device entry 2 with the stream's ELD");
+    }
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 3) else {
+        return TestResult::Fail("open the HDMI PCM");
+    };
+    let first = fixture.model.verbs.len();
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure Intel HDMI playback on the MST entry");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    let at = |v: u32| verbs.iter().position(|x| *x == v);
+    match (
+        at(make_verb(0, 6, 0xf0015)),
+        at(make_verb(0, 6, 0x73502)),
+        at(make_verb(0, 6, 0xf0100)),
+        at(make_verb(0, 6, 0x73184)),
+    ) {
+        (Some(len), Some(sel), Some(conn), Some(ai)) if len < sel && sel < conn && conn < ai => {}
+        _ => return TestResult::Fail("the device entry must be selected before the pin verbs"),
+    }
+    let calls = MST_DISPLAY.state.lock().calls.clone();
+    if calls.is_empty() || calls.iter().any(|c| *c != ("rate", 1, 2, 48_000)) {
+        return TestResult::Fail("the rate sync must name the MST stream's transcoder");
+    }
+    drop(playback);
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_intel_hdmi_mst_device_entry);
