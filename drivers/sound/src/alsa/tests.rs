@@ -1452,7 +1452,10 @@ kernel_test_in!("drivers/sound/alsa", alsa_card_components_and_pcm_names);
 /// RW_NONINTERLEAVED", S32P in pw-top).
 fn alsa_interleaved_only_device_offers_no_planar_access() -> TestResult {
     let fixture = Fixture::new();
-    fixture.backend.interleaved_only.store(true, Ordering::Release);
+    fixture
+        .backend
+        .interleaved_only
+        .store(true, Ordering::Release);
     let f = fixture.pcm(false);
     let m = Memory::new();
     // MMAP_INTERLEAVED (0), RW_INTERLEAVED (3) and RW_NONINTERLEAVED (4).
