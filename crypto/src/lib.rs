@@ -41,6 +41,8 @@ pub mod aes_ccm;
 pub mod aes_ctr;
 pub mod aes_kw;
 pub mod aes_siv;
+#[cfg(all(target_arch = "x86_64", any(test, feature = "kernel")))]
+mod aes_xts_ni;
 pub mod bip;
 pub mod bip_cmac;
 pub mod chacha20;
@@ -379,6 +381,11 @@ pub fn aes_xts_128_encrypt(
         return Err(CryptoError::InvalidInput);
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if aes_xts_ni::xts(true, key_bytes, sector_id, sector_size, data) {
+        return Ok(());
+    }
+
     use aes::cipher::KeyInit;
     use aes::Aes128;
     use xts_mode::{get_tweak_default, Xts128};
@@ -408,6 +415,11 @@ pub fn aes_xts_128_decrypt(
     cap.check_live()?;
     if !valid_xts_area(data, sector_size) {
         return Err(CryptoError::InvalidInput);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if aes_xts_ni::xts(false, key_bytes, sector_id, sector_size, data) {
+        return Ok(());
     }
 
     use aes::cipher::KeyInit;
@@ -452,6 +464,11 @@ pub fn aes_xts_256_encrypt_with_sector_size(
     cap.check_live()?;
     if !valid_xts_area(data, sector_size) {
         return Err(CryptoError::InvalidInput);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if aes_xts_ni::xts(true, key_bytes, sector_id, sector_size, data) {
+        return Ok(());
     }
 
     use aes::cipher::KeyInit;
@@ -499,6 +516,11 @@ pub fn aes_xts_256_decrypt_with_sector_size(
     cap.check_live()?;
     if !valid_xts_area(data, sector_size) {
         return Err(CryptoError::InvalidInput);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if aes_xts_ni::xts(false, key_bytes, sector_id, sector_size, data) {
+        return Ok(());
     }
 
     use aes::cipher::KeyInit;
