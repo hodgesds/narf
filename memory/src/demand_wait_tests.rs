@@ -256,3 +256,47 @@ kernel_test_in!(
     "memory/demand_wait",
     smoke_demand_wait_capacity_and_replacement_waker
 );
+
+/// More waiters than the old fixed table held (one slot per task the
+/// scheduler could admit) all park on one owner, and all wake when it
+/// retires. Linux's folio wait queues link on-stack entries and have no
+/// capacity; with task admission sized from RAM neither may this.
+fn smoke_demand_wait_has_no_waiter_capacity() -> TestResult {
+    const WAITERS: usize = 1100;
+    let space = AddressSpace::empty();
+    space.map_region(region()).unwrap();
+    let ticket = claim(&space, BASE);
+    let count = Arc::new(Count::default());
+    let waker = Waker::from(count.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut waits = alloc::vec::Vec::with_capacity(WAITERS);
+    for _ in 0..WAITERS {
+        let mut wait = alloc::boxed::Box::pin(DemandPageWait::new(&space, BASE, ticket));
+        if !wait.as_mut().poll(&mut cx).is_pending() {
+            drop(waits);
+            space.cancel_demand_page(BASE, ticket);
+            return TestResult::Fail("a demand-page waiter past 1024 could not park");
+        }
+        waits.push(wait);
+    }
+    space.cancel_demand_page(BASE, ticket);
+    let woken = count.0.load(Ordering::Relaxed);
+    let resolved = waits
+        .iter_mut()
+        .all(|wait| wait.as_mut().poll(&mut cx) == Poll::Ready(Ok(())));
+    drop(waits);
+    if woken != WAITERS {
+        return TestResult::Fail("retiring the owner did not wake every waiter");
+    }
+    if !resolved {
+        return TestResult::Fail("a woken waiter did not see its owner retired");
+    }
+    if ACTIVE.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("a dropped waiter stayed registered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/demand_wait",
+    smoke_demand_wait_has_no_waiter_capacity
+);
