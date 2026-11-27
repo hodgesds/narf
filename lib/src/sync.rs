@@ -1,4 +1,5 @@
-//! Sync primitives (`SpinLock`, `IrqSafeSpinLock`, `Once`, `OnceLock`).
+//! Sync primitives (`SpinLock`, `IrqSafeSpinLock`, `TicketSpinLock`,
+//! `IrqSafeTicketSpinLock`, `Once`, `OnceLock`).
 //!
 //! Spec: `lib/specification/spec.md` §3.1. Typestate IRQ safety (§4): holding
 //! a `SpinLockGuard<'_, T, IrqsDisabled>` across code that re-enables IRQs is
@@ -602,6 +603,355 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for IrqSafeSpinLock<T> {
 }
 
 // ──────────────────────────────────────────────────────────────────
+// TicketSpinLock<T> — FIFO-fair spinlock, must be taken with IRQs enabled.
+// ──────────────────────────────────────────────────────────────────
+
+/// FIFO-fair spinlock: waiters take monotonically increasing tickets and
+/// are served strictly in ticket order, so a waiter can never be overtaken
+/// indefinitely by later arrivals (the starvation mode of the plain
+/// ticket-free [`SpinLock`]). Must be acquired with IRQs enabled; taking
+/// it with IRQs disabled risks deadlock against an IRQ handler that tries
+/// the same lock. Use [`IrqSafeTicketSpinLock`] from IRQ-possible contexts.
+///
+/// Fairness only: this changes *who* acquires the lock next under
+/// contention, not how fast the critical section runs. No throughput gain
+/// is claimed for it.
+///
+/// Ticket counters are `usize` and wrap after 2^64 acquisitions; a wrap
+/// can only reorder waiters if more than 2^63 tickets are outstanding at
+/// once, which cannot happen (outstanding waiters are bounded by the CPU
+/// count).
+pub struct TicketSpinLock<T: ?Sized> {
+    next_ticket: AtomicUsize,
+    now_serving: AtomicUsize,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: `TicketSpinLock` serialises access to `T`; if `T: Send`, the lock is
+// `Send + Sync`. We never construct a `&T` alias while the lock is held.
+unsafe impl<T: ?Sized + Send> Send for TicketSpinLock<T> {}
+// SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
+unsafe impl<T: ?Sized + Send> Sync for TicketSpinLock<T> {}
+
+impl<T> TicketSpinLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self {
+            next_ticket: AtomicUsize::new(0),
+            now_serving: AtomicUsize::new(0),
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+}
+
+impl<T: ?Sized> TicketSpinLock<T> {
+    /// Raw pointer to the guarded value, without acquiring the lock.
+    /// See [`SpinLock::as_ptr`] for the (narrow) supported use.
+    #[inline]
+    pub const fn as_ptr(&self) -> *mut T {
+        self.data.get()
+    }
+
+    /// Take the next ticket in line. The caller owns the lock only once
+    /// `now_serving` reaches the returned ticket.
+    #[inline]
+    fn take_ticket(&self) -> usize {
+        self.next_ticket.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Spin until `now_serving` reaches `ticket`. IRQs are enabled here
+    /// (this is the [`IrqsEnabled`] variant), so no shootdown drain is
+    /// needed — an IPI can be taken while spinning.
+    #[inline]
+    fn wait_for_ticket(&self, ticket: usize) {
+        while self.now_serving.load(Ordering::Acquire) != ticket {
+            spin_loop();
+        }
+    }
+
+    /// Hand the lock to the next ticket holder.
+    #[inline]
+    fn release_ticket(&self) {
+        self.now_serving.fetch_add(1, Ordering::Release);
+    }
+
+    /// Take a ticket only if the lock is free *and* nobody is queued
+    /// ahead of us. A contended `try_lock` never jumps the queue: if a
+    /// waiter already holds a ticket, this returns `false` even when the
+    /// current holder releases before we retry.
+    fn try_take_ticket(&self) -> bool {
+        loop {
+            let serving = self.now_serving.load(Ordering::Acquire);
+            let next = self.next_ticket.load(Ordering::Relaxed);
+            if serving != next {
+                return false;
+            }
+            match self.next_ticket.compare_exchange(
+                serving,
+                serving.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Acquire the lock, in ticket order. Caller asserts IRQs are enabled
+    /// via the zero-sized witness `IrqsEnabled`.
+    #[inline]
+    pub fn lock(&self, _: IrqsEnabled) -> TicketSpinLockGuard<'_, T, IrqsEnabled> {
+        let ticket = self.take_ticket();
+        self.wait_for_ticket(ticket);
+        TicketSpinLockGuard {
+            lock: self,
+            _irq: IrqsEnabled,
+        }
+    }
+
+    /// Attempt to acquire without blocking and without jumping the queue;
+    /// returns `None` on contention.
+    #[inline]
+    pub fn try_lock(&self, _: IrqsEnabled) -> Option<TicketSpinLockGuard<'_, T, IrqsEnabled>> {
+        self.try_take_ticket().then(|| TicketSpinLockGuard {
+            lock: self,
+            _irq: IrqsEnabled,
+        })
+    }
+}
+
+/// RAII guard for [`TicketSpinLock`]. The `I: IrqState` parameter
+/// propagates the IRQ context under which the lock was acquired, exactly
+/// as [`SpinLockGuard`] does.
+pub struct TicketSpinLockGuard<'a, T: ?Sized, I: IrqState> {
+    lock: &'a TicketSpinLock<T>,
+    _irq: I,
+}
+
+impl<T: ?Sized, I: IrqState> fmt::Debug for TicketSpinLockGuard<'_, T, I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TicketSpinLockGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+// Guards are `!Send`: unlocking must happen on the CPU that locked.
+impl<T: ?Sized, I: IrqState> !Send for TicketSpinLockGuard<'_, T, I> {}
+
+impl<T: ?Sized, I: IrqState> Deref for TicketSpinLockGuard<'_, T, I> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: lock is held.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized, I: IrqState> DerefMut for TicketSpinLockGuard<'_, T, I> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: lock is held exclusively.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized, I: IrqState> Drop for TicketSpinLockGuard<'_, T, I> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.release_ticket();
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for TicketSpinLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TicketSpinLock")
+            .field("now_serving", &self.now_serving.load(Ordering::Relaxed))
+            .field("next_ticket", &self.next_ticket.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// IrqSafeTicketSpinLock<T> — FIFO-fair spinlock that disables IRQs
+// across the critical section.
+// ──────────────────────────────────────────────────────────────────
+
+/// FIFO-fair variant of [`IrqSafeSpinLock`]: same IRQ save/disable/restore
+/// discipline and the same masked-spin shootdown drain, but waiters are
+/// served in ticket order instead of racing a test-and-set. The epoll
+/// instance locks use this so a `ctl`/`wait` caller cannot be overtaken
+/// indefinitely under contention.
+///
+/// Fairness only — see [`TicketSpinLock`]. This changes acquisition order
+/// under contention, not critical-section speed; no throughput gain is
+/// claimed.
+pub struct IrqSafeTicketSpinLock<T: ?Sized> {
+    inner: TicketSpinLock<T>,
+}
+
+// SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
+unsafe impl<T: ?Sized + Send> Send for IrqSafeTicketSpinLock<T> {}
+// SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
+unsafe impl<T: ?Sized + Send> Sync for IrqSafeTicketSpinLock<T> {}
+
+impl<T> IrqSafeTicketSpinLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self {
+            inner: TicketSpinLock::new(data),
+        }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
+}
+
+impl<T: ?Sized> IrqSafeTicketSpinLock<T> {
+    /// Raw pointer to the guarded value, without acquiring the lock.
+    /// See [`SpinLock::as_ptr`] for the (narrow) supported use and the
+    /// reason a hard-coded "offset 0 of the lock" is not one.
+    #[inline]
+    pub const fn as_ptr(&self) -> *mut T {
+        self.inner.as_ptr()
+    }
+
+    #[inline]
+    pub fn lock(&self) -> IrqSafeTicketSpinLockGuard<'_, T> {
+        // SAFETY: save+disable inline asm is the canonical local IRQ-
+        // disable sequence on each arch; no platform state is touched
+        // beyond the IF / DAIF.I bit of the running CPU.
+        // SAFETY: Valid memory or trusted environment
+        let saved = unsafe { irq_save_disable() };
+        let ticket = self.inner.take_ticket();
+        // Spin count drives a throttled `run_lock_spin_hook` (every 256 pause
+        // iterations): we hold IRQs masked here, so without draining we can't
+        // service a peer's TLB-shootdown IPI — see LOCK_SPIN_HOOK. 256 pauses
+        // (~µs) is far under a shootdown sender's ack cap, so the peer never
+        // stalls, while uncontended locks (no inner spin) pay nothing.
+        let mut spins: u32 = 0;
+        // Whether this acquire published a contended-lock marker while spinning
+        // (see below). Uncontended acquires never do, so they can skip the
+        // marker clear — and, crucially, the `current_cpu()` read it needs.
+        let mut marked = false;
+        while self.inner.now_serving.load(Ordering::Acquire) != ticket {
+            spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins & 0xFF == 0 {
+                let cpu = crate::percpu::current_cpu();
+                if let Some(slot) = CONTENDED_IRQ_LOCK.get(cpu) {
+                    slot.store(self as *const Self as *const () as usize, Ordering::Release);
+                    marked = true;
+                }
+                run_lock_spin_hook();
+            }
+        }
+        // Only clear the per-CPU contended marker — and pay the `current_cpu()`
+        // read it requires (RDTSCP on x86_64) — if this acquire actually set it
+        // while spinning. The common uncontended acquire never spun, so it
+        // publishes nothing and skips the read entirely. IRQs are masked for the
+        // whole of `lock()`, so the CPU cannot change between marking and
+        // clearing.
+        if marked {
+            let cpu = crate::percpu::current_cpu();
+            if let Some(slot) = CONTENDED_IRQ_LOCK.get(cpu) {
+                slot.store(0, Ordering::Release);
+            }
+        }
+        IrqSafeTicketSpinLockGuard {
+            lock: &self.inner,
+            saved,
+            _not_send: core::marker::PhantomData,
+        }
+    }
+
+    /// Non-blocking acquire. Disables IRQs, attempts the lock exactly
+    /// once; on failure restores the caller's IRQ state and returns
+    /// `None` instead of spinning with interrupts masked. Like
+    /// [`TicketSpinLock::try_lock`], this never jumps the queue: it fails
+    /// when a waiter already holds a ticket, even if the lock itself is
+    /// momentarily free.
+    #[inline]
+    pub fn try_lock(&self) -> Option<IrqSafeTicketSpinLockGuard<'_, T>> {
+        // SAFETY: same canonical local IRQ save+disable as `lock`.
+        // SAFETY: Valid memory or trusted environment
+        let saved = unsafe { irq_save_disable() };
+        if self.inner.try_take_ticket() {
+            Some(IrqSafeTicketSpinLockGuard {
+                lock: &self.inner,
+                saved,
+                _not_send: core::marker::PhantomData,
+            })
+        } else {
+            // SAFETY: pairs with the `irq_save_disable` above; we did not
+            // take the lock, so restore the caller's IRQ state.
+            // SAFETY: Valid memory or trusted environment
+            unsafe { irq_restore(saved) };
+            None
+        }
+    }
+}
+
+/// Guard for [`IrqSafeTicketSpinLock`]. Restores the caller's IRQ state on
+/// drop and hands the lock to the next ticket holder.
+///
+/// **Intentionally `!Send`** — see [`IrqSafeSpinLockGuard`].
+pub struct IrqSafeTicketSpinLockGuard<'a, T: ?Sized> {
+    lock: &'a TicketSpinLock<T>,
+    saved: IrqSavedState,
+    /// `*const ()` is `!Send`; the marker propagates that to the
+    /// guard so any future capturing the guard becomes `!Send`.
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+impl<T: ?Sized> fmt::Debug for IrqSafeTicketSpinLockGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IrqSafeTicketSpinLockGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: ?Sized> Deref for IrqSafeTicketSpinLockGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: lock is held exclusively for the lifetime of the guard.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for IrqSafeTicketSpinLockGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: lock is held exclusively.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for IrqSafeTicketSpinLockGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.release_ticket();
+        // SAFETY: pairs with the `irq_save_disable` from the matching lock
+        // call; restoring the saved state is always sound.
+        // SAFETY: Valid memory or trusted environment
+        unsafe {
+            irq_restore(self.saved);
+        }
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for IrqSafeTicketSpinLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IrqSafeTicketSpinLock")
+            .finish_non_exhaustive()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
 // Once / OnceLock — one-shot initialisation.
 // ──────────────────────────────────────────────────────────────────
 
@@ -759,6 +1109,11 @@ impl<T: fmt::Debug> fmt::Debug for OnceLock<T> {
 mod tests {
     use super::*;
 
+    // Host tests run under the std test harness; `std` is available here
+    // even though this crate is `#![no_std]` (the threaded FIFO test
+    // below needs it).
+    extern crate std;
+
     #[test]
     fn spinlock_basic() {
         let l = SpinLock::new(42u32);
@@ -784,6 +1139,117 @@ mod tests {
         *g = 123;
         drop(g);
         assert_eq!(*l.lock(), 123);
+    }
+
+    #[test]
+    fn ticket_spinlock_basic() {
+        let l = TicketSpinLock::new(42u32);
+        {
+            let mut g = l.lock(IrqsEnabled);
+            assert_eq!(*g, 42);
+            *g = 7;
+        }
+        assert_eq!(*l.lock(IrqsEnabled), 7);
+    }
+
+    #[test]
+    fn ticket_try_lock_returns_none_when_held() {
+        let l = TicketSpinLock::new(0u32);
+        let _g = l.lock(IrqsEnabled);
+        assert!(l.try_lock(IrqsEnabled).is_none());
+    }
+
+    #[test]
+    fn ticket_try_lock_does_not_jump_queue() {
+        // Tickets are handed out in order and served in order: taking two
+        // tickets then releasing them advances `now_serving` 0 -> 1 -> 2,
+        // and a try-take only succeeds once no ticket is outstanding.
+        let l = TicketSpinLock::new(0u32);
+        assert_eq!((l.take_ticket(), l.take_ticket()), (0, 1));
+        assert!(!l.try_take_ticket());
+        l.release_ticket();
+        assert!(!l.try_take_ticket()); // second ticket still outstanding
+        l.release_ticket();
+        assert!(l.try_take_ticket());
+        l.release_ticket();
+    }
+
+    #[test]
+    fn irq_safe_ticket_spinlock_basic() {
+        let l = IrqSafeTicketSpinLock::new(0u32);
+        {
+            let mut g = l.lock();
+            *g = 123;
+        }
+        assert_eq!(*l.lock(), 123);
+        assert!(l.try_lock().is_some());
+        let _g = l.lock();
+        assert!(l.try_lock().is_none());
+    }
+
+    #[test]
+    fn irq_safe_ticket_spinlock_fifo_under_contention() {
+        // Deterministic FIFO check: the main thread holds the lock while N
+        // waiter threads take tickets in a fixed order (enforced by
+        // observing `next_ticket` before releasing the next waiter), then
+        // releases it. A ticket lock must then grant the lock in exactly
+        // that order; a ticket-free TAS lock grants it in arrival-race
+        // order instead.
+        use core::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Arc;
+        use std::thread;
+
+        const N: usize = 8;
+        let lock = Arc::new(IrqSafeTicketSpinLock::new(()));
+        let go = Arc::new([const { AtomicBool::new(false) }; N]);
+        let order = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new([const { AtomicUsize::new(usize::MAX) }; N]);
+
+        // Hold the lock so every waiter blocks on its ticket.
+        let holder = lock.lock();
+
+        let mut handles = std::vec::Vec::new();
+        for i in 0..N {
+            let l = Arc::clone(&lock);
+            let g = Arc::clone(&go);
+            let o = Arc::clone(&order);
+            let r = Arc::clone(&recorded);
+            handles.push(thread::spawn(move || {
+                while !g[i].load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let _guard = l.lock();
+                let slot = o.fetch_add(1, Ordering::SeqCst);
+                r[slot].store(i, Ordering::Relaxed);
+            }));
+        }
+
+        // Release waiters one at a time, waiting until each has taken its
+        // ticket before releasing the next, so ticket order is exactly
+        // 0..N. (This tests module is a child of the parent module, so
+        // the private ticket counter is readable here.) The main thread
+        // already holds ticket 0, so `next_ticket` starts at 1 and
+        // waiter `i` takes ticket `i + 1`; the wait is `<=`, not `==`,
+        // because an exact-equality wait can be skipped past if the
+        // waiter takes its ticket between two loads.
+        for i in 0..N {
+            go[i].store(true, Ordering::Release);
+            while lock.inner.next_ticket.load(Ordering::Acquire) <= i + 1 {
+                std::hint::spin_loop();
+            }
+        }
+
+        drop(holder);
+        for h in handles {
+            h.join().expect("waiter thread panicked");
+        }
+        for (slot, want) in recorded.iter().enumerate() {
+            assert_eq!(
+                want.load(Ordering::Relaxed),
+                slot,
+                "ticket lock granted out of order"
+            );
+        }
     }
 
     #[test]

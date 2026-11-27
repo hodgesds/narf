@@ -10,6 +10,7 @@
 **Owns:**
 
 - **Sync primitives** beyond RCU: `SpinLock`, `IrqSafeSpinLock`,
+  `TicketSpinLock`, `IrqSafeTicketSpinLock`,
   `Mutex` (async-aware), `RwLock` (async-aware), `SeqLock`,
   `Once`, `OnceLock`.
 - **Intrusive collections:** linked list, doubly-linked list,
@@ -69,6 +70,29 @@ pub struct IrqSafeSpinLock<T>(…);
 impl<T> IrqSafeSpinLock<T> {
     /// Disables IRQs around the critical section; safe from any context.
     pub fn lock(&self) -> SpinLockGuard<'_, T, IrqsDisabled>;
+}
+
+/// FIFO-fair ticket variants of the spinlocks above: waiters take
+/// monotonically increasing tickets and are served strictly in ticket
+/// order, so a waiter cannot be overtaken indefinitely by later arrivals
+/// (the starvation mode of the ticket-free `SpinLock`). `try_lock` on
+/// either variant never jumps the queue — it fails when a waiter already
+/// holds a ticket, even if the lock itself is momentarily free. Fairness
+/// only: ticket locks change acquisition order under contention, not
+/// critical-section speed; no throughput gain is claimed for them. The
+/// epoll instance locks (`inner` / `ready` / `waiters`) use the IRQ-safe
+/// variant; the plain `IrqSafeSpinLock` remains the default elsewhere.
+pub struct TicketSpinLock<T>(…);
+impl<T> TicketSpinLock<T> {
+    /// FIFO ticket order; requires `IrqsEnabled` at the call site.
+    pub fn lock(&self, _: &IrqContext<IrqsEnabled>)
+        -> TicketSpinLockGuard<'_, T, IrqsEnabled>;
+}
+
+pub struct IrqSafeTicketSpinLock<T>(…);
+impl<T> IrqSafeTicketSpinLock<T> {
+    /// FIFO ticket order; disables IRQs around the critical section.
+    pub fn lock(&self) -> IrqSafeTicketSpinLockGuard<'_, T>;
 }
 
 /// Fatal-path diagnostic: the IrqSafeSpinLock address on which a CPU is
