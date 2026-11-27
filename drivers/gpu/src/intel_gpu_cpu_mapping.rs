@@ -2,11 +2,13 @@
 //!
 //! Tokens retain the same immutable BO/reservation object. Physical rows keep
 //! it alive independently while fork metadata exists before child file-owner
-//! publication. This supplies alias ownership, not storage migration: the
-//! existing CPU revocation transaction cannot await a retained GPU copy.
+//! publication. Storage migration of a mapped object ([`relocate`]) runs
+//! through the synchronous CPU revocation transaction, which cannot await a
+//! GPU copy: its commit copies with the CPU.
 //!
-//! Lock order: BACKINGS -> FRAMES. Frame alias callbacks use only FRAMES.
-//! No registry lock spans a VM call, user callback, GPU operation or await.
+//! Lock order: BACKINGS -> backing frames -> FRAMES. Frame alias callbacks
+//! use only FRAMES (and a retire, backing frames -> FRAMES). No registry lock
+//! spans a VM call, user callback, GPU operation or await.
 use super::*;
 use alloc::sync::Weak;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
@@ -14,9 +16,13 @@ use core::sync::atomic::{AtomicBool, AtomicUsize};
 #[derive(Debug)]
 struct CpuBacking {
     object: Arc<GemObject>,
-    frames: Vec<u64>,
+    /// The CPU frames of the object's current placement; [`relocate`]
+    /// replaces them.
+    frames: IrqSafeSpinLock<Vec<u64>>,
     owners: AtomicUsize,
     pending: AtomicUsize,
+    /// A [`relocate`] is moving the aliases: no retire until it settles.
+    moving: AtomicBool,
     retired: AtomicBool,
 }
 #[derive(Debug)]
@@ -29,13 +35,15 @@ static FRAMES: IrqSafeSpinLock<FrameOwners> = IrqSafeSpinLock::new(BTreeMap::new
 static BACKINGS: IrqSafeSpinLock<Vec<Weak<CpuBacking>>> = IrqSafeSpinLock::new(Vec::new());
 
 fn retire(backing: &Arc<CpuBacking>) {
-    if backing.owners.load(Ordering::Acquire) != 0 {
+    if backing.owners.load(Ordering::Acquire) != 0 || backing.moving.load(Ordering::Acquire) {
         return;
     }
+    let keys = backing.frames.lock();
     let mut frames = FRAMES.lock();
     if backing.retired.load(Ordering::Acquire)
         || backing.owners.load(Ordering::Acquire) != 0
-        || backing.frames.iter().any(|phys| {
+        || backing.moving.load(Ordering::Acquire)
+        || keys.iter().any(|phys| {
             frames
                 .get(phys)
                 .is_some_and(|(owner, count)| Arc::ptr_eq(owner, backing) && *count != 0)
@@ -44,7 +52,7 @@ fn retire(backing: &Arc<CpuBacking>) {
         return;
     }
     backing.retired.store(true, Ordering::Release);
-    for phys in &backing.frames {
+    for phys in keys.iter() {
         let (owner, count) = frames.remove(phys).expect("registered Intel CPU frame");
         assert!(Arc::ptr_eq(&owner, backing) && count == 0);
         // The argument's Arc retains this backing/object while row Arcs are
@@ -124,8 +132,9 @@ pub(crate) fn has_active_aliases(object: &GemObject) -> bool {
     if backing.owners.load(Ordering::Acquire) != 0 {
         return true;
     }
+    let keys = backing.frames.lock();
     let frames = FRAMES.lock();
-    backing.frames.iter().any(|phys| {
+    keys.iter().any(|phys| {
         frames
             .get(phys)
             .is_some_and(|(owner, count)| Arc::ptr_eq(owner, &backing) && *count != 0)
@@ -145,12 +154,14 @@ pub(crate) fn retire_object(object: &Arc<GemObject>) -> Result<(), FsError> {
     else {
         return Ok(());
     };
+    let keys = backing.frames.lock();
     let mut frames = FRAMES.lock();
     if backing.retired.load(Ordering::Acquire) {
         return Ok(());
     }
     if backing.owners.load(Ordering::Acquire) != 0
-        || backing.frames.iter().any(|phys| {
+        || backing.moving.load(Ordering::Acquire)
+        || keys.iter().any(|phys| {
             frames
                 .get(phys)
                 .is_some_and(|(owner, count)| Arc::ptr_eq(owner, &backing) && *count != 0)
@@ -159,7 +170,7 @@ pub(crate) fn retire_object(object: &Arc<GemObject>) -> Result<(), FsError> {
         return Err(FsError::Busy);
     }
     backing.retired.store(true, Ordering::Release);
-    for phys in &backing.frames {
+    for phys in keys.iter() {
         let (owner, count) = frames.remove(phys).expect("registered Intel CPU frame");
         assert!(Arc::ptr_eq(&owner, &backing) && count == 0);
         drop(owner);
@@ -193,20 +204,24 @@ pub(super) fn backing(
                 index.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
                 let backing = Arc::new(CpuBacking {
                     object: object.clone(),
-                    frames: keys,
+                    frames: IrqSafeSpinLock::new(keys),
                     owners: AtomicUsize::new(0),
                     pending: AtomicUsize::new(0),
+                    moving: AtomicBool::new(false),
                     retired: AtomicBool::new(false),
                 });
                 index.push(Arc::downgrade(&backing));
                 backing
             }
         };
+        let keys = backing.frames.lock();
         let mut registry = FRAMES.lock();
         if backing.retired.load(Ordering::Acquire) {
             continue;
         }
-        if backing.frames != whole
+        // A relocation in flight would publish the old frames.
+        if backing.moving.load(Ordering::Acquire)
+            || *keys != whole
             || whole.iter().any(|phys| {
                 registry
                     .get(phys)
@@ -221,6 +236,7 @@ pub(super) fn backing(
         backing.owners.fetch_add(1, Ordering::AcqRel);
         backing.pending.fetch_add(1, Ordering::AcqRel);
         drop(registry);
+        drop(keys);
         break backing;
     };
     drop(index);
@@ -237,6 +253,107 @@ pub(super) fn backing(
         })),
         memory_type,
     })
+}
+
+/// `FRAMES`' metadata-alias count of `phys`, the census the CPU revocation
+/// transaction checks every alias it finds against. A leaf lock.
+fn alias_count(phys: u64) -> usize {
+    FRAMES.lock().get(&phys).map_or(0, |(_, count)| *count)
+}
+
+/// Linux `ttm_bo_handle_move_mem` for an object a process has mmapped:
+/// `ttm_bo_unmap_virtual` takes every CPU translation away before the move,
+/// and the next fault maps the new placement (`xe_bo_cpu_fault`). Here
+/// [`narf_filesystem::mmap_relocation::relocate`] freezes every CPU alias of
+/// the object's current frames, runs `commit` (which moves the storage to
+/// the system frames `new`, without allocating or awaiting) and rebinds the
+/// aliases to `new`. `Ok(false)`: no CPU mapping is registered any more (the
+/// caller moves the object as an unmapped one). `Busy`: a mapping not yet
+/// published, an alias the snapshot cannot see, a relocation in flight, a
+/// registered generation that is not the object's current one, or a refused
+/// commit; nothing changed.
+pub(crate) fn relocate(
+    object: &Arc<GemObject>,
+    new: &[u64],
+    commit: &mut dyn FnMut() -> Result<(), FsError>,
+) -> Result<bool, FsError> {
+    let backing = {
+        let mut index = BACKINGS.lock();
+        index.retain(|weak| weak.strong_count() != 0);
+        let found = index
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|b| Arc::ptr_eq(&b.object, object) && !b.retired.load(Ordering::Acquire));
+        found
+    };
+    let Some(backing) = backing else {
+        return Ok(false);
+    };
+    if backing.moving.swap(true, Ordering::AcqRel) {
+        return Err(FsError::Busy);
+    }
+    struct Moving(Arc<CpuBacking>);
+    impl Drop for Moving {
+        fn drop(&mut self) {
+            self.0.moving.store(false, Ordering::Release);
+            retire(&self.0);
+        }
+    }
+    let moving = Moving(backing.clone());
+    let current = object.cpu_frames(0, object.size as usize)?;
+    if current.len() != new.len() {
+        return Err(FsError::InvalidData);
+    }
+    // Everything the settle step stores is allocated here.
+    let mut next = Vec::new();
+    next.try_reserve_exact(new.len())
+        .map_err(|_| FsError::OutOfMemory)?;
+    next.extend_from_slice(new);
+    let mut retired = Vec::new();
+    retired
+        .try_reserve_exact(new.len())
+        .map_err(|_| FsError::OutOfMemory)?;
+    let old = {
+        let keys = backing.frames.lock();
+        let mut frames = FRAMES.lock();
+        if backing.retired.load(Ordering::Acquire) {
+            // The last alias went before `moving` was published.
+            drop((frames, keys, moving));
+            return Ok(false);
+        }
+        // An mmap handed out but not yet installed would map the old frames.
+        if backing.pending.load(Ordering::Acquire) != 0
+            || *keys != current
+            || keys.iter().any(|key| {
+                !frames
+                    .get(key)
+                    .is_some_and(|(owner, _)| Arc::ptr_eq(owner, &backing))
+            })
+            || new.iter().any(|key| frames.contains_key(key))
+        {
+            return Err(FsError::Busy);
+        }
+        for &key in new {
+            frames.insert(key, (backing.clone(), 0));
+        }
+        keys.to_vec()
+    };
+    let result = narf_filesystem::mmap_relocation::relocate(&old, new, alias_count, commit);
+    let stale = {
+        let mut keys = backing.frames.lock();
+        let mut frames = FRAMES.lock();
+        for key in if result.is_ok() { &old[..] } else { new } {
+            let (owner, count) = frames.remove(key).expect("registered Intel CPU frame");
+            assert_eq!(count, 0, "CPU alias census did not move every alias");
+            retired.push(owner);
+        }
+        result.is_ok().then(|| core::mem::replace(&mut *keys, next))
+    };
+    // Row and key releases run outside the registry locks.
+    drop(stale);
+    drop(retired);
+    drop(moving);
+    result.map(|()| true)
 }
 
 /// The existing VM mmap path calls this only after leaves and their owner

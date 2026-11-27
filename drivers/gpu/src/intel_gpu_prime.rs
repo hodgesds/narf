@@ -56,6 +56,13 @@
 //! Peer-to-peer into another function's BAR is unvalidated on hardware:
 //! the live importer asks for it only with `narf.intel.prime_p2p=1`, and
 //! otherwise takes the migration path.
+//!
+//! A VRAM export a process has mmapped stays in VRAM on every migration
+//! path above (`Busy`) unless `narf.intel.prime_mmap_migrate=1`: then the
+//! move takes its CPU mappings along, as Linux's `ttm_bo_unmap_virtual`
+//! before the move and the refault after it do
+//! (`GemObject::evict_mapped`; the bytes are copied by the CPU inside the
+//! alias freeze, and a DG2 object with Flat-CCS metadata stays refused).
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
@@ -82,16 +89,29 @@ const MAX_SYSTEM_SEGMENT: u64 = u32::MAX as u64 & !(PAGE - 1);
 /// Boot option admitting peer-to-peer for live cross-device imports.
 pub(crate) const P2P_OPTION: &str = "narf.intel.prime_p2p";
 
+/// Boot option letting a PRIME migration move a VRAM export a process has
+/// mmapped, its CPU mappings with it.
+pub(crate) const MMAP_MIGRATE_OPTION: &str = "narf.intel.prime_mmap_migrate";
+
+/// `narf.intel.prime_mmap_migrate=1` is on the command line.
+pub(crate) fn mmap_migrate_opted_in() -> bool {
+    crate::intel_gpu_gt::boot_opt_in(narf_boot::args(), MMAP_MIGRATE_OPTION)
+}
+
 /// The exporting device: what migration and the runtime-PM reference use.
 pub(crate) struct Exporter {
     pub(crate) platform: GtPlatform,
     pub(crate) backend: Arc<dyn UserBackend>,
+    /// A migration may move the export while a process maps it
+    /// ([`MMAP_MIGRATE_OPTION`]).
+    pub(crate) mapped_moves: bool,
 }
 
 impl core::fmt::Debug for Exporter {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Exporter")
             .field("platform", &self.platform)
+            .field("mapped_moves", &self.mapped_moves)
             .finish_non_exhaustive()
     }
 }
@@ -343,7 +363,11 @@ impl Attachment {
         self.wake().await?;
         let epoch = self.exporter_epoch();
         self.object
-            .pin_external(self.exporter.backend.as_ref(), epoch)
+            .pin_external(
+                self.exporter.backend.as_ref(),
+                epoch,
+                self.exporter.mapped_moves,
+            )
             .await?;
         self.pinned.store(true, Ordering::Release);
         Ok(())
@@ -405,6 +429,7 @@ impl Attachment {
                     self.exporter.backend.as_ref(),
                     epoch,
                     self.peer2peer.is_some(),
+                    self.exporter.mapped_moves,
                 )
                 .await?;
             let sg = Arc::new(self.build_sg(self.moves())?);
@@ -607,7 +632,13 @@ impl DmaBufCpuAccess for CpuAccess<'_> {
                 return Ok(());
             };
             // "If we failed, cpu-access takes place in current placement."
-            let _ = migrate_for_cpu_read(self.object, backend.as_ref(), direction).await;
+            let _ = migrate_for_cpu_read(
+                self.object,
+                backend.as_ref(),
+                direction,
+                mmap_migrate_opted_in(),
+            )
+            .await;
             Ok(())
         })
     }
@@ -617,17 +648,21 @@ impl DmaBufCpuAccess for CpuAccess<'_> {
 /// outcome: `Ok(true)` once moved to system memory, `Ok(false)` for a write
 /// or an object already there, else the refusal of
 /// [`GemObject::migrate_for_cpu_access`] (or of the runtime-PM wake).
+/// `mapped_moves` lets it move an export a process has mmapped.
 pub(crate) async fn migrate_for_cpu_read(
     object: &Arc<GemObject>,
     backend: &dyn UserBackend,
     direction: DmaDataDirection,
+    mapped_moves: bool,
 ) -> Result<bool, FsError> {
     if !direction.cpu_reads() || !object.is_vram() {
         return Ok(false);
     }
     let _wakeref = backend.cpu_vram_wakeref().await?;
     let epoch = backend.status().map(|s| s.epoch).filter(|&e| e != 0);
-    object.migrate_for_cpu_access(backend, epoch).await
+    object
+        .migrate_for_cpu_access(backend, epoch, mapped_moves)
+        .await
 }
 
 /// Whether any import in `objects` was notified of a move since its pages
@@ -678,6 +713,7 @@ pub(crate) fn import_foreign(
         Exporter {
             platform: exporter.platform,
             backend,
+            mapped_moves: mmap_migrate_opted_in(),
         },
         &narf_bus::p2pdma::LiveTopology,
         pci_function(exporter_card),
@@ -728,6 +764,7 @@ pub(crate) mod fixture {
             super::Exporter {
                 platform: crate::intel_gpu_gt::GtPlatform::Battlemage,
                 backend: Arc::new(NoGt),
+                mapped_moves: false,
             },
             &Fabric,
             Some(EXPORTER),

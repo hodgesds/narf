@@ -628,11 +628,13 @@ impl GemObject {
     /// object already pinned in VRAM refuses a system-memory pin (EINVAL,
     /// "Can't migrate pinned bo for dma-buf pin"). NARF has no display pin
     /// count, so a VRAM scanout object counts as pinned. Pins exclude
-    /// eviction and migration until [`Self::unpin_external`].
+    /// eviction and migration until [`Self::unpin_external`]. A CPU-mapped
+    /// object migrates only with `mapped_moves` ([`Self::evict_locked`]).
     pub(crate) async fn pin_external(
         self: &Arc<Self>,
         backend: &dyn crate::intel_gpu_user::UserBackend,
         epoch: Option<u64>,
+        mapped_moves: bool,
     ) -> Result<(), FsError> {
         let _migrating = self.migrating.lock().await;
         let (allow_vram, pinned) = {
@@ -652,7 +654,7 @@ impl GemObject {
             // TTM waits for the object's fences before the move; the NARF
             // eviction copy requires an idle object.
             self.wait_idle(true, None).await?;
-            self.evict_locked(backend, epoch, false).await?;
+            self.evict_locked(backend, epoch, false, mapped_moves).await?;
         }
         self.prime.lock().pins += 1;
         Ok(())
@@ -669,12 +671,14 @@ impl GemObject {
     /// importers first), while a peer takes the object where it is (NARF's
     /// `xe_bo_validate` keeps the current placement). A pinned object is not
     /// moved (`xe_bo_is_pinned` skips the migration). The returned guard
-    /// holds the placement while the caller builds its table.
+    /// holds the placement while the caller builds its table. A CPU-mapped
+    /// object migrates only with `mapped_moves`.
     pub(crate) async fn validate_for_dma_buf(
         self: &Arc<Self>,
         backend: &dyn crate::intel_gpu_user::UserBackend,
         epoch: Option<u64>,
         peer2peer: bool,
+        mapped_moves: bool,
     ) -> Result<narf_lib::mutex::MutexGuard<'_, ()>, FsError> {
         let placement = self.migrating.lock().await;
         let pinned = self.externally_pinned() || (self.scanout() && self.is_vram());
@@ -684,7 +688,7 @@ impl GemObject {
             }
             let epoch = epoch.ok_or(FsError::NoDevice)?;
             self.wait_idle(true, None).await?;
-            self.evict_locked(backend, epoch, false).await?;
+            self.evict_locked(backend, epoch, false, mapped_moves).await?;
         }
         Ok(placement)
     }
@@ -696,11 +700,14 @@ impl GemObject {
     /// pinned object is -EBUSY (`xe_bo_is_pinned`; a VRAM scanout object
     /// counts as pinned), one without a system placement -EINVAL
     /// (`xe_bo_can_migrate`), and a move the eviction copy cannot make keeps
-    /// its error. The object stays where it was on any error.
+    /// its error. A CPU-mapped object moves only with `mapped_moves` (its
+    /// mappings then follow it, [`Self::evict_mapped`]), else `Busy`. The
+    /// object stays where it was on any error.
     pub(crate) async fn migrate_for_cpu_access(
         self: &Arc<Self>,
         backend: &dyn crate::intel_gpu_user::UserBackend,
         epoch: Option<u64>,
+        mapped_moves: bool,
     ) -> Result<bool, FsError> {
         let _placement = self.migrating.lock().await;
         if !self.is_vram() {
@@ -716,7 +723,7 @@ impl GemObject {
         // TTM waits for the object's fences before the move; the NARF
         // eviction copy requires an idle object.
         self.wait_idle(true, None).await?;
-        self.evict_locked(backend, epoch, false).await?;
+        self.evict_locked(backend, epoch, false, mapped_moves).await?;
         Ok(true)
     }
     /// A suspend backup awaits [`Self::restore_pinned`]: until then the VRAM
@@ -1212,7 +1219,7 @@ impl GemObject {
         ccs_backup: Option<Arc<GemObject>>,
         allow_scanout: bool,
     ) -> Result<u64, FsError> {
-        let (dropped_vram, old_frames, drop_ccs) = {
+        let released = {
             let _reservation = RESERVATIONS.lock();
             let _cpu = self.cpu.lock();
             let mut backing = self.backing.lock();
@@ -1225,27 +1232,117 @@ impl GemObject {
             {
                 return Err(FsError::Busy);
             }
-            let mut staging_backing = staging.backing.lock();
-            let new_frames = core::mem::take(&mut staging_backing.frames);
-            if !backing.charged && staging_backing.charged {
-                backing.charged = true;
-                staging_backing.charged = false;
-            }
-            drop(staging_backing);
-            let old_vram = backing.vram.take();
-            let old_frames = core::mem::replace(&mut backing.frames, new_frames);
-            let drop_ccs = backing.ccs_backup.take();
-            backing.ccs_backup = ccs_backup;
-            self.storage.store(STORAGE_SYSTEM, Ordering::Release);
-            self.vram_page_sz.store(PAGE, Ordering::Release);
-            (old_vram, old_frames, drop_ccs)
+            self.exchange_for_system(&mut backing, staging, ccs_backup)
         };
-        drop(drop_ccs);
-        drop(dropped_vram);
-        for frame in old_frames {
-            free_frame(frame);
-        }
+        drop(released);
         Ok(self.size)
+    }
+
+    /// The placement swap of an eviction, under the caller's reservation,
+    /// CPU and backing locks: `staging`'s system frames (and its charge)
+    /// become this object's, and the VRAM allocation, frames and Flat-CCS
+    /// backup it gave up are returned, to be released after the locks. It
+    /// neither allocates nor frees.
+    fn exchange_for_system(
+        &self,
+        backing: &mut GemBacking,
+        staging: &GemObject,
+        ccs_backup: Option<Arc<GemObject>>,
+    ) -> Released {
+        let mut staging_backing = staging.backing.lock();
+        let new_frames = core::mem::take(&mut staging_backing.frames);
+        if !backing.charged && staging_backing.charged {
+            backing.charged = true;
+            staging_backing.charged = false;
+        }
+        drop(staging_backing);
+        let vram = backing.vram.take();
+        let frames = core::mem::replace(&mut backing.frames, new_frames);
+        let ccs = backing.ccs_backup.take();
+        backing.ccs_backup = ccs_backup;
+        self.storage.store(STORAGE_SYSTEM, Ordering::Release);
+        self.vram_page_sz.store(PAGE, Ordering::Release);
+        Released { ccs, vram, frames }
+    }
+
+    /// `ttm_bo_handle_move_mem` of a VRAM object a process has mmapped
+    /// (`xe_bo_migrate(bo, XE_PL_TT)` on a PRIME path): Linux takes the CPU
+    /// translations away (`ttm_bo_unmap_virtual`), copies on the GPU and
+    /// faults the new pages in (`xe_bo_cpu_fault`). NARF's revocation
+    /// transaction cannot await a GPU copy, so the move runs inside it with
+    /// every CPU alias frozen: the bytes are copied through the LMEM BAR's
+    /// kernel mapping into new system frames, the placement is swapped and
+    /// every alias is rebound to the new frames
+    /// ([`cpu_mapping::relocate`]). Dynamic importers are notified first, as
+    /// for any move. Refused (`Busy`, nothing moved): a DG2 object whose
+    /// Flat-CCS metadata a CPU copy cannot carry, a closed BAR (runtime
+    /// suspend), work on the object, a pin or scanout, or any refusal of the
+    /// relocation. `Ok(None)`: the CPU mapping went away meanwhile; the
+    /// caller moves the object as an unmapped one.
+    fn evict_mapped(self: &Arc<Self>, allow_scanout: bool) -> Result<Option<u64>, FsError> {
+        let pool = {
+            let backing = self.backing.lock();
+            let Some(vram) = &backing.vram else {
+                return Ok(Some(0));
+            };
+            if vram.requires_ccs_clear() || vram.kernel_virt().is_none() {
+                return Err(FsError::Busy);
+            }
+            vram.pool().clone()
+        };
+        let _bar = pool.cpu_access().ok_or(FsError::Busy)?;
+        // Any reservation change after this sample refuses the commit: no
+        // GPU job may write the VRAM while the CPU copies it.
+        let generation = self.dma_buf.resv.generation();
+        if !self.idle(true) || self.externally_pinned() || (!allow_scanout && self.scanout()) {
+            return Err(FsError::Busy);
+        }
+        let staging = GemObject::private_system(self.size)?;
+        let new: Vec<u64> = staging.pages().collect();
+        // xe_bo_move_notify: dynamic importers drop their mappings first.
+        self.dma_buf.invalidate_mappings();
+        let mut released = None;
+        let moved = cpu_mapping::relocate(self, &new, &mut || {
+            let _reservation = RESERVATIONS.lock();
+            if self.dma_buf.resv.generation() != generation
+                || self.externally_pinned()
+                || (!allow_scanout && self.scanout())
+            {
+                return Err(FsError::Busy);
+            }
+            let _cpu = self.cpu.lock();
+            let mut backing = self.backing.lock();
+            let source = backing
+                .vram
+                .as_ref()
+                .and_then(|vram| vram.kernel_virt())
+                .ok_or(FsError::Busy)?;
+            {
+                let staging_backing = staging.backing.lock();
+                for (index, frame) in staging_backing.frames.iter().enumerate() {
+                    let from = (source + index as u64 * PAGE) as *const u64;
+                    let to = frame.start_address().kernel_mut_ptr::<u64>();
+                    for word in 0..(PAGE / 8) as usize {
+                        // SAFETY: the visible allocation's WC alias and the
+                        // staging frame are both live, page-sized and owned
+                        // here; every CPU alias is frozen and the
+                        // reservation is unchanged, so nothing else writes
+                        // either while they are copied.
+                        unsafe {
+                            core::ptr::write_volatile(
+                                to.add(word),
+                                core::ptr::read_volatile(from.add(word)),
+                            )
+                        };
+                    }
+                }
+            }
+            released = Some(self.exchange_for_system(&mut backing, &staging, None));
+            Ok(())
+        })?;
+        // The VRAM is released only once no CPU alias names it.
+        drop(released);
+        Ok(moved.then_some(self.size))
     }
 
     /// Evict an idle VRAM object to newly allocated system frames using
@@ -1258,16 +1355,19 @@ impl GemObject {
         allow_scanout: bool,
     ) -> Result<u64, FsError> {
         let _migrating = self.migrating.lock().await;
-        self.evict_locked(backend, epoch, allow_scanout).await
+        self.evict_locked(backend, epoch, allow_scanout, false).await
     }
 
     /// [`Self::evict_to_system`] under the caller's `migrating` guard. A
-    /// dma-buf pin holds the placement (`xe_bo_migrate` -EBUSY).
+    /// dma-buf pin holds the placement (`xe_bo_migrate` -EBUSY). A live CPU
+    /// mapping refuses the move (`Busy`) unless `mapped_moves`, which moves
+    /// it with its mappings ([`Self::evict_mapped`]).
     async fn evict_locked(
         self: &Arc<Self>,
         backend: &dyn crate::intel_gpu_user::UserBackend,
         epoch: u64,
         allow_scanout: bool,
+        mapped_moves: bool,
     ) -> Result<u64, FsError> {
         if !self.is_vram() {
             return Ok(0);
@@ -1283,7 +1383,15 @@ impl GemObject {
         {
             return Err(FsError::Busy);
         }
-        cpu_mapping::retire_object(self)?;
+        match cpu_mapping::retire_object(self) {
+            Err(FsError::Busy) if mapped_moves => {
+                if let Some(bytes) = self.evict_mapped(allow_scanout)? {
+                    return Ok(bytes);
+                }
+                cpu_mapping::retire_object(self)?;
+            }
+            result => result?,
+        }
         // xe_bo_move_notify: dynamic importers drop their mappings before
         // the move (dma_buf_invalidate_mappings). Their submitted work is in
         // the shared reservation, which the swap finds idle or refuses.
@@ -1514,6 +1622,24 @@ pub(crate) fn reserve_gpu_explicit(
             .collect()
     };
     drop(retired);
+}
+
+/// What a placement swap gave up, released once no lock is held: the
+/// Flat-CCS backup, then the VRAM allocation, then the frames.
+struct Released {
+    ccs: Option<Arc<GemObject>>,
+    vram: Option<crate::intel_gpu_vram::VramAllocation>,
+    frames: Vec<PhysFrame>,
+}
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        drop(self.ccs.take());
+        drop(self.vram.take());
+        for frame in self.frames.drain(..) {
+            free_frame(frame);
+        }
+    }
 }
 
 impl Drop for GemObject {
