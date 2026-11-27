@@ -165,6 +165,12 @@ fn fixture(pg: bool) -> (Pool, Engine<Fake>) {
         (VCN + u64::from(VCPU) * 4, 1 << 28),
         (VCN + u64::from(STATUS) * 4, 0x2),
         (VCN + u64::from(LMI_STATUS) * 4, 0x24f),
+        // POWER_STATUS is seeded with the reset value: `Fake::read`
+        // returns 0 for unseeded keys, and production's non-PG branch
+        // writes exactly 0 here. `delay` and the DPG_PAUSE model index
+        // this key directly, and `start` yields before production ever
+        // writes it, so an unseeded key panics on the first yield.
+        (VCN + u64::from(POWER_STATUS) * 4, 0),
         (GC + 0x13de * 4, 0x545),
     ]);
     let e = Engine {
