@@ -19,12 +19,14 @@
 //! the HDA data registers 0x2012..0x2015 (`rt711_sdw_read`).
 //!
 //! Boundaries, stated plainly:
-//! - Jack detection here is the polled half: pin sense + the
-//!   combo-jack auto-detect status. In Linux the trigger is the
-//!   SoundWire impl-def interrupt (SCP INT1 bit 2, `0x04`) firing
-//!   `rt711_jack_detect_handler` 250 ms later; NARF has no SDW
-//!   interrupt dispatch yet, so the consumer polls `jack_detect`
-//!   instead. Button detection (`rt711_button_detect`, IRQ flag
+//! - Jack detection is interrupt-driven with a polled fallback:
+//!   the SoundWire impl-def interrupt (SCP INT1 bit 2, `0x04`)
+//!   arms 250 ms deferred work that runs `jack_detect`
+//!   ([`JackDetector`], [`service_interrupt`], mirroring Linux's
+//!   `rt711_interrupt_callback` → `mod_delayed_work(..., 250 ms)`
+//!   → `rt711_jack_detect_handler`); where no interrupt can
+//!   arrive, the consumer polls `jack_detect` directly.
+//!   Button detection (`rt711_button_detect`, IRQ flag
 //!   tables 0x80/0x81) needs an ALSA jack reporting consumer and is
 //!   not implemented.
 //! - DAC DC-offset calibration is implemented as
@@ -39,7 +41,7 @@
 //!   it into stream setup needs the manager's current data rate and
 //!   is a follow-up.
 
-use crate::soundwire::{Bus, SdwError, Transport};
+use crate::soundwire::{regs, Bus, SdwError, Transport};
 use narf_time::Deadline;
 
 /// Vendor-register node (`RT711_VENDOR_REG`).
@@ -582,6 +584,110 @@ pub fn jack_detect<T: Transport>(
     Ok(state.unwrap_or(JackState::Out))
 }
 
+/// Deferred jack detection after an SDW impl-def interrupt (Linux
+/// `rt711_interrupt_callback` in `rt711-sdw.c`: `control_port &
+/// 0x4` → `mod_delayed_work(..., &jack_detect_work,
+/// msecs_to_jiffies(250))` → `rt711_jack_detect_handler`).
+pub const JACK_DETECT_DEFER_MS: u64 = 250;
+
+/// Budget for the `jack_detect` poll a deferred detection runs
+/// (the production budget its docs prescribe: Linux allows up to
+/// 500 iterations ~10 ms apart, ~5 s).
+const JACK_DETECT_TIMEOUT_MS: u64 = 5000;
+
+/// Outcome of one [`JackDetector::service`] tick.
+#[derive(Debug, PartialEq, Eq)]
+pub enum JackDetectOutcome {
+    /// No deferred detection is armed.
+    Idle,
+    /// Detection is armed but the deferral has not elapsed yet;
+    /// `jack_detect` has not run.
+    Waiting,
+    /// The deferral elapsed and `jack_detect` ran: the detected
+    /// jack state, or the detection error.
+    Done(Result<JackState, SdwError>),
+}
+
+/// Deferred jack detection for one RT711: an impl-def interrupt
+/// arms the 250 ms deferral (Linux `mod_delayed_work`, which
+/// re-schedules pending work — re-arming here likewise moves the
+/// deadline), and a service tick runs `jack_detect` once the
+/// deferral has elapsed. The detector remembers the last detected
+/// state for the consumer to report; a detection error still
+/// disarms, so a stuck codec cannot wedge the service loop into
+/// re-running the poll on every tick.
+#[derive(Debug)]
+pub struct JackDetector {
+    defer_ms: u64,
+    armed_until: Option<Deadline>,
+    last_state: Option<JackState>,
+}
+
+impl JackDetector {
+    /// A detector with the Linux 250 ms deferral.
+    pub fn new() -> Self {
+        Self::with_defer_ms(JACK_DETECT_DEFER_MS)
+    }
+    /// A detector with an explicit deferral (tests drive the gate
+    /// with 0 ms / a long deferral instead of waiting on the clock).
+    pub fn with_defer_ms(defer_ms: u64) -> Self {
+        Self {
+            defer_ms,
+            armed_until: None,
+            last_state: None,
+        }
+    }
+    /// Arm (or re-arm) deferred detection from now.
+    pub fn arm(&mut self) {
+        self.armed_until = Some(Deadline::after_ms(self.defer_ms));
+    }
+    /// Whether a deferred detection is armed.
+    pub fn is_armed(&self) -> bool {
+        self.armed_until.is_some()
+    }
+    /// The last state a deferred detection reported, if any.
+    pub fn last_state(&self) -> Option<JackState> {
+        self.last_state
+    }
+    /// One service tick: if armed and the deferral has elapsed, run
+    /// `jack_detect` and disarm, returning the outcome; otherwise
+    /// report `Idle`/`Waiting` without touching the bus.
+    pub fn service<T: Transport>(&mut self, bus: &Bus<T>, dev: u8) -> JackDetectOutcome {
+        let Some(until) = self.armed_until else {
+            return JackDetectOutcome::Idle;
+        };
+        if !until.expired() {
+            return JackDetectOutcome::Waiting;
+        }
+        self.armed_until = None;
+        let result = jack_detect(bus, dev, JACK_DETECT_TIMEOUT_MS);
+        if let Ok(state) = result {
+            self.last_state = Some(state);
+        }
+        JackDetectOutcome::Done(result)
+    }
+}
+
+/// One interrupt-service step for an RT711: consume the pending
+/// SCP INT1 alert through the bus dispatch, arm deferred jack
+/// detection when the impl-def bit fired unmasked (Linux
+/// `rt711_interrupt_callback`), then run the detector's service
+/// tick. The polled `jack_detect` stays available as the fallback
+/// where no interrupt can arrive (a controller without an alert
+/// route, or a masked impl-def bit): the caller runs it directly
+/// instead of this function.
+pub fn service_interrupt<T: Transport>(
+    bus: &Bus<T>,
+    dev: u8,
+    detector: &mut JackDetector,
+) -> Result<JackDetectOutcome, SdwError> {
+    let alert = bus.handle_alert(dev)?;
+    if alert.impl_def {
+        detector.arm();
+    }
+    Ok(detector.service(bus, dev))
+}
+
 /// Map a bus data-rate frequency to the clock-select value written
 /// to registers 0xe0/0xf0 (`rt711_clock_config`: the value selects
 /// on `curr_dr_freq >> 1`). Unknown rates fail `InvalidParams`
@@ -686,6 +792,14 @@ mod tests {
         fn log(&self) -> Vec<Xfer> {
             self.log.lock().clone()
         }
+        /// Raise SCP INT1 bits (fixture injection: the model codec
+        /// asserting its alert line). Bits stay raised until the
+        /// bus acknowledges them with the INT1 write-back.
+        fn raise_int1(&self, bits: u8) {
+            let mut map = self.regs.lock();
+            let entry = map.entry(regs::SCP_INT1).or_insert(0);
+            *entry |= bits;
+        }
         /// Collect the (NID, index, value) triples of every index
         /// write in the log, in order: an index write is the
         /// four-transfer pattern [W(0x75nn,0), W(0x85nn,idx),
@@ -771,6 +885,14 @@ mod tests {
                     };
                     *reads += 1;
                     *self.pending.lock() = response;
+                }
+                if addr == regs::SCP_INT1 {
+                    // INT1 is write-1-to-clear (Linux acknowledges
+                    // an alert by writing the fired bits back).
+                    let mut regs = self.regs.lock();
+                    let entry = regs.entry(addr).or_insert(0);
+                    *entry &= !value;
+                    return Ok(None);
                 }
                 self.regs.lock().insert(addr, value);
                 return Ok(None);
@@ -1186,6 +1308,178 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/soundwire-rt711", jack_detect_removal_and_timeout);
+
+    fn jack_detect_via_impl_def_interrupt() -> TestResult {
+        // Headset fixture: pin sense attached, auto-detect status +
+        // CTIA set.
+        let transport = FakeTransport::new();
+        *transport.pin_sense.lock() = 0x8000_0000;
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x46), 0x0000_0a00);
+        let bus = Bus::new(transport);
+        // Unmask impl-def, then raise it.
+        if bus.write_reg(1, regs::SCP_INTMASK1, regs::SCP_INT1_IMPL_DEF) != Ok(()) {
+            return TestResult::Fail("INTMASK1 write failed");
+        }
+        bus.transport().raise_int1(regs::SCP_INT1_IMPL_DEF);
+        // A zero deferral: the service step runs jack_detect at once.
+        let mut detector = JackDetector::with_defer_ms(0);
+        match service_interrupt(&bus, 1, &mut detector) {
+            Ok(JackDetectOutcome::Done(Ok(JackState::Headset))) => {}
+            _ => return TestResult::Fail("interrupt path must detect the headset"),
+        }
+        if detector.last_state() != Some(JackState::Headset) {
+            return TestResult::Fail("detector must remember the headset state");
+        }
+        // Consumed: a second service step is idle, the alert did
+        // not re-fire.
+        match service_interrupt(&bus, 1, &mut detector) {
+            Ok(JackDetectOutcome::Idle) => {}
+            _ => return TestResult::Fail("second service step must be idle"),
+        }
+        // The log proves the interrupt path ran jack_detect: the
+        // INTMASK1 unmask, then INT1 read, INTMASK1 read, INT1 ack
+        // write, then the pin-sense + index-read conversation.
+        let expected_head = [
+            w(1, regs::SCP_INTMASK1, regs::SCP_INT1_IMPL_DEF),
+            r(1, regs::SCP_INT1),
+            r(1, regs::SCP_INTMASK1),
+            w(1, regs::SCP_INT1, regs::SCP_INT1_IMPL_DEF),
+        ];
+        let expected_detect = [
+            w(1, 0xb921, 0x00),
+            r(1, 0x2012),
+            r(1, 0x2013),
+            r(1, 0x2014),
+            r(1, 0x2015),
+            w(1, 0x7520, 0x00),
+            w(1, 0x85a0, 0x46),
+            w(1, 0x9c20, 0x00),
+            w(1, 0xaca0, 0x00),
+            r(1, 0x2012),
+            r(1, 0x2013),
+            r(1, 0x2014),
+            r(1, 0x2015),
+        ];
+        let log = bus.transport().log();
+        // The second service step appends its own INT1 + INTMASK1
+        // reads; the head of the log is the first step's traffic.
+        if log.len() < expected_head.len() + expected_detect.len()
+            || log[..expected_head.len()] != expected_head
+            || log[expected_head.len()..expected_head.len() + expected_detect.len()]
+                != expected_detect
+        {
+            return TestResult::Fail("interrupt-path conversation mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire-rt711", jack_detect_via_impl_def_interrupt);
+
+    fn interrupt_arms_deferred_detection() -> TestResult {
+        let transport = FakeTransport::new();
+        *transport.pin_sense.lock() = 0x8000_0000;
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x46), 0x0000_0a00);
+        let bus = Bus::new(transport);
+        if bus.write_reg(1, regs::SCP_INTMASK1, regs::SCP_INT1_IMPL_DEF) != Ok(()) {
+            return TestResult::Fail("INTMASK1 write failed");
+        }
+        bus.transport().raise_int1(regs::SCP_INT1_IMPL_DEF);
+        // A 60 s deferral: the service step arms but must not run
+        // jack_detect yet.
+        let mut detector = JackDetector::with_defer_ms(60_000);
+        match service_interrupt(&bus, 1, &mut detector) {
+            Ok(JackDetectOutcome::Waiting) => {}
+            _ => return TestResult::Fail("armed detection must wait out its deferral"),
+        }
+        if !detector.is_armed() {
+            return TestResult::Fail("detector must stay armed while waiting");
+        }
+        // Only the alert handling touched the bus: the unmask write,
+        // then INT1 read, INTMASK1 read, ack write — no pin-sense
+        // verb, no index read.
+        let log = bus.transport().log();
+        if log
+            != [
+                w(1, regs::SCP_INTMASK1, regs::SCP_INT1_IMPL_DEF),
+                r(1, regs::SCP_INT1),
+                r(1, regs::SCP_INTMASK1),
+                w(1, regs::SCP_INT1, regs::SCP_INT1_IMPL_DEF),
+            ]
+        {
+            return TestResult::Fail("waiting step must not run jack_detect");
+        }
+        // Re-raise and drive a zero-deferral detector: now the
+        // deferred work runs and finds the headset.
+        bus.transport().raise_int1(regs::SCP_INT1_IMPL_DEF);
+        let mut detector = JackDetector::with_defer_ms(0);
+        match service_interrupt(&bus, 1, &mut detector) {
+            Ok(JackDetectOutcome::Done(Ok(JackState::Headset))) => {}
+            _ => return TestResult::Fail("due detection must run jack_detect"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire-rt711", interrupt_arms_deferred_detection);
+
+    fn masked_impl_def_does_not_arm_detection() -> TestResult {
+        let transport = FakeTransport::new();
+        *transport.pin_sense.lock() = 0x8000_0000;
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x46), 0x0000_0a00);
+        let bus = Bus::new(transport);
+        // INTMASK1 stays 0: the alert is consumed but arms nothing.
+        bus.transport().raise_int1(regs::SCP_INT1_IMPL_DEF);
+        let mut detector = JackDetector::with_defer_ms(0);
+        match service_interrupt(&bus, 1, &mut detector) {
+            Ok(JackDetectOutcome::Idle) => {}
+            _ => return TestResult::Fail("masked impl-def must not arm detection"),
+        }
+        if detector.is_armed() {
+            return TestResult::Fail("masked impl-def must leave the detector disarmed");
+        }
+        // No jack_detect traffic: only the three alert-handling
+        // transfers (INT1 read, INTMASK1 read, ack write).
+        if bus.transport().log().len() != 3 {
+            return TestResult::Fail("masked alert must not run jack_detect");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/soundwire-rt711",
+        masked_impl_def_does_not_arm_detection
+    );
+
+    fn poll_fallback_detects_without_interrupts() -> TestResult {
+        let transport = FakeTransport::new();
+        *transport.pin_sense.lock() = 0x8000_0000;
+        transport
+            .index_values
+            .lock()
+            .insert((VENDOR_REG, 0x46), 0x0000_0a00);
+        let bus = Bus::new(transport);
+        // No alert raised, no unmask: the interrupt path stays idle.
+        let mut detector = JackDetector::with_defer_ms(0);
+        match service_interrupt(&bus, 1, &mut detector) {
+            Ok(JackDetectOutcome::Idle) => {}
+            _ => return TestResult::Fail("no alert must leave the detector idle"),
+        }
+        // The polled jack_detect still finds the headset: the
+        // interrupt path is an addition, not a replacement.
+        if jack_detect(&bus, 1, 5000) != Ok(JackState::Headset) {
+            return TestResult::Fail("polled jack_detect must still work");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/soundwire-rt711",
+        poll_fallback_detects_without_interrupts
+    );
 
     fn calibration_conversation() -> TestResult {
         let transport = FakeTransport::new();
