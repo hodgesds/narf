@@ -12767,6 +12767,10 @@ PMFW (`Mode1Reset`, PMFW >= 58.26) or else through the PSP
 MMIO while config space is reset — it restores and verifies config space,
 waits up to 2 s for the PSP bootloader (C2PMSG_35 bit 31) and 100 ms for NBIO
 MEMSIZE, and brackets the reset with the ATOM BIOS_SCRATCH_3 engine-hung flag.
+PCI state is restored even when decoding disappears before the PMFW mode1
+acknowledgement can be observed. An all-ones mailbox response is tolerated
+only after issuing that reset command; PCI restore and post-reset readiness
+checks remain required.
 A card without running SOS is not reset (`Ok(None)`). Either way the stage then
 posts as `amdgpu_device_need_post`/`amdgpu_device_asic_init` do: BIOS_SCRATCH_7
 at `adev->bios_scratch_reg_offset` (FirmwareInfo `bios_scratch_reg_startaddr`,

@@ -805,7 +805,18 @@ impl<I: Io> Engine<I> {
         } else {
             let version = self.command(GET_SMU_VERSION, 0, true).await.ok();
             let method = if version.is_some_and(|v| v >= SMU_MODE1_MIN_VERSION) {
-                self.command(MODE1_RESET, 0, false).await?;
+                // Mode1 clears the PCI BARs and command register. The reset
+                // can remove MMIO decoding before we observe its mailbox
+                // acknowledgement, so an all-ones response AFTER issuing
+                // this command is not yet evidence of a lost device. Settle
+                // and restore PCI state before testing device liveness.
+                // Other commands, initial SOS reads, explicit rejection and
+                // timeout still fail normally; restore and bootloader checks
+                // below must succeed before this reset can report success.
+                match self.command(MODE1_RESET, 0, false).await {
+                    Ok(_) | Err(Error::DeviceGone) => {}
+                    Err(error) => return Err(error),
+                }
                 Method::Smu
             } else {
                 self.wait_mp0(TOS, REGISTER_MS)
