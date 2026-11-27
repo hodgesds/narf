@@ -369,10 +369,10 @@ fn key_name(c: char) -> Result<String> {
 
 /// Boot `disk`, type the passphrase at the prompt, and return the serial
 /// output once the workload's verdict appears (or the timeout passes).
-fn boot(args: &Args, kernel: &Path, disk: &Path, work: &Path) -> Result<String> {
+fn boot(args: &Args, kernel: &Path, disk: &Path, work: &Path, mode: &str) -> Result<String> {
     let cmdline = format!(
         "narf.disks=root-rw root=UUID={LUKS_UUID} rd.luks.uuid={LUKS_UUID} \
-         rd.luks.prompt=console rd.luks.timeout=300 narf.ext4_interop=root"
+         rd.luks.prompt=console rd.luks.timeout=300 narf.ext4_interop={mode}"
     );
     std::env::set_var("NARF_NVME_IMG", disk);
     std::env::set_var("XTASK_QEMU_APPEND", &cmdline);
@@ -485,11 +485,11 @@ fn boot(args: &Args, kernel: &Path, disk: &Path, work: &Path) -> Result<String> 
     let _ = child.wait();
     let _ = reader.join();
     let text = serial.lock().map(|s| s.clone()).unwrap_or_default();
-    std::fs::write(work.join("serial.log"), &text)?;
+    std::fs::write(work.join(format!("serial-{mode}.log")), &text)?;
     outcome.map_err(|e| {
         anyhow!(
             "ext4-rootrw-interop: {e}; serial in {}",
-            work.join("serial.log").display()
+            work.join("serial-root.log").display()
         )
     })?;
     if !typed {
@@ -643,11 +643,11 @@ pub fn run_cmd(args: &Args) -> Result<()> {
     build_luks(&work, &ext4, &key, &luks)?;
     build_disk(&work, &luks, &disk)?;
     let before = outside_payload(&disk)?;
-    let serial = boot(args, &kernel, &disk, &work)?;
+    let serial = boot(args, &kernel, &disk, &work, "root")?;
     if !serial.contains("EXT4-INTEROP: PASS root") {
         bail!(
             "ext4-rootrw-interop: the workload did not pass; serial in {}",
-            work.join("serial.log").display()
+            work.join("serial-root.log").display()
         );
     }
     if outside_payload(&disk)? != before {
@@ -658,9 +658,79 @@ pub fn run_cmd(args: &Args) -> Result<()> {
     let plain = work.join("after.ext4");
     decrypt_payload(&disk, &key, &plain)?;
     check(&plain, &work)?;
+    // The same disk again, and this time NARF is killed with the root still
+    // mounted read-write.
+    let serial = boot(args, &kernel, &disk, &work, "crash")?;
+    if !serial.contains("EXT4-INTEROP: PASS crash") {
+        bail!(
+            "ext4-rootrw-interop: the crash workload did not get ready; serial in {}",
+            work.join("serial-crash.log").display()
+        );
+    }
+    let crashed = work.join("crashed.ext4");
+    decrypt_payload(&disk, &key, &crashed)?;
+    check_crash(&crashed)?;
     println!("ext4-rootrw-interop: OK");
     Ok(())
 }
+
+/// After NARF was killed with the journaled root mounted read-write:
+/// - the superblock still says `needs_recovery` (nothing cleared it);
+/// - `e2fsck -fy` recovers the journal and repairs nothing (its
+///   optimizations aside), then `e2fsck -fn` is clean;
+/// - the file written and synced before the kill reads back exactly, and so
+///   does the one written without a sync and left for NARF's 5 s commit
+///   timer.
+fn check_crash(plain: &Path) -> Result<()> {
+    let header = run(Command::new("dumpe2fs").arg("-h").arg(plain), "dumpe2fs -h")?;
+    if !header
+        .lines()
+        .any(|l| l.starts_with("Filesystem features:") && l.contains("needs_recovery"))
+    {
+        bail!("ext4-rootrw-interop: crashed root does not say needs_recovery:\n{header}");
+    }
+    let fsck = Command::new("e2fsck").arg("-fy").arg(plain).output()?;
+    let text = String::from_utf8_lossy(&fsck.stdout).into_owned();
+    let repaired = text
+        .lines()
+        .any(|l| (l.contains("Fix?") || l.contains("? yes")) && !l.contains("Optimize?"));
+    if fsck.status.code() != Some(0) || repaired {
+        bail!(
+            "ext4-rootrw-interop: e2fsck -fy after the crash exited {:?}:\n{text}",
+            fsck.status.code()
+        );
+    }
+    let fsck = Command::new("e2fsck").args(["-fn"]).arg(plain).output()?;
+    if fsck.status.code() != Some(0) {
+        bail!(
+            "ext4-rootrw-interop: e2fsck -fn after recovery exited {:?}:\n{}",
+            fsck.status.code(),
+            String::from_utf8_lossy(&fsck.stdout)
+        );
+    }
+    for (path, seed, len) in [
+        ("/narf-crash/synced", CRASH_SYNCED_SEED, CRASH_SYNCED_LEN),
+        ("/narf-crash/timer", CRASH_TIMER_SEED, CRASH_TIMER_LEN),
+    ] {
+        let cat = Command::new("debugfs")
+            .args(["-R", &format!("cat {path}")])
+            .arg(plain)
+            .output()?;
+        if cat.stdout != pattern(seed, len) {
+            bail!(
+                "ext4-rootrw-interop: after the crash {path} is {} bytes, not its {len}",
+                cat.stdout.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What the guest's `crash` mode writes (`drivers/fs/ext2/src/interop.rs`).
+const CRASH_SYNCED_SEED: u32 = 0x5359_4e43;
+const CRASH_SYNCED_LEN: usize = 300_000;
+const CRASH_TIMER_SEED: u32 = 0x5449_4d52;
+const CRASH_TIMER_LEN: usize = 50_000;
 
 #[cfg(test)]
 mod tests {
