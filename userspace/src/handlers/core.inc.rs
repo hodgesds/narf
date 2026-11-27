@@ -19752,6 +19752,13 @@ const PR_CAP_AMBIENT_IS_SET: u64 = 1;
 const PR_CAP_AMBIENT_RAISE: u64 = 2;
 const PR_CAP_AMBIENT_LOWER: u64 = 3;
 const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+/// PR_FUTEX_HASH (78) — futex hash table control. The sub-operation is
+/// selected by arg_a: SET_SLOTS = 1, GET_SLOTS = 2
+/// (`include/uapi/linux/prctl.h`). NARF has a single global 64-bucket
+/// table (`FUTEX_BUCKET_COUNT` in `compat.inc.rs`); there is no
+/// per-process private hash to set or query.
+const PR_FUTEX_HASH: u64 = 78;
+const PR_FUTEX_HASH_GET_SLOTS: u64 = 2;
 // Highest capability number Linux defines today (CAP_CHECKPOINT_RESTORE
 // = 40). RAISE/LOWER/IS_SET of a larger value is EINVAL.
 const CAP_LAST_CAP: u64 = 40;
