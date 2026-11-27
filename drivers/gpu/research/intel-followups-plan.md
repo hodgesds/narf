@@ -45,6 +45,7 @@ Boot options, each strict and default off:
 | `narf.intel.dg1_kms=1` | The DG1 KMS owner over its firmware-lit Pipe A, with a VRAM presenter |
 | `narf.intel.hdmi14_ext=1` | Display 14+ external deep colour (through a branch and over UHBR SST too), YCbCr 4:4:4 into a DP PCON, DP YCbCr 4:2:0, and HDMI/DP audio (DP MST streams included) with its component |
 | `narf.intel.svm=1` | Xe CPU-address-mirror VMs on fault-mode VMs of USM devices (LNL, PTL/WCL, NVL-S, BMG) |
+| `narf.intel.ext_panel_replay=1` | Full-frame Panel Replay on the display-30 external DP SST routes, exited by fb-console frontbuffer flushes |
 
 ## Still open
 
@@ -53,10 +54,11 @@ work had.
 
 - Silicon runs of everything above, including the Gen9 display suspend
   owner (`narf.intel.gen9_suspend=1`) and Gen9 LP DC9.
-- Nova Lake-S: DC3CO (a typed refusal until the route has a LOBF,
-  panel-replay or PSR2 trigger and owns the CMTG; Panel Replay is qualified
-  on display 20/30 only and never with the AS SDP its trigger needs, and
-  the CMTG is not implemented), and silicon runs of the
+- Nova Lake-S: DC3CO (a typed refusal: Linux 7.4 uses it, with the CMTG,
+  only for a display-35 eDP running LOBF, PSR2 or Panel Replay with the AS
+  SDP; the owned route runs none of them, display-35 replay is not
+  qualified, and the CMTG is not implemented; display 14 to 30 have no
+  DC3CO source, `HAS_DC3CO`), and silicon runs of the
   DC service and of a TBT dock. Thunderbolt alt mode on the LT PHY and the
   MST and DSC fixtures over LT ports have landed; the DMC wakelock is not
   used, and an inherited wakelock mode blocks DC6.
@@ -64,7 +66,10 @@ work had.
   HDMI/DP audio with the HDA driver's Intel HDMI codec on the audio
   component (`narf.intel.hdmi14_ext=1`), a second concurrent external
   route (`narf.intel.ext_routes=2`), Panel Replay on the display-20/30 eDP
-  (`narf.intel.panel_replay=1`) and compressed scanout (`narf.intel.ccs=1`)
+  (`narf.intel.panel_replay=1`, with the VSC and AS SDPs and region early
+  transport), Panel Replay on the display-30 external DP routes with
+  console frontbuffer tracking (`narf.intel.ext_panel_replay=1`) and
+  compressed scanout (`narf.intel.ccs=1`)
   have native fixtures only, as do (under `narf.intel.hdmi14_ext=1`) the
   HDA probe deferral until the display binds its component, deep colour
   through a branch and over UHBR SST, DP YCbCr 4:2:0 and DP MST audio (MST
@@ -73,9 +78,10 @@ work had.
   fixtures too. Still open: their silicon runs, a 10 or 12 bpc DSC input
   (Linux's 10/12 bpc QP tables; NARF compresses from 8 bpc), a PCM per MST
   stream on one pin (the HDA codec's `dyn_pcm_assign`), DP YCbCr 4:2:0 over
-  UHBR or native 4:2:0 DSC, Panel Replay on the external routes (their
-  console scanout has no frontbuffer tracking to exit replay) and with the
-  AS SDP, region early transport, two 128b/132b routes in one DP tunnel BW
+  UHBR or native 4:2:0 DSC, external Panel Replay on display 14 (the
+  route pipe's Wa_14015648006 input) and display 20 (the set context
+  latency the lit route lacks) and with selective update, the AS SDP on
+  routes without replay, early transport with DSC, two 128b/132b routes in one DP tunnel BW
   group that Linux resolves by reducing a lit route's bpp
   (`intel_link_bw_reduce_bpp`, refused typed) or that compress, and a
   tunnelled MST route in one such group with the other route (refused
