@@ -659,7 +659,7 @@ fn apu_attach_publishes_snapshot_and_gpu_temp() -> TestResult {
     // the Navi22 fuse test (`amdgpu_smu_temp_tests`); this asserts
     // the APU arm itself, which is order-independent against the
     // discrete snapshots other tests publish.
-    if crate::amdgpu_smu_temp::gpu_temp_mc_from(None, None, snapshot()) != Some(52350) {
+    if crate::amdgpu_smu_temp::gpu_temp_mc_from(None, None, None, snapshot()) != Some(52350) {
         return TestResult::Fail("gpu_temp_mc must be 52350 mC on the synthetic APU");
     }
     TestResult::Pass
