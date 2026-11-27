@@ -82,11 +82,16 @@
 //! firmware blobs itself — a version whose blob is absent from
 //! the registry runs its table without the firmware step, like
 //! Linux's failed `request_firmware` (warn and continue).
-//! TEST_01 and unknown versions keep reset defaults. Still open:
-//! the USB/LPM init layers for the other families (Linux's
-//! `r8152b_init` / `r8153b_init` / `r8156_init`, the counterpart
-//! of the VER_03–VER_06 `r8153_init` layer already ported) —
-//! tracked as follow-up issues.
+//! TEST_01, VER_14 and unknown versions keep reset defaults:
+//! VER_14's `r8153c_init` layer is still open (follow-up).
+//! The USB/LPM init layers for every other family are ported
+//! (Linux `r8152b_init` / `r8153b_init` / `r8156_init`, the
+//! counterparts of the VER_03–VER_06 `r8153_init` layer) — see
+//! `r8152b_init_ops` / `r8153b_init_ops` / `r8156_init_ops`.
+//! Two honest gaps stay gaps in all four layers: the host-side
+//! `usb_enable_lpm` call is not modelled (NARF's xHCI stack has
+//! no LPM enable yet) and the Dell TB16 RX-aggregation quirk is
+//! not modelled.
 
 extern crate alloc;
 
@@ -341,6 +346,185 @@ pub const ADVERTISE_PAUSE_ASYM: u16 = 0x0800;
 /// EEE advertisement for the original RTL8153 (Linux `eee_adv` =
 /// `MDIO_EEE_1000T | MDIO_EEE_100TX` = `0x0004 | 0x0002`).
 pub const EEE_ADV_8153: u16 = 0x0006;
+
+// ── r8152b / r8153b / r8156 USB/LPM init layer (Linux `r8152b_init`,
+// `r8153b_init`, `r8156_init`) ───────────────────────────────────────
+// Register addresses/bits for the other families' USB/LPM init
+// sequences, from the Linux register header
+// (`drivers/net/usb/r8152.c`, torvalds/linux master 9437ee8b).
+// The sequences that use them are re-derived below in
+// `r8152b_init_ops` / `r8153b_init_ops` / `r8156_init_ops`, not
+// copied. Addresses Linux uses as literals (no symbolic name)
+// are marked as such below.
+
+/// MAC power control 1 (Linux `PLA_MAC_PWR_CTRL`).
+pub const PLA_MAC_PWR_CTRL: u16 = 0xE0C0;
+/// MAC power control 3 (Linux `PLA_MAC_PWR_CTRL3`).
+pub const PLA_MAC_PWR_CTRL3: u16 = 0xE0CC;
+/// GPHY interrupt mask (Linux `PLA_GPHY_INTR_IMR`).
+pub const PLA_GPHY_INTR_IMR: u16 = 0xE022;
+
+/// `PLA_MAC_PWR_CTRL` clock-ratio field mask / value (Linux
+/// `MCU_CLK_RATIO_MASK` / `MCU_CLK_RATIO`) + D3 clock-gate bit
+/// (Linux `D3_CLK_GATED_EN`). 32-bit: the init layer writes
+/// this register with a dword w0w1.
+pub const MCU_CLK_RATIO_MASK: u32 = 0x0F0F_0F0F;
+pub const MCU_CLK_RATIO: u32 = 0x0701_0F07;
+pub const D3_CLK_GATED_EN: u32 = 0x0000_4000;
+
+/// `PLA_GPHY_INTR_IMR` bits (Linux `GPHY_STS_MSK`,
+/// `SPEED_DOWN_MSK`, `SPDWN_RXDV_MSK`, `SPDWN_LINKCHG_MSK`).
+pub const GPHY_STS_MSK: u16 = 0x0001;
+pub const SPEED_DOWN_MSK: u16 = 0x0002;
+pub const SPDWN_RXDV_MSK: u16 = 0x0004;
+pub const SPDWN_LINKCHG_MSK: u16 = 0x0008;
+
+/// `PLA_PHY_PWR` 10M idle-enable bit (Linux `TX_10M_IDLE_EN`).
+pub const TX_10M_IDLE_EN: u16 = 0x0080;
+/// `PLA_PHY_PWR` test-IO-off bit, VER_09 only (Linux
+/// `TEST_IO_OFF` = `BIT(4)`).
+pub const TEST_IO_OFF: u16 = 0x0010;
+/// PLA byte read for the VER_09 Test-IO decision (Linux literal
+/// `0xdc00` in `r8153b_init`; no symbolic name in Linux) + the
+/// bit that selects Test-IO-off (Linux `BIT(5)`).
+pub const PLA_TEST_IO_REG: u16 = 0xDC00;
+pub const TEST_IO_REG_BIT5: u8 = 0x20;
+/// `PLA_MAC_PWR_CTRL2` EEE speed-down ratio mask (Linux
+/// `EEE_SPDWN_RATIO_MASK`): the `r8156_mac_clk_spd` w0w1 clears
+/// this field, then sets `MAC_CLK_SPDWN_EN | 0x03`.
+pub const EEE_SPDWN_RATIO_MASK: u16 = 0x00FF;
+/// `PLA_MAC_PWR_CTRL3` MCU speed-down enable (Linux
+/// `PLA_MCU_SPDWN_EN` = `BIT(14)`).
+pub const PLA_MCU_SPDWN_EN: u16 = 0x4000;
+
+/// UPS control (Linux `USB_UPS_CTRL`) + power-cut bit (Linux
+/// `POWER_CUT`).
+pub const USB_UPS_CTRL: u16 = 0xD800;
+pub const POWER_CUT: u16 = 0x0100;
+/// Power-management control/status (Linux `USB_PM_CTRL_STATUS`,
+/// shares its address with `USB_RX_EXTRA_AGGR_TMR`) + resume
+/// indication bit (Linux `RESUME_INDICATE`).
+pub const USB_PM_CTRL_STATUS: u16 = 0xD432;
+pub const RESUME_INDICATE: u16 = 0x0001;
+/// RX extra aggregation timer (Linux `USB_RX_EXTRA_AGGR_TMR`,
+/// same address as `USB_PM_CTRL_STATUS` — the RTL8153B/RTL8156
+/// name for the register).
+pub const USB_RX_EXTRA_AGGR_TMR: u16 = 0xD432;
+
+/// MSC timer (Linux `USB_MSC_TIMER`) + the value Linux programs
+/// (`0xfff * 8ms = 32760 ms`).
+pub const USB_MSC_TIMER: u16 = 0xCBFC;
+pub const MSC_TIMER_8153B: u16 = 0x0FFF;
+/// U1/U2/L1 idle timer value (Linux `r8156_init`: `500 us`).
+pub const U1U2_TIMER_500US: u16 = 500;
+
+/// LPM configuration (Linux `USB_LPM_CONFIG`) + U1/U2 enable
+/// bit (Linux `LPM_U1U2_EN` = `BIT(0)`). The 8153B/8156
+/// families enable U1/U2 through this bit, not through the
+/// `USB_TOLERANCE` array the original RTL8153 uses.
+pub const USB_LPM_CONFIG: u16 = 0xCFD8;
+pub const LPM_U1U2_EN: u16 = 0x0001;
+
+/// Misc 2 (Linux `USB_MISC_2`) + UPS force-power-down bit
+/// (Linux `UPS_FORCE_PWR_DOWN` = `BIT(0)`).
+pub const USB_MISC_2: u16 = 0xCFFF;
+pub const UPS_FORCE_PWR_DOWN: u8 = 0x01;
+/// `USB_POWER_CUT` UPS bits (Linux `UPS_EN` = `BIT(4)`,
+/// `USP_PREWAKE` = `BIT(5)`), byte accesses.
+pub const UPS_EN: u8 = 0x10;
+pub const USP_PREWAKE: u8 = 0x20;
+
+/// ECM operation register (Linux `USB_ECM_OP`) + all-speeds bit
+/// (Linux `EN_ALL_SPEED` = `BIT(0)`), byte access.
+pub const USB_ECM_OP: u16 = 0xD26B;
+pub const EN_ALL_SPEED: u8 = 0x01;
+/// USB speed option (Linux `USB_SPEED_OPTION`): written 0 for
+/// versions below VER_16.
+pub const USB_SPEED_OPTION: u16 = 0xD32A;
+/// ECM option (Linux `USB_ECM_OPTION`) + MAC-reset bypass bit
+/// (Linux `BYPASS_MAC_RESET` = `BIT(5)`).
+pub const USB_ECM_OPTION: u16 = 0xCFEE;
+pub const BYPASS_MAC_RESET: u16 = 0x0020;
+/// `USB_U2P3_CTRL` RX-detect-8 bit (Linux `RX_DETECT8` =
+/// `BIT(3)`), VER_12–VER_15 only.
+pub const RX_DETECT8: u16 = 0x0008;
+
+/// `PLA_RCR` slot-enable bit (Linux `SLOT_EN` = `BIT(11)`),
+/// cleared for VER_12–VER_15.
+pub const SLOT_EN: u16 = 0x0800;
+/// `PLA_CPCR` flow-control enable bit (Linux `FLOW_CTRL_EN` =
+/// `BIT(0)`), set for VER_12–VER_15.
+pub const FLOW_CTRL_EN: u16 = 0x0001;
+/// Flow-control timer value for VER_12–VER_15 (Linux
+/// `CTRL_TIMER_EN | (600 / 8)`: enable + 600 ms timer).
+pub const FC_TIMER_600MS: u16 = FC_TIMER_CTRL_EN | (600 / 8);
+/// `USB_FW_CTRL` auto-speedup bit (Linux `AUTO_SPEEDUP` =
+/// `BIT(3)`), cleared for VER_12–VER_15.
+pub const AUTO_SPEEDUP: u16 = 0x0008;
+/// `PLA_POL_GPIO_CTRL` DACK-detect-enable bit (Linux
+/// `DACK_DET_EN` = `BIT(15)`): when set, the VER_12–VER_15
+/// flow-control patch bit is not applied.
+pub const DACK_DET_EN: u16 = 0x8000;
+
+/// BMU configuration (Linux `USB_BMU_CONFIG`) + ODMA-activate
+/// bit (Linux `ACT_ODMA` = `BIT(1)`), byte access, versions
+/// below VER_12 only.
+pub const USB_BMU_CONFIG: u16 = 0xD4B4;
+pub const ACT_ODMA: u8 = 0x02;
+
+/// `USB_USB_CTRL` 16-byte-RX-descriptor bit (Linux
+/// `RX_DESC_16B` = `0x0400`), VER_16/17 only.
+pub const RX_DESC_16B: u16 = 0x0400;
+/// `USB_USB_CTRL` bit 11 (Linux `BIT(11)`), VER_17 only:
+/// Linux notes it is specific to RTL8159, with unknown
+/// meaning, and clears it alongside the aggregation bits.
+pub const USB_CTRL_8159_BIT11: u16 = 0x0800;
+
+/// Advanced-register window (Linux `USB_ADV_ADDR` /
+/// `USB_ADV_DATA` / `USB_ADV_CMD`): the BMU and IP register
+/// files are reached through this command channel, not through
+/// plain OCP reads/writes.
+pub const USB_ADV_ADDR: u16 = 0xD5D6;
+pub const USB_ADV_DATA: u16 = 0xD5D8;
+pub const USB_ADV_CMD: u16 = 0xD5DC;
+/// `USB_ADV_CMD` bits (Linux `ADV_CMD_BUSY` = `BIT(0)`,
+/// `ADV_CMD_WR` = `BIT(1)`) + channel selects (Linux
+/// `ADV_CMD_BMU` = 0, `ADV_CMD_IP` = `BIT(2)`).
+pub const ADV_CMD_BUSY: u16 = 0x0001;
+pub const ADV_CMD_WR: u16 = 0x0002;
+pub const ADV_CMD_BMU: u16 = 0x0000;
+pub const ADV_CMD_IP: u16 = 0x0004;
+
+/// U2P3 v2 control (Linux `USB_U2P3_V2_CTRL`, 32-bit) +
+/// enable bit (Linux `U2P3_V2_ENABLE` = `BIT(29)`), VER_16/17
+/// only — reached through the IP advanced channel.
+pub const USB_U2P3_V2_CTRL: u16 = 0xC2C0;
+pub const U2P3_V2_ENABLE: u32 = 1 << 29;
+
+/// MDIO force-mode select register (Linux literal `0xa5b4` in
+/// `r8156_mdio_force_mode`; no symbolic name in Linux) + the
+/// MMD-force-mode bit (bit 15): set selects MMD force mode,
+/// clear selects MDIO force mode.
+pub const OCP_MDIO_FORCE_MODE: u16 = 0xA5B4;
+pub const MDIO_FORCE_MODE_MMD: u16 = 0x8000;
+
+/// USB-window bytes Linux `r8156_init` touches by literal
+/// address (VER_16/17 only; no symbolic name in Linux):
+/// `0xcffe` bit 3 set, `0xd3ca` bit 0 cleared (before the ECM
+/// steps), `0xd4ae` bit 1 cleared (TX descriptor signature).
+pub const USB_VER16_BYTE_CFFE: u16 = 0xCFFE;
+pub const USB_VER16_BYTE_D3CA: u16 = 0xD3CA;
+pub const USB_VER16_BYTE_D4AE: u16 = 0xD4AE;
+
+/// RX aggregation timers (Linux `r8153_set_rx_early_timeout`,
+/// enable-time): the RTL8153B fixes the early timeout to
+/// 128 ns and the RTL8156 family to 640 ns, with the
+/// coalesce-derived value (15 us here) going to the extra
+/// aggregation timer instead. All values are in 8 ns units
+/// (`value = ns / 8`).
+pub const RX_EARLY_TIMEOUT_8153B: u16 = 128 / 8;
+pub const RX_EARLY_TIMEOUT_8156: u16 = 640 / 8;
+pub const RX_EXTRA_AGGR_TMR_15US: u16 = 15_000 / 8;
 
 // ── Per-family PHY-init registers (Linux `r8152.c` register header) ──
 // Addresses/bits for the RTL8152 (VER_01/02/07), RTL8153B
@@ -936,6 +1120,9 @@ pub enum PhyInitOp {
     PlaWordClrBits { addr: u16, bits: u16 },
     /// PLA word plain write.
     PlaWordWrite { addr: u16, value: u16 },
+    /// PLA dword clear-then-set (Linux `ocp_dword_w0w1`):
+    /// read, `(cur & !clear) | set`, write.
+    PlaDwordW0W1 { addr: u16, clear: u32, set: u32 },
     /// USB-window word set-bits.
     UsbWordSetBits { addr: u16, bits: u16 },
     /// MDIO set-bits via `OCP_BASE_MII + reg * 2`.
@@ -1046,6 +1233,28 @@ pub enum PhyInitOp {
     /// p0/p3 and p1/p2 lanes plus the `0xbd5a`/`0xbd5c` and
     /// `0xbc18`/`0xbc1a` pairs.
     MdiSwapIfReversed,
+    /// BMU advanced-register clear-bits (Linux
+    /// `rtl_bmu_clr_bits`): read the 32-bit BMU register at
+    /// `addr` through the ADV command channel (`ADV_CMD_BMU`)
+    /// and clear `clear`. Best-effort when the command channel
+    /// never becomes ready (Linux's callers ignore that
+    /// failure here).
+    BmuClrBits { addr: u16, clear: u32 },
+    /// IP advanced-register clear-bits (Linux
+    /// `rtl_ip_clr_bits`): the `ADV_CMD_IP` counterpart of
+    /// [`PhyInitOp::BmuClrBits`].
+    IpClrBits { addr: u16, clear: u32 },
+    /// EXT_INIT PHY-status clear (Linux `r8156_init`): poll
+    /// the PHY status; when it reads EXT_INIT, clear OCP
+    /// `0xa468` bits 3|1, plus `0xa466` bit 0 when
+    /// `clear_a466` is set (versions VER_12 and up).
+    ExtInitClear { clear_a466: bool },
+    /// Backup-restore wait (Linux `r8159_wait_backup_restore`,
+    /// VER_17 only): when `USB_MISC_0` reports power-cut
+    /// status, poll `USB_GPHY_CTRL` for `BACKUP_RESTRORE`
+    /// (best-effort — Linux aborts the init on timeout, NARF
+    /// proceeds; see `r8156_init_ops`).
+    WaitBackupRestore,
 }
 
 /// EEE-disable steps shared by the VER_03–VER_06 / VER_08 / VER_09 /
@@ -3599,6 +3808,10 @@ async fn apply_phy_init_op(
         PlaWordSetBits { addr, bits } => pla_word_set_bits(dev, addr, bits).await,
         PlaWordClrBits { addr, bits } => pla_word_clr_bits(dev, addr, bits).await,
         PlaWordWrite { addr, value } => ocp_write_word(dev, MCU_TYPE_PLA, addr, value).await,
+        PlaDwordW0W1 { addr, clear, set } => {
+            let cur = ocp_read_dword(dev, MCU_TYPE_PLA, addr).await?;
+            ocp_write_dword(dev, MCU_TYPE_PLA, addr, (cur & !clear) | set).await
+        }
         UsbWordSetBits { addr, bits } => {
             let cur = ocp_read_word(dev, MCU_TYPE_USB, addr).await?;
             ocp_write_word(dev, MCU_TYPE_USB, addr, cur | bits).await
@@ -3805,7 +4018,93 @@ async fn apply_phy_init_op(
             Ok(())
         }
         MdiSwapIfReversed => mdi_swap_if_reversed(dev).await,
+        BmuClrBits { addr, clear } => adv_w0w1(dev, ADV_CMD_BMU, addr, clear, 0).await,
+        IpClrBits { addr, clear } => adv_w0w1(dev, ADV_CMD_IP, addr, clear, 0).await,
+        ExtInitClear { clear_a466 } => {
+            // Linux `r8156_init`: the status poll's return
+            // value drives the clears (no separate poll step).
+            let status = poll_phy_status_any(dev).await?;
+            if status == PHY_STAT_EXT_INIT {
+                ocp_reg_clr_bits(dev, 0xA468, 0x0008 | 0x0002).await?;
+                if clear_a466 {
+                    ocp_reg_clr_bits(dev, 0xA466, 0x0001).await?;
+                }
+            }
+            Ok(())
+        }
+        WaitBackupRestore => {
+            // Linux `r8159_wait_backup_restore`: only when the
+            // power-cut status is set; the poll itself is
+            // best-effort (Linux aborts the init on timeout —
+            // NARF proceeds, like the autoload poll).
+            let misc = ocp_read_word(dev, MCU_TYPE_USB, USB_MISC_0).await?;
+            if misc & PCUT_STATUS != 0 {
+                for _ in 0..100 {
+                    let gphy = ocp_read_word(dev, MCU_TYPE_USB, USB_GPHY_CTRL).await?;
+                    if gphy & GPHY_CTRL_BACKUP_RESTRORE != 0 {
+                        break;
+                    }
+                    narf_scheduler::yield_now().await;
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+/// Wait for the ADV command channel to clear BUSY (Linux
+/// `wait_cmd_ready`: 2000 us interval, 20000 us timeout).
+/// Returns `false` on timeout; callers treat that as
+/// best-effort.
+async fn adv_wait_cmd_ready(dev: &USBDevice) -> Result<bool, ()> {
+    for _ in 0..10 {
+        let cmd = ocp_read_word(dev, MCU_TYPE_USB, USB_ADV_CMD).await?;
+        if cmd & ADV_CMD_BUSY == 0 {
+            return Ok(true);
+        }
+        narf_time::sleep_ms(2).await;
+    }
+    Ok(false)
+}
+
+/// Linux `ocp_adv_read`: read a 32-bit advanced register.
+/// Returns `None` when the command channel never becomes
+/// ready.
+async fn adv_read(dev: &USBDevice, cmd: u16, addr: u16) -> Result<Option<u32>, ()> {
+    if !adv_wait_cmd_ready(dev).await? {
+        return Ok(None);
+    }
+    ocp_write_word(dev, MCU_TYPE_USB, USB_ADV_ADDR, addr).await?;
+    ocp_write_word(dev, MCU_TYPE_USB, USB_ADV_CMD, cmd | ADV_CMD_BUSY).await?;
+    if !adv_wait_cmd_ready(dev).await? {
+        return Ok(None);
+    }
+    Ok(Some(ocp_read_dword(dev, MCU_TYPE_USB, USB_ADV_DATA).await?))
+}
+
+/// Linux `ocp_adv_write`: write a 32-bit advanced register.
+/// Returns `false` when the command channel never becomes
+/// ready (the write is then skipped).
+async fn adv_write(dev: &USBDevice, cmd: u16, addr: u16, data: u32) -> Result<bool, ()> {
+    if !adv_wait_cmd_ready(dev).await? {
+        return Ok(false);
+    }
+    let cmd = cmd | ADV_CMD_WR;
+    ocp_write_dword(dev, MCU_TYPE_USB, USB_ADV_DATA, data).await?;
+    ocp_write_word(dev, MCU_TYPE_USB, USB_ADV_ADDR, addr).await?;
+    ocp_write_word(dev, MCU_TYPE_USB, USB_ADV_CMD, cmd | ADV_CMD_BUSY).await?;
+    Ok(true)
+}
+
+/// Linux `rtl_bmu_w0w1` / `rtl_ip_w0w1` over the ADV command
+/// channel: read, `(cur & !clear) | set`, write. A channel
+/// that never becomes ready skips the step (best-effort —
+/// Linux's callers ignore that failure here).
+async fn adv_w0w1(dev: &USBDevice, cmd: u16, addr: u16, clear: u32, set: u32) -> Result<(), ()> {
+    if let Some(cur) = adv_read(dev, cmd, addr).await? {
+        let _ = adv_write(dev, cmd, addr, (cur & !clear) | set).await?;
+    }
+    Ok(())
 }
 
 /// Run the version-switched PHY init sequence for `version`
@@ -5005,6 +5304,36 @@ pub fn coalesce_for_speed(speed: crate::xhci::PortSpeed) -> u32 {
     }
 }
 
+/// RX aggregation timers for a chip version (Linux
+/// `r8153_set_rx_early_timeout`, enable-time):
+/// `(early_timeout, extra_aggr_timer)` in 8 ns units, or
+/// `None` when Linux programs neither (VER_01/02/07, VER_14,
+/// TEST_01, unknown). VER_03–VER_06 use the speed-derived
+/// coalesce value for the early timeout; VER_08/09 fix it to
+/// 128 ns and VER_10–VER_17 to 640 ns, with the fixed 15 us
+/// coalesce going to the extra aggregation timer instead.
+pub fn rx_aggregation_timers(
+    version: RtlVersion,
+    speed: crate::xhci::PortSpeed,
+) -> Option<(u16, Option<u16>)> {
+    match version {
+        RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06 => {
+            Some(((coalesce_for_speed(speed) / 8) as u16, None))
+        }
+        RtlVersion::Ver08 | RtlVersion::Ver09 => {
+            Some((RX_EARLY_TIMEOUT_8153B, Some(RX_EXTRA_AGGR_TMR_15US)))
+        }
+        RtlVersion::Ver10
+        | RtlVersion::Ver11
+        | RtlVersion::Ver12
+        | RtlVersion::Ver13
+        | RtlVersion::Ver15
+        | RtlVersion::Ver16
+        | RtlVersion::Ver17 => Some((RX_EARLY_TIMEOUT_8156, Some(RX_EXTRA_AGGR_TMR_15US))),
+        _ => None,
+    }
+}
+
 /// The `r8153_init` USB/LPM init sequence for the original RTL8153
 /// family, in Linux's order, as pure [`PhyInitOp`] data. `speed` is
 /// the negotiated USB speed, `burst_size` the pre-read
@@ -5013,8 +5342,10 @@ pub fn coalesce_for_speed(speed: crate::xhci::PortSpeed) -> u32 {
 /// the sequence runs (none of the earlier steps changes them), so
 /// the builder stays pure and fixtures can pin the whole
 /// conversation without hardware. Returns an empty sequence for
-/// every other version — those families keep reset defaults until
-/// their own init layers are ported.
+/// every other version — those families have their own init
+/// layers (`r8152b_init_ops`, `r8153b_init_ops`,
+/// `r8156_init_ops`); VER_14 / TEST_01 / unknown keep reset
+/// defaults.
 ///
 /// Deliberately NOT modelled here (see bind): the host-side
 /// `usb_enable_lpm` call (NARF's xHCI stack has no LPM enable yet;
@@ -5261,8 +5592,607 @@ pub fn r8153_init_ops(
     ops
 }
 
+/// Shared `r8153_queue_wake(tp, false)` steps (Linux):
+/// queue-wake off, then the link-status bits cleared.
+fn queue_wake_disable_ops() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    vec![
+        PlaByteClrBits {
+            addr: PLA_INDICATE_FALG,
+            bits: INDICATE_UPCOMING_RUNTIME_D3,
+        },
+        PlaByteClrBits {
+            addr: PLA_SUSPEND_FLAG,
+            bits: SUSPEND_LINK_CHG_EVENT,
+        },
+        PlaWordClrBits {
+            addr: PLA_EXTRA_STATUS,
+            bits: EXTRA_STATUS_LINK_CHANGE_FLAG,
+        },
+    ]
+}
+
+/// Shared `rtl_runtime_suspend_enable(tp, false)` steps
+/// (Linux): restoring saved WoL is a no-op at bind (nothing
+/// changed WoL yet); link-off-wake off behind the CRWECR dance.
+fn runtime_suspend_disable_ops() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    vec![
+        PlaByteWrite {
+            addr: PLA_CRWECR,
+            value: CRWECR_CONFIG,
+        },
+        PlaWordClrBits {
+            addr: PLA_CONFIG34,
+            bits: CONFIG34_LINK_OFF_WAKE_EN,
+        },
+        PlaByteWrite {
+            addr: PLA_CRWECR,
+            value: CRWECR_NORMAL,
+        },
+    ]
+}
+
+/// Shared link-status branch (Linux `rtl8152_get_speed(tp) &
+/// LINK_STATUS`): set `CUR_LINK_OK | POLL_LINK_CHG` when the
+/// link is up, else clear `CUR_LINK_OK` and set
+/// `POLL_LINK_CHG` (the clear-then-set pair is exactly
+/// `w0w1(clear CUR_LINK_OK, set POLL_LINK_CHG)`).
+fn extra_status_link_ops(link_ok: bool) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    if link_ok {
+        vec![PlaWordSetBits {
+            addr: PLA_EXTRA_STATUS,
+            bits: EXTRA_STATUS_CUR_LINK_OK | EXTRA_STATUS_POLL_LINK_CHG,
+        }]
+    } else {
+        vec![
+            PlaWordClrBits {
+                addr: PLA_EXTRA_STATUS,
+                bits: EXTRA_STATUS_CUR_LINK_OK,
+            },
+            PlaWordSetBits {
+                addr: PLA_EXTRA_STATUS,
+                bits: EXTRA_STATUS_POLL_LINK_CHG,
+            },
+        ]
+    }
+}
+
+/// Shared `r8153b_power_cut_en(tp, false)` steps (Linux):
+/// power enable off — note only `PWR_EN`, unlike
+/// `r8153_power_cut_en` which also clears `PHASE2_EN` — then
+/// the power-cut status cleared.
+fn power_cut_8153b_ops() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    vec![
+        UsbWordClrBits {
+            addr: USB_POWER_CUT,
+            bits: PWR_EN,
+        },
+        UsbWordClrBits {
+            addr: USB_MISC_0,
+            bits: PCUT_STATUS,
+        },
+    ]
+}
+
+/// Shared `r8153b_ups_en(tp, false)` / `r8156_ups_en(tp,
+/// false)` unconditional steps (Linux): UPS + pre-wake off,
+/// UPS force-power-down off. The power-cut-status branch of
+/// both (re-run `hw_phy_cfg` + `set_speed` when `PCUT_STATUS`
+/// is set) is NOT modelled: NARF runs `apply_phy_init`
+/// unconditionally right after the USB init layer, so the
+/// re-run is subsumed, and `set_speed` has no bind equivalent
+/// (speed comes from `PLA_PHYSTATUS` sampling).
+fn ups_disable_ops() -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    vec![
+        UsbByteClrBits {
+            addr: USB_POWER_CUT,
+            bits: UPS_EN | USP_PREWAKE,
+        },
+        UsbByteClrBits {
+            addr: USB_MISC_2,
+            bits: UPS_FORCE_PWR_DOWN,
+        },
+    ]
+}
+
+/// The `r8152b_init` USB/LPM init sequence for the RTL8152
+/// family (VER_01/02/07), in Linux's order, as pure
+/// [`PhyInitOp`] data. Returns an empty sequence for every
+/// other version. Unlike the other families there is no
+/// autoload or PHY-status poll here, and no U1/U2 or LPM timer
+/// step — Linux's `r8152b_init` only clears the MDIO
+/// power-down bit, disables ALDPS, clears the LED mode (VER_01
+/// only), disables power-cut, sets the PHY power + MAC clock
+/// ratio, programs the GPHY interrupt mask, resets the tally
+/// counters, and enables RX aggregation.
+pub fn r8152b_init_ops(version: RtlVersion) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    match version {
+        RtlVersion::Ver01 | RtlVersion::Ver02 | RtlVersion::Ver07 => {}
+        _ => return Vec::new(),
+    }
+    let mut ops = vec![
+        // Clear the PHY power-down bit (test-and-clear).
+        MdioTestAndClrBits {
+            reg: MII_BMCR,
+            bits: BMCR_PDOWN,
+        },
+        // ALDPS disable (whole-word write, no poll — Linux
+        // `r8152_aldps_en(tp, false)`).
+        OcpRegWrite {
+            addr: OCP_ALDPS_CONFIG,
+            value: ALDPS_CFG_8152_DISABLE,
+        },
+    ];
+    if matches!(version, RtlVersion::Ver01) {
+        ops.push(PlaWordClrBits {
+            addr: PLA_LED_FEATURE,
+            bits: LED_MODE_MASK,
+        });
+    }
+    ops.extend([
+        // Power-cut off (Linux `r8152_power_cut_en(tp, false)`).
+        UsbWordClrBits {
+            addr: USB_UPS_CTRL,
+            bits: POWER_CUT,
+        },
+        UsbWordClrBits {
+            addr: USB_PM_CTRL_STATUS,
+            bits: RESUME_INDICATE,
+        },
+        // PHY power: 10M idle enable + PFM/PWM switch.
+        PlaWordSetBits {
+            addr: PLA_PHY_PWR,
+            bits: TX_10M_IDLE_EN | PHY_PWR_PFM_PWM_SWITCH,
+        },
+        // MAC clock ratio + D3 clock gate (dword w0w1).
+        PlaDwordW0W1 {
+            addr: PLA_MAC_PWR_CTRL,
+            clear: MCU_CLK_RATIO_MASK,
+            set: MCU_CLK_RATIO | D3_CLK_GATED_EN,
+        },
+        // GPHY interrupt mask: status + speed-down + RXDV +
+        // link-change.
+        PlaWordWrite {
+            addr: PLA_GPHY_INTR_IMR,
+            value: GPHY_STS_MSK | SPEED_DOWN_MSK | SPDWN_RXDV_MSK | SPDWN_LINKCHG_MSK,
+        },
+        // Tally counters reset.
+        PlaWordSetBits {
+            addr: PLA_RSTTALLY,
+            bits: TALLY_RESET,
+        },
+        // RX aggregation on.
+        UsbWordClrBits {
+            addr: USB_USB_CTRL,
+            bits: USB_CTRL_RX_AGG_DISABLE | USB_CTRL_RX_ZERO_EN,
+        },
+    ]);
+    ops
+}
+
+/// The `r8153b_init` USB/LPM init sequence for the RTL8153B
+/// family (VER_08/09), in Linux's order, as pure [`PhyInitOp`]
+/// data. `speed` is the negotiated USB speed, `link_ok` the
+/// pre-read `PLA_PHYSTATUS` link bit, and `test_io_off` the
+/// pre-read PLA `0xdc00` bit 5 (VER_09 only) — all sampled by
+/// bind before the sequence runs (none of the earlier steps
+/// changes them), so the builder stays pure. Returns an empty
+/// sequence for every other version.
+///
+/// Deliberately NOT modelled here (see bind): the host-side
+/// `usb_enable_lpm` call (see `r8153_init_ops`) and the
+/// `GREEN_ETHERNET` flag set (a Linux-internal flag consumed
+/// by the already-ported `*_hw_phy_cfg` layers, with no
+/// register effect at init time).
+pub fn r8153b_init_ops(
+    version: RtlVersion,
+    speed: crate::xhci::PortSpeed,
+    link_ok: bool,
+    test_io_off: bool,
+) -> Vec<PhyInitOp> {
+    use crate::xhci::PortSpeed;
+    use PhyInitOp::*;
+    match version {
+        RtlVersion::Ver08 | RtlVersion::Ver09 => {}
+        _ => return Vec::new(),
+    }
+    let mut ops = vec![
+        // U1/U2 off while the device initialises (8153B form:
+        // the LPM_CONFIG bit, not the TOLERANCE array).
+        UsbWordClrBits {
+            addr: USB_LPM_CONFIG,
+            bits: LPM_U1U2_EN,
+        },
+        // Wait for the firmware autoload to finish (best-effort).
+        AutoloadPoll,
+        // PHY up to a stable state (any of LAN_ON / PWRDN /
+        // EXT_INIT).
+        PhyStatusPollAny,
+        // Clear the PHY power-down bit (test-and-clear), then
+        // wait for LAN_ON.
+        MdioTestAndClrBits {
+            reg: MII_BMCR,
+            bits: BMCR_PDOWN,
+        },
+        PhyStatusPollLanOn,
+        // U3 off.
+        UsbWordClrBits {
+            addr: USB_U2P3_CTRL,
+            bits: U2P3_ENABLE,
+        },
+        // MSC timer = 0xfff * 8ms = 32760 ms.
+        UsbWordWrite {
+            addr: USB_MSC_TIMER,
+            value: MSC_TIMER_8153B,
+        },
+    ];
+    ops.extend(power_cut_8153b_ops());
+    ops.extend(ups_disable_ops());
+    ops.extend(queue_wake_disable_ops());
+    ops.extend(runtime_suspend_disable_ops());
+    ops.extend(extra_status_link_ops(link_ok));
+    // U1/U2 back on at SuperSpeed and up (host-side LPM enable
+    // is a stack gap — see the doc comment above).
+    if matches!(speed, PortSpeed::Super | PortSpeed::SuperPlus) {
+        ops.push(UsbWordSetBits {
+            addr: USB_LPM_CONFIG,
+            bits: LPM_U1U2_EN,
+        });
+    }
+    ops.extend([
+        // MAC clock speed-down on.
+        PlaWordSetBits {
+            addr: PLA_MAC_PWR_CTRL2,
+            bits: MAC_CLK_SPDWN_EN,
+        },
+        PlaWordClrBits {
+            addr: PLA_MAC_PWR_CTRL3,
+            bits: PLA_MCU_SPDWN_EN,
+        },
+    ]);
+    // VER_09 only: disable Test IO for 32QFN when the PLA
+    // 0xdc00 bit 5 is set (pre-read by bind).
+    if matches!(version, RtlVersion::Ver09) && test_io_off {
+        ops.push(PlaWordSetBits {
+            addr: PLA_PHY_PWR,
+            bits: TEST_IO_OFF,
+        });
+    }
+    ops.extend([
+        // RX aggregation on.
+        UsbWordClrBits {
+            addr: USB_USB_CTRL,
+            bits: USB_CTRL_RX_AGG_DISABLE | USB_CTRL_RX_ZERO_EN,
+        },
+        // Tally counters reset.
+        PlaWordSetBits {
+            addr: PLA_RSTTALLY,
+            bits: TALLY_RESET,
+        },
+    ]);
+    ops
+}
+
+/// The `r8156_init` USB/LPM init sequence for the RTL8156 /
+/// RTL8156B / RTL8157 / RTL8159 families (VER_10/11/12/13/15/
+/// 16/17), in Linux's order, as pure [`PhyInitOp`] data.
+/// `speed` is the negotiated USB speed, `link_ok` the pre-read
+/// `PLA_PHYSTATUS` link bit, and `dack_det` the pre-read
+/// `PLA_POL_GPIO_CTRL` DACK-detect bit (VER_12–VER_15 only) —
+/// all sampled by bind before the sequence runs (none of the
+/// earlier steps changes them), so the builder stays pure.
+/// Returns an empty sequence for every other version.
+///
+/// Deliberately NOT modelled here (see bind): the host-side
+/// `usb_enable_lpm` call (see `r8153_init_ops`); the
+/// `GREEN_ETHERNET` flag set (see `r8153b_init_ops`); the
+/// VER_17 backup-restore timeout abort (Linux aborts the init
+/// — `WaitBackupRestore` is best-effort instead, like the
+/// autoload poll); and the `r8153b_ups_en` / `r8156_ups_en`
+/// power-cut-status branch (see `ups_disable_ops`).
+pub fn r8156_init_ops(
+    version: RtlVersion,
+    speed: crate::xhci::PortSpeed,
+    link_ok: bool,
+    dack_det: bool,
+) -> Vec<PhyInitOp> {
+    use crate::xhci::PortSpeed;
+    use PhyInitOp::*;
+    match version {
+        RtlVersion::Ver10
+        | RtlVersion::Ver11
+        | RtlVersion::Ver12
+        | RtlVersion::Ver13
+        | RtlVersion::Ver15
+        | RtlVersion::Ver16
+        | RtlVersion::Ver17 => {}
+        _ => return Vec::new(),
+    }
+    let is_16_17 = matches!(version, RtlVersion::Ver16 | RtlVersion::Ver17);
+    let is_12_15 = matches!(
+        version,
+        RtlVersion::Ver12 | RtlVersion::Ver13 | RtlVersion::Ver15
+    );
+    let mut ops = Vec::new();
+    if is_16_17 {
+        ops.extend([
+            UsbByteSetBits {
+                addr: USB_VER16_BYTE_CFFE,
+                bits: 0x08,
+            },
+            UsbByteClrBits {
+                addr: USB_VER16_BYTE_D3CA,
+                bits: 0x01,
+            },
+        ]);
+    }
+    ops.push(UsbByteClrBits {
+        addr: USB_ECM_OP,
+        bits: EN_ALL_SPEED,
+    });
+    if !is_16_17 {
+        ops.push(UsbWordWrite {
+            addr: USB_SPEED_OPTION,
+            value: 0,
+        });
+    }
+    ops.push(UsbWordSetBits {
+        addr: USB_ECM_OPTION,
+        bits: BYPASS_MAC_RESET,
+    });
+    if is_12_15 {
+        ops.push(UsbWordSetBits {
+            addr: USB_U2P3_CTRL,
+            bits: RX_DETECT8,
+        });
+    }
+    ops.push(UsbWordClrBits {
+        addr: USB_LPM_CONFIG,
+        bits: LPM_U1U2_EN,
+    });
+    if matches!(
+        version,
+        RtlVersion::Ver13 | RtlVersion::Ver15 | RtlVersion::Ver16 | RtlVersion::Ver17
+    ) {
+        ops.push(WaitLoadingFlash);
+    }
+    ops.push(AutoloadPoll);
+    if matches!(version, RtlVersion::Ver17) {
+        ops.push(WaitBackupRestore);
+    }
+    ops.extend([
+        // PHY status: clear the EXT_INIT bits when the PHY
+        // reports EXT_INIT (plus 0xa466 bit 0 on VER_12+).
+        ExtInitClear {
+            clear_a466: matches!(
+                version,
+                RtlVersion::Ver12
+                    | RtlVersion::Ver13
+                    | RtlVersion::Ver15
+                    | RtlVersion::Ver16
+                    | RtlVersion::Ver17
+            ),
+        },
+        // Clear the PHY power-down bit (test-and-clear), then
+        // wait for LAN_ON.
+        MdioTestAndClrBits {
+            reg: MII_BMCR,
+            bits: BMCR_PDOWN,
+        },
+        PhyStatusPollLanOn,
+    ]);
+    if is_16_17 {
+        ops.push(IpClrBits {
+            addr: USB_U2P3_V2_CTRL,
+            clear: U2P3_V2_ENABLE,
+        });
+    } else {
+        ops.push(UsbWordClrBits {
+            addr: USB_U2P3_CTRL,
+            bits: U2P3_ENABLE,
+        });
+    }
+    ops.extend([
+        // MSC timer = 0xfff * 8ms = 32760 ms.
+        UsbWordWrite {
+            addr: USB_MSC_TIMER,
+            value: MSC_TIMER_8153B,
+        },
+        // U1/U2/L1 idle timer. 500 us.
+        UsbWordWrite {
+            addr: USB_U1U2_TIMER,
+            value: U1U2_TIMER_500US,
+        },
+    ]);
+    if is_16_17 {
+        ops.extend([
+            UsbWordClrBits {
+                addr: USB_POWER_CUT,
+                bits: PWR_EN,
+            },
+            UsbWordClrBits {
+                addr: USB_MISC_0,
+                bits: PCUT_STATUS,
+            },
+            UsbByteClrBits {
+                addr: USB_MISC_2,
+                bits: 0x02,
+            },
+        ]);
+    } else {
+        ops.extend(power_cut_8153b_ops());
+    }
+    ops.extend(ups_disable_ops());
+    ops.extend(queue_wake_disable_ops());
+    ops.extend(runtime_suspend_disable_ops());
+    // U1/U2 back on at SuperSpeed and up (host-side LPM enable
+    // is a stack gap — see the doc comment above).
+    if matches!(speed, PortSpeed::Super | PortSpeed::SuperPlus) {
+        ops.push(UsbWordSetBits {
+            addr: USB_LPM_CONFIG,
+            bits: LPM_U1U2_EN,
+        });
+    }
+    if is_12_15 {
+        ops.extend([
+            PlaWordClrBits {
+                addr: PLA_RCR,
+                bits: SLOT_EN,
+            },
+            PlaWordSetBits {
+                addr: PLA_CPCR,
+                bits: FLOW_CTRL_EN,
+            },
+            // Enable the flow-control timer, 600 ms.
+            UsbWordWrite {
+                addr: USB_FC_TIMER,
+                value: FC_TIMER_600MS,
+            },
+        ]);
+        // Flow-control patch 2 unless DACK was detected
+        // (pre-read by bind), then auto-speedup off.
+        if !dack_det {
+            ops.push(UsbWordSetBits {
+                addr: USB_FW_CTRL,
+                bits: FW_CTRL_FLOW_CTRL_PATCH_2,
+            });
+        }
+        ops.extend([
+            UsbWordClrBits {
+                addr: USB_FW_CTRL,
+                bits: AUTO_SPEEDUP,
+            },
+            UsbWordSetBits {
+                addr: USB_FW_TASK,
+                bits: FW_TASK_FC_PATCH,
+            },
+        ]);
+    }
+    ops.extend([
+        // MAC clock speed-down on (aldps/tp10 ratios 0x0403,
+        // then the speed-down ratio field + enable bit).
+        PlaWordWrite {
+            addr: PLA_MAC_PWR_CTRL,
+            value: 0x0403,
+        },
+        PlaWordClrBits {
+            addr: PLA_MAC_PWR_CTRL2,
+            bits: EEE_SPDWN_RATIO_MASK,
+        },
+        PlaWordSetBits {
+            addr: PLA_MAC_PWR_CTRL2,
+            bits: MAC_CLK_SPDWN_EN | 0x03,
+        },
+    ]);
+    if !is_16_17 {
+        ops.push(PlaWordClrBits {
+            addr: PLA_MAC_PWR_CTRL3,
+            bits: PLA_MCU_SPDWN_EN,
+        });
+    }
+    ops.extend(extra_status_link_ops(link_ok));
+    // RX aggregation on (VER_16/17: 16-byte descriptors too;
+    // VER_17 additionally clears the RTL8159-only bit 11).
+    ops.push(match version {
+        RtlVersion::Ver17 => UsbWordClrBits {
+            addr: USB_USB_CTRL,
+            bits: USB_CTRL_RX_AGG_DISABLE | RX_DESC_16B | USB_CTRL_8159_BIT11,
+        },
+        RtlVersion::Ver16 => UsbWordClrBits {
+            addr: USB_USB_CTRL,
+            bits: USB_CTRL_RX_AGG_DISABLE | RX_DESC_16B,
+        },
+        _ => UsbWordClrBits {
+            addr: USB_USB_CTRL,
+            bits: USB_CTRL_RX_AGG_DISABLE | USB_CTRL_RX_ZERO_EN,
+        },
+    });
+    if !matches!(
+        version,
+        RtlVersion::Ver12
+            | RtlVersion::Ver13
+            | RtlVersion::Ver15
+            | RtlVersion::Ver16
+            | RtlVersion::Ver17
+    ) {
+        ops.push(UsbByteSetBits {
+            addr: USB_BMU_CONFIG,
+            bits: ACT_ODMA,
+        });
+    }
+    if is_16_17 {
+        ops.extend([
+            // Disable Rx Zero Len (BMU register 0x2300 bit 3).
+            BmuClrBits {
+                addr: 0x2300,
+                clear: 0x0008,
+            },
+            // TX descriptor signature off.
+            UsbByteClrBits {
+                addr: USB_VER16_BYTE_D4AE,
+                bits: 0x02,
+            },
+        ]);
+    }
+    ops.extend([
+        // MDIO force mode (clear the MMD-force-mode bit when
+        // set; the unconditional write leaves the same final
+        // state as Linux's conditional one).
+        OcpRegClrBits {
+            addr: OCP_MDIO_FORCE_MODE,
+            bits: MDIO_FORCE_MODE_MMD,
+        },
+        // Tally counters reset.
+        PlaWordSetBits {
+            addr: PLA_RSTTALLY,
+            bits: TALLY_RESET,
+        },
+    ]);
+    ops
+}
+
+/// The version-switched USB/LPM init sequence for `version`,
+/// dispatching to the per-family builder (`r8153_init_ops` for
+/// VER_03–VER_06, `r8152b_init_ops` for VER_01/02/07,
+/// `r8153b_init_ops` for VER_08/09, `r8156_init_ops` for
+/// VER_10/11/12/13/15/16/17). VER_14 / TEST_01 / unknown get
+/// an empty sequence (reset defaults). `burst_size` feeds only
+/// the VER_05/06 branch, `test_io_off` only VER_09,
+/// `dack_det` only VER_12–VER_15.
+pub fn usb_init_ops(
+    version: RtlVersion,
+    speed: crate::xhci::PortSpeed,
+    burst_size: u16,
+    link_ok: bool,
+    test_io_off: bool,
+    dack_det: bool,
+) -> Vec<PhyInitOp> {
+    match version {
+        RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06 => {
+            r8153_init_ops(version, speed, burst_size, link_ok)
+        }
+        RtlVersion::Ver01 | RtlVersion::Ver02 | RtlVersion::Ver07 => r8152b_init_ops(version),
+        RtlVersion::Ver08 | RtlVersion::Ver09 => {
+            r8153b_init_ops(version, speed, link_ok, test_io_off)
+        }
+        RtlVersion::Ver10
+        | RtlVersion::Ver11
+        | RtlVersion::Ver12
+        | RtlVersion::Ver13
+        | RtlVersion::Ver15
+        | RtlVersion::Ver16
+        | RtlVersion::Ver17 => r8156_init_ops(version, speed, link_ok, dack_det),
+        _ => Vec::new(),
+    }
+}
+
 /// Run the version-switched USB/LPM init sequence for `version`
-/// before the PHY init sequence. Unknown and not-yet-ported
+/// before the PHY init sequence. VER_14 / TEST_01 / unknown
 /// versions are a no-op (reset defaults), never a bind failure.
 pub async fn apply_usb_init(
     dev: &USBDevice,
@@ -5270,11 +6200,13 @@ pub async fn apply_usb_init(
     speed: crate::xhci::PortSpeed,
     burst_size: u16,
     link_ok: bool,
+    test_io_off: bool,
+    dack_det: bool,
 ) -> Result<(), ()> {
     // The USB/LPM layer never contains the firmware or patch
     // steps, so the context carries no blob.
     let mut ctx = PhyInitCtx::new(version, None);
-    for op in r8153_init_ops(version, speed, burst_size, link_ok) {
+    for op in usb_init_ops(version, speed, burst_size, link_ok, test_io_off, dack_det) {
         apply_phy_init_op(dev, &mut ctx, op).await?;
     }
     Ok(())
@@ -6535,14 +7467,15 @@ async fn bind(device: Arc<USBDevice>, hub_port: Option<(u8, u8)>) -> Result<usiz
     let version_raw = ocp_read_word(&device, MCU_TYPE_PLA, PLA_TCR1).await?;
     let version = version_from_tcr1(version_raw);
     let gen = generation_for_pid(device.product_id());
-    // USB/LPM init layer for the chip version (Linux `r8153_init`,
+    // USB/LPM init layer for the chip version (Linux `*_init`,
     // probe-time in Linux, so it runs before the PHY init
-    // sequence here). The burst-size word and link bit are
-    // sampled first — none of the init steps changes them — and
-    // both reads are best-effort with the safe defaults (burst 0,
-    // link down) so the init layer adds no new bind failure mode.
-    // Unknown / not-yet-ported versions are a no-op here (reset
-    // defaults).
+    // sequence here). The burst-size word, link bit, test-IO bit
+    // (VER_09) and DACK-detect bit (VER_12–VER_15) are sampled
+    // first — none of the init steps changes them — and all four
+    // reads are best-effort with safe defaults (burst 0, link
+    // down, no test-IO-off, no DACK) so the init layer adds no
+    // new bind failure mode. VER_14 / TEST_01 / unknown versions
+    // are a no-op here (reset defaults).
     let burst_size = ocp_read_word(&device, MCU_TYPE_USB, USB_BURST_SIZE)
         .await
         .unwrap_or(0);
@@ -6550,8 +7483,24 @@ async fn bind(device: Arc<USBDevice>, hub_port: Option<(u8, u8)>) -> Result<usiz
         .await
         .map(|b| b & PHYSTAT_LINK != 0)
         .unwrap_or(false);
-    apply_usb_init(&device, version, device.speed(), burst_size, link_ok).await?;
-    let coalesce_us = coalesce_for_speed(device.speed());
+    let test_io_off = ocp_read_byte(&device, MCU_TYPE_PLA, PLA_TEST_IO_REG)
+        .await
+        .map(|b| b & TEST_IO_REG_BIT5 != 0)
+        .unwrap_or(false);
+    let dack_det = ocp_read_word(&device, MCU_TYPE_PLA, PLA_POL_GPIO_CTRL)
+        .await
+        .map(|w| w & DACK_DET_EN != 0)
+        .unwrap_or(false);
+    apply_usb_init(
+        &device,
+        version,
+        device.speed(),
+        burst_size,
+        link_ok,
+        test_io_off,
+        dack_det,
+    )
+    .await?;
     // Firmware blob for the chip version, from the registry
     // (Linux `rtl8152_request_firmware`, probe-time in Linux).
     // The cap is held alive across the init sequence so the blob
@@ -6586,22 +7535,15 @@ async fn bind(device: Arc<USBDevice>, hub_port: Option<(u8, u8)>) -> Result<usiz
     pla_word_set_bits(&device, vlan_addr, vlan_bits).await?;
     // Snapshot the device's current WoL options (best-effort).
     let wol_opts = read_wol_opts(&device).await;
-    // RX early timeout from the coalesce value (Linux
-    // `r8153_set_rx_early_timeout` at enable time): coalesce us
-    // / 8 fits u16 for every speed (max 524280 / 8 = 65535).
-    // VER_03–VER_06 only — other families use a different
-    // aggregation timer.
-    if matches!(
-        version,
-        RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06
-    ) {
-        ocp_write_word(
-            &device,
-            MCU_TYPE_USB,
-            USB_RX_EARLY_TIMEOUT,
-            (coalesce_us / 8) as u16,
-        )
-        .await?;
+    // RX aggregation timers (Linux `r8153_set_rx_early_timeout`
+    // at enable time): the early timeout plus, for the 8153B /
+    // 8156 families, the extra aggregation timer. Versions
+    // without a ported init layer program neither.
+    if let Some((early, extra)) = rx_aggregation_timers(version, device.speed()) {
+        ocp_write_word(&device, MCU_TYPE_USB, USB_RX_EARLY_TIMEOUT, early).await?;
+        if let Some(extra) = extra {
+            ocp_write_word(&device, MCU_TYPE_USB, USB_RX_EXTRA_AGGR_TMR, extra).await?;
+        }
     }
     // Enable receiver + transmitter.
     let cr = ocp_read_byte(&device, MCU_TYPE_PLA, PLA_CR).await?;
@@ -8500,8 +9442,10 @@ pub mod tests {
 
     fn smoke_r8152_usb_init_ops() -> TestResult {
         use crate::xhci::PortSpeed;
-        // Only VER_03–VER_06 get a sequence; everything else is
-        // reset defaults (empty sequence, never a bind failure).
+        // The VER_03–VER_06 builder serves only those versions;
+        // the other families have their own builders (see the
+        // test below), and VER_14 / TEST_01 / unknown get an
+        // empty sequence (reset defaults, never a bind failure).
         if !r8153_init_ops(RtlVersion::Ver01, PortSpeed::Super, 0, false).is_empty()
             || !r8153_init_ops(RtlVersion::Ver08, PortSpeed::Super, 0, false).is_empty()
             || !r8153_init_ops(RtlVersion::Ver16, PortSpeed::Super, 0, false).is_empty()
@@ -8651,6 +9595,385 @@ pub mod tests {
     }
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_usb_init_ops);
 
+    fn smoke_r8152_usb_init_other_families() -> TestResult {
+        use crate::xhci::PortSpeed;
+        // The dispatcher routes each family to its own builder
+        // and leaves VER_14 / TEST_01 / unknown empty.
+        if !usb_init_ops(RtlVersion::Ver14, PortSpeed::Super, 0, false, false, false).is_empty()
+            || !usb_init_ops(RtlVersion::Test01, PortSpeed::Super, 0, false, false, false)
+                .is_empty()
+            || !usb_init_ops(
+                RtlVersion::Unknown,
+                PortSpeed::Super,
+                0,
+                false,
+                false,
+                false,
+            )
+            .is_empty()
+        {
+            return TestResult::Fail("unported version must have an empty init sequence");
+        }
+        if usb_init_ops(RtlVersion::Ver01, PortSpeed::Super, 0, false, false, false)
+            != r8152b_init_ops(RtlVersion::Ver01)
+            || usb_init_ops(RtlVersion::Ver08, PortSpeed::Super, 0, false, false, false)
+                != r8153b_init_ops(RtlVersion::Ver08, PortSpeed::Super, false, false)
+            || usb_init_ops(RtlVersion::Ver10, PortSpeed::Super, 0, false, false, false)
+                != r8156_init_ops(RtlVersion::Ver10, PortSpeed::Super, false, false)
+            || usb_init_ops(RtlVersion::Ver03, PortSpeed::Super, 0, false, false, false)
+                != r8153_init_ops(RtlVersion::Ver03, PortSpeed::Super, 0, false)
+        {
+            return TestResult::Fail("dispatcher must route each family to its own builder");
+        }
+        // r8152b (VER_01): MDIO test-and-clear, ALDPS whole-word
+        // disable, LED clear only on VER_01, dword clock-ratio
+        // w0w1, GPHY interrupt mask, tally reset, RX agg — and
+        // no autoload or PHY-status poll.
+        let v01 = r8152b_init_ops(RtlVersion::Ver01);
+        if v01.is_empty()
+            || v01[0]
+                != (PhyInitOp::MdioTestAndClrBits {
+                    reg: MII_BMCR,
+                    bits: BMCR_PDOWN,
+                })
+            || v01[1]
+                != (PhyInitOp::OcpRegWrite {
+                    addr: OCP_ALDPS_CONFIG,
+                    value: ALDPS_CFG_8152_DISABLE,
+                })
+        {
+            return TestResult::Fail("VER_01 init must open with MDIO test-and-clear + ALDPS");
+        }
+        if !v01.contains(&PhyInitOp::PlaWordClrBits {
+            addr: PLA_LED_FEATURE,
+            bits: LED_MODE_MASK,
+        }) || r8152b_init_ops(RtlVersion::Ver02).contains(&PhyInitOp::PlaWordClrBits {
+            addr: PLA_LED_FEATURE,
+            bits: LED_MODE_MASK,
+        }) {
+            return TestResult::Fail("VER_01 LED clear must be VER_01 only");
+        }
+        if !v01.contains(&PhyInitOp::PlaDwordW0W1 {
+            addr: PLA_MAC_PWR_CTRL,
+            clear: MCU_CLK_RATIO_MASK,
+            set: MCU_CLK_RATIO | D3_CLK_GATED_EN,
+        }) || !v01.contains(&PhyInitOp::PlaWordWrite {
+            addr: PLA_GPHY_INTR_IMR,
+            value: GPHY_STS_MSK | SPEED_DOWN_MSK | SPDWN_RXDV_MSK | SPDWN_LINKCHG_MSK,
+        }) || !v01.contains(&PhyInitOp::PlaWordSetBits {
+            addr: PLA_PHY_PWR,
+            bits: TX_10M_IDLE_EN | PHY_PWR_PFM_PWM_SWITCH,
+        }) {
+            return TestResult::Fail(
+                "VER_01 init must carry the clock-ratio / IMR / PHY_PWR steps",
+            );
+        }
+        if v01.iter().any(|op| {
+            matches!(
+                op,
+                PhyInitOp::AutoloadPoll
+                    | PhyInitOp::PhyStatusPollAny
+                    | PhyInitOp::PhyStatusPollLanOn
+            )
+        }) {
+            return TestResult::Fail("VER_01 init must not poll autoload or PHY status");
+        }
+        if v01[v01.len() - 1]
+            != (PhyInitOp::UsbWordClrBits {
+                addr: USB_USB_CTRL,
+                bits: USB_CTRL_RX_AGG_DISABLE | USB_CTRL_RX_ZERO_EN,
+            })
+            || v01[v01.len() - 2]
+                != (PhyInitOp::PlaWordSetBits {
+                    addr: PLA_RSTTALLY,
+                    bits: TALLY_RESET,
+                })
+        {
+            return TestResult::Fail("VER_01 init must close with tally reset + RX agg");
+        }
+        if !r8152b_init_ops(RtlVersion::Ver03).is_empty()
+            || !r8152b_init_ops(RtlVersion::Ver08).is_empty()
+        {
+            return TestResult::Fail("r8152b builder must stay VER_01/02/07 only");
+        }
+        // r8153b (VER_08): LPM_CONFIG U1/U2 off first, autoload
+        // + PHY-status polls, MSC timer, power-cut (PWR_EN
+        // only — never PHASE2_EN), MAC clock speed-down on,
+        // tally reset last.
+        let v08 = r8153b_init_ops(RtlVersion::Ver08, PortSpeed::Super, false, false);
+        if v08.is_empty()
+            || v08[0]
+                != (PhyInitOp::UsbWordClrBits {
+                    addr: USB_LPM_CONFIG,
+                    bits: LPM_U1U2_EN,
+                })
+            || v08[1] != PhyInitOp::AutoloadPoll
+            || v08[2] != PhyInitOp::PhyStatusPollAny
+        {
+            return TestResult::Fail("VER_08 init must open with LPM_CONFIG-off + polls");
+        }
+        if !v08.contains(&PhyInitOp::UsbWordWrite {
+            addr: USB_MSC_TIMER,
+            value: MSC_TIMER_8153B,
+        }) || !v08.contains(&PhyInitOp::UsbWordClrBits {
+            addr: USB_POWER_CUT,
+            bits: PWR_EN,
+        }) || v08.contains(&PhyInitOp::UsbWordClrBits {
+            addr: USB_POWER_CUT,
+            bits: PWR_EN | PHASE2_EN,
+        }) || !v08.contains(&PhyInitOp::UsbByteClrBits {
+            addr: USB_POWER_CUT,
+            bits: UPS_EN | USP_PREWAKE,
+        }) || !v08.contains(&PhyInitOp::UsbByteClrBits {
+            addr: USB_MISC_2,
+            bits: UPS_FORCE_PWR_DOWN,
+        }) {
+            return TestResult::Fail("VER_08 power-cut / UPS steps wrong");
+        }
+        if !v08.contains(&PhyInitOp::PlaWordSetBits {
+            addr: PLA_MAC_PWR_CTRL2,
+            bits: MAC_CLK_SPDWN_EN,
+        }) || !v08.contains(&PhyInitOp::PlaWordClrBits {
+            addr: PLA_MAC_PWR_CTRL3,
+            bits: PLA_MCU_SPDWN_EN,
+        }) {
+            return TestResult::Fail("VER_08 MAC clock speed-down steps wrong");
+        }
+        // U1/U2 back on only at SuperSpeed and up.
+        if !v08.contains(&PhyInitOp::UsbWordSetBits {
+            addr: USB_LPM_CONFIG,
+            bits: LPM_U1U2_EN,
+        }) || r8153b_init_ops(RtlVersion::Ver08, PortSpeed::High, false, false).contains(
+            &PhyInitOp::UsbWordSetBits {
+                addr: USB_LPM_CONFIG,
+                bits: LPM_U1U2_EN,
+            },
+        ) {
+            return TestResult::Fail("VER_08 U1/U2 re-enable must be SuperSpeed-only");
+        }
+        // VER_09 Test-IO step is gated on the pre-read bit.
+        if !r8153b_init_ops(RtlVersion::Ver09, PortSpeed::Super, false, true).contains(
+            &PhyInitOp::PlaWordSetBits {
+                addr: PLA_PHY_PWR,
+                bits: TEST_IO_OFF,
+            },
+        ) || r8153b_init_ops(RtlVersion::Ver09, PortSpeed::Super, false, false).contains(
+            &PhyInitOp::PlaWordSetBits {
+                addr: PLA_PHY_PWR,
+                bits: TEST_IO_OFF,
+            },
+        ) || r8153b_init_ops(RtlVersion::Ver08, PortSpeed::Super, false, true).contains(
+            &PhyInitOp::PlaWordSetBits {
+                addr: PLA_PHY_PWR,
+                bits: TEST_IO_OFF,
+            },
+        ) {
+            return TestResult::Fail("VER_09 Test-IO step must follow the pre-read bit");
+        }
+        // Link branch on EXTRA_STATUS, both directions.
+        if !r8153b_init_ops(RtlVersion::Ver08, PortSpeed::Super, true, false).contains(
+            &PhyInitOp::PlaWordSetBits {
+                addr: PLA_EXTRA_STATUS,
+                bits: EXTRA_STATUS_CUR_LINK_OK | EXTRA_STATUS_POLL_LINK_CHG,
+            },
+        ) || !v08.contains(&PhyInitOp::PlaWordClrBits {
+            addr: PLA_EXTRA_STATUS,
+            bits: EXTRA_STATUS_CUR_LINK_OK,
+        }) {
+            return TestResult::Fail("VER_08 link-status branch wrong");
+        }
+        if v08[v08.len() - 1]
+            != (PhyInitOp::PlaWordSetBits {
+                addr: PLA_RSTTALLY,
+                bits: TALLY_RESET,
+            })
+        {
+            return TestResult::Fail("VER_08 init must close with the tally reset");
+        }
+        // r8156 (VER_10): ECM all-speeds off, speed option 0,
+        // ECM bypass, MSC + U1/U2 timers, MAC clock ratios,
+        // MDIO force mode, tally reset — and no flash wait,
+        // no VER_12–15 block, no ADV steps.
+        let v10 = r8156_init_ops(RtlVersion::Ver10, PortSpeed::Super, false, false);
+        if v10.is_empty()
+            || !v10.contains(&PhyInitOp::UsbByteClrBits {
+                addr: USB_ECM_OP,
+                bits: EN_ALL_SPEED,
+            })
+            || !v10.contains(&PhyInitOp::UsbWordWrite {
+                addr: USB_SPEED_OPTION,
+                value: 0,
+            })
+            || !v10.contains(&PhyInitOp::UsbWordSetBits {
+                addr: USB_ECM_OPTION,
+                bits: BYPASS_MAC_RESET,
+            })
+            || !v10.contains(&PhyInitOp::UsbWordWrite {
+                addr: USB_U1U2_TIMER,
+                value: U1U2_TIMER_500US,
+            })
+            || !v10.contains(&PhyInitOp::PlaWordWrite {
+                addr: PLA_MAC_PWR_CTRL,
+                value: 0x0403,
+            })
+            || !v10.contains(&PhyInitOp::PlaWordClrBits {
+                addr: PLA_MAC_PWR_CTRL2,
+                bits: EEE_SPDWN_RATIO_MASK,
+            })
+            || !v10.contains(&PhyInitOp::PlaWordSetBits {
+                addr: PLA_MAC_PWR_CTRL2,
+                bits: MAC_CLK_SPDWN_EN | 0x03,
+            })
+            || !v10.contains(&PhyInitOp::OcpRegClrBits {
+                addr: OCP_MDIO_FORCE_MODE,
+                bits: MDIO_FORCE_MODE_MMD,
+            })
+        {
+            return TestResult::Fail("VER_10 init must carry the ECM / timer / clock steps");
+        }
+        if !v10.contains(&PhyInitOp::ExtInitClear { clear_a466: false })
+            || v10.contains(&PhyInitOp::ExtInitClear { clear_a466: true })
+            || v10.contains(&PhyInitOp::WaitLoadingFlash)
+            || v10.contains(&PhyInitOp::WaitBackupRestore)
+            || v10.iter().any(|op| {
+                matches!(
+                    op,
+                    PhyInitOp::BmuClrBits { .. } | PhyInitOp::IpClrBits { .. }
+                )
+            })
+            || v10.contains(&PhyInitOp::PlaWordClrBits {
+                addr: PLA_RCR,
+                bits: SLOT_EN,
+            })
+        {
+            return TestResult::Fail("VER_10 init must not carry later-family steps");
+        }
+        if !v10.contains(&PhyInitOp::UsbByteSetBits {
+            addr: USB_BMU_CONFIG,
+            bits: ACT_ODMA,
+        }) || !v10.contains(&PhyInitOp::UsbWordClrBits {
+            addr: USB_USB_CTRL,
+            bits: USB_CTRL_RX_AGG_DISABLE | USB_CTRL_RX_ZERO_EN,
+        }) {
+            return TestResult::Fail("VER_10 BMU / RX-agg steps wrong");
+        }
+        // VER_12: the flow-control block, DACK-gated patch bit.
+        let v12 = r8156_init_ops(RtlVersion::Ver12, PortSpeed::Super, true, false);
+        if !v12.contains(&PhyInitOp::ExtInitClear { clear_a466: true })
+            || !v12.contains(&PhyInitOp::UsbWordSetBits {
+                addr: USB_U2P3_CTRL,
+                bits: RX_DETECT8,
+            })
+            || !v12.contains(&PhyInitOp::PlaWordClrBits {
+                addr: PLA_RCR,
+                bits: SLOT_EN,
+            })
+            || !v12.contains(&PhyInitOp::PlaWordSetBits {
+                addr: PLA_CPCR,
+                bits: FLOW_CTRL_EN,
+            })
+            || !v12.contains(&PhyInitOp::UsbWordWrite {
+                addr: USB_FC_TIMER,
+                value: FC_TIMER_600MS,
+            })
+            || !v12.contains(&PhyInitOp::UsbWordSetBits {
+                addr: USB_FW_CTRL,
+                bits: FW_CTRL_FLOW_CTRL_PATCH_2,
+            })
+            || !v12.contains(&PhyInitOp::UsbWordClrBits {
+                addr: USB_FW_CTRL,
+                bits: AUTO_SPEEDUP,
+            })
+            || !v12.contains(&PhyInitOp::UsbWordSetBits {
+                addr: USB_FW_TASK,
+                bits: FW_TASK_FC_PATCH,
+            })
+            || v12.contains(&PhyInitOp::UsbByteSetBits {
+                addr: USB_BMU_CONFIG,
+                bits: ACT_ODMA,
+            })
+        {
+            return TestResult::Fail("VER_12 flow-control block wrong");
+        }
+        if r8156_init_ops(RtlVersion::Ver12, PortSpeed::Super, true, true).contains(
+            &PhyInitOp::UsbWordSetBits {
+                addr: USB_FW_CTRL,
+                bits: FW_CTRL_FLOW_CTRL_PATCH_2,
+            },
+        ) {
+            return TestResult::Fail("VER_12 patch bit must not apply when DACK is detected");
+        }
+        // Flash wait on VER_13/15/16/17 only; backup-restore
+        // wait on VER_17 only.
+        if !r8156_init_ops(RtlVersion::Ver13, PortSpeed::Super, false, false)
+            .contains(&PhyInitOp::WaitLoadingFlash)
+            || !r8156_init_ops(RtlVersion::Ver16, PortSpeed::Super, false, false)
+                .contains(&PhyInitOp::WaitLoadingFlash)
+            || r8156_init_ops(RtlVersion::Ver11, PortSpeed::Super, false, false)
+                .contains(&PhyInitOp::WaitLoadingFlash)
+            || r8156_init_ops(RtlVersion::Ver12, PortSpeed::Super, false, false)
+                .contains(&PhyInitOp::WaitLoadingFlash)
+        {
+            return TestResult::Fail("flash wait must be VER_13/15/16/17 only");
+        }
+        if !r8156_init_ops(RtlVersion::Ver17, PortSpeed::Super, false, false)
+            .contains(&PhyInitOp::WaitBackupRestore)
+            || r8156_init_ops(RtlVersion::Ver16, PortSpeed::Super, false, false)
+                .contains(&PhyInitOp::WaitBackupRestore)
+        {
+            return TestResult::Fail("backup-restore wait must be VER_17 only");
+        }
+        // VER_16: IP U2P3 clear, BMU clear, 16-byte RX
+        // descriptors, no speed-option write, no MAC_PWR_CTRL3
+        // clear; VER_17 adds the RTL8159-only bit 11.
+        let v16 = r8156_init_ops(RtlVersion::Ver16, PortSpeed::Super, false, false);
+        if !v16.contains(&PhyInitOp::UsbByteSetBits {
+            addr: USB_VER16_BYTE_CFFE,
+            bits: 0x08,
+        }) || !v16.contains(&PhyInitOp::UsbByteClrBits {
+            addr: USB_VER16_BYTE_D3CA,
+            bits: 0x01,
+        }) || v16.contains(&PhyInitOp::UsbWordWrite {
+            addr: USB_SPEED_OPTION,
+            value: 0,
+        }) || !v16.contains(&PhyInitOp::IpClrBits {
+            addr: USB_U2P3_V2_CTRL,
+            clear: U2P3_V2_ENABLE,
+        }) || v16.contains(&PhyInitOp::UsbWordClrBits {
+            addr: USB_U2P3_CTRL,
+            bits: U2P3_ENABLE,
+        }) || !v16.contains(&PhyInitOp::BmuClrBits {
+            addr: 0x2300,
+            clear: 0x0008,
+        }) || !v16.contains(&PhyInitOp::UsbByteClrBits {
+            addr: USB_VER16_BYTE_D4AE,
+            bits: 0x02,
+        }) || !v16.contains(&PhyInitOp::UsbWordClrBits {
+            addr: USB_USB_CTRL,
+            bits: USB_CTRL_RX_AGG_DISABLE | RX_DESC_16B,
+        }) || v16.contains(&PhyInitOp::PlaWordClrBits {
+            addr: PLA_MAC_PWR_CTRL3,
+            bits: PLA_MCU_SPDWN_EN,
+        }) {
+            return TestResult::Fail("VER_16 ADV / descriptor steps wrong");
+        }
+        if !r8156_init_ops(RtlVersion::Ver17, PortSpeed::Super, false, false).contains(
+            &PhyInitOp::UsbWordClrBits {
+                addr: USB_USB_CTRL,
+                bits: USB_CTRL_RX_AGG_DISABLE | RX_DESC_16B | USB_CTRL_8159_BIT11,
+            },
+        ) {
+            return TestResult::Fail("VER_17 RX-agg must clear the RTL8159-only bit too");
+        }
+        if !r8156_init_ops(RtlVersion::Ver03, PortSpeed::Super, false, false).is_empty()
+            || !r8156_init_ops(RtlVersion::Ver14, PortSpeed::Super, false, false).is_empty()
+        {
+            return TestResult::Fail("r8156 builder must stay VER_10/11/12/13/15/16/17 only");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_usb_init_other_families);
+
     fn smoke_r8152_coalesce_for_speed() -> TestResult {
         use crate::xhci::PortSpeed;
         if coalesce_for_speed(PortSpeed::Super) != 85_000
@@ -8677,6 +10000,43 @@ pub mod tests {
     }
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_coalesce_for_speed);
 
+    fn smoke_r8152_rx_aggregation_timers() -> TestResult {
+        use crate::xhci::PortSpeed;
+        // VER_03–VER_06: speed-derived early timeout, no extra
+        // timer. 85000/8 = 10625, 250000/8 = 31250,
+        // 524280/8 = 65535.
+        if rx_aggregation_timers(RtlVersion::Ver03, PortSpeed::Super) != Some((10625, None))
+            || rx_aggregation_timers(RtlVersion::Ver04, PortSpeed::High) != Some((31250, None))
+            || rx_aggregation_timers(RtlVersion::Ver05, PortSpeed::Full) != Some((65535, None))
+        {
+            return TestResult::Fail("VER_03–VER_06 aggregation timers wrong");
+        }
+        // VER_08/09: fixed 128 ns early timeout (16), 15 us
+        // extra timer (1875), independent of speed.
+        if rx_aggregation_timers(RtlVersion::Ver08, PortSpeed::Super) != Some((16, Some(1875)))
+            || rx_aggregation_timers(RtlVersion::Ver09, PortSpeed::High) != Some((16, Some(1875)))
+        {
+            return TestResult::Fail("VER_08/09 aggregation timers wrong");
+        }
+        // VER_10–VER_17: fixed 640 ns early timeout (80),
+        // same extra timer.
+        if rx_aggregation_timers(RtlVersion::Ver10, PortSpeed::Super) != Some((80, Some(1875)))
+            || rx_aggregation_timers(RtlVersion::Ver17, PortSpeed::High) != Some((80, Some(1875)))
+        {
+            return TestResult::Fail("VER_10–VER_17 aggregation timers wrong");
+        }
+        // No ported init layer: no timers programmed.
+        if rx_aggregation_timers(RtlVersion::Ver01, PortSpeed::Super).is_some()
+            || rx_aggregation_timers(RtlVersion::Ver14, PortSpeed::Super).is_some()
+            || rx_aggregation_timers(RtlVersion::Test01, PortSpeed::Super).is_some()
+            || rx_aggregation_timers(RtlVersion::Unknown, PortSpeed::Super).is_some()
+        {
+            return TestResult::Fail("unported versions must program no aggregation timers");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_rx_aggregation_timers);
+
     /// Modelled register file for the PHY-init conversation: PLA
     /// words, OCP PHY registers, SRAM cells (both banks), USB-window
     /// words and MDIO registers as small association lists. The
@@ -8693,7 +10053,9 @@ pub mod tests {
     /// request always succeeds, so `patch_aborted` never sets in
     /// the model (the abort path is a thin flag in the executor).
     /// `efuse_7d` is the preloaded 17-bit efuse value the ADC
-    /// calibration reads.
+    /// calibration reads. `phy_status` is the preloaded PHY
+    /// status the EXT_INIT clear reads. `adv` models the
+    /// BMU/IP advanced-register files (32-bit cells).
     struct ModelRegs {
         pla: Vec<(u16, u16)>,
         ocp: Vec<(u16, u16)>,
@@ -8701,11 +10063,13 @@ pub mod tests {
         sram2: Vec<(u16, u16)>,
         usb: Vec<(u16, u16)>,
         mdio: Vec<(u16, u16)>,
+        adv: Vec<(u16, u32)>,
         sram_ptr: u16,
         sram2_ptr: u16,
         fw_steps: usize,
         patch_aborted: bool,
         efuse_7d: u32,
+        phy_status: u16,
     }
 
     impl ModelRegs {
@@ -8717,11 +10081,13 @@ pub mod tests {
                 sram2: Vec::new(),
                 usb: Vec::new(),
                 mdio: Vec::new(),
+                adv: Vec::new(),
                 sram_ptr: 0,
                 sram2_ptr: 0,
                 fw_steps: 0,
                 patch_aborted: false,
                 efuse_7d: 0,
+                phy_status: 0,
             }
         }
         fn get(map: &[(u16, u16)], addr: u16) -> u16 {
@@ -8731,6 +10097,19 @@ pub mod tests {
                 .unwrap_or(0)
         }
         fn set(map: &mut Vec<(u16, u16)>, addr: u16, value: u16) {
+            if let Some(slot) = map.iter_mut().find(|(a, _)| *a == addr) {
+                slot.1 = value;
+            } else {
+                map.push((addr, value));
+            }
+        }
+        fn get32(map: &[(u16, u32)], addr: u16) -> u32 {
+            map.iter()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        }
+        fn set32(map: &mut Vec<(u16, u32)>, addr: u16, value: u32) {
             if let Some(slot) = map.iter_mut().find(|(a, _)| *a == addr) {
                 slot.1 = value;
             } else {
@@ -8790,6 +10169,16 @@ pub mod tests {
                     Self::set(&mut self.pla, addr, cur & !bits);
                 }
                 PlaWordWrite { addr, value } => Self::set(&mut self.pla, addr, value),
+                PlaDwordW0W1 { addr, clear, set } => {
+                    // Same split as `UsbDwordWrite`: low word
+                    // at `addr`, high word at `addr + 1`.
+                    let lo = Self::get(&self.pla, addr) as u32;
+                    let hi = Self::get(&self.pla, addr + 1) as u32;
+                    let cur = lo | (hi << 16);
+                    let new = (cur & !clear) | set;
+                    Self::set(&mut self.pla, addr, new as u16);
+                    Self::set(&mut self.pla, addr + 1, (new >> 16) as u16);
+                }
                 UsbWordSetBits { addr, bits } => {
                     let cur = Self::get(&self.usb, addr);
                     Self::set(&mut self.usb, addr, cur | bits);
@@ -8934,6 +10323,24 @@ pub mod tests {
                         (swap_b & !0x1F1F) | ((swap_a & 0x001F) << 8) | ((swap_a >> 8) & 0x001F),
                     );
                 }
+                BmuClrBits { addr, clear } => {
+                    let cur = Self::get32(&self.adv, addr);
+                    Self::set32(&mut self.adv, addr, cur & !clear);
+                }
+                IpClrBits { addr, clear } => {
+                    let cur = Self::get32(&self.adv, addr);
+                    Self::set32(&mut self.adv, addr, cur & !clear);
+                }
+                ExtInitClear { clear_a466 } => {
+                    if self.phy_status == PHY_STAT_EXT_INIT {
+                        let cur = Self::get(&self.ocp, 0xA468);
+                        Self::set(&mut self.ocp, 0xA468, cur & !(0x0008 | 0x0002));
+                        if clear_a466 {
+                            let cur = Self::get(&self.ocp, 0xA466);
+                            Self::set(&mut self.ocp, 0xA466, cur & !0x0001);
+                        }
+                    }
+                }
                 UsbByteSetBits { addr, bits } => {
                     let cur = Self::get(&self.usb, addr);
                     let lo = (cur as u8 | bits) as u16;
@@ -8973,7 +10380,7 @@ pub mod tests {
                 }
                 // Polls write nothing and always complete, so the
                 // model treats them as satisfied (as with ALDPS).
-                AutoloadPoll | PhyStatusPollAny | PhyStatusPollLanOn => {}
+                AutoloadPoll | PhyStatusPollAny | PhyStatusPollLanOn | WaitBackupRestore => {}
                 AldpsDisable => {
                     let cur = Self::get(&self.ocp, OCP_POWER_CFG);
                     Self::set(&mut self.ocp, OCP_POWER_CFG, cur & !POWER_CFG_EN_ALDPS);
@@ -9487,6 +10894,233 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_ver17_conversation);
+
+    fn smoke_r8152_usb_init_modelled_conversations() -> TestResult {
+        use crate::xhci::PortSpeed;
+        // VER_01 (RTL8152): MDIO power-down cleared, ALDPS
+        // whole-word disable, LED clear, PHY power, clock-ratio
+        // dword, interrupt mask, tally reset, RX agg on.
+        let mut m = ModelRegs::new();
+        ModelRegs::set(&mut m.mdio, OCP_BASE_MII + MII_BMCR * 2, BMCR_PDOWN);
+        ModelRegs::set(&mut m.pla, PLA_LED_FEATURE, LED_MODE_MASK);
+        ModelRegs::set(&mut m.pla, PLA_MAC_PWR_CTRL, 0xA5A5);
+        ModelRegs::set(&mut m.pla, PLA_MAC_PWR_CTRL + 1, 0xA5A5);
+        ModelRegs::set(
+            &mut m.usb,
+            USB_USB_CTRL,
+            USB_CTRL_RX_AGG_DISABLE | USB_CTRL_RX_ZERO_EN,
+        );
+        for op in r8152b_init_ops(RtlVersion::Ver01) {
+            m.apply(op);
+        }
+        if ModelRegs::get(&m.mdio, OCP_BASE_MII + MII_BMCR * 2) != 0 {
+            return TestResult::Fail("VER_01 must clear BMCR power-down");
+        }
+        if ModelRegs::get(&m.ocp, OCP_ALDPS_CONFIG) != ALDPS_CFG_8152_DISABLE {
+            return TestResult::Fail("VER_01 ALDPS config end state wrong");
+        }
+        if ModelRegs::get(&m.pla, PLA_LED_FEATURE) != 0 {
+            return TestResult::Fail("VER_01 must clear the LED mode");
+        }
+        if ModelRegs::get(&m.pla, PLA_PHY_PWR) != TX_10M_IDLE_EN | PHY_PWR_PFM_PWM_SWITCH {
+            return TestResult::Fail("VER_01 PLA_PHY_PWR end state wrong");
+        }
+        // 0xA5A5A5A5 cleared by 0x0F0F0F0F then set 0x07014F07
+        // = 0xA7A1EFA7 (low 0xEFA7, high 0xA7A1).
+        if ModelRegs::get(&m.pla, PLA_MAC_PWR_CTRL) != 0xEFA7
+            || ModelRegs::get(&m.pla, PLA_MAC_PWR_CTRL + 1) != 0xA7A1
+        {
+            return TestResult::Fail("VER_01 MAC clock-ratio end state wrong");
+        }
+        if ModelRegs::get(&m.pla, PLA_GPHY_INTR_IMR) != 0x000F {
+            return TestResult::Fail("VER_01 GPHY interrupt mask wrong");
+        }
+        if ModelRegs::get(&m.pla, PLA_RSTTALLY) != TALLY_RESET
+            || ModelRegs::get(&m.usb, USB_USB_CTRL) != 0
+        {
+            return TestResult::Fail("VER_01 tally / RX-agg end state wrong");
+        }
+        // VER_02 from the same preload: LED mode survives.
+        let mut m2 = ModelRegs::new();
+        ModelRegs::set(&mut m2.pla, PLA_LED_FEATURE, LED_MODE_MASK);
+        for op in r8152b_init_ops(RtlVersion::Ver02) {
+            m2.apply(op);
+        }
+        if ModelRegs::get(&m2.pla, PLA_LED_FEATURE) != LED_MODE_MASK {
+            return TestResult::Fail("VER_02 must not clear the LED mode");
+        }
+        // VER_09 (RTL8153B), SuperSpeed, link up, Test-IO bit
+        // set: LPM back on, Test-IO off, MAC clock speed-down,
+        // MCU speed-down cleared, link bits set, power-cut word
+        // cleared then byte-cleared in order (0xFFFF -> 0xFFFE
+        // -> 0xFFCE).
+        let mut m9 = ModelRegs::new();
+        ModelRegs::set(&mut m9.pla, PLA_MAC_PWR_CTRL3, 0xFFFF);
+        ModelRegs::set(&mut m9.usb, USB_POWER_CUT, 0xFFFF);
+        for op in r8153b_init_ops(RtlVersion::Ver09, PortSpeed::Super, true, true) {
+            m9.apply(op);
+        }
+        if ModelRegs::get(&m9.usb, USB_LPM_CONFIG) != LPM_U1U2_EN {
+            return TestResult::Fail("VER_09 must re-enable U1/U2 at SuperSpeed");
+        }
+        if ModelRegs::get(&m9.pla, PLA_PHY_PWR) != TEST_IO_OFF {
+            return TestResult::Fail("VER_09 must set Test-IO-off");
+        }
+        if ModelRegs::get(&m9.pla, PLA_MAC_PWR_CTRL2) != MAC_CLK_SPDWN_EN
+            || ModelRegs::get(&m9.pla, PLA_MAC_PWR_CTRL3) != 0xBFFF
+        {
+            return TestResult::Fail("VER_09 MAC clock end state wrong");
+        }
+        if ModelRegs::get(&m9.usb, USB_MSC_TIMER) != MSC_TIMER_8153B {
+            return TestResult::Fail("VER_09 MSC timer wrong");
+        }
+        if ModelRegs::get(&m9.usb, USB_POWER_CUT) != 0xFFCE {
+            return TestResult::Fail("VER_09 power-cut end state wrong");
+        }
+        if ModelRegs::get(&m9.pla, PLA_EXTRA_STATUS)
+            != EXTRA_STATUS_CUR_LINK_OK | EXTRA_STATUS_POLL_LINK_CHG
+            || ModelRegs::get(&m9.pla, PLA_RSTTALLY) != TALLY_RESET
+        {
+            return TestResult::Fail("VER_09 link / tally end state wrong");
+        }
+        // VER_09, HighSpeed, link down, Test-IO bit clear: no
+        // U1/U2 re-enable, no Test-IO-off, link bit clear.
+        let mut m9b = ModelRegs::new();
+        for op in r8153b_init_ops(RtlVersion::Ver09, PortSpeed::High, false, false) {
+            m9b.apply(op);
+        }
+        if ModelRegs::get(&m9b.usb, USB_LPM_CONFIG) != 0
+            || ModelRegs::get(&m9b.pla, PLA_PHY_PWR) != 0
+            || ModelRegs::get(&m9b.pla, PLA_EXTRA_STATUS) != EXTRA_STATUS_POLL_LINK_CHG
+        {
+            return TestResult::Fail("VER_09 HighSpeed / link-down end state wrong");
+        }
+        // VER_10 (RTL8156), SuperSpeed, link down, PHY status
+        // EXT_INIT: speed option 0, ECM bypass, timers, clock
+        // ratios, EXT_INIT clears (0xa468 only — VER_10 does
+        // not clear 0xa466), RX agg on, BMU ODMA.
+        let mut m10 = ModelRegs::new();
+        m10.phy_status = PHY_STAT_EXT_INIT;
+        ModelRegs::set(
+            &mut m10.usb,
+            USB_USB_CTRL,
+            USB_CTRL_RX_AGG_DISABLE | USB_CTRL_RX_ZERO_EN,
+        );
+        ModelRegs::set(&mut m10.usb, USB_ECM_OP, EN_ALL_SPEED as u16);
+        ModelRegs::set(&mut m10.usb, USB_U2P3_CTRL, U2P3_ENABLE);
+        ModelRegs::set(&mut m10.pla, PLA_MAC_PWR_CTRL2, 0xFFFF);
+        ModelRegs::set(&mut m10.pla, PLA_MAC_PWR_CTRL3, 0xFFFF);
+        ModelRegs::set(&mut m10.ocp, 0xA468, 0xFFFF);
+        ModelRegs::set(&mut m10.ocp, 0xA466, 0xFFFF);
+        for op in r8156_init_ops(RtlVersion::Ver10, PortSpeed::Super, false, false) {
+            m10.apply(op);
+        }
+        if ModelRegs::get(&m10.usb, USB_SPEED_OPTION) != 0
+            || ModelRegs::get(&m10.usb, USB_ECM_OPTION) != BYPASS_MAC_RESET
+            || ModelRegs::get(&m10.usb, USB_ECM_OP) != 0
+            || ModelRegs::get(&m10.usb, USB_MSC_TIMER) != MSC_TIMER_8153B
+            || ModelRegs::get(&m10.usb, USB_U1U2_TIMER) != U1U2_TIMER_500US
+        {
+            return TestResult::Fail("VER_10 ECM / timer end state wrong");
+        }
+        if ModelRegs::get(&m10.pla, PLA_MAC_PWR_CTRL) != 0x0403
+            || ModelRegs::get(&m10.pla, PLA_MAC_PWR_CTRL2) != 0xFF03
+            || ModelRegs::get(&m10.pla, PLA_MAC_PWR_CTRL3) != 0xBFFF
+        {
+            return TestResult::Fail("VER_10 MAC clock end state wrong");
+        }
+        if ModelRegs::get(&m10.ocp, 0xA468) != 0xFFF5 || ModelRegs::get(&m10.ocp, 0xA466) != 0xFFFF
+        {
+            return TestResult::Fail("VER_10 EXT_INIT clear must skip 0xa466");
+        }
+        if ModelRegs::get(&m10.usb, USB_USB_CTRL) != 0
+            || ModelRegs::get(&m10.usb, USB_BMU_CONFIG) != ACT_ODMA as u16
+            || ModelRegs::get(&m10.usb, USB_LPM_CONFIG) != LPM_U1U2_EN
+            || ModelRegs::get(&m10.pla, PLA_EXTRA_STATUS) != EXTRA_STATUS_POLL_LINK_CHG
+            || ModelRegs::get(&m10.pla, PLA_RSTTALLY) != TALLY_RESET
+            || ModelRegs::get(&m10.usb, USB_U2P3_CTRL) != 0
+        {
+            return TestResult::Fail("VER_10 tail end state wrong");
+        }
+        // Same run with LAN_ON status: no EXT_INIT clears.
+        let mut m10b = ModelRegs::new();
+        m10b.phy_status = PHY_STAT_LAN_ON;
+        ModelRegs::set(&mut m10b.ocp, 0xA468, 0xFFFF);
+        for op in r8156_init_ops(RtlVersion::Ver10, PortSpeed::Super, false, false) {
+            m10b.apply(op);
+        }
+        if ModelRegs::get(&m10b.ocp, 0xA468) != 0xFFFF {
+            return TestResult::Fail("EXT_INIT clear must not run without EXT_INIT status");
+        }
+        // VER_12 (RTL8156B), link up, no DACK: flow-control
+        // block on, patch bit set, auto-speedup off, U2P3 keeps
+        // RX_DETECT8 after the U2P3 disable.
+        let mut m12 = ModelRegs::new();
+        ModelRegs::set(&mut m12.usb, USB_FW_CTRL, AUTO_SPEEDUP);
+        ModelRegs::set(&mut m12.pla, PLA_RCR, SLOT_EN);
+        for op in r8156_init_ops(RtlVersion::Ver12, PortSpeed::Super, true, false) {
+            m12.apply(op);
+        }
+        if ModelRegs::get(&m12.usb, USB_FW_CTRL) != FW_CTRL_FLOW_CTRL_PATCH_2
+            || ModelRegs::get(&m12.usb, USB_FW_TASK) != FW_TASK_FC_PATCH
+            || ModelRegs::get(&m12.pla, PLA_RCR) != 0
+            || ModelRegs::get(&m12.pla, PLA_CPCR) != FLOW_CTRL_EN
+            || ModelRegs::get(&m12.usb, USB_FC_TIMER) != FC_TIMER_600MS
+            || ModelRegs::get(&m12.usb, USB_U2P3_CTRL) != RX_DETECT8
+        {
+            return TestResult::Fail("VER_12 flow-control end state wrong");
+        }
+        // Same run with DACK detected: patch bit stays clear.
+        let mut m12b = ModelRegs::new();
+        ModelRegs::set(&mut m12b.usb, USB_FW_CTRL, AUTO_SPEEDUP);
+        for op in r8156_init_ops(RtlVersion::Ver12, PortSpeed::Super, true, true) {
+            m12b.apply(op);
+        }
+        if ModelRegs::get(&m12b.usb, USB_FW_CTRL) != 0 {
+            return TestResult::Fail("VER_12 patch bit must stay clear with DACK detected");
+        }
+        // VER_16 (RTL8157): literal-byte steps, IP U2P3 clear,
+        // 16-byte RX descriptors, BMU clear, TX-signature
+        // clear, MDIO force mode, no speed-option write, no
+        // MAC_PWR_CTRL3 clear.
+        let mut m16 = ModelRegs::new();
+        ModelRegs::set32(&mut m16.adv, USB_U2P3_V2_CTRL, 0xFFFF_FFFF);
+        ModelRegs::set32(&mut m16.adv, 0x2300, 0xFFFF_FFFF);
+        ModelRegs::set(&mut m16.usb, USB_VER16_BYTE_D3CA, 0x0001);
+        ModelRegs::set(&mut m16.usb, USB_VER16_BYTE_D4AE, 0x0002);
+        ModelRegs::set(&mut m16.ocp, OCP_MDIO_FORCE_MODE, MDIO_FORCE_MODE_MMD);
+        ModelRegs::set(&mut m16.pla, PLA_MAC_PWR_CTRL3, 0xFFFF);
+        ModelRegs::set(&mut m16.usb, USB_USB_CTRL, 0xFFFF);
+        for op in r8156_init_ops(RtlVersion::Ver16, PortSpeed::Super, false, false) {
+            m16.apply(op);
+        }
+        if ModelRegs::get(&m16.usb, USB_VER16_BYTE_CFFE) != 0x0008
+            || ModelRegs::get(&m16.usb, USB_VER16_BYTE_D3CA) != 0x0000
+            || ModelRegs::get(&m16.usb, USB_SPEED_OPTION) != 0
+            || ModelRegs::get32(&m16.adv, USB_U2P3_V2_CTRL) != 0xDFFF_FFFF
+            || ModelRegs::get(&m16.usb, USB_USB_CTRL) != 0xFBEF
+            || ModelRegs::get32(&m16.adv, 0x2300) != 0xFFFF_FFF7
+            || ModelRegs::get(&m16.usb, USB_VER16_BYTE_D4AE) != 0x0000
+            || ModelRegs::get(&m16.ocp, OCP_MDIO_FORCE_MODE) != 0x0000
+            || ModelRegs::get(&m16.pla, PLA_MAC_PWR_CTRL3) != 0xFFFF
+        {
+            return TestResult::Fail("VER_16 ADV / descriptor end state wrong");
+        }
+        // VER_17: same RX-agg clear plus the RTL8159-only bit.
+        let mut m17 = ModelRegs::new();
+        ModelRegs::set(&mut m17.usb, USB_USB_CTRL, 0xFFFF);
+        for op in r8156_init_ops(RtlVersion::Ver17, PortSpeed::Super, false, false) {
+            m17.apply(op);
+        }
+        if ModelRegs::get(&m17.usb, USB_USB_CTRL) != 0xF3EF {
+            return TestResult::Fail("VER_17 RX-agg end state wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/r8152",
+        smoke_r8152_usb_init_modelled_conversations
+    );
 
     /// Minimal firmware-image builder for the `check_firmware`
     /// tests. Images are built from the Linux struct layouts
