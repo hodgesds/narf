@@ -3848,7 +3848,7 @@ a late poll that finds the condition met progresses instead of timing out.
 | Native gamma activation/bypass | 1024-entry Pipe-A LUT, owned copies/blobs, safe inactive preload, preserved flips and later-frame restoration | Implemented; native fixtures pass |
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
-| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20). Swap, lazy-free and compaction now refuse pinned pages, and VRAM CPU mappings are revoked and refaulted across runtime suspend (§20); i915 GEM_USERPTR (`i915_gem_userptr_ioctl`) and the Xe LR_MODE/FAULT_MODE VM flags with PREFETCH are admitted ("Completion of Intel iGPU and Discrete Arc Support"); CPU-address-mirror VMs are admitted on USM devices behind `narf.intel.svm=1`, populated by PREFETCH and by the fault service, zapped by CPU invalidations and refaulted at EXEC (§20, native fixtures added); routing hardware GPU faults to that service (ASIDs, the GuC G2H fault path) and VRAM migration remain |
+| VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/ interval notifiers landed (non-blocking callbacks fired by every translation change, pins bound device access) and Xe MAP_USERPTR re-collects, rebuilds or drops invalidated bindings at EXEC with native fixtures added (§20). Swap, lazy-free and compaction now refuse pinned pages, and VRAM CPU mappings are revoked and refaulted across runtime suspend (§20); i915 GEM_USERPTR (`i915_gem_userptr_ioctl`) and the Xe LR_MODE/FAULT_MODE VM flags with PREFETCH are admitted ("Completion of Intel iGPU and Discrete Arc Support"); CPU-address-mirror VMs are admitted on USM devices behind `narf.intel.svm=1`, populated by PREFETCH and by the fault service, zapped by CPU invalidations and refaulted at EXEC (§20, native fixtures added); with the option VMs take ASIDs (CTX_ASID in every job's LRC), the GuC's REPORT_PAGE_FAULT_REQ_DESC is queued to a device fault service that collects through the creator's grabbed address space, the GT owner rebinds the running jobs' tables, invalidates the PPGTT range by ASID and then answers PAGE_FAULT_RES_DESC, and DRM_IOCTL_XE_MADVISE sets mirror attributes and buffer-VMA PAT indices (native fixtures). Open: UM queues in the ADS (DMA-contiguous memory), so no firmware fault is delivered yet; VRAM migration (no drm_pagemap without ZONE_DEVICE); PURGEABLE_STATE madvise; a silicon run |
 | Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations | Open; DG2/BMG evict VRAM to system memory (flat-CCS saved) and migrate it back, evict under OOM at GEM_CREATE, re-migrate at exec and drain for suspend ("Completion of Intel iGPU and Discrete Arc Support"); CPU mappings of the BAR window are revoked while runtime-suspended and refault through resume (§20); DG1 publishes VRAM below `GSMBASE` (§5); cross-device VRAM PRIME runs with static attachments, and peer-to-peer behind `narf.intel.prime_p2p=1` (§19), unvalidated on hardware. Dynamic (move-notify) importers, in-place suspend of a pinned VRAM export, import mmap through the exporter and integrated-display scanout of an import are implemented with native fixtures (§19), and a CPU-mapped VRAM export migrates with its mappings behind `narf.intel.prime_mmap_migrate=1` (§19; DG2 Flat-CCS exports stay in VRAM); alias revocation and nonvisible allocation beyond the BMG headless profile remain |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
@@ -7971,8 +7971,7 @@ code is `intel_gpu_xe_svm.rs` (`intel_gpu_xe_vm::svm`).
   `CPU_ADDR_MIRROR` and `MADVISE_AUTORESET` stay EINVAL. A mirror is a MAP
   with no object and no `cpu_addr_mirror_offset`, with a coherent PAT on an
   iGPU. NARF also refuses compressed PAT indices and NULL on a mirror, which
-  Linux admits. AUTORESET is admitted and has nothing to reset (there is no
-  `DRM_IOCTL_XE_MADVISE`).
+  Linux admits.
 - **VMAs and ranges.** A mirror MAP reserves a VMA, absorbing adjacent mirror
   VMAs, and maps nothing. A VMA change that removes part of a mirror still
   holding an SVM range is EBUSY; ranges a CPU unmap removed are
@@ -7981,14 +7980,49 @@ code is `intel_gpu_xe_svm.rs` (`intel_gpu_xe_vm::svm`).
   maps (checked by collecting them: drivers have no CPU VMA lookup). Each has
   its own memory/ interval notifier, and its pages are pinned inside
   `read_begin`/`read_retry` (`drm_gpusvm_get_pages`).
-- **Faults.** NARF's GPU takes no recoverable fault: each job runs on private
-  tables built at EXEC, and contexts carry no ASID. `svm::guc` decodes the
-  GuC `REPORT_PAGE_FAULT_REQ_DESC` payload and encodes the
-  `PAGE_FAULT_RES_DESC` reply; `XeFile::service_page_fault` services a fault
-  (`xe_pagefault_service`, `__xe_svm_handle_pagefault`) from the creator's
-  context only (ENOSYS from another process). Nothing routes a hardware fault
-  there yet. PREFETCH over a mirror populates its chunks and skips CPU holes,
-  at most 512 MiB of mirror per PREFETCH.
+- **ASIDs.** With the option on a USM device the backend publishes `xe->usm`
+  (`UserBackend::usm`, `intel_gpu_xe_usm`). Every VM_CREATE takes an ASID
+  (`xa_alloc_cyclic` over `[1, XE_MAX_ASID - 1]`, EBUSY when full);
+  VM_DESTROY or the VM's drop erases it (`xe_vm_close_and_put`). EXEC tags
+  the job (`ResidentBatch::set_fault_vm`) and the GuC scheduler writes
+  `CTX_ASID` (dword 0x2e + 1, two before PDP0 in parallel lanes).
+- **Faults.** The primary GuC's scheduler decodes
+  `REPORT_PAGE_FAULT_REQ_DESC` (`xe_guc_pagefault_handler`; a malformed one
+  or a full queue loses the GT, as Linux's CT dies) into a queue sized by
+  `xe_pagefault_queue_init` from the GT's EU count. One service task
+  (`xe_pagefault_queue_work`, including its last-range cache) looks the VM up
+  by ASID and services it under the VM state (`xe_pagefault_service`,
+  `__xe_svm_handle_pagefault`), collecting through the creator's address
+  space grabbed at VM_CREATE (`IoctlContext::remote_mm`, `gpusvm->mm`). The GT
+  owner then writes the range or the whole buffer VMA into the tables of every
+  job it holds for that ASID (`ResidentBatch::fault_map` over
+  `Ppgtt::rebind`, which never frees a table the walker may cache; the job
+  retains the pages until it retires; 512 MiB budget), sends one
+  page-selective `send_tlb_inval_ppgtt` for the ASID and, after its DONE,
+  `PAGE_FAULT_RES_DESC` (`guc_ack_fault`; each ack rings the doorbell, where
+  Linux flushes once per 16). A failed or no-op service answers at once. A
+  fault-mode VM's bind no longer waits for its jobs (they keep their tables,
+  and their faults need the VM state). `XeFile::service_page_fault` runs the
+  same service from the creator's syscall. **No firmware fault arrives yet:**
+  the GuC reports recoverable faults only through the ADS UM queues
+  (`guc_um_init_params`), 192 KiB of DMA-contiguous memory that NARF's GuC
+  arena cannot provide, so the ADS has no `um_init_data`. PREFETCH over a
+  mirror populates its chunks and skips CPU holes, at most 512 MiB of mirror
+  per PREFETCH.
+- **madvise.** `DRM_IOCTL_XE_MADVISE` exists while GPUSVM is published
+  (EINVAL otherwise). `madvise_args_are_sane` is followed per type; the VMAs
+  split at the range's edges; mirror VMAs keep preferred location, atomic
+  access and PAT (`xe_vma_mem_attr`), buffer, USERPTR and NULL VMAs take the
+  PAT, and atomic advice is checked against a buffer's placements
+  (`check_bo_args_are_sane`) but not stored. Changed mirror parts are zapped
+  (their ranges refault under the new attributes); only default-attribute
+  mirror VMAs merge, and `MADVISE_AUTORESET` returns a CPU-unmapped range's
+  part to default attributes (`xe_svm_range_set_default_attr`). A preferred
+  device fd is ENOENT (`xe_drm_pagemap_from_fd` without
+  `CONFIG_DRM_XE_PAGEMAP`), an atomic fault under `DRM_XE_ATOMIC_CPU` on a
+  dGPU EACCES. NARF refuses `DRM_XE_VMA_ATTR_PURGEABLE_STATE` (EOPNOTSUPP: no
+  purgeable objects) and compressed PAT indices, and sets no
+  `XE_USM_PPGTT_PTE_AE`, so atomic advice changes nothing else.
 - **Invalidation.** Callbacks do not block. An invalidated range is left out
   of every job built afterwards, and EXEC refaults it from the creator's
   context, leaving it unmapped if that fails. An UNMAP also
@@ -7997,16 +8031,29 @@ code is `intel_gpu_xe_svm.rs` (`intel_gpu_xe_vm::svm`).
   against the job tables' 4096 entries and 512 MiB (ENOMEM).
 - **No device memory.** NARF behaves as Linux built without
   `CONFIG_DRM_XE_PAGEMAP`: `svm::Pagemap` is uninhabited, so ranges stay in
-  system memory on Battlemage too, including for a PREFETCH to VRAM.
+  system memory on Battlemage too, including for a PREFETCH to VRAM, an
+  atomic fault and preferred-location advice. Migration stops there by
+  design: `drm_pagemap_migrate_to_devmem` and its eviction
+  (`drm_pagemap_evict_to_ram`, `migrate_to_ram`) move anonymous pages to
+  `MEMORY_DEVICE_PRIVATE` pages through `migrate_vma_setup`/`_pages`, and a
+  CPU access to such a page faults through a device-private swap entry.
+  NARF memory/ has neither ZONE_DEVICE pages nor those entries, which is
+  more than a small driver-facing API.
 
 Fixtures: `drivers/gpu/intel_gpu_xe`:
 `smoke_xe_svm_option_off_refusal_and_mirror_bind_admission`,
 `smoke_xe_svm_mirror_vma_merge_carve_and_cover`,
-`smoke_xe_svm_guc_fault_descriptor_and_reply`; `drivers/gpu/intel_gpu_user`:
-`smoke_xe_svm_gpu_fault_populates_zaps_and_refaults` (Lunar Lake GT model).
-Not done: hardware fault delivery (ASIDs in the LRC, the G2H 0x6002 route,
-in-place PTE updates of a running job and TLB invalidation), VRAM migration,
-madvise, and a silicon run.
+`smoke_xe_svm_guc_fault_descriptor_and_reply`,
+`smoke_xe_usm_asids_fault_queue_and_ppgtt_invalidation`,
+`smoke_xe_madvise_args_split_zap_and_autoreset`,
+`smoke_xe_madvise_option_off_and_battlemage_system_pages`;
+`drivers/gpu/intel_gpu_user`:
+`smoke_xe_svm_gpu_fault_populates_zaps_and_refaults` and
+`smoke_xe_svm_guc_fault_rebinds_running_job_and_acks` (Lunar Lake GT model).
+Not done: the ADS UM queues (so firmware delivers no fault), faults from the
+standalone media GT, zapping running jobs' PTEs on a CPU invalidation (they
+keep their pins, as for USERPTR), VRAM migration, PURGEABLE_STATE, and a
+silicon run.
 
 ### Pinned USERPTR pages survive reclaim — native fixtures added
 

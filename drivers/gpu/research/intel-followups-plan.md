@@ -134,8 +134,12 @@ work had.
   mapped DG2 export's move (its Flat-CCS needs the GPU copy the alias
   freeze cannot await), and validation of the P2P, suspend and migration
   paths on hardware.
-- CPU-address-mirror VMs behind `narf.intel.svm=1`: routing hardware GPU
-  faults to the fault service (ASIDs, the GuC G2H 0x6002 path, updating a
-  running job's tables), VRAM migration (`drm_pagemap`) on Battlemage,
-  madvise, and a silicon run.
+- CPU-address-mirror VMs behind `narf.intel.svm=1`: ASIDs, the GuC
+  page-fault route (service through the grabbed address space, rebind of the
+  running jobs, page-selective PPGTT invalidation, ack) and
+  `DRM_IOCTL_XE_MADVISE` have native fixtures. Open: the ADS UM queues
+  (`guc_um_init_params` needs 192 KiB of DMA-contiguous memory the GuC arena
+  lacks), so firmware delivers no fault yet; media-GT faults; VRAM migration
+  (refused: `drm_pagemap` needs ZONE_DEVICE pages); PURGEABLE_STATE madvise
+  (EOPNOTSUPP); and a silicon run.
 - D3cold through `_PR3` power resources (NARF evaluates no AML).
