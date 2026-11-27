@@ -43,7 +43,7 @@ Boot options, each strict and default off:
 | `narf.intel.gen9_dpll=1` | Gen9 DPLL1-3 arbitration and sharing between external outputs |
 | `narf.intel.rkl_edp=1` | The Rocket Lake internal panel on the owned eDP route, with PSR1 and the KMS presenter |
 | `narf.intel.dg1_kms=1` | The DG1 KMS owner over its firmware-lit Pipe A, with a VRAM presenter |
-| `narf.intel.hdmi14_ext=1` | Display 14+ external deep colour, YCbCr 4:4:4 into a DP PCON, and HDMI/DP audio with its component |
+| `narf.intel.hdmi14_ext=1` | Display 14+ external deep colour (through a branch and over UHBR SST too), YCbCr 4:4:4 into a DP PCON, DP YCbCr 4:2:0, and HDMI/DP audio (DP MST streams included) with its component |
 | `narf.intel.svm=1` | Xe CPU-address-mirror VMs on fault-mode VMs of USM devices (LNL, PTL/WCL, NVL-S, BMG) |
 
 ## Still open
@@ -65,18 +65,23 @@ work had.
   component (`narf.intel.hdmi14_ext=1`), a second concurrent external
   route (`narf.intel.ext_routes=2`), Panel Replay on the display-20/30 eDP
   (`narf.intel.panel_replay=1`) and compressed scanout (`narf.intel.ccs=1`)
-  have native fixtures only. Still open: their silicon runs, the HDA probe
-  deferral when the display binds after the HDA controller, deep colour
-  through a branch, UHBR, MST or DSC, MST audio, DP YCbCr 4:2:0, Panel
-  Replay on the external routes (their console scanout has no frontbuffer
-  tracking to exit replay) and with the AS SDP, and region early
-  transport. MST and UHBR beside a second route and panned compressed
-  views have native fixtures; open there are two 128b/132b routes in one
-  DP tunnel BW group that Linux resolves by reducing a lit route's bpp
+  have native fixtures only, as do (under `narf.intel.hdmi14_ext=1`) the
+  HDA probe deferral until the display binds its component, deep colour
+  through a branch and over UHBR SST, DP YCbCr 4:2:0 and DP MST audio (MST
+  stays at 8 bpc, as Linux limits it), and (under `narf.intel.ext_routes=2`)
+  MST and UHBR beside a second route; panned compressed views have native
+  fixtures too. Still open: their silicon runs, a 10 or 12 bpc DSC input
+  (Linux's 10/12 bpc QP tables; NARF compresses from 8 bpc), a PCM per MST
+  stream on one pin (the HDA codec's `dyn_pcm_assign`), DP YCbCr 4:2:0 over
+  UHBR or native 4:2:0 DSC, Panel Replay on the external routes (their
+  console scanout has no frontbuffer tracking to exit replay) and with the
+  AS SDP, region early transport, two 128b/132b routes in one DP tunnel BW
+  group that Linux resolves by reducing a lit route's bpp
   (`intel_link_bw_reduce_bpp`, refused typed) or that compress, and a
-  tunnelled MST route in that group check (it covers SST tunnels). Native
-  HDMI FRL stays refused: Linux 7.4 has no source FRL link training (its
-  rate and PHY facts are carried).
+  tunnelled MST route in one such group with the other route (refused
+  typed: the group check covers one SST stream per route). Native HDMI FRL
+  stays refused: Linux 7.4 has no source FRL link training (its rate and
+  PHY facts are carried).
 - DP 2.0 UHBR beyond the 128b/132b SST route behind `narf.intel.uhbr=1`
   (UHBR10/20 on C20 and LT ports, over display-30 Thunderbolt with DP
   tunnel BW allocation, through non-transparent LTTPRs, with the
