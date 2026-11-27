@@ -1148,3 +1148,42 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dc_states",
     smoke_dc_states_runtime_d3hot_keeps_program_and_reverifies_on_resume
 );
+
+/// DC3CO below display 35 (Linux 7.4-rc4): `HAS_DC3CO` is display 35+, so
+/// `intel_display_power_dc3co_supported` is false on display 14 (whose
+/// `get_allowed_dc_mask` still carries DC3CO at `max_dc` 4) and on display
+/// 20/30 (`max_dc` 2: DC6 alone), and no trigger changes that: even an eDP
+/// alone on Pipe A with PSR2, replay with the AS SDP and LOBF is refused
+/// for its source. Display 35 answers with its trigger and CMTG refusals.
+fn smoke_dc3co_has_no_source_below_display_35() -> TestResult {
+    let triggered = Dc3coState {
+        lobf: true,
+        panel_replay_as_sdp: true,
+        sel_update: true,
+        ..Dc3coState::OWNED_NOVA_PANEL
+    };
+    for ver in [14, 20, 30] {
+        if has_dc3co(ver) || dc3co_refusal(ver, &triggered) != Dc3coRefusal::SourceUnsupported {
+            return TestResult::Fail("display 14-30 have no DC3CO source");
+        }
+    }
+    if !has_dc3co(35)
+        || dc3co_refusal(35, &triggered) != Dc3coRefusal::CmtgUnowned
+        || dc3co_refusal(35, &Dc3coState::OWNED_NOVA_PANEL) != Dc3coRefusal::NoTrigger
+    {
+        return TestResult::Fail("display 35 must answer with its trigger and the CMTG");
+    }
+    // The targets stay DC6 (field value 2 of the DC5/DC6 mask): no DC3CO
+    // bit (display 14-30) and not the display-35 DC3CO value 3.
+    if XELPDP_ALLOWED_DC_MASK & DC_STATE_EN_DC3CO != 0
+        || XE2LPD_ALLOWED_DC_MASK & DC_STATE_EN_DC3CO != 0
+        || XE3PLPD_ALLOWED_DC_MASK & DC_STATE_EN_UPTO_DC5_DC6_MASK != DC_STATE_EN_UPTO_DC6
+    {
+        return TestResult::Fail("no service may target DC3CO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dc_states",
+    smoke_dc3co_has_no_source_below_display_35
+);
