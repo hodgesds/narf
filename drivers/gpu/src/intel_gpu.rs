@@ -2002,9 +2002,30 @@ pub(crate) fn relight_display_locked(
     Some(scanout)
 }
 
+/// Whether this driver binds the display-14+ audio component for the
+/// display function `vendor:device` (`narf.intel.hdmi14_ext=1` on a
+/// generation whose probe binds it): the HDA probe of a controller beside
+/// such a display waits for the bind, as `snd_hdac_i915_init` defers.
+fn audio_component_provided(vendor: u16, device: u16) -> bool {
+    audio_component_provided_for(
+        crate::intel_gpu_xelpg_external::color::opted_in(),
+        vendor,
+        device,
+    )
+}
+
+/// [`audio_component_provided`] with an explicit option decision.
+pub(crate) fn audio_component_provided_for(opted_in: bool, vendor: u16, device: u16) -> bool {
+    opted_in
+        && chip_info_for_pci_id(vendor, device).is_some_and(|chip| {
+            crate::intel_gpu_xelpg_hpd::hpd_generation_supported(chip.generation)
+        })
+}
+
 /// Register one exact-match PCI driver per row of the canonical
 /// device table, plus the class-match backstop.
 pub fn register_pci_driver() {
+    narf_drivers_sound::display_audio::register_display_audio_provider(audio_component_provided);
     for (name, device) in ids::pci_matches() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name,

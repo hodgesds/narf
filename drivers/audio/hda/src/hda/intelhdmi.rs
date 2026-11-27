@@ -30,6 +30,7 @@ use super::*;
 use crate::hda_codec::{self, AudioPath, Codec, IntelHdmiModel, WidgetType};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use narf_bus::BusDevice;
 use narf_drivers_sound::display_audio::{self as acomp, DisplayAudioCodec, DisplayAudioComponent};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -135,6 +136,123 @@ pub(super) fn intel_port2pin(model: IntelHdmiModel, codec_id: u32, port: i32) ->
 /// registered one.
 fn component() -> Option<&'static (dyn DisplayAudioComponent + Sync)> {
     acomp::display_audio_component()
+}
+
+// ── snd_hdac_i915_init (sound/hda/core/i915.c) ───────────────────────
+
+/// Whether Linux binds the controller `vendor:device` with the graphics
+/// driver (`AZX_DCAPS_I915_COMPONENT` in its `azx_ids[]` entry): every
+/// Intel controller this driver claims but the ICH6/7/9 parts
+/// (`AZX_DCAPS_INTEL_ICH`).
+pub(super) fn i915_component(vendor: u16, device: u16) -> bool {
+    use crate::ids::{HDA_INTEL_ICH6_DEVICE, HDA_INTEL_ICH7_DEVICE, HDA_INTEL_ICH9_DEVICE};
+    vendor == 0x8086
+        && !matches!(
+            device,
+            HDA_INTEL_ICH6_DEVICE | HDA_INTEL_ICH7_DEVICE | HDA_INTEL_ICH9_DEVICE
+        )
+}
+
+/// `i915_gfx_present`'s denylist: the Cannon Lake and Lakefield displays
+/// (no i915 support).
+const I915_DENYLIST: [u16; 15] = [
+    0x5a40, 0x5a41, 0x5a42, 0x5a44, 0x5a49, 0x5a4a, 0x5a4c, 0x5a50, 0x5a51, 0x5a52, 0x5a54, 0x5a59,
+    0x5a5a, 0x5a5c, 0x9840,
+];
+
+/// The PCI bus `device` sits on, as `(segment, bus)`.
+fn pci_bus(device: &BusDevice) -> Option<(u16, u8)> {
+    match device.kind {
+        narf_bus::BusKind::Pcie { addr, .. } => Some((addr.segment, addr.bus)),
+        _ => None,
+    }
+}
+
+/// `connectivity_check`: the two functions share a bus, a parent bus (two
+/// root buses count: "may be NULL!") or, for a discrete GPU's embedded
+/// HD-audio, the parent's parent. `upstream` is `pci_upstream_bridge`.
+pub(super) fn connectivity_check(
+    display: &BusDevice,
+    hdac: &BusDevice,
+    upstream: &dyn Fn(&BusDevice) -> Option<BusDevice>,
+) -> bool {
+    let (Some(a), Some(b)) = (pci_bus(display), pci_bus(hdac)) else {
+        return false;
+    };
+    if a == b {
+        return true;
+    }
+    let (ua, ub) = (upstream(display), upstream(hdac));
+    if ua.and_then(|d| pci_bus(&d)) == ub.and_then(|d| pci_bus(&d)) {
+        return true;
+    }
+    let (Some(ua), Some(ub)) = (ua, ub) else {
+        return false;
+    };
+    let ga = upstream(&ua).and_then(|d| pci_bus(&d));
+    ga.is_some() && ga == upstream(&ub).and_then(|d| pci_bus(&d))
+}
+
+/// `i915_gfx_present` for the controller `hdac` among `devices`: an Intel
+/// display-class function (`pci_is_display`) off the denylist that
+/// `connectivity_check` reaches and, NARF's stand-in for the driver core
+/// knowing the graphics driver will bind, that the registered display
+/// driver binds an audio component for ([`acomp::display_audio_provided`]).
+/// `gpu_bind` and `nomodeset` are not modelled (NARF has neither).
+pub(super) fn i915_gfx_present(
+    hdac: &BusDevice,
+    devices: &[BusDevice],
+    upstream: &dyn Fn(&BusDevice) -> Option<BusDevice>,
+) -> bool {
+    devices.iter().any(|d| {
+        d.id.vendor == 0x8086
+            && d.id.class >> 16 == 0x03
+            && !I915_DENYLIST.contains(&d.id.device)
+            && acomp::display_audio_provided(d.id.vendor, d.id.device)
+            && connectivity_check(d, hdac, upstream)
+    })
+}
+
+/// What `snd_hdac_i915_init` decides for a controller at probe.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum I915Init {
+    /// No component binding: not an `AZX_DCAPS_I915_COMPONENT` controller,
+    /// or no reachable display (`-ENODEV`: "don't bother any longer").
+    Without,
+    /// The display's component is bound: probe now.
+    Bound,
+    /// The display is present and has not bound its component yet
+    /// (`-EPROBE_DEFER`, "couldn't bind with audio component").
+    Defer,
+}
+
+/// `snd_hdac_i915_init` for the controller `hdac` (`bound`: a display half
+/// is bound).
+pub(super) fn i915_init(
+    hdac: &BusDevice,
+    devices: &[BusDevice],
+    upstream: &dyn Fn(&BusDevice) -> Option<BusDevice>,
+    bound: bool,
+) -> I915Init {
+    if !i915_component(hdac.id.vendor, hdac.id.device)
+        || !i915_gfx_present(hdac, devices, upstream)
+    {
+        I915Init::Without
+    } else if bound {
+        I915Init::Bound
+    } else {
+        I915Init::Defer
+    }
+}
+
+/// [`i915_init`] over the bus registry and the bound component.
+pub(super) fn i915_init_for(hdac: &BusDevice) -> I915Init {
+    i915_init(
+        hdac,
+        &narf_bus::registry::devices(),
+        &narf_bus::pci::upstream_bridge,
+        component().is_some(),
+    )
 }
 
 /// `alloc_intel_hdmi`'s precondition: an Intel HDMI codec binds only with

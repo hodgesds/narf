@@ -543,3 +543,28 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_xelpg_audio",
     smoke_xelpg_audio_component_with_scripted_hda
 );
+
+/// The display side of `snd_hdac_i915_init`'s deferral: the driver names,
+/// at its registration, the display functions whose probe binds the audio
+/// component (display 14, 20 and 30 under `narf.intel.hdmi14_ext=1`, the
+/// generations `bind_production_component` runs for), so an HDA controller
+/// probed first waits for the bind. Without the option, on a Tiger Lake
+/// display (no display-14+ component) and for another vendor it names none.
+fn smoke_xelpg_audio_component_provider_names_bound_displays() -> TestResult {
+    use crate::intel_gpu::audio_component_provided_for as provided;
+    use crate::intel_gpu::{MTL_7D55, TGL_U_GT2_9A49};
+    if !provided(true, 0x8086, MTL_7D55) || !provided(true, 0x8086, 0x64a0) {
+        return TestResult::Fail("Meteor and Lunar Lake bind the component under the option");
+    }
+    if provided(false, 0x8086, MTL_7D55)
+        || provided(true, 0x8086, TGL_U_GT2_9A49)
+        || provided(true, 0x1002, MTL_7D55)
+    {
+        return TestResult::Fail("no option, a pre-14 display or another vendor binds none");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_audio",
+    smoke_xelpg_audio_component_provider_names_bound_displays
+);

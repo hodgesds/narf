@@ -2430,6 +2430,21 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             | narf_bus::pci::cmd::INTX_DISABLE,
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // snd_hdac_i915_init: a controller that binds with the graphics driver
+    // and finds its display present, while the display has not bound its
+    // audio component, returns -EPROBE_DEFER and is probed again once the
+    // display driver has bound. NARF keeps the claimed function and probes
+    // it when the component binds, so the Intel HDMI codec is enumerated
+    // bound (`alloc_intel_hdmi`) whichever function probes first.
+    if super::intelhdmi::i915_init_for(&device) == super::intelhdmi::I915Init::Defer {
+        narf_console::write_str(&alloc::format!(
+            "hda: {:04x}:{:04x} couldn't bind with audio component; waiting for the display\n",
+            device.id.vendor,
+            device.id.device,
+        ));
+        narf_scheduler::spawn(deferred_i915_probe(device, cap));
+        return Ok(());
+    }
     // SAFETY: Bus probing has exclusively claimed this function and its BAR.
     let brought_up = unsafe { IntelHda::bring_up(&device, &cap) };
     match brought_up {
@@ -2469,6 +2484,26 @@ fn probe_error(error: HdaError) -> narf_bus::ProbeError {
 fn retries_probe(device: &BusDevice, error: HdaError) -> bool {
     super::amd_sb_preset(device.id.vendor, device.id.device)
         && matches!(error, HdaError::CommandTimeout)
+}
+
+/// The deferred probe of a controller [`super::intelhdmi::I915Init::Defer`]
+/// held back: once the display's audio component binds
+/// (`hdac_component_master_bind`), the probe runs as the driver core's
+/// re-probe would, with the codec enumeration seeing the component.
+async fn deferred_i915_probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
+    narf_drivers_sound::display_audio::DisplayAudioBound.await;
+    // SAFETY: probe handed this task the claimed function and its BAR;
+    // nothing else drives the controller until it registers.
+    let result = match unsafe { IntelHda::bring_up(&device, &cap) } {
+        Ok(dev) => register_controller(&device, dev).map_err(|_| HdaError::DeviceFailed),
+        Err(error) => Err(error),
+    };
+    narf_console::write_str(&alloc::format!(
+        "hda: {:04x}:{:04x} probe after the display audio component bound: {:?}\n",
+        device.id.vendor,
+        device.id.device,
+        result
+    ));
 }
 
 /// Linux `azx_probe_continue`: `++hda->probe_retry < 60`, one second apart.

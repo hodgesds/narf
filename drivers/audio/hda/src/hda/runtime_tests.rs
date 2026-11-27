@@ -4731,3 +4731,126 @@ fn native_hda_pcms_are_interleaved_only() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda/access", native_hda_pcms_are_interleaved_only);
+
+fn pci_function(bus: u8, device: u8, function: u8, id: (u16, u16), class: u32) -> BusDevice {
+    let addr = narf_bus::PcieAddr {
+        segment: 0,
+        bus,
+        device,
+        function,
+    };
+    BusDevice {
+        addr: narf_bus::BusAddr::Pcie(addr),
+        kind: narf_bus::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+        id: narf_bus::DeviceId {
+            vendor: id.0,
+            device: id.1,
+            class,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+    }
+}
+
+/// The display functions the scripted Intel display binds a component for:
+/// Meteor Lake's 8086:7d55 and a Battlemage 8086:e20b.
+fn scripted_provider(vendor: u16, device: u16) -> bool {
+    vendor == 0x8086 && matches!(device, 0x7d55 | 0xe20b | 0x5a40)
+}
+
+/// `snd_hdac_i915_init` at the controller probe (sound/hda/core/i915.c,
+/// sound/hda/controllers/intel.c `azx_probe`): a Meteor Lake PCH
+/// controller (00:1f.3, 8086:7e28) beside its display (00:02.0) defers
+/// (-EPROBE_DEFER) while the display has not bound its component and
+/// probes once it has; without a display driver that binds one (the
+/// `narf.intel.hdmi14_ext` option off) it probes without the component
+/// (-ENODEV, "don't bother any longer"), as do an ICH9 controller (no
+/// `AZX_DCAPS_I915_COMPONENT`) and a denylisted Cannon Lake display.
+/// `connectivity_check`: two root buses count as connected ("may be
+/// NULL!"); a display behind a root port does not reach a root-bus
+/// controller; a discrete GPU's HD-audio under a sibling switch port does
+/// (the parents' parent).
+fn native_hda_i915_init_defers_until_display_binds() -> TestResult {
+    use super::super::intelhdmi::{connectivity_check, i915_init, I915Init};
+    use narf_drivers_sound::display_audio as acomp;
+    let hdac = pci_function(0, 0x1f, 3, (0x8086, 0x7e28), 0x040300);
+    let gpu = pci_function(0, 2, 0, (0x8086, 0x7d55), 0x030000);
+    let none = |_: &BusDevice| None;
+    acomp::register_display_audio_provider(scripted_provider);
+    let defer = i915_init(&hdac, &[gpu, hdac], &none, false);
+    let bound = i915_init(&hdac, &[gpu, hdac], &none, true);
+    let ich9 = i915_init(
+        &pci_function(0, 0x1b, 0, (0x8086, 0x293e), 0x040300),
+        &[gpu],
+        &none,
+        false,
+    );
+    let cnl = i915_init(
+        &hdac,
+        &[pci_function(0, 2, 0, (0x8086, 0x5a40), 0x030000)],
+        &none,
+        false,
+    );
+    // A non-display Intel function is not a display.
+    let not_display = i915_init(
+        &hdac,
+        &[pci_function(0, 2, 0, (0x8086, 0x7d55), 0x048000)],
+        &none,
+        false,
+    );
+    acomp::unregister_display_audio_provider();
+    let option_off = i915_init(&hdac, &[gpu, hdac], &none, false);
+    if defer != I915Init::Defer || bound != I915Init::Bound {
+        return TestResult::Fail("a present display defers the probe until its component binds");
+    }
+    if option_off != I915Init::Without
+        || ich9 != I915Init::Without
+        || cnl != I915Init::Without
+        || not_display != I915Init::Without
+    {
+        return TestResult::Fail("no binding display (or no I915_COMPONENT) probes without it");
+    }
+    // Bus topology: root port 00:01.0 -> bus 3; on bus 3 the switch ports
+    // 03:00.0 -> bus 4 and 03:01.0 -> bus 7; on bus 4 the ports 04:01.0 ->
+    // bus 5 (GPU) and 04:04.0 -> bus 6 (HD-audio, same parent bus); on bus
+    // 7 the port 07:00.0 -> bus 8 (HD-audio, the parents' parent bus 3).
+    let root_port = pci_function(0, 1, 0, (0x8086, 0x7ecc), 0x060400);
+    let switch_a = pci_function(3, 0, 0, (0x8086, 0xe2ff), 0x060400);
+    let switch_b = pci_function(3, 1, 0, (0x8086, 0xe2fe), 0x060400);
+    let gpu_port = pci_function(4, 1, 0, (0x8086, 0xe2f0), 0x060400);
+    let audio_port = pci_function(4, 4, 0, (0x8086, 0xe2f1), 0x060400);
+    let far_port = pci_function(7, 0, 0, (0x8086, 0xe2f2), 0x060400);
+    let dgpu = pci_function(5, 0, 0, (0x8086, 0xe20b), 0x030000);
+    let dhda = pci_function(6, 0, 0, (0x8086, 0xe2f7), 0x040300);
+    let far_hda = pci_function(8, 0, 0, (0x8086, 0xe2f7), 0x040300);
+    let behind_root = pci_function(3, 0, 0, (0x8086, 0x7d55), 0x030000);
+    let parent = move |d: &BusDevice| -> Option<BusDevice> {
+        let narf_bus::BusKind::Pcie { addr, .. } = d.kind else {
+            return None;
+        };
+        match addr.bus {
+            3 => Some(root_port),
+            4 => Some(switch_a),
+            7 => Some(switch_b),
+            5 => Some(gpu_port),
+            6 => Some(audio_port),
+            8 => Some(far_port),
+            _ => None,
+        }
+    };
+    let other_root = pci_function(0x80, 2, 0, (0x8086, 0x7d55), 0x030000);
+    if !connectivity_check(&gpu, &hdac, &parent)
+        || !connectivity_check(&other_root, &hdac, &parent)
+        || connectivity_check(&behind_root, &hdac, &parent)
+        || !connectivity_check(&dgpu, &dhda, &parent)
+        || !connectivity_check(&dgpu, &far_hda, &parent)
+        || connectivity_check(&dgpu, &hdac, &parent)
+    {
+        return TestResult::Fail("connectivity_check differs from sound/hda/core/i915.c");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", native_hda_i915_init_defers_until_display_binds);
