@@ -1158,6 +1158,7 @@ dependencies = [
  "narf-ipc",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
  "polyval",
  "rand_chacha",
  "rand_core 0.6.4",
@@ -1423,7 +1424,9 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-block",
+ "narf-boot",
  "narf-capabilities",
+ "narf-console",
  "narf-driver-runtime",
  "narf-drivers",
  "narf-filesystem",
@@ -3159,6 +3162,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-ext4-host"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "narf-block",
+ "narf-console",
+ "narf-drivers-fs-ext2",
+ "narf-filesystem",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-fb"
 version = "0.0.0"
 dependencies = [
@@ -4882,6 +4899,7 @@ dependencies = [
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "aes",
  "anyhow",
  "blake3",
  "clap",
@@ -4901,6 +4919,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "wait-timeout",
+ "xts-mode",
  "zstd",
 ]
 

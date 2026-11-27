@@ -36,6 +36,8 @@ pub const I_FLAGS_INDEX: u32 = 0x0000_1000;
 /// `i_flags` bit: inode uses extent tree for data blocks. Matches
 /// `EXT4_EXTENTS_FL`.
 pub const I_FLAGS_EXTENTS: u32 = 0x0008_0000;
+/// `EXT4_HUGE_FILE_FL`: `i_blocks` counts filesystem blocks, not sectors.
+pub const I_FLAGS_HUGE_FILE: u32 = 0x0004_0000;
 
 /// `i_flags` bit: the inode's data lives inline in `i_block` / the in-inode
 /// xattr area. Matches `EXT4_INLINE_DATA_FL`.

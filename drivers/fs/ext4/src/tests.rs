@@ -9,12 +9,12 @@
 //!   6. Extent-tree insert (in-place) + merge of adjacent extents
 //!   7. Extent-tree split when leaf is full
 //!   8. HTREE root decode (shared with ext2 — verify same format)
-//!   9. JBD2 superblock encode + decode round-trip
-//!   10. JBD2 descriptor + commit encode + replay end-to-end
 //!   11. File-write round-trip via extents (write extent → read back)
 //!   12. Directory mutators: create then unlink round-trip
 //!   13. Ext4Inode flag decode (EXTENTS_FL set ⇒ uses_extents true)
 //!   14. Ext4Inode 64-bit size combines size + size_high
+//!
+//! JBD2 recovery is tested in `drivers/fs/ext2/src/journal_tests.rs`.
 //!
 //! These are pure-logic smokes — they exercise the on-disk decoders
 //! and encoders without touching a block device. The end-to-end
@@ -34,12 +34,8 @@ use super::extent::{
     empty_iblock_leaf, find_physical_for_logical, insert_into_leaf, lookup_in_node, ExtentHeader,
     ExtentIndex, ExtentLeaf, InsertOutcome, LookupOutcome, EXT4_EXTENT_MAGIC,
 };
-use super::htree::{hash_version, name_hash, DxRoot, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF};
+use super::htree::{ext4fs_dirhash, hash_version, DxRoot, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF};
 use super::inode::{Ext4Inode, EXT4_EXTENTS_FL, EXT4_INDEX_FL};
-use super::journal::{
-    block_type as jbt, build_one_txn_image, encode_commit, encode_descriptor, encode_superblock,
-    replay_journal_flat, CommitBlock, DescriptorBlock, JournalSuperblock, JBD2_MAGIC_NUMBER,
-};
 use super::superblock::{
     incompat, is_64bit, is_flex_bg, validate, Ext4SuperblockError, EXT4_VALID_FS,
 };
@@ -448,110 +444,14 @@ fn smoke_ext4_htree_root_decode_same_format() -> TestResult {
 
     // Verify hash function determinism so the index keys are stable.
     let seed = [0u32; 4];
-    let h1 = name_hash(b"hello", hash_version::TEA_UNSIGNED, &seed);
-    let h2 = name_hash(b"hello", hash_version::TEA_UNSIGNED, &seed);
-    if h1 != h2 {
-        return TestResult::Fail("name_hash must be deterministic");
+    let h1 = ext4fs_dirhash(b"hello", hash_version::TEA_UNSIGNED, &seed);
+    let h2 = ext4fs_dirhash(b"hello", hash_version::TEA_UNSIGNED, &seed);
+    if h1.is_none() || h1 != h2 {
+        return TestResult::Fail("ext4fs_dirhash must be deterministic");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext4", smoke_ext4_htree_root_decode_same_format);
-
-// ── 9: JBD2 superblock + commit encode round-trip ──────────────────
-
-fn smoke_ext4_jbd2_superblock_encode_decode_round_trip() -> TestResult {
-    let block_size = 4096usize;
-    let mut sb = vec![0u8; block_size];
-    encode_superblock(
-        &mut sb,
-        block_size as u32,
-        /*maxlen*/ 100,
-        /*first*/ 1,
-        /*sequence*/ 42,
-        /*start*/ 0,
-    );
-    let parsed = match JournalSuperblock::parse(&sb) {
-        Some(p) => p,
-        None => return TestResult::Fail("encoded superblock failed to parse"),
-    };
-    if parsed.header.magic != JBD2_MAGIC_NUMBER {
-        return TestResult::Fail("magic round-trip failed");
-    }
-    if parsed.header.block_type != jbt::SUPERBLOCK_V2 {
-        return TestResult::Fail("expected v2 superblock");
-    }
-    if parsed.block_size != block_size as u32 {
-        return TestResult::Fail("block_size round-trip failed");
-    }
-    if parsed.maxlen != 100 {
-        return TestResult::Fail("maxlen round-trip failed");
-    }
-    if parsed.sequence != 42 {
-        return TestResult::Fail("sequence round-trip failed");
-    }
-    if !parsed.is_clean() {
-        return TestResult::Fail("start=0 must classify as clean");
-    }
-    // Also encode + decode a standalone commit block.
-    let mut commit = vec![0u8; block_size];
-    encode_commit(&mut commit, 99);
-    let cb = match CommitBlock::parse(&commit) {
-        Some(c) => c,
-        None => return TestResult::Fail("commit block decode failed"),
-    };
-    if cb.header.sequence != 99 {
-        return TestResult::Fail("commit sequence round-trip failed");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/fs/ext4",
-    smoke_ext4_jbd2_superblock_encode_decode_round_trip
-);
-
-// ── 10: JBD2 replay end-to-end via the encoder ─────────────────────
-
-fn smoke_ext4_jbd2_replay_one_transaction() -> TestResult {
-    let block_size = 1024usize;
-    // One descriptor with two tags → two data blocks → one commit.
-    let mut data_a = vec![0u8; block_size];
-    let mut data_b = vec![0u8; block_size];
-    data_a[..4].copy_from_slice(b"DATA");
-    data_a[4..8].copy_from_slice(b"____");
-    data_b[..4].copy_from_slice(b"data");
-    data_b[4..8].copy_from_slice(b"++++");
-    let image = build_one_txn_image(
-        block_size,
-        &[(500u64, data_a.clone()), (600u64, data_b.clone())],
-        /*sequence*/ 7,
-    );
-    let report = match replay_journal_flat(&image, block_size) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = e;
-            return TestResult::Fail("replay returned error");
-        }
-    };
-    if report.transactions_replayed != 1 {
-        return TestResult::Fail("expected exactly 1 replayed transaction");
-    }
-    let got_a = match report.blocks_to_write.get(&500) {
-        Some(v) => v,
-        None => return TestResult::Fail("target block 500 missing from replay"),
-    };
-    if &got_a[..8] != b"DATA____" {
-        return TestResult::Fail("target 500 bytes mismatch");
-    }
-    let got_b = match report.blocks_to_write.get(&600) {
-        Some(v) => v,
-        None => return TestResult::Fail("target block 600 missing from replay"),
-    };
-    if &got_b[..8] != b"data++++" {
-        return TestResult::Fail("target 600 bytes mismatch");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/fs/ext4", smoke_ext4_jbd2_replay_one_transaction);
 
 // ── 11: File-write round-trip via extents ──────────────────────────
 //
@@ -733,35 +633,3 @@ fn smoke_ext4_inode_size_64bit_assembly() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext4", smoke_ext4_inode_size_64bit_assembly);
-
-// ── 15: JBD2 descriptor encode + decode (smoke for tag layout) ─────
-
-fn smoke_ext4_jbd2_descriptor_encode_decodes() -> TestResult {
-    let mut buf = vec![0u8; 256];
-    encode_descriptor(
-        &mut buf,
-        /*sequence*/ 33,
-        &[(100, 0), (200, 0), (300, 0)],
-    );
-    let dd = match DescriptorBlock::parse(&buf) {
-        Some(d) => d,
-        None => return TestResult::Fail("descriptor decode failed"),
-    };
-    if dd.header.sequence != 33 {
-        return TestResult::Fail("descriptor sequence mismatch");
-    }
-    if dd.tags.len() != 3 {
-        return TestResult::Fail("expected 3 tags");
-    }
-    if dd.tags[0].target_block != 100
-        || dd.tags[1].target_block != 200
-        || dd.tags[2].target_block != 300
-    {
-        return TestResult::Fail("tag target_block round-trip wrong");
-    }
-    if !dd.tags[2].is_last() {
-        return TestResult::Fail("last tag must carry LAST_TAG flag");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/fs/ext4", smoke_ext4_jbd2_descriptor_encode_decodes);

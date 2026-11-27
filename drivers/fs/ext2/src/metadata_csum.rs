@@ -436,26 +436,39 @@ pub fn verify_htree_block_checksum(
     ) == calculated
 }
 
-/// Calculate the checksum for a non-root extent-tree block. The final four
-/// bytes carry the checksum and are excluded from the protected extent-node
-/// bytes.
+/// `EXT4_EXTENT_TAIL_OFFSET`: the `ext4_extent_tail` follows the node's
+/// `eh_max` entries. With the usual `eh_max` that is the block's last four
+/// bytes at 1 and 4 KiB (1020, 4092) but not at 2 KiB (169 entries end at
+/// 2040). `None` for a header whose `eh_max` leaves no room for the tail.
+fn extent_tail_offset(block: &[u8]) -> Option<usize> {
+    if block.len() < 12 {
+        return None;
+    }
+    let max = usize::from(u16::from_le_bytes([block[4], block[5]]));
+    let off = 12 + 12 * max;
+    (off + 4 <= block.len()).then_some(off)
+}
+
+/// `ext4_extent_block_csum`: the checksum of a non-root extent-tree block,
+/// over the header and its `eh_max` entry slots, up to the tail.
 pub fn extent_block_checksum(
     sb: &Superblock,
     inode_no: u32,
     inode_generation: u32,
     block: &[u8],
 ) -> Option<u32> {
-    if !sb.has_metadata_csum() || block.len() < 4 {
+    if !sb.has_metadata_csum() {
         return None;
     }
+    let tail = extent_tail_offset(block)?;
     let mut state = crc32c(seed(sb), &inode_no.to_le_bytes());
     state = crc32c(state, &inode_generation.to_le_bytes());
-    Some(crc32c(state, &block[..block.len() - 4]))
+    Some(crc32c(state, &block[..tail]))
 }
 
-/// Update the checksum stored in the final four bytes of an extent-tree
-/// block. The caller must only use this for an ext4 extent block, never for
-/// the 60-byte root stored directly in an inode.
+/// `ext4_extent_block_csum_set`: install the checksum in the node's
+/// `ext4_extent_tail`. Only for an extent block, never for the 60-byte root
+/// stored in an inode.
 pub fn write_extent_block_checksum(
     sb: &Superblock,
     inode_no: u32,
@@ -463,7 +476,26 @@ pub fn write_extent_block_checksum(
     block: &mut [u8],
 ) -> Option<()> {
     let checksum = extent_block_checksum(sb, inode_no, inode_generation, block)?;
-    let off = block.len().checked_sub(4)?;
-    block[off..].copy_from_slice(&checksum.to_le_bytes());
+    let tail = extent_tail_offset(block)?;
+    block[tail..tail + 4].copy_from_slice(&checksum.to_le_bytes());
     Some(())
+}
+
+/// `ext4_extent_block_csum_verify`. True without metadata_csum.
+pub fn verify_extent_block_checksum(
+    sb: &Superblock,
+    inode_no: u32,
+    inode_generation: u32,
+    block: &[u8],
+) -> bool {
+    if !sb.has_metadata_csum() {
+        return true;
+    }
+    let (Some(tail), Some(expected)) = (
+        extent_tail_offset(block),
+        extent_block_checksum(sb, inode_no, inode_generation, block),
+    ) else {
+        return false;
+    };
+    block[tail..tail + 4] == expected.to_le_bytes()
 }

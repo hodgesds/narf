@@ -30,6 +30,12 @@ static BUNDLE: [u8; include_bytes!(concat!(env!("OUT_DIR"), "/bundle.bin")).len(
     *include_bytes!(concat!(env!("OUT_DIR"), "/bundle.bin"));
 const MAX_DESCRIPTORS: usize = 1024;
 const HANDOFF_PAGES: usize = 32;
+/// The image moves only in these steps: boot.S builds the kernel window from
+/// 2 MiB pages.
+const PLACEMENT_ALIGN: u64 = 2 * 1024 * 1024;
+/// boot.S runs the image in 32-bit mode under an identity map of the low
+/// 4 GiB, so the whole image must sit below this.
+const PLACEMENT_LIMIT: u64 = 1 << 32;
 
 #[derive(Debug)]
 enum LoadError {
@@ -38,6 +44,9 @@ enum LoadError {
     InvalidFirmwareTable,
     TooManyDescriptors,
     BridgeTooLarge,
+    /// The link range is not free (the firmware's status), and no free
+    /// range above it on the placement grid fits the image below 4 GiB.
+    NoPlacement(Status),
 }
 
 impl From<Error> for LoadError {
@@ -109,6 +118,10 @@ fn main() -> Status {
                 LoadError::Firmware(status) => {
                     uefi::println!("NARF native EFI: firmware error: {status:?}")
                 }
+                LoadError::NoPlacement(status) => uefi::println!(
+                    "NARF native EFI: the kernel's link range is not free ({status:?}), \
+                     and no free range above it below 4 GiB fits the kernel"
+                ),
                 other => uefi::println!("NARF native EFI: {other:?}"),
             }
             Status::LOAD_ERROR
@@ -128,9 +141,10 @@ fn load_and_start() -> Result<(), LoadError> {
     }
     let elf = ElfImage::parse(bundle.kernel)?;
     let kernel_pages = ((elf.load_end - elf.load_start) / PAGE_SIZE) as usize;
-    // AllocateAddress excludes the running image and firmware-owned pages.
-    // A collision fails visibly instead of overwriting their contents.
-    let mut loaded = Pages::new(MemoryType::LOADER_DATA, kernel_pages, Some(elf.load_start))?;
+    #[cfg(narf_occupy_link)]
+    occupy_link_range(&elf)?;
+    let (mut loaded, delta) = place_kernel(&elf, kernel_pages)?;
+    let entry = u32::try_from(u64::from(elf.entry) + delta).map_err(|_| Error::Overflow)?;
     loaded.bytes_mut().fill(0);
     for segment in elf.segments() {
         let offset = (segment.physical - elf.load_start) as usize;
@@ -181,8 +195,8 @@ fn load_and_start() -> Result<(), LoadError> {
     drop(map);
     uefi::println!(
         "NARF native EFI: kernel {:#x}..{:#x}, initramfs {} bytes; exiting boot services",
-        elf.load_start,
-        elf.load_end,
+        loaded.address(),
+        loaded.address() + (elf.load_end - elf.load_start),
         bundle.initramfs.len()
     );
     mem::forget(loaded);
@@ -217,9 +231,105 @@ fn load_and_start() -> Result<(), LoadError> {
     let enter: unsafe extern "efiapi" fn(u32, u32, u64) -> ! =
         unsafe { mem::transmute(bridge_address as usize) };
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: the validated entry, information block and executable bridge
-    // remain reserved. The bridge never returns to Rust.
-    unsafe { enter(elf.entry, info_address as u32, bridge_address) }
+    // SAFETY: the validated entry, moved with the image, the information
+    // block and the executable bridge remain reserved. The bridge never
+    // returns to Rust.
+    unsafe { enter(entry, info_address as u32, bridge_address) }
+}
+
+/// Allocate the kernel's pages, returning them and how far above its link
+/// address they are.
+///
+/// The link address when that whole range is free. Otherwise, firmware owns
+/// part of it, as on the ThinkPad P14s Gen 5 AMD (ACPI NVS, ACPI tables and
+/// a reserved block at 0x179ec000-0x1f46bfff, inside the link range
+/// 0x10000000-0x1e807000). Then the image goes a whole number of 2 MiB steps
+/// higher, into one free range below 4 GiB, and boot.S finds it there. The
+/// step is chosen at random from every slot that fits, as Linux's EFI stub
+/// places its kernel (`efi_random_alloc`,
+/// drivers/firmware/efi/libstub/randomalloc.c). Without a firmware RNG it is
+/// the lowest slot, as Linux's `efi_low_alloc_above` fallback is.
+///
+/// AllocateAddress excludes the running image and firmware-owned pages, so
+/// neither path overwrites their contents.
+fn place_kernel(elf: &ElfImage<'_>, pages: usize) -> Result<(Pages, u64), LoadError> {
+    let refused = match Pages::new(MemoryType::LOADER_DATA, pages, Some(elf.load_start)) {
+        Ok(pages) => return Ok((pages, 0)),
+        Err(LoadError::Firmware(status)) => status,
+        Err(other) => return Err(other),
+    };
+    let size = pages as u64 * PAGE_SIZE;
+    let slots = |start: u64, page_count: u64| -> Option<(u64, u64)> {
+        let end = start
+            .checked_add(page_count.checked_mul(PAGE_SIZE)?)?
+            .min(PLACEMENT_LIMIT);
+        let above = start.max(elf.load_start) - elf.load_start;
+        let first = elf
+            .load_start
+            .checked_add(above.checked_next_multiple_of(PLACEMENT_ALIGN)?)?;
+        let last = end.checked_sub(size)?;
+        (first <= last).then(|| (first, (last - first) / PLACEMENT_ALIGN + 1))
+    };
+    // Free ranges big enough for the image are few; past this many, the
+    // rest only add candidates, so they are left out.
+    let mut free = [(0u64, 0u64); 64];
+    let mut ranges = 0;
+    {
+        let map = boot::memory_map(MemoryType::LOADER_DATA)
+            .map_err(|error| LoadError::Firmware(error.status()))?;
+        for descriptor in map.entries() {
+            if descriptor.ty != MemoryType::CONVENTIONAL || ranges == free.len() {
+                continue;
+            }
+            if let Some(range) = slots(descriptor.phys_start, descriptor.page_count) {
+                free[ranges] = range;
+                ranges += 1;
+            }
+        }
+    }
+    let total: u64 = free[..ranges].iter().map(|&(_, count)| count).sum();
+    if total == 0 {
+        return Err(LoadError::NoPlacement(refused));
+    }
+    let mut pick = firmware_random().map_or(0, |value| value % total);
+    let mut address = None;
+    for &(first, count) in &free[..ranges] {
+        if pick < count {
+            address = Some(first + pick * PLACEMENT_ALIGN);
+            break;
+        }
+        pick -= count;
+    }
+    let address = address.ok_or(LoadError::NoPlacement(refused))?;
+    let placed = Pages::new(MemoryType::LOADER_DATA, pages, Some(address))?;
+    uefi::println!(
+        "NARF native EFI: link range {:#x}..{:#x} not free ({refused:?}); kernel placed at {address:#x}",
+        elf.load_start,
+        elf.load_end
+    );
+    Ok((placed, address - elf.load_start))
+}
+
+/// Eight bytes from the firmware's EFI_RNG_PROTOCOL, if it has one.
+fn firmware_random() -> Option<u64> {
+    use uefi::proto::rng::Rng;
+    let handle = boot::get_handle_for_protocol::<Rng>().ok()?;
+    let mut rng = boot::open_protocol_exclusive::<Rng>(handle).ok()?;
+    let mut bytes = [0u8; 8];
+    rng.get_rng(None, &mut bytes).ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// Test builds only (`cargo xtask efi-image --occupy-link-range`): hold one
+/// page in the middle of the kernel's link range as ACPI NVS, as the
+/// ThinkPad P14s Gen 5 AMD firmware holds part of it, so an OVMF boot takes
+/// the placement path in `place_kernel`.
+#[cfg(narf_occupy_link)]
+fn occupy_link_range(elf: &ElfImage<'_>) -> Result<(), LoadError> {
+    let middle = (elf.load_start + (elf.load_end - elf.load_start) / 2) & !(PAGE_SIZE - 1);
+    mem::forget(Pages::new(MemoryType::ACPI_NON_VOLATILE, 1, Some(middle))?);
+    uefi::println!("NARF native EFI: test: {middle:#x} held as ACPI NVS");
+    Ok(())
 }
 
 fn convert_memory_map(

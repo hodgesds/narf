@@ -3986,7 +3986,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     policy.as_str(),
                                     e
                                 );
-                                if let Some(why) = narf_drivers_fs_btrfs::rw_gate::last_refusal() {
+                                if let Some(why) = narf_filesystem::rw_refusal::last() {
                                     let _ = writeln!(console::Writer, "  root-mount: {why}");
                                 }
                                 let _ = writeln!(console::Writer, "{rule}");
@@ -4121,6 +4121,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 "btrfs-rootrw-interop",
                 || match narf_boot::args().value("narf.rootrw_interop") {
                     Some(mode) => narf_drivers_fs_btrfs::interop::run(mode),
+                    None => narf_init::InitResult::NotPresent,
+                },
+                300_000,
+            );
+            // The same for `cargo xtask ext4-rootrw-interop`: a LUKS + ext4
+            // root. Inert without `narf.ext4_interop=<mode>`; refuses any
+            // root but the harness image.
+            narf_init::register_with_budget(
+                narf_init::Stage::Late,
+                "ext4-rootrw-interop",
+                || match narf_boot::args().value("narf.ext4_interop") {
+                    Some(mode) => narf_drivers_fs_ext2::interop::run(mode),
                     None => narf_init::InitResult::NotPresent,
                 },
                 300_000,

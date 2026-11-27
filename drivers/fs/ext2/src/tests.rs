@@ -17,10 +17,11 @@ use super::group_desc::GroupDesc;
 use super::inode::Inode;
 use super::metadata_csum::{
     bitmap_checksum, crc32c, directory_block_checksum, extent_block_checksum, group_desc_checksum,
-    htree_block_checksum, inode_checksum, seed, verify_group_desc_checksum,
-    verify_htree_block_checksum, verify_inode_checksum, verify_superblock, write_bitmap_checksum,
-    write_directory_block_checksum, write_extent_block_checksum, write_group_desc_checksum,
-    write_htree_block_checksum, write_inode_checksum, write_superblock_checksum,
+    htree_block_checksum, inode_checksum, seed, verify_extent_block_checksum,
+    verify_group_desc_checksum, verify_htree_block_checksum, verify_inode_checksum,
+    verify_superblock, write_bitmap_checksum, write_directory_block_checksum,
+    write_extent_block_checksum, write_group_desc_checksum, write_htree_block_checksum,
+    write_inode_checksum, write_superblock_checksum,
 };
 use super::superblock::Superblock;
 
@@ -227,15 +228,40 @@ fn smoke_ext4_csum_seed_metadata_writers_cover_checksum_fields() -> TestResult {
         return TestResult::Fail("HTREE checksum accepted a changed index entry");
     }
 
-    let mut extent = vec![0xa5; 4096];
-    let extent_before = match extent_block_checksum(&sb, 42, 0x0102_0304, &extent) {
-        Some(v) => v,
-        None => return TestResult::Fail("extent checksum unavailable"),
-    };
-    if write_extent_block_checksum(&sb, 42, 0x0102_0304, &mut extent).is_none()
-        || extent_block_checksum(&sb, 42, 0x0102_0304, &extent) != Some(extent_before)
-    {
-        return TestResult::Fail("extent checksum was not stable");
+    // `EXT4_EXTENT_TAIL_OFFSET` follows `eh_max`: the block's last four
+    // bytes at 4 KiB (340 entries), but 2040 of 2048 (169 entries).
+    for (bs, max, tail) in [
+        (4096usize, 340u16, 4092usize),
+        (2048, 169, 2040),
+        (1024, 84, 1020),
+    ] {
+        let mut extent = vec![0xa5; bs];
+        extent[0..2].copy_from_slice(&0xf30au16.to_le_bytes());
+        extent[2..4].copy_from_slice(&3u16.to_le_bytes());
+        extent[4..6].copy_from_slice(&max.to_le_bytes());
+        extent[6..8].fill(0);
+        let extent_before = match extent_block_checksum(&sb, 42, 0x0102_0304, &extent) {
+            Some(v) => v,
+            None => return TestResult::Fail("extent checksum unavailable"),
+        };
+        let mut want = crc32c(seed(&sb), &42u32.to_le_bytes());
+        want = crc32c(want, &0x0102_0304u32.to_le_bytes());
+        want = crc32c(want, &extent[..tail]);
+        if extent_before != want {
+            return TestResult::Fail("extent checksum does not cover exactly the eh_max slots");
+        }
+        let after_tail = extent[tail + 4..].to_vec();
+        if write_extent_block_checksum(&sb, 42, 0x0102_0304, &mut extent).is_none()
+            || extent[tail..tail + 4] != want.to_le_bytes()
+            || extent[tail + 4..] != after_tail[..]
+            || !verify_extent_block_checksum(&sb, 42, 0x0102_0304, &extent)
+        {
+            return TestResult::Fail("extent checksum not stored at EXT4_EXTENT_TAIL_OFFSET");
+        }
+        extent[12] ^= 1;
+        if verify_extent_block_checksum(&sb, 42, 0x0102_0304, &extent) {
+            return TestResult::Fail("extent checksum accepted a changed entry");
+        }
     }
     let mut superblock = sb_bytes;
     if write_superblock_checksum(&sb, &mut superblock).is_none()
@@ -510,6 +536,27 @@ fn put_u16(buf: &mut [u8], off: usize, v: u16) {
 ///
 /// Inode 2 = root directory (mode S_IFDIR, points to block 9).
 /// Inode 12 = `data` file (mode S_IFREG, points to block 10).
+/// The free counts mke2fs records, derived from the bitmaps of a
+/// one-group, 1 KiB-block fixture (group from block 1, so `total - 1`
+/// block bits): the group descriptor's and the superblock's. Linux sums the
+/// descriptors into its free-cluster counter at mount, so a fixture that
+/// leaves them 0 is a full filesystem to it (ENOSPC), and to NARF's
+/// allocator, which skips a group whose descriptor says it has nothing free.
+fn set_free_counts(img: &mut [u8], total_blocks: u32, inodes: u32) {
+    const BS: usize = 1024;
+    let clear = |base: usize, bits: u32| {
+        (0..bits as usize)
+            .filter(|&b| img[base + b / 8] & (1 << (b % 8)) == 0)
+            .count() as u32
+    };
+    let free_blocks = clear(3 * BS, total_blocks - 1);
+    let free_inodes = clear(4 * BS, inodes);
+    put_u32(img, BS + 12, free_blocks);
+    put_u32(img, BS + 16, free_inodes);
+    put_u16(img, 2 * BS + 12, free_blocks as u16);
+    put_u16(img, 2 * BS + 14, free_inodes as u16);
+}
+
 fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
     const BS: usize = 1024;
     const TOTAL_BLOCKS: u32 = 64;
@@ -624,6 +671,7 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
         img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
     }
 
+    set_free_counts(&mut img, TOTAL_BLOCKS, INODES_PER_GROUP);
     img
 }
 
@@ -1551,6 +1599,7 @@ fn build_ext4_extent_image_sized(file_data: &[u8], inode_size: u16) -> Vec<u8> {
         img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
     }
 
+    set_free_counts(&mut img, TOTAL_BLOCKS, INODES_PER_GROUP);
     img
 }
 
@@ -1956,6 +2005,7 @@ fn build_ext4_metadata_csum_htree_fixture() -> Result<Vec<u8>, &'static str> {
     image[10 * BS..11 * BS].fill(0);
     put_u32(&mut image, FILE_INODE + 60, 11);
     image[3 * BS + 1] |= 1 << 3; // block 11 is allocated
+    set_free_counts(&mut image, 64, 32);
 
     put_u32(&mut image, ROOT_INODE + 4, (2 * BS) as u32);
     put_u32(&mut image, ROOT_INODE + 28, (2 * BS / 512) as u32);
@@ -2320,7 +2370,8 @@ fn smoke_ext4_extent_write_converts_unwritten() -> TestResult {
     put_u16(&mut image, file_ib + 16, 3 + 0x8000);
     put_u32(&mut image, 5 * 1024 + 11 * 128 + 4, 3 * 1024); // i_size
     image[3 * 1024 + 1] = 0x1F; // blocks 8..=12 in use
-                                // Garbage on disk under the unwritten extent must never surface.
+    set_free_counts(&mut image, 64, 32);
+    // Garbage on disk under the unwritten extent must never surface.
     for b in &mut image[10 * 1024..13 * 1024] {
         *b = 0xAA;
     }
@@ -3064,460 +3115,7 @@ kernel_test_in!(
     smoke_ext4_inode_block_array_serialises_as_extent_root
 );
 
-// ── JBD2 journal replay ────────────────────────────────────────────
-
-fn put_u32_be(buf: &mut [u8], off: usize, v: u32) {
-    buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
-}
-
-fn build_journal_sb_v2(
-    block_size: u32,
-    maxlen: u32,
-    first: u32,
-    sequence: u32,
-    start: u32,
-) -> Vec<u8> {
-    use crate::journal::{block_type, JBD2_MAGIC_NUMBER};
-    let mut b = vec![0u8; block_size as usize];
-    put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
-    put_u32_be(&mut b, 4, block_type::SUPERBLOCK_V2);
-    put_u32_be(&mut b, 8, 0); // h_sequence (unused on SB)
-    put_u32_be(&mut b, 12, block_size);
-    put_u32_be(&mut b, 16, maxlen);
-    put_u32_be(&mut b, 20, first);
-    put_u32_be(&mut b, 24, sequence);
-    put_u32_be(&mut b, 28, start);
-    b
-}
-
-fn smoke_jbd2_superblock_magic_and_fields() -> TestResult {
-    use crate::journal::{JournalSuperblock, JBD2_MAGIC_NUMBER};
-    let b = build_journal_sb_v2(1024, 100, 1, 42, 7);
-    let sb = match JournalSuperblock::parse(&b) {
-        Some(s) => s,
-        None => return TestResult::Fail("jbd2 sb parse failed"),
-    };
-    if sb.block_size != 1024 || sb.maxlen != 100 || sb.first != 1 {
-        return TestResult::Fail("jbd2 sb fields wrong");
-    }
-    if sb.sequence != 42 || sb.start != 7 {
-        return TestResult::Fail("jbd2 sb seq/start wrong");
-    }
-    if sb.is_clean() {
-        return TestResult::Fail("jbd2 sb with start != 0 must be unclean");
-    }
-    // Wrong magic must reject.
-    let mut bad = b.clone();
-    bad[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
-    if JournalSuperblock::parse(&bad).is_some() {
-        return TestResult::Fail("bad magic must reject");
-    }
-    // Clean: start == 0.
-    let clean = build_journal_sb_v2(1024, 100, 1, 1, 0);
-    let sb = JournalSuperblock::parse(&clean).expect("parse");
-    if !sb.is_clean() {
-        return TestResult::Fail("start==0 must be clean");
-    }
-    // Confirm magic constant matches Linux's JBD2_MAGIC_NUMBER.
-    if JBD2_MAGIC_NUMBER != 0xC03B_3998 {
-        return TestResult::Fail("magic constant wrong");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/fs/ext2", smoke_jbd2_superblock_magic_and_fields);
-
-fn smoke_jbd2_descriptor_block_decodes_two_tags() -> TestResult {
-    use crate::journal::{block_type, tag_flag, DescriptorBlock, JBD2_MAGIC_NUMBER};
-    let bs = 1024usize;
-    let mut b = vec![0u8; bs];
-    put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
-    put_u32_be(&mut b, 4, block_type::DESCRIPTOR);
-    put_u32_be(&mut b, 8, 5); // sequence
-                              // tag 0: target=10, flags=0 — UUID follows.
-    put_u32_be(&mut b, 12, 10);
-    put_u32_be(&mut b, 16, 0);
-    // (16-byte UUID stays as zeros.)
-    // tag 1: target=20, flags=SAME_UUID|LAST_TAG.
-    let t1_off = 12 + 8 + 16;
-    put_u32_be(&mut b, t1_off, 20);
-    put_u32_be(&mut b, t1_off + 4, tag_flag::SAME_UUID | tag_flag::LAST_TAG);
-    let d = match DescriptorBlock::parse(&b) {
-        Some(d) => d,
-        None => return TestResult::Fail("descriptor parse failed"),
-    };
-    if d.tags.len() != 2 {
-        return TestResult::Fail("expected 2 tags");
-    }
-    if d.tags[0].target_block != 10 || d.tags[1].target_block != 20 {
-        return TestResult::Fail("tag target_block mismatch");
-    }
-    if !d.tags[1].is_last() {
-        return TestResult::Fail("tag1 LAST_TAG bit not seen");
-    }
-    if d.tags[1].has_uuid() {
-        return TestResult::Fail("tag1 SAME_UUID should skip UUID");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/fs/ext2",
-    smoke_jbd2_descriptor_block_decodes_two_tags
-);
-
-fn smoke_jbd2_commit_block_decodes() -> TestResult {
-    use crate::journal::{block_type, CommitBlock, JBD2_MAGIC_NUMBER};
-    let bs = 1024usize;
-    let mut b = vec![0u8; bs];
-    put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
-    put_u32_be(&mut b, 4, block_type::COMMIT);
-    put_u32_be(&mut b, 8, 7);
-    let c = match CommitBlock::parse(&b) {
-        Some(c) => c,
-        None => return TestResult::Fail("commit parse failed"),
-    };
-    if c.header.sequence != 7 {
-        return TestResult::Fail("commit sequence mismatch");
-    }
-    // Descriptor block must not parse as commit.
-    let mut d = vec![0u8; bs];
-    put_u32_be(&mut d, 0, JBD2_MAGIC_NUMBER);
-    put_u32_be(&mut d, 4, block_type::DESCRIPTOR);
-    if CommitBlock::parse(&d).is_some() {
-        return TestResult::Fail("descriptor must not parse as commit");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/fs/ext2", smoke_jbd2_commit_block_decodes);
-
-fn smoke_jbd2_revoke_block_lists_targets() -> TestResult {
-    use crate::journal::{block_type, RevokeBlock, JBD2_MAGIC_NUMBER};
-    let bs = 1024usize;
-    let mut b = vec![0u8; bs];
-    put_u32_be(&mut b, 0, JBD2_MAGIC_NUMBER);
-    put_u32_be(&mut b, 4, block_type::REVOKE);
-    put_u32_be(&mut b, 8, 9);
-    // r_count = 12 (hdr) + 4 (count itself) + 3*4 = 28.
-    put_u32_be(&mut b, 12, 28);
-    put_u32_be(&mut b, 16, 100);
-    put_u32_be(&mut b, 20, 200);
-    put_u32_be(&mut b, 24, 300);
-    let r = match RevokeBlock::parse(&b) {
-        Some(r) => r,
-        None => return TestResult::Fail("revoke parse failed"),
-    };
-    if r.revoked.len() != 3 || r.revoked[0] != 100 || r.revoked[1] != 200 || r.revoked[2] != 300 {
-        return TestResult::Fail("revoke targets mismatch");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/fs/ext2", smoke_jbd2_revoke_block_lists_targets);
-
-fn smoke_jbd2_replay_end_to_end_one_txn() -> TestResult {
-    // Synthetic journal image. 1024-byte journal blocks.
-    //   block 0: superblock (start=1, first=1, seq=5, maxlen=8)
-    //   block 1: descriptor (seq=5, 1 tag → target FS block 42, LAST_TAG)
-    //   block 2: data block (the bytes journaled for block 42)
-    //   block 3: commit (seq=5)
-    //   block 4+: zeroed (walk terminates on bad magic)
-    use crate::journal::{block_type, replay_journal_flat, tag_flag, JBD2_MAGIC_NUMBER};
-    let bs = 1024usize;
-    let mut img = vec![0u8; bs * 8];
-    let sb = build_journal_sb_v2(bs as u32, 8, 1, 5, 1);
-    img[0..bs].copy_from_slice(&sb);
-
-    // Descriptor at block 1.
-    {
-        let d = &mut img[bs..2 * bs];
-        put_u32_be(d, 0, JBD2_MAGIC_NUMBER);
-        put_u32_be(d, 4, block_type::DESCRIPTOR);
-        put_u32_be(d, 8, 5);
-        put_u32_be(d, 12, 42);
-        put_u32_be(d, 16, tag_flag::SAME_UUID | tag_flag::LAST_TAG);
-    }
-    // Data at block 2.
-    {
-        let data = &mut img[2 * bs..3 * bs];
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_add(0x10);
-        }
-    }
-    // Commit at block 3.
-    {
-        let c = &mut img[3 * bs..4 * bs];
-        put_u32_be(c, 0, JBD2_MAGIC_NUMBER);
-        put_u32_be(c, 4, block_type::COMMIT);
-        put_u32_be(c, 8, 5);
-    }
-
-    let report = match replay_journal_flat(&img, bs) {
-        Ok(r) => r,
-        Err(_) => return TestResult::Fail("replay returned error"),
-    };
-    if report.transactions_replayed != 1 {
-        return TestResult::Fail("expected exactly 1 transaction replayed");
-    }
-    let got = match report.blocks_to_write.get(&42) {
-        Some(v) => v,
-        None => return TestResult::Fail("expected override for FS block 42"),
-    };
-    if got.len() != bs || got[0] != 0x10 || got[3] != 0x13 {
-        return TestResult::Fail("replayed data content mismatch");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/fs/ext2", smoke_jbd2_replay_end_to_end_one_txn);
-
-fn smoke_jbd2_replay_clean_journal_no_overrides() -> TestResult {
-    use crate::journal::replay_journal_flat;
-    let bs = 1024usize;
-    let mut img = vec![0u8; bs * 4];
-    let sb = build_journal_sb_v2(bs as u32, 4, 1, 1, 0); // start==0
-    img[0..bs].copy_from_slice(&sb);
-    let report = match replay_journal_flat(&img, bs) {
-        Ok(r) => r,
-        Err(_) => return TestResult::Fail("clean replay must not error"),
-    };
-    if report.transactions_replayed != 0 || !report.blocks_to_write.is_empty() {
-        return TestResult::Fail("clean journal must produce no overrides");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/fs/ext2",
-    smoke_jbd2_replay_clean_journal_no_overrides
-);
-
-fn smoke_jbd2_replay_revoke_suppresses_target() -> TestResult {
-    // Same as the end-to-end smoke, but a revoke block at seq=5 for
-    // target 42 sits between the data block and the commit. The
-    // override map must NOT contain 42.
-    use crate::journal::{block_type, replay_journal_flat, tag_flag, JBD2_MAGIC_NUMBER};
-    let bs = 1024usize;
-    let mut img = vec![0u8; bs * 8];
-    let sb = build_journal_sb_v2(bs as u32, 8, 1, 5, 1);
-    img[0..bs].copy_from_slice(&sb);
-
-    {
-        let d = &mut img[bs..2 * bs];
-        put_u32_be(d, 0, JBD2_MAGIC_NUMBER);
-        put_u32_be(d, 4, block_type::DESCRIPTOR);
-        put_u32_be(d, 8, 5);
-        put_u32_be(d, 12, 42);
-        put_u32_be(d, 16, tag_flag::SAME_UUID | tag_flag::LAST_TAG);
-    }
-    img[2 * bs..3 * bs].fill(0xAB);
-    {
-        let r = &mut img[3 * bs..4 * bs];
-        put_u32_be(r, 0, JBD2_MAGIC_NUMBER);
-        put_u32_be(r, 4, block_type::REVOKE);
-        put_u32_be(r, 8, 5);
-        put_u32_be(r, 12, 20); // 12 hdr + 4 count + 1*4 = 20
-        put_u32_be(r, 16, 42);
-    }
-    {
-        let c = &mut img[4 * bs..5 * bs];
-        put_u32_be(c, 0, JBD2_MAGIC_NUMBER);
-        put_u32_be(c, 4, block_type::COMMIT);
-        put_u32_be(c, 8, 5);
-    }
-    let report = match replay_journal_flat(&img, bs) {
-        Ok(r) => r,
-        Err(_) => return TestResult::Fail("replay errored"),
-    };
-    if report.blocks_to_write.contains_key(&42) {
-        return TestResult::Fail("revoked target must not appear in overrides");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/fs/ext2",
-    smoke_jbd2_replay_revoke_suppresses_target
-);
-
-// ── Volume mount with unclean journaled image installs overrides ──
-
-/// Build an ext3 (HAS_JOURNAL) image with `s_state == 0` (unclean)
-/// and a tiny in-band journal at inode 8 that replays one block.
-///
-/// The journal contains a single transaction whose descriptor tag
-/// targets block 9 (the root directory's data block) and whose data
-/// block redirects the root directory to a single-entry dir listing
-/// "REPLAYED" inode 12. The on-disk root directory (still on disk
-/// at block 9) lists "ondisk-name" — so any test that observes
-/// "REPLAYED" through `Ext2Volume` instead of "ondisk-name" has
-/// proven that read_block consulted the override map.
-fn build_ext3_unclean_image() -> Vec<u8> {
-    const BS: usize = 1024;
-    const TOTAL_BLOCKS: u32 = 128;
-    const INODES_PER_GROUP: u32 = 32;
-    const INODE_SIZE: u16 = 128;
-    const BLOCKS_PER_GROUP: u32 = 128;
-
-    let mut img = vec![0u8; BS * TOTAL_BLOCKS as usize];
-
-    // Superblock at byte 1024 — ext3-shape (HAS_JOURNAL, s_state==0).
-    let sb = &mut img[1024..2048];
-    put_u32(sb, 0, INODES_PER_GROUP);
-    put_u32(sb, 4, TOTAL_BLOCKS);
-    put_u32(sb, 20, 1);
-    put_u32(sb, 24, 0); // log_block_size = 0 → 1024
-    put_u32(sb, 32, BLOCKS_PER_GROUP);
-    put_u32(sb, 40, INODES_PER_GROUP);
-    put_u16(sb, 56, 0xEF53);
-    put_u16(sb, 58, 0); // s_state = 0 (unclean)
-    put_u32(sb, 76, 1); // rev_level = 1
-    put_u16(sb, 88, INODE_SIZE);
-    // s_feature_compat = HAS_JOURNAL (0x4).
-    put_u32(sb, 92, 0x4);
-    // s_journal_inum = 8.
-    put_u32(sb, 224, 8);
-
-    // Block group descriptor at start of block 2.
-    let gdt_off = 2 * BS;
-    put_u32(&mut img, gdt_off, 3);
-    put_u32(&mut img, gdt_off + 4, 4);
-    put_u32(&mut img, gdt_off + 8, 5);
-    put_u16(&mut img, gdt_off + 12, 0);
-    put_u16(&mut img, gdt_off + 14, 0);
-    put_u16(&mut img, gdt_off + 16, 1);
-
-    // Inode table at blocks 5..=8 (4 blocks * 1024 / 128 = 32 inodes).
-    let itab_off = 5 * BS;
-
-    // Inode 2 (root dir).
-    let root_off = itab_off + INODE_SIZE as usize;
-    put_u16(&mut img, root_off, 0x4000 | 0o755);
-    put_u32(&mut img, root_off + 4, BS as u32);
-    put_u32(&mut img, root_off + 28, (BS / 512) as u32);
-    put_u32(&mut img, root_off + 40, 9); // i_block[0] = 9
-
-    // Inode 8 (the journal). 16 KiB journal stored in blocks
-    // 16..=31 (16 × 1 KiB blocks).
-    let journal_size_blocks: u32 = 16;
-    let journal_start_block: u32 = 16;
-    let journal_inode_off = itab_off + 7 * INODE_SIZE as usize;
-    put_u16(&mut img, journal_inode_off, 0x8000 | 0o600); // regular file
-    put_u32(
-        &mut img,
-        journal_inode_off + 4,
-        journal_size_blocks * BS as u32,
-    );
-    put_u32(
-        &mut img,
-        journal_inode_off + 28,
-        (journal_size_blocks * BS as u32) / 512,
-    );
-    // i_block[0..journal_size_blocks] map to the journal data blocks
-    // 16..(16+journal_size_blocks). Only 12 direct fit in an inode —
-    // we keep the journal short enough that 12 direct blocks cover
-    // everything we need (descriptor + data + commit live in the
-    // first 4 blocks).
-    for i in 0..core::cmp::min(journal_size_blocks, 12) {
-        put_u32(
-            &mut img,
-            journal_inode_off + 40 + (i * 4) as usize,
-            journal_start_block + i,
-        );
-    }
-
-    // ── On-disk root directory at block 9 (the STALE copy that
-    // replay must override). One entry: "ondisk" → inode 12.
-    {
-        let off = 9 * BS;
-        put_u32(&mut img, off, 12);
-        put_u16(&mut img, off + 4, BS as u16);
-        img[off + 6] = b"ondisk".len() as u8;
-        img[off + 7] = ftype::REGULAR;
-        img[off + 8..off + 8 + 6].copy_from_slice(b"ondisk");
-    }
-
-    // ── Journal contents at blocks 16..=19 ────────────────────
-    // Block 16: JBD2 superblock_v2.
-    {
-        let j = &mut img[16 * BS..17 * BS];
-        let mut tmp = build_journal_sb_v2_bytes(BS as u32, 12, 1, 5, 1);
-        // Pad to BS.
-        tmp.resize(BS, 0);
-        j.copy_from_slice(&tmp);
-    }
-    // Block 17 (journal block 1): descriptor.
-    {
-        let d = &mut img[17 * BS..18 * BS];
-        put_u32_be(d, 0, crate::journal::JBD2_MAGIC_NUMBER);
-        put_u32_be(d, 4, crate::journal::block_type::DESCRIPTOR);
-        put_u32_be(d, 8, 5);
-        // tag: target FS block 9, SAME_UUID|LAST_TAG.
-        put_u32_be(d, 12, 9);
-        put_u32_be(
-            d,
-            16,
-            crate::journal::tag_flag::SAME_UUID | crate::journal::tag_flag::LAST_TAG,
-        );
-    }
-    // Block 18 (journal block 2): data — the replayed root dir.
-    {
-        let off = 18 * BS;
-        put_u32(&mut img, off, 12); // inode
-        put_u16(&mut img, off + 4, BS as u16); // rec_len fills block
-        img[off + 6] = b"REPLAYED".len() as u8;
-        img[off + 7] = ftype::REGULAR;
-        img[off + 8..off + 8 + 8].copy_from_slice(b"REPLAYED");
-    }
-    // Block 19 (journal block 3): commit.
-    {
-        let c = &mut img[19 * BS..20 * BS];
-        put_u32_be(c, 0, crate::journal::JBD2_MAGIC_NUMBER);
-        put_u32_be(c, 4, crate::journal::block_type::COMMIT);
-        put_u32_be(c, 8, 5);
-    }
-
-    img
-}
-
-fn build_journal_sb_v2_bytes(
-    block_size: u32,
-    maxlen: u32,
-    first: u32,
-    sequence: u32,
-    start: u32,
-) -> Vec<u8> {
-    build_journal_sb_v2(block_size, maxlen, first, sequence, start)
-}
-
-fn smoke_ext3_unclean_mount_replays_root_dir() -> TestResult {
-    use narf_block::ram::RamBlockDevice;
-    use narf_filesystem::FsInstance;
-    use narf_lib::id::DomainId;
-
-    use crate::volume::Ext2Volume;
-
-    let img = build_ext3_unclean_image();
-    let device = RamBlockDevice::from_image(512, img);
-    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
-        Some(Ok(v)) => v,
-        _ => return TestResult::Fail("mount failed on unclean ext3 image"),
-    };
-    // Replay should have installed at least one override for block 9.
-    if volume.journal_override_count() == 0 {
-        return TestResult::Fail("expected ≥1 journal override after unclean ext3 mount");
-    }
-    // Reading the root directory should return the JOURNAL-side
-    // entry (REPLAYED), not the on-disk stale entry (ondisk).
-    let root = volume.root();
-    let entries = match poll_once(root.enumerate_async(0, 16)) {
-        Some(Ok(v)) => v,
-        _ => return TestResult::Fail("enumerate_async failed"),
-    };
-    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-    if names.contains(&"ondisk") {
-        return TestResult::Fail("post-replay enumeration must NOT see the on-disk stale entry");
-    }
-    if !names.contains(&"REPLAYED") {
-        return TestResult::Fail("expected REPLAYED entry from replay override");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/fs/ext2", smoke_ext3_unclean_mount_replays_root_dir);
+// The JBD2 recovery and journal-at-mount tests are in `journal_tests.rs`.
 
 // ── Write smoke tests ───────────────────────────────────────────────
 
@@ -4223,6 +3821,63 @@ fn smoke_ext2_symlink_fast_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_fast_round_trip);
 
+fn smoke_ext2_symlink_inline_limit_counts_the_nul() -> TestResult {
+    // `ext4_symlink`: a target goes inline only when it and its NUL fit
+    // in the 60-byte i_block, so 59 bytes is the longest fast symlink and
+    // 60 bytes gets a data block (e2fsck rejects a 60-byte fast symlink).
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    for (name, len, fast) in [(&b"s59"[..], 59usize, true), (&b"s60"[..], 60, false)] {
+        let target = alloc::vec![b't'; len];
+        let ino = match poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, name, &target)) {
+            Some(Ok(i)) => i,
+            _ => return TestResult::Fail("symlink create failed"),
+        };
+        let inode = match poll_once(volume.read_inode(ino)) {
+            Some(Ok(i)) => i,
+            _ => return TestResult::Fail("read symlink inode failed"),
+        };
+        if (inode.blocks == 0) != fast {
+            return TestResult::Fail("the inline limit is 59 bytes (60 with the NUL)");
+        }
+        match poll_once(volume.read_symlink_target(&inode)) {
+            Some(Ok(v)) if v == target => {}
+            _ => return TestResult::Fail("symlink target does not read back"),
+        }
+    }
+    // `fscrypt_prepare_symlink`: the target and its NUL must fit in one
+    // block, so bs - 1 bytes is the longest, and bs bytes is ENAMETOOLONG.
+    let bs = volume.block_size();
+    let longest = alloc::vec![b'u'; bs - 1];
+    if !matches!(
+        poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"sbs1", &longest)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("a target of block size - 1 bytes must fit");
+    }
+    let too_long = alloc::vec![b'u'; bs];
+    if !matches!(
+        poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"sbs", &too_long)),
+        Some(Err(narf_filesystem::FsError::NameTooLong))
+    ) {
+        return TestResult::Fail("a target of a whole block must be ENAMETOOLONG");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_symlink_inline_limit_counts_the_nul
+);
+
 fn smoke_ext2_symlink_slow_round_trip() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
@@ -4607,28 +4262,277 @@ kernel_test_in!(
     smoke_ext2_htree_lookup_chooses_correct_bucket
 );
 
-fn smoke_ext2_htree_tea_hash_deterministic() -> TestResult {
-    use crate::htree::{hash_version, name_hash};
-    let seed = [0u32; 4];
-    let h1 = name_hash(b"hello", hash_version::TEA, &seed);
-    let h2 = name_hash(b"hello", hash_version::TEA, &seed);
-    if h1 != h2 {
-        return TestResult::Fail("TEA hash not deterministic");
+fn smoke_ext4_dirhash_matches_e2fsprogs() -> TestResult {
+    // Every hash family, signed and unsigned, against e2fsprogs: name
+    // lengths around the 16-byte (TEA) and 32-byte (half-MD4) chunk
+    // edges, a 255-byte name, bytes >= 0x80 (where signedness matters),
+    // the default seed (`-s` with the nil UUID: an all-zero `s_hash_seed`
+    // selects the built-in seed) and an explicit one.
+    use crate::htree::{ext4fs_dirhash, hash_version as V};
+    let long: alloc::vec::Vec<u8> = b"long_name_".iter().cycle().take(255).copied().collect();
+    // Names: each is `debugfs dx_hash`'s input; see the table below.
+    let names: [&[u8]; 11] = [
+        b"a",
+        b"hello",
+        b"fifteen_chars__",
+        b"sixteen_chars___",
+        b"seventeen_chars__",
+        b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        b"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+        b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        &long,
+        b"\x63\x61\x66\xe9",
+        b"\xff\x80\x78",
+    ];
+    // (seed, version, name, hash, minor) from e2fsprogs 1.47.4:
+    // `debugfs -R "dx_hash -h <0-5> -s <seed> <name>" <img>`. The version is
+    // given by number: debugfs maps an unknown name (`tea_unsigned`) to 0.
+    let table: [(usize, u8, usize, u32, u32); 132] = [
+        (0, V::LEGACY, 0, 0xe74b53e2, 0x0),
+        (0, V::LEGACY, 1, 0x32252546, 0x0),
+        (0, V::LEGACY, 2, 0x8d4eb054, 0x0),
+        (0, V::LEGACY, 3, 0x89fab9c2, 0x0),
+        (0, V::LEGACY, 4, 0xa8c2175e, 0x0),
+        (0, V::LEGACY, 5, 0xa365191c, 0x0),
+        (0, V::LEGACY, 6, 0x71586034, 0x0),
+        (0, V::LEGACY, 7, 0x7851e27c, 0x0),
+        (0, V::LEGACY, 8, 0xef6de4fa, 0x0),
+        (0, V::LEGACY, 9, 0x65f23bce, 0x0),
+        (0, V::LEGACY, 10, 0xb0b9e266, 0x0),
+        (0, V::HALF_MD4, 0, 0xd5fa7d7a, 0xacb48187),
+        (0, V::HALF_MD4, 1, 0x1746da32, 0x420013b5),
+        (0, V::HALF_MD4, 2, 0x22f941fc, 0xafe5ffd1),
+        (0, V::HALF_MD4, 3, 0xef105ba4, 0xffc12b8a),
+        (0, V::HALF_MD4, 4, 0xd8960ae, 0x41e48908),
+        (0, V::HALF_MD4, 5, 0x415798c2, 0xe25911d8),
+        (0, V::HALF_MD4, 6, 0x8036bd46, 0x9d765e5a),
+        (0, V::HALF_MD4, 7, 0xb8a27f84, 0x11ec56cf),
+        (0, V::HALF_MD4, 8, 0xb647b390, 0xe1d34df9),
+        (0, V::HALF_MD4, 9, 0x9be4a372, 0xc33d4f19),
+        (0, V::HALF_MD4, 10, 0x4261bd34, 0x4d364f39),
+        (0, V::TEA, 0, 0x6d0ea4c0, 0xc18922df),
+        (0, V::TEA, 1, 0x6f5bb1a8, 0x231917c2),
+        (0, V::TEA, 2, 0xb808ecc6, 0xc30dc579),
+        (0, V::TEA, 3, 0xd8f8040, 0x72379af6),
+        (0, V::TEA, 4, 0x3f9d267c, 0x205d372b),
+        (0, V::TEA, 5, 0x85384aa4, 0x3bd016f2),
+        (0, V::TEA, 6, 0xc4e94f42, 0x7d25c4a8),
+        (0, V::TEA, 7, 0x54d31c78, 0x5c5b1ba2),
+        (0, V::TEA, 8, 0xf9482fec, 0x968f8d66),
+        (0, V::TEA, 9, 0x84b3a194, 0x1cf71779),
+        (0, V::TEA, 10, 0xb5b9326c, 0xd92ce391),
+        (0, V::LEGACY_UNSIGNED, 0, 0xe74b53e2, 0x0),
+        (0, V::LEGACY_UNSIGNED, 1, 0x32252546, 0x0),
+        (0, V::LEGACY_UNSIGNED, 2, 0x8d4eb054, 0x0),
+        (0, V::LEGACY_UNSIGNED, 3, 0x89fab9c2, 0x0),
+        (0, V::LEGACY_UNSIGNED, 4, 0xa8c2175e, 0x0),
+        (0, V::LEGACY_UNSIGNED, 5, 0xa365191c, 0x0),
+        (0, V::LEGACY_UNSIGNED, 6, 0x71586034, 0x0),
+        (0, V::LEGACY_UNSIGNED, 7, 0x7851e27c, 0x0),
+        (0, V::LEGACY_UNSIGNED, 8, 0xef6de4fa, 0x0),
+        (0, V::LEGACY_UNSIGNED, 9, 0x7c3849d0, 0x0),
+        (0, V::LEGACY_UNSIGNED, 10, 0xb942486a, 0x0),
+        (0, V::HALF_MD4_UNSIGNED, 0, 0xd5fa7d7a, 0xacb48187),
+        (0, V::HALF_MD4_UNSIGNED, 1, 0x1746da32, 0x420013b5),
+        (0, V::HALF_MD4_UNSIGNED, 2, 0x22f941fc, 0xafe5ffd1),
+        (0, V::HALF_MD4_UNSIGNED, 3, 0xef105ba4, 0xffc12b8a),
+        (0, V::HALF_MD4_UNSIGNED, 4, 0xd8960ae, 0x41e48908),
+        (0, V::HALF_MD4_UNSIGNED, 5, 0x415798c2, 0xe25911d8),
+        (0, V::HALF_MD4_UNSIGNED, 6, 0x8036bd46, 0x9d765e5a),
+        (0, V::HALF_MD4_UNSIGNED, 7, 0xb8a27f84, 0x11ec56cf),
+        (0, V::HALF_MD4_UNSIGNED, 8, 0xb647b390, 0xe1d34df9),
+        (0, V::HALF_MD4_UNSIGNED, 9, 0xab408964, 0x7893b5c),
+        (0, V::HALF_MD4_UNSIGNED, 10, 0xcfdb2d3c, 0x8f4961fa),
+        (0, V::TEA_UNSIGNED, 0, 0x6d0ea4c0, 0xc18922df),
+        (0, V::TEA_UNSIGNED, 1, 0x6f5bb1a8, 0x231917c2),
+        (0, V::TEA_UNSIGNED, 2, 0xb808ecc6, 0xc30dc579),
+        (0, V::TEA_UNSIGNED, 3, 0xd8f8040, 0x72379af6),
+        (0, V::TEA_UNSIGNED, 4, 0x3f9d267c, 0x205d372b),
+        (0, V::TEA_UNSIGNED, 5, 0x85384aa4, 0x3bd016f2),
+        (0, V::TEA_UNSIGNED, 6, 0xc4e94f42, 0x7d25c4a8),
+        (0, V::TEA_UNSIGNED, 7, 0x54d31c78, 0x5c5b1ba2),
+        (0, V::TEA_UNSIGNED, 8, 0xf9482fec, 0x968f8d66),
+        (0, V::TEA_UNSIGNED, 9, 0xe665cc26, 0x417d943d),
+        (0, V::TEA_UNSIGNED, 10, 0x9df2c526, 0xceda22fd),
+        (1, V::LEGACY, 0, 0xe74b53e2, 0x0),
+        (1, V::LEGACY, 1, 0x32252546, 0x0),
+        (1, V::LEGACY, 2, 0x8d4eb054, 0x0),
+        (1, V::LEGACY, 3, 0x89fab9c2, 0x0),
+        (1, V::LEGACY, 4, 0xa8c2175e, 0x0),
+        (1, V::LEGACY, 5, 0xa365191c, 0x0),
+        (1, V::LEGACY, 6, 0x71586034, 0x0),
+        (1, V::LEGACY, 7, 0x7851e27c, 0x0),
+        (1, V::LEGACY, 8, 0xef6de4fa, 0x0),
+        (1, V::LEGACY, 9, 0x65f23bce, 0x0),
+        (1, V::LEGACY, 10, 0xb0b9e266, 0x0),
+        (1, V::HALF_MD4, 0, 0x73bfb0a, 0x7446406e),
+        (1, V::HALF_MD4, 1, 0xb230da8a, 0xd96b22d0),
+        (1, V::HALF_MD4, 2, 0x1c64957e, 0x251e9b3b),
+        (1, V::HALF_MD4, 3, 0xb2588710, 0x8cdaabf4),
+        (1, V::HALF_MD4, 4, 0x44008922, 0xc05a1fca),
+        (1, V::HALF_MD4, 5, 0xf492e7a, 0xcfda0b72),
+        (1, V::HALF_MD4, 6, 0x9060aea8, 0x34b4f35d),
+        (1, V::HALF_MD4, 7, 0x7acfd538, 0x4af46b50),
+        (1, V::HALF_MD4, 8, 0x25de8128, 0x9f0c555d),
+        (1, V::HALF_MD4, 9, 0xd731c0e4, 0x95aa1aeb),
+        (1, V::HALF_MD4, 10, 0x30d1d43e, 0xc7933a62),
+        (1, V::TEA, 0, 0xc3d656bc, 0x334f477f),
+        (1, V::TEA, 1, 0xbdcaa196, 0xf19746ea),
+        (1, V::TEA, 2, 0xa9bfe0a4, 0xd283e4bb),
+        (1, V::TEA, 3, 0x18b2f18c, 0x84219cd5),
+        (1, V::TEA, 4, 0xee1a1130, 0x6bc74a61),
+        (1, V::TEA, 5, 0x65c8e67e, 0x16490c6),
+        (1, V::TEA, 6, 0x211c9a8c, 0xda6664de),
+        (1, V::TEA, 7, 0xc2a7f142, 0x1a6c8154),
+        (1, V::TEA, 8, 0xe6c70bf6, 0x31e23d52),
+        (1, V::TEA, 9, 0xa784043e, 0x1a8157dc),
+        (1, V::TEA, 10, 0x5028644e, 0xd8e56ce2),
+        (1, V::LEGACY_UNSIGNED, 0, 0xe74b53e2, 0x0),
+        (1, V::LEGACY_UNSIGNED, 1, 0x32252546, 0x0),
+        (1, V::LEGACY_UNSIGNED, 2, 0x8d4eb054, 0x0),
+        (1, V::LEGACY_UNSIGNED, 3, 0x89fab9c2, 0x0),
+        (1, V::LEGACY_UNSIGNED, 4, 0xa8c2175e, 0x0),
+        (1, V::LEGACY_UNSIGNED, 5, 0xa365191c, 0x0),
+        (1, V::LEGACY_UNSIGNED, 6, 0x71586034, 0x0),
+        (1, V::LEGACY_UNSIGNED, 7, 0x7851e27c, 0x0),
+        (1, V::LEGACY_UNSIGNED, 8, 0xef6de4fa, 0x0),
+        (1, V::LEGACY_UNSIGNED, 9, 0x7c3849d0, 0x0),
+        (1, V::LEGACY_UNSIGNED, 10, 0xb942486a, 0x0),
+        (1, V::HALF_MD4_UNSIGNED, 0, 0x73bfb0a, 0x7446406e),
+        (1, V::HALF_MD4_UNSIGNED, 1, 0xb230da8a, 0xd96b22d0),
+        (1, V::HALF_MD4_UNSIGNED, 2, 0x1c64957e, 0x251e9b3b),
+        (1, V::HALF_MD4_UNSIGNED, 3, 0xb2588710, 0x8cdaabf4),
+        (1, V::HALF_MD4_UNSIGNED, 4, 0x44008922, 0xc05a1fca),
+        (1, V::HALF_MD4_UNSIGNED, 5, 0xf492e7a, 0xcfda0b72),
+        (1, V::HALF_MD4_UNSIGNED, 6, 0x9060aea8, 0x34b4f35d),
+        (1, V::HALF_MD4_UNSIGNED, 7, 0x7acfd538, 0x4af46b50),
+        (1, V::HALF_MD4_UNSIGNED, 8, 0x25de8128, 0x9f0c555d),
+        (1, V::HALF_MD4_UNSIGNED, 9, 0xc9eec110, 0x1143e9d9),
+        (1, V::HALF_MD4_UNSIGNED, 10, 0xf06f1324, 0x332596c9),
+        (1, V::TEA_UNSIGNED, 0, 0xc3d656bc, 0x334f477f),
+        (1, V::TEA_UNSIGNED, 1, 0xbdcaa196, 0xf19746ea),
+        (1, V::TEA_UNSIGNED, 2, 0xa9bfe0a4, 0xd283e4bb),
+        (1, V::TEA_UNSIGNED, 3, 0x18b2f18c, 0x84219cd5),
+        (1, V::TEA_UNSIGNED, 4, 0xee1a1130, 0x6bc74a61),
+        (1, V::TEA_UNSIGNED, 5, 0x65c8e67e, 0x16490c6),
+        (1, V::TEA_UNSIGNED, 6, 0x211c9a8c, 0xda6664de),
+        (1, V::TEA_UNSIGNED, 7, 0xc2a7f142, 0x1a6c8154),
+        (1, V::TEA_UNSIGNED, 8, 0xe6c70bf6, 0x31e23d52),
+        (1, V::TEA_UNSIGNED, 9, 0x96265bd4, 0xa2850e92),
+        (1, V::TEA_UNSIGNED, 10, 0xfff21ac, 0xb4d9d7f4),
+    ];
+    // `-s a1b2c3d4-e5f6-0718-293a-4b5c6d7e8f90`: the UUID's bytes read as
+    // little-endian words, as `s_hash_seed` is.
+    let seeds = [
+        [0u32; 4],
+        [0xd4c3_b2a1, 0x1807_f6e5, 0x5c4b_3a29, 0x908f_7e6d],
+    ];
+    for &(seed, version, name, hash, minor) in &table {
+        match ext4fs_dirhash(names[name], version, &seeds[seed]) {
+            Some(got) if got.hash == hash && got.minor == minor => {}
+            _ => return TestResult::Fail("directory hash differs from e2fsprogs dx_hash"),
+        }
     }
-    // Different name should yield (with overwhelming probability) a
-    // different hash. If this ever flakes the hash is broken.
-    let h3 = name_hash(b"world", hash_version::TEA, &seed);
-    if h1 == h3 {
-        return TestResult::Fail("TEA hash collision on tiny inputs");
-    }
-    // Legacy hash differs from TEA for the same input.
-    let h_legacy = name_hash(b"hello", hash_version::LEGACY, &seed);
-    if h1 == h_legacy {
-        return TestResult::Fail("LEGACY and TEA must differ for non-empty input");
+    // SipHash (6) and unknown versions are refused, as Linux's -EINVAL.
+    if ext4fs_dirhash(b"a", 6, &seeds[0]).is_some() || ext4fs_dirhash(b"a", 7, &seeds[0]).is_some()
+    {
+        return TestResult::Fail("an unsupported hash version must be refused");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/fs/ext2", smoke_ext2_htree_tea_hash_deterministic);
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_dirhash_matches_e2fsprogs);
+
+fn smoke_ext4_dirhash_never_returns_the_eof_cookie() -> TestResult {
+    // The hash readdir reserves (EXT4_HTREE_EOF_32BIT << 1) is folded to
+    // the one below it, and the low bit is always clear.
+    use crate::htree::{ext4fs_dirhash, hash_version as V, HTREE_EOF_32BIT};
+    let mut name = [0u8; 4];
+    for i in 0..20_000u32 {
+        name.copy_from_slice(&i.to_le_bytes());
+        for v in [V::LEGACY, V::HALF_MD4, V::TEA] {
+            let h = match ext4fs_dirhash(&name, v, &[0; 4]) {
+                Some(h) => h.hash,
+                None => return TestResult::Fail("base hash versions must hash"),
+            };
+            if h & 1 != 0 || h == HTREE_EOF_32BIT << 1 {
+                return TestResult::Fail("a name hashed to the EOF cookie or an odd value");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_dirhash_never_returns_the_eof_cookie
+);
+
+fn smoke_ext4_hash_signedness_follows_s_flags() -> TestResult {
+    use crate::htree::{hash_version as V, lookup_hash_version};
+    use crate::superblock::{Superblock, EXT2_FLAGS_SIGNED_HASH, EXT2_FLAGS_UNSIGNED_HASH};
+    let mut buf = alloc::vec![0u8; 1024];
+    buf[56..58].copy_from_slice(&crate::EXT2_SUPER_MAGIC.to_le_bytes());
+    let parse_with = |buf: &mut alloc::vec::Vec<u8>, flags: u32| {
+        buf[352..356].copy_from_slice(&flags.to_le_bytes());
+        Superblock::parse(buf).map(|sb| sb.hash_unsigned())
+    };
+    if parse_with(&mut buf, EXT2_FLAGS_UNSIGNED_HASH) != Some(3)
+        || parse_with(&mut buf, EXT2_FLAGS_SIGNED_HASH) != Some(0)
+    {
+        return TestResult::Fail("s_flags signedness must select the hash variant");
+    }
+    // Neither bit: the platform's char signedness (signed on x86_64).
+    let platform = if core::ffi::c_char::MIN == 0 { 3 } else { 0 };
+    if parse_with(&mut buf, 0) != Some(platform) {
+        return TestResult::Fail("no s_flags bit must fall back to the platform char");
+    }
+    if lookup_hash_version(V::HALF_MD4, 3) != V::HALF_MD4_UNSIGNED
+        || lookup_hash_version(V::TEA, 0) != V::TEA
+        || lookup_hash_version(V::LEGACY, 3) != V::LEGACY_UNSIGNED
+    {
+        return TestResult::Fail("dx_probe adds s_hash_unsigned to the base versions");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_hash_signedness_follows_s_flags
+);
+
+fn smoke_ext4_dx_root_refuses_what_dx_probe_refuses() -> TestResult {
+    use crate::htree::{hash_version as V, DxRoot, DX_ROOT_HEAD_OFF, DX_ROOT_INFO_OFF};
+    let root = |version: u8, levels: u8, flags: u8| {
+        let mut b = alloc::vec![0u8; 1024];
+        b[DX_ROOT_INFO_OFF + 4] = version;
+        b[DX_ROOT_INFO_OFF + 5] = 8;
+        b[DX_ROOT_INFO_OFF + 6] = levels;
+        b[DX_ROOT_INFO_OFF + 7] = flags;
+        b[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2].copy_from_slice(&123u16.to_le_bytes());
+        b[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4].copy_from_slice(&1u16.to_le_bytes());
+        DxRoot::parse(&b).is_some()
+    };
+    for v in [V::LEGACY, V::HALF_MD4, V::TEA] {
+        if !root(v, 0, 0) || !root(v, 1, 0) {
+            return TestResult::Fail("a base-version root with 0 or 1 levels must parse");
+        }
+    }
+    // The _UNSIGNED variants are never stored; SipHash needs casefold.
+    for v in [V::LEGACY_UNSIGNED, V::HALF_MD4_UNSIGNED, V::TEA_UNSIGNED, 6] {
+        if root(v, 0, 0) {
+            return TestResult::Fail("dx_probe refuses this on-disk hash version");
+        }
+    }
+    if root(V::TEA, 2, 0) {
+        return TestResult::Fail("two dx-node levels need largedir");
+    }
+    if root(V::TEA, 0, 1) {
+        return TestResult::Fail("unused_flags bit 0 is unimplemented in Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_dx_root_refuses_what_dx_probe_refuses
+);
 
 fn smoke_ext2_dir_splice_insert_and_delete() -> TestResult {
     use crate::dir::{ftype, rec_len_for, splice};
@@ -6876,18 +6780,12 @@ impl narf_block::BlockDeviceSync for CountingMemDisk {
     }
 }
 
-/// The unclean ext3 fixture with its journal emptied (`s_start == 0`) but the
-/// superblock's `RECOVER` bit still set: the state a writable mount repairs
-/// by rewriting the primary superblock.
+/// The journal fixture of `journal_tests.rs` with its log emptied
+/// (`s_start == 0`) but the superblock's `RECOVER` bit still set: the state a
+/// writable mount repairs by rewriting the primary superblock.
 fn build_ext3_stale_recover_image() -> Vec<u8> {
-    let mut img = build_ext3_unclean_image();
-    let incompat = u32::from_le_bytes(img[1024 + 96..1024 + 100].try_into().unwrap());
-    put_u32(
-        &mut img[1024..2048],
-        96,
-        incompat | super::superblock::incompat::RECOVER,
-    );
-    put_u32_be(&mut img[16 * 1024..17 * 1024], 28, 0); // JBD2 s_start = 0
+    let mut img = crate::journal_tests::ext3_image(true, 1, 0x8000 | 0o600);
+    crate::journal_tests::empty_log(&mut img);
     img
 }
 
@@ -6942,23 +6840,17 @@ kernel_test_in!(
     smoke_ext3_stale_recover_writable_mount_repairs_superblock
 );
 
-/// The same image on a boot-only-guarded (untrusted) disk mounts read-only
-/// with zero writes: the repair is skipped, the bytes are identical and a
-/// create is refused by the volume itself.
+/// The same image on a boot-only-guarded (untrusted) disk: `RECOVER` is set
+/// and the device cannot be written, so Linux's `ext4_load_journal` refuses
+/// the mount with EROFS ("write access unavailable, cannot proceed (try
+/// mounting with noload)") whether or not the log holds anything, and
+/// writes nothing.
 fn smoke_ext3_read_only_device_mount_never_writes() -> TestResult {
-    use narf_filesystem::FsInstance;
     let image = build_ext3_stale_recover_image();
     let (mounted, disk) = mount_through_boot_only_guard(image.clone());
-    let create = mounted
-        .as_ref()
-        .ok()
-        .map(|volume| poll_once(volume.root().create("new.txt")));
     narf_block::disk_policy::__set_policy_for_test(None);
-    let Ok(_volume) = mounted else {
-        return TestResult::Fail("read-only mount of the stale-RECOVER image failed");
-    };
-    if !matches!(create, Some(Some(Err(narf_filesystem::FsError::ReadOnly)))) {
-        return TestResult::Fail("create on a read-only-device mount was not refused");
+    if !matches!(mounted, Err(narf_filesystem::FsError::ReadOnly)) {
+        return TestResult::Fail("RECOVER on a read-only device must be EROFS");
     }
     if disk.writes() != 0 || disk.snapshot() != image {
         return TestResult::Fail("read-only-device ext3 mount wrote to the disk");
@@ -6970,29 +6862,14 @@ kernel_test_in!(
     smoke_ext3_read_only_device_mount_never_writes
 );
 
-/// A dirty journal (needs_recovery, `s_start != 0`) on a read-only device is
-/// replayed into memory only: the replayed directory is visible, nothing is
-/// written.
-fn smoke_ext3_dirty_journal_read_only_replays_in_memory_only() -> TestResult {
-    use narf_filesystem::FsInstance;
-    let mut image = build_ext3_unclean_image();
-    let incompat = u32::from_le_bytes(image[1024 + 96..1024 + 100].try_into().unwrap());
-    put_u32(
-        &mut image[1024..2048],
-        96,
-        incompat | super::superblock::incompat::RECOVER,
-    );
+/// A dirty journal (needs_recovery, `s_start != 0`) on a read-only device:
+/// EROFS and nothing written, as Linux does. There is no in-memory replay.
+fn smoke_ext3_dirty_journal_read_only_device_is_erofs() -> TestResult {
+    let image = crate::journal_tests::ext3_image(true, 1, 0x8000 | 0o600);
     let (mounted, disk) = mount_through_boot_only_guard(image.clone());
-    let names = mounted
-        .as_ref()
-        .ok()
-        .and_then(|volume| poll_once(volume.root().enumerate_async(0, 16)).and_then(Result::ok));
     narf_block::disk_policy::__set_policy_for_test(None);
-    if mounted.is_err() {
-        return TestResult::Fail("dirty-journal read-only mount failed");
-    }
-    if !names.is_some_and(|names| names.iter().any(|(name, _)| name == "REPLAYED")) {
-        return TestResult::Fail("dirty journal was not replayed in memory");
+    if !matches!(mounted, Err(narf_filesystem::FsError::ReadOnly)) {
+        return TestResult::Fail("dirty journal on a read-only device must be EROFS");
     }
     if disk.writes() != 0 || disk.snapshot() != image {
         return TestResult::Fail("dirty-journal read-only mount wrote to the disk");
@@ -7001,7 +6878,7 @@ fn smoke_ext3_dirty_journal_read_only_replays_in_memory_only() -> TestResult {
 }
 kernel_test_in!(
     "drivers/fs/ext2",
-    smoke_ext3_dirty_journal_read_only_replays_in_memory_only
+    smoke_ext3_dirty_journal_read_only_device_is_erofs
 );
 
 // ── FITRIM — first discard caller (#1166) ─────────────────────────
@@ -7359,3 +7236,766 @@ fn smoke_ext2_fitrim_ioctl_paths() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_fitrim_ioctl_paths);
+
+// ── Superblock lifecycle and the write gate (`volume::sb_state`) ─────
+
+fn sb_bytes_with(f: impl FnOnce(&mut [u8])) -> Option<super::superblock::Superblock> {
+    let mut b = alloc::vec![0u8; 1024];
+    b[56..58].copy_from_slice(&crate::EXT2_SUPER_MAGIC.to_le_bytes());
+    put_u16(&mut b, 0x3a, super::superblock::EXT2_VALID_FS);
+    f(&mut b);
+    super::superblock::Superblock::parse(&b)
+}
+
+fn smoke_ext4_rw_gate_rules() -> TestResult {
+    use crate::superblock::{compat, incompat, ro_compat, EXT2_ERROR_FS};
+    use crate::volume::sb_state::{rw_refusal, GateProfile as P};
+    let gate = |f: &dyn Fn(&mut [u8]), j: bool, o: bool, p: P| {
+        sb_bytes_with(|b| f(b)).map(|sb| rw_refusal(&sb, j, o, p).is_some())
+    };
+    let none = |_: &mut [u8]| {};
+    // (superblock edit, journal clean, orphans empty, profile, refused, rule)
+    type Case<'a> = (&'a dyn Fn(&mut [u8]), bool, bool, P, bool, &'static str);
+    let cases: [Case<'_>; 12] = [
+        (
+            &none,
+            false,
+            false,
+            P::RootRw,
+            false,
+            "a clean filesystem is writable",
+        ),
+        (
+            &|b| put_u32(b, 100, 0x8000_0000),
+            true,
+            true,
+            P::Default,
+            true,
+            "unknown ro_compat",
+        ),
+        (
+            &|b| put_u32(b, 100, ro_compat::GDT_CSUM),
+            true,
+            true,
+            P::Default,
+            true,
+            "legacy gdt_csum",
+        ),
+        (
+            &|b| put_u32(b, 96, incompat::RECOVER),
+            false,
+            true,
+            P::Default,
+            true,
+            "dirty journal",
+        ),
+        (
+            &|b| put_u32(b, 96, incompat::RECOVER),
+            true,
+            true,
+            P::Default,
+            false,
+            "stale RECOVER",
+        ),
+        (
+            &|b| put_u32(b, 100, ro_compat::ORPHAN_PRESENT),
+            true,
+            false,
+            P::Default,
+            true,
+            "orphans",
+        ),
+        (
+            &|b| put_u32(b, 100, ro_compat::ORPHAN_PRESENT),
+            true,
+            true,
+            P::Default,
+            false,
+            "stale ORPHAN_PRESENT",
+        ),
+        (
+            &|b| put_u32(b, 0xe8, 12),
+            true,
+            true,
+            P::Default,
+            true,
+            "s_last_orphan",
+        ),
+        (
+            &|b| {
+                put_u32(b, 92, compat::DIR_INDEX);
+                b[0xfc] = 3;
+            },
+            true,
+            true,
+            P::Default,
+            true,
+            "an unknown default hash",
+        ),
+        (
+            &|b| put_u16(b, 0x3a, 1 | EXT2_ERROR_FS),
+            true,
+            true,
+            P::Default,
+            false,
+            "errors, Linux rules",
+        ),
+        (
+            &|b| put_u16(b, 0x3a, 1 | EXT2_ERROR_FS),
+            true,
+            true,
+            P::RootRw,
+            true,
+            "errors under root-rw",
+        ),
+        (
+            &|b| put_u16(b, 0x3a, 0),
+            true,
+            true,
+            P::RootRw,
+            true,
+            "unclean under root-rw",
+        ),
+    ];
+    for (f, j, o, p, refused, _why) in cases {
+        if gate(f, j, o, p) != Some(refused) {
+            return TestResult::Fail("the write gate disagrees with its rule");
+        }
+    }
+    // Without root-rw an unclean filesystem mounts as Linux mounts it.
+    if gate(&|b| put_u16(b, 0x3a, 0), true, true, P::Default) != Some(false) {
+        return TestResult::Fail("Linux mounts an unchecked filesystem read-write");
+    }
+    // What the refusal means for a read-write request, as Linux decides it.
+    use crate::volume::sb_state::Refusal;
+    let kind = |ro_bits: u32| {
+        sb_bytes_with(|b| put_u32(b, 100, ro_bits))
+            .and_then(|sb| rw_refusal(&sb, true, true, P::Default))
+    };
+    if kind(ro_compat::READONLY | 0x8000_0000) != Some(Refusal::ReadOnlyFeature) {
+        return TestResult::Fail("READONLY mounts read-only before anything else is checked");
+    }
+    if !matches!(kind(0x8000_0000), Some(Refusal::Unsupported(_))) {
+        return TestResult::Fail("a feature Linux does not know is EINVAL for read-write");
+    }
+    if !matches!(kind(ro_compat::QUOTA), Some(Refusal::Gate(_))) {
+        return TestResult::Fail("quota is a feature Linux writes and NARF does not: EROFS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_rw_gate_rules);
+
+/// The extent fixture as a filesystem Linux unmounted cleanly
+/// (`s_state = EXT2_VALID_FS`).
+fn clean_ext4_extent_image(data: &[u8]) -> Vec<u8> {
+    let mut img = build_ext4_extent_image(data);
+    put_u16(&mut img, 1024 + 0x3a, super::superblock::EXT2_VALID_FS);
+    img
+}
+
+fn sb_on(device: &narf_block::ram::RamBlockDevice) -> super::superblock::Superblock {
+    let img = device.snapshot();
+    super::superblock::Superblock::parse(&img[1024..2048]).expect("superblock")
+}
+
+fn sb_u16(device: &narf_block::ram::RamBlockDevice, at: usize) -> u16 {
+    let img = device.snapshot();
+    u16::from_le_bytes([img[1024 + at], img[1024 + at + 1]])
+}
+
+fn smoke_ext4_rw_mount_marks_dirty_and_remount_ro_clean() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{sb_flags::RDONLY, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::superblock::{EXT2_FLAGS_SIGNED_HASH, EXT2_FLAGS_UNSIGNED_HASH, EXT2_VALID_FS};
+    use crate::volume::Ext2Volume;
+
+    let device = RamBlockDevice::from_image(512, clean_ext4_extent_image(b"lifecycle"));
+    let before = sb_on(&device);
+    let mounts = sb_u16(&device, 0x34);
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    if !before.is_clean() || volume.is_read_only() {
+        return TestResult::Fail("a clean fixture must mount read-write");
+    }
+    // ext4_setup_super without a journal: not clean, one more mount, a
+    // recorded hash signedness, the default maximal mount count.
+    let dirty = sb_on(&device);
+    if dirty.state & EXT2_VALID_FS != 0 || sb_u16(&device, 0x34) != mounts.wrapping_add(1) {
+        return TestResult::Fail("a read-write mount must clear VALID_FS and count the mount");
+    }
+    if dirty.flags & (EXT2_FLAGS_SIGNED_HASH | EXT2_FLAGS_UNSIGNED_HASH) == 0
+        || sb_u16(&device, 0x36) == 0
+    {
+        return TestResult::Fail("the mount must record hash signedness and a max mount count");
+    }
+    if poll_once(volume.root().syncfs())
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("syncfs failed");
+    }
+    if sb_on(&device).state & EXT2_VALID_FS != 0 {
+        return TestResult::Fail("syncfs must not mark the filesystem clean");
+    }
+    // Remount read-only: clean again, and writes are refused.
+    if !matches!(
+        poll_once(volume.reconfigure_sb_async(RDONLY, RDONLY, "")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("remount read-only failed");
+    }
+    if sb_on(&device).state != before.state || !volume.always_read_only() {
+        return TestResult::Fail("remount read-only must restore s_state and stop writing");
+    }
+    if !matches!(
+        poll_once(volume.root().create("after-ro")),
+        Some(Err(narf_filesystem::FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("a read-only remount must refuse writes with EROFS");
+    }
+    // Back to read-write, then the last reference drops: clean again.
+    if !matches!(
+        poll_once(volume.reconfigure_sb_async(0, RDONLY, "")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("remount read-write failed");
+    }
+    if sb_on(&device).state & EXT2_VALID_FS != 0 {
+        return TestResult::Fail("remount read-write must mark the filesystem dirty again");
+    }
+    drop(volume);
+    if sb_on(&device).state != before.state {
+        return TestResult::Fail("the last unmount must mark the filesystem clean");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_rw_mount_marks_dirty_and_remount_ro_clean
+);
+
+fn smoke_ext4_fs_error_records_and_root_rw_stops_writing() -> TestResult {
+    use narf_block::disk_policy::{self, DiskPolicy};
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::superblock::EXT2_ERROR_FS;
+    use crate::volume::sb_state::ErrorSite;
+    use crate::volume::Ext2Volume;
+
+    let run = |policy| {
+        disk_policy::__set_policy_for_test(Some(policy));
+        let device = RamBlockDevice::from_image(512, clean_ext4_extent_image(b"errors"));
+        let volume = poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0))?.ok()?;
+        poll_once(volume.fs_error(ErrorSite {
+            func: "smoke_test",
+            ino: 12,
+            block: 7,
+            errno: narf_lib::errno::EUCLEAN,
+        }))?;
+        let ro = volume.always_read_only();
+        let img = device.snapshot();
+        let count = u32::from_le_bytes(img[1024 + 0x194..1024 + 0x198].try_into().ok()?);
+        let func = img[1024 + 0x1a8..1024 + 0x1a8 + 10].to_vec();
+        let code = img[1024 + 0x27a];
+        drop(volume);
+        Some((ro, count, func, code, sb_on(&device).state))
+    };
+    let root_rw = run(DiskPolicy::RootRw);
+    let default = run(DiskPolicy::All);
+    disk_policy::__set_policy_for_test(None);
+    let (Some(root_rw), Some(default)) = (root_rw, default) else {
+        return TestResult::Fail("mount or fs_error failed");
+    };
+    if root_rw.1 != 1 || root_rw.2 != b"smoke_test" || root_rw.3 != 5 {
+        return TestResult::Fail(
+            "the error count, function and EXT4_ERR_EFSCORRUPTED must be recorded",
+        );
+    }
+    if !root_rw.0 || default.0 {
+        return TestResult::Fail("root-rw stops writing after an error; errors=continue does not");
+    }
+    if root_rw.4 & EXT2_ERROR_FS == 0 || default.4 & EXT2_ERROR_FS == 0 {
+        return TestResult::Fail("EXT4_ERROR_FS must survive the unmount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_fs_error_records_and_root_rw_stops_writing
+);
+
+fn smoke_ext4_refused_rw_mount_writes_nothing() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    // An orphan list NARF does not walk: read-only, and not one byte of
+    // the image changes, the gate's own repair included.
+    let mut img = clean_ext4_extent_image(b"refused");
+    put_u32(&mut img, 1024 + 0xe8, 12);
+    let device = RamBlockDevice::from_image(512, img);
+    let before = device.snapshot();
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let ro = volume.is_read_only();
+    let refusal = volume.refusal();
+    drop(volume);
+    if !ro || refusal.is_none() {
+        return TestResult::Fail("a non-empty orphan list must refuse read-write, with a reason");
+    }
+    if device.snapshot() != before {
+        return TestResult::Fail("a refused read-write mount must write nothing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_refused_rw_mount_writes_nothing
+);
+
+// ── Lazily initialized groups (`volume::uninit`) ─────────────────────
+
+fn smoke_ext4_uninit_group_layout_follows_linux() -> TestResult {
+    use crate::group_desc::GroupDesc;
+    use crate::superblock::{compat, ro_compat};
+    use crate::volume::uninit::{
+        base_meta_blocks, blocks_in_group, free_bits, gdt_blocks, has_super, init_block_bitmap,
+        init_inode_bitmap,
+    };
+    // 4 KiB blocks, 32768 blocks and 8192 inodes per group, 100 groups plus a
+    // short last one, 64-byte descriptors, 256-byte inodes, 63 reserved GDT
+    // blocks, sparse_super: mke2fs's defaults for a 13 GiB filesystem.
+    let sb = match sb_bytes_with(|b| {
+        put_u32(b, 4, 100 * 32768 + 1000); // s_blocks_count
+        put_u32(b, 24, 2); // s_log_block_size → 4096
+        put_u32(b, 32, 32768);
+        put_u32(b, 40, 8192);
+        put_u32(b, 76, 1);
+        put_u16(b, 88, 256);
+        put_u32(b, 96, super::superblock::incompat::SIXTYFOURBIT);
+        put_u32(b, 100, ro_compat::SPARSE_SUPER | ro_compat::METADATA_CSUM);
+        put_u16(b, 0xce, 63);
+        put_u16(b, 254, 64);
+    }) {
+        Some(sb) => sb,
+        None => return TestResult::Fail("superblock fixture"),
+    };
+    // ext4_bg_has_super: 0, 1, and powers of 3, 5 and 7.
+    let with_super: alloc::vec::Vec<u32> = (0..100).filter(|&g| has_super(&sb, g)).collect();
+    if with_super != [0, 1, 3, 5, 7, 9, 25, 27, 49, 81] {
+        return TestResult::Fail("sparse_super backups are 0, 1 and powers of 3, 5, 7");
+    }
+    // 101 groups of 64-byte descriptors fill two 4 KiB blocks.
+    if gdt_blocks(&sb) != 2
+        || base_meta_blocks(&sb, 3) != 1 + 2 + 63
+        || base_meta_blocks(&sb, 2) != 0
+    {
+        return TestResult::Fail(
+            "base metadata is superblock + GDT + reserved GDT, in backup groups",
+        );
+    }
+    if blocks_in_group(&sb, 100) != 1000 || blocks_in_group(&sb, 99) != 32768 {
+        return TestResult::Fail("the last group is short");
+    }
+    // sparse_super2 names its two backups.
+    let sb2 = sb_bytes_with(|b| {
+        put_u32(b, 4, 100 * 32768 + 1000);
+        put_u32(b, 24, 2);
+        put_u32(b, 32, 32768);
+        put_u32(b, 40, 8192);
+        put_u32(b, 76, 1);
+        put_u32(b, 92, compat::SPARSE_SUPER2);
+        put_u32(b, 0x24c, 1);
+        put_u32(b, 0x250, 99);
+    });
+    let Some(sb2) = sb2 else {
+        return TestResult::Fail("sparse_super2 fixture");
+    };
+    if (0..101)
+        .filter(|&g| has_super(&sb2, g))
+        .collect::<alloc::vec::Vec<_>>()
+        != [0, 1, 99]
+    {
+        return TestResult::Fail("sparse_super2 backups are the groups s_backup_bgs names");
+    }
+    // A flex_bg group whose bitmaps and inode table live in group 0: only
+    // the superblock copy and descriptor tables are used, plus nothing past
+    // the end; a short last group marks its tail used.
+    let elsewhere = GroupDesc {
+        block_bitmap: 1000,
+        inode_bitmap: 1100,
+        inode_table: 1200,
+        free_blocks_count: 0,
+        free_inodes_count: 0,
+        used_dirs_count: 0,
+        flags: 0,
+        itable_unused: 0,
+    };
+    let Some(g3) = init_block_bitmap(&sb, 3, &elsewhere) else {
+        return TestResult::Fail("init_block_bitmap refused a valid group");
+    };
+    if free_bits(&g3, 32768) != 32768 - 66 || g3[0] != 0xff || g3[66 / 8] & (1 << (66 % 8)) != 0 {
+        return TestResult::Fail("a backup group's base metadata, and nothing else, is in use");
+    }
+    let Some(last) = init_block_bitmap(&sb, 100, &elsewhere) else {
+        return TestResult::Fail("init_block_bitmap refused the last group");
+    };
+    if free_bits(&last, 32768) != 1000 {
+        return TestResult::Fail("the bits past a short group's end are in use");
+    }
+    // Its own bitmaps and inode table, when inside the group, are in use.
+    let first = 2 * 32768u64;
+    let own = GroupDesc {
+        block_bitmap: first,
+        inode_bitmap: first + 1,
+        inode_table: first + 2,
+        ..elsewhere
+    };
+    let Some(g2) = init_block_bitmap(&sb, 2, &own) else {
+        return TestResult::Fail("init_block_bitmap refused an own-metadata group");
+    };
+    // 8192 inodes of 256 bytes are 512 table blocks.
+    if free_bits(&g2, 32768) != 32768 - 2 - 512 {
+        return TestResult::Fail("a group's own bitmaps and inode table are in use");
+    }
+    let inodes = init_inode_bitmap(&sb);
+    if free_bits(&inodes, 8192) != 8192 || free_bits(&inodes, 4096 * 8) != 8192 {
+        return TestResult::Fail("an INODE_UNINIT bitmap is all free, padding set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_uninit_group_layout_follows_linux
+);
+
+/// `i_block` of the extent fixture's `data` (inode 12, 128-byte inodes).
+const DATA_IBLOCK: usize = 5 * 1024 + 11 * 128 + 40;
+
+/// `__ext4_ext_check` before an extent change: a leaf whose tail checksum
+/// fails refuses the write with EFSBADCRC (`BadChecksum`); one whose first
+/// extent does not start at its index key refuses with EFSCORRUPTED
+/// (`Corrupted`). Either way nothing is allocated and the error is recorded
+/// in the superblock (`ERROR_FS`, `s_error_count`).
+fn smoke_ext4_extent_write_checks_the_tree_first() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    for csum in [true, false] {
+        let mut image = clean_ext4_extent_image(b"x");
+        if csum && sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+            return TestResult::Fail("could not sign the metadata_csum fixture");
+        }
+        let device = RamBlockDevice::from_image(512, image);
+        let (volume, file) = match mount_ext4_data(device.clone()) {
+            Ok(v) => v,
+            Err(e) => return TestResult::Fail(e),
+        };
+        for block in [2u64, 4, 6, 8] {
+            if !matches!(poll_once(file.write(block * 1024, b"e")), Some(Ok(1))) {
+                return TestResult::Fail("writing extents into holes failed");
+            }
+        }
+        drop(file);
+        drop(volume);
+        let mut img = device.snapshot();
+        if u16::from_le_bytes([img[DATA_IBLOCK + 6], img[DATA_IBLOCK + 7]]) != 1 {
+            return TestResult::Fail("five extents should have grown the tree to depth 1");
+        }
+        let leaf_no = u32::from_le_bytes([
+            img[DATA_IBLOCK + 16],
+            img[DATA_IBLOCK + 17],
+            img[DATA_IBLOCK + 18],
+            img[DATA_IBLOCK + 19],
+        ]);
+        let leaf = leaf_no as usize * 1024;
+        let want = if csum {
+            // An unused entry slot: inside what the tail checksum covers.
+            img[leaf + 12 + 12 * 40] ^= 1;
+            FsError::BadChecksum
+        } else {
+            // The first extent no longer starts at its index key, 0.
+            put_u32(&mut img, leaf + 12, 1);
+            FsError::Corrupted
+        };
+        let used = count_used_blocks(&img);
+        let device = RamBlockDevice::from_image(512, img);
+        let (volume, file) = match mount_ext4_data(device.clone()) {
+            Ok(v) => v,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let got = poll_once(file.write(10 * 1024, b"z"));
+        drop(file);
+        drop(volume);
+        if got != Some(Err(want)) {
+            return TestResult::Fail(if csum {
+                "a write into a leaf with a bad tail checksum must be EBADMSG"
+            } else {
+                "a write into a leaf whose first key is not its index's must be EUCLEAN"
+            });
+        }
+        let after = device.snapshot();
+        if count_used_blocks(&after) != used {
+            return TestResult::Fail("a refused extent change allocated a block");
+        }
+        let error_count = u32::from_le_bytes([
+            after[1024 + 0x194],
+            after[1024 + 0x195],
+            after[1024 + 0x196],
+            after[1024 + 0x197],
+        ]);
+        if sb_on(&device).state & super::superblock::EXT2_ERROR_FS == 0 || error_count == 0 {
+            return TestResult::Fail("a damaged extent tree was not recorded in the superblock");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_write_checks_the_tree_first
+);
+
+/// An extent insert whose tree cannot grow (ENOSPC for the new leaf block
+/// after the data block was taken) frees the data block and leaves the
+/// inode as it was: the bitmap and the descriptor's count match the state
+/// before the write, `i_blocks` is unchanged, the file reads as before.
+fn smoke_ext4_extent_grow_enospc_frees_the_data_block() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    let mut image = clean_ext4_extent_image(b"x");
+    // Four free blocks (60..=63): three take the root to its four extents,
+    // the fourth is the data block of the write that cannot grow the tree.
+    for bit in 11..59usize {
+        image[3 * 1024 + bit / 8] |= 1 << (bit % 8);
+    }
+    set_free_counts(&mut image, 64, 32);
+    let device = RamBlockDevice::from_image(512, image);
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    for block in [2u64, 4, 6] {
+        if !matches!(poll_once(file.write(block * 1024, b"e")), Some(Ok(1))) {
+            return TestResult::Fail("writing extents into holes failed");
+        }
+    }
+    let before = device.snapshot();
+    let blocks_before = file.stat().blocks;
+    if poll_once(file.write(8 * 1024, b"f")) != Some(Err(FsError::NoSpace)) {
+        return TestResult::Fail("an extent insert that cannot grow the tree must be ENOSPC");
+    }
+    drop(file);
+    drop(volume);
+    let after = device.snapshot();
+    if count_used_blocks(&after) != count_used_blocks(&before) {
+        return TestResult::Fail("the data block of the refused insert leaked");
+    }
+    if after[2048 + 12..2048 + 14] != before[2048 + 12..2048 + 14] {
+        return TestResult::Fail("the descriptor's free count drifted from the bitmap");
+    }
+    if after[DATA_IBLOCK..DATA_IBLOCK + 60] != before[DATA_IBLOCK..DATA_IBLOCK + 60] {
+        return TestResult::Fail("the refused insert changed the extent root");
+    }
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if file.stat().blocks != blocks_before {
+        return TestResult::Fail("i_blocks counts the refused insert's block");
+    }
+    let mut got = vec![0u8; 9 * 1024];
+    let n = match poll_once(file.read(0, &mut got)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("reading the file back failed"),
+    };
+    if n != 6 * 1024 + 1 || got[0] != b'x' || got[2048] != b'e' || got[6 * 1024] != b'e' {
+        return TestResult::Fail("the file changed after a refused insert");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_grow_enospc_frees_the_data_block
+);
+
+/// The namespace keeps Linux's no-journal-safe shapes and link limits.
+/// - A rename over an existing name repoints that name's dirent in place
+///   (`ext4_setent`): the dirent stays where it was, naming the new inode,
+///   and the replaced inode is freed.
+/// - `link` of an inode at `EXT4_LINK_MAX` (65000) links is EMLINK, and
+///   changes nothing.
+/// - `mkdir` in a directory at 65000 links is EMLINK; `dir_nlink` lifts that
+///   only for an indexed directory (`EXT4_DIR_LINK_MAX`).
+fn smoke_ext2_namespace_follows_linux_link_rules() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const ROOT_BLOCK: usize = 9 * 1024;
+    const ITAB: usize = 5 * 1024;
+    let dirent_of = |img: &[u8], name: &[u8]| -> Option<(usize, u32)> {
+        let mut off = 0usize;
+        while off + 8 <= 1024 {
+            let at = ROOT_BLOCK + off;
+            let ino = u32::from_le_bytes([img[at], img[at + 1], img[at + 2], img[at + 3]]);
+            let rec_len = usize::from(u16::from_le_bytes([img[at + 4], img[at + 5]]));
+            let len = usize::from(img[at + 6]);
+            if rec_len < 8 {
+                return None;
+            }
+            if ino != 0 && &img[at + 8..at + 8 + len] == name {
+                return Some((off, ino));
+            }
+            off += rec_len;
+        }
+        None
+    };
+
+    // Rename over an existing name.
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"old"));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    if !matches!(poll_once(root.create("tmp")), Some(Ok(_))) {
+        return TestResult::Fail("could not create the replacement source");
+    }
+    let Some((_, tmp_ino)) = dirent_of(&device.snapshot(), b"tmp") else {
+        return TestResult::Fail("the created name is not in the root block");
+    };
+    let Some((data_off, 12)) = dirent_of(&device.snapshot(), b"data") else {
+        return TestResult::Fail("fixture has no `data` -> 12");
+    };
+    if !matches!(poll_once(root.rename("tmp", "data")), Some(Ok(()))) {
+        return TestResult::Fail("rename over an existing name failed");
+    }
+    drop(root);
+    drop(volume);
+    let img = device.snapshot();
+    if dirent_of(&img, b"data") != Some((data_off, tmp_ino)) {
+        return TestResult::Fail("a replacing rename must repoint the dirent in place");
+    }
+    if dirent_of(&img, b"tmp").is_some() {
+        return TestResult::Fail("the source name survived the rename");
+    }
+    if img[4 * 1024 + 1] & (1 << 3) != 0 {
+        return TestResult::Fail("the replaced inode 12 was not freed");
+    }
+
+    // link at EXT4_LINK_MAX.
+    let mut img = build_ext2_image(b"x");
+    put_u16(&mut img, ITAB + 11 * 128 + 26, 65000);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    if poll_once(volume.root().link("data", "again")) != Some(Err(FsError::TooManyLinks)) {
+        return TestResult::Fail("link of an inode at 65000 links must be EMLINK");
+    }
+    drop(volume);
+    let img = device.snapshot();
+    if u16::from_le_bytes([img[ITAB + 11 * 128 + 26], img[ITAB + 11 * 128 + 27]]) != 65000
+        || dirent_of(&img, b"again").is_some()
+    {
+        return TestResult::Fail("a refused link changed the link count or the directory");
+    }
+
+    // mkdir in a directory at EXT4_LINK_MAX, without and with dir_nlink: the
+    // root is not indexed, so dir_nlink does not lift the limit.
+    for dir_nlink in [false, true] {
+        let mut img = build_ext2_image(b"x");
+        put_u16(&mut img, ITAB + 128 + 26, 65000);
+        if dir_nlink {
+            put_u32(
+                &mut img,
+                1024 + 100,
+                super::superblock::ro_compat::DIR_NLINK,
+            );
+        }
+        let device = RamBlockDevice::from_image(512, img);
+        let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("mount failed"),
+        };
+        let made = poll_once(volume.root().mkdir("sub")).map(|r| r.map(|_| ()));
+        if made != Some(Err(FsError::TooManyLinks)) {
+            return TestResult::Fail(
+                "mkdir in a linear directory at 65000 links must be EMLINK, dir_nlink or not",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_namespace_follows_linux_link_rules
+);
+
+/// `ext4_inode_blocks` / `ext4_inode_blocks_set`. With huge_file, an inode
+/// whose `i_blocks` uses its high half (`l_i_blocks_high`, byte 116) or
+/// `HUGE_FILE_FL` holds 2 TiB or more, which NARF's 32-bit count cannot
+/// keep: rewriting it is EFBIG and leaves the high half alone. Without
+/// huge_file Linux never reads those bits, and a write stores them as it
+/// does: zero.
+fn smoke_ext4_inode_blocks_high_half_follows_huge_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const DATA_INODE: usize = 5 * 1024 + 11 * 128;
+    for huge_file in [true, false] {
+        let mut img = build_ext2_image(b"data");
+        put_u16(&mut img, DATA_INODE + 116, 1);
+        if huge_file {
+            put_u32(
+                &mut img,
+                1024 + 100,
+                super::superblock::ro_compat::HUGE_FILE,
+            );
+        }
+        let device = RamBlockDevice::from_image(512, img);
+        let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("mount failed"),
+        };
+        let file = match poll_once(volume.root().lookup_async("data")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("lookup of `data` failed"),
+        };
+        let wrote = poll_once(file.write(4, b"more"));
+        drop(file);
+        drop(volume);
+        let high = {
+            let img = device.snapshot();
+            u16::from_le_bytes([img[DATA_INODE + 116], img[DATA_INODE + 117]])
+        };
+        if huge_file {
+            if wrote != Some(Err(FsError::FileTooLarge)) || high != 1 {
+                return TestResult::Fail(
+                    "an inode with a 48-bit i_blocks must refuse a rewrite with EFBIG",
+                );
+            }
+        } else if wrote != Some(Ok(4)) || high != 0 {
+            return TestResult::Fail("without huge_file the high half must be written as 0");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_inode_blocks_high_half_follows_huge_file
+);

@@ -345,7 +345,7 @@ pub mod disk_policy {
     pub const ARG: &str = "narf.disks";  // all | boot-only | root-ro | root-rw
     pub enum DiskPolicy { All, BootOnly, RootRo, RootRw }
     pub enum PolicyError { NotRootPolicy, NoRootUuidArg, UuidMismatch, NoSuchDevice,
-        NotAPartition, IdentityMismatch, Ambiguous, EfiOrVfat, NotBtrfs,
+        NotAPartition, IdentityMismatch, Ambiguous, EfiOrVfat, UnsupportedRootFs,
         AlreadyDesignated, Revoked }
     pub type DiskId = u64;                          // physical disk, never reused
     pub type DevId = u64;                           // registry entry, never reused
@@ -385,7 +385,8 @@ Under `RootRo` / `RootRw` nothing is writable until root mounting calls
 against the command line (exactly one `root=`), the partition metadata and the
 device's own superblock; refuses whole disks, ESP / vfat partitions, a UUID
 carried by more than one registered device, and (under `RootRw`) anything but
-btrfs. Under `RootRw` the guard whose `DevId` was designated passes writes,
+btrfs or ext4, the two filesystems whose writers have a write-safety gate
+(`UnsupportedRootFs`). Under `RootRw` the guard whose `DevId` was designated passes writes,
 as does its verified ESP (below); under `RootRo` neither does. The root
 designation is revoked for the rest of the boot if that entry is unregistered
 or replaced or another device carrying
@@ -446,7 +447,7 @@ retains one-attempt semantics.
 `disk_policy::designate_encrypted_root(name, container_uuid, &view)` retains
 all partition, on-medium UUID, uniqueness, ESP, hotplug, and revocation checks.
 It requires the concrete authenticated adapter to wrap the exact registered
-backing Arc; root-rw additionally requires btrfs inside that adapter. In root
+backing Arc; root-rw additionally requires btrfs or ext4 inside that adapter. In root
 policies, `root=UUID=` selects the **outer LUKS UUID**; an inner UUID alone does
 not authorize probing every encrypted disk.
 `registry::register_encrypted_root(name, parent, view)` registers that concrete

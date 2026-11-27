@@ -30,7 +30,25 @@ pub struct GroupDesc {
     pub free_inodes_count: u32,
     /// `bg_used_dirs_count` (+ _hi).
     pub used_dirs_count: u32,
+    /// `bg_flags` (offset 0x12): [`BG_INODE_UNINIT`], [`BG_BLOCK_UNINIT`],
+    /// [`BG_INODE_ZEROED`]. Meaningful only with a group-descriptor
+    /// checksum (`metadata_csum` or `gdt_csum`).
+    pub flags: u16,
+    /// `bg_itable_unused` (+ _hi): inodes at the end of the table never
+    /// used.
+    pub itable_unused: u32,
 }
+
+/// `EXT4_BG_INODE_UNINIT`: the inode bitmap was never written; every inode
+/// of the group is free.
+pub const BG_INODE_UNINIT: u16 = 0x1;
+/// `EXT4_BG_BLOCK_UNINIT`: the block bitmap was never written; its
+/// contents are derived from the group's layout (`ext4_init_block_bitmap`).
+pub const BG_BLOCK_UNINIT: u16 = 0x2;
+/// `EXT4_BG_INODE_ZEROED`: the inode table is zeroed.
+pub const BG_INODE_ZEROED: u16 = 0x4;
+/// Offset of `bg_flags` in a descriptor.
+pub const BG_FLAGS_OFFSET: usize = 0x12;
 
 /// ext2/3 on-disk descriptor size. ext4 with 64BIT uses 64.
 pub const GROUP_DESC_SIZE: usize = 32;
@@ -50,6 +68,13 @@ impl GroupDesc {
         let free_blocks_lo = u16::from_le_bytes([buf[12], buf[13]]);
         let free_inodes_lo = u16::from_le_bytes([buf[14], buf[15]]);
         let used_dirs_lo = u16::from_le_bytes([buf[16], buf[17]]);
+        let flags = u16::from_le_bytes([buf[0x12], buf[0x13]]);
+        let itable_unused_lo = u16::from_le_bytes([buf[0x1c], buf[0x1d]]);
+        let itable_unused_hi = if desc_size >= 64 {
+            u16::from_le_bytes([buf[0x32], buf[0x33]])
+        } else {
+            0
+        };
 
         let (
             block_bitmap_hi,
@@ -85,6 +110,8 @@ impl GroupDesc {
             free_blocks_count: ((free_blocks_hi as u32) << 16) | free_blocks_lo as u32,
             free_inodes_count: ((free_inodes_hi as u32) << 16) | free_inodes_lo as u32,
             used_dirs_count: ((used_dirs_hi as u32) << 16) | used_dirs_lo as u32,
+            flags,
+            itable_unused: ((itable_unused_hi as u32) << 16) | itable_unused_lo as u32,
         })
     }
 

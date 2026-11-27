@@ -800,3 +800,176 @@ fn smoke_crypto_debug_redaction() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("crypto", smoke_crypto_debug_redaction);
+
+/// Deterministic filler for the SIMD tests.
+#[cfg(target_arch = "x86_64")]
+fn simd_test_bytes(seed: u64, out: &mut [u8]) {
+    let mut x = seed | 1;
+    for byte in out.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *byte = x as u8;
+    }
+}
+
+/// The AES-NI and SHA-NI paths leave `xmm0`-`xmm15` exactly as they found
+/// them: a pattern loaded into the registers survives an AES-256-XTS
+/// encryption and a PBKDF2-HMAC-SHA-256 that spans several sections. The
+/// pattern stands in for a user task's live FP/SIMD state (`simd.rs`).
+#[cfg(target_arch = "x86_64")]
+fn smoke_crypto_simd_preserves_xmm() -> TestResult {
+    use crate::{aes_xts_256_encrypt_with_sector_size, AesXts256, Key};
+    use narf_capabilities::{Cap, Grant};
+
+    #[repr(C, align(16))]
+    struct Regs([u8; 256]);
+
+    let caps = crate::simd::caps();
+    if !caps.aes || !caps.sha256 {
+        return TestResult::Skip("CPU lacks AES-NI or SHA-NI");
+    }
+    let mut pattern = Regs([0; 256]);
+    simd_test_bytes(0x5eed, &mut pattern.0);
+    let mut after = Regs([0; 256]);
+    let mut key = [0u8; 64];
+    simd_test_bytes(7, &mut key);
+    let mut data = [0u8; 4096 + 48];
+    let cap = Cap::<Key<AesXts256>, Grant>::bootstrap();
+    let mut derived = [0u8; 64];
+    let mut crypt_ok = false;
+    // The outer section keeps whatever this CPU had in the registers.
+    crate::simd::section(|| {
+        // SAFETY: inside a section; `pattern` is 256 aligned bytes.
+        unsafe {
+            core::arch::asm!(
+                "movdqa xmm0, [{p}]", "movdqa xmm1, [{p} + 16]",
+                "movdqa xmm2, [{p} + 32]", "movdqa xmm3, [{p} + 48]",
+                "movdqa xmm4, [{p} + 64]", "movdqa xmm5, [{p} + 80]",
+                "movdqa xmm6, [{p} + 96]", "movdqa xmm7, [{p} + 112]",
+                "movdqa xmm8, [{p} + 128]", "movdqa xmm9, [{p} + 144]",
+                "movdqa xmm10, [{p} + 160]", "movdqa xmm11, [{p} + 176]",
+                "movdqa xmm12, [{p} + 192]", "movdqa xmm13, [{p} + 208]",
+                "movdqa xmm14, [{p} + 224]", "movdqa xmm15, [{p} + 240]",
+                p = in(reg) pattern.0.as_ptr(),
+                out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+                out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+                out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+                out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        crypt_ok = aes_xts_256_encrypt_with_sector_size(&cap, &key, 9, 512, &mut data).is_ok();
+        crate::pbkdf2::pbkdf2_hmac_sha256(b"pw", b"salt", 1000, &mut derived);
+        // SAFETY: as above; `after` is 256 writable aligned bytes.
+        unsafe {
+            core::arch::asm!(
+                "movdqa [{q}], xmm0", "movdqa [{q} + 16], xmm1",
+                "movdqa [{q} + 32], xmm2", "movdqa [{q} + 48], xmm3",
+                "movdqa [{q} + 64], xmm4", "movdqa [{q} + 80], xmm5",
+                "movdqa [{q} + 96], xmm6", "movdqa [{q} + 112], xmm7",
+                "movdqa [{q} + 128], xmm8", "movdqa [{q} + 144], xmm9",
+                "movdqa [{q} + 160], xmm10", "movdqa [{q} + 176], xmm11",
+                "movdqa [{q} + 192], xmm12", "movdqa [{q} + 208], xmm13",
+                "movdqa [{q} + 224], xmm14", "movdqa [{q} + 240], xmm15",
+                q = in(reg) after.0.as_mut_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
+    });
+    if !crypt_ok {
+        return TestResult::Fail("AES-XTS-256 refused a valid request");
+    }
+    if after.0 != pattern.0 {
+        return TestResult::Fail("an XMM register changed across the AES-NI/SHA-NI paths");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("crypto/simd", smoke_crypto_simd_preserves_xmm);
+
+/// The accelerated AES-XTS and PBKDF2 agree with the portable ones through
+/// the public API, in kernel context: AES-128 and AES-256, 512- and
+/// 4096-byte units, a short final unit, more than one 16 KiB section.
+#[cfg(target_arch = "x86_64")]
+fn smoke_crypto_simd_matches_portable() -> TestResult {
+    use crate::{
+        aes_xts_128_decrypt, aes_xts_128_encrypt, aes_xts_256_decrypt_with_sector_size,
+        aes_xts_256_encrypt_with_sector_size, AesXts128, AesXts256, Key,
+    };
+    use alloc::vec;
+    use narf_capabilities::{Cap, Grant};
+
+    let caps = crate::simd::caps();
+    if !caps.aes && !caps.sha256 {
+        return TestResult::Skip("CPU lacks AES-NI and SHA-NI");
+    }
+    let cap128 = Cap::<Key<AesXts128>, Grant>::bootstrap();
+    let cap256 = Cap::<Key<AesXts256>, Grant>::bootstrap();
+    let mut k128 = [0u8; 32];
+    let mut k256 = [0u8; 64];
+    simd_test_bytes(128, &mut k128);
+    simd_test_bytes(256, &mut k256);
+    for (unit, len) in [
+        (512usize, 512usize),
+        (512, 3 * 16384 + 1536),
+        (4096, 4096 * 5 + 1024),
+    ] {
+        let mut plain = vec![0u8; len];
+        simd_test_bytes(len as u64, &mut plain);
+        for sector in [0u64, 0x1_0000_0001] {
+            let mut fast128 = plain.clone();
+            let mut fast256 = plain.clone();
+            let ok = aes_xts_128_encrypt(&cap128, &k128, sector, unit, &mut fast128).is_ok()
+                && aes_xts_256_encrypt_with_sector_size(&cap256, &k256, sector, unit, &mut fast256)
+                    .is_ok();
+            crate::simd::force_portable_for_test(true);
+            let mut slow128 = plain.clone();
+            let mut slow256 = plain.clone();
+            let ok = ok
+                && aes_xts_128_encrypt(&cap128, &k128, sector, unit, &mut slow128).is_ok()
+                && aes_xts_256_encrypt_with_sector_size(&cap256, &k256, sector, unit, &mut slow256)
+                    .is_ok();
+            // Decrypt the accelerated ciphertext on the portable path.
+            let mut back128 = fast128.clone();
+            let mut back256 = fast256.clone();
+            let ok = ok
+                && aes_xts_128_decrypt(&cap128, &k128, sector, unit, &mut back128).is_ok()
+                && aes_xts_256_decrypt_with_sector_size(&cap256, &k256, sector, unit, &mut back256)
+                    .is_ok();
+            crate::simd::force_portable_for_test(false);
+            // And the portable ciphertext on the accelerated path.
+            let mut back_fast = slow256.clone();
+            let ok = ok
+                && aes_xts_256_decrypt_with_sector_size(
+                    &cap256,
+                    &k256,
+                    sector,
+                    unit,
+                    &mut back_fast,
+                )
+                .is_ok();
+            if !ok {
+                return TestResult::Fail("AES-XTS refused a valid request");
+            }
+            if fast128 != slow128 || fast256 != slow256 {
+                return TestResult::Fail("AES-NI ciphertext differs from the portable path");
+            }
+            if back128 != plain || back256 != plain || back_fast != plain {
+                return TestResult::Fail("AES-XTS round trip across the two paths failed");
+            }
+        }
+    }
+    let mut fast = [0u8; 64];
+    let mut slow = [0u8; 64];
+    crate::pbkdf2::pbkdf2_hmac_sha256(b"passphrase", &[0x3c; 32], 5000, &mut fast);
+    crate::simd::force_portable_for_test(true);
+    crate::pbkdf2::pbkdf2_hmac_sha256(b"passphrase", &[0x3c; 32], 5000, &mut slow);
+    crate::simd::force_portable_for_test(false);
+    if fast != slow {
+        return TestResult::Fail("SHA-NI PBKDF2 differs from the portable path");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("crypto/simd", smoke_crypto_simd_matches_portable);

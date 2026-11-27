@@ -1154,6 +1154,13 @@ pub fn __reset_modifiers_for_test() {
 /// blocked console reader from IRQ context without dropping an `Arc`
 /// under the lock.
 pub fn push_global(ev: InputEvent) -> bool {
+    // A boot credential prompt owns every keystroke while it reads
+    // (see `secret`): the key never reaches the console ring.
+    if let InputEvent::Key(key) = ev {
+        if secret::divert(key) {
+            return true;
+        }
+    }
     let is_key = matches!(ev, InputEvent::Key(_));
     let is_ascii = matches!(ev, InputEvent::AsciiByte(_));
     let is_pointer = matches!(ev, InputEvent::Pointer(_));
@@ -1583,7 +1590,15 @@ pub fn register_initcalls() {
 }
 
 pub mod goodix;
+pub mod keymap;
 pub mod rmi4;
+pub mod secret;
+
+pub use keymap::key_to_ascii;
+pub use secret::{
+    begin_secret_entry, poll_keyboards, pop_secret_key, register_keyboard_poller,
+    secret_entry_active, SecretEntry,
+};
 
 // ── evdev event-routing layer ─────────────────────────────────────────────────
 

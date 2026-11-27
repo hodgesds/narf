@@ -10746,3 +10746,41 @@ fn smoke_synaptics_image_sensor_irq_path() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/input", smoke_synaptics_image_sensor_irq_path);
+
+fn smoke_i8042_keys_go_to_secret_entry() -> TestResult {
+    // The decoder feeds the boot credential prompt, not the console
+    // ring, while a prompt holds secret entry: shift + a, then Enter.
+    use crate::i8042;
+    use narf_input::{
+        __reset_global_ring_for_test, __reset_modifiers_for_test, begin_secret_entry,
+        init_global_ring, key_to_ascii, pop_global, pop_secret_key,
+    };
+
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    __reset_modifiers_for_test();
+    i8042::__reset_for_test();
+    let Some(guard) = begin_secret_entry() else {
+        return TestResult::Fail("secret entry already active");
+    };
+    i8042::feed_bytes_for_test(&[0x2A, 0x1E, 0x9E, 0xAA, 0x1C, 0x9C]);
+    let mut typed = alloc::vec::Vec::new();
+    while let Some(k) = pop_secret_key() {
+        if k.pressed {
+            if let Some(b) = key_to_ascii(k.code, k.modifiers) {
+                typed.push(b);
+            }
+        }
+    }
+    let leaked = pop_global();
+    drop(guard);
+    __reset_modifiers_for_test();
+    if leaked.is_some() {
+        return TestResult::Fail("an i8042 keystroke reached the console ring during secret entry");
+    }
+    if typed != b"A\n" {
+        return TestResult::Fail("secret entry must see the decoded keys in order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input", smoke_i8042_keys_go_to_secret_entry);

@@ -465,22 +465,89 @@ ordinary encrypted CachyOS installation bootable through the native package.
 | Open common LUKS2 volumes | Implemented for one normal AES-XTS/`plain64` crypt segment with bounded PBKDF2 or Argon2i/Argon2id keyslots |
 | Read and write the unlocked payload | Implemented; LUKS metadata itself is opened read-only |
 | Supply a key from a measured NARF initramfs | Implemented with `rd.luks.key=/path` and optional `rd.luks.uuid=<uuid>` |
-| Prompt interactively for a passphrase during boot | Not implemented |
+| Prompt interactively for a passphrase during boot | Implemented: `rd.luks.prompt=console` (built-in keyboard, US layout; serial too) or `rd.luks.prompt=serial`, with `rd.luks.uuid=<container-uuid>` |
 | Format LUKS, edit keyslots, repair metadata, use integrity profiles, or resume reencryption | Not implemented |
-| Unlock an installed CachyOS root from the current Arch package entry | Not integrated or accepted as a supported workflow |
+| Unlock an installed CachyOS root from the current Arch package entry | Not integrated; use a native `efi-image` with the prompt (below) |
 
 The keyfile path names a file *inside the staged NARF initramfs*, not a path on
 the still-locked root filesystem. The current Arch package boots built-in
-userspace and does not build or attach a CachyOS-specific NARF initramfs, add
-the required kernel arguments, or offer an unlock prompt. A typical encrypted
-CachyOS root therefore remains unavailable even when its particular LUKS
-header and cipher profile are understood by the block layer.
+userspace and does not add the kernel arguments below.
 
-For now, leave an encrypted production installation unchanged. Test storage
-with a disposable unencrypted ext4 image or disk, or build a dedicated NARF
-initramfs containing a test keyfile. Never copy a production passphrase into a
-development image, and do not remove encryption from the CachyOS installation
-just to test NARF.
+An installed encrypted root is unlocked with the passphrase prompt. Never use a
+keyfile for it: the image sits unencrypted on the ESP, so a key inside it
+unlocks the disk for anyone who can read the ESP. Never copy a production
+passphrase into a development image, and do not remove encryption from the
+CachyOS installation to test NARF.
+
+The prompt runs in the kernel while the root mounts, before PID 1. It prints
+`LUKS <uuid> passphrase (no echo): ` and reads the built-in keyboard (and the
+serial console, if there is one). Each keystroke goes only to the prompt: not to
+the console, not to any `/dev/input/event*` node. Enter submits, Backspace
+deletes a character, Ctrl-U clears the line, and Escape or Ctrl-C gives up. A
+wrong passphrase prints `No key available with this passphrase.` and asks again,
+up to `rd.luks.tries=` times (default 3). Each attempt waits at most
+`rd.luks.timeout=` seconds (default 90, at most 300). USB keyboards are
+best-effort at this stage of boot; use the built-in one.
+
+A read-only trial of a LUKS root (nothing on the disk is written; systemd runs on
+a tmpfs overlay), chainloaded from GRUB like any native image. Here
+`<LUKS_UUID>` is the container's own UUID, the one `lsblk -f` shows for the
+`crypto_LUKS` partition. Under `root-ro` and `root-rw`, `root=UUID=` names the
+container too, not the filesystem inside it: the disk policy designates the
+partition by its own identity
+([block spec](../block/specification/spec.md)).
+
+```sh
+cargo xtask efi-image --output target/narf-root-ro.efi \
+  --cmdline "narf.disks=root-ro root=UUID=<LUKS_UUID> rd.luks.uuid=<LUKS_UUID> \
+rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
+```
+
+`systemd_pid1` on the command line selects the systemd PID 1 kernel build, as
+`--root-policy` does for `grub-image`.
+
+#### An ext4 root, read-write
+
+`narf.disks=root-rw` takes an ext4 root as well as a btrfs one, the
+LUKS-unlocked root above included:
+
+```sh
+cargo xtask efi-image --output target/narf-root-rw.efi \
+  --cmdline "narf.disks=root-rw root=UUID=<LUKS_UUID> rd.luks.uuid=<LUKS_UUID> \
+rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
+```
+
+- **No journal.** NARF writes ext4 metadata in place and never writes the
+  journal. Its writes follow an order in which a crash leaves only what
+  e2fsck repairs: a leaked block, a directory entry reachable twice, a link
+  count one too high. A crash never leaves a name pointing at a freed inode,
+  or a block mapped by two files.
+- **Not clean while mounted.** Because nothing is journaled, a read-write
+  mount clears the clean bit and counts a mount, as Linux does without a
+  journal (`dumpe2fs -h` shows `Filesystem state: not clean`). A remount
+  read-only or an unmount sets it again. After a NARF crash the next CachyOS
+  boot finds the root not clean, and its fsck runs a full e2fsck.
+- **The gate.** The root mounts read-only instead, with the reason on the
+  boot banner, when the filesystem:
+  - has recorded errors or was not cleanly unmounted (run e2fsck);
+  - has a journal needing recovery (boot CachyOS once);
+  - has an orphan list that isn't empty;
+  - has features NARF cannot write: quota, project, bigalloc, verity,
+    legacy `gdt_csum`;
+  - has a default directory hash other than legacy, half-MD4 or TEA.
+
+  A root with an incompat feature NARF cannot read (`meta_bg`,
+  `inline_data`, `encrypt`, `casefold`, `largedir`, `ea_inode`, `mmp`) does
+  not mount at all. A mkfs.ext4 default root (metadata_csum, 64bit,
+  flex_bg, orphan_file, dir_nlink, huge_file) passes.
+- **Before the first `root-rw` boot**, back up the root. Then boot the
+  `root-ro` image above once, to prove the unlock and the mount with nothing
+  written. Shut NARF down cleanly (`systemctl poweroff`). Back in CachyOS,
+  `sudo dumpe2fs -h "$(findmnt -no SOURCE /)" | grep -i state` must say
+  `clean`.
+- **Testing.** The writer runs against real `mkfs.ext4` images on the host
+  (`cargo xtask ext4-host-rw`, judged by `e2fsck -fn`, debugfs and a NARF
+  remount) and in QEMU. It has not been validated on hardware.
 
 The exact accepted profiles and work limits are documented in the
 [encrypted-block specification](../block/specification/encrypted.md).

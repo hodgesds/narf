@@ -38,6 +38,26 @@ fn ftype_for_mode(mode: u16) -> u8 {
     }
 }
 
+/// `EXT4_LINK_MAX`.
+const EXT4_LINK_MAX: u16 = 65000;
+
+/// `ext4_inc_count`: a directory past `EXT4_LINK_MAX` links (possible only
+/// with `dir_nlink` on an indexed directory) counts 1, meaning "many", and
+/// stays 1.
+fn inc_count(inode: &mut Inode) {
+    inode.links_count = inode.links_count.saturating_add(1);
+    if inode.is_htree() && (inode.links_count > EXT4_LINK_MAX || inode.links_count == 2) {
+        inode.links_count = 1;
+    }
+}
+
+/// `ext4_dec_count`: a directory at 1 ("many") or 2 keeps its count.
+fn dec_count(inode: &mut Inode) {
+    if !inode.is_dir() || inode.links_count > 2 {
+        inode.links_count = inode.links_count.saturating_sub(1);
+    }
+}
+
 impl<B: BlockDevice + 'static> Ext2Volume<B> {
     fn add_directory_checksum_tail(&self, block: &mut [u8]) -> Result<(), FsError> {
         if !self.superblock.has_metadata_csum() {
@@ -180,66 +200,396 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Err(FsError::NotFound)
     }
 
-    /// Insert into a one-level ext4 HTREE without changing its index. The
-    /// root hash chooses exactly one existing leaf; as long as that leaf has
-    /// spare dirent space, only its classic directory checksum changes.
+    /// `dx_root_limit`: index entries that fit in the root block after
+    /// `.`, `..`, `dx_root_info` and (with metadata_csum) the `dx_tail`.
+    fn dx_root_limit(&self) -> u16 {
+        let tail = if self.superblock.has_metadata_csum() {
+            8
+        } else {
+            0
+        };
+        ((self.block_size() - 32 - tail) / 8) as u16
+    }
+
+    /// `dx_node_limit`: index entries in an interior node after its fake
+    /// dirent and (with metadata_csum) the `dx_tail`.
+    fn dx_node_limit(&self) -> u16 {
+        let tail = if self.superblock.has_metadata_csum() {
+            8
+        } else {
+            0
+        };
+        ((self.block_size() - 8 - tail) / 8) as u16
+    }
+
+    /// Write an index block (root or node) with its `dx_tail` checksum.
+    async fn write_dx_block(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+        physical: u64,
+        block: &mut [u8],
+    ) -> Result<(), FsError> {
+        if self.superblock.has_metadata_csum()
+            && metadata_csum::write_htree_block_checksum(
+                &self.superblock,
+                inode_no,
+                inode.generation,
+                block,
+            )
+            .is_none()
+        {
+            return Err(FsError::Corrupted);
+        }
+        self.write_block(physical, block).await
+    }
+
+    /// `dx_probe`: walk the index from the root to the leaf that holds
+    /// `hash`, validating each level as Linux does (hash version, depth,
+    /// `limit` against the computed limit, `count`, block numbers inside the
+    /// directory, the `dx_tail` checksum). Structural damage is
+    /// `Corrupted` (EFSCORRUPTED), a checksum failure `BadChecksum`.
+    async fn dx_probe(
+        &self,
+        dir_no: u32,
+        dir: &Inode,
+        name: &[u8],
+    ) -> Result<(alloc::vec::Vec<DxFrame>, u32, u8), FsError> {
+        let bs = self.block_size();
+        let dir_blocks = (dir.size as usize).div_ceil(bs) as u64;
+        let root_phys = self.map_block(dir, 0).await?;
+        if root_phys == 0 {
+            return Err(FsError::Corrupted);
+        }
+        let mut root = vec![0u8; bs];
+        self.read_block(root_phys, &mut root).await?;
+        if self
+            .verify_htree_block_for_write(dir_no, dir, &root)
+            .is_err()
+        {
+            return Err(FsError::BadChecksum);
+        }
+        let info = DxRoot::parse(&root).ok_or(FsError::Corrupted)?;
+        if info.limit != self.dx_root_limit() {
+            return Err(FsError::Corrupted);
+        }
+        let version =
+            htree::lookup_hash_version(info.hash_version, self.superblock.hash_unsigned());
+        let hash = htree::ext4fs_dirhash(name, version, &self.superblock.hash_seed)
+            .ok_or(FsError::Corrupted)?
+            .hash;
+        let mut frames = alloc::vec::Vec::with_capacity(2);
+        let at = dx::find(&root, htree::DX_ROOT_ENTRIES_OFF, hash).ok_or(FsError::Corrupted)?;
+        frames.push(DxFrame {
+            physical: root_phys,
+            block: root,
+            entries: htree::DX_ROOT_ENTRIES_OFF,
+            at,
+        });
+        for _ in 0..info.indirect_levels {
+            let parent = frames.last().expect("root frame");
+            let child = u64::from(dx::block_of(&parent.block, parent.entries, parent.at));
+            if child == 0 || child >= dir_blocks {
+                return Err(FsError::Corrupted);
+            }
+            let phys = self.map_block(dir, child).await?;
+            if phys == 0 {
+                return Err(FsError::Corrupted);
+            }
+            let mut node = vec![0u8; bs];
+            self.read_block(phys, &mut node).await?;
+            // A dx_node opens with a fake dirent spanning the block.
+            if node[0..4] != [0; 4] || usize::from(u16::from_le_bytes([node[4], node[5]])) != bs {
+                return Err(FsError::Corrupted);
+            }
+            if self
+                .verify_htree_block_for_write(dir_no, dir, &node)
+                .is_err()
+            {
+                return Err(FsError::BadChecksum);
+            }
+            if dx::limit(&node, htree::DX_NODE_ENTRIES_OFF) != self.dx_node_limit() {
+                return Err(FsError::Corrupted);
+            }
+            let at = dx::find(&node, htree::DX_NODE_ENTRIES_OFF, hash).ok_or(FsError::Corrupted)?;
+            frames.push(DxFrame {
+                physical: phys,
+                block: node,
+                entries: htree::DX_NODE_ENTRIES_OFF,
+                at,
+            });
+        }
+        let leaf = frames.last().expect("frame");
+        let leaf_block = u64::from(dx::block_of(&leaf.block, leaf.entries, leaf.at));
+        if leaf_block == 0 || leaf_block >= dir_blocks {
+            return Err(FsError::Corrupted);
+        }
+        Ok((frames, hash, version))
+    }
+
+    /// Append one block to directory `dir` (`ext4_append`): map it, grow
+    /// `i_size`, and return its logical and physical numbers. The inode is
+    /// not written; the caller does that once the block's contents are on
+    /// the device.
+    async fn dir_append_block(&self, dir_no: u32, dir: &mut Inode) -> Result<(u64, u64), FsError> {
+        let bs = self.block_size() as u64;
+        let logical = dir.size.div_ceil(bs);
+        let physical = self.map_block_alloc(dir_no, dir, logical).await?;
+        dir.size = (logical + 1) * bs;
+        Ok((logical, physical))
+    }
+
+    /// `ext4_dx_add_entry`: insert into an indexed directory, splitting the
+    /// target leaf (`do_split`), a full index node, or adding the second
+    /// index level, as Linux does.
+    ///
+    /// Without a journal every split keeps this order: write the new block,
+    /// write the inode that maps it, write the one index block that makes it
+    /// reachable (the commit), then shorten the old block. A crash before
+    /// the commit leaves a block nothing indexes; a crash after it leaves
+    /// entries present twice. Either is what e2fsck repairs; no entry is
+    /// ever unreachable. An error after a block was allocated is recorded
+    /// with `fs_error`.
+    ///
+    /// LINUX-GAP: a full one-block linear directory grows linearly; it is
+    /// not converted to an index (`make_indexed_dir`).
     async fn dir_insert_htree(
         &self,
         parent_inode_no: u32,
-        parent_inode: &Inode,
+        parent_inode: &mut Inode,
         name: &[u8],
         target_inode_no: u32,
         file_type: u8,
     ) -> Result<(), FsError> {
-        let root_phys = self.map_block(parent_inode, 0).await?;
-        if root_phys == 0 {
-            return Err(FsError::InvalidData);
-        }
         let bs = self.block_size();
-        let mut root = vec![0u8; bs];
-        self.read_block(root_phys, &mut root).await?;
-        self.verify_htree_block_for_write(parent_inode_no, parent_inode, &root)?;
-        let dx_root = DxRoot::parse(&root).ok_or(FsError::InvalidData)?;
-        // A deeper tree contains interior dx nodes. Deleting from such a tree
-        // is safe via a checksum-aware linear leaf scan below, but inserting
-        // requires a full two-level index walk and split propagation.
-        if dx_root.indirect_levels != 0 {
-            return Err(FsError::Unsupported);
-        }
-        let hash = htree::name_hash(name, dx_root.hash_version, &self.superblock.hash_seed);
-        let leaf = htree::dx_find_entry_root(&root, hash.hash).ok_or(FsError::InvalidData)?;
-        let blocks = (parent_inode.size as usize).div_ceil(bs);
-        if leaf.block == 0 || leaf.block as usize >= blocks {
-            return Err(FsError::InvalidData);
-        }
-        let leaf_phys = self.map_block(parent_inode, leaf.block as u64).await?;
-        if leaf_phys == 0 {
-            return Err(FsError::InvalidData);
-        }
-        let mut block = vec![0u8; bs];
-        self.read_block(leaf_phys, &mut block).await?;
-        self.verify_directory_block_for_write(parent_inode_no, parent_inode, &block)?;
-        match splice::insert_entry(&mut block, target_inode_no, name, file_type) {
-            splice::InsertResult::Ok { .. } => {
-                self.write_directory_block(parent_inode_no, parent_inode, leaf_phys, &mut block)
-                    .await
+        // At most two index splits (node, then root) precede the leaf split.
+        for _ in 0..3 {
+            let (mut frames, hash, version) =
+                self.dx_probe(parent_inode_no, parent_inode, name).await?;
+            let last = frames.len() - 1;
+            let leaf_logical = u64::from(dx::block_of(
+                &frames[last].block,
+                frames[last].entries,
+                frames[last].at,
+            ));
+            let leaf_phys = self.map_block(parent_inode, leaf_logical).await?;
+            if leaf_phys == 0 {
+                return Err(FsError::Corrupted);
             }
-            splice::InsertResult::Exists => Err(FsError::InvalidPath),
-            splice::InsertResult::NoRoom => Err(FsError::Unsupported),
-            splice::InsertResult::Corrupt => Err(FsError::InvalidData),
+            let mut leaf = vec![0u8; bs];
+            self.read_block(leaf_phys, &mut leaf).await?;
+            if self
+                .verify_directory_block_for_write(parent_inode_no, parent_inode, &leaf)
+                .is_err()
+            {
+                return Err(FsError::BadChecksum);
+            }
+            match splice::insert_entry(&mut leaf, target_inode_no, name, file_type) {
+                splice::InsertResult::Ok { .. } => {
+                    return self
+                        .write_directory_block(parent_inode_no, parent_inode, leaf_phys, &mut leaf)
+                        .await;
+                }
+                splice::InsertResult::Exists => return Err(FsError::InvalidPath),
+                splice::InsertResult::Corrupt => return Err(FsError::Corrupted),
+                splice::InsertResult::NoRoom => {}
+            }
+            let full = {
+                let f = &frames[last];
+                dx::count(&f.block, f.entries) == dx::limit(&f.block, f.entries)
+            };
+            if !full {
+                return self
+                    .dx_split_leaf(
+                        parent_inode_no,
+                        parent_inode,
+                        &mut frames[last],
+                        (leaf_phys, leaf),
+                        (hash, version),
+                        (name, target_inode_no, file_type),
+                    )
+                    .await;
+            }
+            self.dx_split_index(parent_inode_no, parent_inode, &mut frames)
+                .await?;
         }
+        Err(FsError::Corrupted)
     }
 
-    /// Splice a `(name, inode, file_type)` entry into `parent_inode`'s
-    /// directory body. A one-level HTREE selects its existing leaf by name
-    /// hash; a classic directory walks logical blocks in order and allocates
-    /// a fresh logical block when every existing block reports `NoRoom`.
-    ///
-    /// On `Exists`, returns `FsError::InvalidPath` (the FS layer uses
-    /// that for name conflicts — `FsError` has no dedicated AlreadyExists
-    /// variant yet).
-    ///
-    /// Caller persists the parent inode (size may grow on extension).
+    /// `do_split`: move the upper half (by hash) of a full leaf into a new
+    /// block, index it from `frame`, then insert the new name into the half
+    /// its hash belongs to.
+    async fn dx_split_leaf(
+        &self,
+        dir_no: u32,
+        dir: &mut Inode,
+        frame: &mut DxFrame,
+        (leaf_phys, leaf): (u64, alloc::vec::Vec<u8>),
+        (hash, version): (u32, u8),
+        (name, target, file_type): (&[u8], u32, u8),
+    ) -> Result<(), FsError> {
+        let bs = self.block_size();
+        let csum_tail = if self.superblock.has_metadata_csum() {
+            12
+        } else {
+            0
+        };
+        let map = dx::make_map(&leaf, bs - csum_tail, version, &self.superblock.hash_seed)
+            .ok_or(FsError::Corrupted)?;
+        let split = dx::split_point(&map, bs);
+        if split == 0 || split >= map.len() {
+            return Err(FsError::Corrupted);
+        }
+        let hash2 = map[split].hash;
+        let continued = u32::from(hash2 == map[split - 1].hash);
+
+        let saved = *dir;
+        let (new_logical, new_phys) = self.dir_append_block(dir_no, dir).await?;
+        let mut upper = dx::pack(&leaf, &map[split..], bs, csum_tail);
+        let mut lower = dx::pack(&leaf, &map[..split], bs, csum_tail);
+        if csum_tail != 0 {
+            self.add_directory_checksum_tail(&mut upper)?;
+            self.add_directory_checksum_tail(&mut lower)?;
+        }
+        // New block, then the inode that maps it: before the commit, a
+        // failure can still be undone.
+        let staged = async {
+            self.write_directory_block(dir_no, dir, new_phys, &mut upper)
+                .await?;
+            self.write_inode(dir_no, dir).await
+        }
+        .await;
+        if let Err(error) = staged {
+            let _ = self.free_block(new_phys).await;
+            *dir = saved;
+            let _ = self.write_inode(dir_no, dir).await;
+            return Err(error);
+        }
+        // The commit: index the new block.
+        dx::insert_after(
+            &mut frame.block,
+            frame.entries,
+            frame.at,
+            hash2 + continued,
+            new_logical as u32,
+        );
+        let committed = async {
+            self.write_dx_block(dir_no, dir, frame.physical, &mut frame.block)
+                .await?;
+            self.write_directory_block(dir_no, dir, leaf_phys, &mut lower)
+                .await?;
+            let (dest_phys, dest) = if hash >= hash2 {
+                (new_phys, &mut upper)
+            } else {
+                (leaf_phys, &mut lower)
+            };
+            match splice::insert_entry(dest, target, name, file_type) {
+                splice::InsertResult::Ok { .. } => {}
+                splice::InsertResult::Exists => return Err(FsError::InvalidPath),
+                _ => return Err(FsError::Corrupted),
+            }
+            self.write_directory_block(dir_no, dir, dest_phys, dest)
+                .await
+        }
+        .await;
+        if let Err(error) = &committed {
+            if !matches!(error, FsError::InvalidPath) {
+                self.fs_error(super::volume::sb_state::ErrorSite {
+                    func: "dx_split_leaf",
+                    ino: dir_no,
+                    block: leaf_phys,
+                    errno: narf_lib::errno::EIO,
+                })
+                .await;
+            }
+        }
+        committed
+    }
+
+    /// The index level `frames.last()` is full: split it into two nodes
+    /// (when its parent has room), or move the root's entries into a new
+    /// node and make the root point at it (`indirect_levels` 0 → 1). A
+    /// tree at its maximum depth whose root is full is ENOSPC, before any
+    /// write, as in Linux.
+    async fn dx_split_index(
+        &self,
+        dir_no: u32,
+        dir: &mut Inode,
+        frames: &mut [DxFrame],
+    ) -> Result<(), FsError> {
+        let levels = frames.len();
+        let parent_has_room = levels == 2 && {
+            let root = &frames[0];
+            dx::count(&root.block, root.entries) < dx::limit(&root.block, root.entries)
+        };
+        if levels == 1 + usize::from(htree::MAX_INDIRECT_LEVELS) && !parent_has_room {
+            return Err(FsError::NoSpace);
+        }
+        let bs = self.block_size();
+        let node_limit = self.dx_node_limit();
+        let saved = *dir;
+        let (new_logical, new_phys) = self.dir_append_block(dir_no, dir).await?;
+        let full = frames.last().expect("frame");
+        let icount = dx::count(&full.block, full.entries);
+        let moved_from = if parent_has_room { icount / 2 } else { 0 };
+        let mut node = dx::new_node(bs, node_limit);
+        dx::copy_entries(&full.block, full.entries, moved_from, icount, &mut node);
+        let staged = async {
+            self.write_dx_block(dir_no, dir, new_phys, &mut node)
+                .await?;
+            self.write_inode(dir_no, dir).await
+        }
+        .await;
+        if let Err(error) = staged {
+            let _ = self.free_block(new_phys).await;
+            *dir = saved;
+            let _ = self.write_inode(dir_no, dir).await;
+            return Err(error);
+        }
+        let committed = if parent_has_room {
+            // Split a full node: the root gains an entry for the new one,
+            // then the old node keeps its lower half.
+            let hash2 = dx::hash_of(&frames[1].block, frames[1].entries, moved_from);
+            let (root, rest) = frames.split_at_mut(1);
+            let root = &mut root[0];
+            dx::insert_after(
+                &mut root.block,
+                root.entries,
+                root.at,
+                hash2,
+                new_logical as u32,
+            );
+            let old = &mut rest[0];
+            async {
+                self.write_dx_block(dir_no, dir, root.physical, &mut root.block)
+                    .await?;
+                dx::set_count(&mut old.block, old.entries, moved_from);
+                self.write_dx_block(dir_no, dir, old.physical, &mut old.block)
+                    .await
+            }
+            .await
+        } else {
+            // Add a level: the root's entries move to the new node and the
+            // root indexes only it.
+            let root = &mut frames[0];
+            dx::set_count(&mut root.block, root.entries, 1);
+            dx::set_block(&mut root.block, root.entries, 0, new_logical as u32);
+            root.block[htree::DX_ROOT_INFO_OFF + 6] += 1;
+            self.write_dx_block(dir_no, dir, root.physical, &mut root.block)
+                .await
+        };
+        if committed.is_err() {
+            self.fs_error(super::volume::sb_state::ErrorSite {
+                func: "dx_split_index",
+                ino: dir_no,
+                block: new_phys,
+                errno: narf_lib::errno::EIO,
+            })
+            .await;
+        }
+        committed
+    }
+
     pub(crate) async fn dir_insert(
         &self,
         parent_inode_no: u32,
@@ -302,7 +652,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
         // No existing block had room — extend the directory by one
         // block. Allocate, seed with a single record, write, then
-        // bump the parent's i_size + i_blocks.
+        // bump the parent's i_size. `map_block_alloc` already counted the
+        // new block (and any index block) in i_blocks.
         let new_logical = blocks as u64;
         let phys = self
             .map_block_alloc(parent_inode_no, parent_inode, new_logical)
@@ -324,8 +675,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             .await?;
         // Update parent inode bookkeeping.
         parent_inode.size += bs as u64;
-        // i_blocks is in 512-byte sectors.
-        parent_inode.blocks = parent_inode.blocks.saturating_add(bs as u32 / 512);
         self.write_inode(parent_inode_no, parent_inode).await
     }
 
@@ -340,33 +689,84 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         parent_inode: &mut Inode,
         name: &[u8],
     ) -> Result<(u32, u8), FsError> {
+        let (phys, mut blockbuf, off, inode, file_type) =
+            self.dir_locate(parent_inode_no, parent_inode, name).await?;
+        splice::delete_entry(&mut blockbuf, off).map_err(|_| FsError::Corrupted)?;
+        self.write_directory_block(parent_inode_no, parent_inode, phys, &mut blockbuf)
+            .await?;
+        Ok((inode, file_type))
+    }
+
+    /// `ext4_setent`: point `name`'s existing dirent at `inode_no`, in
+    /// place. The name never stops existing, so a crash during a rename
+    /// that replaces it leaves it naming the old inode or the new one.
+    async fn dir_setent(
+        &self,
+        dir_no: u32,
+        dir: &Inode,
+        name: &[u8],
+        inode_no: u32,
+        mode: u16,
+    ) -> Result<(), FsError> {
+        let (phys, mut blockbuf, off, _, _) = self.dir_locate(dir_no, dir, name).await?;
+        blockbuf[off..off + 4].copy_from_slice(&inode_no.to_le_bytes());
+        if self.superblock.feature_incompat & super::superblock::incompat::FILETYPE != 0 {
+            blockbuf[off + 7] = ftype_for_mode(mode);
+        }
+        self.write_directory_block(dir_no, dir, phys, &mut blockbuf)
+            .await
+    }
+
+    /// Find `name`'s dirent for a change: its block (physical number and
+    /// bytes, checked for writing), the dirent's offset, inode and type.
+    /// Leaves are scanned in order. The index blocks of an HTREE hold no
+    /// names: the root's index hides inside `..`, and an interior node opens
+    /// with a fake dirent spanning the block, so both are skipped at any
+    /// depth.
+    ///
+    /// LINUX-GAP: an indexed directory is scanned leaf by leaf rather than
+    /// probed by hash (`ext4_dx_find_entry`); the result is the same.
+    async fn dir_locate(
+        &self,
+        dir_no: u32,
+        dir: &Inode,
+        name: &[u8],
+    ) -> Result<(u64, alloc::vec::Vec<u8>, usize, u32, u8), FsError> {
         let bs = self.block_size();
-        let blocks = (parent_inode.size as usize).div_ceil(bs);
-        let first_leaf = if parent_inode.is_htree() {
-            let root_phys = self.map_block(parent_inode, 0).await?;
+        let blocks = (dir.size as usize).div_ceil(bs);
+        let indexed = dir.is_htree();
+        let first_leaf = if indexed {
+            let root_phys = self.map_block(dir, 0).await?;
             if root_phys == 0 {
-                return Err(FsError::InvalidData);
+                return Err(FsError::Corrupted);
             }
             let mut root = vec![0u8; bs];
             self.read_block(root_phys, &mut root).await?;
-            self.verify_htree_block_for_write(parent_inode_no, parent_inode, &root)?;
-            let root = DxRoot::parse(&root).ok_or(FsError::InvalidData)?;
-            if root.indirect_levels != 0 {
-                return Err(FsError::Unsupported);
+            if self
+                .verify_htree_block_for_write(dir_no, dir, &root)
+                .is_err()
+            {
+                return Err(FsError::BadChecksum);
             }
+            DxRoot::parse(&root).ok_or(FsError::Corrupted)?;
             1
         } else {
             0
         };
         for i in first_leaf..blocks {
-            let phys = self.map_block(parent_inode, i as u64).await?;
+            let phys = self.map_block(dir, i as u64).await?;
             if phys == 0 {
                 continue;
             }
             let mut blockbuf = vec![0u8; bs];
             self.read_block(phys, &mut blockbuf).await?;
-            self.verify_directory_block_for_write(parent_inode_no, parent_inode, &blockbuf)?;
-            // Scan for the entry.
+            if indexed
+                && blockbuf[0..4] == [0; 4]
+                && usize::from(u16::from_le_bytes([blockbuf[4], blockbuf[5]])) == bs
+            {
+                continue;
+            }
+            self.verify_directory_block_for_write(dir_no, dir, &blockbuf)?;
             let mut off = 0usize;
             while off + 8 <= blockbuf.len() {
                 let inode = u32::from_le_bytes([
@@ -378,23 +778,38 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 let rec_len = u16::from_le_bytes([blockbuf[off + 4], blockbuf[off + 5]]) as usize;
                 let name_len = blockbuf[off + 6] as usize;
                 let file_type = blockbuf[off + 7];
-                if rec_len < 8 || off + rec_len > blockbuf.len() {
-                    return Err(FsError::Io(narf_block::BlockError::IOError));
+                if rec_len < 8 || off + rec_len > blockbuf.len() || 8 + name_len > rec_len {
+                    return Err(FsError::Corrupted);
                 }
                 if inode != 0
                     && name_len == name.len()
                     && &blockbuf[off + 8..off + 8 + name_len] == name
                 {
-                    splice::delete_entry(&mut blockbuf, off)
-                        .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
-                    self.write_directory_block(parent_inode_no, parent_inode, phys, &mut blockbuf)
-                        .await?;
-                    return Ok((inode, file_type));
+                    return Ok((phys, blockbuf, off, inode, file_type));
                 }
                 off += rec_len;
             }
         }
         Err(FsError::NotFound)
+    }
+
+    /// Roll back an inode written but never linked (`discard_new_inode`):
+    /// the slot is cleared first, so nothing maps the data block when it is
+    /// freed.
+    async fn discard_new_inode(&self, ino: u32, data_block: Option<u64>) {
+        let _ = self.free_inode(ino).await;
+        if let Some(block) = data_block {
+            let _ = self.free_block(block).await;
+        }
+    }
+
+    /// `EXT4_DIR_LINK_MAX`: `dir` cannot take another subdirectory. At
+    /// `EXT4_LINK_MAX` links it is full, unless `dir_nlink` lets an indexed
+    /// directory go on with a link count of 1.
+    fn dir_link_max(&self, dir: &Inode) -> bool {
+        dir.links_count >= EXT4_LINK_MAX
+            && !(self.superblock.feature_ro_compat & super::superblock::ro_compat::DIR_NLINK != 0
+                && dir.is_htree())
     }
 
     /// Create a regular file inode + directory entry.
@@ -473,6 +888,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let _update = self.lock_inode_updates().await;
         let now = Ext2Volume::<B>::now_secs();
         let bs = self.block_size();
+        let parent = self.read_inode(parent_inode_no).await?;
+        if !parent.is_dir() {
+            return Err(FsError::InvalidPath);
+        }
+        // `ext4_mkdir`: a parent at its link limit takes no subdirectory.
+        if self.dir_link_max(&parent) {
+            return Err(FsError::TooManyLinks);
+        }
         // Allocate the inode + a data block.
         let new_ino = self.alloc_inode().await?;
         let mut new_inode = Inode::new_directory(mode);
@@ -520,13 +943,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let _ = self.abort_inode_allocation(new_ino).await;
             return Err(error);
         }
-        // Splice into the parent.
+        // Splice into the parent: the dirent is the commit. Before it, the
+        // inode is cleared first, so nothing maps the block it frees.
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
-        if !parent_inode.is_dir() {
-            let _ = self.free_block(data_block).await;
-            let _ = self.free_inode(new_ino).await;
-            return Err(FsError::InvalidPath);
-        }
         if let Err(e) = self
             .dir_insert(
                 parent_inode_no,
@@ -537,12 +956,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             )
             .await
         {
-            let _ = self.free_block(data_block).await;
             let _ = self.free_inode(new_ino).await;
+            let _ = self.free_block(data_block).await;
             return Err(e);
         }
-        // Bump parent's links_count + touch its timestamps.
-        parent_inode.links_count = parent_inode.links_count.saturating_add(1);
+        // `ext4_inc_count`: the new ".." links the parent.
+        inc_count(&mut parent_inode);
         parent_inode.touch_ctime_mtime(now);
         self.write_inode(parent_inode_no, &parent_inode).await?;
         self.note_dir_count_delta(new_ino, 1).await?;
@@ -619,12 +1038,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let _ = self
             .dir_delete(parent_inode_no, &mut parent_inode, name)
             .await?;
-        self.truncate_inode(&mut target).await?;
+        // Unlinked before its blocks go, so the inode written with them
+        // gone is never a live directory with no blocks.
         target.links_count = 0;
+        self.truncate_inode(target_ino, &mut target).await?;
         self.write_inode(target_ino, &target).await?;
         self.note_dir_count_delta(target_ino, -1).await?;
         self.free_inode(target_ino).await?;
-        parent_inode.links_count = parent_inode.links_count.saturating_sub(1);
+        dec_count(&mut parent_inode);
         parent_inode.touch_ctime_mtime(now);
         self.write_inode(parent_inode_no, &parent_inode).await?;
         Ok(())
@@ -656,20 +1077,34 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             Err(FsError::NotFound) => {}
             Err(error) => return Err(error),
         }
-        self.dir_insert(
-            parent_inode_no,
-            &mut parent_inode,
-            name,
-            target_ino,
-            target.mode,
-        )
-        .await?;
-        target.links_count = target.links_count.saturating_add(1);
+        // `ext4_link`.
+        if target.links_count >= EXT4_LINK_MAX {
+            return Err(FsError::TooManyLinks);
+        }
+        // The count goes up on disk before the name exists: a crash in
+        // between leaves a count one too high (e2fsck lowers it), never a
+        // name the count does not cover, which a later unlink would free
+        // from under.
+        let before = target;
+        target.links_count += 1;
         // ctime changes on the target (link count changed); parent
         // dir's mtime + ctime change because its dirent list grew.
         target.touch_ctime(now);
-        parent_inode.touch_ctime_mtime(now);
         self.write_inode(target_ino, &target).await?;
+        if let Err(error) = self
+            .dir_insert(
+                parent_inode_no,
+                &mut parent_inode,
+                name,
+                target_ino,
+                target.mode,
+            )
+            .await
+        {
+            let _ = self.write_inode(target_ino, &before).await;
+            return Err(error);
+        }
+        parent_inode.touch_ctime_mtime(now);
         self.write_inode(parent_inode_no, &parent_inode).await?;
         Ok(())
     }
@@ -712,54 +1147,90 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // An existing destination is REPLACED, not rejected. POSIX and
         // Linux both require plain rename(2) to swap the name atomically;
         // only renameat2(RENAME_NOREPLACE) refuses, and the syscall layer
-        // already enforces that itself (returning the correct EEXIST), so
-        // failing here was both redundant and wrong — and it reported
-        // EINVAL rather than EEXIST.
+        // already enforces that itself (returning the correct EEXIST).
         //
         // This is Qt QSaveFile's every-write path: write a temp beside the
         // target, then rename it ONTO the existing target. Refusing broke
-        // every KConfig/KSycoca write on the ext2 rootfs, surfacing as
-        // kwin logging `Couldn't write ".../kwinrc" . Disk full?` (KConfig
-        // prints that for any failed commit; the disk had 2.5 GB free).
-        //
-        // Unlink the victim FIRST so `dir_insert` cannot leave a second
-        // dirent with the same name in the directory: insert-then-unlink
-        // would remove whichever entry matched first on the next pass.
-        let victim = self.dir_lookup(&new_parent_probe, new_name).await.ok();
-        if let Some((victim_ino, _)) = victim {
-            // Renaming a name onto ITSELF is a documented no-op that must
-            // leave the file intact, so do not unlink in that case.
-            if victim_ino == target_ino {
-                return Ok(());
+        // every KConfig/KSycoca write on the ext2 rootfs.
+        let victim = match self.dir_lookup(&new_parent_probe, new_name).await {
+            Ok((victim_ino, _)) => {
+                // Renaming a name onto ITSELF is a documented no-op that
+                // must leave the file intact.
+                if victim_ino == target_ino {
+                    return Ok(());
+                }
+                let victim_inode = self.read_inode(victim_ino).await?;
+                // `ext4_rename`: a directory may only be replaced when it is
+                // empty (`ext4_empty_dir` → -ENOTEMPTY, which `rename_errno`
+                // maps from `Busy`). Checked before any dirent changes so a
+                // refused rename leaves both directories untouched.
+                if victim_inode.is_dir() && !self.dir_is_empty(&victim_inode).await? {
+                    return Err(FsError::Busy);
+                }
+                Some((victim_ino, victim_inode))
             }
-            let mut victim_inode = self.read_inode(victim_ino).await?;
-            let victim_is_dir = victim_inode.is_dir();
-            // `ext4_rename`: a directory may only be replaced when it is
-            // empty (`ext4_empty_dir` → -ENOTEMPTY, which `rename_errno`
-            // maps from `Busy`). Checked before any dirent changes so a
-            // refused rename leaves both directories untouched.
-            if victim_is_dir && !self.dir_is_empty(&victim_inode).await? {
-                return Err(FsError::Busy);
+            Err(FsError::NotFound) => {
+                // A directory moving to a new parent adds a link there.
+                if is_dir
+                    && old_parent_inode_no != new_parent_inode_no
+                    && self.dir_link_max(&new_parent_probe)
+                {
+                    return Err(FsError::TooManyLinks);
+                }
+                None
             }
-            let mut victim_parent = self.read_inode(new_parent_inode_no).await?;
-            self.dir_delete(new_parent_inode_no, &mut victim_parent, new_name)
-                .await?;
-            if victim_is_dir {
-                // Released exactly as `dir_rmdir` does: the empty directory's
-                // blocks and inode are freed, and the parent loses the
-                // victim's ".." back-link.
-                self.truncate_inode(&mut victim_inode).await?;
+            Err(error) => return Err(error),
+        };
+
+        // The new name: the victim's dirent repointed in place
+        // (`ext4_setent`), so the name exists throughout and a crash leaves
+        // it naming the old inode or the new one; or a new dirent.
+        let mut new_parent = self.read_inode(new_parent_inode_no).await?;
+        if victim.is_some() {
+            self.dir_setent(
+                new_parent_inode_no,
+                &new_parent,
+                new_name,
+                target_ino,
+                target.mode,
+            )
+            .await?;
+        } else {
+            self.dir_insert(
+                new_parent_inode_no,
+                &mut new_parent,
+                new_name,
+                target_ino,
+                target.mode,
+            )
+            .await?;
+        }
+        target.touch_ctime(now);
+        self.write_inode(target_ino, &target).await?;
+        // Then the old name goes. Re-read: the insert may have changed the
+        // directory (old == new).
+        let mut old_parent = self.read_inode(old_parent_inode_no).await?;
+        self.dir_delete(old_parent_inode_no, &mut old_parent, old_name)
+            .await?;
+        old_parent.touch_ctime_mtime(now);
+        self.write_inode(old_parent_inode_no, &old_parent).await?;
+
+        // The replaced inode loses its name.
+        let replaced = victim.is_some();
+        if let Some((victim_ino, mut victim_inode)) = victim {
+            if victim_inode.is_dir() {
+                // Released exactly as `dir_rmdir` does (`clear_nlink`): the
+                // empty directory's blocks and inode are freed.
                 victim_inode.links_count = 0;
+                self.truncate_inode(victim_ino, &mut victim_inode).await?;
                 victim_inode.touch_ctime(now);
                 self.write_inode(victim_ino, &victim_inode).await?;
                 self.note_dir_count_delta(victim_ino, -1).await?;
                 self.free_inode(victim_ino).await?;
-                victim_parent.links_count = victim_parent.links_count.saturating_sub(1);
             } else {
-                // Release the replaced inode exactly as dir_unlink does: drop
-                // a link, and free the blocks + inode when the last one goes.
-                // Skipping this would leak the overwritten file's blocks on
-                // every config save.
+                // As dir_unlink does: drop a link, and free the blocks +
+                // inode when the last one goes. Skipping this would leak
+                // the overwritten file's blocks on every config save.
                 victim_inode.links_count = victim_inode.links_count.saturating_sub(1);
                 victim_inode.touch_ctime(now);
                 if victim_inode.links_count == 0 {
@@ -768,77 +1239,78 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     self.write_inode(victim_ino, &victim_inode).await?;
                 }
             }
-            victim_parent.touch_ctime_mtime(now);
-            self.write_inode(new_parent_inode_no, &victim_parent)
-                .await?;
         }
 
-        // Insert into the new parent.
-        let mut new_parent = self.read_inode(new_parent_inode_no).await?;
-        self.dir_insert(
-            new_parent_inode_no,
-            &mut new_parent,
-            new_name,
-            target_ino,
-            target.mode,
-        )
-        .await?;
-        // Delete from the old parent. Re-read in case insert
-        // mutated it (when old == new).
-        let mut old_parent = self.read_inode(old_parent_inode_no).await?;
-        self.dir_delete(old_parent_inode_no, &mut old_parent, old_name)
-            .await?;
-
-        // Touch timestamps on the target (ctime always) and both
-        // parent dirs (mtime + ctime because their dirent lists changed).
-        target.touch_ctime(now);
-        self.write_inode(target_ino, &target).await?;
-        old_parent.touch_ctime_mtime(now);
-        self.write_inode(old_parent_inode_no, &old_parent).await?;
+        if is_dir {
+            // `ext4_rename_dir_finish`: the moved directory's ".." names its
+            // new parent.
+            if old_parent_inode_no != new_parent_inode_no {
+                self.set_dotdot(target_ino, new_parent_inode_no).await?;
+            }
+            // `ext4_dec_count(old.dir)`, and `ext4_inc_count(new.dir)` unless
+            // the directory replaced one (whose ".." link it takes over).
+            let mut op = self.read_inode(old_parent_inode_no).await?;
+            dec_count(&mut op);
+            op.touch_ctime(now);
+            self.write_inode(old_parent_inode_no, &op).await?;
+            if !replaced {
+                let mut np = self.read_inode(new_parent_inode_no).await?;
+                inc_count(&mut np);
+                self.write_inode(new_parent_inode_no, &np).await?;
+            }
+        }
         if old_parent_inode_no != new_parent_inode_no {
             let mut np = self.read_inode(new_parent_inode_no).await?;
             np.touch_ctime_mtime(now);
             self.write_inode(new_parent_inode_no, &np).await?;
         }
-
-        // Cross-directory move of a directory needs link-count balance:
-        // - old parent loses the ".." back-link → drop links_count
-        // - new parent gains it → bump links_count
-        // - target's ".." entry is updated to the new parent
-        if is_dir && old_parent_inode_no != new_parent_inode_no {
-            let mut old_p = self.read_inode(old_parent_inode_no).await?;
-            old_p.links_count = old_p.links_count.saturating_sub(1);
-            old_p.touch_ctime(now);
-            self.write_inode(old_parent_inode_no, &old_p).await?;
-            let mut new_p = self.read_inode(new_parent_inode_no).await?;
-            new_p.links_count = new_p.links_count.saturating_add(1);
-            new_p.touch_ctime(now);
-            self.write_inode(new_parent_inode_no, &new_p).await?;
-            // Rewrite target's ".." to point at the new parent.
-            let target_now = self.read_inode(target_ino).await?;
-            let bs = self.block_size();
-            // ".." is the second entry in the first block.
-            let phys = self.map_block(&target_now, 0).await?;
-            if phys != 0 {
-                let mut blockbuf = vec![0u8; bs];
-                self.read_block(phys, &mut blockbuf).await?;
-                // Skip "." entry then patch the ".." inode pointer.
-                let dot_rec_len = u16::from_le_bytes([blockbuf[4], blockbuf[5]]) as usize;
-                if dot_rec_len + 4 <= blockbuf.len() {
-                    blockbuf[dot_rec_len..dot_rec_len + 4]
-                        .copy_from_slice(&new_parent_inode_no.to_le_bytes());
-                    self.write_directory_block(target_ino, &target_now, phys, &mut blockbuf)
-                        .await?;
-                }
-            }
-            self.write_inode(target_ino, &target_now).await?;
-        }
         Ok(())
     }
 
-    /// Create a symlink. For targets ≤ 60 bytes, the link path is
-    /// stored inline in the inode's `i_block` area ("fast symlink");
-    /// longer targets get an allocated data block.
+    /// Point directory `dir_no`'s ".." at `parent`. It is the second entry
+    /// of the first block, which for an indexed directory is the dx root:
+    /// that block carries a `dx_tail` checksum, not a dirent tail.
+    async fn set_dotdot(&self, dir_no: u32, parent: u32) -> Result<(), FsError> {
+        let dir = self.read_inode(dir_no).await?;
+        let phys = self.map_block(&dir, 0).await?;
+        if phys == 0 {
+            return Err(FsError::Corrupted);
+        }
+        let mut blockbuf = vec![0u8; self.block_size()];
+        self.read_block(phys, &mut blockbuf).await?;
+        let indexed = dir.is_htree();
+        let checked = if indexed {
+            self.verify_htree_block_for_write(dir_no, &dir, &blockbuf)
+        } else {
+            self.verify_directory_block_for_write(dir_no, &dir, &blockbuf)
+        };
+        if checked.is_err() {
+            return Err(FsError::BadChecksum);
+        }
+        let dot = usize::from(u16::from_le_bytes([blockbuf[4], blockbuf[5]]));
+        if dot + 10 > blockbuf.len()
+            || blockbuf[6] != 1
+            || blockbuf[8] != b'.'
+            || blockbuf[dot + 6] != 2
+            || &blockbuf[dot + 8..dot + 10] != b".."
+        {
+            return Err(FsError::Corrupted);
+        }
+        blockbuf[dot..dot + 4].copy_from_slice(&parent.to_le_bytes());
+        if indexed {
+            self.write_dx_block(dir_no, &dir, phys, &mut blockbuf).await
+        } else {
+            self.write_directory_block(dir_no, &dir, phys, &mut blockbuf)
+                .await
+        }
+    }
+
+    /// Create a symlink. A target that fits in the inode's 60-byte
+    /// `i_block` area together with its NUL — at most 59 bytes — is stored
+    /// there ("fast symlink"); a longer one gets a data block. That is
+    /// `ext4_symlink`'s `disk_link.len > EXT4_N_BLOCKS * 4` test, where
+    /// `disk_link.len` counts the NUL: e2fsck rejects a fast symlink of
+    /// 60 bytes.
     pub async fn dir_create_symlink(
         &self,
         parent_inode_no: u32,
@@ -850,6 +1322,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if target.is_empty() {
             return Err(FsError::InvalidPath);
         }
+        // `fscrypt_prepare_symlink`, before any inode exists: the target and
+        // its NUL must fit in one block (-ENAMETOOLONG).
+        if target.len() + 1 > self.block_size() {
+            return Err(FsError::NameTooLong);
+        }
         // Allocate the inode.
         let new_ino = self.alloc_inode().await?;
         let mut new_inode = Inode::new_symlink(0o777);
@@ -859,7 +1336,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // The data block of a slow symlink, for rollback.
         let mut slow_block: Option<u64> = None;
 
-        if target.len() <= 60 {
+        if target.len() < 60 {
             // Fast symlink — pack target bytes into block[].
             let mut bytes = [0u8; 60];
             bytes[..target.len()].copy_from_slice(target);
@@ -876,10 +1353,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         } else {
             // Slow symlink — store target in a data block.
             let bs = self.block_size();
-            if target.len() > bs {
-                let _ = self.abort_inode_allocation(new_ino).await;
-                return Err(FsError::InvalidPath);
-            }
             // `ext4_symlink`: a slow symlink is extent-mapped on an ext4
             // volume, block-mapped otherwise.
             let first_block = if self.init_extent_root(&mut new_inode) {
@@ -913,9 +1386,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let _ = self.abort_inode_allocation(new_ino).await;
             return Err(error);
         }
+        // The dirent is the commit; before it, the inode is cleared, then
+        // a slow symlink's block is freed (it leaked before).
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
-            let _ = self.free_inode(new_ino).await;
+            self.discard_new_inode(new_ino, slow_block).await;
             return Err(FsError::InvalidPath);
         }
         if let Err(e) = self
@@ -928,7 +1403,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             )
             .await
         {
-            let _ = self.free_inode(new_ino).await;
+            self.discard_new_inode(new_ino, slow_block).await;
             return Err(e);
         }
         // Parent directory mtime + ctime change because its dirent list
@@ -972,5 +1447,192 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut buf = vec![0u8; bs];
         self.read_block(phys, &mut buf).await?;
         Ok(buf[..len.min(bs)].to_vec())
+    }
+}
+
+/// One level of a `dx_probe` walk: an index block (root or node), where its
+/// entries start, and the entry the hash chose (`frame->at`).
+struct DxFrame {
+    physical: u64,
+    block: alloc::vec::Vec<u8>,
+    entries: usize,
+    at: u16,
+}
+
+/// The dx index block layout (`fs/ext4/namei.c`). Entry `i` sits at
+/// `entries + 8 * i` as `{ u32 hash, u32 block }`; entry 0's hash word is
+/// the `(limit, count)` header. Linux keeps the top four bits of a block
+/// number reserved (`dx_get_block`).
+mod dx {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::super::dir::rec_len_for;
+    use super::super::htree;
+
+    fn u16_at(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([b[at], b[at + 1]])
+    }
+
+    fn u32_at(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    pub fn limit(b: &[u8], entries: usize) -> u16 {
+        u16_at(b, entries)
+    }
+
+    pub fn count(b: &[u8], entries: usize) -> u16 {
+        u16_at(b, entries + 2)
+    }
+
+    pub fn set_count(b: &mut [u8], entries: usize, count: u16) {
+        b[entries + 2..entries + 4].copy_from_slice(&count.to_le_bytes());
+    }
+
+    pub fn hash_of(b: &[u8], entries: usize, i: u16) -> u32 {
+        u32_at(b, entries + 8 * usize::from(i))
+    }
+
+    pub fn block_of(b: &[u8], entries: usize, i: u16) -> u32 {
+        u32_at(b, entries + 8 * usize::from(i) + 4) & 0x0fff_ffff
+    }
+
+    pub fn set_block(b: &mut [u8], entries: usize, i: u16, block: u32) {
+        let at = entries + 8 * usize::from(i) + 4;
+        b[at..at + 4].copy_from_slice(&block.to_le_bytes());
+    }
+
+    /// `dx_probe`'s binary search: the last entry whose hash is at most
+    /// `hash` (entry 0 covers everything below entry 1). `None` for a
+    /// count that is zero or past the limit.
+    pub fn find(b: &[u8], entries: usize, hash: u32) -> Option<u16> {
+        let count = count(b, entries);
+        if count == 0 || count > limit(b, entries) || entries + 8 * usize::from(count) > b.len() {
+            return None;
+        }
+        let (mut p, mut q) = (1i32, i32::from(count) - 1);
+        while p <= q {
+            let m = p + (q - p) / 2;
+            if hash_of(b, entries, m as u16) > hash {
+                q = m - 1;
+            } else {
+                p = m + 1;
+            }
+        }
+        Some((p - 1) as u16)
+    }
+
+    /// `dx_insert_block`: a new entry `(hash, block)` right after `at`.
+    pub fn insert_after(b: &mut [u8], entries: usize, at: u16, hash: u32, block: u32) {
+        let count = usize::from(count(b, entries));
+        let from = entries + 8 * (usize::from(at) + 1);
+        let end = entries + 8 * count;
+        b.copy_within(from..end, from + 8);
+        b[from..from + 4].copy_from_slice(&hash.to_le_bytes());
+        b[from + 4..from + 8].copy_from_slice(&block.to_le_bytes());
+        set_count(b, entries, (count + 1) as u16);
+    }
+
+    /// An empty `dx_node`: a fake dirent spanning the block, then the
+    /// `(limit, count)` header.
+    pub fn new_node(bs: usize, limit: u16) -> Vec<u8> {
+        let mut b = vec![0u8; bs];
+        b[4..6].copy_from_slice(&(bs as u16).to_le_bytes());
+        b[htree::DX_NODE_ENTRIES_OFF..htree::DX_NODE_ENTRIES_OFF + 2]
+            .copy_from_slice(&limit.to_le_bytes());
+        b
+    }
+
+    /// Entries `from..to` of `src` become entries `0..` of the node `dst`
+    /// (whose own entry-0 hash word stays its header).
+    pub fn copy_entries(src: &[u8], src_entries: usize, from: u16, to: u16, dst: &mut [u8]) {
+        let off = htree::DX_NODE_ENTRIES_OFF;
+        for (k, i) in (from..to).enumerate() {
+            let k = k as u16;
+            if k != 0 {
+                let at = off + 8 * usize::from(k);
+                dst[at..at + 4].copy_from_slice(&hash_of(src, src_entries, i).to_le_bytes());
+            }
+            set_block(dst, off, k, block_of(src, src_entries, i));
+        }
+        set_count(dst, off, to - from);
+    }
+
+    /// One live dirent of a leaf (`struct dx_map_entry`).
+    #[derive(Copy, Clone)]
+    pub struct MapEntry {
+        pub hash: u32,
+        pub offset: usize,
+        /// The record's `rec_len`, slack included.
+        pub size: usize,
+    }
+
+    /// `dx_make_map`: every live entry of `leaf[..usable]` with its hash,
+    /// sorted by hash. `None` for a malformed record.
+    pub fn make_map(
+        leaf: &[u8],
+        usable: usize,
+        version: u8,
+        seed: &[u32; 4],
+    ) -> Option<Vec<MapEntry>> {
+        let mut map = Vec::new();
+        let mut off = 0usize;
+        while off + 8 <= usable {
+            let inode = u32_at(leaf, off);
+            let rec_len = usize::from(u16_at(leaf, off + 4));
+            let name_len = usize::from(leaf[off + 6]);
+            if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > usable || 8 + name_len > rec_len {
+                return None;
+            }
+            if inode != 0 && name_len != 0 {
+                let name = &leaf[off + 8..off + 8 + name_len];
+                let hash = htree::ext4fs_dirhash(name, version, seed)?.hash;
+                map.push(MapEntry {
+                    hash,
+                    offset: off,
+                    size: rec_len,
+                });
+            }
+            off += rec_len;
+        }
+        map.sort_by_key(|e| e.hash);
+        Some(map)
+    }
+
+    /// `do_split`'s split point: from the highest hash down, the entries
+    /// whose sizes fit in half a block move; if they all would, split by
+    /// count instead.
+    pub fn split_point(map: &[MapEntry], bs: usize) -> usize {
+        let mut size = 0usize;
+        for (moved, e) in map.iter().rev().enumerate() {
+            if size + e.size / 2 > bs / 2 {
+                return map.len() - moved;
+            }
+            size += e.size;
+        }
+        map.len() / 2
+    }
+
+    /// `dx_move_dirents` / `dx_pack_dirents`: the given entries of `leaf`,
+    /// packed at their minimal record length, the last one spanning to the
+    /// checksum tail.
+    pub fn pack(leaf: &[u8], entries: &[MapEntry], bs: usize, csum_tail: usize) -> Vec<u8> {
+        let mut out = vec![0u8; bs];
+        let mut pos = 0usize;
+        for (i, e) in entries.iter().enumerate() {
+            let name_len = leaf[e.offset + 6];
+            let len = usize::from(rec_len_for(name_len));
+            out[pos..pos + 8 + usize::from(name_len)]
+                .copy_from_slice(&leaf[e.offset..e.offset + 8 + usize::from(name_len)]);
+            let rec_len = if i + 1 == entries.len() {
+                bs - csum_tail - pos
+            } else {
+                len
+            };
+            out[pos + 4..pos + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+            pos += len;
+        }
+        out
     }
 }

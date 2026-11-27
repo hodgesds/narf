@@ -72,8 +72,41 @@ mb2_header_end:
 _start:
     cli
 
-    /* Stack: 64 KiB in .boot.data. */
+    /* ── Where is the image running? ──
+     *
+     * Not always at its link address. A loader that finds part of that range
+     * owned by firmware places the image higher and enters at `_start` plus
+     * the difference. NARF's EFI loader does this on the ThinkPad P14s Gen 5
+     * AMD, whose ACPI NVS, ACPI tables and a reserved block cover
+     * 0x179ec000-0x1f46bfff, inside the image's link range.
+     *
+     * 32-bit code has no RIP-relative addressing, so the address comes from a
+     * call and a pop. There is no stack yet, so the call borrows the first
+     * dword of the handoff at ebx and puts it back, as Linux's
+     * `pvh_start_xen` does (arch/x86/platform/pvh/head.S). Both handoffs put a
+     * structure in writable RAM there: hvm_start_info starts with its magic,
+     * the multiboot2 information with its total_size. eax (the multiboot2
+     * magic) and ebx are preserved.
+     *
+     * ebp = running address - link address: the physical delta every
+     * instruction from `.Lphys_done` on already applies after the stub's own
+     * copy. A placement below the link address, or off the 2 MiB grid the
+     * kernel window is built from, cannot be represented; stop there. */
+    mov edx, [ebx]
+    lea esp, [ebx + 4]
+    call .Lwhere
+.Lwhere:
+    pop ebp
+    mov [ebx], edx
+    cmp ebp, offset .Lwhere
+    jb .Lplaced_bad
+    sub ebp, offset .Lwhere
+    test ebp, 0x1FFFFF
+    jnz .Lplaced_bad
+
+    /* Stack: 64 KiB in .boot.data, in the running image. */
     mov esp, offset stack_top
+    add esp, ebp
 
     /* Stash the bootloader handoff. */
     push 0
@@ -121,10 +154,15 @@ _start:
      * long mode, and the two values recorded for Rust. Miss one and it reads or
      * writes the stale copy, which still exists and still looks valid.
      *
-     * `esp` is the deliberate exception. It stays link-time-physical because
-     * `long_mode_start` turns it into a VA with `add rsp, KERNEL_VIRT_BASE +
-     * slide`, and the window maps that VA to `offset + delta` — so the delta is
-     * already accounted for. Adding ebp here would count it twice.
+     * `esp` moves with the image too: after the copy it gets ebp added, so in
+     * both cases it points into the image that runs. `long_mode_start`
+     * subtracts the delta again before it turns esp into a window VA, because
+     * the window maps `KERNEL_VIRT_BASE + slide + offset` to `offset + delta`.
+     *
+     * When the loader has already placed the image off its link address (ebp
+     * nonzero from `_start`), that placement is final. The stub neither picks
+     * a target nor copies: the code before `.Lphys_done` addresses its
+     * scratch at link-time addresses, which then belong to someone else.
      *
      * Target selection, in `.Lphys_pick` below, must satisfy:
      *
@@ -144,7 +182,8 @@ _start:
      * in this tree can boot it to test the result. Relocation being off is the
      * safe answer for an unrecognized handoff, not a silent guess.
      */
-    mov ebp, 0                                  /* physical delta; 0 = none */
+    test ebp, ebp                               /* placed by the loader? */
+    jnz .Lphys_done                             /* final; ebp is the delta */
 
     /* A pinned delta skips selection entirely, for reproducing a specific
      * layout. Deliberately NOT validated against the memory map, mirroring
@@ -174,6 +213,10 @@ _start:
     shr ecx, 2                                  /* bytes -> dwords */
     cld
     rep movsd
+
+    /* The stack moves with the image. Everything on it was pushed before
+     * the copy, so the copy holds the same words. */
+    add esp, ebp
 
     /* Continue in the copy. Everything after this label runs at +ebp. */
     mov eax, offset .Lphys_done
@@ -729,6 +772,12 @@ _start:
     xor eax, eax
     ret
 
+/* The loader entered the image below its link address or off the 2 MiB grid.
+ * Nothing here can run it there, and no console exists yet: stop. */
+.Lplaced_bad:
+    hlt
+    jmp .Lplaced_bad
+
 /* eax = base, ecx = length. Appends to the avoid list. Preserves every
  * register except edi (the running count). */
 .Lphys_add_avoid:
@@ -874,7 +923,14 @@ long_mode_start:
      * pops are complete and Rust has not run, so no saved frame pointer
      * and no pointer-to-stack-local exists yet to be left pointing at the
      * low alias. Every push from the `call` below lands high.
+     *
+     * esp is in the running image, `offset + delta`, and the window maps
+     * `KERNEL_VIRT_BASE + slide + offset` there, so the delta comes off
+     * first. `mov ebp, ebp` zero-extends it: the upper halves of registers
+     * written in 32-bit mode are undefined here.
      */
+    mov ebp, ebp
+    sub rsp, rbp
     movabs rax, 0xFFFFFFFF80000000              /* KERNEL_VIRT_BASE */
     add rax, rbx                                /* + KASLR slide    */
     add rsp, rax

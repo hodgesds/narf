@@ -24,7 +24,7 @@ validates the extent header on every inode load. `extent` implements the
 ext4-only extent-tree algorithms — walking the tree, and inserting, splitting,
 and merging extents. `htree` drives the hashed B-tree directory index (shared
 in spirit with ext3's HTREE). `dir` presents directories to the VFS, and
-`journal` implements the JBD2 lifecycle, including the commit-record builder.
+`journal` re-exports the shared JBD2 format and recovery from `drivers/fs/ext2`.
 
 Because NARF is GPL-2.0-or-later, this driver cites the Linux `fs/ext4/*` and
 `fs/jbd2/*` sources directly where the on-disk layout or algorithm derives

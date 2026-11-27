@@ -23,7 +23,7 @@ use narf_block::{BlockDevice, BlockFeature, BlockOp, BlockRequest, LbaRange, Qos
 use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
 use narf_filesystem::{
-    BlockMapping, CacheFolio, DirOps, FolioSlice, FsError, FsInstance, PageCache, PAGE_SIZE,
+    BlockMapping, DirOps, FolioSlice, FsError, FsInstance, PageCache, PAGE_SIZE,
 };
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
 use narf_lib::mutex::Mutex;
@@ -39,6 +39,9 @@ use super::superblock::{ExtFlavour, Superblock};
 
 mod extent_write;
 mod file_data;
+mod free_list;
+pub mod sb_state;
+pub(crate) mod uninit;
 pub(crate) mod xattr;
 
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
@@ -301,13 +304,6 @@ pub struct Ext2Volume<B: BlockDevice + 'static> {
     /// deadlock under cooperative async). A device op pops its own buffer
     /// from the pool, so concurrent reads/writes never share scratch.
     io: IrqSafeSpinLock<VolumeIo>,
-    /// JBD2 read-side replay overrides — FS-block → post-replay
-    /// bytes. Populated by `Ext2Volume::mount` when an unclean
-    /// ext3+ volume is seen; consulted by `read_block` before
-    /// going to the device so RO reads observe the post-replay
-    /// state without ever touching the disk. Empty on clean
-    /// volumes and on ext2 (which has no journal).
-    journal_overrides: BTreeMap<u64, Vec<u8>>,
     /// The volume's page cache: one tree for the block-device mapping
     /// (`bdev_mapping`, inode 0 — metadata keyed by device page). An `Arc`
     /// so it can also be registered with the central memory reclaimer as a
@@ -346,11 +342,24 @@ pub struct Ext2Volume<B: BlockDevice + 'static> {
     /// Mount-root metadata must be available to the synchronous `root()`
     /// interface. It is loaded during mount and refreshed by `write_inode`.
     root_inode: IrqSafeSpinLock<Option<Inode>>,
-    /// Set when a feature or dynamic recovery flag lacks a safe write path.
-    /// Clean metadata_csum/csum_seed volumes are writable: inode, directory,
-    /// bitmap, group-descriptor, and primary-superblock writers regenerate
-    /// their dependent checksums before returning.
-    read_only: bool,
+    /// Set when this mount writes nothing: requested read-only, refused by
+    /// the write gate ([`sb_state::rw_refusal`]), a dirty journal replayed
+    /// into memory only, an error under a read-only error policy, or a
+    /// remount read-only. Cleared only by a remount read-write that passes
+    /// the gate again.
+    read_only: core::sync::atomic::AtomicBool,
+    /// The gate rules this mount was made under.
+    profile: sb_state::GateProfile,
+    /// Why the gate refused a read-write mount, if it did.
+    refusal: Option<sb_state::Refusal>,
+    /// `s_state` as the mount found it (Linux `s_mount_state`), restored
+    /// when the filesystem is marked clean again.
+    mount_state: u16,
+    /// An error was recorded during this mount (`EXT4_ERROR_FS` then
+    /// survives the clean unmount).
+    errors_seen: core::sync::atomic::AtomicBool,
+    /// The superblock says "not clean" because this mount wrote it so.
+    dirty_marked: core::sync::atomic::AtomicBool,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
 }
@@ -460,63 +469,6 @@ async fn device_read_into<B: BlockDevice>(
     Ok(())
 }
 
-/// Mount-time byte writer using the already-registered scratch pool. This is
-/// intentionally limited to pre-construction recovery updates, when no other
-/// volume operation can contend for `io.pool[0]`.
-async fn write_byte_range_static<B: BlockDevice>(
-    device: &B,
-    io: &VolumeIo,
-    byte_off: u64,
-    src: &[u8],
-) -> Result<(), FsError> {
-    let lbs = io.lbs;
-    let scratch = io
-        .pool
-        .first()
-        .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
-    let mut cursor = 0usize;
-    while cursor < src.len() {
-        let absolute = byte_off + cursor as u64;
-        let lba = absolute / lbs as u64;
-        let in_lba = (absolute % lbs as u64) as usize;
-        let take = (src.len() - cursor).min(lbs - in_lba);
-        let mut sector = vec![0u8; lbs];
-        if in_lba != 0 || take != lbs {
-            device_read_into(
-                device,
-                lbs,
-                io.scratch_bytes,
-                scratch,
-                lba * lbs as u64,
-                &mut sector,
-            )
-            .await?;
-        }
-        sector[in_lba..in_lba + take].copy_from_slice(&src[cursor..cursor + take]);
-        {
-            let dma = resolve_cap(scratch)
-                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-            // SAFETY: mount owns this scratch entry exclusively and the DMA
-            // allocation is at least one logical sector.
-            let dst = unsafe { core::slice::from_raw_parts_mut(dma.as_mut_ptr(), lbs) };
-            dst.copy_from_slice(&sector);
-        }
-        let request = BlockRequest {
-            op: BlockOp::Write { fua: true },
-            lba,
-            blocks: 1,
-            buffer: scratch
-                .derive::<Read>()
-                .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
-            qos: QosHint::Latency,
-            user_tag: 0,
-        };
-        device.submit(request).await.result.map_err(FsError::Io)?;
-        cursor += take;
-    }
-    Ok(())
-}
-
 /// Free-function variant of `Ext2Volume::read_byte_range_into`
 /// usable from other free helpers.
 async fn read_byte_range_into_static<B: BlockDevice>(
@@ -526,6 +478,184 @@ async fn read_byte_range_into_static<B: BlockDevice>(
     dst: &mut [u8],
 ) -> Result<(), FsError> {
     device_read_into(device, io.lbs, io.scratch_bytes, &io.pool[0], byte_off, dst).await
+}
+
+/// `EXT4_S_ERR_START` .. `EXT4_S_ERR_END`: `s_error_count` up to
+/// `s_mount_opts`.
+const ERR_START: usize = 0x194;
+const ERR_END: usize = 0x200;
+
+/// How the journal is loaded at mount.
+#[derive(Copy, Clone)]
+struct JournalMount {
+    /// `sb_rdonly`: a read-only mount.
+    read_only: bool,
+    /// `bdev_read_only`: the device cannot be written.
+    really_read_only: bool,
+    /// `needs_recovery` as `ext4_fill_super` computed it before the load,
+    /// cleared on a read-only device.
+    needs_recovery: bool,
+}
+
+/// The JBD2 error as `ext4_fill_super` reports it.
+fn journal_error(error: journal::JournalError) -> FsError {
+    use journal::JournalError as J;
+    match error {
+        J::Invalid => FsError::InvalidData,
+        J::BadChecksum => FsError::BadChecksum,
+        J::Corrupted => FsError::Corrupted,
+        J::Io => FsError::Io(narf_block::BlockError::IOError),
+        J::NoMemory => FsError::OutOfMemory,
+        J::FastCommit => FsError::Unsupported,
+    }
+}
+
+/// Write `src` at device byte `byte_off` before the volume exists (mount
+/// time, when `io.pool[0]` is the only buffer in use). Whole logical blocks
+/// go out several per request; a partial one is read, merged and written.
+async fn write_byte_range_static<B: BlockDevice>(
+    device: &B,
+    io: &VolumeIo,
+    byte_off: u64,
+    src: &[u8],
+    fua: bool,
+) -> Result<(), FsError> {
+    let lbs = io.lbs;
+    let per_request = (io.scratch_bytes / lbs).max(1);
+    let scratch = &io.pool[0];
+    let mut cursor = 0usize;
+    while cursor < src.len() {
+        let abs = byte_off + cursor as u64;
+        let lba = abs / lbs as u64;
+        let in_lba = (abs % lbs as u64) as usize;
+        let (blocks, take) = if in_lba == 0 && src.len() - cursor >= lbs {
+            let n = ((src.len() - cursor) / lbs).min(per_request);
+            (n, n * lbs)
+        } else {
+            (1, (src.len() - cursor).min(lbs - in_lba))
+        };
+        let mut staged = vec![0u8; blocks * lbs];
+        if take != blocks * lbs {
+            device_read_into(
+                device,
+                lbs,
+                io.scratch_bytes,
+                scratch,
+                lba * lbs as u64,
+                &mut staged,
+            )
+            .await?;
+        }
+        staged[in_lba..in_lba + take].copy_from_slice(&src[cursor..cursor + take]);
+        {
+            let buf = resolve_cap(scratch)
+                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+            // SAFETY: mount time: nothing else uses `pool[0]`, and the
+            // buffer holds `scratch_bytes >= blocks * lbs` bytes.
+            let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), staged.len()) };
+            dst.copy_from_slice(&staged);
+        }
+        let req = BlockRequest {
+            op: BlockOp::Write { fua },
+            lba,
+            blocks: blocks as u32,
+            buffer: scratch
+                .derive::<Read>()
+                .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
+            qos: QosHint::Latency,
+            user_tag: 0,
+        };
+        device.submit(req).await.result.map_err(FsError::Io)?;
+        cursor += take;
+    }
+    Ok(())
+}
+
+/// `ext4_commit_super` at mount time: the checksum, then the primary
+/// superblock with FUA.
+async fn commit_super_static<B: BlockDevice>(
+    device: &B,
+    io: &VolumeIo,
+    sb: &Superblock,
+    sb_bytes: &mut [u8],
+) -> Result<(), FsError> {
+    metadata_csum::write_superblock_checksum(sb, sb_bytes).ok_or(FsError::InvalidData)?;
+    write_byte_range_static(device, io, 1024, sb_bytes, true).await
+}
+
+/// The journal inode's blocks, through the mount-time helpers.
+struct MountJournalIo<'a, B: BlockDevice> {
+    device: &'a B,
+    io: &'a VolumeIo,
+    sb: &'a Superblock,
+    group_descs: &'a [GroupDesc],
+    inode: Inode,
+    bs: usize,
+    total_len: u32,
+    /// Whether a replayed block went to the filesystem.
+    wrote_home: bool,
+}
+
+impl<B: BlockDevice + 'static> MountJournalIo<'_, B> {
+    /// `ext4_journal_bmap`: a journal block that does not map is
+    /// EFSCORRUPTED.
+    async fn map(&self, block: u32) -> Result<u64, journal::JournalError> {
+        if block >= self.total_len {
+            return Err(journal::JournalError::Corrupted);
+        }
+        let physical = Ext2Volume::<B>::map_block_static(
+            self.device,
+            self.io,
+            self.sb,
+            self.group_descs,
+            &self.inode,
+            u64::from(block),
+        )
+        .await
+        .map_err(|_| journal::JournalError::Corrupted)?;
+        if physical == 0 {
+            return Err(journal::JournalError::Corrupted);
+        }
+        Ok(physical)
+    }
+}
+
+impl<B: BlockDevice + 'static> journal::JournalIo for MountJournalIo<'_, B> {
+    fn read_log<'b>(&'b mut self, block: u32, buf: &'b mut [u8]) -> journal::IoFuture<'b> {
+        alloc::boxed::Box::pin(async move {
+            let physical = self.map(block).await?;
+            read_byte_range_into_static(self.device, self.io, physical * self.bs as u64, buf)
+                .await
+                .map_err(|_| journal::JournalError::Io)
+        })
+    }
+
+    fn write_home<'b>(&'b mut self, block: u64, data: &'b [u8]) -> journal::IoFuture<'b> {
+        alloc::boxed::Box::pin(async move {
+            self.wrote_home = true;
+            write_byte_range_static(self.device, self.io, block * self.bs as u64, data, false)
+                .await
+                .map_err(|_| journal::JournalError::Io)
+        })
+    }
+
+    fn write_log_fua<'b>(&'b mut self, block: u32, data: &'b [u8]) -> journal::IoFuture<'b> {
+        alloc::boxed::Box::pin(async move {
+            let physical = self.map(block).await?;
+            write_byte_range_static(self.device, self.io, physical * self.bs as u64, data, true)
+                .await
+                .map_err(|_| journal::JournalError::Io)
+        })
+    }
+
+    fn flush(&mut self) -> journal::IoFuture<'_> {
+        alloc::boxed::Box::pin(async move {
+            self.device
+                .flush_result()
+                .await
+                .map_err(|_| journal::JournalError::Io)
+        })
+    }
 }
 
 /// A boxed future for the recursive block-tree walks (an `async fn` cannot
@@ -542,22 +672,97 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// A device that reports [`BlockDevice::is_read_only`] is mounted as by
     /// [`Self::mount_read_only`].
     pub async fn mount(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
-        Self::mount_with(device, domain, false).await
+        Self::mount_with(device, domain, false, false).await
     }
 
-    /// Mount without writing a single byte to `device`, ever: the stale
-    /// `RECOVER`/`ORPHAN_PRESENT` superblock repair a writable mount performs
-    /// is skipped, a dirty journal is replayed into memory only (the
-    /// existing read-side override map), and every later write is refused
-    /// with [`FsError::ReadOnly`].
+    /// Mount read-only (`MS_RDONLY`). Every later write is refused with
+    /// [`FsError::ReadOnly`]. What the mount itself writes is what Linux
+    /// writes on a read-only mount (`ext4_load_journal`,
+    /// `ext4_mark_recovery_complete`): a journal that needs recovery is
+    /// replayed to the device and marked empty, and the superblock's
+    /// `RECOVER` cleared. On a device that cannot be written that recovery
+    /// fails the mount with EROFS instead, and nothing is written at all.
     pub async fn mount_read_only(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
-        Self::mount_with(device, domain, true).await
+        Self::mount_with(device, domain, true, false).await
+    }
+
+    /// Mount with ext4's `ro` and `noload` (`norecovery`) options. With
+    /// `noload` the journal is not loaded: a read-only mount then sees the
+    /// filesystem as it is on disk, without the transactions still in the
+    /// log, and a read-write mount of a filesystem that needs recovery is
+    /// refused (`ext4_fill_super`, EINVAL).
+    pub async fn mount_with_options(
+        device: Arc<B>,
+        domain: DomainId,
+        read_only: bool,
+        noload: bool,
+    ) -> Result<Arc<Self>, FsError> {
+        Self::mount_with(device, domain, read_only, noload).await
+    }
+
+    /// The superblock (its bytes and parse) and the group descriptors, each
+    /// checked as `ext4_fill_super` checks them.
+    async fn read_geometry(
+        device: &B,
+        io: &VolumeIo,
+    ) -> Result<(Vec<u8>, Superblock, Vec<GroupDesc>), FsError> {
+        // Read 1024 bytes starting at byte 1024 — the superblock.
+        // For a 512-byte LBS this is two LBA reads (LBA 2 and LBA
+        // 3); for a 1024-byte LBS it's one (LBA 1); for a 4096-byte
+        // LBS the superblock sits inside LBA 0 at byte 1024.
+        let mut sb_bytes = vec![0u8; 1024];
+        Self::read_byte_range_into(device, io, 1024, &mut sb_bytes).await?;
+        let superblock = Superblock::parse(&sb_bytes).ok_or(FsError::Unsupported)?;
+        // Reject any volume that uses incompat features we don't
+        // implement — refusing is safer than mis-decoding. Encrypted
+        // and inline-data volumes hit this; ext2/3/4 with EXTENTS +
+        // 64BIT + FLEX_BG + FILETYPE + RECOVER pass.
+        if superblock.check_incompat_features().is_err() {
+            return Err(FsError::Unsupported);
+        }
+        if !metadata_csum::verify_superblock(&superblock, &sb_bytes) {
+            return Err(FsError::InvalidData);
+        }
+        // Block group descriptor table starts at the block after
+        // the superblock. With a 1-KiB block volume that's block 2;
+        // with a 2-KiB or 4-KiB block volume it's block 1. The
+        // canonical formula:
+        //
+        //     bgdt_block = s_first_data_block + 1
+        //
+        // ext2 design paper, §"Block Groups". ext4 with 64BIT uses
+        // 64-byte descriptors instead of 32 — see effective_desc_size.
+        let bs = superblock.block_size() as u64;
+        let group_count = superblock.block_group_count() as usize;
+        let desc_size = superblock.effective_desc_size();
+        let bgdt_size_bytes = (group_count * desc_size) as u64;
+        let bgdt_block_offset = (superblock.first_data_block + 1) as u64 * bs;
+
+        let mut bgdt_bytes = vec![0u8; bgdt_size_bytes as usize];
+        Self::read_byte_range_into(device, io, bgdt_block_offset, &mut bgdt_bytes).await?;
+
+        let mut group_descs = Vec::with_capacity(group_count);
+        for i in 0..group_count {
+            let off = i * desc_size;
+            if !metadata_csum::verify_group_desc_checksum(
+                &superblock,
+                i as u32,
+                &bgdt_bytes[off..off + desc_size],
+            ) {
+                return Err(FsError::InvalidData);
+            }
+            let gd = GroupDesc::parse_sized(&bgdt_bytes[off..off + desc_size], desc_size)
+                .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+            group_descs.push(gd);
+        }
+        Ok((sb_bytes, superblock, group_descs))
     }
 
     async fn mount_with(
         device: Arc<B>,
         domain: DomainId,
         read_only_requested: bool,
+        noload: bool,
     ) -> Result<Arc<Self>, FsError> {
         let read_only_requested = read_only_requested || device.is_read_only();
         let lbs = device.logical_block_size() as usize;
@@ -587,114 +792,72 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             scratch_bytes,
         };
 
-        // Read 1024 bytes starting at byte 1024 — the superblock.
-        // For a 512-byte LBS this is two LBA reads (LBA 2 and LBA
-        // 3); for a 1024-byte LBS it's one (LBA 1); for a 4096-byte
-        // LBS the superblock sits inside LBA 0 at byte 1024.
-        let mut sb_bytes = vec![0u8; 1024];
-        Self::read_byte_range_into(&*device, &io, 1024, &mut sb_bytes).await?;
+        // `io` drops on an error return, unregistering every pooled buffer.
+        let (mut sb_bytes, mut superblock, mut group_descs) =
+            Self::read_geometry(&*device, &io).await?;
 
-        let mut superblock = match Superblock::parse(&sb_bytes) {
-            Some(s) => s,
-            None => {
-                // `io` drops here, unregistering every pooled buffer.
-                return Err(FsError::Unsupported);
-            }
-        };
-        // Reject any volume that uses incompat features we don't
-        // implement — refusing is safer than mis-decoding. Encrypted
-        // and inline-data volumes hit this; ext2/3/4 with EXTENTS +
-        // 64BIT + FLEX_BG + FILETYPE + RECOVER pass.
-        if superblock.check_incompat_features().is_err() {
-            // `io` drops here, unregistering every pooled buffer.
-            return Err(FsError::Unsupported);
-        }
-        if !metadata_csum::verify_superblock(&superblock, &sb_bytes) {
-            return Err(FsError::InvalidData);
-        }
-        // Block group descriptor table starts at the block after
-        // the superblock. With a 1-KiB block volume that's block 2;
-        // with a 2-KiB or 4-KiB block volume it's block 1. The
-        // canonical formula:
+        // ── ext4_load_journal ───────────────────────────────────
         //
-        //     bgdt_block = s_first_data_block + 1
-        //
-        // ext2 design paper, §"Block Groups". ext4 with 64BIT uses
-        // 64-byte descriptors instead of 32 — see effective_desc_size.
-        let bs = superblock.block_size() as u64;
-        let group_count = superblock.block_group_count() as usize;
-        let desc_size = superblock.effective_desc_size();
-        let bgdt_size_bytes = (group_count * desc_size) as u64;
-        let bgdt_block_offset = (superblock.first_data_block + 1) as u64 * bs;
-
-        let mut bgdt_bytes = vec![0u8; bgdt_size_bytes as usize];
-        Self::read_byte_range_into(&*device, &io, bgdt_block_offset, &mut bgdt_bytes).await?;
-
-        let mut group_descs = Vec::with_capacity(group_count);
-        for i in 0..group_count {
-            let off = i * desc_size;
-            if !metadata_csum::verify_group_desc_checksum(
+        // `ext4_fill_super` loads the journal before it reads any inode but
+        // the journal's own: recovery may rewrite any metadata block. A
+        // journal that needs recovery is replayed to the device on a
+        // read-only mount too; only a device that cannot be written refuses
+        // it (EROFS), unless `noload` asks for the filesystem as it is on
+        // disk.
+        let really_read_only = device.is_read_only();
+        let recover_bit = super::superblock::incompat::RECOVER;
+        let needs_recovery = superblock.last_orphan != 0
+            || superblock.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT != 0
+            || superblock.feature_incompat & recover_bit != 0;
+        // Whether the JBD2 log has nothing to replay, and the orphan file
+        // nothing to release: then a stale RECOVER / ORPHAN_PRESENT bit is
+        // repaired by the read-write mount's superblock update below.
+        let journal_clean;
+        let mut orphans_empty = false;
+        if superblock.flavour() != ExtFlavour::Ext2 && superblock.has_journal() && !noload {
+            let rewrote = Self::load_journal_at_mount(
+                &*device,
+                &io,
                 &superblock,
-                i as u32,
-                &bgdt_bytes[off..off + desc_size],
-            ) {
-                return Err(FsError::InvalidData);
+                &group_descs,
+                &mut sb_bytes,
+                JournalMount {
+                    read_only: read_only_requested,
+                    really_read_only,
+                    needs_recovery: needs_recovery && !really_read_only,
+                },
+            )
+            .await?;
+            if rewrote {
+                // The replay may have rewritten the superblock and the
+                // group descriptors.
+                (_, superblock, group_descs) = Self::read_geometry(&*device, &io).await?;
             }
-            let gd = GroupDesc::parse_sized(&bgdt_bytes[off..off + desc_size], desc_size)
-                .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
-            group_descs.push(gd);
+            journal_clean = true;
+        } else if noload && !read_only_requested && superblock.feature_incompat & recover_bit != 0 {
+            // "required journal recovery suppressed and not mounted
+            // read-only".
+            return Err(FsError::InvalidData);
+        } else {
+            journal_clean = superblock.feature_incompat & recover_bit == 0;
         }
-
-        // ── JBD2 read-side replay ───────────────────────────────
-        //
-        // If the volume is ext3+ AND was not cleanly unmounted, walk
-        // the journal and build an override map of FS-block →
-        // post-replay bytes. For RO mounts this is sufficient — we
-        // never write to disk; later `read_block` calls consult the
-        // override before doing device I/O.
-        let mut journal_overrides: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-        if superblock.flavour() != ExtFlavour::Ext2
-            && superblock.has_journal()
-            && (!superblock.is_clean()
-                || superblock.feature_incompat & super::superblock::incompat::RECOVER != 0)
-        {
-            // Best-effort replay: failure is non-fatal for an RO
-            // mount (we just fall back to the on-disk state — same
-            // as ext2 was before journal support). The override
-            // map only narrows reads, never invents data.
-            if let Ok((map, journal_clean)) =
-                Self::replay_journal_at_mount(&*device, &io, &superblock, &group_descs).await
-            {
-                journal_overrides = map;
-                // A clean JBD2 superblock means there is nothing to replay;
-                // a stale main-superblock RECOVER bit can be cleared safely.
-                // Persist that repair now so this and subsequent mounts can
-                // enable checksum-aware direct writes. Dirty journals remain
-                // override-only/read-only until verified persistent replay is
-                // implemented for every JBD2 feature combination.
-                let orphan_clean = if journal_clean
-                    && superblock.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT
-                        != 0
-                {
-                    Self::orphan_file_is_empty_at_mount(&*device, &io, &superblock, &group_descs)
-                        .await
-                        .unwrap_or(false)
-                } else {
-                    true
-                };
-                if journal_clean && orphan_clean && !read_only_requested {
-                    superblock.feature_incompat &= !super::superblock::incompat::RECOVER;
-                    superblock.feature_ro_compat &= !super::superblock::ro_compat::ORPHAN_PRESENT;
-                    sb_bytes[96..100].copy_from_slice(&superblock.feature_incompat.to_le_bytes());
-                    sb_bytes[100..104].copy_from_slice(&superblock.feature_ro_compat.to_le_bytes());
-                    metadata_csum::write_superblock_checksum(&superblock, &mut sb_bytes)
-                        .ok_or(FsError::InvalidData)?;
-                    write_byte_range_static(&*device, &io, 1024, &sb_bytes).await?;
-                }
-            }
+        if superblock.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT != 0 {
+            orphans_empty =
+                Self::orphan_file_is_empty_at_mount(&*device, &io, &superblock, &group_descs)
+                    .await
+                    .unwrap_or(false);
         }
-
-        let read_only = read_only_requested || !superblock.write_features_supported();
+        // The write gate. Nothing has been written yet, whatever it says.
+        let profile = sb_state::GateProfile::current();
+        let refusal = if read_only_requested {
+            None
+        } else {
+            sb_state::rw_refusal(&superblock, journal_clean, orphans_empty, profile)
+        };
+        if let Some(refusal) = refusal {
+            sb_state::report_refusal(&superblock, refusal);
+        }
+        let read_only = read_only_requested || refusal.is_some();
 
         let page_cache = Arc::new(PageCache::new());
         let volume = Arc::new_cyclic(|self_weak| Ext2Volume {
@@ -704,7 +867,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
-            journal_overrides,
             page_cache: page_cache.clone(),
             bdev_mapping: BlockMapping::new(page_cache, 0),
             icache: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -716,11 +878,33 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
-            read_only,
+            read_only: core::sync::atomic::AtomicBool::new(read_only),
+            profile,
+            refusal,
+            mount_state: superblock.state,
+            errors_seen: core::sync::atomic::AtomicBool::new(false),
+            dirty_marked: core::sync::atomic::AtomicBool::new(false),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
         });
         let root_inode = volume.read_inode(super::EXT2_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root_inode);
+        // `ext4_setup_super`: mark the filesystem dirty (and repair a stale
+        // RECOVER / ORPHAN_PRESENT the gate found clean) before anything
+        // else is written. If that cannot be written, `ext4_fill_super`
+        // falls back to read-only, and so does this.
+        if !volume.is_read_only() {
+            if let Err(error) = volume.setup_super().await {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ext4 {}: superblock update failed ({error:?}); mounting READ-ONLY",
+                    sb_state::uuid_string(&volume.superblock)
+                );
+                volume
+                    .read_only
+                    .store(true, core::sync::atomic::Ordering::Release);
+            }
+        }
         // Register the page cache with the central memory reclaimer so its
         // clean pages can be shed under pressure (shrinker). Done after the
         // owning Arc exists so a Weak can be held without keeping it alive.
@@ -728,84 +912,178 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(volume)
     }
 
-    /// Drive `journal::replay_journal` against the on-disk journal
-    /// inode (`s_journal_inum`, typically 8). Reads journal blocks
-    /// in sequence by walking the inode's logical→physical map and
-    /// fetching one FS block at a time, eagerly into a `Vec<Vec<u8>>`
-    /// (one entry per journal-block index) so the pure-logic
-    /// `replay_journal` closure stays synchronous.
+    /// `ext4_load_journal`, then the journal half of
+    /// `ext4_mark_recovery_complete`, before anything else on the volume is
+    /// read. Returns whether anything outside the journal was written (the
+    /// caller then re-reads the superblock and descriptors).
     ///
-    /// References:
-    ///   * Linux `fs/jbd2/journal.c::jbd2_journal_get_descriptor_buffer`
-    ///     for the journal-block addressing model (logical block N of
-    ///     the journal inode → on-disk FS block via `map_block`).
-    ///   * Linux `fs/jbd2/recovery.c::do_one_pass` for the algorithm
-    ///     we implement in `journal::replay_journal`.
-    async fn replay_journal_at_mount(
+    /// - The journal inode must be live and regular (`ext4_get_journal_inode`,
+    ///   EFSCORRUPTED), and its superblock valid
+    ///   (`journal_check_superblock`: EINVAL, EFSBADCRC).
+    /// - `RECOVER` on a read-only mount of a device that cannot be written:
+    ///   EROFS.
+    /// - `RECOVER` clear: the log is wiped (`jbd2_journal_wipe`), and on a
+    ///   writable device marked empty. `RECOVER` set: it is replayed
+    ///   (`jbd2_journal_load`); any recovery error fails the mount.
+    /// - The superblock's error fields are put back if the replay
+    ///   overwrote them, and an error recorded in the journal
+    ///   (`s_errno`) moves into the superblock's ERROR_FS
+    ///   (`ext4_clear_journal_err`).
+    /// - With `needs_recovery`, the log is marked empty (`jbd2_journal_flush`)
+    ///   and, on a read-only mount, `RECOVER` and `ORPHAN_PRESENT` are
+    ///   cleared.
+    ///
+    /// LINUX-GAP: NARF has no orphan cleanup yet (`ext4_orphan_cleanup`).
+    /// When the orphan file still holds inodes, a read-only mount leaves
+    /// `RECOVER` and `ORPHAN_PRESENT` set for the next Linux mount to
+    /// process, where Linux would have processed them and cleared both.
+    async fn load_journal_at_mount(
         device: &B,
         io: &VolumeIo,
         sb: &Superblock,
         group_descs: &[GroupDesc],
-    ) -> Result<(BTreeMap<u64, Vec<u8>>, bool), FsError> {
+        sb_bytes: &mut [u8],
+        how: JournalMount,
+    ) -> Result<bool, FsError> {
+        use core::fmt::Write as _;
         let bs = sb.block_size() as usize;
         let inode_no = sb.journal_inum;
         if inode_no == 0 {
-            return Ok((BTreeMap::new(), true));
+            // An external journal device (`ext4_open_dev_journal`).
+            return Err(FsError::Unsupported);
         }
-        // Read the journal inode directly (avoid building a temporary
-        // Ext2Volume just for this — we already have `device`,
-        // `group_descs`, and `io`).
-        let (group, index) = {
-            let zero = inode_no.checked_sub(1).ok_or(FsError::NotFound)?;
-            let g = zero / sb.inodes_per_group;
-            let i = zero % sb.inodes_per_group;
-            if (g as usize) >= group_descs.len() {
-                return Err(FsError::NotFound);
-            }
-            (g, i)
-        };
-        let gd = &group_descs[group as usize];
+        // `ext4_get_journal_inode`.
+        let zero = inode_no.checked_sub(1).ok_or(FsError::Corrupted)?;
+        let gd = group_descs
+            .get((zero / sb.inodes_per_group) as usize)
+            .ok_or(FsError::Corrupted)?;
         let inode_size = sb.inode_size_bytes();
-        let table_byte_off = gd.inode_table * bs as u64;
-        let inode_byte_off = table_byte_off + (index as u64) * inode_size as u64;
-        let mut inode_buf = vec![0u8; 128];
-        read_byte_range_into_static::<B>(device, io, inode_byte_off, &mut inode_buf).await?;
-        let inode = Inode::parse(&inode_buf).ok_or(FsError::Io(narf_block::BlockError::IOError))?;
-
-        // Size of the journal in bytes → number of journal blocks.
-        let journal_bytes = inode.size as u64;
-        let n_blocks = (journal_bytes / bs as u64) as u32;
-        if n_blocks == 0 {
-            return Ok((BTreeMap::new(), true));
+        let inode_off =
+            gd.inode_table * bs as u64 + (zero % sb.inodes_per_group) as u64 * inode_size as u64;
+        let mut inode_bytes = vec![0u8; inode_size];
+        read_byte_range_into_static::<B>(device, io, inode_off, &mut inode_bytes).await?;
+        if !metadata_csum::verify_inode_checksum(sb, inode_no, &inode_bytes) {
+            return Err(FsError::BadChecksum);
         }
+        let inode = Inode::parse(&inode_bytes).ok_or(FsError::Corrupted)?;
+        if inode.links_count == 0 || inode.mode & 0xF000 != 0x8000 {
+            return Err(FsError::Corrupted);
+        }
+        let total_len = u32::try_from(inode.size / bs as u64).unwrap_or(u32::MAX);
+        let mut jio = MountJournalIo {
+            device,
+            io,
+            sb,
+            group_descs,
+            inode,
+            bs,
+            total_len,
+            wrote_home: false,
+        };
+        let mut first = vec![0u8; bs];
+        journal::JournalIo::read_log(&mut jio, 0, &mut first)
+            .await
+            .map_err(journal_error)?;
+        let mut journal =
+            journal::Journal::load_superblock(&first, bs, total_len).map_err(journal_error)?;
 
-        // Eagerly fetch every journal block into memory. JBD2 journals
-        // are typically 128 MiB max; for the in-driver replay the
-        // simplicity of a flat buffer is worth the cost. We can swap
-        // to a demand-fetch closure later if needed.
-        let mut journal_image: Vec<Vec<u8>> = Vec::with_capacity(n_blocks as usize);
-        for i in 0..n_blocks {
-            let phys =
-                Self::map_block_static(device, io, sb, group_descs, &inode, i as u64).await?;
-            if phys == 0 {
-                // Sparse hole in the journal — treat as a block of
-                // zeros. The replay walker will hit a bad-magic
-                // header and stop walking forward at this point.
-                journal_image.push(vec![0u8; bs]);
-                continue;
+        let recover = sb.feature_incompat & super::superblock::incompat::RECOVER != 0;
+        if recover && how.read_only && how.really_read_only {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ext4 {}: write access unavailable, cannot proceed (try mounting with noload)",
+                sb_state::uuid_string(sb)
+            );
+            return Err(FsError::ReadOnly);
+        }
+        let writable = !how.really_read_only;
+        if !recover {
+            journal
+                .wipe(&mut jio, writable)
+                .await
+                .map_err(journal_error)?;
+        }
+        let saved_errors = sb_bytes[ERR_START..ERR_END].to_vec();
+        let loaded = journal.load(&mut jio, writable).await;
+        let mut wrote = jio.wrote_home;
+        if wrote {
+            Self::read_byte_range_into(device, io, 1024, sb_bytes).await?;
+        }
+        // `ext4_load_journal`: the replay must not lose errors recorded since
+        // the transaction that last wrote the superblock.
+        let mut changed = sb_bytes[ERR_START..ERR_END] != saved_errors[..];
+        if changed {
+            sb_bytes[ERR_START..ERR_END].copy_from_slice(&saved_errors);
+        }
+        let state = u16::from_le_bytes([sb_bytes[0x3a], sb_bytes[0x3b]]);
+        let merged = state | (sb.state & super::superblock::EXT2_ERROR_FS);
+        if merged != state {
+            sb_bytes[0x3a..0x3c].copy_from_slice(&merged.to_le_bytes());
+            changed = true;
+        }
+        let mut result = loaded.map(|_| ()).map_err(journal_error);
+        if changed && writable {
+            let committed = commit_super_static(device, io, sb, sb_bytes).await;
+            wrote = true;
+            if result.is_ok() {
+                result = committed;
             }
-            let mut buf = vec![0u8; bs];
-            read_byte_range_into_static::<B>(device, io, phys * bs as u64, &mut buf).await?;
-            journal_image.push(buf);
+        }
+        if let Err(error) = result {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ext4 {}: error loading journal ({error:?})",
+                sb_state::uuid_string(sb)
+            );
+            return Err(error);
         }
 
-        let journal_clean = journal_image
-            .first()
-            .and_then(|bytes| journal::JournalSuperblock::parse(bytes))
-            .is_some_and(|journal_sb| journal_sb.is_clean());
-        let report = journal::replay_journal(n_blocks, |i| journal_image.get(i as usize).cloned())
-            .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
-        Ok((report.blocks_to_write, journal_clean))
+        // `ext4_clear_journal_err`.
+        if journal.errno != 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ext4 {}: Filesystem error recorded from previous mount: errno {}",
+                sb_state::uuid_string(sb),
+                -journal.errno
+            );
+            let state = u16::from_le_bytes([sb_bytes[0x3a], sb_bytes[0x3b]]);
+            sb_bytes[0x3a..0x3c]
+                .copy_from_slice(&(state | super::superblock::EXT2_ERROR_FS).to_le_bytes());
+            if writable {
+                commit_super_static(device, io, sb, sb_bytes).await?;
+                wrote = true;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ext4 {}: Marked fs in need of filesystem check.",
+                    sb_state::uuid_string(sb)
+                );
+                journal.clear_err(&mut jio).await;
+            }
+        }
+
+        // `ext4_mark_recovery_complete`.
+        if how.needs_recovery {
+            journal.mark_empty(&mut jio).await;
+            let incompat = u32::from_le_bytes(sb_bytes[0x60..0x64].try_into().expect("4 bytes"));
+            let ro_compat = u32::from_le_bytes(sb_bytes[0x64..0x68].try_into().expect("4 bytes"));
+            let orphan_present = super::superblock::ro_compat::ORPHAN_PRESENT;
+            let recover_bit = super::superblock::incompat::RECOVER;
+            if how.read_only && (incompat & recover_bit != 0 || ro_compat & orphan_present != 0) {
+                let current = Superblock::parse(sb_bytes).ok_or(FsError::InvalidData)?;
+                let orphans_empty =
+                    Self::orphan_file_is_empty_at_mount(device, io, &current, group_descs)
+                        .await
+                        .unwrap_or(false);
+                if orphans_empty {
+                    sb_bytes[0x60..0x64].copy_from_slice(&(incompat & !recover_bit).to_le_bytes());
+                    sb_bytes[0x64..0x68]
+                        .copy_from_slice(&(ro_compat & !orphan_present).to_le_bytes());
+                    commit_super_static(device, io, sb, sb_bytes).await?;
+                    wrote = true;
+                }
+            }
+        }
+        Ok(wrote)
     }
 
     /// Verify that every slot in ext4's orphan file is empty. Only then may a
@@ -990,15 +1268,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         block_no: u64,
     ) -> Result<Option<FolioSlice>, FsError> {
         let bs = self.block_size();
-        if let Some(override_data) = self.journal_overrides.get(&block_no) {
-            if override_data.len() == bs {
-                let Some(mut allocation) = CacheFolio::alloc_zeroed() else {
-                    return Ok(None);
-                };
-                allocation[..bs].copy_from_slice(override_data);
-                return Ok(allocation.into_private_slice(0, bs));
-            }
-        }
         if bs > PAGE_SIZE || PAGE_SIZE % bs != 0 {
             return Ok(None);
         }
@@ -1042,12 +1311,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             .try_reserve_exact(bs)
             .map_err(|_| FsError::OutOfMemory)?;
         bytes.resize(bs, 0);
-        if let Some(override_data) = self.journal_overrides.get(&block_no) {
-            if override_data.len() == bs {
-                bytes.copy_from_slice(override_data);
-                return Ok(BlockView::Owned(bytes));
-            }
-        }
         self.read_byte_range(block_no * bs as u64, &mut bytes)
             .await?;
         Ok(BlockView::Owned(bytes))
@@ -1065,66 +1328,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             dst.copy_from_slice(&view);
             return Ok(());
         }
-        if let Some(override_data) = self.journal_overrides.get(&block_no) {
-            if override_data.len() == bs {
-                dst.copy_from_slice(override_data);
-                return Ok(());
-            }
-        }
         self.read_byte_range(block_no * bs as u64, dst).await
-    }
-
-    /// Number of journal-replay overrides installed at mount. Zero
-    /// on clean volumes / ext2. Used by smokes to confirm replay
-    /// fired without exposing the internal map.
-    pub fn journal_override_count(&self) -> usize {
-        self.journal_overrides.len()
     }
 
     /// Read `dst.len()` bytes starting at the device byte offset
     /// `byte_off`. Internally serialises on the volume's scratch
     /// buffer + cap.
-    ///
-    /// If the requested range falls inside one or more FS blocks
-    /// that the journal replay overrode, those bytes are served
-    /// from the in-memory override map; bytes outside overridden
-    /// blocks go to the device. This keeps RO replay correctness
-    /// for inode-table reads (which are sub-block byte ranges)
-    /// without paying the override-check cost in the device-LBA
-    /// loop.
     pub async fn read_byte_range(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), FsError> {
-        // Fast path — no overrides installed.
-        if self.journal_overrides.is_empty() {
-            let lbs = self.io.lock().lbs;
-            return Self::read_byte_range_with(&*self.device, lbs, &self.io, byte_off, dst).await;
-        }
-        // Walk one FS-block at a time, consulting the override map.
-        let bs = self.block_size() as u64;
-        let mut cursor = 0usize;
-        while cursor < dst.len() {
-            let abs = byte_off + cursor as u64;
-            let fs_block = abs / bs;
-            let in_block = (abs % bs) as usize;
-            let want = core::cmp::min(dst.len() - cursor, bs as usize - in_block);
-            if let Some(ov) = self.journal_overrides.get(&fs_block) {
-                if ov.len() == bs as usize {
-                    dst[cursor..cursor + want].copy_from_slice(&ov[in_block..in_block + want]);
-                    cursor += want;
-                    continue;
-                }
-            }
-            let lbs = self.io.lock().lbs;
-            Self::read_byte_range_with(
-                &*self.device,
-                lbs,
-                &self.io,
-                abs,
-                &mut dst[cursor..cursor + want],
-            )
-            .await?;
-            cursor += want;
-        }
-        Ok(())
+        let lbs = self.io.lock().lbs;
+        Self::read_byte_range_with(&*self.device, lbs, &self.io, byte_off, dst).await
     }
 
     /// Write `src.len()` bytes starting at device byte offset
@@ -1132,10 +1344,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// byte-granularity write — for sub-LBA spans we read-modify-
     /// write the enclosing sector.
     pub async fn write_byte_range(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
-        if self.read_only {
+        if self.is_read_only() {
             return Err(FsError::ReadOnly);
         }
-        let result = self.write_byte_range_device(byte_off, src).await;
+        let result = self.write_byte_range_device(byte_off, src, false).await;
         // Direct block writes bypass the page cache, so once the device has
         // changed — even partially, on an error — drop the cached device
         // pages they overwrote, and void any fill of exactly those pages that
@@ -1148,7 +1360,30 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         result
     }
 
-    async fn write_byte_range_device(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
+    /// [`Self::write_byte_range`] with Force Unit Access on every sector:
+    /// for the superblock state changes that must be on media before any
+    /// write that depends on them ([`sb_state`]).
+    pub(crate) async fn write_byte_range_fua(
+        &self,
+        byte_off: u64,
+        src: &[u8],
+    ) -> Result<(), FsError> {
+        if self.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let result = self.write_byte_range_device(byte_off, src, true).await;
+        let first_page = byte_off / PAGE_SIZE as u64;
+        let end_page = (byte_off + src.len() as u64).div_ceil(PAGE_SIZE as u64);
+        self.bdev_mapping.invalidate(first_page, end_page);
+        result
+    }
+
+    async fn write_byte_range_device(
+        &self,
+        byte_off: u64,
+        src: &[u8],
+        fua: bool,
+    ) -> Result<(), FsError> {
         let lbs = self.io.lock().lbs;
         let mut cursor = 0usize;
         while cursor < src.len() {
@@ -1186,7 +1421,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     dst.copy_from_slice(&sector);
                 }
                 let req = BlockRequest {
-                    op: BlockOp::Write { fua: false },
+                    op: BlockOp::Write { fua },
                     lba,
                     blocks: 1,
                     buffer: guard
@@ -1306,6 +1541,26 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
         } else {
             self.read_byte_range(inode_byte_off, &mut buf).await?;
+            // `ext4_inode_blocks`: with huge_file, `i_blocks` is 48 bits
+            // (`l_i_blocks_high` at 116), and counts filesystem blocks under
+            // `HUGE_FILE_FL`. NARF keeps 32 bits of sectors; rewriting such
+            // an inode would leave the high half and the flag over a low
+            // half counted another way.
+            // LINUX-GAP: a file holding 2 TiB or more cannot be changed.
+            let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+            if self.superblock.feature_ro_compat & super::superblock::ro_compat::HUGE_FILE != 0
+                && (u16::from_le_bytes([buf[116], buf[117]]) != 0
+                    || flags & super::inode::I_FLAGS_HUGE_FILE != 0)
+            {
+                return Err(FsError::FileTooLarge);
+            }
+        }
+        // `ext4_inode_blocks_set`: a count past 32 bits is EFBIG unless the
+        // high half is used, which NARF does not do. Every real count is a
+        // multiple of the sectors per block, so `u32::MAX` is only ever a
+        // saturated sum.
+        if inode.blocks == u32::MAX {
+            return Err(FsError::FileTooLarge);
         }
         // `ext4_update_inode`: the first file past 2 GiB turns the volume's
         // RO_COMPAT_LARGE_FILE on, or an older kernel / e2fsck would take
@@ -1315,6 +1570,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             self.set_large_file_feature().await?;
         }
         inode.encode_into(&mut buf);
+        // A count that fits 32 bits is stored as Linux stores it: high half
+        // zero, `HUGE_FILE_FL` clear (without huge_file Linux never reads
+        // either).
+        buf[116..118].fill(0);
+        let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]])
+            & !super::inode::I_FLAGS_HUGE_FILE;
+        buf[32..36].copy_from_slice(&flags.to_le_bytes());
         // Keep this self-contained so every inode metadata writer
         // (chmod/chown, truncate, directory links, and data writes) inherits
         // the correct checksum.
@@ -1408,7 +1670,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Directory metadata is write-through. Complete deferred inode teardown
     /// before flushing the device, and preserve a failed flush as an error.
     pub(crate) async fn sync_metadata(&self) -> Result<(), FsError> {
-        if self.read_only {
+        if self.is_read_only() {
             return Ok(());
         }
         let _update = self.inode_update_lock.lock().await;
@@ -1420,7 +1682,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// just the inode used to obtain the syncfs descriptor. Never keep the
     /// icache spinlock across I/O or nest the inode-update mutex.
     pub(crate) async fn sync_filesystem(&self) -> Result<(), FsError> {
-        if self.read_only {
+        if self.is_read_only() {
             return Ok(());
         }
         let nodes: Vec<_> = self
@@ -1458,7 +1720,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if inode.links_count != 0 {
             return Ok(());
         }
-        self.truncate_inode(&mut inode).await?;
+        self.truncate_inode(inode_no, &mut inode).await?;
         self.write_inode(inode_no, &inode).await?;
         self.free_inode(inode_no).await
     }
@@ -1490,7 +1752,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             return Ok(());
         }
-        self.truncate_inode(inode).await?;
+        self.truncate_inode(inode_no, inode).await?;
         self.write_inode(inode_no, inode).await?;
         self.free_inode(inode_no).await
     }
@@ -1558,6 +1820,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_group_desc(
         &self,
         group: usize,
@@ -1566,8 +1829,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         dirs: i64,
         bitmap: Option<(BitmapKind, &[u8])>,
         allocated_inode_index: Option<u32>,
+        clear_flags: u16,
     ) -> Result<(), FsError> {
         let (offset, mut desc) = self.group_desc_bytes(group).await?;
+        if clear_flags != 0 {
+            use super::group_desc::BG_FLAGS_OFFSET as F;
+            let flags = u16::from_le_bytes([desc[F], desc[F + 1]]) & !clear_flags;
+            desc[F..F + 2].copy_from_slice(&flags.to_le_bytes());
+        }
         for (lo_off, hi_off, delta) in
             [(12usize, 44usize, blocks), (14, 46, inodes), (16, 48, dirs)]
         {
@@ -1711,50 +1980,176 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.write_byte_range(1024, &bytes).await
     }
 
-    async fn alloc_in_bitmap_block(
+    /// The group's descriptor as it is on the device now (the mount-time
+    /// `group_descs` snapshot does not follow free counts or flags).
+    async fn current_group_desc(&self, group: usize) -> Result<GroupDesc, FsError> {
+        let (_, bytes) = self.group_desc_bytes(group).await?;
+        GroupDesc::parse_sized(&bytes, bytes.len()).ok_or(FsError::Corrupted)
+    }
+
+    /// `ext4_read_block_bitmap` of a `BLOCK_UNINIT` group: compute the
+    /// bitmap (`ext4_init_block_bitmap`), check it against the free count
+    /// the descriptor promises, write it, and clear the flag.
+    async fn init_block_bitmap_on_disk(&self, group: usize, gd: &GroupDesc) -> Result<(), FsError> {
+        let bitmap = uninit::init_block_bitmap(&self.superblock, group as u32, gd)
+            .ok_or(FsError::Corrupted)?;
+        let bits = uninit::blocks_in_group(&self.superblock, group as u32);
+        if uninit::free_bits(&bitmap, bits) != gd.free_blocks_count {
+            return Err(FsError::Corrupted);
+        }
+        self.write_block(gd.block_bitmap, &bitmap).await?;
+        self.update_group_desc(
+            group,
+            0,
+            0,
+            0,
+            Some((BitmapKind::Block, &bitmap)),
+            None,
+            super::group_desc::BG_BLOCK_UNINIT,
+        )
+        .await
+    }
+
+    /// Allocate one bit of `kind` in `group`, scanning from `start` and
+    /// wrapping. The caller holds `allocation_lock`.
+    ///
+    /// - A group whose descriptor counts nothing free is skipped without
+    ///   reading its bitmap (`ext4_mb_good_group`).
+    /// - A lazily initialized group (`BLOCK_UNINIT` / `INODE_UNINIT`) is
+    ///   used only when `allow_uninit`, the allocator's last pass: its
+    ///   bitmap is computed ([`uninit`]), and the allocation writes it out
+    ///   with the flag cleared. An inode allocated in a group whose block
+    ///   bitmap is still uninitialized initializes that first, as
+    ///   `__ext4_new_inode` does.
+    /// - A bitmap whose checksum fails, or a computed one that disagrees
+    ///   with the descriptor, quarantines the group: it is skipped.
+    ///
+    /// Writes go bitmap, then descriptor (with the bitmap's checksum), then
+    /// superblock counters.
+    async fn alloc_in_group(
         &self,
         group: usize,
         kind: BitmapKind,
-        bm_block: u64,
-        max_bits: u32,
-        skip_first: u32,
+        start: u32,
+        allow_uninit: bool,
     ) -> Result<Option<u32>, FsError> {
-        let bs = self.block_size();
-        let mut buf = vec![0u8; bs];
-        self.read_block(bm_block, &mut buf).await?;
-        match self.verify_bitmap(group, kind, &buf).await {
-            Ok(()) => {}
-            // A large ext4 volume can still allocate safely from its other
-            // groups. Quarantine this group rather than mutating metadata
-            // whose checksum does not validate or failing the whole volume.
-            Err(FsError::InvalidData) => return Ok(None),
-            Err(error) => return Err(error),
+        use super::group_desc::{BG_BLOCK_UNINIT, BG_INODE_UNINIT};
+        let gd = self.current_group_desc(group).await?;
+        let flags_valid = uninit::has_group_desc_csum(&self.superblock);
+        let (uninit_flag, free, bits, bm_block) = match kind {
+            BitmapKind::Block => (
+                BG_BLOCK_UNINIT,
+                gd.free_blocks_count,
+                uninit::blocks_in_group(&self.superblock, group as u32),
+                gd.block_bitmap,
+            ),
+            BitmapKind::Inode => (
+                BG_INODE_UNINIT,
+                gd.free_inodes_count,
+                self.superblock.inodes_per_group,
+                gd.inode_bitmap,
+            ),
+        };
+        if free == 0 {
+            return Ok(None);
         }
-        let max = (max_bits as usize).min(bs * 8);
-        for bit in (skip_first as usize)..max {
-            let byte = bit / 8;
-            let bit_in_byte = bit % 8;
-            if (buf[byte] >> bit_in_byte) & 1 == 0 {
-                buf[byte] |= 1 << bit_in_byte;
-                self.write_block(bm_block, &buf).await?;
-                let (blocks, inodes) = match kind {
-                    BitmapKind::Block => (-1, 0),
-                    BitmapKind::Inode => (0, -1),
-                };
-                self.update_group_desc(
-                    group,
-                    blocks,
-                    inodes,
-                    0,
-                    Some((kind, &buf)),
-                    matches!(kind, BitmapKind::Inode).then_some(bit as u32),
-                )
-                .await?;
-                self.update_superblock_counters(blocks, inodes).await?;
-                return Ok(Some(bit as u32));
+        let lazy = flags_valid && gd.flags & uninit_flag != 0;
+        if lazy && !allow_uninit {
+            return Ok(None);
+        }
+        let mut buf = if lazy {
+            match kind {
+                BitmapKind::Block => {
+                    let Some(bitmap) =
+                        uninit::init_block_bitmap(&self.superblock, group as u32, &gd)
+                    else {
+                        return Ok(None);
+                    };
+                    if uninit::free_bits(&bitmap, bits) != free {
+                        return Ok(None);
+                    }
+                    bitmap
+                }
+                BitmapKind::Inode => uninit::init_inode_bitmap(&self.superblock),
+            }
+        } else {
+            let mut buf = vec![0u8; self.block_size()];
+            self.read_block(bm_block, &mut buf).await?;
+            match self.verify_bitmap(group, kind, &buf).await {
+                Ok(()) => {}
+                // A large ext4 volume can still allocate safely from its other
+                // groups. Quarantine this group rather than mutating metadata
+                // whose checksum does not validate or failing the whole volume.
+                Err(FsError::InvalidData) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            buf
+        };
+        let max = bits.min(buf.len() as u32 * 8);
+        let start = start.min(max);
+        let Some(bit) = (start..max)
+            .chain(0..start)
+            .find(|&bit| buf[bit as usize / 8] & (1 << (bit % 8)) == 0)
+        else {
+            return Ok(None);
+        };
+        if matches!(kind, BitmapKind::Inode) && flags_valid && gd.flags & BG_BLOCK_UNINIT != 0 {
+            self.init_block_bitmap_on_disk(group, &gd).await?;
+        }
+        buf[bit as usize / 8] |= 1 << (bit % 8);
+        self.write_block(bm_block, &buf).await?;
+        let (blocks, inodes) = match kind {
+            BitmapKind::Block => (-1, 0),
+            BitmapKind::Inode => (0, -1),
+        };
+        self.update_group_desc(
+            group,
+            blocks,
+            inodes,
+            0,
+            Some((kind, &buf)),
+            matches!(kind, BitmapKind::Inode).then_some(bit),
+            if lazy { uninit_flag } else { 0 },
+        )
+        .await?;
+        self.update_superblock_counters(blocks, inodes).await?;
+        Ok(Some(bit))
+    }
+
+    /// Allocate one block, starting at `goal`'s group (`ext4_mb_new_blocks`
+    /// with a goal): the goal group from the goal block, then every later
+    /// group wrapping around; groups still lazily initialized only in a
+    /// second pass, so initialized space is used first. The caller holds
+    /// `allocation_lock`.
+    async fn alloc_block_locked(&self, goal: Option<u64>) -> Result<u64, FsError> {
+        if self.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let groups = self.group_descs.len();
+        let first = u64::from(self.superblock.first_data_block);
+        let bpg = u64::from(self.superblock.blocks_per_group);
+        let (goal_group, goal_bit) = match goal {
+            Some(goal) if goal >= first && goal < self.superblock.total_blocks() => (
+                ((goal - first) / bpg) as usize,
+                ((goal - first) % bpg) as u32,
+            ),
+            _ => (0, 0),
+        };
+        for allow_uninit in [false, true] {
+            for step in 0..groups {
+                let group = (goal_group + step) % groups;
+                let start = if step == 0 { goal_bit } else { 0 };
+                if let Some(bit) = self
+                    .alloc_in_group(group, BitmapKind::Block, start, allow_uninit)
+                    .await?
+                {
+                    return Ok(
+                        uninit::group_first_block(&self.superblock, group as u32) + u64::from(bit)
+                    );
+                }
             }
         }
-        Ok(None)
+        Err(FsError::NoSpace)
     }
 
     /// Clear bit `bit_index` in bitmap block `bm_block`.
@@ -1765,6 +2160,18 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         bm_block: u64,
         bit_index: u32,
     ) -> Result<(), FsError> {
+        // Nothing was ever allocated in a lazily initialized group: freeing
+        // there is Linux's "bit already cleared" (EFSCORRUPTED), and its
+        // on-disk bitmap is not to be read.
+        if uninit::has_group_desc_csum(&self.superblock) {
+            let flag = match kind {
+                BitmapKind::Block => super::group_desc::BG_BLOCK_UNINIT,
+                BitmapKind::Inode => super::group_desc::BG_INODE_UNINIT,
+            };
+            if self.current_group_desc(group).await?.flags & flag != 0 {
+                return Err(FsError::Corrupted);
+            }
+        }
         let bs = self.block_size();
         let mut buf = vec![0u8; bs];
         self.read_block(bm_block, &mut buf).await?;
@@ -1778,42 +2185,18 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 BitmapKind::Block => (1, 0),
                 BitmapKind::Inode => (0, 1),
             };
-            self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)), None)
+            self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)), None, 0)
                 .await?;
             self.update_superblock_counters(blocks, inodes).await?;
         }
         Ok(())
     }
 
-    /// Allocate a free block from the volume. Walks block groups in
-    /// order, scanning each group's block bitmap. Returns the
-    /// absolute (1-based) block number of the allocated block.
-    ///
-    /// The on-disk `bg_free_blocks_count` is treated as a hint only
-    /// — we still scan the bitmap when the count is zero, because
-    /// the in-memory snapshot reflects mount-time state and we
-    /// don't update the descriptor cache on every alloc. Linux does
-    /// the same (`ext2_new_blocks` re-scans rather than trusting
-    /// the descriptor) for robustness against unclean mounts.
+    /// Allocate a free block anywhere ([`Self::alloc_block_locked`] with no
+    /// goal). Returns the absolute block number.
     pub async fn alloc_block(&self) -> Result<u64, FsError> {
         let _allocation = self.allocation_lock.lock().await;
-        let bpg = self.superblock.blocks_per_group;
-        let first_block = self.superblock.first_data_block;
-        for (gi, gd) in self.group_descs.iter().enumerate() {
-            // ext2 block numbers are 1-based starting from
-            // first_data_block. Bit 0 of group `g`'s bitmap maps
-            // to absolute block `first_data_block + g*blocks_per_group`.
-            let group_first = first_block as u64 + gi as u64 * bpg as u64;
-            let group_last = (group_first + bpg as u64).min(self.superblock.total_blocks());
-            let bits_in_group = (group_last - group_first) as u32;
-            if let Some(bit) = self
-                .alloc_in_bitmap_block(gi, BitmapKind::Block, gd.block_bitmap, bits_in_group, 0)
-                .await?
-            {
-                return Ok(group_first + bit as u64);
-            }
-        }
-        Err(FsError::NoSpace)
+        self.alloc_block_locked(None).await
     }
 
     /// Free block `block_no` (absolute 1-based).
@@ -1947,26 +2330,38 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         run_len * bs
     }
 
-    /// Allocate a free inode. Returns the 1-based inode number.
-    /// Treats `bg_free_inodes_count` as a hint (see `alloc_block`).
+    /// Allocate a free inode. Returns the 1-based inode number. Groups in
+    /// order, skipping the reserved inodes of group 0 (`EXT4_FIRST_INO`);
+    /// lazily initialized groups only in a second pass.
+    ///
+    /// LINUX-GAP: no Orlov spreading of new directories across groups
+    /// (`find_group_orlov`).
     pub async fn alloc_inode(&self) -> Result<u32, FsError> {
+        // EROFS before ENOSPC, as the VFS refuses a read-only mount before
+        // the filesystem looks for space.
+        if self.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
         let _allocation = self.allocation_lock.lock().await;
         let ipg = self.superblock.inodes_per_group;
         let first_reserved = self.superblock.first_ino();
-        for (gi, gd) in self.group_descs.iter().enumerate() {
-            // Reserve first_reserved-1 bits of group 0 (matches
-            // mkfs.ext2's behaviour — bit 0 = inode 1, bit 1 = inode 2,
-            // ...). Higher groups have no reserved range.
-            let skip = if gi == 0 {
-                first_reserved.saturating_sub(1)
-            } else {
-                0
-            };
-            if let Some(bit) = self
-                .alloc_in_bitmap_block(gi, BitmapKind::Inode, gd.inode_bitmap, ipg, skip)
-                .await?
-            {
-                return Ok((gi as u32) * ipg + bit + 1);
+        for allow_uninit in [false, true] {
+            for group in 0..self.group_descs.len() {
+                let skip = if group == 0 {
+                    first_reserved.saturating_sub(1)
+                } else {
+                    0
+                };
+                if let Some(bit) = self
+                    .alloc_in_group(group, BitmapKind::Inode, skip, allow_uninit)
+                    .await?
+                {
+                    // The wrap-around scan must not hand out a reserved inode.
+                    if group == 0 && bit < skip {
+                        return Err(FsError::Corrupted);
+                    }
+                    return Ok((group as u32) * ipg + bit + 1);
+                }
             }
         }
         Err(FsError::NoSpace)
@@ -2027,7 +2422,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let (group, _) = self
             .inode_group_and_index(inode_no)
             .ok_or(FsError::NotFound)?;
-        self.update_group_desc(group as usize, 0, 0, delta, None, None)
+        self.update_group_desc(group as usize, 0, 0, delta, None, None, 0)
             .await
     }
 
@@ -2161,10 +2556,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok((new as u64, true))
     }
 
-    /// Free every block an inode owns (direct, indirect, double-indirect, and
-    /// triple-indirect), zeroing the inode's `block[]` field. Caller persists
-    /// the inode.
-    pub async fn truncate_inode(&self, inode: &mut Inode) -> Result<(), FsError> {
+    /// Free every block an inode's map owns (an extent tree, or direct and
+    /// indirect blocks) and leave an empty map, `i_size` 0. The inode is
+    /// written with the empty map before any block is freed
+    /// ([`free_list`]); the caller writes it again with its other changes.
+    pub async fn truncate_inode(&self, inode_no: u32, inode: &mut Inode) -> Result<(), FsError> {
         // A fast symlink's `i_block` is the link text, not block pointers:
         // walking it frees whatever blocks the text bytes happen to name
         // (or fails with EIO when they are out of range, which made
@@ -2173,90 +2569,19 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if inode.is_fast_symlink(self.block_size() as u32) {
             return Ok(());
         }
-        if self.superblock.uses_extents() && inode.uses_extents() {
-            // `ext4_ext_remove_space` over the whole file; this answered
-            // `Unsupported` (-EINVAL), so O_TRUNC and unlink failed for every
-            // extent-mapped file.
-            let freed = self.extent_free_all(inode).await?;
-            inode.size = 0;
-            inode.blocks = inode.blocks.saturating_sub(freed);
-            return Ok(());
-        }
-        let bs = self.block_size();
-        let p = self.pointers_per_block() as u64;
-        for i in 0..super::inode::N_DIRECT {
-            let b = inode.block[i];
-            if b != 0 {
-                self.free_block(b as u64).await?;
-                inode.block[i] = 0;
-            }
-        }
-        // Single-indirect.
-        let single = inode.block[super::inode::SINGLE_IND_IDX];
-        if single != 0 {
-            self.free_indirect_one(single as u64, p, bs).await?;
-            self.free_block(single as u64).await?;
-            inode.block[super::inode::SINGLE_IND_IDX] = 0;
-        }
-        // Double-indirect.
-        let dbl = inode.block[super::inode::DOUBLE_IND_IDX];
-        if dbl != 0 {
-            let mut mid_buf = vec![0u8; bs];
-            self.read_block(dbl as u64, &mut mid_buf).await?;
-            for i in 0..p {
-                let off = (i as usize) * 4;
-                let mid = u32::from_le_bytes([
-                    mid_buf[off],
-                    mid_buf[off + 1],
-                    mid_buf[off + 2],
-                    mid_buf[off + 3],
-                ]);
-                if mid != 0 {
-                    self.free_indirect_one(mid as u64, p, bs).await?;
-                    self.free_block(mid as u64).await?;
-                }
-            }
-            self.free_block(dbl as u64).await?;
-            inode.block[super::inode::DOUBLE_IND_IDX] = 0;
-        }
-        // Triple-indirect.
-        let tri = inode.block[super::inode::TRIPLE_IND_IDX];
-        if tri != 0 {
-            let mut top_buf = vec![0u8; bs];
-            self.read_block(tri as u64, &mut top_buf).await?;
-            for i in 0..p {
-                let off = (i as usize) * 4;
-                let mid = u32::from_le_bytes([
-                    top_buf[off],
-                    top_buf[off + 1],
-                    top_buf[off + 2],
-                    top_buf[off + 3],
-                ]);
-                if mid != 0 {
-                    let mut mid_buf = vec![0u8; bs];
-                    self.read_block(mid as u64, &mut mid_buf).await?;
-                    for j in 0..p {
-                        let o2 = (j as usize) * 4;
-                        let leaf = u32::from_le_bytes([
-                            mid_buf[o2],
-                            mid_buf[o2 + 1],
-                            mid_buf[o2 + 2],
-                            mid_buf[o2 + 3],
-                        ]);
-                        if leaf != 0 {
-                            self.free_indirect_one(leaf as u64, p, bs).await?;
-                            self.free_block(leaf as u64).await?;
-                        }
-                    }
-                    self.free_block(mid as u64).await?;
-                }
-            }
-            self.free_block(tri as u64).await?;
-            inode.block[super::inode::TRIPLE_IND_IDX] = 0;
-        }
+        let mut deferred = free_list::FreeList::default();
+        let freed = if self.superblock.uses_extents() && inode.uses_extents() {
+            // `ext4_ext_remove_space` over the whole file.
+            self.extent_free_all(inode, &mut deferred).await?
+        } else {
+            self.blockmap_free_range(inode, 0, u64::MAX, &mut deferred)
+                .await?
+        };
         inode.size = 0;
-        inode.blocks = 0;
-        Ok(())
+        // What the file still owns outside its map (an external xattr
+        // block) stays counted.
+        inode.blocks = inode.blocks.saturating_sub(freed);
+        self.release_deferred(inode_no, inode, deferred).await
     }
 
     /// `ext4_truncate` for a shrink to a nonzero size: free every block
@@ -2277,7 +2602,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Release every block mapped at logical `first..end` and any tree block
     /// left mapping nothing (`ext4_ext_remove_space` / `ext4_ind_remove_space`):
     /// the block-freeing half of truncate and of `FALLOC_FL_PUNCH_HOLE`.
-    /// `i_blocks` drops by what was released; the caller writes the inode.
+    /// `i_blocks` drops by what was released. The trimmed nodes, then the
+    /// inode, are written before any block is freed ([`free_list`]); the
+    /// caller writes the inode again with its other changes.
     pub(crate) async fn free_block_range(
         &self,
         inode_no: u32,
@@ -2288,18 +2615,23 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if inode.is_fast_symlink(self.block_size() as u32) || end <= first {
             return Ok(());
         }
+        let mut deferred = free_list::FreeList::default();
         let freed = if self.superblock.uses_extents() && inode.uses_extents() {
             // Logical block numbers are 32-bit in an extent tree; nothing is
             // mapped at or past 2^32.
             match u32::try_from(first) {
-                Ok(first) => self.extent_free_range(inode_no, inode, first, end).await?,
+                Ok(first) => {
+                    self.extent_free_range(inode_no, inode, first, end, &mut deferred)
+                        .await?
+                }
                 Err(_) => 0,
             }
         } else {
-            self.blockmap_free_range(inode, first, end).await?
+            self.blockmap_free_range(inode, first, end, &mut deferred)
+                .await?
         };
         inode.blocks = inode.blocks.saturating_sub(freed);
-        Ok(())
+        self.release_deferred(inode_no, inode, deferred).await
     }
 
     /// `ext4_alloc_file_blocks` over logical blocks `first..end`: every hole
@@ -2403,6 +2735,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode: &mut Inode,
         first: u64,
         end: u64,
+        deferred: &mut free_list::FreeList,
     ) -> Result<u32, FsError> {
         use super::inode::{DOUBLE_IND_IDX, N_DIRECT, SINGLE_IND_IDX, TRIPLE_IND_IDX};
         let spb = (self.block_size() / 512) as u32;
@@ -2412,7 +2745,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         for slot in first.min(N_DIRECT as u64)..direct_end {
             let slot = slot as usize;
             if inode.block[slot] != 0 {
-                self.free_block(u64::from(inode.block[slot])).await?;
+                deferred.push(u64::from(inode.block[slot]));
                 inode.block[slot] = 0;
                 freed = freed.saturating_add(spb);
             }
@@ -2434,11 +2767,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                         level,
                         first.saturating_sub(base),
                         end.saturating_sub(base),
+                        deferred,
                     )
                     .await?;
                 freed = freed.saturating_add(sub);
                 if empty {
-                    self.free_block(root).await?;
+                    deferred.push(root);
                     inode.block[slot] = 0;
                     freed = freed.saturating_add(spb);
                 }
@@ -2453,13 +2787,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// relative logical blocks `start..end`. Returns whether the block now
     /// maps nothing (the caller frees it) and the sectors released below it;
     /// a block that keeps entries is written back.
-    fn blockmap_free_branch(
-        &self,
+    fn blockmap_free_branch<'a>(
+        &'a self,
         block: u64,
         level: u32,
         start: u64,
         end: u64,
-    ) -> TreeFuture<'_, (bool, u32)> {
+        deferred: &'a mut free_list::FreeList,
+    ) -> TreeFuture<'a, (bool, u32)> {
         alloc::boxed::Box::pin(async move {
             let spb = (self.block_size() / 512) as u32;
             let p = self.pointers_per_block() as u64;
@@ -2492,13 +2827,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                             level - 1,
                             start.saturating_sub(child_first),
                             end.saturating_sub(child_first).min(child_span),
+                            &mut *deferred,
                         )
                         .await?;
                     freed = freed.saturating_add(sub);
                     empty
                 };
                 if empty {
-                    self.free_block(child).await?;
+                    deferred.push(child);
                     freed = freed.saturating_add(spb);
                     buf[off..off + 4].fill(0);
                     changed = true;
@@ -2511,20 +2847,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             Ok((!live, freed))
         })
-    }
-
-    /// Free every pointer in a single-indirect block.
-    async fn free_indirect_one(&self, ind_block: u64, p: u64, bs: usize) -> Result<(), FsError> {
-        let mut buf = vec![0u8; bs];
-        self.read_block(ind_block, &mut buf).await?;
-        for i in 0..p {
-            let off = (i as usize) * 4;
-            let v = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
-            if v != 0 {
-                self.free_block(v as u64).await?;
-            }
-        }
-        Ok(())
     }
 
     /// Read the on-disk inode `inode_no`.
@@ -2733,5 +3055,70 @@ impl<B: BlockDevice + 'static> FsInstance for Ext2Volume<B> {
     /// [`super::mount_opts::validate_remount`].
     fn reconfigure(&self, options: &str) -> Result<(), FsError> {
         super::mount_opts::validate_remount(options)
+    }
+
+    /// Writes are refused at the mount (`mnt_want_write` → EROFS) while
+    /// this mount writes nothing.
+    fn always_read_only(&self) -> bool {
+        self.is_read_only()
+    }
+
+    /// `__ext4_remount`: `SB_RDONLY` turning on writes everything back and
+    /// marks the filesystem clean; turning off runs the write gate again.
+    fn reconfigure_sb_async<'a>(
+        &'a self,
+        sb_flags: u64,
+        sb_mask: u64,
+        options: &'a str,
+    ) -> narf_filesystem::FsFuture<'a, ()> {
+        alloc::boxed::Box::pin(async move {
+            use narf_filesystem::sb_flags::RDONLY;
+            super::mount_opts::validate_remount(options)?;
+            let mut want_ro = (sb_mask & RDONLY != 0).then_some(sb_flags & RDONLY != 0);
+            for option in options.split(',') {
+                match option {
+                    "ro" => want_ro = Some(true),
+                    "rw" => want_ro = Some(false),
+                    _ => {}
+                }
+            }
+            match want_ro {
+                Some(true) => self.remount_read_only().await,
+                Some(false) => self.remount_read_write().await,
+                None => Ok(()),
+            }
+        })
+    }
+}
+
+impl<B: BlockDevice + 'static> Drop for Ext2Volume<B> {
+    /// The last reference went away (umount, which never syncs, or a
+    /// dropped internal mount): `ext4_put_super` marks the filesystem clean
+    /// after everything is on the device. Drop cannot block, so the flush
+    /// and superblock write are polled once in place, which completes on
+    /// NARF's synchronous block devices. If they cannot finish, the
+    /// superblock keeps saying "not clean", and e2fsck checks it, which is
+    /// safe.
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering;
+        if self.read_only.load(Ordering::Acquire) || !self.dirty_marked.load(Ordering::Acquire) {
+            return;
+        }
+        use core::future::Future as _;
+        let this: &Self = self;
+        let mut finish = core::pin::pin!(async move {
+            let _ = this.device.flush_result().await;
+            this.mark_clean().await
+        });
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+        if finish.as_mut().poll(&mut cx).is_pending() {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "ext4 {}: last unmount could not mark the filesystem clean; e2fsck will check it",
+                sb_state::uuid_string(&self.superblock)
+            );
+        }
     }
 }

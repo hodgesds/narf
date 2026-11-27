@@ -111,15 +111,21 @@ impl Sha256 {
     /// Process a 64-byte block
     /// Reference: <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf#page=22> (Section 6.2.2)
     fn process_block(&mut self) {
+        let block = self.block;
+        Self::compress_portable(&mut self.h, &block);
+    }
+
+    /// One SHA-256 compression of `block` into `state`, in portable code.
+    pub(crate) fn compress_portable(state: &mut [u32; 8], block: &[u8; 64]) {
         let mut w = [0u32; 64];
 
         // 1. Prepare the message schedule, W
         for (i, word) in w.iter_mut().enumerate().take(16) {
             *word = u32::from_be_bytes([
-                self.block[i * 4],
-                self.block[i * 4 + 1],
-                self.block[i * 4 + 2],
-                self.block[i * 4 + 3],
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
             ]);
         }
         for i in 16..64 {
@@ -130,14 +136,14 @@ impl Sha256 {
         }
 
         // 2. Initialize the eight working variables
-        let mut a = self.h[0];
-        let mut b = self.h[1];
-        let mut c = self.h[2];
-        let mut d = self.h[3];
-        let mut e = self.h[4];
-        let mut f = self.h[5];
-        let mut g = self.h[6];
-        let mut h = self.h[7];
+        let mut a = state[0];
+        let mut b = state[1];
+        let mut c = state[2];
+        let mut d = state[3];
+        let mut e = state[4];
+        let mut f = state[5];
+        let mut g = state[6];
+        let mut h = state[7];
 
         // 3. For t = 0 to 63
         for t in 0..64 {
@@ -158,14 +164,14 @@ impl Sha256 {
         }
 
         // 4. Compute the intermediate hash value
-        self.h[0] = self.h[0].wrapping_add(a);
-        self.h[1] = self.h[1].wrapping_add(b);
-        self.h[2] = self.h[2].wrapping_add(c);
-        self.h[3] = self.h[3].wrapping_add(d);
-        self.h[4] = self.h[4].wrapping_add(e);
-        self.h[5] = self.h[5].wrapping_add(f);
-        self.h[6] = self.h[6].wrapping_add(g);
-        self.h[7] = self.h[7].wrapping_add(h);
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
     }
 
     pub fn update(&mut self, data: &[u8]) {
@@ -219,5 +225,242 @@ impl Sha256 {
             out[i * 4..(i + 1) * 4].copy_from_slice(&self.h[i].to_be_bytes());
         }
         out
+    }
+}
+
+/// 16-byte-aligned wrapper: legacy-SSE memory operands (`paddd`, `movdqa`)
+/// fault on unaligned addresses.
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(16))]
+struct Align16<T>(T);
+
+/// [`K`] for `paddd`: four round constants per 16 bytes, round `4g` in the
+/// low dword of group `g`.
+#[cfg(target_arch = "x86_64")]
+static K_NI: Align16<[u32; 64]> = Align16(K);
+
+/// `pshufb` mask that byte-swaps each dword: the message words are
+/// big-endian (FIPS 180-4 §3.1).
+#[cfg(target_arch = "x86_64")]
+static BSWAP32: Align16<[u8; 16]> = Align16([3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12]);
+
+impl Sha256 {
+    /// SHA-256 compression of each 64-byte block of `blocks` into `state`
+    /// on the SHA extensions (Intel SDM vol. 2, `SHA256RNDS2`,
+    /// `SHA256MSG1`, `SHA256MSG2`). Same result as
+    /// [`Self::compress_portable`] applied block by block.
+    ///
+    /// `SHA256RNDS2 xmm1, xmm2` runs two rounds: xmm1 holds C,D,G,H and
+    /// xmm2 holds A,B,E,F (A in the top dword), and the implicit `xmm0`
+    /// holds W+K for the two rounds in its low qword. The result, the new
+    /// A,B,E,F, lands in xmm1. After two rounds the old A,B,E,F is the new
+    /// C,D,G,H, so the two state registers swap roles each call.
+    ///
+    /// # Safety
+    /// Only inside [`crate::simd::section`], and only when
+    /// [`crate::simd::caps`] reported `sha256`.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) unsafe fn compress_ni(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        if blocks.is_empty() {
+            return;
+        }
+        // Registers: xmm0 W+K, xmm1 ABEF, xmm2 CDGH, xmm3-xmm6 the four
+        // message groups in flight, xmm7 scratch, xmm8/xmm9 the block's
+        // starting ABEF/CDGH, xmm10 the byte-swap mask.
+        //
+        // Rounds 0-15 use the loaded message. Rounds 16-63 run as three
+        // passes of four groups; group g's words come from groups g-4..g-1
+        // (W[t] = σ1(W[t-2]) + W[t-7] + σ0(W[t-15]) + W[t-16]): MSG1 adds
+        // σ0, `palignr` lines up W[t-7], MSG2 adds σ1. Group g overwrites
+        // the register of group g-4, so each pass uses the same registers.
+        // SAFETY: the caller is inside a section with SHA-NI present.
+        // `state` is 32 bytes, `blocks` holds `blocks.len()` 64-byte
+        // blocks, and K_NI/BSWAP32 are 16-byte aligned for the m128
+        // operands.
+        unsafe {
+            core::arch::asm!(
+                // Load a..h and rearrange to ABEF / CDGH.
+                "movdqu xmm1, [{h}]",
+                "movdqu xmm2, [{h} + 16]",
+                "pshufd xmm1, xmm1, 0xB1", // b a d c
+                "pshufd xmm2, xmm2, 0x1B", // h g f e
+                "movdqa xmm7, xmm1",
+                "palignr xmm1, xmm2, 8", // f e b a = ABEF
+                "pblendw xmm2, xmm7, 0xF0", // h g d c = CDGH
+                "movdqa xmm10, [{bswap}]",
+                "2:",
+                "movdqa xmm8, xmm1",
+                "movdqa xmm9, xmm2",
+                "movdqu xmm3, [{d}]",
+                "pshufb xmm3, xmm10",
+                "movdqu xmm4, [{d} + 16]",
+                "pshufb xmm4, xmm10",
+                "movdqu xmm5, [{d} + 32]",
+                "pshufb xmm5, xmm10",
+                "movdqu xmm6, [{d} + 48]",
+                "pshufb xmm6, xmm10",
+                // Rounds 0-15.
+                "movdqa xmm0, xmm3",
+                "paddd xmm0, [{k}]",
+                "sha256rnds2 xmm2, xmm1",
+                "pshufd xmm0, xmm0, 0x0E",
+                "sha256rnds2 xmm1, xmm2",
+                "movdqa xmm0, xmm4",
+                "paddd xmm0, [{k} + 16]",
+                "sha256rnds2 xmm2, xmm1",
+                "pshufd xmm0, xmm0, 0x0E",
+                "sha256rnds2 xmm1, xmm2",
+                "movdqa xmm0, xmm5",
+                "paddd xmm0, [{k} + 32]",
+                "sha256rnds2 xmm2, xmm1",
+                "pshufd xmm0, xmm0, 0x0E",
+                "sha256rnds2 xmm1, xmm2",
+                "movdqa xmm0, xmm6",
+                "paddd xmm0, [{k} + 48]",
+                "sha256rnds2 xmm2, xmm1",
+                "pshufd xmm0, xmm0, 0x0E",
+                "sha256rnds2 xmm1, xmm2",
+                // Rounds 16-63.
+                "lea {kc}, [{k} + 64]",
+                "mov {pass:e}, 3",
+                "3:",
+                // xmm3 <- groups (xmm3, xmm4, xmm5, xmm6)
+                "sha256msg1 xmm3, xmm4",
+                "movdqa xmm7, xmm6",
+                "palignr xmm7, xmm5, 4",
+                "paddd xmm3, xmm7",
+                "sha256msg2 xmm3, xmm6",
+                "movdqa xmm0, xmm3",
+                "paddd xmm0, [{kc}]",
+                "sha256rnds2 xmm2, xmm1",
+                "pshufd xmm0, xmm0, 0x0E",
+                "sha256rnds2 xmm1, xmm2",
+                // xmm4 <- groups (xmm4, xmm5, xmm6, xmm3)
+                "sha256msg1 xmm4, xmm5",
+                "movdqa xmm7, xmm3",
+                "palignr xmm7, xmm6, 4",
+                "paddd xmm4, xmm7",
+                "sha256msg2 xmm4, xmm3",
+                "movdqa xmm0, xmm4",
+                "paddd xmm0, [{kc} + 16]",
+                "sha256rnds2 xmm2, xmm1",
+                "pshufd xmm0, xmm0, 0x0E",
+                "sha256rnds2 xmm1, xmm2",
+                // xmm5 <- groups (xmm5, xmm6, xmm3, xmm4)
+                "sha256msg1 xmm5, xmm6",
+                "movdqa xmm7, xmm4",
+                "palignr xmm7, xmm3, 4",
+                "paddd xmm5, xmm7",
+                "sha256msg2 xmm5, xmm4",
+                "movdqa xmm0, xmm5",
+                "paddd xmm0, [{kc} + 32]",
+                "sha256rnds2 xmm2, xmm1",
+                "pshufd xmm0, xmm0, 0x0E",
+                "sha256rnds2 xmm1, xmm2",
+                // xmm6 <- groups (xmm6, xmm3, xmm4, xmm5)
+                "sha256msg1 xmm6, xmm3",
+                "movdqa xmm7, xmm5",
+                "palignr xmm7, xmm4, 4",
+                "paddd xmm6, xmm7",
+                "sha256msg2 xmm6, xmm5",
+                "movdqa xmm0, xmm6",
+                "paddd xmm0, [{kc} + 48]",
+                "sha256rnds2 xmm2, xmm1",
+                "pshufd xmm0, xmm0, 0x0E",
+                "sha256rnds2 xmm1, xmm2",
+                "add {kc}, 64",
+                "dec {pass:e}",
+                "jnz 3b",
+                // Feed forward, next block.
+                "paddd xmm1, xmm8",
+                "paddd xmm2, xmm9",
+                "add {d}, 64",
+                "dec {n}",
+                "jnz 2b",
+                // Back to a..h.
+                "pshufd xmm1, xmm1, 0x1B", // a b e f
+                "pshufd xmm2, xmm2, 0xB1", // g h c d
+                "movdqa xmm7, xmm1",
+                "pblendw xmm1, xmm2, 0xF0", // a b c d
+                "palignr xmm2, xmm7, 8", // e f g h
+                "movdqu [{h}], xmm1",
+                "movdqu [{h} + 16], xmm2",
+                h = in(reg) state.as_mut_ptr(),
+                d = inout(reg) blocks.as_ptr() => _,
+                n = inout(reg) blocks.len() => _,
+                k = in(reg) K_NI.0.as_ptr(),
+                bswap = in(reg) BSWAP32.0.as_ptr(),
+                kc = out(reg) _,
+                pass = out(reg) _,
+                out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+                out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+                out("xmm8") _, out("xmm9") _, out("xmm10") _,
+                options(nostack),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ni_tests {
+    extern crate std;
+
+    use super::*;
+
+    fn blocks(seed: u64, n: usize) -> alloc::vec::Vec<[u8; 64]> {
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                let mut b = [0u8; 64];
+                for byte in b.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *byte = x as u8;
+                }
+                b
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compress_ni_matches_portable() {
+        if !crate::simd::caps().sha256 {
+            std::eprintln!("no SHA-NI on this CPU; skipped");
+            return;
+        }
+        for (seed, n) in [(1u64, 1usize), (2, 2), (3, 5), (0xfeed, 17)] {
+            let input = blocks(seed, n);
+            let mut want = H0;
+            for b in &input {
+                Sha256::compress_portable(&mut want, b);
+            }
+            let mut got = H0;
+            // SAFETY: inside a section, and caps() reported SHA-NI.
+            crate::simd::section(|| unsafe { Sha256::compress_ni(&mut got, &input) });
+            assert_eq!(got, want, "seed={seed} n={n}");
+        }
+    }
+
+    /// FIPS 180-4 example: SHA-256("abc"), one padded block, on SHA-NI.
+    #[test]
+    fn compress_ni_abc() {
+        if !crate::simd::caps().sha256 {
+            return;
+        }
+        let mut block = [0u8; 64];
+        block[..3].copy_from_slice(b"abc");
+        block[3] = 0x80;
+        block[63] = 24;
+        let mut h = H0;
+        // SAFETY: as above.
+        crate::simd::section(|| unsafe { Sha256::compress_ni(&mut h, &[block]) });
+        assert_eq!(
+            h,
+            [
+                0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223, 0xb00361a3, 0x96177a9c, 0xb410ff61,
+                0xf20015ad
+            ]
+        );
     }
 }

@@ -162,6 +162,8 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
                         Some(narf_filesystem::FsError::ReadOnly) => EROFS,
                         Some(narf_filesystem::FsError::NoSpace) => ENOSPC,
                         Some(narf_filesystem::FsError::QuotaExceeded) => EDQUOT,
+                        Some(narf_filesystem::FsError::Corrupted) => EUCLEAN,
+                        Some(narf_filesystem::FsError::BadChecksum) => EBADMSG,
                         _ => EIO,
                     };
                     ctx.set_return(errno_ret(errno));
@@ -198,6 +200,17 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
         }
         Some(Err(narf_filesystem::FsError::Io(_))) => {
             ctx.set_return(errno_ret(EIO))
+        }
+        // `ext4_mkdir`: the parent is at `EXT4_DIR_LINK_MAX` without
+        // `dir_nlink` (EMLINK); a damaged parent (EFSCORRUPTED / EFSBADCRC).
+        Some(Err(narf_filesystem::FsError::TooManyLinks)) => {
+            ctx.set_return(errno_ret(EMLINK))
+        }
+        Some(Err(narf_filesystem::FsError::Corrupted)) => {
+            ctx.set_return(errno_ret(EUCLEAN))
+        }
+        Some(Err(narf_filesystem::FsError::BadChecksum)) => {
+            ctx.set_return(errno_ret(EBADMSG))
         }
         _ => ctx.set_return(errno_ret(EPERM)),
     }

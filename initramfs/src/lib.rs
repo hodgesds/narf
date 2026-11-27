@@ -242,11 +242,11 @@ pub fn register_initcalls() {
             );
         }
         if let Some(prompt) = args.value("rd.luks.prompt") {
-            if prompt != "serial"
-                || args.value("rd.luks.key").is_some()
-                || args.value("rd.luks.uuid").is_none()
-            {
-                panic!("LUKS serial prompt requires rd.luks.uuid and no rd.luks.key");
+            let Some(source) = credentials::Source::from_arg(prompt) else {
+                panic!("rd.luks.prompt= must be `serial` or `console`");
+            };
+            if args.value("rd.luks.key").is_some() || args.value("rd.luks.uuid").is_none() {
+                panic!("LUKS passphrase prompt requires rd.luks.uuid and no rd.luks.key");
             }
             let selected = args.value("rd.luks.uuid").unwrap();
             assert!(
@@ -254,15 +254,18 @@ pub fn register_initcalls() {
                     selected.strip_prefix("luks-").unwrap_or(selected)
                 )
                 .is_some(),
-                "LUKS serial prompt requires a canonical container UUID"
+                "LUKS passphrase prompt requires a canonical container UUID"
             );
             let attempts = args
                 .value("rd.luks.tries")
                 .and_then(|v| v.parse::<u8>().ok())
                 .unwrap_or(3);
+            let provider = match source {
+                credentials::Source::Serial => credentials::serial_provider,
+                credentials::Source::Console => credentials::console_provider,
+            };
             narf_block::encrypted::install_luks_passphrase_provider_with_attempts(
-                credentials::serial_provider,
-                attempts,
+                provider, attempts,
             );
             return InitResult::Ok;
         }

@@ -45,9 +45,21 @@ The loader retains the complete final EFI descriptor map in tag 17, in
 addition to the coalesced type-6 map, and preserves the system table through
 tag 12. EFI loader code/data, the kernel, initramfs, bridge, information block,
 runtime and boot-services regions stay reserved. Boot-services reclamation
-requires an explicit firmware-table lifetime audit. Native EFI currently
-requires the kernel's fixed physical load range to be available; a collision
-is fatal. Command-line
+requires an explicit firmware-table lifetime audit.
+
+The kernel goes to its ELF physical load range when the firmware leaves that
+range free. When firmware owns part of it (the ThinkPad P14s Gen 5 AMD holds
+ACPI NVS, ACPI tables and a reserved block at 0x179ec000-0x1f46bfff, inside
+0x10000000-0x1e807000), the loader places the image a whole number of 2 MiB
+steps higher, inside one free range below 4 GiB, and enters at the entry
+point plus the same delta. The slot is random among all that fit when the
+firmware has EFI_RNG_PROTOCOL, and the lowest otherwise, as Linux's EFI stub
+places its kernel (`efi_random_alloc`). If no range fits, the loader returns
+an error to firmware. Any Multiboot2 or PVH loader may enter this way: the
+stub finds its own address (a call/pop on a stack borrowed from the handoff's
+first dword, as Linux's `pvh_start_xen` does), runs in place and skips its
+own physical relocation. It halts on an entry below the link address or off
+the 2 MiB grid. Command-line
 and initramfs bytes are embedded before any administrator signing. Firmware
 load options do not override them. Build/install/run instructions and limits
 are in `docs/NATIVE_UEFI.md`.

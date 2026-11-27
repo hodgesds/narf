@@ -2506,8 +2506,10 @@ kernel_test_in!(
     smoke_block_disk_policy_root_follows_identity_not_names
 );
 
-/// Refusals: a missing / repeated / malformed root=, the wrong policy, an
-/// ESP, and (root-rw) a non-btrfs root all leave everything read-only.
+/// Refusals: a missing / repeated / malformed root=, the wrong policy and an
+/// ESP all leave everything read-only. An ext4 root is designated under
+/// root-rw (a filesystem with neither writer is refused: `UnsupportedRootFs`,
+/// reachable only through a LUKS container, see `luks2.rs`).
 fn smoke_block_disk_policy_root_refusals() -> TestResult {
     use crate::disk_policy::{self, DiskPolicy, PolicyError};
     use crate::partition::PartitionBlockDevice;
@@ -2578,7 +2580,8 @@ fn smoke_block_disk_policy_root_refusals() -> TestResult {
             return Err("an ESP must never be designated");
         }
         crate::unregister_block_device("rp-ref0p3");
-        // root-rw on a non-btrfs filesystem: an ext superblock with the UUID.
+        // root-rw on an ext4 root: an ext superblock with the UUID. Its
+        // writer has a write-safety gate (`sb_state`), so root-rw takes it.
         {
             let mut b = bytes.lock();
             let base = RP_ROOT.0 as usize * 512;
@@ -2586,24 +2589,28 @@ fn smoke_block_disk_policy_root_refusals() -> TestResult {
             b[base + 1024 + 0x38..base + 1024 + 0x3a].copy_from_slice(&[0x53, 0xEF]);
             b[base + 1024 + 0x68..base + 1024 + 0x78].copy_from_slice(&uuid);
         }
+        // Over the raw disk, as `rp_register_disk` builds it: the registered
+        // `whole` is the policy-gated view, which refuses its own writes.
+        let raw = Arc::new(VecBlock {
+            data: bytes.clone(),
+            lba_size: 512,
+        }) as Arc<dyn crate::BlockDeviceSync>;
         register_partition_device(
             "rp-ref0p2",
             "rp-ref0",
-            Arc::new(PartitionBlockDevice::new(whole, RP_ROOT.0, RP_ROOT.1)),
+            Arc::new(PartitionBlockDevice::new(raw, RP_ROOT.0, RP_ROOT.1)),
             Some(meta("0FC63DAF-8483-4772-8E79-3D69D8477DE4")),
         );
-        if disk_policy::designate_root("rp-ref0p2", uuid) != Err(PolicyError::NotBtrfs) {
-            return Err("root-rw must refuse a non-btrfs root");
+        drop(whole);
+        disk_policy::designate_root("rp-ref0p2", uuid)
+            .map_err(|_| "root-rw must designate an ext4 root")?;
+        if !rp_writes("rp-ref0p2") || rp_writes("rp-ref0p1") || rp_writes("rp-ref0") {
+            return Err("only the designated ext4 root partition may be writable");
         }
-        for name in names {
-            if rp_writes(name) {
-                return Err("a refused designation must leave every disk read-only");
-            }
-        }
-        // root-ro may designate it (it never writes).
+        // root-ro designates it as well (it never writes).
         rp_reset(Some(DiskPolicy::RootRo), Some(Some(&root_arg)));
         disk_policy::designate_root("rp-ref0p2", uuid)
-            .map_err(|_| "root-ro may mount a non-btrfs root read-only")?;
+            .map_err(|_| "root-ro may mount an ext4 root read-only")?;
         Ok(())
     })();
     rp_finish(&names, result)

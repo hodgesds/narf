@@ -12,8 +12,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_capabilities::{Cap, Grant};
-use narf_crypto::hkdf::hmac_sha256;
-use narf_crypto::pbkdf2_sha1::{hmac_sha1, Sha1};
+use narf_crypto::pbkdf2::{pbkdf2_hmac_sha1, pbkdf2_hmac_sha256, pbkdf2_hmac_sha512};
+use narf_crypto::pbkdf2_sha1::Sha1;
 use narf_crypto::sha256::Sha256;
 use narf_crypto::sha512::Sha512;
 use narf_crypto::{aes_xts_256_decrypt, AesXts256, CryptoError, Key};
@@ -146,16 +146,26 @@ pub struct Luks1UnlockPolicy {
     /// master-key digest. This bounds boot-time CPU denial of service by a
     /// corrupt or attacker-controlled header.
     pub max_pbkdf2_iterations: u32,
-    /// Maximum sum of all PBKDF2 work attempted across enabled keyslots,
+    /// Maximum sum of the PBKDF2 work of the keyslots actually tried,
     /// including one master-key digest check per slot.
     pub max_total_pbkdf2_iterations: u64,
 }
 
+/// The default per-PBKDF2 bound, for LUKS1 and LUKS2. cryptsetup sizes a
+/// keyslot to its 2-second default iteration time on the machine that
+/// formats it, with no upper limit: a ThinkPad P14s Gen 5 AMD (Ryzen 7 PRO
+/// 8840HS) installer header has 10,880,166 iterations in slot 0. This leaves
+/// room for about 4.5 times that.
+pub const DEFAULT_MAX_PBKDF2_ITERATIONS: u32 = 50_000_000;
+/// The default bound on the PBKDF2 work of one unlock: 2.5 times the
+/// per-PBKDF2 bound, the ratio of the earlier 10M/25M defaults.
+pub const DEFAULT_MAX_TOTAL_PBKDF2_ITERATIONS: u64 = 125_000_000;
+
 impl Default for Luks1UnlockPolicy {
     fn default() -> Self {
         Self {
-            max_pbkdf2_iterations: 10_000_000,
-            max_total_pbkdf2_iterations: 25_000_000,
+            max_pbkdf2_iterations: DEFAULT_MAX_PBKDF2_ITERATIONS,
+            max_total_pbkdf2_iterations: DEFAULT_MAX_TOTAL_PBKDF2_ITERATIONS,
         }
     }
 }
@@ -354,29 +364,23 @@ pub(crate) fn unlock(
         return Err(Luks1Error::WorkFactorTooLarge);
     }
 
-    let active_slots = header.keyslots.iter().filter(|slot| slot.active).count();
-    if active_slots == 0 {
+    if !header.keyslots.iter().any(|slot| slot.active) {
         return Err(Luks1Error::NoActiveKeyslot);
     }
-    let requested_work = header
-        .keyslots
-        .iter()
-        .filter(|slot| slot.active)
-        .try_fold(0u64, |total, slot| {
-            total
-                .checked_add(u64::from(slot.iterations))?
-                .checked_add(u64::from(header.master_key_digest_iterations))
-        })
-        .ok_or(Luks1Error::WorkFactorTooLarge)?;
-    if requested_work > policy.max_total_pbkdf2_iterations {
-        return Err(Luks1Error::WorkFactorTooLarge);
-    }
 
+    // Slots are tried in order and the first that opens wins, as cryptsetup's
+    // `LUKS_open_key_with_hdr` does. Only the slots actually tried count
+    // against the budget, as in the LUKS2 path: summing every enabled slot up
+    // front would refuse a correct passphrase in slot 0 for slot 1's cost.
+    let mut work = 0u64;
     let xts_cap = Cap::<Key<AesXts256>, Grant>::bootstrap();
     for slot in header.keyslots.iter().filter(|slot| slot.active) {
-        if slot.iterations > policy.max_pbkdf2_iterations {
-            return Err(Luks1Error::WorkFactorTooLarge);
-        }
+        work = charge_attempt(
+            policy,
+            work,
+            slot.iterations,
+            header.master_key_digest_iterations,
+        )?;
 
         let key_bytes = header.key_bytes as usize;
         let material_bytes = key_bytes * slot.stripes as usize;
@@ -434,6 +438,28 @@ pub(crate) fn unlock(
     Err(Luks1Error::WrongPassphrase)
 }
 
+/// Charge one keyslot attempt, its PBKDF2 plus the master-key digest check,
+/// to the unlock budget before running it. Returns the work spent so far,
+/// this attempt included.
+fn charge_attempt(
+    policy: Luks1UnlockPolicy,
+    spent: u64,
+    slot_iterations: u32,
+    digest_iterations: u32,
+) -> Result<u64, Luks1Error> {
+    if slot_iterations > policy.max_pbkdf2_iterations {
+        return Err(Luks1Error::WorkFactorTooLarge);
+    }
+    let spent = spent
+        .checked_add(u64::from(slot_iterations))
+        .and_then(|work| work.checked_add(u64::from(digest_iterations)))
+        .ok_or(Luks1Error::WorkFactorTooLarge)?;
+    if spent > policy.max_total_pbkdf2_iterations {
+        return Err(Luks1Error::WorkFactorTooLarge);
+    }
+    Ok(spent)
+}
+
 pub(crate) fn pbkdf2(
     hash: Luks1Hash,
     password: &[u8],
@@ -442,80 +468,13 @@ pub(crate) fn pbkdf2(
     output_len: usize,
 ) -> Zeroizing<Vec<u8>> {
     debug_assert!(iterations > 0);
-    let digest_len = hash.digest_len();
     let mut output = Zeroizing::new(alloc::vec![0u8; output_len]);
-    let mut salt_block = Zeroizing::new(Vec::with_capacity(salt.len() + 4));
-    salt_block.extend_from_slice(salt);
-    salt_block.extend_from_slice(&[0u8; 4]);
-
-    for block_index in 1..=output_len.div_ceil(digest_len) {
-        let index = u32::try_from(block_index).expect("PBKDF2 output exceeds u32 blocks");
-        let suffix = salt_block.len() - 4;
-        salt_block[suffix..].copy_from_slice(&index.to_be_bytes());
-
-        let mut u = Zeroizing::new([0u8; 64]);
-        let mut t = Zeroizing::new([0u8; 64]);
-        hmac_into(hash, password, &salt_block, &mut u);
-        t[..digest_len].copy_from_slice(&u[..digest_len]);
-        for _ in 1..iterations {
-            let previous = Zeroizing::new(*u);
-            hmac_into(hash, password, &previous[..digest_len], &mut u);
-            for i in 0..digest_len {
-                t[i] ^= u[i];
-            }
-        }
-
-        let output_offset = (block_index - 1) * digest_len;
-        let take = (output_len - output_offset).min(digest_len);
-        output[output_offset..output_offset + take].copy_from_slice(&t[..take]);
+    match hash {
+        Luks1Hash::Sha1 => pbkdf2_hmac_sha1(password, salt, iterations, &mut output),
+        Luks1Hash::Sha256 => pbkdf2_hmac_sha256(password, salt, iterations, &mut output),
+        Luks1Hash::Sha512 => pbkdf2_hmac_sha512(password, salt, iterations, &mut output),
     }
     output
-}
-
-fn hmac_into(hash: Luks1Hash, key: &[u8], data: &[u8], out: &mut [u8; 64]) {
-    out.zeroize();
-    match hash {
-        Luks1Hash::Sha1 => {
-            let digest = Zeroizing::new(hmac_sha1(key, data));
-            out[..20].copy_from_slice(&digest[..]);
-        }
-        Luks1Hash::Sha256 => {
-            let digest = Zeroizing::new(hmac_sha256(key, data));
-            out[..32].copy_from_slice(&digest[..]);
-        }
-        Luks1Hash::Sha512 => {
-            let digest = Zeroizing::new(hmac_sha512(key, data));
-            out.copy_from_slice(&digest[..]);
-        }
-    }
-}
-
-fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
-    const BLOCK_BYTES: usize = 128;
-    let mut key_block = Zeroizing::new([0u8; BLOCK_BYTES]);
-    if key.len() > BLOCK_BYTES {
-        let mut hasher = Sha512::new();
-        hasher.update(key);
-        key_block[..64].copy_from_slice(&hasher.finalize());
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut inner_pad = Zeroizing::new([0x36u8; BLOCK_BYTES]);
-    let mut outer_pad = Zeroizing::new([0x5cu8; BLOCK_BYTES]);
-    for index in 0..BLOCK_BYTES {
-        inner_pad[index] ^= key_block[index];
-        outer_pad[index] ^= key_block[index];
-    }
-    let mut inner = Sha512::new();
-    inner.update(&inner_pad[..]);
-    inner.update(data);
-    let inner_digest = Zeroizing::new(inner.finalize());
-
-    let mut outer = Sha512::new();
-    outer.update(&outer_pad[..]);
-    outer.update(&inner_digest[..]);
-    outer.finalize()
 }
 
 fn hash_into(hash: Luks1Hash, prefix: &[u8], data: &[u8], out: &mut [u8; 64]) {
@@ -708,4 +667,193 @@ pub(crate) mod tests {
         }
     }
     kernel_test_in!("block/luks1", smoke_luks1_af_merge_vector);
+
+    /// A read-only in-memory volume.
+    struct Image(Vec<u8>);
+
+    impl BlockDeviceSync for Image {
+        fn lba_size(&self) -> u32 {
+            SECTOR_BYTES as u32
+        }
+        fn capacity(&self) -> u64 {
+            (self.0.len() / SECTOR_BYTES) as u64
+        }
+        fn read(&self, lba: u64, blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
+            let start = lba as usize * SECTOR_BYTES;
+            let len = usize::from(blocks) * SECTOR_BYTES;
+            let bytes = self
+                .0
+                .get(start..start + len)
+                .ok_or(BlockIoError::OutOfRange)?;
+            out.get_mut(..len)
+                .ok_or(BlockIoError::OutOfRange)?
+                .copy_from_slice(bytes);
+            Ok(())
+        }
+        fn write(&self, _: u64, _: u16, _: &[u8]) -> Result<(), BlockIoError> {
+            Err(BlockIoError::OutOfRange)
+        }
+    }
+
+    const PASSPHRASE: &[u8] = b"correct horse battery staple";
+    /// Slot 0's PBKDF2 iterations, and the master-key digest's. The digest's
+    /// is lower, so a bound between them refuses the slot, not the digest.
+    const SLOT0_ITERATIONS: u32 = 1000;
+    const DIGEST_ITERATIONS: u32 = 500;
+
+    /// A two-slot LUKS1 volume, as CachyOS's installer writes one (the
+    /// passphrase, then GRUB's keyfile). Slot 0 opens with [`PASSPHRASE`]
+    /// with `slot0_iterations`. Slot 1 is enabled with `slot1_iterations`
+    /// but no passphrase opens it.
+    fn two_slot_volume(slot0_iterations: u32, slot1_iterations: u32) -> Arc<dyn BlockDeviceSync> {
+        const STRIPES: usize = 4;
+        let mut header = header_fixture();
+        header[104..108].copy_from_slice(&16u32.to_be_bytes()); // payload sector
+        let master_key: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(29) ^ 0x5c);
+        let digest_salt = [0x33u8; 32];
+        let digest = pbkdf2(
+            Luks1Hash::Sha256,
+            &master_key,
+            &digest_salt,
+            DIGEST_ITERATIONS,
+            20,
+        );
+        header[112..132].copy_from_slice(&digest);
+        header[132..164].copy_from_slice(&digest_salt);
+        header[164..168].copy_from_slice(&DIGEST_ITERATIONS.to_be_bytes());
+        for (slot, iterations, salt, sector) in [
+            (0usize, slot0_iterations, 0x22u8, 8u32),
+            (1, slot1_iterations, 0x44, 9),
+        ] {
+            let at = 208 + slot * 48;
+            header[at..at + 4].copy_from_slice(&KEY_ENABLED.to_be_bytes());
+            header[at + 4..at + 8].copy_from_slice(&iterations.to_be_bytes());
+            header[at + 8..at + 40].fill(salt);
+            header[at + 40..at + 44].copy_from_slice(&sector.to_be_bytes());
+            header[at + 44..at + 48].copy_from_slice(&(STRIPES as u32).to_be_bytes());
+        }
+
+        // AF split, the inverse of `af_merge`: stripes of filler diffused
+        // into a state, then a last stripe of state XOR the master key.
+        let mut material = [0u8; SECTOR_BYTES];
+        let mut state = [0u8; 64];
+        for stripe in 0..STRIPES - 1 {
+            let bytes = &mut material[stripe * 64..(stripe + 1) * 64];
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(7).wrapping_add(stripe as u8);
+            }
+            xor_in_place(&mut state, bytes);
+            let mut diffused = [0u8; 64];
+            diffuse(Luks1Hash::Sha256, &state, &mut diffused);
+            state = diffused;
+        }
+        xor_in_place(&mut state, &master_key);
+        material[(STRIPES - 1) * 64..STRIPES * 64].copy_from_slice(&state);
+        let slot_key = pbkdf2(
+            Luks1Hash::Sha256,
+            PASSPHRASE,
+            &[0x22u8; 32],
+            slot0_iterations,
+            64,
+        );
+        let slot_key: &[u8; 64] = slot_key.as_slice().try_into().expect("64-byte key");
+        narf_crypto::aes_xts_256_encrypt(
+            &Cap::<Key<AesXts256>, Grant>::bootstrap(),
+            slot_key,
+            0,
+            &mut material,
+        )
+        .expect("keyslot encryption");
+
+        let mut image = alloc::vec![0u8; 32 * SECTOR_BYTES];
+        image[..header.len()].copy_from_slice(&header);
+        image[8 * SECTOR_BYTES..9 * SECTOR_BYTES].copy_from_slice(&material);
+        // Slot 1's sector stays zero: it decrypts to garbage that fails the
+        // digest, as a keyslot the passphrase does not belong to does.
+        Arc::new(Image(image))
+    }
+
+    /// The unlock budget counts only the slots it tries, as cryptsetup tries
+    /// them: slot 1 costing 40 times the budget must not refuse a passphrase
+    /// slot 0 opens. A wrong passphrase still stops at the budget, before
+    /// slot 1's PBKDF2 runs.
+    fn smoke_luks1_budget_counts_only_the_slots_tried() -> TestResult {
+        let policy = Luks1UnlockPolicy {
+            max_pbkdf2_iterations: 1_000_000,
+            max_total_pbkdf2_iterations: 3000,
+        };
+        let volume = two_slot_volume(SLOT0_ITERATIONS, 120_000);
+        match unlock(volume.clone(), PASSPHRASE, policy) {
+            Ok(_) => {}
+            Err(Luks1Error::WorkFactorTooLarge) => {
+                return TestResult::Fail("slot 1's cost refused a passphrase slot 0 opens")
+            }
+            Err(_) => return TestResult::Fail("slot 0 did not open with its passphrase"),
+        }
+        match unlock(volume, b"not the passphrase", policy) {
+            Err(Luks1Error::WorkFactorTooLarge) => TestResult::Pass,
+            Err(Luks1Error::WrongPassphrase) => {
+                TestResult::Fail("slot 1 ran although the budget does not cover it")
+            }
+            _ => TestResult::Fail("a wrong passphrase did not stop at the budget"),
+        }
+    }
+    kernel_test_in!(
+        "block/luks1",
+        smoke_luks1_budget_counts_only_the_slots_tried
+    );
+
+    /// A slot over the per-PBKDF2 bound is refused before its PBKDF2 runs,
+    /// even with the right passphrase, and one at the bound is tried.
+    fn smoke_luks1_slot_over_the_iteration_bound_is_refused() -> TestResult {
+        let at_bound = Luks1UnlockPolicy {
+            max_pbkdf2_iterations: SLOT0_ITERATIONS,
+            max_total_pbkdf2_iterations: 1_000_000,
+        };
+        let volume = two_slot_volume(SLOT0_ITERATIONS, SLOT0_ITERATIONS);
+        if unlock(volume.clone(), PASSPHRASE, at_bound).is_err() {
+            return TestResult::Fail("a slot at the iteration bound was refused");
+        }
+        let below = Luks1UnlockPolicy {
+            max_pbkdf2_iterations: SLOT0_ITERATIONS - 1,
+            ..at_bound
+        };
+        match unlock(volume, PASSPHRASE, below) {
+            Err(Luks1Error::WorkFactorTooLarge) => TestResult::Pass,
+            _ => TestResult::Fail("a slot over the iteration bound was tried"),
+        }
+    }
+    kernel_test_in!(
+        "block/luks1",
+        smoke_luks1_slot_over_the_iteration_bound_is_refused
+    );
+
+    /// The default policy opens a stock cryptsetup header from a 2024 laptop:
+    /// the ThinkPad P14s Gen 5 AMD's (slot 0 10,880,166 iterations, slot 1
+    /// 9,686,614, master-key digest 302,357), which the earlier 10M bound
+    /// refused. It covers a wrong passphrase reaching slot 1 too, and the
+    /// bounds still hold just past their limits.
+    fn smoke_luks1_default_policy_admits_cryptsetup_headers() -> TestResult {
+        let policy = Luks1UnlockPolicy::default();
+        let both = charge_attempt(policy, 0, 10_880_166, 302_357)
+            .and_then(|spent| charge_attempt(policy, spent, 9_686_614, 302_357));
+        if both.is_err() {
+            return TestResult::Fail("the default policy refuses a stock two-slot header");
+        }
+        if charge_attempt(policy, 0, DEFAULT_MAX_PBKDF2_ITERATIONS + 1, 0)
+            != Err(Luks1Error::WorkFactorTooLarge)
+        {
+            return TestResult::Fail("the per-PBKDF2 bound no longer holds");
+        }
+        if charge_attempt(policy, DEFAULT_MAX_TOTAL_PBKDF2_ITERATIONS, 1, 0)
+            != Err(Luks1Error::WorkFactorTooLarge)
+        {
+            return TestResult::Fail("the unlock work bound no longer holds");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "block/luks1",
+        smoke_luks1_default_policy_admits_cryptsetup_headers
+    );
 }

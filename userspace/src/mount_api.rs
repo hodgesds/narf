@@ -305,6 +305,14 @@ pub(crate) fn mount_error_errno(error: FsError) -> i64 {
         // read-only ("source write-protected, mounted read-only").
         FsError::ReadOnly => EROFS,
         FsError::ArgumentListTooLong => E2BIG,
+        // `ext4_fill_super`: a superblock or group-descriptor checksum that
+        // fails (EFSBADCRC), descriptors that do not add up (EFSCORRUPTED),
+        // or a read error.
+        FsError::BadChecksum => EBADMSG,
+        FsError::Corrupted => EUCLEAN,
+        FsError::Io(_) => EIO,
+        // `ext4_fill_super` / jbd2 recovery out of memory.
+        FsError::OutOfMemory => ENOMEM,
         _ => EINVAL,
     }
 }

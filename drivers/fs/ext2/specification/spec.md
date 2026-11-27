@@ -13,10 +13,10 @@ NARF.
   feature set is supported mount read/write; inode, classic-directory,
   bitmap, group-descriptor, HTREE, and primary-superblock mutations regenerate
   the corresponding CRC32C before returning.
-- **Out of Scope (this iteration):** journal writes (ext3+), HTREE leaf
-  splitting/rebalancing and multi-level insertion, extended attributes,
-  `fsck`-style repair, and
-  extents-tree writes.
+- **Out of Scope (this iteration):** journal writes (ext3+), HTREE
+  rebalancing on delete, `largedir` (a third HTREE level), converting a
+  linear directory to an index (`make_indexed_dir`), and `fsck`-style
+  repair.
 
 ## 2. Assumptions
 
@@ -36,6 +36,25 @@ NARF.
 registry without constructing a volume. Both mount syscall APIs invoke the
 registered constructor with a block source and options, then attach its returned
 `Arc<dyn FsInstance>` in the caller's namespace.
+
+The constructor takes the whole `MountRequest`:
+- **One volume per device** (`registry::mount`, Linux `get_tree_bdev`). A
+  second mount of the same device shares the first one's volume; one that
+  would change its read-only state fails with EBUSY.
+- **A read-only request** (`MS_RDONLY`, or `ro` in the data) mounts without
+  writing a byte.
+- **A read-write request the volume cannot honour** fails as Linux's does:
+  - EINVAL for a read-only-compatible feature Linux does not know
+    (`ext4_feature_set_ok`);
+  - a read-only mount without error for the READONLY feature;
+  - EROFS for a filesystem Linux would write and NARF does not, or a device
+    `narf.disks=` keeps read-only. libmount then retries read-only.
+- **The write gate** (`volume::sb_state::rw_refusal`) decides. Each refusal
+  is logged and recorded in `narf_filesystem::rw_refusal` for the
+  `narf.disks=root-rw` failure banner.
+- **Remount** (`reconfigure_sb_async`): `SB_RDONLY` (or `ro`) writes
+  everything back, flushes and marks the filesystem clean; clearing it runs
+  the gate again over the on-disk superblock.
 
 The driver implements `narf_filesystem::FsInstance` for `Ext2Volume`.
 Per-node ops live on `Ext2Node`, which implements both `FileOps` and
@@ -130,10 +149,48 @@ A device without `BlockFeature::Discard` fails the ioctl with
   bitmap, classic-directory leaf, or HTREE index block before mutation. Writers
   install dependent bitmap/directory checksums first, then the
   group-descriptor/superblock checksum that names them. Unknown
-  read-only-compatible features, a dirty JBD2 log, and a non-empty orphan file
-  keep the volume read-only. One-level HTREE insertion into an existing leaf
+  read-only-compatible features and a non-empty orphan file keep the volume
+  read-only. One-level HTREE insertion into an existing leaf
   and deletion from existing one-level HTREE leaves are supported; a full
   leaf or multi-level mutation is rejected before mutation.
+- **Directory names hash as Linux hashes them** (`htree::ext4fs_dirhash`,
+  `fs/ext4/hash.c::__ext4fs_dirhash`): legacy, half-MD4 and TEA, each
+  signed or unsigned, checked against e2fsprogs' `dx_hash`. The low bit is
+  cleared and the readdir EOF cookie (`EXT4_HTREE_EOF_32BIT << 1`) is never
+  returned. A lookup adds `s_hash_unsigned` to the root's base version as
+  `dx_probe` does: 3 when `s_flags` says unsigned, 0 when it says signed,
+  and the platform's `char` signedness when it says neither (signed on
+  x86_64, unsigned on aarch64). `DxRoot::parse` refuses what `dx_probe`
+  refuses: an on-disk version other than 0-2, `unused_flags` bit 0, and
+  more than one dx-node level (two need `largedir`, which is refused at
+  mount).
+- **A crash is never hidden** (Linux `ext4_setup_super` without a journal).
+  NARF writes metadata in place, never through the journal. So a
+  read-write mount first clears `EXT4_VALID_FS`, bumps `s_mnt_count`, sets
+  `s_mtime`, records the hash signedness, and repairs a stale
+  `RECOVER`/`ORPHAN_PRESENT` the gate found clean. That one superblock write
+  goes out with FUA and a flush before any other write. Remount read-only
+  and the last unmount (`Drop`, polled once in place) restore the mount-time
+  `s_state` after a full write-back, adding `EXT4_ERROR_FS` if an error was
+  recorded. `syncfs` never marks the filesystem clean. After a crash,
+  `e2fsck -p` sees an unclean filesystem and checks it fully.
+- **The write gate** refuses a read-write mount, and writes nothing, for:
+  - an unknown or unwritable read-only-compatible feature;
+  - legacy `gdt_csum`;
+  - a non-empty orphan file or `s_last_orphan` list;
+  - a default directory hash other than 0-2.
+
+  Under `narf.disks=root-rw` it also refuses a filesystem with
+  `EXT4_ERROR_FS` or without `EXT4_VALID_FS`. LINUX-GAP: Linux mounts those
+  with a warning; NARF writes a production root only after e2fsck has seen
+  it.
+- **Errors are recorded** (`fs_error`, Linux `__ext4_error`). This sets:
+  - `EXT4_ERROR_FS` and `s_error_count`;
+  - the first and last error's time, inode, block and function;
+  - the `EXT4_ERR_*` code.
+
+  Under `root-rw`, or with `s_errors=remount-ro`, the mount stops writing.
+  `s_errors=panic` panics.
 - **Allocation metadata is serialized and quarantined by group.** Bitmap,
   group-descriptor, and superblock-counter updates cannot interleave. A block
   group whose bitmap checksum fails is skipped without mutation, allowing a
@@ -141,6 +198,111 @@ A device without `BlockFeature::Discard` fails the ioctl with
   allocation also monotonically advances ext4's `bg_itable_unused` boundary
   before the updated group-descriptor checksum is persisted, so Linux does not
   classify newly initialized inode slots as deleted.
+- **Allocation starts at its goal** (`ext4_mb_new_blocks` with a goal):
+  - Order: the goal's group from the goal block, then every later group,
+    wrapping around.
+  - A group whose descriptor counts nothing free is skipped without reading
+    its bitmap.
+  - Inodes are taken from groups in order, after `EXT4_FIRST_INO`
+    (`s_first_ino`). LINUX-GAP: no Orlov spreading of directories.
+- **Lazily initialized groups** (`BLOCK_UNINIT`, `INODE_UNINIT`, with a
+  descriptor checksum) are used only after every initialized group.
+  - Their bitmap is never read: it is computed as `ext4_init_block_bitmap`
+    computes it. That covers the superblock copy (`ext4_bg_has_super`,
+    `sparse_super` / `sparse_super2`), the descriptor table and reserved GDT
+    blocks, the group's own bitmaps and inode table when they lie inside it,
+    and the padding past a short last group.
+  - The computed bitmap must agree with the descriptor's free count; if it
+    does not, the group is skipped.
+  - The first allocation writes the bitmap and clears the flag.
+  - An inode allocated in a group whose block bitmap is uninitialized
+    initializes it first (`__ext4_new_inode`).
+  - Freeing anything in such a group is `Corrupted`.
+- **Group count** is `DIV_ROUND_UP(blocks_count - first_data_block,
+  blocks_per_group)`, as `ext4_fill_super` computes it.
+- **HTREE inserts split as Linux does** (`dir_mut.rs`, `ext4_dx_add_entry`).
+  - `dx_probe` checks every index level: the root's `limit` equals what
+    the block holds (`dx_root_limit`), each node opens with a fake dirent
+    spanning the block and has `dx_node_limit`, `count` is within `limit`,
+    child blocks lie inside the directory, and the `dx_tail` checksum
+    holds. Damage is `Corrupted`, a bad checksum `BadChecksum`.
+  - A full leaf splits at `do_split`'s point: from the highest hash down,
+    entries move while they fill at most half a block. The new block is
+    indexed with the first moved hash, plus one when that hash continues
+    from the block before (`continued`).
+  - A full index node splits in two when the root has room. A full root at
+    `indirect_levels` 0 moves into a new node and the root indexes it
+    (0 → 1). A full tree at the maximum depth (two levels without
+    `largedir`) is ENOSPC before any write.
+  - Without a journal: the new block, then the inode that maps it, then
+    the one index block that makes it reachable (the commit), then the old
+    block shrinks. Before the commit a failure frees the block and restores
+    the inode; after it the error is recorded.
+  - LINUX-GAP: a full one-block linear directory grows linearly; it is not
+    converted to an index (`make_indexed_dir`).
+- **Namespace changes keep a no-journal-safe order** (`dir_mut.rs`).
+  - A new inode is written before its dirent, which is the commit. A
+    failure before it clears the inode slot, then frees its data block.
+  - `link` raises and writes the link count before the new name exists,
+    so a crash can leave the count too high (e2fsck lowers it), never a
+    name the count does not cover.
+  - A rename onto an existing name repoints that dirent in place
+    (`ext4_setent`), so the name exists throughout. The old name goes
+    next, then the replaced inode's link, then a moved directory's `..`,
+    written with the dx root's checksum when the directory is indexed.
+  - Link limits are Linux's. `link` of an inode at `EXT4_LINK_MAX` (65000)
+    links is EMLINK. So is `mkdir`, or a rename moving a directory, into a
+    directory at that limit, unless `dir_nlink` lets an indexed directory
+    go on at a count of 1 (`EXT4_DIR_LINK_MAX`, `ext4_inc_count`). `rmdir`
+    and a rename leave a parent at 1 or 2 alone (`ext4_dec_count`).
+- **Extent trees grow to any depth** (`volume/extent_write.rs`, Linux
+  `ext4_ext_insert_extent`), up to `EXT4_MAX_EXTENT_DEPTH` (5).
+  - A full leaf gets a sibling, indexed from the deepest index level with
+    room. Every full level between gets a new node holding the new child
+    and the entries right of the path (`ext4_ext_split`).
+  - When every level is full, the root's entries move to a new block and
+    the root indexes it, one level deeper (`ext4_ext_grow_indepth`).
+  - An index key equals its child's first key, corrected upward while the
+    child is its parent's first entry (`ext4_ext_correct_indexes`).
+- **Extent blocks are checked before a change** (`__ext4_ext_check`):
+  magic, depth, `eh_max` within what the node holds, `eh_entries` within
+  `eh_max`, no empty index, entries in order and inside the filesystem, the
+  first key equal to the parent's, and below the root the tail checksum.
+  - Structural damage is `Corrupted` (EFSCORRUPTED), a bad checksum
+    `BadChecksum` (EFSBADCRC); both are recorded with `fs_error`.
+  - The tail checksum covers the header and `eh_max` entry slots and sits
+    right after them (`EXT4_EXTENT_TAIL_OFFSET`), not at the block's end:
+    the two differ at 2 KiB blocks.
+  - LINUX-GAP: reads do not verify extent blocks. Linux verifies once per
+    buffer and caches the result; NARF has no per-buffer verified state, and
+    a CRC of every extent block on every mapping lookup is too costly.
+- **Extent inserts allocate first and commit once.** Every block the
+  change needs (the caller's data block, new tree nodes) is allocated
+  before anything is written. New nodes are written, then the one node that
+  makes them reachable (the commit: an index block, or the inode for a
+  root change), then the old nodes lose what moved, then keys above are
+  corrected.
+  - Before the commit, a failure frees every block it took, the data block
+    too, and leaves the inode as it was. After it, the error is recorded
+    and the inode, counting the new blocks, is still written.
+  - A crash between the commit and the trim leaves entries reachable from
+    two nodes, which e2fsck repairs; no entry is ever unreachable.
+- **Blocks are freed after nothing maps them** (`volume/free_list.rs`).
+  Truncate, punch and unlink, for extent trees and block maps alike, write
+  the trimmed nodes bottom-up, then the inode, and only then free. A crash
+  in between leaks blocks e2fsck reclaims; a block is never free while an
+  inode on disk still maps it, so it cannot end up shared by two files.
+  Frees are collected as runs and applied one bitmap and descriptor write
+  per group per run.
+- **`i_blocks` is 32 bits of sectors.** It is stored as Linux stores a
+  count that fits (`ext4_inode_blocks_set`): `l_i_blocks_high` zero,
+  `HUGE_FILE_FL` clear. A sum past 32 bits is EFBIG.
+  - LINUX-GAP: on a huge_file volume, an inode already using the high half
+    or `HUGE_FILE_FL` (a file holding 2 TiB or more) is refused a rewrite
+    with EFBIG, rather than having its count corrupted.
+- **A failed write still persists a changed block map.** When the first
+  page of a write fails after its block was allocated and mapped, the inode
+  is written anyway, so `i_blocks` counts the block.
 
 ## 5. Architecture notes
 
@@ -152,13 +314,48 @@ A device without `BlockFeature::Discard` fails the ioctl with
   allocated under pressure, the same interface falls back to one fallibly
   allocated filesystem-block buffer, bounded independently of directory size.
 - **Write scope.** Legacy direct/indirect block allocation, inode metadata,
-  classic directory mutation, checksum-aware bitmaps/descriptors, and writes
-  inside an already mapped extent persist. Extent-tree growth/truncation,
-  HTREE leaf splitting/multi-level insertion, and dirty-journal commit remain
-  unsupported. Existing one-level HTREE leaves accept checksum-safe insertion
-  and deletion without changing the index.
+  classic directory mutation, checksum-aware bitmaps/descriptors, extent
+  trees of any depth (growth, unwritten conversion, truncation, punch), and
+  HTREE inserts with leaf and index splits up to two index levels persist.
+  Metadata is still written in place, not through the journal.
   If the JBD2 superblock and orphan file are both clean, stale `RECOVER` and
   `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
+- **The journal is recovered at mount, as Linux does it** (`journal.rs`;
+  `fs/jbd2/recovery.c`, `fs/jbd2/journal.c`, `ext4_load_journal`). Before
+  any inode but the journal's own is read:
+  - The journal inode must be live and regular (EFSCORRUPTED) and its
+    superblock valid, in `journal_check_superblock`'s order (EINVAL;
+    EFSBADCRC for its checksum). An external journal is EOPNOTSUPP.
+  - `RECOVER` clear: the log is wiped (`jbd2_journal_wipe`), and marked empty
+    when the device can be written.
+  - `RECOVER` set: the three passes (SCAN, REVOKE, REPLAY) write every
+    complete, un-revoked transaction home, then flush. They verify csum v2/v3
+    descriptor, revoke, commit and tag checksums and the v1 transaction
+    checksum, tell a stale log from a corrupt one by commit time, accept a
+    torn commit block, restore escaped blocks, wrap at `s_maxlen` and carry
+    64-bit block numbers. Any recovery error fails the mount; a corrupt
+    committed transaction is EFSCORRUPTED. The log restarts two ids past the
+    last good one, and `journal_reset` rewrites its tail.
+  - This happens on a read-only mount too. Only a device that cannot be
+    written refuses it, with EROFS ("try mounting with noload"), writing
+    nothing. `noload` / `norecovery` skip the journal: a read-only mount
+    then sees the filesystem as it is on disk; a read-write mount of one
+    that needs recovery is EINVAL.
+  - Error fields the replay overwrote in the superblock are put back, and
+    an error recorded in the journal (`s_errno`) becomes `EXT4_ERROR_FS`
+    (`ext4_clear_journal_err`).
+  - Then `ext4_mark_recovery_complete`: the log is marked empty and, on a
+    read-only mount, `RECOVER` and `ORPHAN_PRESENT` are cleared.
+  - LINUX-GAPs:
+    - No orphan cleanup yet: a read-only mount whose orphan file still
+      holds inodes leaves `RECOVER` and `ORPHAN_PRESENT` set for Linux.
+    - Fast commits are not replayed: a dirty journal with `FAST_COMMIT` is
+      EOPNOTSUPP, before anything is written.
+    - A pass that reads more block headers than one lap of the log holds
+      ends with EFSCORRUPTED (Linux would loop).
+    - Recovery holds at most 2^20 revoke records (ENOMEM beyond).
+    - On a read-only device an `s_errno` is noted in memory only; Linux
+      attempts the superblock write.
 - **Block-size flexibility.** Block size is `1024 << s_log_block_size`;
   the driver does not hard-code 4096.
 - **Damaged-group containment.** Allocation scans treat a checksum-invalid

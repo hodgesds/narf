@@ -10,7 +10,10 @@ ENTRY(_start)
  * extends into that range, so Limine cannot load its final PT_LOAD.
  * Secure Boot OVMF also reserves memory below 26 MiB. The PVH direct-boot
  * path (QEMU `-kernel`) honours the same ELF p_paddr. This is still a fixed
- * load address, not a guarantee for every firmware memory map. */
+ * load address, not a guarantee for every firmware memory map: the ThinkPad
+ * P14s Gen 5 AMD holds ACPI NVS and tables at 0x179ec000-0x1f46bfff. There
+ * NARF's EFI loader places the image a multiple of 2 MiB higher, and boot.S
+ * `_start` runs it where it lands. */
 KERNEL_LOAD_BASE = 0x10000000;
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 

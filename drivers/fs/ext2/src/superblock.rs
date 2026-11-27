@@ -27,6 +27,9 @@ pub mod compat {
     pub const RESIZE_INODE: u32 = 0x0010;
     pub const DIR_INDEX: u32 = 0x0020;
     pub const ORPHAN_FILE: u32 = 0x1000;
+    /// `COMPAT_SPARSE_SUPER2`: superblock backups only in the two groups
+    /// `s_backup_bgs` names.
+    pub const SPARSE_SUPER2: u32 = 0x0200;
 }
 
 /// `s_feature_incompat` bits — if any unknown bit is set the
@@ -87,6 +90,24 @@ pub mod ro_compat {
     /// supersedes it with CRC32C and is checked separately below.
     pub const WRITE_SUPPORTED: u32 =
         SPARSE_SUPER | LARGE_FILE | HUGE_FILE | GDT_CSUM | DIR_NLINK | EXTRA_ISIZE | METADATA_CSUM;
+
+    /// `EXT4_FEATURE_RO_COMPAT_SUPP`: the features Linux knows. A bit
+    /// outside it makes Linux refuse a read-write mount (EINVAL); a bit
+    /// inside it but outside [`WRITE_SUPPORTED`] is one Linux writes and
+    /// NARF does not.
+    pub const LINUX_SUPPORTED: u32 = SPARSE_SUPER
+        | LARGE_FILE
+        | GDT_CSUM
+        | DIR_NLINK
+        | EXTRA_ISIZE
+        | BTREE_DIR
+        | HUGE_FILE
+        | BIGALLOC
+        | METADATA_CSUM
+        | QUOTA
+        | PROJECT
+        | VERITY
+        | ORPHAN_PRESENT;
 }
 
 /// What flavour of the ext family a superblock represents. Driver
@@ -185,7 +206,40 @@ pub struct Superblock {
     /// `s_orphan_file_inum` (offset 640), when `COMPAT_ORPHAN_FILE`
     /// is enabled.
     pub orphan_file_inum: u32,
+    /// `s_def_hash_version` (offset 252): the hash a newly indexed
+    /// directory gets (`make_indexed_dir`).
+    pub def_hash_version: u8,
+    /// `s_flags` (offset 352): `EXT2_FLAGS_{SIGNED,UNSIGNED}_HASH` and
+    /// `EXT2_FLAGS_TEST_FILESYS`.
+    pub flags: u32,
+    /// `s_errors` (offset 0x3c): what to do when an error is detected
+    /// ([`EXT4_ERRORS_CONTINUE`] and friends).
+    pub errors: u16,
+    /// `s_last_orphan` (offset 0xe8): head of the pre-orphan-file list of
+    /// inodes still to be released. Nonzero after a crash on a volume
+    /// without `orphan_file`.
+    pub last_orphan: u32,
+    /// `s_first_ino` (offset 0x54, rev 1+): the first non-reserved inode.
+    pub first_ino_field: u32,
+    /// `s_reserved_gdt_blocks` (offset 0xce): descriptor-table growth room
+    /// after each superblock copy.
+    pub reserved_gdt_blocks: u16,
+    /// `s_backup_bgs` (offset 0x24c): the two backup groups under
+    /// `sparse_super2`.
+    pub backup_bgs: [u32; 2],
 }
+
+/// `s_errors`: keep going after an error.
+pub const EXT4_ERRORS_CONTINUE: u16 = 1;
+/// `s_errors`: remount read-only after an error.
+pub const EXT4_ERRORS_RO: u16 = 2;
+/// `s_errors`: panic after an error.
+pub const EXT4_ERRORS_PANIC: u16 = 3;
+
+/// `s_flags` bit: directory names hash as signed chars.
+pub const EXT2_FLAGS_SIGNED_HASH: u32 = 0x0001;
+/// `s_flags` bit: directory names hash as unsigned chars.
+pub const EXT2_FLAGS_UNSIGNED_HASH: u32 = 0x0002;
 
 /// `s_state` value meaning "filesystem was unmounted cleanly".
 /// Linux `include/uapi/linux/ext2_fs.h::EXT2_VALID_FS`.
@@ -292,6 +346,40 @@ impl Superblock {
         } else {
             0
         };
+        let def_hash_version = if buf.len() > 252 { buf[252] } else { 0 };
+        let errors = if buf.len() >= 0x3e {
+            u16::from_le_bytes([buf[0x3c], buf[0x3d]])
+        } else {
+            0
+        };
+        let first_ino_field = if buf.len() >= 0x58 {
+            u32::from_le_bytes([buf[0x54], buf[0x55], buf[0x56], buf[0x57]])
+        } else {
+            0
+        };
+        let reserved_gdt_blocks = if buf.len() >= 0xd0 {
+            u16::from_le_bytes([buf[0xce], buf[0xcf]])
+        } else {
+            0
+        };
+        let backup_bgs = if buf.len() >= 0x254 {
+            [
+                u32::from_le_bytes([buf[0x24c], buf[0x24d], buf[0x24e], buf[0x24f]]),
+                u32::from_le_bytes([buf[0x250], buf[0x251], buf[0x252], buf[0x253]]),
+            ]
+        } else {
+            [0; 2]
+        };
+        let last_orphan = if buf.len() >= 0xec {
+            u32::from_le_bytes([buf[0xe8], buf[0xe9], buf[0xea], buf[0xeb]])
+        } else {
+            0
+        };
+        let flags = if buf.len() >= 356 {
+            u32::from_le_bytes([buf[352], buf[353], buf[354], buf[355]])
+        } else {
+            0
+        };
 
         Some(Self {
             inodes_count,
@@ -315,7 +403,31 @@ impl Superblock {
             hash_seed,
             want_extra_isize,
             orphan_file_inum,
+            def_hash_version,
+            flags,
+            errors,
+            last_orphan,
+            first_ino_field,
+            reserved_gdt_blocks,
+            backup_bgs,
         })
+    }
+
+    /// `s_hash_unsigned` (`ext4_hash_info_init`): 3 when directory names
+    /// hash as unsigned bytes, else 0. With neither `s_flags` bit set,
+    /// Linux uses the platform's `char` signedness: signed on x86_64,
+    /// unsigned on aarch64 (and records that choice on a read-write
+    /// mount).
+    pub fn hash_unsigned(&self) -> u8 {
+        if self.flags & EXT2_FLAGS_UNSIGNED_HASH != 0 {
+            3
+        } else if self.flags & EXT2_FLAGS_SIGNED_HASH != 0 {
+            0
+        } else if core::ffi::c_char::MIN == 0 {
+            3
+        } else {
+            0
+        }
     }
 
     /// True iff `s_state` indicates a clean unmount (== EXT2_VALID_FS).
@@ -420,10 +532,14 @@ impl Superblock {
         1024u32 << self.log_block_size
     }
 
-    /// Number of block groups in the volume — ceil(blocks_count /
-    /// blocks_per_group).
+    /// Number of block groups in the volume, as `ext4_fill_super` computes
+    /// it: `DIV_ROUND_UP(blocks_count - first_data_block, blocks_per_group)`.
+    /// Group 0 starts at `s_first_data_block` (1 on a 1 KiB-block volume),
+    /// so counting from block 0 could add a group that does not exist.
     pub fn block_group_count(&self) -> u32 {
-        self.total_blocks().div_ceil(self.blocks_per_group as u64) as u32
+        self.total_blocks()
+            .saturating_sub(self.first_data_block as u64)
+            .div_ceil(self.blocks_per_group as u64) as u32
     }
 
     /// Bytes per inode — for rev-0 volumes this is fixed at 128;
@@ -432,12 +548,14 @@ impl Superblock {
         self.inode_size as usize
     }
 
-    /// First non-reserved inode number for fresh allocations.
-    /// Linux `include/uapi/linux/ext2_fs.h::EXT2_GOOD_OLD_FIRST_INO`
-    /// is 11; rev-1+ volumes embed `s_first_ino` at byte 84 of the
-    /// superblock. We don't decode the rev-1 field (it's almost
-    /// always 11 in practice) and just return the fixed value.
+    /// First non-reserved inode number for fresh allocations
+    /// (`EXT4_FIRST_INO`): `EXT4_GOOD_OLD_FIRST_INO` (11) on a rev-0
+    /// volume, `s_first_ino` otherwise.
     pub fn first_ino(&self) -> u32 {
-        11
+        if self.rev_level == 0 || self.first_ino_field == 0 {
+            11
+        } else {
+            self.first_ino_field
+        }
     }
 }

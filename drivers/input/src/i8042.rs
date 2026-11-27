@@ -11,13 +11,13 @@
 //! + IBM PS/2 Hardware Interface Technical Reference §7):
 //!   1. Disable kbd + AUX channels (so spurious data doesn't race init).
 //!   2. Flush output buffer.
-//!   3. Read controller config byte — clear "translation" so we get
-//!      raw scancode-set-1, disable IRQs while we're configuring.
+//!   3. Read controller config byte — clear translation and disable
+//!      IRQs while we're configuring.
 //!   4. Self-test the controller (cmd 0xAA → expect 0x55).
-//!   5. Enable kbd channel + IRQ 1.
-//!   6. Reset keyboard (data 0xFF → expect 0xFA + 0xAA), set scancode
-//!      set 1 (data 0xF0 0x01 → 0xFA), enable scanning (data 0xF4 →
-//!      0xFA).
+//!   5. Enable kbd channel + IRQ 1, with translation on: the controller
+//!      turns the keyboard's set 2 into the set 1 `decode` reads.
+//!   6. Reset keyboard (data 0xFF → expect 0xFA + 0xAA), which leaves it
+//!      in its default set 2, and enable scanning (data 0xF4 → 0xFA).
 //!
 //! The IRQ handler is the simple part: read 0x60, decode, push.
 //!
@@ -58,6 +58,12 @@ pub const PS2_CMD: u16 = 0x64;
 /// Controller-status bits (read from port 0x64).
 const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_INPUT_FULL: u8 = 1 << 1;
+/// The output-buffer byte came from the AUX (mouse) port (Linux
+/// `I8042_STR_AUXDATA`).
+pub(crate) const STATUS_AUX_DATA: u8 = 1 << 5;
+/// Bytes one [`poll`] call drains at most, so a controller that keeps
+/// reporting data cannot hold the caller. Matches [`flush_output`].
+const POLL_BURST: usize = 32;
 
 /// Controller commands (write to port 0x64).
 const CMD_DISABLE_KBD: u8 = 0xAD;
@@ -216,7 +222,7 @@ fn flush_output() {
 
 /// Re-enable the keyboard channel after the controller is known good:
 /// enable the channel, restore the IRQ + translation config byte,
-/// reset the keyboard, select scancode set 1, enable scanning.
+/// reset the keyboard (which leaves it in set 2), enable scanning.
 /// Returns whether the keyboard is genuinely scanning — the same
 /// `scanning_ok` signal `init()` reports via `I8042_KBD_SCANNING_OK`
 /// (a controller that passes self-test with no keyboard behind the
@@ -252,14 +258,16 @@ fn enable_keyboard_channel() -> Result<bool, InitError> {
     conf2 |= CONF_KBD_IRQ;
     conf2 &= !CONF_KBD_DISABLE;
     // ENABLE first-port translation. The i8042 controller then
-    // translates whatever scancode set the keyboard emits (default
-    // is set 2 post-AT) into set 1 — which is what our decode()
-    // path expects (Set 1 make codes 1..=83 == Linux evdev codes
-    // 1..=83). Linux's atkbd uses this approach for the same
-    // reason. Renoir's EC silently ignores our explicit "set
-    // scancode 1" command (0xF0 0x01) below, so the keyboard
-    // emits set 2 anyway — without translation we'd see e.g.
-    // set-2 'A' = 0x1C reaching `from_evdev(28)` = Enter.
+    // translates the keyboard's set 2 into set 1, which is what our
+    // decode() path expects (Set 1 make codes 1..=83 == Linux evdev
+    // codes 1..=83). Without it we'd see e.g. set-2 'A' = 0x1C
+    // reaching `from_evdev(28)` = Enter.
+    //
+    // The keyboard must then stay in set 2, so no scancode-set command
+    // is sent (Linux `atkbd_select_set`: "if (atkbd->translated) return
+    // 2"). Selecting set 1 as well translated it twice wherever the
+    // keyboard honoured the command, QEMU's among them: Enter arrived as
+    // 'A'. Renoir's EC ignores the command, which hid that.
     conf2 |= CONF_KBD_TRANSLATE;
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
@@ -277,7 +285,7 @@ fn enable_keyboard_channel() -> Result<bool, InitError> {
         outb(PS2_DATA, conf2);
     }
 
-    // 6. Keyboard reset / set scancode-set 1 / enable scanning. On
+    // 6. Keyboard reset (back to its default set 2) / enable scanning. On
     //    real silicon this is where the AMD Phoenix / Renoir EC's
     //    PS/2 emulation latency matters: each ACK can take tens of
     //    ms; the BAT byte after reset, up to 500 ms (IBM PS/2 §7).
@@ -311,34 +319,6 @@ fn enable_keyboard_channel() -> Result<bool, InitError> {
         },
         Some(KBD_BAT_OK) => {} // reset complete in one byte
         _ => scanning_ok = false,
-    }
-
-    if scanning_ok {
-        // Set scancode-set 1: 0xF0 then 0x01, each ACK'd.
-        let _ = wait_input_clear_ms(KBD_REPLY_MS);
-        // SAFETY: `out` to data port `0x60` (keyboard "set scancode
-        // set" command 0xF0); CPL0 + exclusive ownership; input
-        // buffer cleared by the wait above.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            outb(PS2_DATA, 0xF0);
-        }
-        if wait_output_byte_ms(KBD_REPLY_MS) != Some(KBD_ACK) {
-            scanning_ok = false;
-        }
-        if scanning_ok {
-            let _ = wait_input_clear_ms(KBD_REPLY_MS);
-            // SAFETY: `out` to data port `0x60` (the 0x01 argument
-            // selecting scancode set 1); CPL0 + exclusive ownership;
-            // input buffer cleared by the wait above.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            unsafe {
-                outb(PS2_DATA, 0x01);
-            }
-            if wait_output_byte_ms(KBD_REPLY_MS) != Some(KBD_ACK) {
-                scanning_ok = false;
-            }
-        }
     }
 
     if scanning_ok {
@@ -483,8 +463,8 @@ pub unsafe fn init() -> Result<(), InitError> {
 // never complete — the keyboard is reset below), park any
 // in-flight LED exchange (its ACK will never arrive post-reset),
 // then re-run the channel bring-up `init()` used: keyboard
-// channel re-enable (enable + config + reset + scancode set 1 +
-// scanning) and the mouse channel re-enable. IRQ routing is NOT
+// channel re-enable (enable + config + reset + scanning) and the
+// mouse channel re-enable. IRQ routing is NOT
 // redone here: the platform resume path restores IRQ masks /
 // IOAPIC routing (`power/src/suspend.rs::restore_irq_masks`).
 // The evdev nodes are NOT re-registered: they survive suspend.
@@ -970,22 +950,82 @@ fn process_byte(byte: u8) {
     emit_key(decode(make, extended), pressed);
 }
 
-/// IRQ-1 handler. Reads one byte from 0x60 and runs it through the
-/// decode state machine.
+/// IRQ-1 handler. Under [`PORT_LOCK`], takes the controller's byte if
+/// it still holds one and runs it through the decode state machine (or,
+/// if the status says it is a mouse byte, the mouse decoder).
 ///
 /// # Safety
 /// IRQ context only.
 pub unsafe fn on_irq1() {
-    // SAFETY: 0x60 is the i8042 data port.
-    let byte = unsafe { inb(PS2_DATA) };
-
-    // LED exchange responses (ACK / RESEND for an in-flight Set
-    // LEDs) are protocol bytes, not scancodes.
-    if led_route_byte(byte) {
+    let port = PORT_LOCK.lock();
+    // `i8042_interrupt`: an interrupt whose byte another reader (`poll`
+    // on another CPU) already took carries no data.
+    let Some((status, byte)) = read_byte_locked() else {
+        return;
+    };
+    if status & STATUS_AUX_DATA != 0 {
+        drop(port);
+        crate::i8042_mouse::feed_aux_byte(byte);
         return;
     }
+    keyboard_byte(byte);
+}
 
-    process_byte(byte);
+/// Linux `i8042_lock`: one reader of the controller at a time. The IRQ
+/// handlers and [`poll`] run at once on different CPUs while a prompt
+/// polls with the BSP's interrupts masked. Reading the data port after
+/// another reader emptied the output buffer returns the last byte again,
+/// a keystroke typed twice, and two decoders fed in parallel reorder keys:
+/// the console prompt got a wrong passphrase that way. Keyboard bytes are
+/// decoded under the lock, so they stay in order.
+pub(crate) static PORT_LOCK: narf_lib::sync::IrqSafeSpinLock<()> =
+    narf_lib::sync::IrqSafeSpinLock::new(());
+
+/// Take the controller's byte if it holds one: `(status, byte)`. The
+/// caller holds [`PORT_LOCK`].
+pub(crate) fn read_byte_locked() -> Option<(u8, u8)> {
+    // SAFETY: status-register read at CPL 0; 0x64 is the i8042 status
+    // port and the read has no side effects.
+    let status = unsafe { inb(PS2_STATUS) };
+    if status & STATUS_OUTPUT_FULL == 0 {
+        return None;
+    }
+    // SAFETY: data-port read with the output buffer full; it consumes
+    // exactly the byte the status read reported.
+    Some((status, unsafe { inb(PS2_DATA) }))
+}
+
+/// A byte from the keyboard port: an LED exchange reply (ACK / RESEND for
+/// an in-flight Set LEDs is a protocol byte, not a scancode), or a
+/// scancode. The caller holds [`PORT_LOCK`].
+pub(crate) fn keyboard_byte(byte: u8) {
+    if !led_route_byte(byte) {
+        process_byte(byte);
+    }
+}
+
+/// Receive by polling, for code that runs with interrupts masked: the
+/// boot credential prompt runs inside the initcalls, before the BSP
+/// first enables interrupts, so IRQ1 never fires there (it may on another
+/// CPU, which [`PORT_LOCK`] orders against this). Linux `i8042_interrupt`
+/// does the same status-then-data read: the status register's AUX bit
+/// says which port the byte came from. Keyboard bytes take the IRQ
+/// handler's exact path (LED exchange, then the decoder); mouse bytes go
+/// to the mouse packet decoder so its framing stays in sync. Registered
+/// with `narf_input::register_keyboard_poller` once the controller is up.
+pub fn poll() {
+    for _ in 0..POLL_BURST {
+        let port = PORT_LOCK.lock();
+        let Some((status, byte)) = read_byte_locked() else {
+            return;
+        };
+        if status & STATUS_AUX_DATA != 0 {
+            drop(port);
+            crate::i8042_mouse::feed_aux_byte(byte);
+        } else {
+            keyboard_byte(byte);
+        }
+    }
 }
 
 /// Test-only: process a synthetic byte stream through the same
