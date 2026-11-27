@@ -141,6 +141,17 @@ pub fn yield_now() -> impl Future<Output=()>;
 /// Handle sched_yield for the current own-stack task; an eligible local peer
 /// may use the bounded direct-transfer path; false selects fallback.
 pub fn stackful::sched_yield_current() -> bool;
+/// An intrusive wait-queue entry a stackful task links from its own stack
+/// while it parks (Linux's on-stack wait_queue_entry). A slot dropped
+/// without resuming (budget Kill, revoked cap) never unwinds its frames, so
+/// the task records the entry; StackfulAdapter::drop (and the KernelTask
+/// backstop) call its detach once, while the stack is still mapped, before
+/// the stack is retired. One record per task at a time.
+pub struct stackful::StackWait;
+impl stackful::StackWait {
+    pub const unsafe fn new(data: *const (), detach: unsafe fn(*const ())) -> Self;
+}
+pub fn stackful::record_stack_wait(wait: Pin<&StackWait>) -> Option<StackWaitRecord<'_>>;
 /// Conservative current-CPU probe: false only when no runnable peer,
 /// deferred wake, due timer, or staged cross-CPU wake can use a yield.
 pub fn has_other_runnable_work(current: u64) -> bool;
