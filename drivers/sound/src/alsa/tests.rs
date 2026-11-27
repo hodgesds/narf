@@ -1465,11 +1465,11 @@ fn alsa_interleaved_only_device_offers_no_planar_access() -> TestResult {
     if ioctl(f.as_ref(), &m, 0x10, 3, 608, 128) != Ok(0) {
         return TestResult::Fail("HW_REFINE");
     }
-    let (access, info) = {
+    let (access, info_bits) = {
         let bytes = m.bytes.lock();
         (get32(&bytes, 128 + 4), get32(&bytes, 128 + 520))
     };
-    if access != (1 | (1 << 3)) || info & 0x200 != 0 || info & 0x101 != 0x101 {
+    if access != (1 | (1 << 3)) || info_bits & 0x200 != 0 || info_bits & 0x101 != 0x101 {
         return TestResult::Fail("interleaved-only: MMAP and RW interleaved access only");
     }
     m.put(128, &any_params(4));
