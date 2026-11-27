@@ -434,6 +434,14 @@ duplicate aliases deterministically. See
 Signed board calibration, policy and exact board/PNVM matching are separate
 gates.
 
+The firmware registry falls back to page-backed virtual storage when a whole
+blob cannot fit in one coherent DMA allocation. WCN6855 AMSS and board data
+larger than 4 MiB can therefore reach the module without increasing buddy or
+DMA allocation limits. Direct coherent addresses are optional; transports
+retain ownership of DMA staging. A signed synthetic 5/7 MiB initramfs/module
+regression covers discovery, signature rejection and complete chunked reads.
+Physical bring-up on the laptop remains unverified.
+
 The [per-chip inventory](drivers/wireless/research/chip-inventory.md)
 audits all 102 registered bus identities and records the measured source
 footprint. Footprint counts are not completion percentages, and a delivery

@@ -22,6 +22,7 @@ firmware-allow-unsigned = []
 narf-lib          = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
 narf-io           = { path = "../io" }
+narf-memory       = { path = "../memory" }
 narf-rcu          = { path = "../rcu" }
 narf-crypto       = { path = "../crypto" }
 narf-kernel-test  = { path = "../verification/kernel-test" }

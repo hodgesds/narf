@@ -8,9 +8,9 @@
 //! use narf_firmware::{open, FirmwareError};
 //! let cap   = open("qcom/qcnfa765/amss.bin", &fw_authority)?;
 //! let view  = cap.view()?;
-//! // SAFETY: BAR0 mapped, exclusive owner; phys is DMA-coherent.
-// SAFETY: Valid memory or trusted environment
-//! unsafe { self.bhi_load(view.phys, view.bytes.len() as u32)?; }
+//! // Stage verified bytes in the transport's own DMA buffers. A direct
+//! // coherent address is available only when view.phys is Some(...).
+//! self.stage_and_load(view.bytes)?;
 //! ```
 //!
 //! ## Sources
@@ -125,13 +125,12 @@ pub struct BlobView<'a> {
     /// Signer fingerprint (Ed25519 public-key hash). `None` when
     /// the blob was unsigned and the build accepts unsigned blobs.
     pub signer: Option<[u8; 32]>,
-    /// The bytes themselves. Identity-mapped DMA-coherent memory
-    /// on kernel-resident builds; on a future userspace-driver
-    /// build this is the user-AS view of the same shared frame.
+    /// Verified bytes in contiguous kernel virtual memory. The physical
+    /// backing may consist of separate pages; drivers stage transport DMA.
     pub bytes: &'a [u8],
-    /// Phys address corresponding to `bytes`. Same on kernel
-    /// builds; IOMMU-translated on userspace builds.
-    pub phys: u64,
+    /// Direct coherent physical address, only when the backing is one DMA
+    /// buffer. `None` requires staging into driver-owned DMA storage.
+    pub phys: Option<u64>,
 }
 
 /// One blob's identity for `snapshot()`. Used by observability +

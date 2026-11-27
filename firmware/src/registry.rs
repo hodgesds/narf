@@ -18,6 +18,7 @@ use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_capabilities::{Cap, Read};
@@ -27,6 +28,56 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::signature;
 use crate::{BlobIdentity, BlobSource, BlobView, FirmwareBlob, FirmwareError};
+
+/// Small images retain their direct-DMA view. Large images, or images whose
+/// contiguous allocation fails, use page-backed virtual memory like Linux's
+/// firmware loader (`fs/kernel_read_file.c`); transport DMA is separate.
+#[derive(Debug)]
+enum Backing {
+    Coherent(DmaBuffer),
+    Paged { ptr: NonNull<u8>, len: usize },
+}
+
+// SAFETY: allocation is uniquely owned until installation finishes copying
+// the payload. Published backings are immutable, shared through Arc, and freed
+// only when the last registry entry/cap binding drops its reference.
+unsafe impl Send for Backing {}
+// SAFETY: shared access exposes only immutable bytes from the owned backing.
+unsafe impl Sync for Backing {}
+
+impl Backing {
+    fn new(len: usize) -> Result<Self, FirmwareError> {
+        if let Ok(buffer) = alloc_coherent(len, DomainId::DRIVER_0) {
+            return Ok(Self::Coherent(buffer));
+        }
+        let ptr = narf_memory::vmalloc::valloc(len).ok_or(FirmwareError::OutOfMemory)?;
+        Ok(Self::Paged { ptr, len })
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        match self {
+            Self::Coherent(buffer) => buffer.cpu_mut_ptr::<u8>(),
+            Self::Paged { ptr, .. } => ptr.as_ptr(),
+        }
+    }
+
+    fn phys(&self) -> Option<u64> {
+        match self {
+            Self::Coherent(buffer) => Some(buffer.phys_addr().raw()),
+            Self::Paged { .. } => None,
+        }
+    }
+}
+
+impl Drop for Backing {
+    fn drop(&mut self) {
+        if let Self::Paged { ptr, len } = self {
+            // SAFETY: exactly the allocation returned by valloc in new;
+            // Arc ownership keeps it live until the final borrower retires.
+            unsafe { narf_memory::vmalloc::vfree(*ptr, *len) };
+        }
+    }
+}
 
 /// One registered blob.
 ///
@@ -48,10 +99,9 @@ pub struct Entry {
     /// stash this so a `view()` call can find the entry without
     /// the registry holding a strong slot index.
     pub seq: usize,
-    /// DMA-coherent backing for the payload bytes.
-    backing: Arc<DmaBuffer>,
-    /// Length of the payload (smaller than `backing.len()` because
-    /// the backing is page-aligned).
+    /// Owned coherent or page-backed storage for the payload bytes.
+    backing: Arc<Backing>,
+    /// Length of the payload (the backing is page-rounded).
     payload_len: usize,
 }
 
@@ -66,7 +116,7 @@ struct CapBinding {
     signer: Option<[u8; 32]>,
     #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     version: Option<String>,
-    backing: Arc<DmaBuffer>,
+    backing: Arc<Backing>,
     payload_len: usize,
 }
 
@@ -150,14 +200,9 @@ pub(crate) fn view_for<'a>(
         .find(|binding| binding.cap_index == cap_index)
         .ok_or(FirmwareError::NotFound)?
         .clone();
-    let phys = b.backing.phys_addr().raw();
-    // `narf-firmware` has no narf-memory dependency, so the direct-map
-    // offset comes from `narf-lib`, which both can reach. This used to be
-    // a deliberate identity access on the grounds that PML4[0] still
-    // mapped RAM under the kernel CR3 — that is no longer true.
-    let bytes_ptr = narf_lib::directmap::pv_ptr::<u8>(phys).cast_const();
-    // SAFETY: the backing is DMA-coherent memory reached through
-    // the direct map;
+    let phys = b.backing.phys();
+    let bytes_ptr = b.backing.ptr().cast_const();
+    // SAFETY: the owned backing is mapped in the shared kernel address space;
     // the `payload_len` was set when the entry was installed and
     // is bounded by the backing buffer's length.
     // SAFETY: Valid memory or trusted environment
@@ -179,7 +224,7 @@ pub(crate) fn view_for<'a>(
 }
 
 /// Install a blob into the priority tier matching `source`. Run
-/// signature verification, allocate a DMA-coherent page, copy the
+/// signature verification, allocate backing storage, copy the
 /// payload in, register the entry.
 pub(crate) fn install_blob(
     name: impl Into<Cow<'static, str>>,
@@ -200,18 +245,15 @@ pub(crate) fn install_blob(
         }
     };
 
-    // 2. Allocate a DMA-coherent page rounded up to 4 KiB
-    //    boundaries. Use the firmware-domain by convention; today
-    //    that's the same DRIVER_0 domain everything else uses.
+    // 2. Prefer the existing coherent backing; fall back to individual pages
+    //    mapped contiguously in kernel VA, without a high-order requirement.
     let payload_len = trailer.payload.len();
-    let pages = (payload_len + 4095) & !4095;
-    let backing =
-        alloc_coherent(pages, DomainId::DRIVER_0).map_err(|_| FirmwareError::OutOfMemory)?;
+    let backing = Backing::new(payload_len)?;
 
     // 3. Copy payload in.
-    let dst = backing.cpu_mut_ptr::<u8>();
-    // SAFETY: the direct-map pointer covers this exclusively owned,
-    // coherent allocation. Its page-rounded capacity holds the payload.
+    let dst = backing.ptr();
+    // SAFETY: the pointer covers this exclusively owned allocation.
+    // Every payload byte is initialized before the backing is published.
     // A physical address is not a CPU pointer after user page-table swaps.
     unsafe {
         core::ptr::copy_nonoverlapping(trailer.payload.as_ptr(), dst, payload_len);

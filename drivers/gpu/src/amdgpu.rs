@@ -1896,7 +1896,7 @@ impl AmdGpu {
     /// Sequence per `drivers/gpu/specification/amdgpu.md` §4
     /// step 2:
     ///   1. open the blob from the registry
-    ///   2. write `view.phys` (lo / hi) to MP0_C2PMSG_64 / _67
+    ///   2. require a direct coherent address (`view.phys` is `Some`)
     ///   3. write `(LOAD_TA = 5) | (size << 8)` to MP0_C2PMSG_69
     ///   4. poll MP0_C2PMSG_64 until bit 31 is set
     ///   5. status code in bits[30:0]; 0 = success
@@ -1908,9 +1908,8 @@ impl AmdGpu {
     ///
     /// # Safety
     /// Caller owns BAR0 + BAR5 exclusively. The blob's
-    /// `view().phys` must remain valid for the duration of the
-    /// PSP handshake (the cap stays alive until this function
-    /// returns).
+    /// direct coherent firmware backing must remain valid throughout the PSP
+    /// handshake (the cap stays alive until this function returns).
     pub unsafe fn load_firmware(
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
@@ -1938,7 +1937,7 @@ impl AmdGpu {
         })?;
         let view = narf_firmware::view_of(&cap).map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
 
-        let phys = view.phys;
+        let phys = view.phys.ok_or(AmdgpuError::FirmwareLoadFailed)?;
         let size = view.bytes.len() as u32;
         if size == 0 || size & 0xFF00_0000 != 0 {
             // PSP `LOAD_TA` packs size into bits[31:8] of the
@@ -2003,7 +2002,7 @@ impl AmdGpu {
             Err(_) => return Err(AmdgpuError::FirmwareLoadFailed),
         };
         let view = narf_firmware::view_of(&cap).map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
-        let phys = view.phys;
+        let phys = view.phys.ok_or(AmdgpuError::FirmwareLoadFailed)?;
         let size = view.bytes.len() as u32;
         if size == 0 || size & 0xFF00_0000 != 0 {
             // PSP_CMD trigger word packs size into bits[31:8]; > 16 MiB
@@ -2062,7 +2061,7 @@ impl AmdGpu {
         let mp1_base = self
             .mp1_mailbox_base()
             .ok_or(AmdgpuError::SmuBringUpFailed)?;
-        let phys = view.phys;
+        let phys = view.phys.ok_or(AmdgpuError::FirmwareLoadFailed)?;
         let size = view.bytes.len() as u32;
 
         let mut adapter = SmuRegsAdapter { regs: &self.regs };
