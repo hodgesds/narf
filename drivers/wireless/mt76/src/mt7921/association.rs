@@ -400,12 +400,26 @@ fn tlv(bytes: &mut Vec<u8>, id: u16, len: usize) -> usize {
     offset
 }
 
-/// Eight-byte `STA_REC_HW_AMSDU` (15) TLV: eight subframes, the
-/// large-MPDU flag, enabled — the same bytes `peer_record_on`
-/// appends for every HT station
-/// (`mt76_connac_mcu_sta_amsdu_tlv`).
-fn hw_amsdu_tlv(large_mpdu: bool) -> [u8; 8] {
-    [15, 0, 8, 0, 8, u8::from(large_mpdu), 1, 0]
+/// The CONNAC3 station-update inputs [`JoinPlan::uni_sta_caps`]
+/// derives from the negotiated profiles, for
+/// `crate::mt7925::mcu::build_uni_sta_update_req`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UniStaCaps {
+    /// `STA_REC_PHY` (`mt7925_mcu_sta_phy_tlv`).
+    pub(crate) phy: crate::mt7925::mcu::UniStaPhy,
+    /// HT, VHT, HW_AMSDU, HE_V2, HE_6G, EHT, each only when negotiated.
+    pub(crate) cap_tlvs: Vec<u8>,
+    /// `STA_REC_RA` (`mt7925_mcu_sta_rate_ctrl_tlv`).
+    pub(crate) ra: crate::mt7925::mcu::UniStaRa,
+    /// `sta_rec_state_v2.vht_opmode`.
+    pub(crate) vht_opmode: u8,
+}
+
+/// Append one fixed-size UNI TLV built by `encode` to `out`.
+fn push_uni_tlv<const N: usize>(out: &mut Vec<u8>, encode: impl FnOnce(&mut [u8]) -> Option<()>) {
+    let mut tlv = [0u8; N];
+    let _ = encode(&mut tlv);
+    out.extend_from_slice(&tlv);
 }
 #[cfg(any(test, feature = "builtin"))]
 fn ies(
@@ -1174,50 +1188,144 @@ impl JoinPlan {
         Ok(out)
     }
 
-    /// UNI capability TLV stream for [`Self::peer_record_uni_on`]:
-    /// the negotiated HT/VHT/HE/EHT records in upstream order
-    /// (`mt7925_mcu_sta_cmd`, `mt7925/mcu.c:2182-2197`: BASIC, PHY,
-    /// HT, VHT, UAPSD, AMSDU, HE, HE_6G, EHT, rate-ctrl,
-    /// STATE_V2). This fills the HT/VHT/AMSDU/HE/HE_6G/EHT
-    /// members — the same byte builders `peer_record_on` appends,
-    /// minus its WTBL nesting (the UNI update has no WTBL TLVs).
-    /// PHY, UAPSD, rate-ctrl and STATE_V2 have no UNI encoders in
-    /// the tree yet and are not emitted; the builder's plain STATE
-    /// TLV stands in for STATE_V2. Only when `associated`: a
-    /// pre-association add has no negotiation, exactly as
-    /// `peer_record_on` gates its HT arm on `associated`.
-    pub(crate) fn uni_cap_tlvs(&self, associated: bool) -> Vec<u8> {
+    /// CONNAC3 station-update inputs for [`Self::peer_record_uni_on`],
+    /// in `mt7925_mcu_sta_cmd` order (Linux v7.0-rc7
+    /// `mt7925/mcu.c:1977-2007`: BASIC, PHY, HT, VHT, UAPSD, AMSDU,
+    /// HE, HE_6G, EHT, rate-ctrl, STATE_V2, MLD/EHT MLD, HDR_TRANS).
+    /// The PHY, RA and STATE_V2 inputs are always produced; the
+    /// capability run (`cap_tlvs`) carries HT/VHT/AMSDU/HE_V2/HE_6G/
+    /// EHT only for what the plan negotiated, and only when
+    /// `associated`: mac80211 fills `link_sta`'s HT/VHT/HE/EHT/6 GHz
+    /// capabilities from the association response, so the
+    /// pre-association add (`MT76_STA_INFO_STATE_NONE`) has none —
+    /// the same gate `peer_record_on` puts on its HT arm. The legacy
+    /// rates and basic set are known before authentication
+    /// (`ieee80211_mgd_setup_link_sta`, `net/mac80211/mlme.c:5739-
+    /// 5797`), so PHY and RA carry them in both records.
+    ///
+    /// Not emitted, matching upstream for a station: UAPSD
+    /// (`mt76_connac_mcu_sta_uapsd` returns unless the vif is an AP)
+    /// and the CONNAC2 `STA_REC_HE` (`mt7925_mcu_sta_he_tlv`,
+    /// `mt7925/mcu.c:1636-1642`, sends only `STA_REC_HE_V2`).
+    pub(crate) fn uni_sta_caps(&self, associated: bool) -> UniStaCaps {
+        use crate::mt7925::mcu;
+        let six = self.common.six_ghz();
+        let five =
+            six.is_some() || super::channel::band(self.channel) == Some(super::channel::Band::Ghz5);
+        // `link_conf->basic_rates` / `link_sta->supp_rates[band]` index
+        // the band's sband table: 12 entries on 2.4 GHz, the 8 OFDM
+        // entries on 5/6 GHz (as in `peer_record_on`).
+        let (rates, basic) = self.common.legacy_rates();
+        let (rates, basic) = if five {
+            (rates >> 4, basic >> 4)
+        } else {
+            (rates, basic)
+        };
+        // mt76_connac_get_phy_mode_v2 (`mt76_connac_mcu.c:791-845`).
+        let mut phy_type = if five {
+            mcu::PHY_TYPE_BIT_OFDM
+        } else {
+            mcu::PHY_TYPE_BIT_HR_DSSS | mcu::PHY_TYPE_BIT_ERP
+        };
+        let (mut af, mut mm) = (0u8, 0u8);
+        let mut rx_mcs_bitmask = [0u8; 10];
+        let mut vht_opmode = 0;
         let mut out = Vec::new();
         if let Some(profile) = self.ht20.filter(|_| associated) {
-            // Top-level STA_REC_HT (9): the peer HT capability.
-            out.extend_from_slice(&[9, 0, 8, 0]);
-            out.extend_from_slice(&profile.peer_capability().to_le_bytes());
-            out.extend_from_slice(&[0, 0]);
+            // mt7925_mcu_sta_ht_tlv: `link_sta->ht_cap.cap`.
+            phy_type |= mcu::PHY_TYPE_BIT_HT;
+            af = profile.ampdu() & 0x03;
+            mm = profile.ampdu() >> 2;
+            push_uni_tlv::<{ mcu::STA_REC_HT_TLV_SIZE }>(&mut out, |b| {
+                mcu::encode_sta_rec_ht_tlv(profile.peer_capability(), b)
+            });
+            let mut max_amsdu = profile.max_amsdu_len();
             if let Some(vht) = self.vht {
+                // mt7925_mcu_sta_vht_tlv: the same 16-byte
+                // `sta_rec_vht` the CONNAC2 record carries. PHY takes
+                // the larger A-MPDU exponent (`mt7925/mcu.c:1790-
+                // 1795`); STATE_V2 the operating width and NSS.
+                // get_phy_mode_v2 sets the VHT bit on 5/6 GHz only.
+                if five {
+                    phy_type |= mcu::PHY_TYPE_BIT_VHT;
+                }
+                af = af.max(vht.ampdu_factor());
                 out.extend_from_slice(&vht.sta());
+                vht_opmode = mcu::sta_state_v2_vht_opmode(vht.width(), vht.transmit_streams());
+                max_amsdu = vht.max_amsdu_len();
             }
-            let max_amsdu = self
-                .vht
-                .map_or(profile.max_amsdu_len(), |vht| vht.max_amsdu_len());
-            out.extend_from_slice(&hw_amsdu_tlv(max_amsdu >= 7991));
+            // mac80211 eht.c: on 2.4 GHz the EHT MAC Maximum MPDU
+            // Length replaces the HT value (`net/mac80211/eht.c:80-
+            // 102`); VHT/HE set it on 5/6 GHz.
+            if let (false, Some(eht)) = (five, self.eht) {
+                max_amsdu = eht.max_amsdu_len_24();
+            }
+            push_uni_tlv::<{ mcu::STA_REC_HW_AMSDU_TLV_SIZE }>(&mut out, |b| {
+                mcu::encode_sta_rec_amsdu_tlv(mcu::amsdu_max_mpdu_size(max_amsdu), b)
+            });
             if let Some(he) = self.he {
-                out.extend_from_slice(&he.sta());
+                phy_type |= mcu::PHY_TYPE_BIT_HE;
                 out.extend_from_slice(&he.sta_v2());
             }
             if let Some(eht) = self.eht {
+                phy_type |= mcu::PHY_TYPE_BIT_BE;
                 out.extend_from_slice(&eht.sta());
             }
-        } else if let (Some(six), Some(he), true) = (self.common.six_ghz(), self.he, associated) {
+            // mt7925_mcu_sta_rate_ctrl_tlv: `ht_cap.mcs.rx_mask`, the
+            // same mask the CONNAC2 RA record carries.
+            rx_mcs_bitmask = profile.transmit_mcs_mask();
+        } else if let (Some(six), Some(he), true) = (six, self.he, associated) {
+            // A 6 GHz HE peer: no HT/VHT capability (`link_sta->
+            // vht_cap` stays zero), `he_6ghz_capa` set.
             let peer = six.peer_capability();
-            out.extend_from_slice(&hw_amsdu_tlv(super::six_ghz::large_mpdu(peer)));
-            out.extend_from_slice(&he.sta());
+            let capa = Some(peer).filter(|p| p.bits() != 0);
+            phy_type |= mcu::PHY_TYPE_BIT_HE;
+            if let Some(peer) = capa {
+                // mt7925_mcu_sta_vht_tlv: sent for the 6 GHz
+                // capability alone, all zero (`mt7925/mcu.c:1709-
+                // 1711`). PHY takes both A-MPDU fields from the band
+                // capability (`mt7925/mcu.c:1797-1802`).
+                push_uni_tlv::<{ mcu::STA_REC_VHT_TLV_SIZE }>(&mut out, |b| {
+                    mcu::encode_sta_rec_vht_tlv(0, 0, 0, b)
+                });
+                (af, mm) = super::six_ghz::wtbl_ht_factors(peer);
+            }
+            // ieee80211_update_from_he_6ghz_capa (`net/mac80211/he.c:
+            // 40-51`): agg.max_amsdu_len from the band capability's
+            // Maximum MPDU Length.
+            let max_amsdu = match peer.max_mpdu_len() {
+                2 => 11454,
+                1 => 7991,
+                _ => 3895,
+            };
+            push_uni_tlv::<{ mcu::STA_REC_HW_AMSDU_TLV_SIZE }>(&mut out, |b| {
+                mcu::encode_sta_rec_amsdu_tlv(mcu::amsdu_max_mpdu_size(max_amsdu), b)
+            });
             out.extend_from_slice(&he.sta_v2());
-            out.extend_from_slice(&super::six_ghz::sta_he_6g(peer));
+            if let Some(peer) = capa {
+                push_uni_tlv::<{ mcu::STA_REC_HE_6G_TLV_SIZE }>(&mut out, |b| {
+                    mcu::encode_sta_rec_he_6g_tlv(peer.bits(), b)
+                });
+            }
             if let Some(eht) = self.eht {
+                phy_type |= mcu::PHY_TYPE_BIT_BE;
                 out.extend_from_slice(&eht.sta());
             }
         }
-        out
+        UniStaCaps {
+            phy: mcu::UniStaPhy {
+                basic_rate: basic,
+                phy_type,
+                ampdu_factor: af,
+                density: mm,
+            },
+            cap_tlvs: out,
+            ra: mcu::UniStaRa {
+                legacy: mcu::ra_legacy(rates, !five),
+                rx_mcs_bitmask,
+            },
+            vht_opmode,
+        }
     }
 
     /// UNI station update for `link`'s peer (MT7925/CONNAC3):
@@ -1226,11 +1334,14 @@ impl JoinPlan {
     ///
     /// Same guards as [`Self::peer_record_on`]: aid range, phase,
     /// and the associated/aid agreement. The body is
-    /// `sta_req_hdr` + BASIC + `cap_tlvs` (from
-    /// [`Self::uni_cap_tlvs`]: the negotiated HT/VHT/HE/EHT
-    /// capability TLVs) + STATE (+ MLD + EHT MLD when `mld` is
-    /// set and the state is not NONE), built by
-    /// `crate::mt7925::mcu::build_uni_sta_update_req`. The
+    /// `sta_req_hdr` + BASIC + PHY + the negotiated capability run +
+    /// RA + STATE_V2 (+ MLD once associated, + EHT MLD when `mld`
+    /// names an MLD vif) + HDR_TRANS, built by
+    /// `crate::mt7925::mcu::build_uni_sta_update_req` from
+    /// [`Self::uni_sta_caps`]. BASIC carries `CONNECTION_INFRA_AP`:
+    /// for a station vif `mt76_connac_mcu_sta_basic_tlv`
+    /// (`mt76_connac_mcu.c:410-418`) describes the peer, the AP
+    /// (`CONNECTION_INFRA_STA` is the BSS record's type). The
     /// caller sends one such message per active link, primary
     /// first; the CONNAC2 WTBL nested TLVs of `peer_record_on`
     /// have no UNI-station-update counterpart (WTBL programming on
@@ -1253,12 +1364,12 @@ impl JoinPlan {
         if !associated && aid != 0 {
             return Err(Error::Protocol);
         }
-        let caps = self.uni_cap_tlvs(associated);
+        let caps = self.uni_sta_caps(associated);
         let params = crate::mt7925::mcu::UniStaParams {
             bss_idx: link.bss(),
             wcid_idx: u16::from(link.peer()),
             omac_idx: link.omac(),
-            conn_type: crate::mt7925::mcu::CONN_TYPE_INFRA_STA,
+            conn_type: crate::mt7925::mcu::CONN_TYPE_INFRA_AP,
             conn_state: crate::mt7925::mcu::CONN_STATE_PORT_SECURE,
             aid,
             peer_addr: self.peer,
@@ -1269,7 +1380,11 @@ impl JoinPlan {
             } else {
                 crate::mt7925::mcu::STA_STATE_NONE
             },
-            cap_tlvs: &caps,
+            phy: caps.phy,
+            cap_tlvs: &caps.cap_tlvs,
+            ra: caps.ra,
+            vht_opmode: caps.vht_opmode,
+            hdr_trans: crate::mt7925::mcu::UniStaHdrTrans::STATION,
             mld,
         };
         Ok(crate::mt7925::mcu::build_uni_sta_update_req(&params))

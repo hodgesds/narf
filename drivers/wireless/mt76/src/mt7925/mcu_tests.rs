@@ -150,43 +150,80 @@ fn sta_params(mld: Option<MldLinks>, state: u8) -> UniStaParams<'static> {
         bss_idx: 0,
         wcid_idx: 1,
         omac_idx: 0,
-        conn_type: CONN_TYPE_INFRA_STA,
+        // A station vif's peer is the AP (`mt76_connac_mcu_sta_basic_tlv`).
+        conn_type: CONN_TYPE_INFRA_AP,
         conn_state: CONN_STATE_PORT_SECURE,
         aid: 7,
         peer_addr: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
         qos: true,
         newly: false,
         state,
+        phy: UniStaPhy::default(),
         cap_tlvs: &[],
+        ra: UniStaRa::default(),
+        vht_opmode: 0,
+        hdr_trans: UniStaHdrTrans::STATION,
         mld,
     }
 }
 
+/// Walk a station request's TLVs (after the 8-byte header) and return
+/// their `(tag, len)` pairs in order.
+fn sta_tlv_list(req: &[u8]) -> alloc::vec::Vec<(u16, u16)> {
+    let mut out = alloc::vec::Vec::new();
+    let mut rest = &req[STA_REQ_HDR_SIZE..];
+    while rest.len() >= TLV_HDR_SIZE {
+        let tag = u16::from_le_bytes([rest[0], rest[1]]);
+        let len = u16::from_le_bytes([rest[2], rest[3]]);
+        if usize::from(len) < TLV_HDR_SIZE || usize::from(len) > rest.len() {
+            break;
+        }
+        out.push((tag, len));
+        rest = &rest[usize::from(len)..];
+    }
+    out
+}
+
 fn smoke_mt7925_uni_sta_update_mld() -> TestResult {
     let req = build_uni_sta_update_req(&sta_params(Some(mld_links(true)), STA_STATE_ASSOC));
-    // hdr 8 + BASIC 20 + STATE 12 + MLD 28 + EHT MLD 16.
-    if req.len() != 84 {
+    // mt7925_mcu_sta_cmd (v7.0-rc7 mcu.c:1977-2007) with no
+    // capability TLVs: BASIC, PHY, RA, STATE_V2, MLD, EHT MLD,
+    // HDR_TRANS = 8 + 20 + 12 + 16 + 16 + 28 + 16 + 8.
+    if req.len() != 124 {
         return TestResult::Fail("mt7925 UNI station update (MLD) length wrong");
     }
-    if u16::from_le_bytes([req[2], req[3]]) != 4 {
+    if u16::from_le_bytes([req[2], req[3]]) != 7 {
         return TestResult::Fail("mt7925 UNI station update (MLD) tlv_num wrong");
     }
-    // BASIC at 8: conn_type 0x10001, conn_state 2, aid 7, peer, extra 1.
+    if sta_tlv_list(&req)
+        != [
+            (STA_REC_BASIC, 20),
+            (STA_REC_PHY, 12),
+            (STA_REC_RA, 16),
+            (STA_REC_STATE, 16),
+            (STA_REC_MLD, 28),
+            (STA_REC_EHT_MLD, 16),
+            (STA_REC_HDR_TRANS, 8),
+        ]
+    {
+        return TestResult::Fail("mt7925 UNI station update (MLD) TLV order wrong");
+    }
+    // BASIC at 8: conn_type 0x10002, conn_state 2, aid 7, peer, extra 1.
     let basic = &req[8..28];
     if u16::from_le_bytes([basic[0], basic[1]]) != STA_REC_BASIC
-        || u32::from_le_bytes([basic[4], basic[5], basic[6], basic[7]]) != CONN_TYPE_INFRA_STA
+        || u32::from_le_bytes([basic[4], basic[5], basic[6], basic[7]]) != 0x10002
         || basic[8] != CONN_STATE_PORT_SECURE
         || u16::from_le_bytes([basic[10], basic[11]]) != 7
         || basic[18..20] != [1, 0]
     {
         return TestResult::Fail("mt7925 UNI station BASIC TLV wrong");
     }
-    // STATE at 28: tag 7, state byte at +8 = ASSOC.
-    if u16::from_le_bytes([req[28], req[29]]) != STA_REC_STATE || req[36] != STA_STATE_ASSOC {
-        return TestResult::Fail("mt7925 UNI station STATE TLV wrong");
+    // STATE_V2 at 56: tag 7, state byte at +4 = ASSOC.
+    if u16::from_le_bytes([req[56], req[57]]) != STA_REC_STATE || req[60] != STA_STATE_ASSOC {
+        return TestResult::Fail("mt7925 UNI station STATE_V2 TLV wrong");
     }
-    // MLD at 40: primary first, secondary second, link_num 2.
-    let mld = &req[40..68];
+    // MLD at 72: primary first, secondary second, link_num 2.
+    let mld = &req[72..100];
     if u16::from_le_bytes([mld[0], mld[1]]) != STA_REC_MLD
         || mld[4..10] != [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
         || u16::from_le_bytes([mld[10], mld[11]]) != 1
@@ -200,8 +237,8 @@ fn smoke_mt7925_uni_sta_update_mld() -> TestResult {
     {
         return TestResult::Fail("mt7925 UNI station MLD TLV wrong");
     }
-    // EHT MLD at 68: mld_type 0xff, eml_cap bytes at 10..12.
-    let eht = &req[68..84];
+    // EHT MLD at 100: mld_type 0xff, eml_cap bytes at 10..12.
+    let eht = &req[100..116];
     if u16::from_le_bytes([eht[0], eht[1]]) != STA_REC_EHT_MLD
         || eht[5] != 0xff
         || eht[10] != 0x03
@@ -209,30 +246,223 @@ fn smoke_mt7925_uni_sta_update_mld() -> TestResult {
     {
         return TestResult::Fail("mt7925 UNI station EHT MLD TLV wrong");
     }
+    // HDR_TRANS closes the enable branch (mcu.c:2005-2007).
+    if req[116..124] != [0x2b, 0, 8, 0, 0, 1, 1, 0] {
+        return TestResult::Fail("mt7925 UNI station HDR_TRANS tail wrong");
+    }
     // No-EMLSR: str_cap[0] = BIT(1) at offset 7, eml_cap bytes zero.
     let req = build_uni_sta_update_req(&sta_params(Some(mld_links(false)), STA_STATE_ASSOC));
-    if req[68 + 7] != (1 << 1) || req[68 + 10] != 0 || req[68 + 11] != 0 {
+    if req[100 + 7] != (1 << 1) || req[100 + 10] != 0 || req[100 + 11] != 0 {
         return TestResult::Fail("mt7925 UNI station EHT MLD STR cap wrong");
     }
     // NONE state: no MLD/EHT MLD TLVs (upstream gates them on
-    // state != NONE); single link: MLD still emitted, link_num 1.
+    // state != NONE), even for an MLD vif.
     let single = MldLinks {
         secondary: None,
         ..mld_links(true)
     };
     let req = build_uni_sta_update_req(&sta_params(Some(single), STA_STATE_NONE));
-    if req.len() != STA_REQ_HDR_SIZE + STA_REC_BASIC_TLV_SIZE + STA_REC_STATE_TLV_SIZE
-        || u16::from_le_bytes([req[2], req[3]]) != 2
+    if req.len() != UNI_STA_UPDATE_BOUND
+        || u16::from_le_bytes([req[2], req[3]]) != 5
+        || sta_tlv_list(&req)
+            != [
+                (STA_REC_BASIC, 20),
+                (STA_REC_PHY, 12),
+                (STA_REC_RA, 16),
+                (STA_REC_STATE, 16),
+                (STA_REC_HDR_TRANS, 8),
+            ]
     {
         return TestResult::Fail("mt7925 UNI station update (NONE) wrong");
     }
+    // Non-MLD vif, ASSOC: the MLD TLV is still sent
+    // (`mt7925_mcu_sta_mld_tlv` has no MLD gate) with the peer
+    // address, primary_id = wlan_id = the WCID, link_num 0; no EHT MLD
+    // (`ieee80211_vif_is_mld` gate).
     let req = build_uni_sta_update_req(&sta_params(None, STA_STATE_ASSOC));
-    if req.len() != 40 || u16::from_le_bytes([req[2], req[3]]) != 2 {
+    if req.len() != UNI_STA_UPDATE_BOUND + STA_REC_MLD_TLV_SIZE
+        || u16::from_le_bytes([req[2], req[3]]) != 6
+    {
         return TestResult::Fail("mt7925 UNI station update (non-MLD) wrong");
+    }
+    let mld = &req[72..100];
+    if u16::from_le_bytes([mld[0], mld[1]]) != STA_REC_MLD
+        || u16::from_le_bytes([mld[2], mld[3]]) != 28
+        || mld[4..10] != [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        || u16::from_le_bytes([mld[10], mld[11]]) != 1
+        || u16::from_le_bytes([mld[12], mld[13]]) != 0
+        || u16::from_le_bytes([mld[14], mld[15]]) != 1
+        || mld[16] != 0
+        || mld[17..28].iter().any(|&b| b != 0)
+    {
+        return TestResult::Fail("mt7925 UNI non-MLD STA_REC_MLD wrong");
+    }
+    if req[100..108] != [0x2b, 0, 8, 0, 0, 1, 1, 0] {
+        return TestResult::Fail("mt7925 UNI non-MLD HDR_TRANS tail wrong");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/mt7921", smoke_mt7925_uni_sta_update_mld);
+
+fn smoke_mt7925_uni_sta_update_fixed_tlvs() -> TestResult {
+    // The capability run sits between PHY and RA, verbatim and counted.
+    let mut caps = [0u8; STA_REC_HT_TLV_SIZE];
+    let _ = encode_sta_rec_ht_tlv(0x01ef, &mut caps);
+    let params = UniStaParams {
+        phy: UniStaPhy {
+            basic_rate: 0x0150,
+            phy_type: PHY_TYPE_BIT_OFDM | PHY_TYPE_BIT_HT | PHY_TYPE_BIT_VHT,
+            ampdu_factor: 7,
+            density: 5,
+        },
+        cap_tlvs: &caps,
+        ra: UniStaRa {
+            legacy: 0x3fc0,
+            rx_mcs_bitmask: [0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0],
+        },
+        vht_opmode: sta_state_v2_vht_opmode(2, 2),
+        ..sta_params(None, STA_STATE_ASSOC)
+    };
+    let req = build_uni_sta_update_req(&params);
+    if sta_tlv_list(&req)
+        != [
+            (STA_REC_BASIC, 20),
+            (STA_REC_PHY, 12),
+            (STA_REC_HT, 8),
+            (STA_REC_RA, 16),
+            (STA_REC_STATE, 16),
+            (STA_REC_MLD, 28),
+            (STA_REC_HDR_TRANS, 8),
+        ]
+        || u16::from_le_bytes([req[2], req[3]]) != 7
+    {
+        return TestResult::Fail("mt7925 UNI station capability run misplaced");
+    }
+    // PHY at 28 (`struct sta_rec_phy`): basic_rate LE, phy_type,
+    // ampdu = FIELD_PREP(FACTOR, 7) | FIELD_PREP(DENSITY, 5) = 3 | 20,
+    // rts_policy 0, rcpi 0 (CONNAC3 never sets it), max_ampdu_len 7.
+    if req[28..40] != [0x15, 0, 12, 0, 0x50, 0x01, 0x38, 0x17, 0, 0, 7, 0] {
+        return TestResult::Fail("mt7925 STA_REC_PHY bytes wrong");
+    }
+    if req[40..48] != [9, 0, 8, 0, 0xef, 0x01, 0, 0] {
+        return TestResult::Fail("mt7925 STA_REC_HT bytes wrong");
+    }
+    // RA at 48 (`struct sta_rec_ra_info`): legacy LE, rx_mcs_bitmask[10].
+    if req[48..64] != [1, 0, 16, 0, 0xc0, 0x3f, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return TestResult::Fail("mt7925 STA_REC_RA bytes wrong");
+    }
+    // STATE_V2 at 64: state at +4, flags 0, vht_opmode at +12 =
+    // BW_80 (2) | rx_nss 2 << 4 (no `- 1` on CONNAC3).
+    if req[64..80] != [7, 0, 16, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0x22, 0, 0, 0] {
+        return TestResult::Fail("mt7925 STA_REC_STATE_V2 bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921",
+    smoke_mt7925_uni_sta_update_fixed_tlvs
+);
+
+fn smoke_mt7925_sta_rec_cap_encoders() -> TestResult {
+    // Tags (mt76_connac_mcu.h:802-836).
+    if STA_REC_RA != 1
+        || STA_REC_STATE != 7
+        || STA_REC_HT != 9
+        || STA_REC_VHT != 10
+        || STA_REC_APPS != 11
+        || STA_REC_HE != 14
+        || STA_REC_HW_AMSDU != 15
+        || STA_REC_PHY != 0x15
+        || STA_REC_HE_6G != 0x17
+        || STA_REC_HE_V2 != 0x19
+        || STA_REC_HDR_TRANS != 0x2b
+    {
+        return TestResult::Fail("mt7925 STA_REC tag values wrong");
+    }
+    // Sizes are the sizeof() of the upstream structs.
+    if STA_REC_PHY_TLV_SIZE != 12
+        || STA_REC_RA_TLV_SIZE != 16
+        || STA_REC_STATE_V2_TLV_SIZE != 16
+        || STA_REC_HT_TLV_SIZE != 8
+        || STA_REC_VHT_TLV_SIZE != 16
+        || STA_REC_HW_AMSDU_TLV_SIZE != 8
+        || STA_REC_HE_V2_TLV_SIZE != 28
+        || STA_REC_HE_6G_TLV_SIZE != 8
+        || STA_REC_HDR_TRANS_TLV_SIZE != 8
+    {
+        return TestResult::Fail("mt7925 STA_REC sizes wrong");
+    }
+    // VHT: cap LE32, rx/tx maps LE16, rts_bw_sig + rsv zero.
+    let mut vht = [0xaau8; STA_REC_VHT_TLV_SIZE];
+    if encode_sta_rec_vht_tlv(0x0380_01b2, 0xfffa, 0xfff5, &mut vht).is_none()
+        || vht
+            != [
+                10, 0, 16, 0, 0xb2, 0x01, 0x80, 0x03, 0xfa, 0xff, 0xf5, 0xff, 0, 0, 0, 0,
+            ]
+    {
+        return TestResult::Fail("mt7925 STA_REC_VHT bytes wrong");
+    }
+    // HW_AMSDU: eight subframes, CONNAC3 max_mpdu_size enum, enabled.
+    if amsdu_max_mpdu_size(11454) != 2
+        || amsdu_max_mpdu_size(7991) != 1
+        || amsdu_max_mpdu_size(7935) != 1
+        || amsdu_max_mpdu_size(3895) != 0
+        || amsdu_max_mpdu_size(3839) != 0
+    {
+        return TestResult::Fail("mt7925 AMSDU max_mpdu_size mapping wrong");
+    }
+    let mut amsdu = [0u8; STA_REC_HW_AMSDU_TLV_SIZE];
+    if encode_sta_rec_amsdu_tlv(AMSDU_MAX_MPDU_11454, &mut amsdu).is_none()
+        || amsdu != [15, 0, 8, 0, 8, 2, 1, 0]
+    {
+        return TestResult::Fail("mt7925 STA_REC_HW_AMSDU bytes wrong");
+    }
+    // HE_6G: capa LE16, rsv[2].
+    let mut he6 = [0xaau8; STA_REC_HE_6G_TLV_SIZE];
+    if encode_sta_rec_he_6g_tlv(0x06bd, &mut he6).is_none()
+        || he6 != [0x17, 0, 8, 0, 0xbd, 0x06, 0, 0]
+    {
+        return TestResult::Fail("mt7925 STA_REC_HE_6G bytes wrong");
+    }
+    // HDR_TRANS for a 3-address station without RX decap offload.
+    let mut hdr = [0xaau8; STA_REC_HDR_TRANS_TLV_SIZE];
+    if encode_sta_rec_hdr_trans_tlv(&UniStaHdrTrans::STATION, &mut hdr).is_none()
+        || hdr != [0x2b, 0, 8, 0, 0, 1, 1, 0]
+    {
+        return TestResult::Fail("mt7925 STA_REC_HDR_TRANS bytes wrong");
+    }
+    // RA legacy: 2.4 GHz keeps CCK in 0..3 and moves OFDM to 6..13;
+    // 5/6 GHz has only the 8 OFDM rates.
+    if ra_legacy(0x0011, true) != 0x0041
+        || ra_legacy(0x0fff, true) != 0x3fcf
+        || ra_legacy(0x00ff, false) != 0x3fc0
+        || ra_legacy(0x0015, false) != 0x0540
+    {
+        return TestResult::Fail("mt7925 RA legacy mapping wrong");
+    }
+    // PHY: a VHT exponent above 3 is masked out of `ampdu` only.
+    let mut phy = [0u8; STA_REC_PHY_TLV_SIZE];
+    let p = UniStaPhy {
+        basic_rate: 0x000f,
+        phy_type: PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP,
+        ampdu_factor: 3,
+        density: 7,
+    };
+    if encode_sta_rec_phy_tlv(&p, &mut phy).is_none()
+        || phy != [0x15, 0, 12, 0, 0x0f, 0, 3, 3 | (7 << 2), 0, 0, 3, 0]
+    {
+        return TestResult::Fail("mt7925 STA_REC_PHY 2.4 GHz bytes wrong");
+    }
+    // STATE_V2 for a non-VHT peer: vht_opmode stays 0.
+    let mut state = [0xaau8; STA_REC_STATE_V2_TLV_SIZE];
+    if encode_sta_rec_state_v2_tlv(STA_STATE_NONE, 0, &mut state).is_none()
+        || state != [7, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    {
+        return TestResult::Fail("mt7925 STA_REC_STATE_V2 (NONE) bytes wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/mt7921", smoke_mt7925_sta_rec_cap_encoders);
 
 fn smoke_mt7925_uni_sta_remove_req() -> TestResult {
     let req = build_uni_sta_remove_req(1, 2, 3);

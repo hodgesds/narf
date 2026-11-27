@@ -436,6 +436,94 @@ kernel_test_in!(
     mt76_six_ghz_sae_h2e_association_records_and_teardown
 );
 
+/// The same 6 GHz association on an MT7925 radio: the station update is
+/// the UNI one (`mt7925_mcu_sta_cmd`, Linux v7.0-rc7
+/// `mt7925/mcu.c:1977-2007`), whose 6 GHz shape differs from CONNAC2's.
+fn uni_association() -> Result<(), &'static str> {
+    let (mut session, bss) = prepared(elements(PRIMARY, 2, 167, 0, 0));
+    let State::RadioReady(mut radio) = session.state else {
+        return Err("6 GHz MT7925 fixture radio");
+    };
+    radio.chip_id = 0x7925;
+    session.state = State::RadioReady(radio);
+    let indoor = domain(RegFlags::INDOOR_ONLY, 23);
+    let grant = TxPermission::from_ap(&indoor, radio, &bss).ok_or("6 GHz MT7925 grant")?;
+    if join(&mut session, &bss, sae(), grant) != Ok(42) {
+        return Err("6 GHz MT7925 SAE-H2E association");
+    }
+    let Some(peer) = session
+        .backend
+        .frames
+        .iter()
+        .rev()
+        .map(|(_, f)| f)
+        .find(|f| super::vht_tests::record(f, 0x17).is_some())
+    else {
+        return Err("UNI STA update with STA_REC_HE_6G");
+    };
+    // TLV order: BASIC, PHY, VHT (all zero: sent for the 6 GHz
+    // capability alone), HW_AMSDU, HE_V2, HE_6G, RA, STATE_V2, MLD,
+    // HDR_TRANS — no HT, no CONNAC2 STA_REC_HE, no WTBL.
+    let mut tags = Vec::new();
+    let mut offset = 56;
+    while let Some(header) = peer.get(offset..offset + 4) {
+        let len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if len < 4 {
+            break;
+        }
+        tags.push(u16::from_le_bytes([header[0], header[1]]));
+        offset += len;
+    }
+    if tags != [0, 0x15, 10, 15, 0x19, 0x17, 1, 7, 0x20, 0x2b] {
+        return Err("6 GHz UNI STA update TLV order");
+    }
+    // PHY: OFDM | HE; `ampdu` and `max_ampdu_len` from the band
+    // capability alone (`mt7925/mcu.c:1797-1806`): af 7 (masked to 3 in
+    // `ampdu`), mm 5; rcpi 0.
+    let phy = super::vht_tests::record(peer, 0x15).ok_or("PHY")?;
+    if phy.len() != 12 || phy[6..12] != [0x48, 3 | (5 << 2), 0, 0, 7, 0] {
+        return Err("6 GHz UNI STA_REC_PHY");
+    }
+    // VHT: the full 16-byte struct, all zero.
+    if super::vht_tests::record(peer, 10)
+        != Some(&[10, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..])
+    {
+        return Err("6 GHz UNI STA_REC_VHT");
+    }
+    // HW_AMSDU: Maximum MPDU Length 11454 is max_mpdu_size 2 on
+    // CONNAC3 (CONNAC2 sends the flag 1).
+    let [lo, hi] = AP_CAPA.to_le_bytes();
+    if super::vht_tests::record(peer, 15) != Some(&[15, 0, 8, 0, 8, 2, 1, 0][..])
+        || super::vht_tests::record(peer, 0x17) != Some(&[0x17, 0, 8, 0, lo, hi, 0, 0][..])
+        || super::vht_tests::record(peer, 0x19).is_none_or(|he| he.len() != 28)
+    {
+        return Err("6 GHz UNI HW_AMSDU/HE_6G/HE_V2");
+    }
+    // RA: OFDM-only legacy rates, no HT MCS mask; STATE_V2 ASSOC with no
+    // VHT opmode.
+    let ra = super::vht_tests::record(peer, 1).ok_or("RA")?;
+    let state = super::vht_tests::record(peer, 7).ok_or("STATE_V2")?;
+    if ra.len() != 16
+        || u16::from_le_bytes([ra[4], ra[5]]) & !0x3fc0 != 0
+        || ra[4..6] == [0, 0]
+        || ra[6..16].iter().any(|&b| b != 0)
+        || state.len() != 16
+        || state[4] != 2
+        || state[12] != 0
+    {
+        return Err("6 GHz UNI STA_REC_RA/STATE_V2");
+    }
+    Ok(())
+}
+
+fn mt76_six_ghz_mt7925_uni_station_update() -> TestResult {
+    uni_association().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/six_ghz",
+    mt76_six_ghz_mt7925_uni_station_update
+);
+
 fn refusals() -> Result<(), &'static str> {
     let he6 = elements(PRIMARY, 0, PRIMARY, 0, 0);
     let indoor = domain(RegFlags::INDOOR_ONLY, 23);

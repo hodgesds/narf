@@ -344,13 +344,19 @@ fn native80() -> Result<(), &'static str> {
     else {
         return Err("literal STA_REC_EHT");
     };
-    // The 7925 join drives the UNI station update: no STA_REC_PHY
-    // (0x15) TLV and no WTBL nesting — the EHT record itself is
-    // the BE admission, and the update is BASIC + caps + STATE.
-    if super::vht_tests::record(peer, 0x15).is_some()
+    // The 7925 join drives the UNI station update
+    // (`mt7925_mcu_sta_cmd`): STA_REC_PHY (0x15, 12 bytes) with
+    // `get_phy_mode_v2`'s OFDM | HT | VHT | HE | BE on 5 GHz, HE only
+    // as STA_REC_HE_V2 (0x19, never the CONNAC2 STA_REC_HE 14), the
+    // 16-byte STATE_V2, the HDR_TRANS tail, and no WTBL nesting.
+    if super::vht_tests::record(peer, 0x15).is_none_or(|phy| phy.len() != 12 || phy[6] != 0xf8)
+        || super::vht_tests::record(peer, 0x19).is_none_or(|he| he.len() != 28)
+        || super::vht_tests::record(peer, 14).is_some()
+        || super::vht_tests::record(peer, 7).is_none_or(|state| state.len() != 16)
+        || super::vht_tests::record(peer, 0x2b).is_none()
         || super::vht_tests::record(peer, 13).is_some()
     {
-        return Err("UNI STA update carries PHY or WTBL TLVs");
+        return Err("UNI STA update PHY/HE_V2/STATE_V2/HDR_TRANS or WTBL TLVs wrong");
     }
     // EHT SU MCS13 two streams, EHT MU and EHT SU MCS14 DCM are admitted.
     s.backend.packets.push_back(eht_data(13, 13, 2, 0, 9));

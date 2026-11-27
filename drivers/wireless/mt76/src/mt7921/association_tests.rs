@@ -488,17 +488,35 @@ kernel_test_in!(
 
 fn mt76_uni_station_records_per_link() -> TestResult {
     use crate::mt7925::mcu::{
-        MldLink, MldLinks, STA_REC_BASIC_TLV_SIZE, STA_REC_STATE_TLV_SIZE, STA_REQ_HDR_SIZE,
+        MldLink, MldLinks, STA_REC_MLD_TLV_SIZE, STA_REC_PHY, STA_REC_RA, UNI_STA_UPDATE_BOUND,
     };
     let mut plan = JoinPlan::prepare(&bss(false), OWN, b"narf", Security::Open).unwrap();
-    // Pre-association add: BASIC + STATE, tlv_num 2, STATE NONE.
+    // Pre-association add (`mt7925_mac_link_sta_add`, state NONE):
+    // BASIC + PHY + RA + STATE_V2 + HDR_TRANS, tlv_num 5. BASIC is
+    // CONNECTION_INFRA_AP (the peer of a station vif) with
+    // EXTRA_INFO_VER | EXTRA_INFO_NEW; STATE_V2 carries NONE at +4.
     let add = plan.peer_record_uni_on(Link::HOME, 0, false, None).unwrap();
-    if add.len() != STA_REQ_HDR_SIZE + STA_REC_BASIC_TLV_SIZE + STA_REC_STATE_TLV_SIZE
-        || u16::from_le_bytes([add[2], add[3]]) != 2
+    if add.len() != UNI_STA_UPDATE_BOUND
+        || u16::from_le_bytes([add[2], add[3]]) != 5
+        || add[12..16] != 0x10002u32.to_le_bytes()
         || add[16] != 2
-        || add[36] != 0
+        || add[26..28] != [3, 0]
+        || add[56..58] != [7, 0]
+        || add[58..60] != [16, 0]
+        || add[60] != 0
+        || add[72..80] != [0x2b, 0, 8, 0, 0, 1, 1, 0]
     {
         return TestResult::Fail("UNI pre-association station record wrong");
+    }
+    // The legacy rates are known before authentication
+    // (`ieee80211_mgd_setup_link_sta`): `bss(false)` is 2.4 GHz with
+    // 1/2/5.5/11 Mbps all basic, so PHY is HR_DSSS | ERP with basic
+    // rates 0x000f and no A-MPDU fields, and RA keeps CCK in bits 0..3.
+    if find_tlv(&add, 8, STA_REC_PHY) != Some(&[0x15, 0, 12, 0, 0x0f, 0, 3, 0, 0, 0, 0, 0][..])
+        || find_tlv(&add, 8, STA_REC_RA)
+            != Some(&[1, 0, 16, 0, 0x0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..])
+    {
+        return TestResult::Fail("UNI pre-association PHY/RA TLVs wrong");
     }
     // Associated add before the AP response is Busy, as for CONNAC2.
     if plan.peer_record_uni_on(Link::HOME, 42, true, None) != Err(Error::Busy) {
@@ -534,8 +552,24 @@ fn mt76_uni_station_records_per_link() -> TestResult {
     let assoc = plan
         .peer_record_uni_on(Link::HOME, 42, true, Some(mld))
         .unwrap();
-    if assoc.len() != 84 || u16::from_le_bytes([assoc[2], assoc[3]]) != 4 || assoc[36] != 2 {
+    // + MLD (28) + EHT MLD (16) once the state is ASSOC; no
+    // capability TLVs (this plan negotiated no HT).
+    if assoc.len() != UNI_STA_UPDATE_BOUND + STA_REC_MLD_TLV_SIZE + 16
+        || u16::from_le_bytes([assoc[2], assoc[3]]) != 7
+        || assoc[60] != 2
+        || assoc[26..28] != [1, 0]
+    {
         return TestResult::Fail("UNI associated MLD station record wrong");
+    }
+    // A non-MLD association still carries STA_REC_MLD (link_num 0)
+    // and no EHT MLD.
+    let plain = plan.peer_record_uni_on(Link::HOME, 42, true, None).unwrap();
+    if plain.len() != UNI_STA_UPDATE_BOUND + STA_REC_MLD_TLV_SIZE
+        || u16::from_le_bytes([plain[2], plain[3]]) != 6
+        || find_tlv(&plain, 8, 0x20).is_none_or(|mld| mld[4..10] != AP || mld[16] != 0)
+        || find_tlv(&plain, 8, 0x21).is_some()
+    {
+        return TestResult::Fail("UNI associated non-MLD station record wrong");
     }
     // Remove: hdr + REMOVE + MLD_OFF, valid from any phase.
     let remove = plan.sta_remove_uni_on(Link::HOME);
@@ -770,6 +804,39 @@ fn mt76_uni_station_join_caps_mirror() -> TestResult {
     }
     if find_tlv(&uni, 8, 0x22).is_some() || find_tlv(&uni, 8, 13).is_some() {
         return TestResult::Fail("UNI station record carries EHT or WTBL TLVs");
+    }
+    // BASIC conn_type is CONNECTION_INFRA_AP on both generations.
+    if uni[12..16] != connac2[12..16] || uni[12..16] != 0x10002u32.to_le_bytes() {
+        return TestResult::Fail("UNI BASIC conn_type differs from the CONNAC2 one");
+    }
+    // PHY: basic rate, phy_type (HR_DSSS | ERP | HT) and the HT ampdu
+    // byte match the CONNAC2 record; CONNAC3 adds max_ampdu_len = the
+    // HT factor (`ht_elements` advertises factor 2, density 7).
+    let (Some(uni_phy), Some(c2_phy)) = (find_tlv(&uni, 8, 0x15), find_tlv(&connac2, 8, 0x15))
+    else {
+        return TestResult::Fail("UNI or CONNAC2 record has no PHY TLV");
+    };
+    if uni_phy.len() != 12
+        || uni_phy[4..8] != c2_phy[4..8]
+        || uni_phy[6] != 0x13
+        || uni_phy[7] != 2 | (7 << 2)
+        || uni_phy[9] != 0
+        || uni_phy[10] != 2
+    {
+        return TestResult::Fail("UNI PHY TLV wrong");
+    }
+    // RA: the same legacy map and HT MCS mask as the CONNAC2 record.
+    if find_tlv(&uni, 8, 1).is_none() || find_tlv(&uni, 8, 1) != find_tlv(&connac2, 8, 1) {
+        return TestResult::Fail("UNI RA TLV differs from the CONNAC2 one");
+    }
+    // STATE_V2 (16 bytes, ASSOC at +4, no VHT opmode), the MLD TLV of
+    // a non-MLD vif and the HDR_TRANS tail; never the CONNAC2 HE.
+    if find_tlv(&uni, 8, 7).is_none_or(|s| s.len() != 16 || s[4] != 2 || s[12] != 0)
+        || find_tlv(&uni, 8, 0x20).is_none_or(|m| m[16] != 0)
+        || find_tlv(&uni, 8, 0x2b) != Some(&[0x2b, 0, 8, 0, 0, 1, 1, 0][..])
+        || find_tlv(&uni, 8, 14).is_some()
+    {
+        return TestResult::Fail("UNI STATE_V2/MLD/HDR_TRANS TLVs wrong");
     }
     TestResult::Pass
 }

@@ -27,7 +27,9 @@
 //!   link. `mt7925/mcu.c:761-824`.
 //! - The MLD TLV always lists the primary (deflink) first, then the
 //!   secondary links, at most 2 links total (`link[2]`).
-//!   `mt7925/mcu.c:2066-2140`.
+//!   `mt7925/mcu.c:2066-2140`. It is emitted on every non-NONE
+//!   station update, MLD vif or not: a non-MLD vif sends it with
+//!   `link_num = 0` (v7.0-rc7 `mt7925/mcu.c:1913-1944, 1995-1998`).
 //! - The EHT MLD TLV is emitted only for an MLD vif
 //!   (`ieee80211_vif_is_mld`); `mld_type = 0xff` always.
 //!   `mt7925/mcu.c:2028-2062`.
@@ -46,19 +48,24 @@
 //!   BSS HE `max_nss_mcs`, BSS EHT op fields) are plain inputs here.
 //!   Slice 7 (`mt7921::he`, `iface.rs`) computes them from the AP's
 //!   EHT IEs; this module only lays out their bytes.
-//! - `cap_tlvs` in the station builder is the caller-supplied
-//!   capability TLV stream (HT/VHT/HE/EHT/RA/PHY/UAPSD/AMSDU/
-//!   HDR_TRANS) in upstream order. `mt7921::association`
-//!   (`JoinPlan::uni_cap_tlvs`, MLO slice) fills it from the
-//!   negotiated profiles, mirroring the CONNAC2 `peer_record_on`
-//!   arms; the builder itself only lays out the bytes.
+//! - The station update follows `mt7925_mcu_sta_cmd` (Linux v7.0-rc7
+//!   `mt7925/mcu.c:1958-2010`): BASIC, PHY, HT, VHT, (UAPSD — AP vifs
+//!   only), HW_AMSDU, HE_V2, HE_6G, EHT, RA, STATE_V2, then MLD (+
+//!   EHT MLD for an MLD vif) once the state is not NONE, then
+//!   HDR_TRANS. The fixed records (PHY, RA, STATE_V2, HDR_TRANS) take
+//!   structured inputs; `cap_tlvs` is the caller-supplied run of the
+//!   capability-gated ones (HT..EHT). `mt7921::association`
+//!   (`JoinPlan::uni_sta_caps`) fills both from the negotiated
+//!   profiles; the builder itself only lays out the bytes. Only
+//!   `STA_REC_HE_V2` carries HE: `mt7925_mcu_sta_he_tlv` never sends
+//!   the CONNAC2 `STA_REC_HE`.
 //! - 320 MHz stays refused (`association.rs:1296`): the RLM encoder
 //!   accepts the upstream `CMD_CBW_320MHZ` value but no caller in
 //!   this slice passes it.
 //! - `MT7925_STA_UPDATE_MAX_SIZE` / `MT7925_BSS_UPDATE_MAX_SIZE`
-//!   from upstream (`mt7925/mcu.h:527-558`) are **not** reproduced:
-//!   they sum TLV structs this module does not encode (BF, UAPSD,
-//!   RA_FIXED, HE_6G, ...). The `UNI_*_UPDATE_BOUND` consts below
+//!   from upstream (`mt7925/mcu.h:505-524` in v7.0-rc7) are **not**
+//!   reproduced: they sum TLV structs this module does not encode
+//!   (BF, BFEE, RA_FIXED, ...). The `UNI_*_UPDATE_BOUND` consts below
 //!   bound only what this module emits, for the future send path's
 //!   static buffers.
 
@@ -257,10 +264,33 @@ pub fn encode_bss_req_hdr(bss_idx: u8, out: &mut [u8]) -> Option<()> {
 
 /// `STA_REC_BASIC` = 0.
 pub const STA_REC_BASIC: u16 = 0;
+/// `STA_REC_RA` = 1 (`struct sta_rec_ra_info`).
+pub const STA_REC_RA: u16 = 1;
 /// `STA_REC_BA` = 6.
 pub const STA_REC_BA: u16 = 6;
-/// `STA_REC_STATE` = 7.
+/// `STA_REC_STATE` = 7. CONNAC3 sends `struct sta_rec_state_v2`
+/// under this same tag (`mt7925_mcu_sta_state_v2_tlv`).
 pub const STA_REC_STATE: u16 = 7;
+/// `STA_REC_HT` = 9.
+pub const STA_REC_HT: u16 = 9;
+/// `STA_REC_VHT` = 10.
+pub const STA_REC_VHT: u16 = 10;
+/// `STA_REC_APPS` = 11 (`struct sta_rec_uapsd`). Listed for the
+/// record only: `mt76_connac_mcu_sta_uapsd` (`mt76_connac_mcu.c:434-
+/// 464`) returns unless the vif is an AP, so a station never sends it.
+pub const STA_REC_APPS: u16 = 11;
+/// `STA_REC_HE` = 14 — the CONNAC2 `struct sta_rec_he`. Listed for
+/// the record only: `mt7925_mcu_sta_he_tlv` (`mt7925/mcu.c:1636-1642`)
+/// sends only `STA_REC_HE_V2`.
+pub const STA_REC_HE: u16 = 14;
+/// `STA_REC_HW_AMSDU` = 15 (`struct sta_rec_amsdu`).
+pub const STA_REC_HW_AMSDU: u16 = 15;
+/// `STA_REC_PHY` = 0x15 (`mt76_connac_mcu.h:824`).
+pub const STA_REC_PHY: u16 = 0x15;
+/// `STA_REC_HE_6G` = 0x17.
+pub const STA_REC_HE_6G: u16 = 0x17;
+/// `STA_REC_HE_V2` = 0x19.
+pub const STA_REC_HE_V2: u16 = 0x19;
 /// `STA_REC_MLD` = 0x20.
 pub const STA_REC_MLD: u16 = 0x20;
 /// `STA_REC_EHT_MLD` = 0x21.
@@ -279,6 +309,8 @@ pub const STA_REC_REMOVE: u16 = 0x25;
 /// `STA_REC_UPDATE` carrying only this TLV (`mt7925_mcu_add_key`,
 /// `mt7925/mcu.c:1403-1423`).
 pub const STA_REC_KEY_V3: u16 = 0x27;
+/// `STA_REC_HDR_TRANS` = 0x2B (`mt76_connac_mcu.h:835`).
+pub const STA_REC_HDR_TRANS: u16 = 0x2b;
 
 /// CONNAC3 cipher ids (`mt7925/mcu.h:165-175`, enum):
 /// NONE = 0, WEP40 = 1, TKIP = 2, AES_CCMP = 4, WEP104 = 5,
@@ -364,9 +396,36 @@ pub const STA_EXTRA_INFO_NEW: u16 = 2;
 /// `sta_rec_basic` total size: tag+len (4) + conn_type (4) +
 /// conn_state (1) + qos (1) + aid (2) + peer_addr (6) + extra_info (2).
 pub const STA_REC_BASIC_TLV_SIZE: usize = 20;
-/// `sta_rec_state` total size: tag+len (4) + flags (4) + state (1) +
-/// vht_opmode (1) + action (1) + rsv (1).
-pub const STA_REC_STATE_TLV_SIZE: usize = 12;
+/// `sta_rec_state_v2` total size (`mt7925/mcu.c:1815-1824`, local to
+/// `mt7925_mcu_sta_state_v2_tlv`): tag+len (4) + state (1) + rsv[3] +
+/// flags (4) + vht_opmode (1) + action (1) + rsv2[2]. Not the CONNAC2
+/// 12-byte `sta_rec_state`, whose `state` byte sits at offset 8.
+pub const STA_REC_STATE_V2_TLV_SIZE: usize = 16;
+/// `sta_rec_phy` total size (`mt76_connac_mcu.h:405-415`): tag+len
+/// (4), basic_rate (2), then phy_type, ampdu, rts_policy, rcpi,
+/// max_ampdu_len (connac3) and rsv (6).
+pub const STA_REC_PHY_TLV_SIZE: usize = 12;
+/// `sta_rec_ra_info` total size (`mt76_connac_mcu.h:398-403`):
+/// tag+len (4) + legacy (2) + rx_mcs_bitmask[HT_MCS_MASK_NUM = 10].
+pub const STA_REC_RA_TLV_SIZE: usize = 16;
+/// `sta_rec_ht` total size (`mt76_connac_mcu.h:302-307`).
+pub const STA_REC_HT_TLV_SIZE: usize = 8;
+/// `sta_rec_vht` total size (`mt76_connac_mcu.h:309-318`): the full
+/// struct, `rts_bw_sig` tail included — `mt7925_mcu_sta_vht_tlv`
+/// adds `sizeof(*vht)` (`mt7925/mcu.c:1713`).
+pub const STA_REC_VHT_TLV_SIZE: usize = 16;
+/// `sta_rec_amsdu` total size (`mt76_connac_mcu.h:376-383`).
+pub const STA_REC_HW_AMSDU_TLV_SIZE: usize = 8;
+/// `sta_rec_he_v2` total size (`mt76_connac_mcu.h:366-374`): tag+len
+/// (4) + he_mac_cap[6] + he_phy_cap[11] + pkt_ext (1) +
+/// max_nss_mcs[3] (6). The bytes come from the shared
+/// `mt7921::he::Profile::sta_v2` builder (same struct on both
+/// generations).
+pub const STA_REC_HE_V2_TLV_SIZE: usize = 28;
+/// `sta_rec_he_6g_capa` total size (`mt76_connac_mcu.h:417-422`).
+pub const STA_REC_HE_6G_TLV_SIZE: usize = 8;
+/// `sta_rec_hdr_trans` total size (`mt7925/mcu.h:438-445`).
+pub const STA_REC_HDR_TRANS_TLV_SIZE: usize = 8;
 /// `sta_rec_ba_uni` total size (`mt7925/mcu.h:414-425`).
 pub const STA_REC_BA_UNI_TLV_SIZE: usize = 16;
 /// `sta_rec_mld` total size (`mt7925/mcu.h:469-483`): header + mac +
@@ -424,16 +483,245 @@ pub fn encode_sta_rec_basic_tlv(
     Some(())
 }
 
-/// Encode `sta_rec_state` (`mt76_connac_mcu.h:410-418`): `{ flags: u32
-/// LE = 0, state, vht_opmode = 0, action = 0, rsv = 0 }`. The state
-/// byte sits at offset 8, matching the in-tree CONNAC2 record
-/// (`association.rs::peer_record_on`).
-pub fn encode_sta_rec_state_tlv(state: u8, out: &mut [u8]) -> Option<()> {
-    let body = out.get_mut(..STA_REC_STATE_TLV_SIZE)?;
+/// Encode `sta_rec_state_v2` (`mt7925_mcu_sta_state_v2_tlv`,
+/// `mt7925/mcu.c:1810-1836`): `{ state, rsv[3], flags: u32 LE = 0,
+/// vht_opmode, action = 0, rsv2[2] }` under tag `STA_REC_STATE`. The
+/// `rcpi` the upstream function takes is unused. `vht_opmode` is
+/// [`sta_state_v2_vht_opmode`] for a VHT peer and 0 otherwise.
+pub fn encode_sta_rec_state_v2_tlv(state: u8, vht_opmode: u8, out: &mut [u8]) -> Option<()> {
+    let body = out.get_mut(..STA_REC_STATE_V2_TLV_SIZE)?;
     body.fill(0);
     body[0..2].copy_from_slice(&STA_REC_STATE.to_le_bytes());
-    body[2..4].copy_from_slice(&(STA_REC_STATE_TLV_SIZE as u16).to_le_bytes());
-    body[8] = state;
+    body[2..4].copy_from_slice(&(STA_REC_STATE_V2_TLV_SIZE as u16).to_le_bytes());
+    body[4] = state;
+    body[12] = vht_opmode;
+    Some(())
+}
+
+/// `sta_rec_state_v2.vht_opmode` for a VHT peer
+/// (`mt7925/mcu.c:1831-1835`): the `IEEE80211_STA_RX_BW_*` value in
+/// the low bits and `rx_nss << IEEE80211_OPMODE_NOTIF_RX_NSS_SHIFT`
+/// (4). Upstream shifts `rx_nss` itself, NOT `rx_nss - 1` as the
+/// CONNAC2 `mt76_connac_mcu_sta_tlv` does (`mt76_connac_mcu.c:940-
+/// 944`); this mirrors the CONNAC3 code as written.
+pub const fn sta_state_v2_vht_opmode(bandwidth: u8, rx_nss: u8) -> u8 {
+    bandwidth | (rx_nss << 4)
+}
+
+/// `PHY_TYPE_BIT_*` (`mt76_connac_mcu.h:950-971`): the
+/// `sta_rec_phy.phy_type` bits `mt76_connac_get_phy_mode_v2`
+/// (`mt76_connac_mcu.c:791-845`) sets — HR_DSSS | ERP on 2.4 GHz,
+/// OFDM on 5/6 GHz, plus HT / VHT (5/6 GHz only) / HE / BE for the
+/// peer's capabilities.
+pub const PHY_TYPE_BIT_HR_DSSS: u8 = 1 << 0;
+pub const PHY_TYPE_BIT_ERP: u8 = 1 << 1;
+pub const PHY_TYPE_BIT_OFDM: u8 = 1 << 3;
+pub const PHY_TYPE_BIT_HT: u8 = 1 << 4;
+pub const PHY_TYPE_BIT_VHT: u8 = 1 << 5;
+pub const PHY_TYPE_BIT_HE: u8 = 1 << 6;
+pub const PHY_TYPE_BIT_BE: u8 = 1 << 7;
+
+/// `sta_rec_phy` inputs (`mt7925_mcu_sta_phy_tlv`,
+/// `mt7925/mcu.c:1762-1807`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct UniStaPhy {
+    /// `link_conf->basic_rates` truncated to u16: a bitmap over the
+    /// band's sband bitrate table (12 entries on 2.4 GHz, the 8 OFDM
+    /// entries on 5/6 GHz).
+    pub basic_rate: u16,
+    /// `mt76_connac_get_phy_mode_v2(.., link_sta)`: `PHY_TYPE_BIT_*`.
+    pub phy_type: u8,
+    /// A-MPDU length exponent `af`: the HT factor, raised to the VHT
+    /// `MAX_A_MPDU_LENGTH_EXPONENT` when larger, replaced by the 6 GHz
+    /// band capability's exponent when that capability is present.
+    /// Full width (0..=7): `max_ampdu_len` carries it as is, while
+    /// `ampdu` keeps only the 2-bit HT factor field.
+    pub ampdu_factor: u8,
+    /// Minimum MPDU start spacing `mm` (`IEEE80211_HT_AMPDU_PARM_DENSITY`
+    /// encoding): the HT density, or the 6 GHz capability's.
+    pub density: u8,
+}
+
+/// Encode `sta_rec_phy` (`mt7925_mcu_sta_phy_tlv`): `{ basic_rate: u16
+/// LE, phy_type, ampdu, rts_policy = 0, rcpi = 0, max_ampdu_len, rsv }`.
+/// `ampdu = FIELD_PREP(IEEE80211_HT_AMPDU_PARM_FACTOR, af) |
+/// FIELD_PREP(IEEE80211_HT_AMPDU_PARM_DENSITY, mm)` — `FIELD_PREP`
+/// masks, so a VHT exponent above 3 survives only in `max_ampdu_len`.
+/// The CONNAC3 builder never sets `rcpi` (the CONNAC2 one does).
+pub fn encode_sta_rec_phy_tlv(phy: &UniStaPhy, out: &mut [u8]) -> Option<()> {
+    let body = out.get_mut(..STA_REC_PHY_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_PHY.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_PHY_TLV_SIZE as u16).to_le_bytes());
+    body[4..6].copy_from_slice(&phy.basic_rate.to_le_bytes());
+    body[6] = phy.phy_type;
+    body[7] = (phy.ampdu_factor & 0x03) | ((phy.density << 2) & 0x1c);
+    body[10] = phy.ampdu_factor;
+    Some(())
+}
+
+/// `RA_LEGACY_OFDM` = GENMASK(13, 6), `RA_LEGACY_CCK` = GENMASK(3, 0)
+/// (`mt76_connac_mcu.h:395-396`).
+pub const RA_LEGACY_OFDM: u16 = 0x3fc0;
+pub const RA_LEGACY_CCK: u16 = 0x000f;
+
+/// `sta_rec_ra_info.legacy` from `link_sta->supp_rates[band]`
+/// (`mt7925_mcu_sta_rate_ctrl_tlv`, `mt7925/mcu.c:1861-1868`).
+/// `supp_rates` indexes the band's sband table: on 2.4 GHz entries
+/// 0..3 are CCK and 4..11 OFDM, so the OFDM half moves to bits 6..13
+/// and CCK stays in 0..3; on 5/6 GHz the table is the 8 OFDM rates.
+pub const fn ra_legacy(supp_rates: u16, two_ghz: bool) -> u16 {
+    if two_ghz {
+        (((supp_rates >> 4) << 6) & RA_LEGACY_OFDM) | (supp_rates & RA_LEGACY_CCK)
+    } else {
+        (supp_rates << 6) & RA_LEGACY_OFDM
+    }
+}
+
+/// `sta_rec_ra_info` inputs (`mt7925_mcu_sta_rate_ctrl_tlv`,
+/// `mt7925/mcu.c:1839-1874`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct UniStaRa {
+    /// [`ra_legacy`] of the peer's supported legacy rates.
+    pub legacy: u16,
+    /// `link_sta->ht_cap.mcs.rx_mask` for an HT peer, zero otherwise.
+    pub rx_mcs_bitmask: [u8; 10],
+}
+
+/// Encode `sta_rec_ra_info` (tag `STA_REC_RA`): `{ legacy: u16 LE,
+/// rx_mcs_bitmask[10] }`.
+pub fn encode_sta_rec_ra_tlv(ra: &UniStaRa, out: &mut [u8]) -> Option<()> {
+    let body = out.get_mut(..STA_REC_RA_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_RA.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_RA_TLV_SIZE as u16).to_le_bytes());
+    body[4..6].copy_from_slice(&ra.legacy.to_le_bytes());
+    body[6..16].copy_from_slice(&ra.rx_mcs_bitmask);
+    Some(())
+}
+
+/// `sta_rec_hdr_trans` inputs (`mt7925_mcu_sta_hdr_trans_tlv`,
+/// `mt7925/mcu.c:1067-1103`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UniStaHdrTrans {
+    /// Set for a non-station vif, or a 4-address WCID.
+    pub from_ds: bool,
+    /// Set for a station vif, or a 4-address WCID.
+    pub to_ds: bool,
+    /// `!test_bit(MT_WCID_FLAG_HDR_TRANS)`: RX 802.3 decap offload off.
+    pub dis_rx_hdr_tran: bool,
+}
+
+impl UniStaHdrTrans {
+    /// A 3-address station vif without RX decap offload: `to_ds = 1`,
+    /// `from_ds = 0`, `dis_rx_hdr_tran = 1`. NARF never enables RX
+    /// decap offload (`mt7925_sta_set_decap_offload`,
+    /// `mt7925/main.c:1552`, is what sets `MT_WCID_FLAG_HDR_TRANS`;
+    /// NARF's RX path parses 802.11 headers, as the CONNAC2
+    /// WTBL_HDR_TRANS "no RX translation" byte already says) and has
+    /// no 4-address mode, so both WCID flags are clear — upstream's
+    /// values for a station without either feature.
+    pub const STATION: Self = Self {
+        from_ds: false,
+        to_ds: true,
+        dis_rx_hdr_tran: true,
+    };
+}
+
+/// Encode `sta_rec_hdr_trans` (`mt7925/mcu.h:438-445`): `{ from_ds,
+/// to_ds, dis_rx_hdr_tran, rsv }`.
+pub fn encode_sta_rec_hdr_trans_tlv(hdr: &UniStaHdrTrans, out: &mut [u8]) -> Option<()> {
+    let body = out.get_mut(..STA_REC_HDR_TRANS_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_HDR_TRANS.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_HDR_TRANS_TLV_SIZE as u16).to_le_bytes());
+    body[4] = u8::from(hdr.from_ds);
+    body[5] = u8::from(hdr.to_ds);
+    body[6] = u8::from(hdr.dis_rx_hdr_tran);
+    Some(())
+}
+
+/// Encode `sta_rec_ht` (`mt7925_mcu_sta_ht_tlv`, `mt7925/mcu.c:1689-
+/// 1701`): `{ ht_cap: u16 LE = link_sta->ht_cap.cap, rsv }`.
+pub fn encode_sta_rec_ht_tlv(ht_cap: u16, out: &mut [u8]) -> Option<()> {
+    let body = out.get_mut(..STA_REC_HT_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_HT.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_HT_TLV_SIZE as u16).to_le_bytes());
+    body[4..6].copy_from_slice(&ht_cap.to_le_bytes());
+    Some(())
+}
+
+/// Encode `sta_rec_vht` (`mt7925_mcu_sta_vht_tlv`, `mt7925/mcu.c:1704-
+/// 1719`): `{ vht_cap: u32 LE, vht_rx_mcs_map: u16 LE, vht_tx_mcs_map:
+/// u16 LE, rts_bw_sig = 0, rsv[3] }`. Upstream sends it for a VHT peer
+/// AND for any peer with a 6 GHz band capability ("necessary to let hw
+/// work normally"), where `link_sta->vht_cap` is all zero
+/// (`ieee80211_vht_cap_ie_to_sta_vht_cap` memsets it and returns
+/// without an HT capability).
+pub fn encode_sta_rec_vht_tlv(
+    cap: u32,
+    rx_mcs_map: u16,
+    tx_mcs_map: u16,
+    out: &mut [u8],
+) -> Option<()> {
+    let body = out.get_mut(..STA_REC_VHT_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_VHT.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_VHT_TLV_SIZE as u16).to_le_bytes());
+    body[4..8].copy_from_slice(&cap.to_le_bytes());
+    body[8..10].copy_from_slice(&rx_mcs_map.to_le_bytes());
+    body[10..12].copy_from_slice(&tx_mcs_map.to_le_bytes());
+    Some(())
+}
+
+/// `IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_{3895,7991,11454}` = 0, 1, 2:
+/// the `sta_rec_amsdu.max_mpdu_size` values CONNAC3 sends.
+pub const AMSDU_MAX_MPDU_3895: u8 = 0;
+pub const AMSDU_MAX_MPDU_7991: u8 = 1;
+pub const AMSDU_MAX_MPDU_11454: u8 = 2;
+
+/// `sta_rec_amsdu.max_mpdu_size` from `link_sta->agg.max_amsdu_len`
+/// (`mt7925_mcu_sta_amsdu_tlv`, `mt7925/mcu.c:1746-1758`): 11454 → 2,
+/// 7935 (HT) or 7991 → 1, anything else → 0. CONNAC2 sends the 0/1
+/// flag `max_amsdu_len >= 7991` instead (`mt76_connac_mcu.c:615-616`),
+/// so the two generations part at 11454.
+pub const fn amsdu_max_mpdu_size(max_amsdu_len: u16) -> u8 {
+    match max_amsdu_len {
+        11454 => AMSDU_MAX_MPDU_11454,
+        7935 | 7991 => AMSDU_MAX_MPDU_7991,
+        _ => AMSDU_MAX_MPDU_3895,
+    }
+}
+
+/// Encode `sta_rec_amsdu` (`mt7925_mcu_sta_amsdu_tlv`, tag
+/// `STA_REC_HW_AMSDU`): `{ max_amsdu_num = 8, max_mpdu_size,
+/// amsdu_en = 1, rsv }`. Sent for a station/AP vif whenever
+/// `agg.max_amsdu_len` is non-zero — mac80211 sets it from the HT,
+/// VHT, 6 GHz band or (2.4 GHz) EHT capability, so never for a
+/// legacy peer.
+pub fn encode_sta_rec_amsdu_tlv(max_mpdu_size: u8, out: &mut [u8]) -> Option<()> {
+    let body = out.get_mut(..STA_REC_HW_AMSDU_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_HW_AMSDU.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_HW_AMSDU_TLV_SIZE as u16).to_le_bytes());
+    body[4] = 8;
+    body[5] = max_mpdu_size;
+    body[6] = 1;
+    Some(())
+}
+
+/// Encode `sta_rec_he_6g_capa` (`mt7925_mcu_sta_he_6g_tlv`,
+/// `mt7925/mcu.c:1645-1658`): `{ capa: u16 LE, rsv[2] }`. Upstream
+/// sends it whenever `link_sta->he_6ghz_capa.capa` is non-zero — no
+/// band/state gate, unlike CONNAC2's `band == 6GHZ && state == ASSOC`
+/// (`mt76_connac_mcu.c:898-906`).
+pub fn encode_sta_rec_he_6g_tlv(capa: u16, out: &mut [u8]) -> Option<()> {
+    let body = out.get_mut(..STA_REC_HE_6G_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_HE_6G.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_HE_6G_TLV_SIZE as u16).to_le_bytes());
+    body[4..6].copy_from_slice(&capa.to_le_bytes());
     Some(())
 }
 
@@ -489,7 +777,11 @@ pub struct MldLink {
 /// is the secondary WCID (0 when there is none).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MldLinks {
-    /// The station's own MAC (the MLD MAC).
+    /// The station's own MAC (the MLD MAC). Upstream's `sta_rec_mld`
+    /// writes `sta->addr` here — the peer AP MLD's address
+    /// (`mt7925/mcu.c:1927`); NARF does not parse that address from
+    /// the Basic Multi-Link element yet, so the `MldStation` path (no
+    /// live callers) keeps the own MLD MAC until it does.
     pub own_mac: [u8; MAC_ADDR_LEN],
     /// Primary (deflink) link.
     pub primary: MldLink,
@@ -534,6 +826,29 @@ pub fn encode_sta_rec_mld_tlv(links: &MldLinks, out: &mut [u8]) -> Option<()> {
         body[26] = secondary.bss_idx;
     }
     body[16] = link_num;
+    Some(())
+}
+
+/// Encode `sta_rec_mld` for a station on a non-MLD vif
+/// (`mt7925_mcu_sta_mld_tlv`, `mt7925/mcu.c:1913-1944`, which has no
+/// MLD gate of its own): `mac_addr = sta->addr` (the peer), `primary_id
+/// = wlan_id = deflink wcid`, `secondary_id = 0`, and `link_num =
+/// min(hweight16(mvif->valid_links), 2)` = 0 because a non-MLD vif has
+/// no valid links (`mvif->valid_links` is only written by
+/// `mt7925_change_vif_links`, `mt7925/main.c:2039`), so `link[]` stays
+/// zero.
+pub fn encode_sta_rec_mld_tlv_non_mld(
+    peer_addr: [u8; MAC_ADDR_LEN],
+    wcid_idx: u16,
+    out: &mut [u8],
+) -> Option<()> {
+    let body = out.get_mut(..STA_REC_MLD_TLV_SIZE)?;
+    body.fill(0);
+    body[0..2].copy_from_slice(&STA_REC_MLD.to_le_bytes());
+    body[2..4].copy_from_slice(&(STA_REC_MLD_TLV_SIZE as u16).to_le_bytes());
+    body[4..10].copy_from_slice(&peer_addr);
+    body[10..12].copy_from_slice(&wcid_idx.to_le_bytes());
+    body[14..16].copy_from_slice(&wcid_idx.to_le_bytes());
     Some(())
 }
 
@@ -615,7 +930,8 @@ pub fn encode_sta_rec_remove_tlv(out: &mut [u8]) -> Option<()> {
 // ── Station builders ─────────────────────────────────────────────
 
 /// Parameters for one link's UNI station update
-/// (`mt7925_mcu_sta_cmd`, `mt7925/mcu.c:2159-2246`).
+/// (`mt7925_mcu_sta_cmd`, `mt7925/mcu.c:1958-2010`, the
+/// `info->enable && info->link_sta` branch).
 #[derive(Clone, Debug)]
 pub struct UniStaParams<'a> {
     /// BSS index of this link (`mvif->idx`).
@@ -639,33 +955,53 @@ pub struct UniStaParams<'a> {
     pub newly: bool,
     /// Station info state (`STA_STATE_*`).
     pub state: u8,
-    /// Caller-supplied capability TLV stream (HT/VHT/HE/EHT/RA/PHY/
-    /// UAPSD/AMSDU/HDR_TRANS) in upstream order, appended verbatim
-    /// between BASIC and STATE. Filled by
-    /// `mt7921::association::JoinPlan::uni_cap_tlvs` (MLO slice)
-    /// from the negotiated profiles.
+    /// `STA_REC_PHY` inputs.
+    pub phy: UniStaPhy,
+    /// Caller-supplied capability TLV stream, appended verbatim
+    /// between PHY and RA in upstream order: HT, VHT, (UAPSD: AP vifs
+    /// only, never here), HW_AMSDU, HE_V2, HE_6G, EHT — each present
+    /// only when the peer has the capability. Filled by
+    /// `mt7921::association::JoinPlan::uni_sta_caps` from the
+    /// negotiated profiles.
     pub cap_tlvs: &'a [u8],
-    /// MLD links, when the vif is an MLD vif. Appends the MLD +
-    /// EHT MLD TLVs after STATE (upstream emits them only when
-    /// `state != MT76_STA_INFO_STATE_NONE`).
+    /// `STA_REC_RA` inputs.
+    pub ra: UniStaRa,
+    /// `sta_rec_state_v2.vht_opmode` (0 for a non-VHT peer).
+    pub vht_opmode: u8,
+    /// `STA_REC_HDR_TRANS` inputs.
+    pub hdr_trans: UniStaHdrTrans,
+    /// MLD links, when the vif is an MLD vif. Once the state is not
+    /// NONE the MLD TLV follows STATE for every station (built from
+    /// these links, or the non-MLD form with `link_num = 0` when
+    /// `None`), and the EHT MLD TLV follows it only for an MLD vif
+    /// (`mt7925_mcu_sta_eht_mld_tlv` returns unless
+    /// `ieee80211_vif_is_mld`).
     pub mld: Option<MldLinks>,
 }
 
 /// Upper bound on what [`build_uni_sta_update_req`] emits for one
-/// link with no capability TLVs and no MLD: hdr (8) + BASIC (20) +
-/// STATE (12). MLD adds 44 (MLD 28 + EHT MLD 16); capability TLVs
-/// add their own length. This is a NARF-side bound for the TLVs
+/// link with no capability TLVs, in state NONE: hdr (8), BASIC (20),
+/// PHY (12), RA (16), STATE_V2 (16) and HDR_TRANS (8). A non-NONE
+/// state adds MLD (28), an MLD vif EHT MLD (16) on top; capability
+/// TLVs add their own length. This is a NARF-side bound for the TLVs
 /// this module emits, not upstream's `MT7925_STA_UPDATE_MAX_SIZE`.
-pub const UNI_STA_UPDATE_BOUND: usize =
-    STA_REQ_HDR_SIZE + STA_REC_BASIC_TLV_SIZE + STA_REC_STATE_TLV_SIZE;
+pub const UNI_STA_UPDATE_BOUND: usize = STA_REQ_HDR_SIZE
+    + STA_REC_BASIC_TLV_SIZE
+    + STA_REC_PHY_TLV_SIZE
+    + STA_REC_RA_TLV_SIZE
+    + STA_REC_STATE_V2_TLV_SIZE
+    + STA_REC_HDR_TRANS_TLV_SIZE;
 
 /// Build one link's UNI station-update body
-/// (`MCU_UNI_CMD(STA_REC_UPDATE)`, `mt7925/mcu.c:2159-2246`):
-/// `sta_req_hdr` + BASIC + `cap_tlvs` + STATE [+ MLD + EHT MLD].
-/// The caller sends one such message per active link, primary first
-/// (`mt7925_mcu_uni_tx_ba`/`mt7925_mcu_uni_rx_ba` show the per-link
-/// loop shape; the station update itself is one message per link in
-/// the MLO path, `mt7925_mcu_sta_update` per `mlink`).
+/// (`MCU_UNI_CMD(STA_REC_UPDATE)`, `mt7925_mcu_sta_cmd` with
+/// `enable` and a `link_sta`, `mt7925/mcu.c:1977-2007`):
+/// `sta_req_hdr` + BASIC + PHY + `cap_tlvs` (HT, VHT, HW_AMSDU,
+/// HE_V2, HE_6G, EHT) + RA + STATE_V2 [+ MLD [+ EHT MLD]] +
+/// HDR_TRANS. HDR_TRANS is the enable branch's tail
+/// (`mt7925/mcu.c:2005-2007`); the disable branch is
+/// [`build_uni_sta_remove_req`]. The caller sends one such message
+/// per active link, primary first (`mt7925_mcu_sta_update` per
+/// `mlink`).
 pub fn build_uni_sta_update_req(params: &UniStaParams<'_>) -> Vec<u8> {
     let mut out = Vec::with_capacity(UNI_STA_UPDATE_BOUND + params.cap_tlvs.len() + 44);
     out.resize(STA_REQ_HDR_SIZE, 0);
@@ -685,6 +1021,11 @@ pub fn build_uni_sta_update_req(params: &UniStaParams<'_>) -> Vec<u8> {
     out.extend_from_slice(&basic);
     tlv_count += 1;
 
+    let mut phy = [0u8; STA_REC_PHY_TLV_SIZE];
+    let _ = encode_sta_rec_phy_tlv(&params.phy, &mut phy);
+    out.extend_from_slice(&phy);
+    tlv_count += 1;
+
     out.extend_from_slice(params.cap_tlvs);
     // Capability TLVs arrive pre-counted by the caller: each is a
     // 4-byte-header TLV, so count them by walking their lengths.
@@ -698,23 +1039,36 @@ pub fn build_uni_sta_update_req(params: &UniStaParams<'_>) -> Vec<u8> {
         rest = &rest[len..];
     }
 
-    let mut state = [0u8; STA_REC_STATE_TLV_SIZE];
-    let _ = encode_sta_rec_state_tlv(params.state, &mut state);
+    let mut ra = [0u8; STA_REC_RA_TLV_SIZE];
+    let _ = encode_sta_rec_ra_tlv(&params.ra, &mut ra);
+    out.extend_from_slice(&ra);
+    tlv_count += 1;
+
+    let mut state = [0u8; STA_REC_STATE_V2_TLV_SIZE];
+    let _ = encode_sta_rec_state_v2_tlv(params.state, params.vht_opmode, &mut state);
     out.extend_from_slice(&state);
     tlv_count += 1;
 
-    if let Some(links) = params.mld {
-        if params.state != STA_STATE_NONE {
-            let mut mld = [0u8; STA_REC_MLD_TLV_SIZE];
-            let _ = encode_sta_rec_mld_tlv(&links, &mut mld);
-            out.extend_from_slice(&mld);
-            tlv_count += 1;
+    if params.state != STA_STATE_NONE {
+        let mut mld = [0u8; STA_REC_MLD_TLV_SIZE];
+        let _ = match params.mld {
+            Some(links) => encode_sta_rec_mld_tlv(&links, &mut mld),
+            None => encode_sta_rec_mld_tlv_non_mld(params.peer_addr, params.wcid_idx, &mut mld),
+        };
+        out.extend_from_slice(&mld);
+        tlv_count += 1;
+        if let Some(links) = params.mld {
             let mut eht_mld = [0u8; STA_REC_EHT_MLD_TLV_SIZE];
             let _ = encode_sta_rec_eht_mld_tlv(&links, &mut eht_mld);
             out.extend_from_slice(&eht_mld);
             tlv_count += 1;
         }
     }
+
+    let mut hdr_trans = [0u8; STA_REC_HDR_TRANS_TLV_SIZE];
+    let _ = encode_sta_rec_hdr_trans_tlv(&params.hdr_trans, &mut hdr_trans);
+    out.extend_from_slice(&hdr_trans);
+    tlv_count += 1;
 
     set_sta_req_tlv_count(&mut out, tlv_count);
     out
