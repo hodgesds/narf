@@ -309,6 +309,13 @@ pub const CURPOS: u64 = 0x70088;
 pub const CURSURFLIVE: u64 = 0x700ac;
 /// `MCURSOR_MODE_MASK`.
 pub const MCURSOR_MODE_MASK: u32 = 0x27;
+/// `MCURSOR_MODE_64_2B` (Wa_16021440873's fetch mode).
+pub const MCURSOR_MODE_64_2B: u32 = 0x04;
+/// `PIPE_SRCSZ_ERLY_TPT(PIPE_A)` and `CURPOS_ERLY_TPT(PIPE_A)`
+/// (`intel_psr_regs.h`, `intel_cursor_regs.h`; pipes 0x1000 apart): the
+/// early-transport SU size and cursor position.
+pub const PIPE_SRCSZ_ERLY_TPT: u64 = 0x70074;
+pub const CURPOS_ERLY_TPT: u64 = 0x7008c;
 /// `MCURSOR_MODE_64_ARGB_AX`.
 pub const MCURSOR_MODE_64_ARGB_AX: u32 = 0x27;
 /// `CHICKEN_TRANS(TRANSCODER_A)` on display 14 (`_MTL_CHICKEN_TRANS_A`).
@@ -898,6 +905,9 @@ pub struct Psr2 {
     /// Display 14.00 A0..A3 (`IS_DISPLAY_VERx100_STEP(1400, A0, B0)`):
     /// Wa_16014451276 and Wa_16012604467.
     pub a0_to_b0: bool,
+    /// `enable_psr2_su_region_et` (`psr2_su_region_et_valid`: display 20+
+    /// eDP only, so never for display 14's PSR2).
+    pub su_region_et: bool,
     /// The pipe source width (`pipe_src`).
     pub width: u16,
     /// The pipe source height.
@@ -1013,6 +1023,8 @@ pub(crate) fn compute_psr2(
         frames_before_su: (sink.sync_latency + 1).max(2),
         tp2_wakeup_us: panel.table.map_or(0, |t| t.psr2_tp2_tp3_wakeup_time_us),
         a0_to_b0: source.step < 4,
+        // psr2_su_region_et_valid needs display 20+.
+        su_region_et: false,
         width: timing.width,
         height: timing.height,
     })
@@ -1227,6 +1239,28 @@ pub struct SelFetch {
     /// The cursor's new area and `CURCNTR` when the cursor joined the
     /// commit's `update_planes`.
     pub cursor: Option<(Area, u32)>,
+    /// `pipe_srcsz_early_tpt` (`psr2_pipe_srcsz_early_tpt_calc`): the SU
+    /// area's `PIPESRC_WIDTH(w - 1) | PIPESRC_HEIGHT(h - 1)` with early
+    /// transport, 0 for a full update or without it.
+    pub early_tpt: u32,
+    /// With early transport and the cursor in the commit: its
+    /// `CURPOS_ERLY_TPT` (`intel_cursor_position(.., true)` while it
+    /// fetches, Wa_16021440873's `CURSOR_POS_Y(pipe height + 1)` otherwise).
+    pub cursor_early_tpt: u32,
+}
+
+/// `intel_cursor_position`'s sign-magnitude `CURPOS` encoding.
+pub const fn cursor_position(x: i32, y: i32) -> u32 {
+    let mut pos = 0;
+    let (x, y) = (x as i64, y as i64);
+    if x < 0 {
+        pos |= 1 << 15;
+    }
+    pos |= (x.unsigned_abs() as u32) & 0x7fff;
+    if y < 0 {
+        pos |= 1 << 31;
+    }
+    pos | ((y.unsigned_abs() as u32) & 0x7fff) << 16
 }
 
 /// `psr2_man_trk_ctl_calc` for display 14 (ADL-P layout, no enable bit;
@@ -1266,9 +1300,12 @@ fn clip_area_update(su: &mut Option<(i32, i32)>, damage: &Rect, pipe_src: &Rect)
 
 /// `intel_psr2_sel_fetch_update` for the fixed full-screen primary
 /// (`dst` = `pipe_src` = `0, 0, width, height`, always visible, alpha and
-/// position unchanged) on a PSR2 with `su`, given the planes' previous
-/// areas `(primary, cursor)`. No early transport (display < 20), no DSC,
-/// and Wa_14014971492 needs the splitter, which qualification refuses.
+/// position unchanged) on a PSR2 or replay selective update `su`, given the
+/// planes' previous areas `(primary, cursor)`. No DSC, and Wa_14014971492
+/// needs the splitter, which qualification refuses. With early transport
+/// (`su.su_region_et`) the SU area grows to cover a cursor it touches
+/// (`intel_psr2_sel_fetch_et_alignment`), alternating with the pipe
+/// alignment until the cursor is inside or nothing changes.
 pub fn sel_fetch_update(su: &Psr2, commit: &SuCommit<'_>, previous: (Area, Area)) -> SelFetch {
     let pipe_src = Rect::new(0, 0, i32::from(su.width), i32::from(su.height));
     let dst = pipe_src;
@@ -1278,6 +1315,8 @@ pub fn sel_fetch_update(su: &Psr2, commit: &SuCommit<'_>, previous: (Area, Area)
         man_trk_ctl: 0,
         primary: previous.0,
         cursor: None,
+        early_tpt: 0,
+        cursor_early_tpt: 0,
     };
     let mut area = None;
     if commit.pipe_supported {
@@ -1292,11 +1331,32 @@ pub fn sel_fetch_update(su: &Psr2, commit: &SuCommit<'_>, previous: (Area, Area)
     // a full update that skips the plane loop.
     if let Some((mut y1, mut y2)) = area {
         result.full_update = false;
-        // intel_psr2_sel_fetch_pipe_alignment without DSC.
         let g = i32::from(su.su_y_granularity);
-        y1 -= y1 % g;
-        if y2 % g != 0 {
-            y2 = (y2 / g + 1) * g;
+        loop {
+            // intel_psr2_sel_fetch_et_alignment: a visible cursor the SU
+            // area touches is covered whole.
+            let mut cursor_in_su = false;
+            if let (true, Some(cursor)) = (su.su_region_et, commit.cursor) {
+                let mut inter = Rect::new(0, y1, pipe_src.x2, y2);
+                if inter.intersect(&cursor.dst) {
+                    let mut grown = Some((y1, y2));
+                    clip_area_update(&mut grown, &cursor.dst, &pipe_src);
+                    if let Some(rows) = grown {
+                        (y1, y2) = rows;
+                    }
+                    cursor_in_su = true;
+                }
+            }
+            // intel_psr2_sel_fetch_pipe_alignment without DSC.
+            let aligned = (
+                y1 - y1 % g,
+                if y2 % g != 0 { (y2 / g + 1) * g } else { y2 },
+            );
+            let changed = aligned != (y1, y2);
+            (y1, y2) = aligned;
+            if cursor_in_su || !changed {
+                break;
+            }
         }
         result.su = (y1, y2);
         let su_rect = Rect::new(0, y1, pipe_src.x2, y2);
@@ -1313,9 +1373,11 @@ pub fn sel_fetch_update(su: &Psr2, commit: &SuCommit<'_>, previous: (Area, Area)
                 // fetch area (NARF policy).
                 result.full_update = true;
             } else if !inter.intersect(&cursor.dst) {
-                // A previously enabled cursor fetch is disabled.
+                // A previously enabled cursor fetch is disabled
+                // (Wa_16021440873 with early transport).
                 if area_height(previous.1) > 0 {
                     result.cursor = Some((None, cursor.ctl));
+                    result.cursor_early_tpt = cursor_position(0, i32::from(su.height) + 1);
                 }
             } else if !cursor.supported() {
                 result.full_update = true;
@@ -1324,10 +1386,21 @@ pub fn sel_fetch_update(su: &Psr2, commit: &SuCommit<'_>, previous: (Area, Area)
                     Some((inter.y1 - cursor.dst.y1, inter.y2 - cursor.dst.y1)),
                     cursor.ctl,
                 ));
+                result.cursor_early_tpt = cursor_position(
+                    cursor.dst.x1,
+                    (-cursor.dst.height() + 1).max(cursor.dst.y1 - y1),
+                );
             }
         }
     }
     result.man_trk_ctl = man_trk_ctl(result.full_update, result.su);
+    if su.su_region_et && !result.full_update {
+        result.early_tpt = ((u32::from(su.width).wrapping_sub(1) & 0xffff) << 16)
+            | ((result.su.1 - result.su.0 - 1) as u32 & 0xffff);
+    }
+    if !su.su_region_et {
+        result.cursor_early_tpt = 0;
+    }
     result
 }
 
@@ -1782,13 +1855,18 @@ impl Psr {
     }
 
     /// The commit's arm half for the primary: `PSR2_MAN_TRK_CTL`
-    /// (`commit_pipe_pre_planes`), then `icl_plane_update_sel_fetch_arm`'s
+    /// (`commit_pipe_pre_planes`; with early transport then
+    /// `PIPE_SRCSZ_ERLY_TPT`), then `icl_plane_update_sel_fetch_arm`'s
     /// `SEL_FETCH_PLANE_CTL`, ahead of the plane's surface write.
     pub fn program_sel_fetch_arm<M: MmioWindow + ?Sized>(&mut self, regs: &M, sf: &SelFetch) {
         let Some(su) = self.su.as_mut() else {
             return;
         };
         regs.write32(PSR2_MAN_TRK_CTL, sf.man_trk_ctl);
+        // intel_psr2_program_trans_man_trk_ctl with early transport.
+        if su.config.su_region_et {
+            regs.write32(PIPE_SRCSZ_ERLY_TPT, sf.early_tpt);
+        }
         regs.write32(
             SEL_FETCH_PLANE_CTL,
             if area_height(sf.primary) > 0 {
@@ -1802,16 +1880,31 @@ impl Psr {
 
     /// `i9xx_cursor_update_sel_fetch_arm` when the cursor joined the
     /// commit: `SEL_FETCH_CUR_CTL` (its `CURCNTR` while it fetches, else
-    /// 0), then `CURBASE` rewritten unchanged, the write that arms every
-    /// cursor register (`i9xx_cursor_update_arm` always writes it).
+    /// 0; with early transport `CURPOS_ERLY_TPT` first while it fetches,
+    /// and Wa_16021440873's 64x64 2-bit fetch parked below the pipe
+    /// instead of 0), then `CURBASE` rewritten unchanged, the write that
+    /// arms every cursor register (`i9xx_cursor_update_arm` always writes
+    /// it).
     pub fn program_sel_fetch_cursor<M: MmioWindow + ?Sized>(&mut self, regs: &M, sf: &SelFetch) {
         let (Some(su), Some((area, ctl))) = (self.su.as_mut(), sf.cursor) else {
             return;
         };
-        regs.write32(
-            SEL_FETCH_CUR_CTL,
-            if area_height(area) > 0 { ctl } else { 0 },
-        );
+        if !su.config.su_region_et {
+            regs.write32(
+                SEL_FETCH_CUR_CTL,
+                if area_height(area) > 0 { ctl } else { 0 },
+            );
+        } else if area_height(area) > 0 {
+            regs.write32(CURPOS_ERLY_TPT, sf.cursor_early_tpt);
+            regs.write32(SEL_FETCH_CUR_CTL, ctl);
+        } else {
+            // Wa_16021440873: keep a 64x64 2-bit fetch, parked below the pipe.
+            regs.write32(
+                SEL_FETCH_CUR_CTL,
+                (ctl & !MCURSOR_MODE_MASK) | MCURSOR_MODE_64_2B,
+            );
+            regs.write32(CURPOS_ERLY_TPT, sf.cursor_early_tpt);
+        }
         let base = regs.read32(CURBASE);
         if base != u32::MAX {
             regs.write32(CURBASE, base);

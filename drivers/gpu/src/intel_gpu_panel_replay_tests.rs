@@ -185,8 +185,15 @@ fn smoke_panel_replay_caps_and_compute_follow_linux() -> TestResult {
         silence_period_sym_clocks: 105,
         lfps_half_cycle_num_of_syms: 19,
     };
-    if config.alpm != Some(want) || !config.su || config.sdp_prior_scanline || !config.edp {
-        return TestResult::Fail("the eDP ALPM state and SU must be Linux's");
+    // psr2_su_region_et_valid: display 20 eDP whose 0x0b0 reports early
+    // transport (bit 2).
+    if config.alpm != Some(want)
+        || !config.su
+        || !config.su_region_et
+        || config.sdp_prior_scanline
+        || !config.edp
+    {
+        return TestResult::Fail("the eDP ALPM state, SU and early transport must be Linux's");
     }
     // Typed refusals: eDP below display 20, eDP off pipes A/B, HDCP,
     // 128b/132b, no AUX-less ALPM, MST, and the AS SDP need.
@@ -306,12 +313,13 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     };
     // intel_alpm_enable_sink (ENABLE | LOCK_ERROR_IRQ_HPD | MODE_AUX_LESS),
     // PANEL_REPLAY_CONFIG = ENABLE | VSC_SDP_CRC | UNRECOVERABLE_ERROR |
-    // RFB_STORAGE_ERROR | ACTIVE_FRAME_CRC_ERROR | SU_ENABLE (0x7b),
-    // CONFIG2 = CRC_VERIFICATION, CONFIG3 = T1, then DP_SET_POWER D0.
+    // RFB_STORAGE_ERROR | ACTIVE_FRAME_CRC_ERROR | SU_ENABLE |
+    // ENABLE_SU_REGION_ET (0xfb), CONFIG2 = CRC_VERIFICATION, CONFIG3 = T1,
+    // then DP_SET_POWER D0.
     if sink.writes
         != [
             (0x116, 0x07),
-            (0x1b0, 0x7b),
+            (0x1b0, 0xfb),
             (0x1b1, 0x02),
             (0x11a, 0x00),
             (0x600, 0x01),
@@ -344,9 +352,12 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
     if pr.resume(&regs) != Ok(true) {
         return TestResult::Fail("an idle replay must activate");
     }
-    // dg2_activate_panel_replay: EDP_PSR2_CTL (no region ET, no SDP line)
-    // = 0, PSR2_MAN_TRK_CTL continuous full frame, TRANS_DP2_CTL(A) PR on.
-    if regs.log() != [(0x60900, 0), (0x60910, 1 << 13), (0x600a0, 1 << 30)] || !pr.active() {
+    // dg2_activate_panel_replay: EDP_PSR2_CTL = LNL_EDP_PSR2_SU_REGION_ET_
+    // ENABLE (bit 27; no SDP line), PSR2_MAN_TRK_CTL continuous full frame,
+    // TRANS_DP2_CTL(A) PR on.
+    if regs.log() != [(0x60900, 1 << 27), (0x60910, 1 << 13), (0x600a0, 1 << 30)]
+        || !pr.active()
+    {
         return TestResult::Fail("activation must write PSR2_CTL, MAN_TRK and TRANS_DP2_CTL");
     }
     // Exit before a frame change, then the SU of a damaged band.
@@ -371,8 +382,13 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
         (None, None),
     );
     // Y granularity 4: rows 101..203 align to 100..204; MAN_TRK (ADL-P
-    // layout) = SF_PARTIAL | start 100 << 16 | end 203.
-    if sf.full_update || sf.su != (100, 204) || sf.man_trk_ctl != (1 << 31) | (100 << 16) | 203 {
+    // layout) = SF_PARTIAL | start 100 << 16 | end 203; early transport's
+    // PIPE_SRCSZ_ERLY_TPT = PIPESRC_WIDTH(1919) | PIPESRC_HEIGHT(103).
+    if sf.full_update
+        || sf.su != (100, 204)
+        || sf.man_trk_ctl != (1 << 31) | (100 << 16) | 203
+        || sf.early_tpt != (1919 << 16) | 103
+    {
         return TestResult::Fail("the SU area must align to the sink's 4-line granularity");
     }
     regs.writes.borrow_mut().clear();
@@ -383,6 +399,7 @@ fn smoke_panel_replay_edp_enable_exit_and_selective_update() -> TestResult {
             (0x7089c, 100 << 16),
             (0x70898, (103 << 16) | 1919),
             (0x60910, (1 << 31) | (100 << 16) | 203),
+            (0x70074, (1919 << 16) | 103),
             (0x70890, 1 << 31),
         ]
     {
@@ -622,4 +639,126 @@ fn smoke_panel_replay_as_sdp_follows_intel_dp() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_psr",
     smoke_panel_replay_as_sdp_follows_intel_dp
+);
+
+/// Region early transport on the display-20 eDP replay
+/// (`intel_psr2_sel_fetch_update` with `enable_psr2_su_region_et`, Linux
+/// 7.4-rc4): the SU area grows over a cursor it touches, also when the
+/// alignment pulls the cursor in; `PIPE_SRCSZ_ERLY_TPT` follows the area;
+/// the cursor's `CURPOS_ERLY_TPT` is its position against the area's top
+/// (`intel_cursor_position(.., true)`), and a cursor leaving the area keeps
+/// Wa_16021440873's parked 64x64 2-bit fetch. Without early transport (DSC
+/// here) nothing grows.
+fn smoke_panel_replay_region_early_transport_follows_intel_psr() -> TestResult {
+    use crate::intel_gpu_psr::{CursorPlane, Psr, Psr1, SuCommit, MCURSOR_MODE_64_ARGB_AX};
+    let mut sink = edp_sink();
+    let caps = Caps::read(&mut sink, true, false).expect("caps");
+    let config = compute(&caps, &edp_stream(), None).expect("config");
+    if !config.su_region_et
+        || compute(
+            &caps,
+            &Stream {
+                dsc: true,
+                ..edp_stream()
+            },
+            None,
+        )
+        .map(|c| (c.su, c.su_region_et))
+            != Ok((true, false))
+    {
+        return TestResult::Fail("early transport must be on, and off with DSC");
+    }
+    let _ = enable_before_training(&mut sink, 20, true, false, true);
+    let regs = Regs::default();
+    let src = Rect::new(0, 0, 1920, 1080);
+    let full = Damage::Full;
+    let psr1 = Psr1 {
+        idle_frames: 0,
+        tps3: false,
+        wm_level_disabled: false,
+        tp1_wakeup_us: 0,
+        tp2_tp3_wakeup_us: 0,
+        display20: true,
+        entry_setup_frames: 0,
+    };
+    fn commit(damage: &Damage, src: Rect, cursor: Option<CursorPlane>) -> SuCommit<'_> {
+        SuCommit {
+            damage,
+            old_src: src,
+            src,
+            pipe_supported: true,
+            cursor,
+        }
+    }
+    let mut psr = match Psr::enable_replay(
+        &regs,
+        &mut sink,
+        psr1,
+        config,
+        1920,
+        1080,
+        &commit(&full, src, None),
+    ) {
+        Ok(psr) => psr,
+        Err(_) => return TestResult::Fail("the eDP replay must enable"),
+    };
+    let cursor = |y| CursorPlane {
+        dst: Rect::new(100, y, 164, y + 64),
+        ctl: MCURSOR_MODE_64_ARGB_AX,
+    };
+    // A: rows 101..103 touch a cursor at y 102: 101..166, aligned 100..168.
+    let band_a = Damage::Clips(alloc::vec![Rect::new(0, 101, 1920, 103)]);
+    let Some(sf) = psr.sel_fetch(&commit(&band_a, src, Some(cursor(102)))) else {
+        return TestResult::Fail("replay SU must compute a selective fetch");
+    };
+    if sf.full_update
+        || sf.su != (100, 168)
+        || sf.man_trk_ctl != (1 << 31) | (100 << 16) | 167
+        || sf.early_tpt != (1919 << 16) | 67
+        || sf.cursor != Some((Some((0, 64)), MCURSOR_MODE_64_ARGB_AX))
+        || sf.cursor_early_tpt != (2 << 16) | 100
+    {
+        return TestResult::Fail("early transport must cover the cursor it touches");
+    }
+    regs.writes.borrow_mut().clear();
+    psr.program_sel_fetch_arm(&regs, &sf);
+    psr.program_sel_fetch_cursor(&regs, &sf);
+    if regs.log()
+        != [
+            (0x60910, (1 << 31) | (100 << 16) | 167),
+            (0x70074, (1919 << 16) | 67),
+            (0x70890, 1 << 31),
+            (0x7008c, (2 << 16) | 100),
+            (0x70880, MCURSOR_MODE_64_ARGB_AX),
+            (0x70084, 0),
+        ]
+    {
+        return TestResult::Fail("MAN_TRK, PIPE_SRCSZ_ERLY_TPT and CURPOS_ERLY_TPT in arm order");
+    }
+    // B: rows 101..102 miss a cursor at y 103 until the 4-line alignment
+    // (100..104) reaches it: 100..167, aligned 100..168, cursor row 3.
+    let band_b = Damage::Clips(alloc::vec![Rect::new(0, 101, 1920, 102)]);
+    match psr.sel_fetch(&commit(&band_b, src, Some(cursor(103)))) {
+        Some(sf) if sf.su == (100, 168) && sf.cursor_early_tpt == (3 << 16) | 100 => {}
+        _ => return TestResult::Fail("an alignment that reaches the cursor must cover it"),
+    }
+    // C: the cursor (last fetched rows 0..64) leaves rows 500..504:
+    // Wa_16021440873 parks a 64x64 2-bit fetch at CURSOR_POS_Y(1081).
+    let band_c = Damage::Clips(alloc::vec![Rect::new(0, 500, 1920, 502)]);
+    let Some(sf) = psr.sel_fetch(&commit(&band_c, src, Some(cursor(102)))) else {
+        return TestResult::Fail("replay SU must compute a selective fetch");
+    };
+    if sf.su != (500, 504) || sf.cursor != Some((None, MCURSOR_MODE_64_ARGB_AX)) {
+        return TestResult::Fail("a cursor outside the area must leave the commit's fetch");
+    }
+    regs.writes.borrow_mut().clear();
+    psr.program_sel_fetch_cursor(&regs, &sf);
+    if regs.log() != [(0x70880, 0x04), (0x7008c, 1081 << 16), (0x70084, 0)] {
+        return TestResult::Fail("Wa_16021440873 must park the cursor fetch below the pipe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_psr",
+    smoke_panel_replay_region_early_transport_follows_intel_psr
 );

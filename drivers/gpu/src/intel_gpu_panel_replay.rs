@@ -46,7 +46,11 @@
 //! refused ([`Refusal::NotEnabledAtTraining`]). Selective update over
 //! Panel Replay runs with selective fetch (display 14+ have no PSR HW
 //! tracking) at the sink's granularity, through the PSR owner's
-//! selective-fetch programming ([`crate::intel_gpu_psr::Psr`]).
+//! selective-fetch programming ([`crate::intel_gpu_psr::Psr`]); on display
+//! 20+ eDP with region early transport (`psr2_su_region_et_valid`: the
+//! sink's `DP_PANEL_REPLAY_ENABLE_SU_REGION_ET`, `LNL_EDP_PSR2_SU_REGION_ET_ENABLE`,
+//! the SU area grown over the cursor, `PIPE_SRCSZ_ERLY_TPT` and the cursor's
+//! `CURPOS_ERLY_TPT`), except with DSC.
 //!
 //! The owned external DP SST routes run this owner behind their own option,
 //! `narf.intel.ext_panel_replay=1`, with frontbuffer tracking for their
@@ -832,11 +836,16 @@ pub(crate) fn compute(
         port: stream.port,
         su,
         su_y_granularity: u16::from(caps.su_y_granularity),
-        // psr2_su_region_et_valid would allow early transport on display
-        // 20+ eDP; the selective-fetch area code here has no early
-        // transport adjustments, so it stays off, as Linux's
-        // I915_PSR_DEBUG_SU_REGION_ET_DISABLE leaves it.
-        su_region_et: false,
+        // psr2_su_region_et_valid: display 20+ eDP with the sink's
+        // early-transport capability (eDP replay already requires it).
+        // Stricter than Linux: off with DSC, whose SU early-transport
+        // parameters (intel_dsc_su_et_parameters_configure) are not
+        // modelled.
+        su_region_et: su
+            && caps.edp
+            && stream.display_ver >= 20
+            && caps.dpcd[0] & DP_PANEL_REPLAY_EARLY_TRANSPORT_SUPPORT != 0
+            && !stream.dsc,
         sdp_prior_scanline: sdp_prior,
         alpm,
         wm_level_disabled,
@@ -1145,6 +1154,7 @@ impl PanelReplay {
             frames_before_su: 0,
             tp2_wakeup_us: 0,
             a0_to_b0: false,
+            su_region_et: self.config.su_region_et,
             width,
             height,
         })
@@ -1152,7 +1162,8 @@ impl PanelReplay {
 
     /// One commit's selective update over Panel Replay for the pipe's
     /// full-screen primary: the noarm `SEL_FETCH_PLANE_POS`, `_OFFSET`,
-    /// `_SIZE`, then `PSR2_MAN_TRK_CTL` and `SEL_FETCH_PLANE_CTL`
+    /// `_SIZE`, then `PSR2_MAN_TRK_CTL` (with early transport
+    /// `PIPE_SRCSZ_ERLY_TPT`) and `SEL_FETCH_PLANE_CTL`
     /// (`icl_plane_update_sel_fetch_noarm` / `_arm`,
     /// `intel_psr2_program_trans_man_trk_ctl`).
     pub fn program_sel_fetch<M: MmioWindow + ?Sized>(
@@ -1176,6 +1187,12 @@ impl PanelReplay {
             ((y2.wrapping_sub(y1).wrapping_sub(1) as u32) << 16) | u32::from(width).wrapping_sub(1),
         );
         regs.write32(psr2_man_trk_ctl(self.config.pipe), sf.man_trk_ctl);
+        if self.config.su_region_et {
+            regs.write32(
+                crate::intel_gpu_psr::PIPE_SRCSZ_ERLY_TPT + pipe,
+                sf.early_tpt,
+            );
+        }
         regs.write32(
             crate::intel_gpu_psr::SEL_FETCH_PLANE_CTL + pipe,
             if y2 > y1 {
