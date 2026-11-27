@@ -3,20 +3,22 @@
 //! `memory` reports reserve pressure only after retiring its page claim and
 //! dropping allocator/address-space locks. A stackful fault handler can then
 //! install its existing executor waker here and switch out until kswapd makes
-//! (or finishes attempting) progress. The table is deliberately fixed: a page
-//! fault must never grow a collection or allocate while handling a trap.
+//! (or finishes attempting) progress. A page fault must never grow a
+//! collection or allocate while handling a trap, so each waiting fault links
+//! an entry from its own kernel stack into its node's wait queue, as Linux's
+//! `reclaim_throttle` sleeps on `pgdat->reclaim_wait` with an on-stack entry:
+//! the queue has no capacity, and every fault the scheduler admitted can park.
 
+use core::cell::{Cell, UnsafeCell};
+use core::pin::Pin;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::Waker;
 
+use narf_lib::intrusive::{IntrusiveList, Node};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::reclaim::ReclaimTicket;
 use narf_memory::{AddressSpace, AddressSpaceError, VirtAddr, FRAME_MAX_NUMA_NODES};
-
-/// One slot for every user task the scheduler can admit. Consequently every
-/// live stackful user fault can park; `Full` remains a fail-safe for broken
-/// admission/accounting rather than an expected pressure behavior.
-const MAX_RECLAIM_WAITERS: usize = narf_scheduler::MAX_USER_TASKS;
 
 static RECLAIM_COMPLETED: [AtomicU32; FRAME_MAX_NUMA_NODES] =
     [const { AtomicU32::new(0) }; FRAME_MAX_NUMA_NODES];
@@ -26,35 +28,91 @@ static RECLAIM_COMPLETED: [AtomicU32; FRAME_MAX_NUMA_NODES] =
 /// inline, so each iteration below waits for one exact completed cycle.
 const MAX_RECLAIM_RETRIES: usize = 16;
 
+/// Wakers a completion takes out of a queue per pass. They are woken after
+/// the queue lock drops; the pass repeats until no matching entry is left
+/// unwoken, so this bounds lock hold time, not the number of waiters.
+const WAKE_BATCH: usize = 16;
+
 struct Waiter {
     ticket: ReclaimTicket,
-    waker: Waker,
+    /// Read only under the node queue lock.
+    waker: UnsafeCell<Option<Waker>>,
+    /// The completed sequence whose pass last took this entry's waker, so a
+    /// completion that wakes in batches visits each entry once.
+    woken_for: Cell<u32>,
 }
 
-static RECLAIM_WAITERS: [IrqSafeSpinLock<Option<Waiter>>; MAX_RECLAIM_WAITERS] =
-    [const { IrqSafeSpinLock::new(None) }; MAX_RECLAIM_WAITERS];
+/// Per-node queues of parked faults.
+static RECLAIM_WAITERS: [IrqSafeSpinLock<IntrusiveList<Waiter>>; FRAME_MAX_NUMA_NODES] =
+    [const { IrqSafeSpinLock::new(IntrusiveList::new()) }; FRAME_MAX_NUMA_NODES];
 
-struct Registration {
-    slot: usize,
+/// One fault's wait-queue entry, pinned on the faulting task's own kernel
+/// stack (its frame survives the switch-out).
+struct ReclaimWaiter {
+    entry: Node<Waiter>,
+    /// The node queue the entry is linked into, while linked.
+    linked: Cell<Option<usize>>,
 }
 
-impl Drop for Registration {
-    fn drop(&mut self) {
-        *RECLAIM_WAITERS[self.slot].lock() = None;
+impl ReclaimWaiter {
+    fn new(ticket: ReclaimTicket, waker: Waker) -> Self {
+        Self {
+            entry: Node::new(Waiter {
+                ticket,
+                waker: UnsafeCell::new(Some(waker)),
+                woken_for: Cell::new(0),
+            }),
+            linked: Cell::new(None),
+        }
+    }
+
+    /// Unlink the entry, if linked; its waker drops after the queue lock.
+    fn unlink(&self) {
+        let Some(node) = self.linked.take() else {
+            return;
+        };
+        let waker = {
+            let queue = RECLAIM_WAITERS[node].lock();
+            // SAFETY: `linked` says the entry is in exactly this queue, whose
+            // lock is held.
+            unsafe { queue.unlink(NonNull::from(&self.entry)) };
+            // SAFETY: unlinked under the lock; nothing else reaches the cell.
+            unsafe { (*self.entry.value.waker.get()).take() }
+        };
+        drop(waker);
+    }
+
+    /// `StackWait` detach for a task dropped while parked here.
+    ///
+    /// # Safety
+    /// `waiter` points at a live, pinned `ReclaimWaiter` whose task no longer
+    /// runs.
+    unsafe fn detach_raw(waiter: *const ()) {
+        // SAFETY: the caller's contract.
+        unsafe { (*waiter.cast::<ReclaimWaiter>()).unlink() };
     }
 }
 
-enum RegisterResult {
+/// Owns a linked entry; dropping it unlinks the entry.
+struct Registration<'a> {
+    waiter: Pin<&'a ReclaimWaiter>,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        self.waiter.unlink();
+    }
+}
+
+enum RegisterResult<'a> {
     /// A reclaim completion raced registration; retry without sleeping.
     RetryNow,
     /// The waiter is durably visible to every later completion.
-    Armed(Registration),
-    /// Fixed capacity is full; fail without allocating or busy-waiting.
-    Full,
+    Armed(Registration<'a>),
 }
 
 /// Sequence arithmetic over request IDs 1..=2^30-1. At most 2^29 requests
-/// may be outstanding on one node, vastly beyond the fixed waiter capacity.
+/// may be outstanding on one node, vastly beyond any number of waiters.
 fn sequence_reached(completed: u32, target: u32) -> bool {
     const MODULUS: u32 = 0x3fff_ffff;
     const HALF_RANGE: u32 = MODULUS / 2;
@@ -73,12 +131,22 @@ fn sequence_reached(completed: u32, target: u32) -> bool {
 /// failure was handled or its task exited.
 #[allow(dead_code)] // kswapd is compiled out of several test-only frame images.
 pub(crate) fn has_waiter_for(ticket: ReclaimTicket) -> bool {
-    RECLAIM_WAITERS.iter().any(|slot| {
-        slot.lock().as_ref().is_some_and(|waiter| {
-            waiter.ticket.node == ticket.node
-                && sequence_reached(ticket.sequence, waiter.ticket.sequence)
-        })
-    })
+    let Some(queue) = RECLAIM_WAITERS.get(ticket.node) else {
+        return false;
+    };
+    let queue = queue.lock();
+    let mut cursor = queue.front();
+    while let Some(entry) = cursor {
+        // SAFETY: linked into this queue, whose lock is held; owners unlink
+        // under the same lock before their stack frame goes.
+        let waiter = unsafe { &entry.as_ref().value };
+        if sequence_reached(ticket.sequence, waiter.ticket.sequence) {
+            return true;
+        }
+        // SAFETY: as above.
+        cursor = unsafe { queue.next(entry) };
+    }
+    false
 }
 
 fn ticket_completed(ticket: ReclaimTicket) -> bool {
@@ -87,29 +155,31 @@ fn ticket_completed(ticket: ReclaimTicket) -> bool {
     })
 }
 
-fn register_waiter(ticket: ReclaimTicket, waker: Waker) -> RegisterResult {
-    let mut waiter = Some(Waiter { ticket, waker });
-    for (slot_index, slot) in RECLAIM_WAITERS.iter().enumerate() {
-        let mut entry = slot.lock();
-        if entry.is_some() {
-            continue;
-        }
-        *entry = waiter.take();
-        drop(entry);
-
-        let registration = Registration { slot: slot_index };
-        // SeqCst makes the classic prepare-to-wait ordering explicit: either
-        // this load follows completion of the exact request and observes it,
-        // or completion follows this load and kswapd's subsequent scan sees
-        // the installed slot. There is no scan-before-install + stale-load
-        // gap, and an unrelated older cycle cannot satisfy this ticket.
-        if ticket_completed(ticket) {
-            drop(registration);
-            return RegisterResult::RetryNow;
-        }
-        return RegisterResult::Armed(registration);
+/// Link `waiter` into the queue of its ticket's node.
+fn register_waiter(mut waiter: Pin<&mut ReclaimWaiter>) -> RegisterResult<'_> {
+    let ticket = waiter.entry.value.ticket;
+    let node = ticket.node;
+    {
+        let queue = RECLAIM_WAITERS[node].lock();
+        // SAFETY: a structural pin projection — `entry` is never moved out —
+        // and `Registration` (or the stack-wait detach) unlinks it under this
+        // lock before its storage goes.
+        queue.push_back(unsafe { waiter.as_mut().map_unchecked_mut(|w| &mut w.entry) });
+        waiter.linked.set(Some(node));
     }
-    RegisterResult::Full
+    let registration = Registration {
+        waiter: waiter.into_ref(),
+    };
+    // SeqCst makes the classic prepare-to-wait ordering explicit: either
+    // this load follows completion of the exact request and observes it,
+    // or completion follows this load and kswapd's subsequent scan sees
+    // the linked entry. There is no scan-before-link + stale-load gap, and
+    // an unrelated older cycle cannot satisfy this ticket.
+    if ticket_completed(ticket) {
+        drop(registration);
+        return RegisterResult::RetryNow;
+    }
+    RegisterResult::Armed(registration)
 }
 
 /// Publish completion of one bounded reclaim/OOM balancing cycle and wake
@@ -118,41 +188,81 @@ fn register_waiter(ticket: ReclaimTicket, waker: Waker) -> RegisterResult {
 /// not published: neither proves that this fault's request has completed.
 /// Called only by the matching node's kswapd task context, never by a trap.
 ///
-/// Slots are cloned but deliberately not removed here. Their owners remove
-/// them after resume, so a newly registering waiter can never reuse a slot
-/// while an older owner is still capable of clearing it (ABA).
+/// Entries are left linked here. Their owners unlink them after resume, so
+/// an entry is never reused while an older owner could still unlink it.
 #[cfg_attr(
     any(feature = "boot-smoke", feature = "idt-selftest"),
     allow(dead_code)
 )]
 pub(crate) fn notify_reclaim_progress(ticket: ReclaimTicket) {
-    let Some(completed) = RECLAIM_COMPLETED.get(ticket.node) else {
+    let (Some(completed), Some(queue)) = (
+        RECLAIM_COMPLETED.get(ticket.node),
+        RECLAIM_WAITERS.get(ticket.node),
+    ) else {
         return;
     };
     completed.store(ticket.sequence, Ordering::SeqCst);
-    for slot in &RECLAIM_WAITERS {
-        let waker = slot.lock().as_ref().and_then(|waiter| {
-            (waiter.ticket.node == ticket.node
-                && sequence_reached(ticket.sequence, waiter.ticket.sequence))
-            .then(|| waiter.waker.clone())
-        });
-        if let Some(waker) = waker {
-            // Do not invoke scheduler wake code while holding a waiter lock.
+    loop {
+        let mut batch: [Option<Waker>; WAKE_BATCH] = [const { None }; WAKE_BATCH];
+        let mut taken = 0;
+        let mut more = false;
+        {
+            let queue = queue.lock();
+            let mut cursor = queue.front();
+            while let Some(entry) = cursor {
+                // SAFETY: linked into this queue, whose lock is held.
+                let waiter = unsafe { &entry.as_ref().value };
+                // SAFETY: as above.
+                cursor = unsafe { queue.next(entry) };
+                if waiter.woken_for.get() == ticket.sequence
+                    || !sequence_reached(ticket.sequence, waiter.ticket.sequence)
+                {
+                    continue;
+                }
+                if taken == WAKE_BATCH {
+                    more = true;
+                    break;
+                }
+                waiter.woken_for.set(ticket.sequence);
+                // SAFETY: the waker cell is read only under this lock.
+                batch[taken] = unsafe { (*waiter.waker.get()).clone() };
+                taken += 1;
+            }
+        }
+        // Do not invoke scheduler wake code while holding a waiter lock.
+        for waker in batch.iter_mut().take(taken).filter_map(Option::take) {
             waker.wake();
+        }
+        if !more {
+            return;
         }
     }
 }
 
 /// Park the current stackful task until reclaim advances. `false` is the safe
-/// fallback outside stackful execution or when the fixed waiter table is full.
+/// fallback outside stackful execution.
 fn park_until_reclaim(ticket: ReclaimTicket) -> bool {
     let Some(waker) = narf_scheduler::stackful::current_stackful_waker() else {
         return false;
     };
-    match register_waiter(ticket, waker) {
+    if ticket.node >= FRAME_MAX_NUMA_NODES {
+        return false;
+    }
+    let mut waiter = core::pin::pin!(ReclaimWaiter::new(ticket, waker));
+    let registered = register_waiter(waiter.as_mut());
+    match registered {
         RegisterResult::RetryNow => true,
-        RegisterResult::Full => false,
         RegisterResult::Armed(registration) => {
+            // SAFETY: `detach_raw` unlinks exactly this pinned entry and does
+            // not block; the scheduler calls it only once this task has
+            // stopped for good, while its stack (and so `waiter`) is mapped.
+            let stack_wait = core::pin::pin!(unsafe {
+                narf_scheduler::stackful::StackWait::new(
+                    core::ptr::from_ref(registration.waiter.get_ref()).cast(),
+                    ReclaimWaiter::detach_raw,
+                )
+            });
+            let record = narf_scheduler::stackful::record_stack_wait(stack_wait.as_ref());
             // The allocation path already cancelled its demand ticket and
             // returned through every address-space/allocator lock. The active
             // mempolicy slot is also cleared by `try_demand_page` below.
@@ -160,6 +270,7 @@ fn park_until_reclaim(ticket: ReclaimTicket) -> bool {
             // this CPU; yielding from its kernel trap continuation is the same
             // scheduler boundary used by blocking syscalls.
             unsafe { narf_scheduler::stackful::yield_current_stackful() };
+            drop(record);
             drop(registration);
             true
         }
@@ -280,9 +391,12 @@ mod tests {
         const NODE: usize = FRAME_MAX_NUMA_NODES - 1;
         WAKES.store(0, Ordering::Relaxed);
         let ticket = next_ticket(NODE);
-        let registration = match register_waiter(ticket, counting_waker()) {
+        let mut waiter = core::pin::pin!(ReclaimWaiter::new(ticket, counting_waker()));
+        let registration = match register_waiter(waiter.as_mut()) {
             RegisterResult::Armed(registration) => registration,
-            _ => return TestResult::Fail("fixed reclaim waiter could not register"),
+            RegisterResult::RetryNow => {
+                return TestResult::Fail("reclaim waiter could not register")
+            }
         };
         // An overlapping cycle on another node cannot satisfy this request.
         notify_reclaim_progress(next_ticket(NODE - 1));
@@ -301,14 +415,18 @@ mod tests {
         // not leave a waker installed for a cycle that already ended.
         let completed = next_ticket(NODE);
         notify_reclaim_progress(completed);
-        match register_waiter(completed, counting_waker()) {
-            RegisterResult::RetryNow => TestResult::Pass,
+        let mut late = core::pin::pin!(ReclaimWaiter::new(completed, counting_waker()));
+        match register_waiter(late.as_mut()) {
+            RegisterResult::RetryNow => {}
             RegisterResult::Armed(registration) => {
                 drop(registration);
-                TestResult::Fail("stale generation armed a sleeping waiter")
+                return TestResult::Fail("stale generation armed a sleeping waiter");
             }
-            RegisterResult::Full => TestResult::Fail("waiter table unexpectedly full"),
         }
+        if late.linked.get().is_some() {
+            return TestResult::Fail("a retried waiter stayed linked");
+        }
+        TestResult::Pass
     }
     kernel_test_in!("frame", smoke_reclaim_wait_registration_is_lost_wake_free);
 
@@ -322,14 +440,13 @@ mod tests {
         const WAITERS: usize = 1100;
         WAKES.store(0, Ordering::Relaxed);
         let ticket = next_ticket(NODE);
+        let mut waiters = (0..WAITERS)
+            .map(|_| alloc::boxed::Box::pin(ReclaimWaiter::new(ticket, counting_waker())))
+            .collect::<alloc::vec::Vec<_>>();
         let mut registrations = alloc::vec::Vec::with_capacity(WAITERS);
-        for _ in 0..WAITERS {
-            match register_waiter(ticket, counting_waker()) {
+        for waiter in waiters.iter_mut() {
+            match register_waiter(waiter.as_mut()) {
                 RegisterResult::Armed(registration) => registrations.push(registration),
-                RegisterResult::Full => {
-                    drop(registrations);
-                    return TestResult::Fail("a reclaim waiter past 1024 found the table full");
-                }
                 RegisterResult::RetryNow => {
                     drop(registrations);
                     return TestResult::Fail("an unfinished reclaim cycle forced a retry");
@@ -338,9 +455,20 @@ mod tests {
         }
         notify_reclaim_progress(ticket);
         let woken = WAKES.load(Ordering::Relaxed);
+        // Entries stay linked until their owners resume; publishing the same
+        // completed sequence again must not wake any of them twice.
+        notify_reclaim_progress(ticket);
+        let rewoken = WAKES.load(Ordering::Relaxed) - woken;
+        let any_waiter = has_waiter_for(ticket);
         drop(registrations);
         if woken != WAITERS {
             return TestResult::Fail("reclaim progress did not wake every waiter");
+        }
+        if rewoken != 0 {
+            return TestResult::Fail("one completion woke an entry twice");
+        }
+        if !any_waiter || has_waiter_for(ticket) {
+            return TestResult::Fail("has_waiter_for did not track the linked waiters");
         }
         TestResult::Pass
     }
