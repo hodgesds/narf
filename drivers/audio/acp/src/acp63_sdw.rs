@@ -36,9 +36,13 @@
 use crate::acp63_sdw_dma::AcpSdwDmaFactory;
 use crate::soundwire::{
     profile_for, Bus, CodecCard, Peripheral, SdwError, StreamConfig, Transport, BROADCAST_DEV_NUM,
+    RT711_CODEC_PROFILE,
 };
 use crate::{soundwire_rt1316, soundwire_rt711};
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -499,12 +503,67 @@ fn register_cards(cards: Vec<Arc<CodecCard<AcpSdwTransport>>>, addr: narf_bus::B
         if capture_card.is_none() {
             capture_card = Some(index);
         }
+        // RT711 cards get an interrupt service task: the manager
+        // has no alert IRQ route for slave interrupts, so the task
+        // polls SCP INT1 on the tree's 2 ms audio service cadence
+        // (HDA stream service, ACP PDM service) and runs the 250 ms
+        // deferred jack detection on impl-def alerts, reporting
+        // plug/unplug to the mixer jack sink.
+        if profile == RT711_CODEC_PROFILE {
+            spawn_rt711_jack_service(Arc::downgrade(&card.bus()), card.dev_num(), index);
+        }
         registered.push(card);
     }
     Bound {
         cards: registered,
         capture_card: capture_card.unwrap_or(0),
     }
+}
+
+/// Service loop for one RT711 codec's SDW impl-def interrupts:
+/// consume the pending SCP INT1 alert, arm the 250 ms deferred
+/// jack detection on the impl-def bit, and report a detected
+/// plug/unplug to the mixer jack sink (Linux
+/// `sdw_handle_slave_alerts` → `rt711_interrupt_callback` →
+/// `rt711_jack_detect_handler` → `snd_soc_jack_report`).
+///
+/// The ACP manager has no alert IRQ route for slave interrupts,
+/// so the loop polls on the tree's 2 ms audio service cadence
+/// (HDA stream service, ACP PDM service), exactly as a controller
+/// without an interrupt route keeps its service loop. The impl-def
+/// unmask is programmed here at attach (Linux programs INTMASK1
+/// from `scp_int1_mask` at slave init) and retried until it
+/// sticks, so a transport hiccup at probe time does not lose
+/// interrupts permanently; a failed alert read just skips the
+/// tick. The task ends when the bus is dropped.
+fn spawn_rt711_jack_service(
+    bus: Weak<IrqSafeSpinLock<Bus<AcpSdwTransport>>>,
+    dev_num: u8,
+    card_index: u32,
+) {
+    narf_scheduler::spawn(async move {
+        let mut detector = crate::soundwire_rt711::JackDetector::new();
+        let mut unmasked = false;
+        loop {
+            narf_time::SleepUntil::new(Deadline::after_ms(2).as_instant()).await;
+            let Some(bus) = bus.upgrade() else {
+                break;
+            };
+            let outcome = {
+                let bus = bus.lock();
+                if !unmasked {
+                    unmasked = bus.enable_impl_def_interrupt(dev_num).is_ok();
+                }
+                crate::soundwire_rt711::service_interrupt(&bus, dev_num, &mut detector)
+            };
+            if let Ok(crate::soundwire_rt711::JackDetectOutcome::Done(Ok(state))) = outcome {
+                narf_drivers_sound::mixer::jack_event(
+                    card_index as usize,
+                    state != crate::soundwire_rt711::JackState::Out,
+                );
+            }
+        }
+    });
 }
 
 /// Bind SoundWire codecs on an ACP function the PDM probe already

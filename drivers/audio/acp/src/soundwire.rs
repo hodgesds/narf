@@ -24,8 +24,18 @@
 //!   manager-frame concern and is out of scope: streams here are
 //!   configured while stopped, like the HDA/ACP paths in this crate.
 //!
+//! - Interrupt dispatch mirrors `sdw_handle_slave_alerts`
+//!   (`drivers/soundwire/bus.c`)'s SCP INT1 half: read INT1, decode
+//!   parity/bus-clash/impl-def, acknowledge the fired bits by
+//!   writing them back, and report the impl-def bit only when it is
+//!   unmasked in INTMASK1. Port/cascade dispatch is not implemented
+//!   yet; the codec layer (`crate::soundwire_rt711`) turns an
+//!   impl-def alert into 250 ms deferred jack detection.
+//!
 //! Register addresses are the MIPI-standard SCP/DPn map, as in Linux
-//! `include/linux/soundwire/sdw_registers.h`.
+//! `include/linux/soundwire/sdw_registers.h` (MIPI SoundWire 1.2:
+//! the SCP block lives at 0x40-0x55, the DP0 block at 0x00-0x3F, DPn
+//! blocks at 0x100*n).
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use narf_drivers_sound::{
@@ -38,15 +48,27 @@ use narf_time::Deadline;
 
 /// MIPI-standard SoundWire register map (peripheral side).
 pub mod regs {
-    /// SCP interrupt status/mask block.
-    pub const SCP_INT1: u32 = 0x0000;
-    /// SCP interrupt status 1 (read-to-clear source status).
-    pub const SCP_INTSTAT1: u32 = 0x0001;
-    /// SCP control (clock-stop request lives here).
-    pub const SCP_CONTROL: u32 = 0x0007;
-    /// SCP port state for the control port: low 3 bits mirror the PING
-    /// encoding (0 = unattached, 1 = attached, 2 = alert).
-    pub const SCP_PORTSTATE: u32 = 0x0040;
+    /// SCP interrupt status (Linux `SDW_SCP_INT1`, 0x40): the fired
+    /// INT1 sources. The INT and STATUS views are the same
+    /// register; a fired bit is acknowledged by writing it back
+    /// (write-1-to-clear), as `sdw_handle_slave_alerts` does —
+    /// this register is *not* read-to-clear.
+    pub const SCP_INT1: u32 = 0x0040;
+    /// SCP interrupt mask 1 (Linux `SDW_SCP_INTMASK1`, 0x41): a set
+    /// bit enables that INT1 source. Linux programs it from the
+    /// codec's `scp_int1_mask` at slave init (`sdw_initialize_slave`).
+    pub const SCP_INTMASK1: u32 = 0x0041;
+    /// SCP INT1 parity-error bit (Linux `SDW_SCP_INT1_PARITY`).
+    pub const SCP_INT1_PARITY: u8 = 0x01;
+    /// SCP INT1 bus-clash bit (Linux `SDW_SCP_INT1_BUS_CLASH`).
+    pub const SCP_INT1_BUS_CLASH: u8 = 0x02;
+    /// SCP INT1 implementation-defined bit (Linux
+    /// `SDW_SCP_INT1_IMPL_DEF`, BIT(2)): the codec jack-detect
+    /// trigger on RT711.
+    pub const SCP_INT1_IMPL_DEF: u8 = 0x04;
+    /// SCP control (Linux `SDW_SCP_CTRL`, 0x44; clock-stop request
+    /// lives here).
+    pub const SCP_CONTROL: u32 = 0x0044;
     /// SCP device number: the manager writes the assigned number here
     /// while the peripheral still listens on the enumeration address.
     pub const SCP_DEVNUMBER: u32 = 0x0046;
@@ -368,6 +390,86 @@ impl<T: Transport> Bus<T> {
     pub fn port_deprepare(&self, dev: u8, port: u8) -> Result<(), SdwError> {
         self.write_reg(dev, port_base(port)? + regs::DPN_PREPARE, 0)
     }
+
+    /// Consume one pending SCP interrupt for `dev`: the SCP INT1
+    /// half of Linux's `sdw_handle_slave_alerts`
+    /// (`drivers/soundwire/bus.c`). Reads `SCP_INT1` and
+    /// `SCP_INTMASK1`, decodes the fired sources, and acknowledges
+    /// the handled bits by writing them back to `SCP_INT1`
+    /// (write-1-to-clear; the status register itself is not
+    /// read-to-clear).
+    ///
+    /// Parity and bus-clash report the raw fired bit (a diagnostic
+    /// fact, as in Linux's error logging); the impl-def bit is
+    /// reported only when it fired *and* is unmasked in INTMASK1,
+    /// exactly as Linux gates the codec callback on
+    /// `scp_int1_mask` — a masked impl-def alert is acknowledged
+    /// but not dispatched. DPn port bits (INT1 bits 3-6) and the
+    /// SCP2 cascade (bit 7) ride in `raw` undecoded and are not
+    /// acknowledged: DPn/cascade dispatch is a remainder, and this
+    /// function must not clear a source it did not handle.
+    ///
+    /// A failed INT1 or INTMASK1 read, or a failed acknowledge
+    /// write, fails closed with the interrupt still pending (the
+    /// caller retries on its next service tick). A status of zero
+    /// writes nothing back.
+    pub fn handle_alert(&self, dev: u8) -> Result<ScpAlert, SdwError> {
+        let raw = self.read_reg(dev, regs::SCP_INT1)?;
+        let mask = self.read_reg(dev, regs::SCP_INTMASK1)?;
+        let mut clear = 0u8;
+        if raw & regs::SCP_INT1_PARITY != 0 {
+            clear |= regs::SCP_INT1_PARITY;
+        }
+        if raw & regs::SCP_INT1_BUS_CLASH != 0 {
+            clear |= regs::SCP_INT1_BUS_CLASH;
+        }
+        if raw & regs::SCP_INT1_IMPL_DEF != 0 {
+            clear |= regs::SCP_INT1_IMPL_DEF;
+        }
+        if clear != 0 {
+            self.write_reg(dev, regs::SCP_INT1, clear)?;
+        }
+        Ok(ScpAlert {
+            raw,
+            parity: raw & regs::SCP_INT1_PARITY != 0,
+            bus_clash: raw & regs::SCP_INT1_BUS_CLASH != 0,
+            impl_def: raw & regs::SCP_INT1_IMPL_DEF != 0 && mask & regs::SCP_INT1_IMPL_DEF != 0,
+        })
+    }
+
+    /// Enable the implementation-defined SCP interrupt for `dev`
+    /// (Linux programs `SDW_SCP_INTMASK1` from the codec's
+    /// `scp_int1_mask` at slave init; RT711's mask is impl-def |
+    /// bus-clash | parity): read-modify-write INTMASK1, setting
+    /// only the impl-def bit and leaving the rest alone. Already
+    /// set is a no-op that writes nothing.
+    pub fn enable_impl_def_interrupt(&self, dev: u8) -> Result<(), SdwError> {
+        let mask = self.read_reg(dev, regs::SCP_INTMASK1)?;
+        if mask & regs::SCP_INT1_IMPL_DEF != 0 {
+            return Ok(());
+        }
+        self.write_reg(dev, regs::SCP_INTMASK1, mask | regs::SCP_INT1_IMPL_DEF)
+    }
+}
+
+/// One consumed SCP INT1 alert, as decoded by
+/// [`Bus::handle_alert`] (Linux `sdw_slave_intr_status`'s
+/// `control_port` byte, decoded). `raw` carries every fired bit,
+/// including the DPn port and cascade sources this dispatch does
+/// not handle; `parity` and `bus_clash` report their raw fired
+/// bits; `impl_def` is set only when the impl-def bit fired while
+/// unmasked in INTMASK1 — the only case the codec callback runs for.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScpAlert {
+    /// Raw `SCP_INT1` byte read from the peripheral.
+    pub raw: u8,
+    /// Parity-error bit fired.
+    pub parity: bool,
+    /// Bus-clash bit fired.
+    pub bus_clash: bool,
+    /// Implementation-defined bit fired while unmasked: dispatch
+    /// the codec interrupt callback for this alert.
+    pub impl_def: bool,
 }
 
 fn port_base(port: u8) -> Result<u32, SdwError> {
@@ -592,6 +694,17 @@ impl<T: Transport> CodecCard<T> {
     /// endpoint counts from it).
     pub fn profile(&self) -> CodecProfile {
         self.profile
+    }
+
+    /// The shared bus this card's streams run on (the ACP binding
+    /// uses it for the per-codec interrupt service task).
+    pub fn bus(&self) -> Arc<IrqSafeSpinLock<Bus<T>>> {
+        self.bus.clone()
+    }
+
+    /// The assigned device number this card drives.
+    pub fn dev_num(&self) -> u8 {
+        self.dev_num
     }
 
     /// Install the platform payload engine factory. The ACP binding
@@ -913,7 +1026,6 @@ mod tests {
             for (i, byte) in id.iter().enumerate() {
                 regs.insert(regs::SCP_DEVID_0 + i as u32, *byte);
             }
-            regs.insert(regs::SCP_PORTSTATE, 1);
             Self {
                 id,
                 regs,
@@ -959,6 +1071,16 @@ mod tests {
         }
         fn log(&self) -> Vec<Xfer> {
             self.log.lock().clone()
+        }
+        /// Raise SCP INT1 bits on an assigned peripheral (fixture
+        /// injection: the model peripheral asserting its alert
+        /// line). Bits stay raised until the bus acknowledges them
+        /// with the INT1 write-back.
+        fn raise_int1(&self, dev: u8, bits: u8) {
+            if let Some(peripheral) = self.assigned.lock().get_mut(&dev) {
+                let entry = peripheral.regs.entry(regs::SCP_INT1).or_insert(0);
+                *entry |= bits;
+            }
         }
     }
 
@@ -1020,6 +1142,13 @@ mod tests {
                 return Err(SdwError::NoResponse);
             };
             if let Some(value) = write {
+                if addr == regs::SCP_INT1 {
+                    // INT1 is write-1-to-clear (Linux acknowledges
+                    // an alert by writing the fired bits back).
+                    let entry = peripheral.regs.entry(addr).or_insert(0);
+                    *entry &= !value;
+                    return Ok(None);
+                }
                 peripheral.regs.insert(addr, value);
                 return Ok(None);
             }
@@ -1143,10 +1272,10 @@ mod tests {
         if bus.write_reg(BROADCAST_DEV_NUM, regs::SCP_CONTROL, 0) != Ok(()) {
             return TestResult::Fail("broadcast write rejected");
         }
-        if bus.read_reg(9, regs::SCP_PORTSTATE) != Err(SdwError::NoResponse) {
+        if bus.read_reg(9, regs::SCP_INT1) != Err(SdwError::NoResponse) {
             return TestResult::Fail("absent peripheral read must fail");
         }
-        if bus.read_reg(0, regs::SCP_PORTSTATE) != Err(SdwError::InvalidDevice) {
+        if bus.read_reg(0, regs::SCP_INT1) != Err(SdwError::InvalidDevice) {
             return TestResult::Fail("enumeration-address read must be rejected");
         }
         TestResult::Pass
@@ -1258,6 +1387,194 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/soundwire", absent_and_stuck_peripherals_fail_closed);
+
+    fn scp_int1_impl_def_alert_dispatches_and_acks() -> TestResult {
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        // Unmask impl-def, then raise it: the alert must dispatch.
+        if bus.write_reg(1, regs::SCP_INTMASK1, regs::SCP_INT1_IMPL_DEF) != Ok(()) {
+            return TestResult::Fail("INTMASK1 write failed");
+        }
+        bus.transport().raise_int1(1, regs::SCP_INT1_IMPL_DEF);
+        let before = bus.transport().log().len();
+        let alert = match bus.handle_alert(1) {
+            Ok(alert) => alert,
+            Err(_) => return TestResult::Fail("handle_alert failed"),
+        };
+        if alert
+            != (ScpAlert {
+                raw: regs::SCP_INT1_IMPL_DEF,
+                parity: false,
+                bus_clash: false,
+                impl_def: true,
+            })
+        {
+            return TestResult::Fail("impl-def alert misdecoded");
+        }
+        // The conversation: read INT1, read INTMASK1, acknowledge
+        // the fired bit by writing it back.
+        let log = bus.transport().log();
+        if log[before..]
+            != [
+                Xfer {
+                    dev: 1,
+                    addr: regs::SCP_INT1,
+                    write: None,
+                },
+                Xfer {
+                    dev: 1,
+                    addr: regs::SCP_INTMASK1,
+                    write: None,
+                },
+                Xfer {
+                    dev: 1,
+                    addr: regs::SCP_INT1,
+                    write: Some(regs::SCP_INT1_IMPL_DEF),
+                },
+            ]
+        {
+            return TestResult::Fail("alert conversation mismatch");
+        }
+        // Consumed: a second dispatch sees nothing pending.
+        match bus.handle_alert(1) {
+            Ok(alert) if alert == ScpAlert::default() => {}
+            _ => return TestResult::Fail("acked alert must not re-fire"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/soundwire",
+        scp_int1_impl_def_alert_dispatches_and_acks
+    );
+
+    fn scp_int1_masked_impl_def_is_acked_not_dispatched() -> TestResult {
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        // INTMASK1 stays 0: the impl-def bit fires but must not
+        // dispatch — yet it is still acknowledged, not left pending.
+        bus.transport().raise_int1(1, regs::SCP_INT1_IMPL_DEF);
+        let alert = match bus.handle_alert(1) {
+            Ok(alert) => alert,
+            Err(_) => return TestResult::Fail("handle_alert failed"),
+        };
+        if alert.impl_def || alert.raw != regs::SCP_INT1_IMPL_DEF {
+            return TestResult::Fail("masked impl-def must not dispatch");
+        }
+        match bus.handle_alert(1) {
+            Ok(alert) if alert == ScpAlert::default() => {}
+            _ => return TestResult::Fail("masked alert must still be acked"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "audio/soundwire",
+        scp_int1_masked_impl_def_is_acked_not_dispatched
+    );
+
+    fn scp_int1_parity_and_bus_clash_are_acked() -> TestResult {
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        bus.transport()
+            .raise_int1(1, regs::SCP_INT1_PARITY | regs::SCP_INT1_BUS_CLASH);
+        let before = bus.transport().log().len();
+        let alert = match bus.handle_alert(1) {
+            Ok(alert) => alert,
+            Err(_) => return TestResult::Fail("handle_alert failed"),
+        };
+        if alert
+            != (ScpAlert {
+                raw: regs::SCP_INT1_PARITY | regs::SCP_INT1_BUS_CLASH,
+                parity: true,
+                bus_clash: true,
+                impl_def: false,
+            })
+        {
+            return TestResult::Fail("parity/bus-clash alert misdecoded");
+        }
+        // Both bits are acknowledged in one write-back.
+        let log = bus.transport().log();
+        if log[before..].last()
+            != Some(&Xfer {
+                dev: 1,
+                addr: regs::SCP_INT1,
+                write: Some(regs::SCP_INT1_PARITY | regs::SCP_INT1_BUS_CLASH),
+            })
+        {
+            return TestResult::Fail("parity/bus-clash ack mismatch");
+        }
+        match bus.handle_alert(1) {
+            Ok(alert) if alert == ScpAlert::default() => {}
+            _ => return TestResult::Fail("acked alert must not re-fire"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire", scp_int1_parity_and_bus_clash_are_acked);
+
+    fn enable_impl_def_interrupt_sets_mask_bit() -> TestResult {
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        // INTMASK1 starts 0: enable sets the impl-def bit.
+        if bus.enable_impl_def_interrupt(1) != Ok(()) {
+            return TestResult::Fail("enable failed");
+        }
+        if bus.read_reg(1, regs::SCP_INTMASK1) != Ok(regs::SCP_INT1_IMPL_DEF) {
+            return TestResult::Fail("impl-def bit not set");
+        }
+        // The other bits are preserved: preset bus-clash, enable
+        // again, and the mask becomes impl-def | bus-clash.
+        if bus.write_reg(1, regs::SCP_INTMASK1, regs::SCP_INT1_BUS_CLASH) != Ok(()) {
+            return TestResult::Fail("INTMASK1 preset failed");
+        }
+        if bus.enable_impl_def_interrupt(1) != Ok(()) {
+            return TestResult::Fail("re-enable failed");
+        }
+        if bus.read_reg(1, regs::SCP_INTMASK1)
+            != Ok(regs::SCP_INT1_IMPL_DEF | regs::SCP_INT1_BUS_CLASH)
+        {
+            return TestResult::Fail("other mask bits not preserved");
+        }
+        // Already set: a further enable reads once and writes
+        // nothing.
+        let before = bus.transport().log().len();
+        if bus.enable_impl_def_interrupt(1) != Ok(()) {
+            return TestResult::Fail("no-op enable failed");
+        }
+        let log = bus.transport().log();
+        if log[before..]
+            != [Xfer {
+                dev: 1,
+                addr: regs::SCP_INTMASK1,
+                write: None,
+            }]
+        {
+            return TestResult::Fail("no-op enable must not write");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire", enable_impl_def_interrupt_sets_mask_bit);
+
+    fn handle_alert_fails_closed() -> TestResult {
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        if bus.handle_alert(9) != Err(SdwError::NoResponse) {
+            return TestResult::Fail("absent peripheral alert must fail");
+        }
+        if bus.handle_alert(0) != Err(SdwError::InvalidDevice) {
+            return TestResult::Fail("enumeration-address alert must be rejected");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire", handle_alert_fails_closed);
 
     fn sdw_pcm_moves_samples_through_dma_engine() -> TestResult {
         use crate::acp63_sdw_dma::{FakeDmaFactory, FakeRegs};

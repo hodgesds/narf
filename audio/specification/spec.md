@@ -246,7 +246,14 @@ surface programs a data port's transport parameters (`DPn_BLOCKCTRL1`
 word length, `DPn_SAMPLECTRL1/2` sample interval), writes `DPn_PREPARE`
 and polls its NotFinished bits under a bounded wait, then sets
 `DPn_CHANNELEN` to enable and clears it to disable, clearing
-`DPN_PREPARE` on deprepare. Streams are configured while stopped;
+`DPN_PREPARE` on deprepare. Interrupt dispatch consumes the
+pending SCP interrupt (`Bus::handle_alert`: read SCP INT1, decode
+parity/bus-clash/impl-def, acknowledge the fired bits by writing
+them back, and report impl-def only when unmasked in SCP
+INTMASK1, as Linux's `sdw_handle_slave_alerts` does);
+`Bus::enable_impl_def_interrupt` programs the INTMASK1 impl-def
+bit. Port/cascade dispatch is not implemented yet. Streams are
+configured while stopped;
 glitchless bank switching mid-stream is out of scope. SDCA register
 access at or above 0x8000 is paged through SCP_ADDRPAGE1/2 (Linux
 `sdw_fill_msg`); peripherals that declare no paging support (RT711)
@@ -274,10 +281,13 @@ else keeps the generic profile (DP1 sink + DP1 source, stereo S16LE
 RT711 I/O init (HDA-verb-over-SoundWire sequences, jack setup) and
 RT1316 I/O init (SDCA blind-write table) — and a failed init fails
 the bind closed with no half-initialised card published. A bus with
-no answering codec publishes nothing. The RT711 jack state machine
-(`soundwire_rt711::jack_detect`, polled — pin sense plus combo-jack
-auto-detect status, since the bus layer has no interrupt dispatch)
-and the RT1316 smart-amp power/mute sequences
+no answering codec publishes nothing. The RT711 jack state machine is interrupt-driven: an SCP INT1
+impl-def alert arms 250 ms deferred work that runs
+`soundwire_rt711::jack_detect` (pin sense plus combo-jack
+auto-detect status), with the polled `jack_detect` kept as the
+fallback where no interrupt can arrive; the ACP binding runs the
+service loop per RT711 card and reports plug/unplug to the mixer
+jack sink. The RT1316 smart-amp power/mute sequences
 (`soundwire_rt1316::amp_enable` / `amp_disable`) are available to
 consumers; RT711 clock configuration (`clock_config`) is implemented
 but not yet wired into stream setup (see #1606). The card
