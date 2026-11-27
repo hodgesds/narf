@@ -210,6 +210,19 @@ impl Profile {
         out[31..34].copy_from_slice(&self.peer_mcs[3..6]);
         out
     }
+    /// mac80211 `agg.max_amsdu_len` from the peer's EHT MAC Maximum
+    /// MPDU Length (`IEEE80211_EHT_MAC_CAP0_MAX_MPDU_LEN_MASK` = 0xc0:
+    /// 0 = 3895, 1 = 7991, 2 = 11454, otherwise 3895).
+    /// `ieee80211_eht_cap_ie_to_sta_eht_cap` applies it on 2.4 GHz only
+    /// (`net/mac80211/eht.c:80-102`), where it replaces the HT value;
+    /// the field is reserved elsewhere.
+    pub(crate) fn max_amsdu_len_24(self) -> u16 {
+        match (self.peer_mac[0] & 0xc0) >> 6 {
+            2 => 11454,
+            1 => 7991,
+            _ => 3895,
+        }
+    }
     pub(crate) fn rx_limits(self) -> EhtRx {
         let mcs15 = match self.width {
             0 | 1 => self.local_phy6 & MCS15_20MHZ != 0,

@@ -8,10 +8,11 @@ use crate::mt7921::firmware_transport::{NicCapabilities, PhyCapabilities, Report
 use crate::mt7921::vif_slots::Vif;
 use crate::mt7925::mcu::{
     UniBssHe, UniBssRlm, UniBssSec, BA_TYPE_RECIPIENT, BSS_SEC_MODE_WPA2_PSK,
-    CONNAC3_CIPHER_AES_CCMP, RLM_BAND_5G, RLM_BW_160, RLM_BW_320, STA_REC_BA,
-    STA_REC_BASIC_TLV_SIZE, STA_REC_EHT, STA_REC_EHT_MLD, STA_REC_EHT_MLD_TLV_SIZE,
-    STA_REC_EHT_TLV_SIZE, STA_REC_MLD, STA_REC_MLD_TLV_SIZE, STA_REC_STATE_TLV_SIZE,
-    STA_REQ_HDR_SIZE, UNI_BSS_MLD_TLV_SIZE, UNI_BSS_UPDATE_BOUND,
+    CONNAC3_CIPHER_AES_CCMP, RLM_BAND_5G, RLM_BW_160, RLM_BW_320, STA_REC_BA, STA_REC_BASIC,
+    STA_REC_EHT, STA_REC_EHT_MLD, STA_REC_EHT_MLD_TLV_SIZE, STA_REC_EHT_TLV_SIZE,
+    STA_REC_HDR_TRANS, STA_REC_HE_V2, STA_REC_HT, STA_REC_HW_AMSDU, STA_REC_MLD,
+    STA_REC_MLD_TLV_SIZE, STA_REC_PHY, STA_REC_RA, STA_REC_STATE, STA_REC_VHT, STA_REQ_HDR_SIZE,
+    UNI_BSS_MLD_TLV_SIZE, UNI_BSS_UPDATE_BOUND, UNI_STA_UPDATE_BOUND,
 };
 use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -348,25 +349,94 @@ fn mt76_mlo_single_link_add_teardown() -> TestResult {
     }
     let sta_record = &messages[1].body;
     if sta_record.len()
-        != STA_REQ_HDR_SIZE
-            + STA_REC_BASIC_TLV_SIZE
-            + STA_REC_STATE_TLV_SIZE
-            + plan.uni_cap_tlvs(true).len()
+        != UNI_STA_UPDATE_BOUND + STA_REC_MLD_TLV_SIZE + plan.uni_sta_caps(true).cap_tlvs.len()
     {
         return TestResult::Fail("single-link STA record length wrong");
     }
-    // The negotiated EHT record rides the UNI update; no MLD TLVs
-    // on a single-link station.
+    // mt7925_mcu_sta_cmd order (v7.0-rc7 mcu.c:1977-2007) for a 5 GHz
+    // HT/VHT/HE/EHT peer on a non-MLD vif: no UAPSD (AP vifs only),
+    // HE only as HE_V2, no HE_6G (no 6 GHz capability), the MLD TLV
+    // but no EHT MLD, HDR_TRANS last.
+    let mut tags = Vec::new();
+    let mut offset = STA_REQ_HDR_SIZE;
+    while let Some(header) = sta_record.get(offset..offset + 4) {
+        tags.push(u16::from_le_bytes([header[0], header[1]]));
+        offset += usize::from(u16::from_le_bytes([header[2], header[3]]));
+    }
+    if tags
+        != [
+            STA_REC_BASIC,
+            STA_REC_PHY,
+            STA_REC_HT,
+            STA_REC_VHT,
+            STA_REC_HW_AMSDU,
+            STA_REC_HE_V2,
+            STA_REC_EHT,
+            STA_REC_RA,
+            STA_REC_STATE,
+            STA_REC_MLD,
+            STA_REC_HDR_TRANS,
+        ]
+        || u16::from_le_bytes([sta_record[2], sta_record[3]]) as usize != tags.len()
+    {
+        return TestResult::Fail("single-link STA record TLV order wrong");
+    }
+    // The negotiated EHT/HE/VHT records ride the UNI update as built
+    // by the shared profile builders.
     let Some(eht) = find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_EHT) else {
         return TestResult::Fail("single-link STA record has no EHT TLV");
     };
     if eht.len() != STA_REC_EHT_TLV_SIZE || eht[..] != plan.eht().unwrap().sta()[..] {
         return TestResult::Fail("single-link STA EHT TLV is not the negotiated profile");
     }
-    if find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_MLD).is_some()
+    if find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_HE_V2)
+        != Some(&plan.he().unwrap().sta_v2()[..])
+        || find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_VHT)
+            != Some(&plan.vht().unwrap().sta()[..])
+    {
+        return TestResult::Fail("single-link STA HE_V2/VHT TLV is not the negotiated profile");
+    }
+    // PHY: OFDM | HT | VHT | HE | BE; basic 6/12/24 Mbps on the
+    // 8-entry 5 GHz table (bits 0, 2, 4); the HT factor 2 / density 7
+    // (`ht[2] = 30`) and the VHT exponent 2 (`cap = 0x01000020`), so
+    // af = max(2, 2) and max_ampdu_len = 2.
+    if find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_PHY)
+        != Some(&[0x15, 0, 12, 0, 0x15, 0, 0xf8, 2 | (7 << 2), 0, 0, 2, 0][..])
+    {
+        return TestResult::Fail("single-link STA PHY TLV wrong");
+    }
+    // HW_AMSDU: the VHT Maximum MPDU Length 0 (3895) gives
+    // max_mpdu_size 0.
+    if find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_HW_AMSDU)
+        != Some(&[15, 0, 8, 0, 8, 0, 1, 0][..])
+    {
+        return TestResult::Fail("single-link STA HW_AMSDU TLV wrong");
+    }
+    // RA: OFDM-only legacy map (supported 6/12/24 << 6).
+    let Some(ra) = find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_RA) else {
+        return TestResult::Fail("single-link STA record has no RA TLV");
+    };
+    if ra.len() != 16 || ra[4..6] != 0x0540u16.to_le_bytes() || ra[6] == 0 {
+        return TestResult::Fail("single-link STA RA TLV wrong");
+    }
+    // STATE_V2: ASSOC at +4, vht_opmode = bandwidth | rx_nss << 4.
+    let vht = plan.vht().unwrap();
+    let Some(state) = find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_STATE) else {
+        return TestResult::Fail("single-link STA record has no STATE TLV");
+    };
+    if state.len() != 16
+        || state[4] != 2
+        || state[12] != vht.width() | (vht.transmit_streams() << 4)
+    {
+        return TestResult::Fail("single-link STA STATE_V2 TLV wrong");
+    }
+    // Non-MLD vif: STA_REC_MLD with the AP address and link_num 0,
+    // and no EHT MLD.
+    if find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_MLD)
+        .is_none_or(|mld| mld[4..10] != AP || mld[16] != 0)
         || find_tlv(sta_record, STA_REQ_HDR_SIZE, STA_REC_EHT_MLD).is_some()
     {
-        return TestResult::Fail("single-link STA record carries MLD TLVs");
+        return TestResult::Fail("single-link STA record MLD TLVs wrong");
     }
     if station.primary_state() != LinkState::Associated || station.is_mld() {
         return TestResult::Fail("single-link station state wrong after add");

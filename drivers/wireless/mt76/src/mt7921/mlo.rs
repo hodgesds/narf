@@ -22,7 +22,11 @@
 //!   `mld->link[2]`).
 //! - The station update emits `sta_rec_eht` + `sta_rec_mld` +
 //!   `sta_rec_eht_mld` together (`:2182-2202`); the MLD pair only
-//!   when the state is not NONE and the vif is an MLD vif.
+//!   when the state is not NONE. In Linux v7.0-rc7
+//!   (`mt7925/mcu.c:1995-1998`) `sta_rec_mld` has no MLD-vif gate —
+//!   a non-MLD vif sends it with `link_num = 0` — and only
+//!   `sta_rec_eht_mld` requires `ieee80211_vif_is_mld`; NARF follows
+//!   v7.0-rc7 (`build_uni_sta_update_req`).
 //! - Removal is `STA_REC_REMOVE` + bare `STA_REC_MLD_OFF`
 //!   (`:2237-2244`).
 //! - BSS info is one message per link

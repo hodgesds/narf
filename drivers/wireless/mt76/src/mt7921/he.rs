@@ -331,6 +331,11 @@ impl Profile {
         out
     }
     /// 28-byte `struct sta_rec_he_v2` (`mt76_connac_mcu_sta_he_tlv_v2`).
+    /// Shared by both generations: CONNAC2 sends it after [`Self::sta`]
+    /// (`mt76_connac_mcu_sta_tlv`), while the MT7925 UNI update sends it
+    /// alone — `mt7925_mcu_sta_he_tlv` (`mt7925/mcu.c:1636-1642`) calls
+    /// only `mt76_connac_mcu_sta_he_tlv_v2` (see
+    /// `JoinPlan::uni_sta_caps`).
     pub(crate) fn sta_v2(self) -> Vec<u8> {
         let mut out = vec![0u8; 28];
         out[..2].copy_from_slice(&STA_REC_HE_V2.to_le_bytes());
