@@ -300,3 +300,180 @@ fn smoke_intel_hdcp_mst_layouts() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/intel_hdcp", smoke_intel_hdcp_mst_layouts);
+
+// ── Display 9 to 11: MST streams over the port-indexed block ─────────
+
+/// HDCP 2.2 over DP MST on a Kaby Lake (display 9, big core) DDI B with
+/// the MEI firmware: streams on transcoders A (the master) and B, payload
+/// IDs 1 and 2. Linux 7.4-rc4 below display 12 (`intel_hdcp_regs.h`,
+/// `intel_dp_hdcp.c::intel_dp_mst_hdcp2_stream_encryption`,
+/// `intel_hdcp.c::initialize_hdcp_port_data`):
+/// - every firmware command names {INTEGRATED, HDCP_DDI_B, no transcoder}
+///   (`hdcp_transcoder` "retained for <Gen12 forever");
+/// - the link encrypts on port B's `HDCP2_CTL` (0x665B0), never on
+///   transcoder A's display-12 block (0x664B0);
+/// - each stream's `TRANS_DDI_HDCP_SELECT` is in its own
+///   `TRANS_DDI_FUNC_CTL` and confirms in `PIPE_HDCP2_STREAM_STATUS` of the
+///   pipe the stream transcoder names (`HDCP2_STREAM_STATUS(display,
+///   cpu_transcoder, pipe)`: pipe A 0x668C0, pipe B 0x665C0);
+/// - RepeaterAuth_Stream_Manage carries k = 2, both type 1;
+/// - the disable drops stream B's select under the encrypted link, then
+///   stream A's with the link, then closes the session.
+fn smoke_intel_hdcp22_mst_gen9_port_block_and_pipe_stream_status() -> TestResult {
+    let regs = Regs::legacy(0, 1, SKL_PW_CTL_IDX_PW_1);
+    let d = Hdcp2Data::new(true);
+    let mut s = DpShim::new(mst_branch(&d));
+    let mut fw = FwModel::legacy(&regs, 0, 1, msg::HDCP_PROTOCOL_DP, Hdcp2Data::new(true));
+    fw.mst_streams = Some(vec![(1, 1), (2, 1)]);
+    let mut env = Env::default();
+    let kaby = live::LegacyDisplay::of(crate::intel_gpu_gt::GtPlatform::Gen9(
+        crate::intel_gpu_gt::Gen9Platform::KabyLake,
+    ))
+    .unwrap();
+    let mut hdcp = MstHdcp::new(0, &[(0, 1), (1, 2)], LineRekey::None, kaby.hdcp2)
+        .with_hw(HdcpHw::legacy(kaby.display_ver, kaby.big_core, 1).unwrap());
+    if hdcp.link.port_data.port_id() != [1, 1, 0, 0] {
+        return TestResult::Fail("display 9 MST hdcp_port_id");
+    }
+    let r = {
+        let mut cx = Ctx {
+            io: &regs,
+            shim: &mut s,
+            fw: Some(&mut fw),
+            env: &mut env,
+        };
+        drive(hdcp.enable(&mut cx, 0))
+    };
+    if let Some(bad) = fw.bad {
+        return TestResult::Fail(bad);
+    }
+    if r != Some(Ok(()))
+        || hdcp.value() != CpValue::Enabled
+        || !hdcp.streams.iter().all(|st| st.hdcp2_encrypted())
+        || hdcp.link.num_streams != 2
+        || !hdcp.link.auth_status
+        || hdcp.link.port_data.hdcp_transcoder != 0
+    {
+        return TestResult::Fail("Gen9 two-stream HDCP 2.2 enable failed");
+    }
+    if s.dpcd.got(shim::DP_HDCP_2_2_REG_SEQ_NUM_M_OFFSET, 9) != [0, 0, 0, 0, 2, 1, 1, 2, 1] {
+        return TestResult::Fail("Gen9 RepeaterAuth_Stream_Manage contents");
+    }
+    if regs.get(0x665b0) & CTL_LINK_ENCRYPTION_REQ == 0 || !regs.wrote(0x664b0).is_empty() {
+        return TestResult::Fail("Gen9 link encryption not on port B's HDCP2_CTL");
+    }
+    for (t, status) in [(0u8, 0x668c0u64), (1, 0x665c0)] {
+        if regs.get(trans_ddi_func_ctl(t)) & TRANS_DDI_HDCP_SELECT == 0
+            || regs.read32(status) & STREAM_ENCRYPTION_STATUS == 0
+        {
+            return TestResult::Fail("Gen9 stream select / PIPE_HDCP2_STREAM_STATUS");
+        }
+    }
+    let r = {
+        let mut cx = Ctx {
+            io: &regs,
+            shim: &mut s,
+            fw: Some(&mut fw),
+            env: &mut env,
+        };
+        drive(hdcp.disable(&mut cx))
+    };
+    let b_off = last_write(&regs, trans_ddi_func_ctl(1), TRANS_DDI_HDCP_SELECT, 0);
+    let a_off = last_write(&regs, trans_ddi_func_ctl(0), TRANS_DDI_HDCP_SELECT, 0);
+    let link_off = last_write(&regs, 0x665b0, CTL_LINK_ENCRYPTION_REQ, 0);
+    if r != Some(Ok(()))
+        || hdcp.value() != CpValue::Undesired
+        || hdcp.link.num_streams != 0
+        || hdcp.link.auth_status
+        || !(b_off.is_some() && b_off < a_off && a_off < link_off)
+        || fw.log.last() != Some(&0x0003_100a)
+        || fw.log.iter().filter(|&&c| c == 0x0003_100a).count() != 1
+    {
+        return TestResult::Fail("Gen9 MST disable order or session close");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_hdcp",
+    smoke_intel_hdcp22_mst_gen9_port_block_and_pipe_stream_status
+);
+
+/// HDCP 1.4 over DP MST on an Ice Lake (display 11) DDI C: streams on
+/// transcoders B (the master) and C. Part 1 runs on port C's block
+/// (`HDCP_CONF` 0x66600, keys through `HDCP_KEY_CONF`, not the pcode
+/// mailbox); each stream's select is confirmed by its
+/// `HDCP_STATUS_STREAM_x_ENC` bit (B bit 30, C bit 29) in port C's one
+/// `HDCP_STATUS` (0x6661C: `HDCP_STATUS(display, trans, port)` below display
+/// 12 is `PORT_HDCP_STATUS(port)`); no display-12 transcoder block is
+/// written, and the disable drops stream C's select before the link.
+fn smoke_intel_hdcp14_mst_gen11_port_status_carries_every_stream() -> TestResult {
+    let regs = Regs::legacy(1, 2, ICL_PW_CTL_IDX_PW_1);
+    let mut s = DpShim::new(DpSink::hdcp14(false));
+    let mut env = Env::default();
+    let ice = live::LegacyDisplay::of(crate::intel_gpu_gt::GtPlatform::Gen11(
+        crate::intel_gpu_gt::Gen11Platform::IceLake,
+    ))
+    .unwrap();
+    let mut hdcp = MstHdcp::new(1, &[(1, 2), (2, 3)], LineRekey::None, ice.hdcp2)
+        .with_hw(HdcpHw::legacy(ice.display_ver, ice.big_core, 2).unwrap());
+    let r = {
+        let mut cx = Ctx {
+            io: &regs,
+            shim: &mut s,
+            fw: None::<&mut FwModel>,
+            env: &mut env,
+        };
+        drive(hdcp.enable(&mut cx, 0))
+    };
+    if r != Some(Ok(()))
+        || hdcp.value() != CpValue::Enabled
+        || !hdcp.streams.iter().all(|st| st.hdcp_encrypted())
+    {
+        return TestResult::Fail("Gen11 two-stream HDCP 1.4 enable failed");
+    }
+    if regs.wrote(HDCP_KEY_CONF).first() != Some(&HDCP_KEY_LOAD_TRIGGER)
+        || !regs.wrote(crate::intel_gpu_pcode::PCODE_MAILBOX).is_empty()
+        || regs.wrote(0x66600).first() != Some(&HDCP_CONF_CAPTURE_AN)
+        || regs.get(0x66600) != HDCP_CONF_AUTH_AND_ENC
+    {
+        return TestResult::Fail("Gen11 MST key load or port C CONF");
+    }
+    let status = regs.read32(0x6661c);
+    if status & hdcp_status_stream_enc(1) != 1 << 30
+        || status & hdcp_status_stream_enc(2) != 1 << 29
+        || (0x66400..0x66420)
+            .step_by(4)
+            .chain((0x66500..0x66520).step_by(4))
+            .any(|r| !regs.wrote(r).is_empty())
+    {
+        return TestResult::Fail("Gen11 port C HDCP_STATUS stream bits");
+    }
+    for t in [1, 2] {
+        if regs.get(trans_ddi_func_ctl(t)) & TRANS_DDI_HDCP_SELECT == 0 {
+            return TestResult::Fail("Gen11 stream select");
+        }
+    }
+    let r = {
+        let mut cx = Ctx {
+            io: &regs,
+            shim: &mut s,
+            fw: None::<&mut FwModel>,
+            env: &mut env,
+        };
+        drive(hdcp.disable(&mut cx))
+    };
+    let c_off = last_write(&regs, trans_ddi_func_ctl(2), TRANS_DDI_HDCP_SELECT, 0);
+    let conf_off = last_write(&regs, 0x66600, !0, 0);
+    if r != Some(Ok(()))
+        || hdcp.value() != CpValue::Undesired
+        || !(c_off.is_some() && c_off < conf_off)
+        || regs.get(0x66600) != 0
+    {
+        return TestResult::Fail("Gen11 HDCP 1.4 MST disable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_hdcp",
+    smoke_intel_hdcp14_mst_gen11_port_status_carries_every_stream
+);
