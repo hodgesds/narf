@@ -41,7 +41,7 @@
 //!   it into stream setup needs the manager's current data rate and
 //!   is a follow-up.
 
-use crate::soundwire::{regs, Bus, SdwError, Transport};
+use crate::soundwire::{Bus, SdwError, Transport};
 use narf_time::Deadline;
 
 /// Vendor-register node (`RT711_VENDOR_REG`).
@@ -623,6 +623,12 @@ pub struct JackDetector {
     last_state: Option<JackState>,
 }
 
+impl Default for JackDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JackDetector {
     /// A detector with the Linux 250 ms deferral.
     pub fn new() -> Self {
@@ -716,6 +722,7 @@ pub fn clock_config<T: Transport>(bus: &Bus<T>, dev: u8, dr_freq_hz: u32) -> Res
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
+    use crate::soundwire::regs;
     use alloc::collections::BTreeMap;
     use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
