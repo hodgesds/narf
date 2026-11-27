@@ -84,7 +84,7 @@ fn navi31_power_update_folds_samples_and_reports_transitions() -> TestResult {
         sample(Err(RefreshError::DeviceGone), Some(limits())),
     );
     assert!(s.telemetry.is_some());
-    assert_eq!(s.samples, 2);
+    assert_eq!(s.samples, 3);
     assert_eq!(e.failed, Some(RefreshError::DeviceGone));
     let (s, e) = update(
         Some(s),
