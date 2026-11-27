@@ -1671,7 +1671,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let map = load_leaf_driver_map(&root).expect("driver-test-map.toml loads");
         // Update this count when extending the map.
-        assert_eq!(map.entries.len(), 22);
+        assert_eq!(map.entries.len(), 24);
         let igb = map
             .entries
             .iter()
