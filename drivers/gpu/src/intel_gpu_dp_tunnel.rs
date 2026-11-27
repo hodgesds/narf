@@ -35,6 +35,9 @@
 //!
 //! NARF owns one external route, so a tunnel's group holds only this
 //! tunnel: `calc_group_available_bw` reduces to its estimated bandwidth.
+//! The streams of a 128b/132b MST link share the tunnel: their bandwidth
+//! is checked together ([`Tunnel::check_stream_bws`]) and allocated as one
+//! sum.
 //! Linux wakes the BW request wait from the tunnel's HPD IRQ
 //! (`drm_dp_tunnel_handle_irq`); here the wait polls
 //! `DP_TUNNELING_STATUS` every millisecond, the read after the deadline
@@ -309,6 +312,36 @@ impl Tunnel {
             (true, Some(available)) => rate.min(u64::from(available)),
             _ => rate,
         }
+    }
+
+    /// `get_max_dprx_bw`: the DPRX's data rate rounded up to the
+    /// granularity (a request of it is granted as the DPRX's rate), at most
+    /// `MAX_DP_REQUEST_BW` units.
+    pub fn max_dprx_bw(&self) -> u32 {
+        let gr = self.granularity;
+        let bw = max_dprx_data_rate(self.max_dprx_rate, u32::from(self.max_dprx_lanes));
+        let bw = u32::try_from(bw).unwrap_or(u32::MAX);
+        if gr == 0 {
+            return bw;
+        }
+        bw.div_ceil(gr).saturating_mul(gr).min(MAX_DP_REQUEST_BW * gr)
+    }
+
+    /// `drm_dp_tunnel_atomic_check_stream_bws` for this tunnel's one-tunnel
+    /// group (`drm_dp_tunnel_atomic_check_group_bw`) with `required` kBps
+    /// of streams (`drm_dp_tunnel_atomic_get_required_bw`, the sum of each
+    /// stream's `drm_dp_tunnel_atomic_set_stream_bw`): within the DPRX's
+    /// bandwidth ([`Self::max_dprx_bw`]), and rounded up to the granularity
+    /// (at most the DPRX's) within the group's available bandwidth, which an
+    /// undetermined (-1) one never is.
+    pub fn check_stream_bws(&self, required: u32) -> bool {
+        let max_dprx_bw = self.max_dprx_bw();
+        if required > max_dprx_bw {
+            return false;
+        }
+        let gr = self.granularity.max(1);
+        let group_bw = required.div_ceil(gr).saturating_mul(gr).min(max_dprx_bw);
+        self.available_bw.is_some_and(|available| group_bw <= available)
     }
 
     /// `intel_dp_tunnel_uhbr_lanes_wa_setup`: with BW allocation enabled and

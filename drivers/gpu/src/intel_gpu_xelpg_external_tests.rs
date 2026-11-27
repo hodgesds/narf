@@ -5495,7 +5495,7 @@ kernel_test_in!(
 /// group 1, 0.25 Gbps granularity, 72 units (2250000 kBps) estimated,
 /// nothing allocated, and a DPRX of HBR3 x2 with UHBR10 and the 128b/132b
 /// lane 0 mapping.
-fn usb4_adapter() -> [u8; 0x32] {
+pub(crate) fn usb4_adapter() -> [u8; 0x32] {
     let mut t = [0u8; 0x32];
     t[0x0d] = tunnel::DP_TUNNELING_SUPPORT | tunnel::DP_IN_BW_ALLOCATION_MODE_SUPPORT;
     t[0x0f] = 1;

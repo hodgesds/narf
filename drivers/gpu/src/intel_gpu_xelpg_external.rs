@@ -152,9 +152,9 @@
 //! when Linux 7.4's DSC search lands there (FEC implicit: no
 //! `DP_FEC_READY`, no `DP_TP_CTL` FEC). A UHBR-capable MST hub runs
 //! 128b/132b MST (`intel_gpu_xelpg_mst.rs`) at its highest-bandwidth
-//! configuration. Thunderbolt UHBR on display 14/20 and 128b/132b MST over
-//! Thunderbolt are refused typed
-//! ([`ExternalError::Uhbr`]). HDCP takes a 128b/132b SST route as DP SST
+//! configuration, on display 30+ also through a DP tunnel, whose BW
+//! allocation carries the streams' sum. Thunderbolt UHBR on display 14/20
+//! is refused typed ([`ExternalError::Uhbr`]). HDCP takes a 128b/132b SST route as DP SST
 //! ([`hdcp_route_of`]). The same option gives an 8b/10b link on a C10 or C20
 //! port the VBT's DP 1.4 vswing/pre-emphasis override ([`Dp14Vspeo`]).
 //! Without the option no 128b/132b register is touched and the DP 1.4
@@ -1573,12 +1573,21 @@ struct UhbrMstLink {
     pub lanes: u8,
     pub post_lt_adj_req: bool,
     pub caps: uhbr::LinkCaps,
+    /// The DP tunnel with BW allocation enabled the link runs through
+    /// (Thunderbolt alt mode, display 30+); its streams' bandwidth is the
+    /// MST owner's to account.
+    pub tunnel: Option<tunnel::Tunnel>,
 }
 
 /// [`UhbrMstLink`] for a hub on `link`: `Ok(None)` when its best common
-/// configuration is 8b/10b (the 8b/10b MST route stands), a typed refusal
-/// over Thunderbolt alt mode (display 14/20: no TBT UHBR clock; display
-/// 30+: the tunnel's per-stream bandwidth is not accounted).
+/// configuration is 8b/10b (the 8b/10b MST route stands), the typed `Tbt`
+/// refusal over display-14/20 Thunderbolt alt mode (no TBT UHBR clock).
+/// On display-30+ Thunderbolt alt mode the hub's link is found as the SST
+/// route's ([`plan_uhbr`]): the unconditional
+/// `DP_128B132B_SUPPORTED_LINK_RATES` read, `intel_dp_tunnel_detect` and BW
+/// allocation, then the tunnel's 128b/132b rates, maximum rate and lane
+/// count and its UHBR lane workaround; a tunnel the 128b/132b MST link does
+/// not take is handed back to its legacy allocation.
 fn uhbr_mst_link<M: MmioWindow + ?Sized>(
     io: &M,
     link: &LinkProbe,
@@ -1587,22 +1596,65 @@ fn uhbr_mst_link<M: MmioWindow + ?Sized>(
     if source == 0 {
         return Ok(None);
     }
-    let sink = uhbr::read_sink(&mut link.aux(io), &link.raw)
+    let mut aux = link.aux(io);
+    let mut found = None;
+    if link.tbt() && link.display_ip.is_display30() {
+        let mut rates = [0u8];
+        aux.dpcd_read(uhbr::DP_128B132B_SUPPORTED_LINK_RATES, &mut rates)
+            .map_err(|e| ExternalError::Link(LinkError::AuxFailure(e)))?;
+        if let Ok(mut t) = tunnel::detect(&mut aux) {
+            if tunnel::enable_bw_alloc(&mut aux, &mut t).is_ok() {
+                found = Some(t);
+            }
+        }
+    }
+    let result = uhbr_mst_link_with(&mut aux, link, source, found);
+    if let Some(mut t) = found {
+        if !matches!(&result, Ok(Some(u)) if u.tunnel.is_some()) {
+            let _ = tunnel::disable_bw_alloc(&mut aux, &mut t);
+        }
+    }
+    result
+}
+
+/// [`uhbr_mst_link`] once the tunnel (if any) is known.
+fn uhbr_mst_link_with<A: crate::dp_aux::AuxChannel + ?Sized>(
+    aux: &mut A,
+    link: &LinkProbe,
+    source: u8,
+    tunnel: Option<tunnel::Tunnel>,
+) -> Result<Option<UhbrMstLink>, ExternalError> {
+    let sink = uhbr::read_sink_rates(aux, &link.raw, tunnel.map(|t| t.dprx_128b132b_rates))
         .map_err(|e| ExternalError::Link(LinkError::AuxFailure(e)))?;
     let common = sink.rates & source;
     if common == 0 {
         return Ok(None);
     }
-    let caps = DpcdCaps::decode(&link.raw);
-    let ceiling = if TrainRate::Hbr3.rate_kbps() <= caps.max_rate.rate_kbps() {
-        TrainRate::Hbr3
-    } else {
-        caps.max_rate
+    let tc_lanes = link.tc.map_or(4, |tc| tc.max_lanes);
+    // With BW allocation, max_dprx_rate / max_dprx_lane_count are the
+    // tunnel's, and intel_dp_tunnel_uhbr_lanes_wa_apply drops the narrow
+    // UHBR configurations.
+    let (mut limits, lane_mask) = match tunnel {
+        Some(t) => (
+            dsc::LinkLimits::standard(
+                t.max_dprx_rate.min(810_000),
+                tc_lanes.min(t.max_dprx_lanes),
+            ),
+            t.uhbr_lane_mask(),
+        ),
+        None => {
+            let caps = DpcdCaps::decode(&link.raw);
+            let ceiling = if TrainRate::Hbr3.rate_kbps() <= caps.max_rate.rate_kbps() {
+                TrainRate::Hbr3
+            } else {
+                caps.max_rate
+            };
+            (
+                dsc::LinkLimits::standard(link_clock_khz(ceiling), tc_lanes.min(caps.max_lanes)),
+                0,
+            )
+        }
     };
-    let mut limits = dsc::LinkLimits::standard(
-        link_clock_khz(ceiling),
-        link.tc.map_or(4, |tc| tc.max_lanes).min(caps.max_lanes),
-    );
     let lttpr_rate = uhbr::lttpr_max_link_rate(&sink.lttpr_caps);
     let lttpr_lanes = uhbr::lttpr_max_lanes(&sink.lttpr_caps);
     if lttpr_rate != 0 || lttpr_lanes != 0 {
@@ -1615,7 +1667,8 @@ fn uhbr_mst_link<M: MmioWindow + ?Sized>(
             if lttpr_lanes != 0 { lttpr_lanes } else { 4 },
         );
     }
-    let link_caps = uhbr::LinkCaps::new(&limits, common);
+    let mut link_caps = uhbr::LinkCaps::new(&limits, common);
+    link_caps.disable_uhbr_lanes(lane_mask);
     let (order, n) = link_caps.ordered(uhbr::FallbackOrder::Bw);
     let Some(&(rate, lanes)) = order[..n]
         .iter()
@@ -1627,18 +1680,15 @@ fn uhbr_mst_link<M: MmioWindow + ?Sized>(
     let Some(rate) = uhbr::UhbrRate::from_link_rate(rate) else {
         return Ok(None);
     };
-    if link.tbt() {
-        return Err(ExternalError::Uhbr(if link.display_ip.is_display30() {
-            uhbr::UhbrRefusal::Mst
-        } else {
-            uhbr::UhbrRefusal::Tbt
-        }));
+    if link.tbt() && !link.display_ip.is_display30() {
+        return Err(ExternalError::Uhbr(uhbr::UhbrRefusal::Tbt));
     }
     Ok(Some(UhbrMstLink {
         rate,
         lanes,
         post_lt_adj_req: sink.post_lt_adj_req,
         caps: link_caps,
+        tunnel,
     }))
 }
 

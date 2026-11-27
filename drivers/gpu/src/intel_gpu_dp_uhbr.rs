@@ -64,10 +64,13 @@
 //!   `drm_dp_get_vc_payload_bw`'s 128b/132b PBN divider, the remote PBN
 //!   with the SSC margin and the remote TU.
 //!
-//! Not implemented, refused typed ([`UhbrRefusal`]) instead of running a
-//! link Linux would not: 128b/132b MST over Thunderbolt (the tunnel's
-//! per-stream bandwidth), and Thunderbolt-alt UHBR on display 14/20 (no TBT
-//! UHBR clock select).
+//! - **MST through a DP tunnel** (display 30+ Thunderbolt alt mode): the
+//!   tunnel supplies the hub's 128b/132b link as for SST, and the MST owner
+//!   accounts each stream's `intel_dp_config_required_rate` in the tunnel
+//!   ([`super::tunnel::Tunnel::check_stream_bws`]) and allocates their sum.
+//!
+//! Refused typed ([`UhbrRefusal`]) instead of running a link Linux would
+//! not: Thunderbolt-alt UHBR on display 14/20 (no TBT UHBR clock select).
 
 use crate::dp_aux::{AuxChannel, AuxError};
 use crate::intel_gpu_modeset::Mode;
@@ -288,6 +291,7 @@ pub const fn lttpr_count(caps: &[u8; 8]) -> Option<u8> {
 /// `DP_128B132B_SUPPORTED_LINK_RATES` when `DP_CAP_ANSI_128B132B` is set,
 /// and the LTTPR common capabilities (`drm_dp_read_lttpr_common_caps`; a
 /// failed read is Linux's zeroed caps, no repeater).
+#[cfg(any(test, feature = "kernel-test"))]
 pub fn read_sink<A: AuxChannel + ?Sized>(
     aux: &mut A,
     raw: &[u8; 16],
@@ -1539,10 +1543,6 @@ pub fn poll_act_handled<A: AuxChannel + ?Sized, C: Clock>(aux: &mut A, clock: &m
 /// (nothing was programmed unless noted).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UhbrRefusal {
-    /// A 128b/132b MST link over Thunderbolt alt mode: Linux accounts each
-    /// stream's bandwidth in the DP tunnel's group
-    /// (`drm_dp_tunnel_atomic_set_stream_bw`), which is not implemented.
-    Mst,
     /// The stream needs UHBR over Thunderbolt alt mode on display 14 or 20:
     /// `intel_mtl_tbt_clock_select` has no UHBR10/20 select below display
     /// 30 (Linux WARNs and programs the 162 MHz one).
