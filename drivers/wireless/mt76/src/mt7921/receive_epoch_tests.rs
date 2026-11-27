@@ -112,7 +112,7 @@ fn reentrant() -> Result<(), &'static str> {
             module_copy.borrow_mut().extend_from_slice(bytes);
             Ok(())
         };
-        if crate::module_host::publish_received(
+        if crate::mt7921::firmware_transport::publish_received(
             &module_bytes,
             old_epoch,
             0,
@@ -184,7 +184,7 @@ fn reentrant() -> Result<(), &'static str> {
                 "old batch reached IPC/second callback or closed a replacement peer/key owner",
             );
         }
-        if crate::module_host::publish_received(
+        if crate::mt7921::firmware_transport::publish_received(
             &module_bytes,
             old_epoch,
             module_bytes.len(),
@@ -208,7 +208,7 @@ fn reentrant() -> Result<(), &'static str> {
         if fresh.received.len() != 1 || fresh.receive_epoch == old_epoch {
             return Err("fresh key/peer inherited an old batch or replay epoch");
         }
-        if crate::module_host::publish_received(
+        if crate::mt7921::firmware_transport::publish_received(
             &fresh.received[0],
             fresh.receive_epoch,
             fresh.received[0].len(),

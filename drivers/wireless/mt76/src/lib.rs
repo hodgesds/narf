@@ -11,9 +11,10 @@
 //! in the `.ko` (the `drivers/wireless/ath11k` precedent).
 //!
 //! - Built in, [`iface`] is the full `WirelessNetIface` netdev (station, AP,
-//!   P2P, monitor, WoW, system PM), and the private copy-mode family host
-//!   ([`module_protocol`], `module_host`) stays registered for loadable
-//!   frontends built against it.
+//!   P2P, monitor, WoW, system PM). The retired private copy-mode family host
+//!   (`module_host.rs` / `module_protocol.rs`, family `"mt76"` v1) is gone:
+//!   no host answers that family any more, and the loadable frontend runs
+//!   MCU/WFDMA in-module over the generic `WIFI` host instead.
 //! - As a module, `mt7921::pci_kabi` binds the function over the KABI and
 //!   `iface_module` publishes the station netdev and wiphy through the netif
 //!   bridge and the generic `WIFI` family host (version 2).
@@ -32,10 +33,10 @@ extern crate alloc;
 
 use narf_driver_macros::narf_driver;
 
-pub mod module_protocol;
-
+/// Retirement smokes for the removed copy-mode family host.
 #[cfg(feature = "builtin")]
-mod module_host;
+#[path = "module_tests.rs"]
+mod tests;
 
 /// Kernel services under one name in both builds.
 pub mod platform;
@@ -82,16 +83,7 @@ narf_driver! {
 
 #[cfg(feature = "builtin")]
 fn do_register() {
-    module_host::register();
     mt7921::register();
-}
-
-/// The built-in registration without the PCI binding (`mt76-module-only` in
-/// `narf-drivers-wireless`): `mt76.ko` owns the CONNAC2 PCI ids, and only the
-/// private copy-mode family host is registered.
-#[cfg(feature = "builtin")]
-pub fn register_host_only() {
-    module_host::register();
 }
 
 /// `mt76.debug=1` (or the load argument `debug=1`): the routine firmware and

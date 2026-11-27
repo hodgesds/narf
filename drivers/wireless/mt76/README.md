@@ -22,9 +22,10 @@ CONNAC3-specific UNI layer lives in `src/mt7925/` (`mcu.rs`) and the MLD
 station lifecycle in `src/mt7921/mlo.rs`, documented in
 [`src/mt7925.md`](src/mt7925.md); the shared probe, BAR/L1 windows,
 WFDMA and firmware transport in `src/mt7921/` select on the PCI id. The
-private copy-mode family (`src/module_protocol.rs` / `src/module_host.rs`)
-stays registered in the built-in build for compatibility; no in-tree `.ko`
-uses it.
+older private copy-mode family host (`src/module_protocol.rs` /
+`src/module_host.rs`, family `"mt76"` v1) was retired: no in-tree `.ko`
+ever used it, and the module runs MCU/WFDMA in-module over the generic
+`WIFI` host instead.
 
 Hardware validation is gated by the crate's own documentation: QEMU
 emulates no MediaTek Wi-Fi PCIe device, so chip-id read, firmware

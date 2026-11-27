@@ -1581,11 +1581,11 @@ The native wireless family host (`wireless/src/module_host.rs`) is the
 cfg80211 glue that makes Wi-Fi `.ko` datapaths work. It registers one
 permanent `module_wireless::Host` (family `0x7769_6669`, `"wifi"`,
 version 2) from `narf_wireless::register_initcalls` at boot, before any
-module can load. It coexists with the mt76 private family (`0x6d74_3736`,
-`"mt76"`), whose copy-mode protocol keeps native MCU/WFDMA execution in
-its own host; the generic host serves every other Wi-Fi `.ko`. The wire
-records are in `modules/DATAPATH_ABI_DESIGN.md` ("Wireless copy-mode host
-services").
+module can load. The generic host serves every Wi-Fi `.ko`, including
+`mt76.ko`, which runs MCU/WFDMA in-module. The retired mt76 private family
+(`0x6d74_3736`, `"mt76"`, copy-mode v1) no longer has a host; its wire
+records are marked retired in `modules/DATAPATH_ABI_DESIGN.md` ("Wireless
+copy-mode host services").
 
 - **Sessions.** A module opens its probe device with
   `narf_wireless_open_with_event` (the per-session callback receives
@@ -2007,8 +2007,8 @@ services come from `src/platform/`: `kernel.rs` re-exports the kernel crates;
   alias, CONNAC3), and both chip-id gates still refuse it: what
   `MT_HW_CHIPID` reads on that silicon is open (#2494).
   `narf-drivers-wireless/mt76-module-only` leaves the built-in PCI ids
-  unclaimed so an early-loaded `mt76.ko` owns the function; the private
-  family host below stays registered.
+  unclaimed so an early-loaded `mt76.ko` owns the function; nothing is
+  registered built in — the private copy-mode family host is retired.
 - **Probe** (`mt7921/pci_kabi.rs`, the built-in `bring_up_current`).
   1. `narf_pci_identity` against the table; firmware-owned DMA is retained
      on teardown from the start.
@@ -2069,10 +2069,10 @@ services come from `src/platform/`: `kernel.rs` re-exports the kernel crates;
   owner code is linked but no authority can be minted); WoW and system PM;
   scheduled scan; roaming; CQM, survey and station statistics; power-save
   control; the association-comeback event; the userspace SME.
-- **Private family.** The mt76 copy-mode family (`0x6d74_3736`, version 1,
-  `module_host.rs`) stays registered unchanged in the built-in build. No
-  in-tree `.ko` opens it any more; it can be retired once no out-of-tree
-  frontend depends on it.
+- **Private family (retired).** The mt76 copy-mode family (`0x6d74_3736`,
+  version 1, `module_host.rs`) is gone: no host answers it, and `mt76.ko`
+  runs MCU/WFDMA in-module over the generic `WIFI` host. `module_tests.rs`
+  pins the removal (retired family answers no `open`; `WIFI` v2 does).
 - **Proof.** `modules/e2e/mt76` loads the real `.ko`: relocations resolve,
   init runs to Live, the `debug` parameter is declared and applies, exactly
   the eight ids are claimed, a probe with no device context is

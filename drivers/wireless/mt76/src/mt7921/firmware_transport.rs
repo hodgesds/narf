@@ -364,15 +364,6 @@ async fn finish_boot_keys() -> Result<(), Error> {
 /// requires the separate verified-reset recovery path, never a fresh claim.
 /// Repeating this on an initialized radio preserves its current station state.
 pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
-    #[cfg(feature = "builtin")]
-    if crate::module_host::owns_discovery() {
-        return Err(Error::Busy);
-    }
-    provision_radio_inner().await
-}
-
-#[cfg(feature = "builtin")]
-pub(crate) async fn provision_module_radio_once() -> Result<RadioInfo, Error> {
     provision_radio_inner().await
 }
 
@@ -459,22 +450,6 @@ pub fn boot_status() -> BootStatus {
             BootStatus::Retained(owner.state())
         }),
     }
-}
-
-#[cfg(feature = "builtin")]
-/// Copy only the executable images already opened and validated for the
-/// current native transport. There is no arbitrary registry name or new
-/// registry authority at the module boundary.
-pub(crate) fn module_firmware_chunk(
-    image: u8,
-    offset: usize,
-    len: usize,
-) -> Result<Vec<u8>, Error> {
-    let owner = BOOT_OWNER.try_lock().ok_or(Error::Busy)?;
-    owner
-        .as_ref()
-        .ok_or(Error::DeviceGone)?
-        .module_firmware_chunk(image, offset, len)
 }
 
 /// Run a receive-only hardware diagnostic using the retained boot owner.
@@ -835,6 +810,47 @@ pub(crate) fn boot_receive_publish(epoch: u64, publish: impl FnOnce()) -> Result
         return Ok(false);
     };
     owner.publish_receive(epoch, publish)
+}
+
+#[cfg(feature = "builtin")]
+/// Same final gate for a bounded module-byte copy: the epoch owner encloses
+/// the *actual* copy, not an earlier staging copy or stale scalar
+/// observation. The callback only copies bytes. Moved here from the retired
+/// copy-mode host (`module_host.rs`); the receive-epoch fixtures keep
+/// exercising it, and it is the shared shape the live boot owner and any
+/// bounded consumer must both satisfy.
+pub(crate) fn publish_received(
+    bytes: &[u8],
+    epoch: u64,
+    capacity: usize,
+    publish: &mut narf_bus::module_wireless::Publish<'_>,
+    gate: impl FnOnce(u64, &mut dyn FnMut()) -> Result<bool, Error>,
+) -> (i32, usize) {
+    if capacity < bytes.len() {
+        return (-105, bytes.len());
+    }
+    let mut result = Err(-19);
+    let mut copy = || {
+        result = publish(bytes);
+    };
+    match gate(epoch, &mut copy) {
+        Ok(true) => match result {
+            Ok(()) => (0, bytes.len()),
+            Err(error) => (error, 0),
+        },
+        Ok(false) => (-19, 0),
+        Err(error) => (
+            match error {
+                Error::Busy => -16,
+                Error::Authority => -13,
+                Error::Bounds => -22,
+                Error::DeviceGone => -19,
+                Error::Timeout => -110,
+                _ => -5,
+            },
+            0,
+        ),
+    }
 }
 
 /// cfg80211 `wiphy->frag_threshold` as set through
@@ -1242,9 +1258,6 @@ where
 pub(super) fn start_boot() -> narf_init::InitResult {
     use narf_init::InitResult;
     BOOT_STARTED.store(true, core::sync::atomic::Ordering::Release);
-    if crate::module_host::owns_discovery() {
-        return InitResult::Ok;
-    }
     // No device, nothing to bring up — and no bring-up future to build.
     if !super::pci::is_probed() {
         return InitResult::NotPresent;

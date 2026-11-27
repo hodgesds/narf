@@ -484,7 +484,6 @@ impl Mt76Iface {
             |epoch| self.receive_current(epoch),
             |data| narf_net::iface::on_rx_frame_from(&self.name, data),
             |data, epoch| {
-                crate::module_host::capture_receive(&self.name, &data, epoch);
                 if let Ok(mut buffer) =
                     narf_io::alloc_coherent(data.len(), narf_lib::id::DomainId::DRIVER_0)
                 {
@@ -1850,12 +1849,6 @@ pub(crate) fn data_task_specs() -> (narf_scheduler::TaskSpec, Option<narf_schedu
     let cpu = narf_scheduler::affinity::CpuId::BOOT.0;
     let pump = narf_net::napi::rx_pump_spec(cpu);
     (pump, narf_net::napi::rx_deferral_spec(cpu))
-}
-
-/// The permanent module host retains this exact publication, never a name
-/// which could be reused by a later native binding.
-pub(crate) fn module_active() -> Option<Arc<Mt76Iface>> {
-    ACTIVE.lock().clone()
 }
 
 /// PCI removal (Linux `mt76_unregister_device` → `ieee80211_unregister_hw`):

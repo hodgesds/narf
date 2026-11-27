@@ -482,52 +482,22 @@ publication gate, so rekey/close cannot interleave a stale module-byte copy.
 its required size. Zero consumes a copied terminal reply; negative native
 terminal errors consume it too. A forged/stale handle never enters the host.
 
-MT76 family `0x6d743736`, version1, uses the following little-endian records.
-All reserved fields must be zero; input length must match exactly.
-
-| Opcode | Request | Reply |
-|---|---|---|
-|1 INITIALIZE|empty|version u32, family u32, chip u16, band mask u8, hardware type u8, real MAC[6], reserved u16, ifindex u32, wiphy u64, firmware version[10], build date[15], name length u8, name bytes|
-|2 SCAN|active u8, frequency count u8<=64, SSID count u8<=4, reserved u8, IE length u16<=512, reserved u16, frequencies u32[], SSIDs as length u8<=32+bytes, IE bytes|count u32; each BSSID[6], RSSI i8, SSID length u8, frequency u32, channel u32, security u8 (open/WEP/WPA/WPA2/WPA3=0..4), SSID bytes|
-|3 ASSOCIATE|BSSID[6], channel u8, security u8(open/PSK/SAE=0..2), frequency u32, SSID/IE/secret lengths u16, reserved u16; SSID, IEs, secret bytes|empty after actual native completion|
-|4 DISASSOCIATE|empty|empty after native completion|
-|5 TRANSMIT|one Ethernet frame,14..2304 bytes|empty after actual native TX completion; queue acceptance is insufficient|
-|6 RECEIVE|empty|one independently copied native Ethernet frame, or empty if no copy is queued|
-|7 FIRMWARE_CHUNK|image u8(patch/RAM=0/1), reserved u8, length u16(1..4096), offset u32|complete image length u32, requested offset u32, complete image SHA-256[32], available bytes up to requested length|
-
-PSK secrets are32 bytes, SAE passwords1..63 bytes, and Open has no secret;
-SSID is1..32 bytes for association. Native admission validates frequency,
-security, PHY and emission policy. RX copies retain their native epoch until
-final delivery and lose validity when keys/port ownership changes, including
-while a reply is waiting for a larger output buffer. The bounded independent
-copy queue has64 slots and drops saturated copies only; it never steals stack
-or IPC frames. Firmware chunks expose only the immutable executable images
-already opened/verified for the exact current transport, with no arbitrary
-registry name, lookup authority or direct firmware pointer.
-
-MT76 allows one retained operation per session. Cancellation before its first
-poll drops unstarted work and produces `-ECANCELED`. Once native work started,
-its future stays retained through actual terminal completion. If a cancelled
-operation succeeds natively, its reply is `-EALREADY`: effects may have occurred.
-Cancellation never fabricates an ACK, descriptor retirement or hardware stop.
-Close/unload removes the exact service and native generation, withdraws
-publications, invokes proven-or-retain removal and revokes its old probe cap.
-A permanent task finishes started futures without any module callback; DMA
-whose retirement cannot be proved remains retained. Close remains available
-after revocation. Device context teardown calls host close before its normal
-cap revocation. Existing Ethernet/module exports keep their signatures and
-semantics; their established CRC/hash policy applies to the additive exports.
-
-Source fixtures for owner/device/version isolation, short-buffer retention,
-late cap revocation, teardown ordering, native-future cancellation and wire
-bounds are implemented. Their execution and dual module builds remain pending
-in the final coordinated validation pass; no RF acceptance is implied.
+MT76 family `0x6d743736`, version 1 (copy-mode), is **retired**: the
+`mt76` copy-mode host (`drivers/wireless/mt76/src/module_host.rs` /
+`module_protocol.rs`) was removed, no host answers that family, and
+`mt76.ko` runs MCU/WFDMA in-module over the generic `WIFI` host below.
+Its wire records (INITIALIZE / SCAN / ASSOCIATE / DISASSOCIATE / TRANSMIT
+/ RECEIVE / FIRMWARE_CHUNK) are void; the receive-epoch final gate it
+owned now lives in `firmware_transport.rs` (`publish_received`).
 
 WIFI family `0x77696669`, **version 2** (generic host, `narf-wireless`),
 uses the following little-endian records. All reserved fields must be zero;
 input length must match exactly. One session per probe device; one retained
 operation per session (every v2 opcode completes at submit, the poll only
-collects the reply); the same cancellation contract as MT76.
+collects the reply); the same retained-operation cancellation contract as
+the retired MT76 family (unstarted work drops with `-ECANCELED`, started
+work is retained to its actual terminal result, a cancelled success
+reports `-EALREADY`).
 `open_with_event` registers the per-session event callback for native→module
 events; a plain open has no event channel. The callback is invoked only
 through the bus call gate and forgotten on close or device retirement.
