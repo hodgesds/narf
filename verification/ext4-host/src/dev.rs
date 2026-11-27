@@ -34,6 +34,8 @@ pub struct ImageDev {
     log: Mutex<Vec<Ev>>,
     writes: AtomicU64,
     flushes: AtomicU64,
+    /// Writes left before every write fails (`u64::MAX`: never).
+    fail_after: AtomicU64,
 }
 
 #[allow(dead_code)] // recording is used by the crash scenario
@@ -59,11 +61,23 @@ impl ImageDev {
             log: Mutex::new(Vec::new()),
             writes: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
+            fail_after: AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// After `n` more writes, every write fails with a driver error (a
+    /// device that went away mid-commit).
+    pub fn fail_writes_after(&self, n: u64) {
+        self.fail_after.store(n, Ordering::Release);
     }
 
     pub fn set_recording(&self, on: bool) {
         self.recording.store(on, Ordering::Release);
+    }
+
+    /// Events recorded so far.
+    pub fn log_len(&self) -> usize {
+        self.log.lock().unwrap().len()
     }
 
     pub fn take_log(&self) -> Vec<Ev> {
@@ -86,6 +100,13 @@ impl ImageDev {
         }
         if off + len as u64 > self.len {
             return Err(BlockIoError::OutOfRange);
+        }
+        let left = self.fail_after.load(Ordering::Acquire);
+        if left != u64::MAX {
+            if left == 0 {
+                return Err(BlockIoError::DriverError);
+            }
+            self.fail_after.store(left - 1, Ordering::Release);
         }
         let data = &data[..len];
         self.file

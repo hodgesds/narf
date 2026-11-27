@@ -13,7 +13,8 @@ NARF.
   feature set is supported mount read/write; inode, classic-directory,
   bitmap, group-descriptor, HTREE, and primary-superblock mutations regenerate
   the corresponding CRC32C before returning.
-- **Out of Scope (this iteration):** journal writes (ext3+), HTREE
+- **Out of Scope (this iteration):** fast commits (written or replayed),
+  the orphan file's use (`ext4_orphan_add` / cleanup), HTREE
   rebalancing on delete, `largedir` (a third HTREE level), converting a
   linear directory to an index (`make_indexed_dir`), and `fsck`-style
   repair.
@@ -164,16 +165,58 @@ A device without `BlockFeature::Discard` fails the ioctl with
   refuses: an on-disk version other than 0-2, `unused_flags` bit 0, and
   more than one dx-node level (two need `largedir`, which is refused at
   mount).
-- **A crash is never hidden** (Linux `ext4_setup_super` without a journal).
-  NARF writes metadata in place, never through the journal. So a
-  read-write mount first clears `EXT4_VALID_FS`, bumps `s_mnt_count`, sets
-  `s_mtime`, records the hash signedness, and repairs a stale
-  `RECOVER`/`ORPHAN_PRESENT` the gate found clean. That one superblock write
-  goes out with FUA and a flush before any other write. Remount read-only
-  and the last unmount (`Drop`, polled once in place) restore the mount-time
-  `s_state` after a full write-back, adding `EXT4_ERROR_FS` if an error was
-  recorded. `syncfs` never marks the filesystem clean. After a crash,
-  `e2fsck -p` sees an unclean filesystem and checks it fully.
+- **A crash is never hidden** (Linux `ext4_setup_super`). A read-write
+  mount bumps `s_mnt_count`, sets `s_mtime` and records the hash
+  signedness in one superblock write, with FUA and a flush, before any
+  other write. Remount read-only and the last unmount (`Drop`, polled once
+  in place) restore the mount-time `s_state` after a full write-back,
+  adding `EXT4_ERROR_FS` if an error was recorded. `syncfs` never marks the
+  filesystem clean.
+  - With a journal (the next bullet): `EXT4_VALID_FS` stays set, and
+    `RECOVER` (and `ORPHAN_PRESENT` with an orphan file) is set while
+    mounted read-write. The unmount commits, checkpoints and empties the log
+    before clearing them. After a crash, recovery replays the log.
+  - Without one (`^has_journal`, or `noload` on a filesystem that does not
+    need recovery): metadata is written in place in no-journal order,
+    `EXT4_VALID_FS` is cleared while mounted, and a stale
+    `RECOVER`/`ORPHAN_PRESENT` the gate found clean is repaired. After a
+    crash, `e2fsck -p` sees an unclean filesystem and checks it fully.
+- **Metadata goes through the journal** on a journaled read-write mount
+  (`volume/jbd.rs`; `fs/jbd2/commit.c`, `checkpoint.c`, `data=ordered`):
+  - A metadata write lands in the running transaction (whole blocks, the
+    latest copy of each), which every read consults first. The device keeps
+    the committed state until the commit.
+  - File data and the zero-fill of freshly allocated blocks go to the
+    device directly, inside the operation that writes them, so they are on
+    the device before the commit that references them.
+  - Each operation holds `inode_update_lock`, which is the jbd2 handle: a
+    commit runs only between operations.
+  - A commit writes the descriptors and copies, flushes, writes the commit
+    block with FUA, checkpoints (writes every block home, flushes) and
+    moves the log tail past it (FUA).
+  - It happens when an operation starts and the transaction is at its
+    limit (a quarter of the log, at most 4 MiB), on `fsync`/`syncfs`,
+    every 5 s (`JBD2_DEFAULT_MAX_COMMIT_AGE`), and at remount read-only and
+    unmount.
+  - The journal features are ext4's (`ext4_set_journal_csum_feature_set`:
+    csum v3 under `metadata_csum`, none without; 64-bit tags on a 64-bit
+    filesystem). A v1 journal superblock cannot carry them: EINVAL.
+  - Blocks freed in a transaction are not allocated again before it
+    commits, and `fitrim` skips them.
+  - A failed commit write aborts the journal (`jbd2_journal_abort`): the
+    volume goes read-only, `RECOVER` stays set, and nothing more is
+    written; the next mount recovers the last committed state. So does a
+    filesystem error that stops writing (`narf.disks=root-rw`,
+    `errors=remount-ro` or `panic`; `ext4_handle_error`), before the error
+    is recorded, so the failed operation's partial changes never commit.
+  - Whole device sectors go out several per request, so a journal block
+    (a commit block above all) is one write, as Linux submits it.
+  - LINUX-GAPs: one transaction at a time, committed and checkpointed in
+    one go (no committing/running overlap, no lazy checkpoint, so no
+    revoke records are ever needed); `commit=` is accepted but the interval
+    stays 5 s; an operation larger than the whole log fails with ENOSPC
+    (Linux splits large truncates across transactions with the orphan
+    list); fast commits are not written.
 - **The write gate** refuses a read-write mount, and writes nothing, for:
   - an unknown or unwritable read-only-compatible feature;
   - legacy `gdt_csum`;
@@ -317,7 +360,6 @@ A device without `BlockFeature::Discard` fails the ioctl with
   classic directory mutation, checksum-aware bitmaps/descriptors, extent
   trees of any depth (growth, unwritten conversion, truncation, punch), and
   HTREE inserts with leaf and index splits up to two index levels persist.
-  Metadata is still written in place, not through the journal.
   If the JBD2 superblock and orphan file are both clean, stale `RECOVER` and
   `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
 - **The journal is recovered at mount, as Linux does it** (`journal.rs`;

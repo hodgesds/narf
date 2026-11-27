@@ -6816,8 +6816,11 @@ fn mount_through_boot_only_guard(
     (mounted, disk)
 }
 
-/// Positive control: on a writable disk the stale-RECOVER repair really
-/// writes the superblock, so the read-only tests below are meaningful.
+/// Positive control: on a writable disk the mount really writes the
+/// superblock, so the read-only tests below are meaningful. The journal is
+/// running, so as on Linux `RECOVER` stays set while the filesystem is
+/// mounted read-write (`ext4_setup_super`) and is cleared by the clean
+/// unmount (`ext4_put_super`), with the log empty.
 fn smoke_ext3_stale_recover_writable_mount_repairs_superblock() -> TestResult {
     let disk = CountingMemDisk::new(build_ext3_stale_recover_image());
     let mounted = poll_once(crate::volume::Ext2Volume::mount(
@@ -6826,12 +6829,23 @@ fn smoke_ext3_stale_recover_writable_mount_repairs_superblock() -> TestResult {
         ),
         narf_lib::id::DomainId::DRIVER_0,
     ));
-    if !matches!(mounted, Some(Ok(_))) {
+    let Some(Ok(volume)) = mounted else {
         return TestResult::Fail("writable mount of the stale-RECOVER image failed");
+    };
+    let recover = |disk: &CountingMemDisk| {
+        let img = disk.snapshot();
+        u32::from_le_bytes(img[1024 + 96..1024 + 100].try_into().unwrap())
+            & super::superblock::incompat::RECOVER
+            != 0
+    };
+    if disk.writes() == 0 || !recover(&disk) {
+        return TestResult::Fail("a journaled read-write mount must keep RECOVER set");
     }
-    let incompat = u32::from_le_bytes(disk.snapshot()[1024 + 96..1024 + 100].try_into().unwrap());
-    if disk.writes() == 0 || incompat & super::superblock::incompat::RECOVER != 0 {
-        return TestResult::Fail("writable mount did not repair the stale RECOVER bit");
+    drop(volume);
+    let img = disk.snapshot();
+    let jsb = &img[16 * 1024..16 * 1024 + 1024];
+    if recover(&disk) || u32::from_be_bytes(jsb[0x1C..0x20].try_into().unwrap()) != 0 {
+        return TestResult::Fail("the clean unmount must clear RECOVER and leave the log empty");
     }
     TestResult::Pass
 }

@@ -656,7 +656,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         }
         let zeros = alloc::vec![0u8; (to - from) as usize];
         self.volume
-            .write_byte_range(phys * bs + from % bs, &zeros)
+            .write_data_range(phys * bs + from % bs, &zeros)
             .await
     }
 

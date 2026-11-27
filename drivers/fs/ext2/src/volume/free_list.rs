@@ -109,6 +109,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             if cleared != 0 {
                 self.write_block(bm_block, &buf).await?;
+                // Not reusable until the running journal transaction commits.
+                self.hold_blocks(at, stop - at);
                 self.update_group_desc(
                     group,
                     cleared,

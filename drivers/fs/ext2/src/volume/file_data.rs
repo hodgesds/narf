@@ -109,7 +109,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             if phys != 0 {
                 let mut bytes = vec![0u8; (seg_hi - seg_lo) as usize];
                 folio.read((seg_lo - page_start) as usize, &mut bytes);
-                self.write_byte_range(phys * bs + (seg_lo - block_start), &bytes)
+                self.write_data_range(phys * bs + (seg_lo - block_start), &bytes)
                     .await?;
             }
             pos = seg_hi;

@@ -251,9 +251,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.alloc_block_locked(Some(goal)).await
     }
 
+    /// File data: zeros for a new or unwritten block, straight to the
+    /// device ([`Self::write_data_range`]).
     async fn zero_block(&self, block: u64) -> Result<(), FsError> {
-        let zeros = vec![0u8; self.block_size()];
-        self.write_block(block, &zeros).await
+        self.zero_fresh_block(block).await
     }
 
     /// `__ext4_ext_check` for one node: magic, the expected depth, an

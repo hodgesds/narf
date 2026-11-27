@@ -32,7 +32,7 @@ USAGE: narf-ext4-host [OPTIONS]
   --seeds N         seeds per scenario (default 2)
   --ops N           operations per run (default 1500)
   --scenario LIST   comma-separated subset of: baseline,lifecycle,gate,uninit,
-                    htree,extents,replay
+                    htree,extents,replay,crash,reuse,abort
                     (default all)
   --workdir DIR     scratch directory (default target/ext4-host)
   --keep            keep the images of passing runs
@@ -80,7 +80,24 @@ fn parse_args() -> Opts {
 }
 
 /// Judge an image after NARF let go of it.
+/// After an unmount a journaled filesystem is left as Linux leaves it: no
+/// `needs_recovery`, no `orphan_present`, an empty log (`s_start` 0).
+fn journal_left_clean(image: &Path) -> Result<(), String> {
+    let features = sb_field(image, "Filesystem features");
+    if !features.contains("has_journal") {
+        return Ok(());
+    }
+    let start = sb_field(image, "Journal start");
+    if features.contains("needs_recovery") || features.contains("orphan_present") || start != "0" {
+        return Err(format!(
+            "journal not left clean: {features}; journal start {start}"
+        ));
+    }
+    Ok(())
+}
+
 fn verdict(image: &Path, expected: &Model, scratch: &Path) -> Result<(), String> {
+    journal_left_clean(image)?;
     let (code, out) = check::e2fsck(image);
     if code != 0 {
         return Err(format!(
@@ -101,6 +118,7 @@ fn verdict(image: &Path, expected: &Model, scratch: &Path) -> Result<(), String>
     let narf = narf::walk(&fs.root())?;
     drop(fs);
     narf_block::registry::__reset_for_test();
+    journal_left_clean(image)?;
     let d = expected.diff(&narf, 20);
     if !d.is_empty() {
         return Err(format!(
@@ -169,51 +187,108 @@ fn debugfs_w(image: &Path, cmd: &str) {
     assert!(ok, "debugfs -w {cmd}");
 }
 
-/// The superblock across a root-rw mount: "not clean" while mounted, one
-/// more mount counted, "clean" again after a remount read-only, and e2fsck
-/// finds nothing.
+/// The superblock across a root-rw mount, as Linux keeps it, and `e2fsck
+/// -fn` clean after it:
+/// - journaled (the default mkfs): "clean" while mounted, with
+///   `needs_recovery` (and `orphan_present`, for the orphan file) set; the
+///   journal sequence advances as transactions commit; after a remount
+///   read-only both flags are gone and the log is empty (start 0);
+/// - without a journal (`-O ^has_journal`): "not clean" while mounted, and
+///   "clean" again after the remount.
+///
+/// Either way the mount is counted and `syncfs` never marks the filesystem
+/// clean.
 fn lifecycle(o: &Opts, seed: u64) -> Result<String, String> {
     use narf_filesystem::sb_flags::RDONLY;
-    let name = format!("lifecycle-{seed}");
-    let fx = fixture::build(&o.workdir, &name, &fixture::Spec::root(), seed);
-    let model = Model::load_host(&fx.tree);
-    let mounts_before: u32 = sb_field(&fx.image, "Mount count").parse().unwrap_or(0);
-    let uuid = narf::image_uuid(&fx.image);
-    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
-    let fs = narf::mount_root_rw(dev, &uuid).map_err(|e| format!("root-rw mount: {e:?}"))?;
-    let dirty = sb_field(&fx.image, "Filesystem state");
-    let mounts: u32 = sb_field(&fx.image, "Mount count").parse().unwrap_or(0);
-    if dirty != "not clean" || mounts != mounts_before + 1 {
-        return Err(format!(
-            "mounted: state {dirty:?}, mount count {mounts} (was {mounts_before})"
+    let mut report = Vec::new();
+    for journaled in [true, false] {
+        let name = format!(
+            "lifecycle-{seed}-{}",
+            if journaled { "jbd" } else { "nojournal" }
+        );
+        let spec = fixture::Spec {
+            mkfs_args: if journaled {
+                Vec::new()
+            } else {
+                vec!["-O".into(), "^has_journal".into()]
+            },
+            ..fixture::Spec::root()
+        };
+        let fx = fixture::build(&o.workdir, &name, &spec, seed);
+        let model = Model::load_host(&fx.tree);
+        let mounts_before: u32 = sb_field(&fx.image, "Mount count").parse().unwrap_or(0);
+        let seq_before = sb_field(&fx.image, "Journal sequence");
+        let uuid = narf::image_uuid(&fx.image);
+        let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+        let fs = narf::mount_root_rw(dev, &uuid).map_err(|e| format!("root-rw mount: {e:?}"))?;
+        let state = sb_field(&fx.image, "Filesystem state");
+        let features = sb_field(&fx.image, "Filesystem features");
+        let mounts: u32 = sb_field(&fx.image, "Mount count").parse().unwrap_or(0);
+        let want_state = if journaled { "clean" } else { "not clean" };
+        if state != want_state || mounts != mounts_before + 1 {
+            return Err(format!(
+                "journaled={journaled}: mounted: state {state:?}, mount count {mounts} (was {mounts_before})"
+            ));
+        }
+        if journaled
+            && (!features.contains("needs_recovery") || !features.contains("orphan_present"))
+        {
+            return Err(format!(
+                "mounted: needs_recovery/orphan_present not set: {features}"
+            ));
+        }
+        let mut w = Workload::new(seed, model, fs.root());
+        w.run(&Params {
+            ops: o.ops / 4,
+            roots: vec!["/work".into()],
+            hot_dirs: Vec::new(),
+            max_file: 128 * 1024,
+        })?;
+        host::block_on(fs.root().syncfs()).map_err(|e| format!("syncfs: {e:?}"))?;
+        if sb_field(&fx.image, "Filesystem state") != want_state {
+            return Err("syncfs must not change the filesystem state".into());
+        }
+        if journaled {
+            let seq = sb_field(&fx.image, "Journal sequence");
+            if seq == seq_before || sb_field(&fx.image, "Journal start") == "0" {
+                return Err(format!(
+                    "no transaction committed: sequence {seq} (was {seq_before}), start {}",
+                    sb_field(&fx.image, "Journal start")
+                ));
+            }
+        }
+        host::block_on(fs.reconfigure_sb_async(RDONLY, RDONLY, ""))
+            .map_err(|e| format!("remount read-only: {e:?}"))?;
+        let clean = sb_field(&fx.image, "Filesystem state");
+        if clean != "clean" {
+            return Err(format!("after remount read-only the state is {clean:?}"));
+        }
+        if journaled {
+            let features = sb_field(&fx.image, "Filesystem features");
+            if features.contains("needs_recovery")
+                || features.contains("orphan_present")
+                || sb_field(&fx.image, "Journal start") != "0"
+            {
+                return Err(format!(
+                    "after remount read-only: {features}; journal start {}",
+                    sb_field(&fx.image, "Journal start")
+                ));
+            }
+        }
+        let (model, counts) = (w.model.clone(), w.counts.values().sum::<usize>());
+        drop(w);
+        drop(fs);
+        narf_block::registry::__reset_for_test();
+        verdict(&fx.image, &model, &o.workdir.join(format!("{name}/rdump")))?;
+        if !o.keep {
+            let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+        }
+        report.push(format!(
+            "{}: {counts} ops",
+            if journaled { "journaled" } else { "no journal" }
         ));
     }
-    let mut w = Workload::new(seed, model, fs.root());
-    w.run(&Params {
-        ops: o.ops / 4,
-        roots: vec!["/work".into()],
-        hot_dirs: Vec::new(),
-        max_file: 128 * 1024,
-    })?;
-    host::block_on(fs.root().syncfs()).map_err(|e| format!("syncfs: {e:?}"))?;
-    if sb_field(&fx.image, "Filesystem state") != "not clean" {
-        return Err("syncfs must not mark the filesystem clean".into());
-    }
-    host::block_on(fs.reconfigure_sb_async(RDONLY, RDONLY, ""))
-        .map_err(|e| format!("remount read-only: {e:?}"))?;
-    let clean = sb_field(&fx.image, "Filesystem state");
-    if clean != "clean" {
-        return Err(format!("after remount read-only the state is {clean:?}"));
-    }
-    let (model, counts) = (w.model.clone(), format!("{:?}", w.counts));
-    drop(w);
-    drop(fs);
-    narf_block::registry::__reset_for_test();
-    verdict(&fx.image, &model, &o.workdir.join(format!("{name}/rdump")))?;
-    if !o.keep {
-        let _ = std::fs::remove_dir_all(o.workdir.join(&name));
-    }
-    Ok(counts)
+    Ok(report.join(", "))
 }
 
 /// root-rw refuses what e2fsck has not checked: an unclean filesystem, one
@@ -625,12 +700,475 @@ fn replay(o: &Opts, seed: u64) -> Result<String, String> {
     Ok(format!("replayed on {}", report.join(" and ")))
 }
 
+/// How a cut write stream reaches the disk.
+#[derive(Clone, Copy, Debug)]
+enum CutModel {
+    /// Every write before the cut landed.
+    Prefix,
+    /// Writes after the last flush before the cut were lost, except those
+    /// with FUA (a power cut with a volatile write cache).
+    DropVolatile,
+}
+
+/// `log[..cut]` applied to `image` under `model`.
+fn apply_cut(image: &Path, log: &[dev::Ev], cut: usize, model: CutModel) {
+    use std::os::unix::fs::FileExt;
+    let last_flush = log[..cut]
+        .iter()
+        .rposition(|e| matches!(e, dev::Ev::Flush))
+        .map_or(0, |i| i + 1);
+    let f = std::fs::OpenOptions::new().write(true).open(image).unwrap();
+    for (i, ev) in log[..cut].iter().enumerate() {
+        if let dev::Ev::Write { off, data, fua } = ev {
+            if matches!(model, CutModel::DropVolatile) && i >= last_flush && !fua {
+                continue;
+            }
+            f.write_all_at(data, *off).unwrap();
+        }
+    }
+}
+
+/// Transactions still to replay in `image`'s log, as e2fsprogs reads it
+/// (`debugfs logdump`: the commit blocks between the tail and the end).
+fn pending_commits(image: &Path) -> usize {
+    let out = std::process::Command::new("debugfs")
+        .args(["-R", "logdump"])
+        .arg(image)
+        .output()
+        .expect("run debugfs logdump");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("(commit block)"))
+        .count()
+}
+
+/// Whether `ev` writes a JBD2 commit block.
+fn is_commit_write(ev: &dev::Ev) -> bool {
+    match ev {
+        dev::Ev::Write { data, fua, .. } => {
+            *fua && data.len() >= 8
+                && data[..4] == 0xC03B_3998u32.to_be_bytes()
+                && data[4..8] == 2u32.to_be_bytes()
+        }
+        dev::Ev::Flush => false,
+    }
+}
+
+/// [`crash_one`] over the journal formats ext4 writes: csum v3 with 64-bit
+/// tags (the default); no checksums (`^metadata_csum`); 32-bit tags
+/// (`^64bit`); 1 KiB blocks with the smallest journal (1024 blocks), which
+/// commits often and wraps the log many times.
+fn crash(o: &Opts, seed: u64) -> Result<String, String> {
+    let formats: [(&str, u32, &[&str]); 4] = [
+        ("csum-v3", 4096, &[]),
+        (
+            "no-csum",
+            4096,
+            &["-O", "^metadata_csum,^metadata_csum_seed"],
+        ),
+        ("32-bit", 4096, &["-O", "^64bit"]),
+        ("1k-small-journal", 1024, &["-J", "size=1"]),
+    ];
+    let mut report = Vec::new();
+    for (label, block_size, args) in formats {
+        let summary =
+            crash_one(o, seed, label, block_size, args).map_err(|e| format!("{label}: {e}"))?;
+        report.push(format!("{label}: {summary}"));
+    }
+    Ok(report.join("; "))
+}
+
+/// A journaled workload cut short. NARF's write stream from the mount on is
+/// recorded, then replayed onto the original image up to each cut: after
+/// every flush (sampled), just before and just after commit blocks, and at
+/// random points; each as all-landed and as lost-volatile-writes. After
+/// each cut:
+/// - `e2fsck -fy` may only recover the journal (anything it has to fix is a
+///   failure);
+/// - `e2fsck -fn` then finds nothing;
+/// - a file written and fsynced before the cut, and not touched after,
+///   reads back exactly (`debugfs cat`).
+///
+/// On cuts just after a commit block, NARF itself recovers a copy, and
+/// must reach the tree e2fsck reaches. Some cuts must hold transactions
+/// still to replay.
+fn crash_one(
+    o: &Opts,
+    seed: u64,
+    label: &str,
+    block_size: u32,
+    mkfs_args: &[&str],
+) -> Result<String, String> {
+    let name = format!("crash-{label}-{seed}");
+    let spec = fixture::Spec {
+        block_size,
+        size_mib: 64,
+        lib_files: 50,
+        packages: 10,
+        mkfs_args: mkfs_args.iter().map(|a| a.to_string()).collect(),
+        ..fixture::Spec::root()
+    };
+    let fx = fixture::build(&o.workdir, &name, &spec, seed);
+    let dir = o.workdir.join(&name);
+    let base = dir.join("base.img");
+    std::fs::copy(&fx.image, &base).unwrap();
+    let model = Model::load_host(&fx.tree);
+    let dev = Arc::new(ImageDev::open(&fx.image, 512));
+    dev.set_recording(true);
+    let fs = narf::mount(dev.clone() as Arc<dyn narf_block::BlockDeviceSync>)?;
+    // The smallest journal gets enough operations to go round its 1024
+    // blocks several times.
+    let scale = if label == "1k-small-journal" { 4 } else { 1 };
+    let params = Params {
+        ops: (o.ops / 6).max(50) * scale,
+        roots: vec!["/work".into()],
+        hot_dirs: Vec::new(),
+        max_file: 64 * 1024,
+    };
+    let mut w = Workload::new(seed, model, fs.root());
+    w.run(&params)?;
+    let mut rng = rng::Rng::new(seed ^ 0x5eed);
+    let marker: Vec<u8> = (0..20_000).map(|_| rng.next() as u8).collect();
+    host::block_on(async {
+        let f = fs.root().create("marker").await?;
+        let mut off = 0usize;
+        while off < marker.len() {
+            off += f.write(off as u64, &marker[off..]).await?;
+        }
+        f.fsync(false).await
+    })
+    .map_err(|e| format!("marker: {e:?}"))?;
+    let durable = dev.log_len();
+    w.run(&params)?;
+    let log = dev.take_log();
+    dev.set_recording(false);
+    drop(w);
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+
+    let flushes: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, dev::Ev::Flush))
+        .map(|(i, _)| i + 1)
+        .collect();
+    let commits: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_commit_write(e))
+        .map(|(i, _)| i)
+        .collect();
+    if commits.is_empty() {
+        return Err("no commit block was written".into());
+    }
+    // Each commit block's place in the log: a lower one than the last means
+    // the log wrapped past `s_maxlen` back to `s_first`.
+    let offsets: Vec<u64> = commits
+        .iter()
+        .map(|&i| match &log[i] {
+            dev::Ev::Write { off, .. } => *off,
+            dev::Ev::Flush => 0,
+        })
+        .collect();
+    let wraps = offsets.windows(2).filter(|w| w[1] < w[0]).count();
+    if label == "1k-small-journal" && wraps == 0 {
+        return Err("the smallest journal never wrapped".into());
+    }
+    let features = sb_field(&fx.image, "Journal features");
+    let format_ok = match label {
+        "csum-v3" => features.contains("journal_checksum_v3") && features.contains("journal_64bit"),
+        "no-csum" => !features.contains("checksum"),
+        "32-bit" => !features.contains("journal_64bit") && features.contains("journal_checksum_v3"),
+        _ => true,
+    };
+    if !format_ok {
+        return Err(format!("journal written in the wrong format: {features}"));
+    }
+    let mut cuts: Vec<(usize, bool)> = flushes
+        .iter()
+        .step_by((flushes.len() / 16).max(1))
+        .map(|&c| (c, false))
+        .collect();
+    for &c in commits.iter().step_by((commits.len() / 8).max(1)) {
+        cuts.push((c, false));
+        cuts.push((c + 1, true));
+    }
+    for _ in 0..6 {
+        cuts.push((1 + (rng.next() as usize) % log.len(), false));
+    }
+    cuts.push((durable, false));
+    cuts.push((log.len(), false));
+    cuts.sort_unstable();
+    cuts.dedup_by_key(|c| c.0);
+    let image = dir.join("cut.img");
+    let narf_image = dir.join("narf-cut.img");
+    let (mut checked, mut pending, mut narf_replays) = (0usize, 0usize, 0usize);
+    for &(cut, after_commit) in &cuts {
+        for model in [CutModel::Prefix, CutModel::DropVolatile] {
+            std::fs::copy(&base, &image).unwrap();
+            apply_cut(&image, &log, cut, model);
+            let to_replay = pending_commits(&image);
+            pending += to_replay;
+            if after_commit && matches!(model, CutModel::Prefix) {
+                std::fs::copy(&image, &narf_image).unwrap();
+            }
+            let fsck = std::process::Command::new("e2fsck")
+                .arg("-fy")
+                .arg(&image)
+                .output()
+                .expect("run e2fsck -fy");
+            let text = String::from_utf8_lossy(&fsck.stdout).into_owned()
+                + &String::from_utf8_lossy(&fsck.stderr);
+            // e2fsck's optional optimizations ("extent tree could be
+            // shorter. Optimize?") are not repairs: Linux leaves such trees
+            // too, and `e2fsck -fn` does not count them.
+            let repaired = text
+                .lines()
+                .any(|l| (l.contains("Fix?") || l.contains("? yes")) && !l.contains("Optimize?"));
+            if fsck.status.code() != Some(0) || repaired {
+                return Err(format!(
+                    "cut {cut}/{} {model:?}: e2fsck -fy had to repair ({:?}):\n{text}",
+                    log.len(),
+                    fsck.status.code()
+                ));
+            }
+            let (code, out) = check::e2fsck(&image);
+            if code != 0 {
+                return Err(format!(
+                    "cut {cut} {model:?}: e2fsck -fn after recovery:\n{out}"
+                ));
+            }
+            if cut >= durable {
+                let cat = std::process::Command::new("debugfs")
+                    .args(["-R", "cat /marker"])
+                    .arg(&image)
+                    .output()
+                    .expect("run debugfs cat");
+                if cat.stdout != marker {
+                    return Err(format!(
+                        "cut {cut} {model:?}: the fsynced marker did not survive ({} bytes)",
+                        cat.stdout.len()
+                    ));
+                }
+            }
+            if after_commit && matches!(model, CutModel::Prefix) {
+                // NARF recovers its own log, to the tree e2fsck reached.
+                let ro = Arc::new(ImageDev::open(&narf_image, 512));
+                let fs = narf::mount_with(ro as Arc<dyn narf_block::BlockDeviceSync>, "", true)
+                    .map_err(|e| format!("cut {cut}: NARF recovery mount: {e}"))?;
+                drop(fs);
+                narf_block::registry::__reset_for_test();
+                let (code, out) = check::e2fsck(&narf_image);
+                if code != 0 {
+                    return Err(format!(
+                        "cut {cut}: e2fsck -fn after NARF's recovery:\n{out}"
+                    ));
+                }
+                let linux = check::debugfs_tree(&image, &dir.join("tree-linux"));
+                let narf = check::debugfs_tree(&narf_image, &dir.join("tree-narf"));
+                let d = linux.diff(&narf, 10);
+                if !d.is_empty() {
+                    return Err(format!(
+                        "cut {cut}: NARF's recovery differs from e2fsck's:\n  {}",
+                        d.join("\n  ")
+                    ));
+                }
+                narf_replays += 1;
+            }
+            checked += 1;
+        }
+    }
+    if pending == 0 {
+        return Err(
+            "no cut left a transaction to replay: the cuts do not exercise recovery".into(),
+        );
+    }
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(format!(
+        "{checked} cuts, {pending} pending commits replayed, {narf_replays} recovered by NARF too; {} commits, {wraps} log wraps, {} flushes",
+        commits.len(),
+        flushes.len()
+    ))
+}
+
+/// One file of `image` as e2fsprogs reads it (`debugfs cat`), `None` if it
+/// does not exist.
+fn debugfs_cat(image: &Path, path: &str) -> Option<Vec<u8>> {
+    let stat = std::process::Command::new("debugfs")
+        .args(["-R", &format!("stat {path}")])
+        .arg(image)
+        .output()
+        .expect("run debugfs stat");
+    if String::from_utf8_lossy(&stat.stderr).contains("File not found") {
+        return None;
+    }
+    let cat = std::process::Command::new("debugfs")
+        .args(["-R", &format!("cat {path}")])
+        .arg(image)
+        .output()
+        .expect("run debugfs cat");
+    Some(cat.stdout)
+}
+
+/// Write `data` to a new file `name` under `root`.
+async fn create_with(
+    root: &Arc<dyn narf_filesystem::DirOps>,
+    name: &str,
+    data: &[u8],
+) -> Result<Arc<dyn narf_filesystem::FileOps>, narf_filesystem::FsError> {
+    let f = root.create(name).await?;
+    let mut off = 0usize;
+    while off < data.len() {
+        off += f.write(off as u64, &data[off..]).await?;
+    }
+    Ok(f)
+}
+
+/// Nothing reaches its home location before its transaction commits, and a
+/// block freed in a transaction is not reused before that commit
+/// (`ext4_free_blocks` holds it until `ext4_journal_commit_callback`):
+/// - `/a` (256 KiB) is written and fsynced;
+/// - `/a` is unlinked and `/b`, as large, is written, without a sync.
+///   NARF already sees `/b` and no `/a`; the device, read by debugfs,
+///   still has `/a` intact and no `/b`. Had `/b` reused `/a`'s freed
+///   blocks, `/a`'s committed bytes would be gone;
+/// - after `syncfs` the device has `/b` and no `/a`, and e2fsck is clean.
+fn reuse(o: &Opts, seed: u64) -> Result<String, String> {
+    let name = format!("reuse-{seed}");
+    let spec = fixture::Spec {
+        size_mib: 64,
+        lib_files: 50,
+        packages: 10,
+        ..fixture::Spec::root()
+    };
+    let fx = fixture::build(&o.workdir, &name, &spec, seed);
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+    let fs = narf::mount(dev)?;
+    let root = fs.root();
+    let mut rng = rng::Rng::new(seed);
+    let a: Vec<u8> = (0..256 * 1024).map(|_| rng.next() as u8).collect();
+    let b: Vec<u8> = (0..256 * 1024).map(|_| rng.next() as u8).collect();
+    host::block_on(async { create_with(&root, "a", &a).await?.fsync(false).await })
+        .map_err(|e| format!("write /a: {e:?}"))?;
+    if debugfs_cat(&fx.image, "/a").as_deref() != Some(&a[..]) {
+        return Err("fsynced /a is not on the device".into());
+    }
+    host::block_on(async {
+        root.unlink("a").await?;
+        create_with(&root, "b", &b).await.map(|_| ())
+    })
+    .map_err(|e| format!("unlink /a, write /b: {e:?}"))?;
+    let seen = host::block_on(async {
+        let f = root.lookup_async("b").await?;
+        narf::read_all(&f).await
+    })
+    .map_err(|e| format!("read /b: {e:?}"))?;
+    if seen != b || host::block_on(root.lookup_async("a")).is_ok() {
+        return Err("NARF does not see its own uncommitted changes".into());
+    }
+    if debugfs_cat(&fx.image, "/a").as_deref() != Some(&a[..]) {
+        return Err(
+            "before the commit, the device lost /a's bytes: a freed block was reused".into(),
+        );
+    }
+    if debugfs_cat(&fx.image, "/b").is_some() {
+        return Err("before the commit, /b is already on the device".into());
+    }
+    host::block_on(root.syncfs()).map_err(|e| format!("syncfs: {e:?}"))?;
+    if debugfs_cat(&fx.image, "/a").is_some()
+        || debugfs_cat(&fx.image, "/b").as_deref() != Some(&b[..])
+    {
+        return Err("after syncfs the device does not have the new state".into());
+    }
+    drop(root);
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    journal_left_clean(&fx.image)?;
+    let (code, out) = check::e2fsck(&fx.image);
+    if code != 0 {
+        return Err(format!("e2fsck -fn:\n{out}"));
+    }
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+    }
+    Ok("committed state held until the commit".into())
+}
+
+/// A device write fails in the middle of a commit (`jbd2_journal_abort`):
+/// `syncfs` fails, the volume refuses further writes (EROFS), and the
+/// filesystem is left needing recovery. `e2fsck -fy` then recovers the last
+/// committed state without a repair: the fsynced file is intact, the
+/// uncommitted one absent.
+fn abort(o: &Opts, seed: u64) -> Result<String, String> {
+    let name = format!("abort-{seed}");
+    let spec = fixture::Spec {
+        size_mib: 64,
+        lib_files: 50,
+        packages: 10,
+        ..fixture::Spec::root()
+    };
+    let fx = fixture::build(&o.workdir, &name, &spec, seed);
+    let dev = Arc::new(ImageDev::open(&fx.image, 512));
+    let fs = narf::mount(dev.clone() as Arc<dyn narf_block::BlockDeviceSync>)?;
+    let root = fs.root();
+    let mut rng = rng::Rng::new(seed);
+    let kept: Vec<u8> = (0..64 * 1024).map(|_| rng.next() as u8).collect();
+    host::block_on(async { create_with(&root, "kept", &kept).await?.fsync(false).await })
+        .map_err(|e| format!("write /kept: {e:?}"))?;
+    host::block_on(async {
+        create_with(&root, "lost", &kept[..4096]).await?;
+        root.mkdir("lostdir").await.map(|_| ())
+    })
+    .map_err(|e| format!("uncommitted changes: {e:?}"))?;
+    // The commit's third write and every one after it fail.
+    dev.fail_writes_after(2);
+    if host::block_on(root.syncfs()).is_ok() {
+        return Err("syncfs succeeded on a failing device".into());
+    }
+    if !matches!(
+        host::block_on(root.create("after")),
+        Err(narf_filesystem::FsError::ReadOnly)
+    ) {
+        return Err("an aborted journal must refuse writes with EROFS".into());
+    }
+    drop(root);
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    if !sb_field(&fx.image, "Filesystem features").contains("needs_recovery") {
+        return Err("an aborted journal must leave needs_recovery".into());
+    }
+    let fsck = std::process::Command::new("e2fsck")
+        .arg("-fy")
+        .arg(&fx.image)
+        .output()
+        .expect("run e2fsck -fy");
+    let text = String::from_utf8_lossy(&fsck.stdout).into_owned();
+    if fsck.status.code() != Some(0) || text.contains("Fix?") {
+        return Err(format!(
+            "e2fsck -fy after the abort ({:?}):\n{text}",
+            fsck.status.code()
+        ));
+    }
+    if debugfs_cat(&fx.image, "/kept").as_deref() != Some(&kept[..])
+        || debugfs_cat(&fx.image, "/lost").is_some()
+        || debugfs_cat(&fx.image, "/lostdir").is_some()
+    {
+        return Err("recovery did not land on the last committed state".into());
+    }
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+    }
+    Ok("aborted, recovered to the last commit".into())
+}
+
 fn main() {
     let o = parse_args();
     host::init();
     std::fs::create_dir_all(&o.workdir).unwrap();
     type Scenario = fn(&Opts, u64) -> Result<String, String>;
-    let all: [(&str, Scenario); 7] = [
+    let all: [(&str, Scenario); 10] = [
         ("baseline", baseline),
         ("lifecycle", lifecycle),
         ("gate", gate),
@@ -638,6 +1176,9 @@ fn main() {
         ("htree", htree),
         ("extents", extents),
         ("replay", replay),
+        ("crash", crash),
+        ("reuse", reuse),
+        ("abort", abort),
     ];
     let mut failed = 0;
     for (name, run) in all {

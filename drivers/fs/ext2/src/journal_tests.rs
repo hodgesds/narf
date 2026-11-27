@@ -1223,6 +1223,56 @@ kernel_test_in!(
     smoke_ext4_recovery_on_read_only_device_is_erofs
 );
 
+/// An error that stops writing (`narf.disks=root-rw`, like
+/// `errors=remount-ro`) aborts the journal first (`ext4_handle_error` ->
+/// `jbd2_journal_abort`): the running transaction, a failed operation's
+/// partial changes included, is never committed, and `RECOVER` stays set
+/// through the unmount.
+fn smoke_ext4_error_that_stops_writes_aborts_the_journal() -> TestResult {
+    use narf_block::disk_policy::{self, DiskPolicy};
+    let mut image = ext3_image(false, 1, 0x8000 | 0o600);
+    empty_log(&mut image);
+    disk_policy::__set_policy_for_test(Some(DiskPolicy::RootRw));
+    let device = RamBlockDevice::from_image(512, image);
+    let result = (|| {
+        let volume = run(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)).ok()?;
+        if volume.is_read_only() {
+            return None;
+        }
+        let block = vec![0xA5u8; FS_BS];
+        run(volume.write_block(120, &block)).ok()?;
+        run(volume.fs_error(crate::volume::sb_state::ErrorSite {
+            func: "smoke_test",
+            ino: 0,
+            block: 120,
+            errno: narf_lib::errno::EIO,
+        }));
+        let committed = run(volume.journal_commit()).is_ok();
+        let on_disk = device.snapshot()[120 * FS_BS..121 * FS_BS] == block[..];
+        let ro = volume.is_read_only();
+        drop(volume);
+        Some((
+            committed,
+            on_disk,
+            ro,
+            incompat(&device.snapshot()) & 0x4 != 0,
+        ))
+    })();
+    disk_policy::__set_policy_for_test(None);
+    match result {
+        Some((false, false, true, true)) => TestResult::Pass,
+        Some((true, _, _, _)) | Some((_, true, _, _)) => {
+            TestResult::Fail("after an error that stops writing nothing may commit")
+        }
+        Some(_) => TestResult::Fail("the volume must be read-only with RECOVER kept"),
+        None => TestResult::Fail("mount or write failed"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_error_that_stops_writes_aborts_the_journal
+);
+
 /// `noload` on a read-write mount of a filesystem that needs recovery:
 /// "required journal recovery suppressed and not mounted read-only", EINVAL.
 fn smoke_ext4_noload_rw_needing_recovery_is_einval() -> TestResult {

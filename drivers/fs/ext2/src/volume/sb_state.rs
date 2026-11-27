@@ -275,21 +275,37 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.device.flush_result().await.map_err(FsError::Io)
     }
 
-    /// `ext4_setup_super` for a read-write mount without a journal, plus
-    /// the repair of a stale `RECOVER` / `ORPHAN_PRESENT` the gate found
-    /// clean. Marks the filesystem dirty; [`Self::mark_clean`] undoes it.
+    /// `ext4_setup_super` for a read-write mount. Marks the filesystem
+    /// dirty; [`Self::mark_clean`] undoes it.
+    ///
+    /// - With the journal running (`jbd.rs`), as Linux with `s_journal`:
+    ///   `EXT4_VALID_FS` stays, and the journal needs recovery
+    ///   (`RECOVER`, plus `ORPHAN_PRESENT` with an orphan file) until the
+    ///   clean unmount. After a crash, recovery replays the log.
+    /// - Without one: `EXT4_VALID_FS` is cleared, so after a crash e2fsck
+    ///   checks everything; and a stale `RECOVER` / `ORPHAN_PRESENT` the
+    ///   gate found clean is repaired.
     pub(crate) async fn setup_super(&self) -> Result<(), FsError> {
         let now = u64::from(Self::now_secs());
         let platform_unsigned = core::ffi::c_char::MIN == 0;
+        let journaled = self.journaling();
+        let orphan_file = self.superblock.feature_compat & compat::ORPHAN_FILE != 0;
         self.sb_update(|b| {
             let mut incompat_bits = get_u32(b, off::FEATURE_INCOMPAT);
             let mut ro_bits = get_u32(b, off::FEATURE_RO_COMPAT);
-            incompat_bits &= !incompat::RECOVER;
-            ro_bits &= !ro_compat::ORPHAN_PRESENT;
+            let state = get_u16(b, off::STATE);
+            if journaled {
+                incompat_bits |= incompat::RECOVER;
+                if orphan_file {
+                    ro_bits |= ro_compat::ORPHAN_PRESENT;
+                }
+            } else {
+                incompat_bits &= !incompat::RECOVER;
+                ro_bits &= !ro_compat::ORPHAN_PRESENT;
+                put_u16(b, off::STATE, state & !EXT2_VALID_FS);
+            }
             put_u32(b, off::FEATURE_INCOMPAT, incompat_bits);
             put_u32(b, off::FEATURE_RO_COMPAT, ro_bits);
-            let state = get_u16(b, off::STATE);
-            put_u16(b, off::STATE, state & !EXT2_VALID_FS);
             if get_u16(b, off::MAX_MNT_COUNT) as i16 == 0 {
                 put_u16(b, off::MAX_MNT_COUNT, EXT4_DFL_MAX_MNT_COUNT);
             }
@@ -317,15 +333,34 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// `ext4_put_super` / remount read-only: restore `s_state` to what the
     /// mount found, with `EXT4_ERROR_FS` if this mount saw an error. The
     /// caller has written back and flushed everything first.
+    ///
+    /// With the journal running, first `jbd2_journal_destroy`'s part: the
+    /// running transaction is committed and checkpointed and the log
+    /// marked empty; then `RECOVER` and `ORPHAN_PRESENT` are cleared (NARF
+    /// puts nothing in the orphan file, so it is empty).
     pub(crate) async fn mark_clean(&self) -> Result<(), FsError> {
         if !self.dirty_marked.load(Ordering::Acquire) {
             return Ok(());
+        }
+        let journaled = self.journaling();
+        if journaled {
+            let _update = self.inode_update_lock.lock().await;
+            self.journal_flush().await?;
         }
         let mut state = self.mount_state;
         if self.errors_seen.load(Ordering::Acquire) {
             state |= EXT2_ERROR_FS;
         }
-        self.sb_update(|b| put_u16(b, off::STATE, state)).await?;
+        self.sb_update(|b| {
+            put_u16(b, off::STATE, state);
+            if journaled {
+                let incompat_bits = get_u32(b, off::FEATURE_INCOMPAT) & !incompat::RECOVER;
+                let ro_bits = get_u32(b, off::FEATURE_RO_COMPAT) & !ro_compat::ORPHAN_PRESENT;
+                put_u32(b, off::FEATURE_INCOMPAT, incompat_bits);
+                put_u32(b, off::FEATURE_RO_COMPAT, ro_bits);
+            }
+        })
+        .await?;
         self.dirty_marked.store(false, Ordering::Release);
         Ok(())
     }
@@ -394,6 +429,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             site.errno
         };
         let code = errno_to_code(errno);
+        // `ext4_handle_error`: an error that does not let the filesystem
+        // continue aborts the journal before the error is recorded, so the
+        // failed operation's partial changes are never committed.
+        let stops = self.profile == GateProfile::RootRw
+            || self.superblock.errors == EXT4_ERRORS_RO
+            || self.superblock.errors == EXT4_ERRORS_PANIC;
+        if stops {
+            self.journal_abort();
+        }
         if !self.is_read_only() {
             let now = u64::from(Self::now_secs());
             let _ = self
