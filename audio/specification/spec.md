@@ -289,8 +289,14 @@ fallback where no interrupt can arrive; the ACP binding runs the
 service loop per RT711 card and reports plug/unplug to the mixer
 jack sink. The RT1316 smart-amp power/mute sequences
 (`soundwire_rt1316::amp_enable` / `amp_disable`) are available to
-consumers; RT711 clock configuration (`clock_config`) is implemented
-but not yet wired into stream setup (see #1606). The card
+consumers; RT711 clock configuration (`clock_config`, Linux
+`rt711_clock_config` via the `bus_config` step) is applied at
+stream prepare from the stream's committed data rate
+(`StreamConfig.dr_freq_hz`, 24 MHz on the ACP 6.3 manager: 12 MHz
+bus clock × 2), before the port transport parameters are
+programmed; an unknown rate fails the prepare. The codec profile
+selects it (`CodecProfile.clock`); generic and RT1316 profiles
+apply none. The card
 implements the PCM lifecycle against the bus (configure/prepare/enable/
 disable/deprepare) and moves PCM payload through the ACP SDW DMA engine
 (`acp63_sdw_dma::SdwDma`, installed on each card at probe): one ring

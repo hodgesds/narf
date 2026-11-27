@@ -16,13 +16,17 @@
 //!   device number with a write to `SCP_DEVNUMBER` (still addressed to
 //!   device 0), then repeat until a DevID read goes unanswered.
 //! - Stream setup mirrors `stream.c`'s prepare/enable conversation
-//!   reduced to a stopped bus: program the port's transport parameters
-//!   (word length, sample interval), write `DPn_PREPARE`, poll the
-//!   register until its NotFinished bits clear, then set
-//!   `DPn_CHANNELEN`. Disable clears `CHANNELEN`; deprepare clears
-//!   `PREPARE`. Glitchless bank switching while a stream runs is a
-//!   manager-frame concern and is out of scope: streams here are
-//!   configured while stopped, like the HDA/ACP paths in this crate.
+//!   reduced to a stopped bus: prepare first runs the codec
+//!   profile's bus-config step (Linux `sdw_slave_ops.bus_config`,
+//!   which programs the vendor clock select from the stream's
+//!   committed data rate, `StreamConfig.dr_freq_hz`), then programs
+//!   the port's transport parameters (word length, sample interval),
+//!   writes `DPn_PREPARE`, polls the register until its NotFinished
+//!   bits clear, then sets `DPn_CHANNELEN`. Disable clears
+//!   `CHANNELEN`; deprepare clears `PREPARE`. Glitchless bank
+//!   switching while a stream runs is a manager-frame concern and
+//!   is out of scope: streams here are configured while stopped,
+//!   like the HDA/ACP paths in this crate.
 //!
 //! - Interrupt dispatch mirrors `sdw_handle_slave_alerts`
 //!   (`drivers/soundwire/bus.c`)'s SCP INT1 half: read INT1, decode
@@ -225,8 +229,14 @@ pub struct StreamConfig {
     /// Payload slot interval between consecutive samples of one channel,
     /// in bus bit-slots (programmed into `DPn_SAMPLECTRL1/2`). The
     /// binding derives it from its manager clock and frame shape; e.g.
-    /// a 4.8 Mbit/s bus carrying 48 kHz audio uses 100.
+    /// a 24 Mbit/s bus carrying 48 kHz audio uses 500.
     pub sample_interval: u16,
+    /// The manager's current SoundWire data-rate frequency in Hz
+    /// (Linux `sdw_bus_params.curr_dr_freq`: the bus clock × 2,
+    /// the SoundWire double-rate factor). Stream setup programs
+    /// vendor clock selects from it; the ACP 6.3 manager runs at
+    /// 24 MHz (12 MHz bus clock, `AMD_SDW_DEFAULT_CLK_FREQ`).
+    pub dr_freq_hz: u32,
 }
 
 /// A SoundWire bus behind one manager transport.
@@ -492,6 +502,20 @@ pub struct PortProfile {
     pub max_word: u8,
 }
 
+/// Which vendor clock programming stream setup applies for this
+/// profile, from the stream's committed data rate (Linux
+/// `sdw_slave_ops.bus_config`, run at stream prepare before the
+/// port transport parameters are set). An unknown rate fails the
+/// prepare; the stream is never started on a mis-clocked codec.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClockConfig {
+    /// No vendor clock programming at stream setup.
+    None,
+    /// Realtek RT711: [`crate::soundwire_rt711::clock_config`]
+    /// (Linux `rt711_clock_config`).
+    Rt711,
+}
+
 /// The generic codec conversation's view of a peripheral: one sink
 /// port (playback) and/or one or two source ports (capture). Vendor
 /// codecs with richer topologies layer their own profiles on the same
@@ -507,6 +531,8 @@ pub struct CodecProfile {
     pub source: Option<PortProfile>,
     /// Second capture (source) port, if the codec exposes one.
     pub source2: Option<PortProfile>,
+    /// Vendor clock select applied at stream setup.
+    pub clock: ClockConfig,
 }
 
 /// The near-universal SDW codec arrangement: DP1 is the primary audio
@@ -523,6 +549,7 @@ pub const GENERIC_CODEC_PROFILE: CodecProfile = CodecProfile {
         max_word: 32,
     }),
     source2: None,
+    clock: ClockConfig::None,
 };
 
 /// Realtek MIPI manufacturer ID (0x025D), as in the DevID registers
@@ -534,7 +561,8 @@ pub const REALTEK_MFG_ID: u16 = 0x025D;
 /// captures through DP4; AIF2 captures through DP2. Formats
 /// S16/S20_3/S24/S8, so the widest word is 24 bits. The jack-detect
 /// and init sequences for this profile live in
-/// [`crate::soundwire_rt711`].
+/// [`crate::soundwire_rt711`], as does the clock select stream
+/// setup applies at prepare.
 pub const RT711_CODEC_PROFILE: CodecProfile = CodecProfile {
     sink: Some(PortProfile {
         port: 3,
@@ -551,6 +579,7 @@ pub const RT711_CODEC_PROFILE: CodecProfile = CodecProfile {
         max_channels: 2,
         max_word: 24,
     }),
+    clock: ClockConfig::Rt711,
 };
 
 /// RT1316 smart amplifier (Linux `sound/soc/codecs/rt1316-sdw.c`,
@@ -570,6 +599,7 @@ pub const RT1316_CODEC_PROFILE: CodecProfile = CodecProfile {
         max_word: 24,
     }),
     source2: None,
+    clock: ClockConfig::None,
 };
 
 /// Select the codec profile for an enumerated peripheral by
@@ -782,6 +812,7 @@ impl<T: Transport + 'static> PcmDevice for CodecCard<T> {
                 bus: self.bus.clone(),
                 dev_num: self.dev_num,
                 stream: self.stream,
+                clock: self.profile.clock,
             },
             claim,
             port: port.port,
@@ -802,6 +833,7 @@ struct SdwCardRef<T: Transport> {
     bus: Arc<IrqSafeSpinLock<Bus<T>>>,
     dev_num: u8,
     stream: StreamConfig,
+    clock: ClockConfig,
 }
 
 #[derive(Debug)]
@@ -871,6 +903,26 @@ impl<T: Transport> PcmHardware for SdwPcm<T> {
         }
         let config = self.card.stream;
         let mask = self.ch_mask();
+        // The bus-config step (Linux `rt711_bus_config`, the
+        // `sdw_slave_ops.bus_config` callback): the codec's
+        // bus-clock select is programmed from the stream's
+        // committed data rate before the port's transport
+        // parameters are set. An unknown rate fails the prepare
+        // (Linux returns -EINVAL from `bus_config`) — the stream
+        // is never started on a mis-clocked codec, and the
+        // failure is loud, not a silent skip.
+        let clock = self.card.clock;
+        let dev_num = self.card.dev_num;
+        let dr_freq_hz = config.dr_freq_hz;
+        let clock_result = self.bus_op(|bus| match clock {
+            ClockConfig::None => Ok(()),
+            ClockConfig::Rt711 => crate::soundwire_rt711::clock_config(bus, dev_num, dr_freq_hz),
+        });
+        if clock_result.is_err() {
+            let _ = self.bus_op(|bus| bus.port_deprepare(self.card.dev_num, self.port));
+            self.prepared = false;
+            return clock_result;
+        }
         let result =
             self.bus_op(|bus| bus.port_prepare(self.card.dev_num, self.port, mask, config));
         if result.is_err() {
@@ -1289,7 +1341,8 @@ mod tests {
         }
         let config = StreamConfig {
             word_length: 16,
-            sample_interval: 100,
+            sample_interval: 500,
+            dr_freq_hz: 24_000_000,
         };
         let base = regs::dpn_base(1);
         let before = bus.transport().log().len();
@@ -1315,12 +1368,12 @@ mod tests {
             Xfer {
                 dev: 1,
                 addr: base + regs::DPN_SAMPLECTRL1,
-                write: Some(100),
+                write: Some(244),
             },
             Xfer {
                 dev: 1,
                 addr: base + regs::DPN_SAMPLECTRL2,
-                write: Some(0),
+                write: Some(1),
             },
             Xfer {
                 dev: 1,
@@ -1379,7 +1432,8 @@ mod tests {
         }
         let config = StreamConfig {
             word_length: 16,
-            sample_interval: 100,
+            sample_interval: 500,
+            dr_freq_hz: 24_000_000,
         };
         if bus.port_prepare(1, 1, 0b11, config) != Err(SdwError::Timeout) {
             return TestResult::Fail("stuck prepare must time out");
@@ -1585,7 +1639,8 @@ mod tests {
         }
         let stream = StreamConfig {
             word_length: 16,
-            sample_interval: 100,
+            sample_interval: 500,
+            dr_freq_hz: 24_000_000,
         };
         let regs = FakeRegs::new();
         let mut card = CodecCard::new(
@@ -1689,7 +1744,8 @@ mod tests {
         }
         let stream = StreamConfig {
             word_length: 16,
-            sample_interval: 100,
+            sample_interval: 500,
+            dr_freq_hz: 24_000_000,
         };
         let card = CodecCard::new(
             Arc::new(IrqSafeSpinLock::new(bus)),
@@ -1784,7 +1840,8 @@ mod tests {
         // lands as BLOCKCTRL1 15 on the routed port's block.
         let stream = StreamConfig {
             word_length: 16,
-            sample_interval: 100,
+            sample_interval: 500,
+            dr_freq_hz: 24_000_000,
         };
         let mut bus = Bus::new(ModelTransport::new(&[RT711]));
         if bus.enumerate().map(|found| found.len()) != Ok(1) {
@@ -1875,4 +1932,165 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("audio/soundwire", vendor_profile_card_routing);
+
+    fn rt711_clock_config_applied_at_prepare() -> TestResult {
+        // End-to-end wiring (Refs #1606): stream setup applies the
+        // RT711 clock select from the stream's committed data rate,
+        // before the port transport parameters, and an unknown rate
+        // fails the prepare instead of being silently skipped. The
+        // ACP manager's 24 MHz data rate selects value 0x0 (Linux
+        // `rt711_clock_config`: `curr_dr_freq >> 1` is 12 MHz).
+        let stream = StreamConfig {
+            word_length: 16,
+            sample_interval: 500,
+            dr_freq_hz: 24_000_000,
+        };
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        let card = CodecCard::new(
+            Arc::new(IrqSafeSpinLock::new(bus)),
+            1,
+            RT711_CODEC_PROFILE,
+            stream,
+        );
+        let mut pcm = match card.open(false, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("RT711 playback open failed"),
+        };
+        if pcm.configure(card.default_params(false)) != Ok(()) || pcm.prepare() != Ok(()) {
+            return TestResult::Fail("RT711 prepare failed");
+        }
+        // Playback is DP3, so the clock writes land before DP3's
+        // BLOCKCTRL1 write, and the value is the 24 MHz select.
+        let log = card.bus.lock().transport().log();
+        let clock: Vec<&Xfer> = log
+            .iter()
+            .filter(|xfer| xfer.addr == 0x00e0 || xfer.addr == 0x00f0)
+            .collect();
+        if clock.len() != 2 || clock[0].write != Some(0x0) || clock[1].write != Some(0x0) {
+            return TestResult::Fail("24 MHz prepare must write clock value 0x0 to 0xe0/0xf0");
+        }
+        let blockctrl = log
+            .iter()
+            .position(|xfer| xfer.addr == regs::dpn_base(3) + regs::DPN_BLOCKCTRL1);
+        let first_clock = log.iter().position(|xfer| xfer.addr == 0x00e0);
+        match (blockctrl, first_clock) {
+            (Some(block), Some(first)) if first < block => {}
+            _ => return TestResult::Fail("clock config must precede port prepare"),
+        }
+        drop(pcm);
+        // A second rate selects its own value: 9.6 MHz -> 0x3.
+        let stream_9600 = StreamConfig {
+            word_length: 16,
+            sample_interval: 200,
+            dr_freq_hz: 9_600_000,
+        };
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        let card = CodecCard::new(
+            Arc::new(IrqSafeSpinLock::new(bus)),
+            1,
+            RT711_CODEC_PROFILE,
+            stream_9600,
+        );
+        let mut pcm = match card.open(false, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("RT711 playback open failed"),
+        };
+        if pcm.configure(card.default_params(false)) != Ok(()) || pcm.prepare() != Ok(()) {
+            return TestResult::Fail("9.6 MHz prepare failed");
+        }
+        let log = card.bus.lock().transport().log();
+        if !log
+            .iter()
+            .any(|xfer| xfer.addr == 0x00e0 && xfer.write == Some(0x3))
+            || !log
+                .iter()
+                .any(|xfer| xfer.addr == 0x00f0 && xfer.write == Some(0x3))
+        {
+            return TestResult::Fail("9.6 MHz prepare must write clock value 0x3 to 0xe0/0xf0");
+        }
+        drop(pcm);
+        // An unknown rate fails the prepare, programs nothing on
+        // the port, and writes no clock select — then leaves the
+        // port deprepared, so a retry starts from a known state.
+        let stream_unknown = StreamConfig {
+            word_length: 16,
+            sample_interval: 500,
+            dr_freq_hz: 1_000_000,
+        };
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        let card = CodecCard::new(
+            Arc::new(IrqSafeSpinLock::new(bus)),
+            1,
+            RT711_CODEC_PROFILE,
+            stream_unknown,
+        );
+        let mut pcm = match card.open(false, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("RT711 playback open failed"),
+        };
+        if pcm.configure(card.default_params(false)) != Ok(()) {
+            return TestResult::Fail("configure failed");
+        }
+        if pcm.prepare() != Err(SoundError::BadState) {
+            return TestResult::Fail("unknown data rate must fail prepare");
+        }
+        let log = card.bus.lock().transport().log();
+        if log
+            .iter()
+            .any(|xfer| xfer.addr == 0x00e0 || xfer.addr == 0x00f0)
+        {
+            return TestResult::Fail("unknown rate must write no clock select");
+        }
+        if log
+            .iter()
+            .any(|xfer| xfer.addr == regs::dpn_base(3) + regs::DPN_BLOCKCTRL1)
+        {
+            return TestResult::Fail("unknown rate must program no port");
+        }
+        if !log
+            .iter()
+            .any(|xfer| xfer.addr == regs::dpn_base(3) + regs::DPN_PREPARE && xfer.write == Some(0))
+        {
+            return TestResult::Fail("failed prepare must deprepare the port");
+        }
+        drop(pcm);
+        // A generic-profile card prepares with no clock writes: the
+        // select is a vendor step, not part of the generic
+        // conversation.
+        let mut bus = Bus::new(ModelTransport::new(&[RT711]));
+        if bus.enumerate().map(|found| found.len()) != Ok(1) {
+            return TestResult::Fail("enumeration failed");
+        }
+        let card = CodecCard::new(
+            Arc::new(IrqSafeSpinLock::new(bus)),
+            1,
+            GENERIC_CODEC_PROFILE,
+            stream,
+        );
+        let mut pcm = match card.open(false, 0) {
+            Ok(pcm) => pcm,
+            Err(_) => return TestResult::Fail("generic open failed"),
+        };
+        if pcm.configure(card.default_params(false)) != Ok(()) || pcm.prepare() != Ok(()) {
+            return TestResult::Fail("generic prepare failed");
+        }
+        let log = card.bus.lock().transport().log();
+        if log
+            .iter()
+            .any(|xfer| xfer.addr == 0x00e0 || xfer.addr == 0x00f0)
+        {
+            return TestResult::Fail("generic prepare must write no clock select");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("audio/soundwire", rt711_clock_config_applied_at_prepare);
 }

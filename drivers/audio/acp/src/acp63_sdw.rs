@@ -399,6 +399,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// enumeration is `NotForThisDriver`, not an error — the caller
 /// decides whether that means "decline" (standalone probe) or
 /// "PDM-only" (composed bind).
+/// Manager bus clock in Hz (Linux `AMD_SDW_DEFAULT_CLK_FREQ`,
+/// `drivers/soundwire/amd_manager.h`): the ACP SDW manager runs
+/// its bus at 12 MHz.
+const BUS_CLK_FREQ_HZ: u32 = 12_000_000;
+/// Manager current data-rate frequency in Hz: the bus clock × 2
+/// (SoundWire transfers on both clock edges; Linux
+/// `sdw_bus_params.curr_dr_freq`, computed in
+/// `sdw_bus_master_add` from `max_clk_freq`). The 50×10 frame
+/// shape is this rate's shape: 12 MHz clock → 48,000 frames/s,
+/// 500 bits per frame.
+const DR_FREQ_HZ: u32 = 2 * BUS_CLK_FREQ_HZ;
+
 fn compose_cards(
     mmio: MmioRegion,
 ) -> Result<Vec<Arc<CodecCard<AcpSdwTransport>>>, narf_bus::ProbeError> {
@@ -437,13 +449,19 @@ fn compose_cards(
             return Err(ProbeError::BadDevice);
         }
     }
-    // Generic-profile stream parameters for the manager's default
-    // clocking: 50×10 frame = 500 bit-slots per frame at a 4.8 MHz
-    // bus clock is 9600 frames/s, so a 48 kHz sample lands every
-    // 100 slots. The word length matches the card's S16LE profile.
+    // Stream parameters for the manager's clocking: 50×10 frame =
+    // 500 bit-slots per frame at a 24 MHz data rate is 48,000
+    // frames/s, so a 48 kHz sample lands every 500 slots. The word
+    // length matches the card's S16LE profile. (An earlier revision
+    // modelled the bus at 4.8 MHz with interval 100; that figure
+    // had no Linux source and contradicts the AMD manager, whose
+    // 50×10 shape is the 12 MHz-clock / 24 MHz-data-rate shape —
+    // corrected here, with the rate plumbed through so stream
+    // setup can program vendor clock selects from it.)
     let stream = StreamConfig {
         word_length: 16,
-        sample_interval: 100,
+        sample_interval: 500,
+        dr_freq_hz: DR_FREQ_HZ,
     };
     let shared = Arc::new(IrqSafeSpinLock::new(bus));
     let mut cards = Vec::new();

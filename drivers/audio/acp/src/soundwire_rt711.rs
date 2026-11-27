@@ -37,9 +37,10 @@
 //!   (`calibration_work`) otherwise, and NARF has no deferred-work
 //!   queue yet, so no in-tree caller runs it — the ACP binding
 //!   runs it as deferred work once that exists.
-//! - `clock_config` is a pure mapping (`rt711_clock_config`); wiring
-//!   it into stream setup needs the manager's current data rate and
-//!   is a follow-up.
+//! - `clock_config` is a pure mapping (`rt711_clock_config`);
+//!   stream setup applies it at prepare through the codec
+//!   profile's clock selector (`soundwire::ClockConfig::Rt711`),
+//!   from the stream's committed data rate.
 
 use crate::soundwire::{regs, Bus, SdwError, Transport};
 use narf_time::Deadline;
@@ -705,8 +706,11 @@ pub fn clock_value(dr_freq_hz: u32) -> Result<u8, SdwError> {
 }
 
 /// Program the bus-clock select registers for `dr_freq_hz`
-/// (`rt711_clock_config`). Wiring this into stream setup needs the
-/// manager's current data rate, so no in-tree caller uses it yet.
+/// (`rt711_clock_config`). Called at stream setup
+/// (`soundwire::SdwPcm::prepare`, the `bus_config` step) for
+/// RT711-profile cards, from the stream's committed data rate;
+/// an unknown rate fails `InvalidParams` and the prepare fails
+/// with it — never a silent skip.
 pub fn clock_config<T: Transport>(bus: &Bus<T>, dev: u8, dr_freq_hz: u32) -> Result<(), SdwError> {
     let value = clock_value(dr_freq_hz)?;
     bus.write_reg(dev, 0xe0, value)?;
