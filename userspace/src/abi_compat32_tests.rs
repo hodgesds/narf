@@ -2569,3 +2569,167 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_socket_msghdr_and_socketcall
 );
+
+// ── The native entries ───────────────────────────────────────────────
+
+/// `call32(nr, regs)` answers exactly as the native `native` handler does
+/// on the same registers.
+fn same_as_native(nr: u32, native: Syscall, regs: [u64; 6]) -> Result<(), &'static str> {
+    let args = SyscallArgs {
+        arg0: regs[0],
+        arg1: regs[1],
+        arg2: regs[2],
+        arg3: regs[3],
+        arg4: regs[4],
+        arg5: regs[5],
+    };
+    let want = call(native.raw(), args).ok_or("native call failed")?;
+    if call32(nr, regs) != want {
+        return Err("an i386 native-entry call does not answer as its native handler");
+    }
+    Ok(())
+}
+
+/// The i386 rows whose entry point is the x86_64 one (`syscall_32.tbl`
+/// names the same `sys_*`) answer as their native handler does, with their
+/// signed C arguments sign-extended. A sample across the families:
+///
+///   * process and scheduling: getpgrp (65), getsid (147), getpgid (132),
+///     getpriority (96), sched_get_priority_max / _min (159/160),
+///     sched_getscheduler (157), prctl(PR_GET_DUMPABLE) (172), getcpu (318),
+///     alarm (27);
+///   * files: memfd_create (356), then fchmod (94), flock (143), fsync (118)
+///     and fdatasync (148) on it; symlinkat (304), renameat (302) and
+///     fchmodat (306) with AT_FDCWD as the 32-bit register 0xFFFFFF9C,
+///     which only sign-extension makes AT_FDCWD;
+///   * inotify_init1 (332), inotify_add_watch (292), inotify_rm_watch (293);
+///   * timerfd_create (322), timerfd_settime64 (411) and timerfd_gettime64
+///     (410) with the 64-bit `itimerspec`; clock_getres_time64 (406).
+fn smoke_compat32_table_native_entries_pass_through() -> TestResult {
+    const PRIO_PROCESS: u64 = 0;
+    const SCHED_FIFO: u64 = 1;
+    const PR_GET_DUMPABLE: u64 = 3;
+    const LOCK_EX: u64 = 2;
+    const LOCK_UN: u64 = 8;
+    const IN_CREATE: u64 = 0x100;
+    const CLOCK_MONOTONIC: u64 = 1;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["native"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-nat", "compat32-nat", &[("f", b"abc")], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            for (nr, native, regs) in [
+                (65u32, Syscall::Getpgrp, [0u64; 6]),
+                (147, Syscall::Getsid, [0; 6]),
+                (132, Syscall::Getpgid, [0; 6]),
+                (96, Syscall::Getpriority, [PRIO_PROCESS, 0, 0, 0, 0, 0]),
+                (
+                    159,
+                    Syscall::SchedGetPriorityMax,
+                    [SCHED_FIFO, 0, 0, 0, 0, 0],
+                ),
+                (
+                    160,
+                    Syscall::SchedGetPriorityMin,
+                    [SCHED_FIFO, 0, 0, 0, 0, 0],
+                ),
+                (157, Syscall::SchedGetScheduler, [0; 6]),
+                (172, Syscall::Prctl, [PR_GET_DUMPABLE, 0, 0, 0, 0, 0]),
+            ] {
+                same_as_native(nr, native, regs)?;
+            }
+            if call32(159, [SCHED_FIFO, 0, 0, 0, 0, 0]) != 99 {
+                return Err("i386 sched_get_priority_max(SCHED_FIFO) must be 99");
+            }
+            if call32(318, [base + 0x100, base + 0x104, 0, 0, 0, 0]) != 0 {
+                return Err("i386 getcpu failed");
+            }
+            if call32(27, [0, 0, 0, 0, 0, 0]) < 0 {
+                return Err("i386 alarm(0) failed");
+            }
+            put_user(base + 0x200, b"m\0")?;
+            let mfd = call32(356, [base + 0x200, 0, 0, 0, 0, 0]);
+            if mfd < 0 {
+                return Err("i386 memfd_create failed");
+            }
+            let mfd = mfd as u64;
+            for (nr, native, regs) in [
+                (94u32, Syscall::Fchmod, [mfd, 0o600, 0, 0, 0, 0]),
+                (143, Syscall::Flock, [mfd, LOCK_EX, 0, 0, 0, 0]),
+                (143, Syscall::Flock, [mfd, LOCK_UN, 0, 0, 0, 0]),
+                (118, Syscall::Fsync, [mfd, 0, 0, 0, 0, 0]),
+                (148, Syscall::Fdatasync, [mfd, 0, 0, 0, 0, 0]),
+            ] {
+                same_as_native(nr, native, regs)?;
+            }
+            let _ = call32(6, [mfd, 0, 0, 0, 0, 0]);
+            put_user(base + 0x300, b"/compat32-nat/f\0")?;
+            put_user(base + 0x320, b"/compat32-nat/l\0")?;
+            put_user(base + 0x340, b"/compat32-nat/g\0")?;
+            if call32(304, [base + 0x300, AT_FDCWD32, base + 0x320, 0, 0, 0]) != 0 {
+                return Err("i386 symlinkat(AT_FDCWD) failed");
+            }
+            if call32(305, [AT_FDCWD32, base + 0x320, base + 0x400, 64, 0, 0]) != 15
+                || get_user(base + 0x400, 15)? != b"/compat32-nat/f"
+            {
+                return Err("i386 readlinkat(AT_FDCWD) did not read the new link");
+            }
+            if call32(
+                302,
+                [AT_FDCWD32, base + 0x300, AT_FDCWD32, base + 0x340, 0, 0],
+            ) != 0
+            {
+                return Err("i386 renameat(AT_FDCWD) failed");
+            }
+            if call32(306, [AT_FDCWD32, base + 0x340, 0o640, 0, 0, 0]) != 0 {
+                return Err("i386 fchmodat(AT_FDCWD) failed");
+            }
+            let ifd = call32(332, [0, 0, 0, 0, 0, 0]);
+            if ifd < 0 {
+                return Err("i386 inotify_init1 failed");
+            }
+            put_user(base + 0x380, b"/compat32-nat\0")?;
+            let wd = call32(292, [ifd as u64, base + 0x380, IN_CREATE, 0, 0, 0]);
+            if wd < 0 || call32(293, [ifd as u64, wd as u64, 0, 0, 0, 0]) != 0 {
+                return Err("i386 inotify_add_watch / inotify_rm_watch failed");
+            }
+            let _ = call32(6, [ifd as u64, 0, 0, 0, 0, 0]);
+            let tfd = call32(322, [CLOCK_MONOTONIC, 0, 0, 0, 0, 0]);
+            if tfd < 0 {
+                return Err("i386 timerfd_create failed");
+            }
+            // struct itimerspec64 { it_interval, it_value }: a 5 s one-shot.
+            let mut its = [0u8; 32];
+            its[16..24].copy_from_slice(&5i64.to_le_bytes());
+            put_user(base + 0x500, &its)?;
+            if call32(411, [tfd as u64, 0, base + 0x500, 0, 0, 0]) != 0
+                || call32(410, [tfd as u64, base + 0x540, 0, 0, 0, 0]) != 0
+            {
+                return Err("i386 timerfd_settime64 / timerfd_gettime64 failed");
+            }
+            let left = get_u64(base + 0x540 + 16)?;
+            if left > 5 || (left == 0 && get_u64(base + 0x540 + 24)? == 0) {
+                return Err("i386 timerfd_gettime64 did not report the 64-bit it_value");
+            }
+            let _ = call32(6, [tfd as u64, 0, 0, 0, 0, 0]);
+            put_user(base + 0x580, &[0xFFu8; 16])?;
+            if call32(406, [CLOCK_MONOTONIC, base + 0x580, 0, 0, 0, 0]) != 0
+                || get_u64(base + 0x580)? != 0
+            {
+                return Err("i386 clock_getres_time64 did not write a __kernel_timespec");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_native_entries_pass_through
+);
