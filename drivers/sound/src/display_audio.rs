@@ -447,6 +447,11 @@ pub fn unregister_display_audio_provider() {
     *PROVIDER.lock() = None;
 }
 
+/// The registered provider, if any (fixtures save and restore it).
+pub fn display_audio_provider() -> Option<DisplayAudioProvider> {
+    *PROVIDER.lock()
+}
+
 /// Whether a registered display driver binds a component for the display
 /// function `(vendor, device)`.
 pub fn display_audio_provided(vendor: u16, device: u16) -> bool {
@@ -935,6 +940,16 @@ pub mod tests {
     /// it is then ready. The provider answers only for the functions it
     /// names, and nothing is provided without one.
     fn smoke_display_audio_bound_waits_for_bind() -> TestResult {
+        let saved = display_audio_provider();
+        let result = bound_waits_for_bind();
+        match saved {
+            Some(provider) => register_display_audio_provider(provider),
+            None => unregister_display_audio_provider(),
+        }
+        result
+    }
+
+    fn bound_waits_for_bind() -> TestResult {
         use core::future::Future;
         unbind_display_audio_component();
         unregister_display_audio_provider();

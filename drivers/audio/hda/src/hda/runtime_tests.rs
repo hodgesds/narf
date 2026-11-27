@@ -4782,6 +4782,7 @@ fn native_hda_i915_init_defers_until_display_binds() -> TestResult {
     let hdac = pci_function(0, 0x1f, 3, (0x8086, 0x7e28), 0x040300);
     let gpu = pci_function(0, 2, 0, (0x8086, 0x7d55), 0x030000);
     let none = |_: &BusDevice| None;
+    let saved = acomp::display_audio_provider();
     acomp::register_display_audio_provider(scripted_provider);
     let defer = i915_init(&hdac, &[gpu, hdac], &none, false);
     let bound = i915_init(&hdac, &[gpu, hdac], &none, true);
@@ -4806,6 +4807,9 @@ fn native_hda_i915_init_defers_until_display_binds() -> TestResult {
     );
     acomp::unregister_display_audio_provider();
     let option_off = i915_init(&hdac, &[gpu, hdac], &none, false);
+    if let Some(provider) = saved {
+        acomp::register_display_audio_provider(provider);
+    }
     if defer != I915Init::Defer || bound != I915Init::Bound {
         return TestResult::Fail("a present display defers the probe until its component binds");
     }
