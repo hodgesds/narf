@@ -2973,6 +2973,21 @@ rt_sigpending (176), rt_sigsuspend (179), signalfd / signalfd4 (321/327)
 and sched_setaffinity (241) pass through: their compat sigsets and CPU
 masks have the native bytes.
 
+**32-bit times and 16-bit ids.** `compat32::legacy` serves the `*_time32` entries
+by widening their `old_timespec32` / `old_timeval32` / `old_utimbuf32`
+inputs and narrowing their outputs (a sleep's `rem` only when it was
+interrupted, and not for an absolute `clock_nanosleep`): nanosleep (162),
+clock_nanosleep (267), clock_settime (264), clock_getres (266),
+timer_settime / timer_gettime (260/261), timerfd_settime / timerfd_gettime
+(325/326), utimensat (320), futimesat (299), utimes (271), utime (30),
+sched_rr_get_interval (161), io_getevents (247) and mq_timedsend /
+mq_timedreceive (279/280). It also serves the 16-bit id calls of
+`kernel/uid16.c` by widening ids with `low2highuid` (0xFFFF is -1) and narrowing
+them with `high2lowuid` (65534 past 16 bits): chown (182), lchown (16), fchown (95),
+setuid (23), setgid (46), setreuid / setregid (70/71), setresuid /
+setresgid (164/170), setfsuid / setfsgid (138/139), getresuid / getresgid
+(165/171), getgroups (80) and setgroups (81).
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

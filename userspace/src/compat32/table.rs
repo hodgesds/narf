@@ -42,12 +42,15 @@ pub mod nr {
     pub const TIME: u32 = 13;
     pub const MKNOD: u32 = 14;
     pub const CHMOD: u32 = 15;
+    pub const LCHOWN: u32 = 16;
     pub const LSEEK: u32 = 19;
     pub const GETPID: u32 = 20;
     pub const MOUNT: u32 = 21;
+    pub const SETUID: u32 = 23;
     pub const GETUID: u32 = 24;
     pub const ALARM: u32 = 27;
     pub const PAUSE: u32 = 29;
+    pub const UTIME: u32 = 30;
     pub const ACCESS: u32 = 33;
     pub const SYNC: u32 = 36;
     pub const KILL: u32 = 37;
@@ -58,6 +61,7 @@ pub mod nr {
     pub const PIPE: u32 = 42;
     pub const TIMES: u32 = 43;
     pub const BRK: u32 = 45;
+    pub const SETGID: u32 = 46;
     pub const GETGID: u32 = 47;
     pub const GETEUID: u32 = 49;
     pub const GETEGID: u32 = 50;
@@ -71,12 +75,16 @@ pub mod nr {
     pub const GETPPID: u32 = 64;
     pub const GETPGRP: u32 = 65;
     pub const SETSID: u32 = 66;
+    pub const SETREUID: u32 = 70;
+    pub const SETREGID: u32 = 71;
     pub const SETHOSTNAME: u32 = 74;
     pub const SETRLIMIT: u32 = 75;
     pub const GETRLIMIT: u32 = 76;
     pub const GETRUSAGE: u32 = 77;
     pub const GETTIMEOFDAY: u32 = 78;
     pub const SETTIMEOFDAY: u32 = 79;
+    pub const GETGROUPS: u32 = 80;
+    pub const SETGROUPS: u32 = 81;
     pub const SELECT: u32 = 82;
     pub const SYMLINK: u32 = 83;
     pub const READLINK: u32 = 85;
@@ -86,6 +94,7 @@ pub mod nr {
     pub const TRUNCATE: u32 = 92;
     pub const FTRUNCATE: u32 = 93;
     pub const FCHMOD: u32 = 94;
+    pub const FCHOWN: u32 = 95;
     pub const GETPRIORITY: u32 = 96;
     pub const SETPRIORITY: u32 = 97;
     pub const STATFS: u32 = 99;
@@ -106,6 +115,8 @@ pub mod nr {
     pub const GETPGID: u32 = 132;
     pub const FCHDIR: u32 = 133;
     pub const PERSONALITY: u32 = 136;
+    pub const SETFSUID: u32 = 138;
+    pub const SETFSGID: u32 = 139;
     pub const LLSEEK: u32 = 140;
     pub const NEWSELECT: u32 = 142;
     pub const FLOCK: u32 = 143;
@@ -125,8 +136,14 @@ pub mod nr {
     pub const SCHED_YIELD: u32 = 158;
     pub const SCHED_GET_PRIORITY_MAX: u32 = 159;
     pub const SCHED_GET_PRIORITY_MIN: u32 = 160;
+    pub const SCHED_RR_GET_INTERVAL: u32 = 161;
+    pub const NANOSLEEP: u32 = 162;
     pub const MREMAP: u32 = 163;
+    pub const SETRESUID: u32 = 164;
+    pub const GETRESUID: u32 = 165;
     pub const POLL: u32 = 168;
+    pub const SETRESGID: u32 = 170;
+    pub const GETRESGID: u32 = 171;
     pub const PRCTL: u32 = 172;
     pub const RT_SIGACTION: u32 = 174;
     pub const RT_SIGPROCMASK: u32 = 175;
@@ -134,6 +151,7 @@ pub mod nr {
     pub const RT_SIGSUSPEND: u32 = 179;
     pub const PREAD64: u32 = 180;
     pub const PWRITE64: u32 = 181;
+    pub const CHOWN: u32 = 182;
     pub const GETCWD: u32 = 183;
     pub const CAPGET: u32 = 184;
     pub const CAPSET: u32 = 185;
@@ -191,6 +209,7 @@ pub mod nr {
     pub const SCHED_SETAFFINITY: u32 = 241;
     pub const SCHED_GETAFFINITY: u32 = 242;
     pub const IO_DESTROY: u32 = 246;
+    pub const IO_GETEVENTS: u32 = 247;
     pub const IO_CANCEL: u32 = 249;
     pub const FADVISE64: u32 = 250;
     pub const EXIT_GROUP: u32 = 252;
@@ -198,14 +217,22 @@ pub mod nr {
     pub const EPOLL_CTL: u32 = 255;
     pub const EPOLL_WAIT: u32 = 256;
     pub const SET_TID_ADDRESS: u32 = 258;
+    pub const TIMER_SETTIME: u32 = 260;
+    pub const TIMER_GETTIME: u32 = 261;
     pub const TIMER_GETOVERRUN: u32 = 262;
     pub const TIMER_DELETE: u32 = 263;
+    pub const CLOCK_SETTIME: u32 = 264;
     pub const CLOCK_GETTIME: u32 = 265;
+    pub const CLOCK_GETRES: u32 = 266;
+    pub const CLOCK_NANOSLEEP: u32 = 267;
     pub const STATFS64: u32 = 268;
     pub const FSTATFS64: u32 = 269;
     pub const TGKILL: u32 = 270;
+    pub const UTIMES: u32 = 271;
     pub const FADVISE64_64: u32 = 272;
     pub const MQ_UNLINK: u32 = 278;
+    pub const MQ_TIMEDSEND: u32 = 279;
+    pub const MQ_TIMEDRECEIVE: u32 = 280;
     pub const WAITID: u32 = 284;
     pub const ADD_KEY: u32 = 286;
     pub const REQUEST_KEY: u32 = 287;
@@ -218,6 +245,7 @@ pub mod nr {
     pub const MKDIRAT: u32 = 296;
     pub const MKNODAT: u32 = 297;
     pub const FCHOWNAT: u32 = 298;
+    pub const FUTIMESAT: u32 = 299;
     pub const FSTATAT64: u32 = 300;
     pub const UNLINKAT: u32 = 301;
     pub const RENAMEAT: u32 = 302;
@@ -235,10 +263,13 @@ pub mod nr {
     pub const TEE: u32 = 315;
     pub const GETCPU: u32 = 318;
     pub const EPOLL_PWAIT: u32 = 319;
+    pub const UTIMENSAT: u32 = 320;
     pub const SIGNALFD: u32 = 321;
     pub const TIMERFD_CREATE: u32 = 322;
     pub const EVENTFD: u32 = 323;
     pub const FALLOCATE: u32 = 324;
+    pub const TIMERFD_SETTIME: u32 = 325;
+    pub const TIMERFD_GETTIME: u32 = 326;
     pub const SIGNALFD4: u32 = 327;
     pub const EVENTFD2: u32 = 328;
     pub const EPOLL_CREATE1: u32 = 329;
@@ -809,6 +840,40 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
         // `compat_get_user_cpu_mask` reads `len` bytes of 32-bit words: the
         // same bytes the native handler copies.
         SCHED_SETAFFINITY => forward_sx(ctx, Syscall::SchedSetaffinity, 0b1),
+        // The `*_time32` entries (`old_timespec32`, `old_timeval32`,
+        // `old_utimbuf32`), in `compat32::legacy`.
+        NANOSLEEP
+        | CLOCK_NANOSLEEP
+        | CLOCK_SETTIME
+        | CLOCK_GETRES
+        | TIMER_SETTIME
+        | TIMER_GETTIME
+        | TIMERFD_SETTIME
+        | TIMERFD_GETTIME
+        | UTIMENSAT
+        | FUTIMESAT
+        | UTIMES
+        | UTIME
+        | SCHED_RR_GET_INTERVAL
+        | IO_GETEVENTS
+        | MQ_TIMEDSEND
+        | MQ_TIMEDRECEIVE => super::legacy::time32_nr(ctx, nr),
+        // kernel/uid16.c: `low2highuid` in, `high2lowuid` out.
+        CHOWN => super::legacy::set_ids16(ctx, Syscall::Chown, 0b110),
+        LCHOWN => super::legacy::set_ids16(ctx, Syscall::Lchown, 0b110),
+        FCHOWN => super::legacy::set_ids16(ctx, Syscall::Fchown, 0b110),
+        SETUID => super::legacy::set_ids16(ctx, Syscall::SetUid, 0b1),
+        SETGID => super::legacy::set_ids16(ctx, Syscall::SetGid, 0b1),
+        SETREUID => super::legacy::set_ids16(ctx, Syscall::Setreuid, 0b11),
+        SETREGID => super::legacy::set_ids16(ctx, Syscall::Setregid, 0b11),
+        SETRESUID => super::legacy::set_ids16(ctx, Syscall::Setresuid, 0b111),
+        SETRESGID => super::legacy::set_ids16(ctx, Syscall::Setresgid, 0b111),
+        SETFSUID => super::legacy::set_ids16(ctx, Syscall::Setfsuid, 0b1),
+        SETFSGID => super::legacy::set_ids16(ctx, Syscall::Setfsgid, 0b1),
+        GETRESUID => super::legacy::getres_ids16(ctx, Syscall::Getresuid),
+        GETRESGID => super::legacy::getres_ids16(ctx, Syscall::Getresgid),
+        GETGROUPS => super::legacy::getgroups16(ctx),
+        SETGROUPS => super::legacy::setgroups16(ctx),
         _ => {
             ctx.set_return(SyscallReturn::not_implemented());
             None
