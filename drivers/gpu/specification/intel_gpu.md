@@ -720,7 +720,10 @@ TC1/TC2 are admitted, and its internal display-programming gate stays closed
 unless `narf.intel.rkl_edp=1` admits the panel: then a VBT declaring eDP on
 port A routes it through the Tiger Lake panel modeset on combo PHY A
 (`rkl_pll_mgr`'s DPLL0, the RKL `DPCLKA_CFGCR0` layout, no PW_2, the RKL
-CDCLK and eDP buffer tables) with the CNP-layout PWM and no PSR.
+CDCLK and eDP buffer tables) with the CNP-layout PWM, console PSR1 on the
+Tiger Lake layout (Wa_16011181250 defeatures PSR2, as on Alder Lake-S) and
+the Gen12 KMS presenter over `rkl_desc`'s three pipes and five planes;
+color, the cursor and tiled views stay unadvertised there.
 Arrow Lake shares the `MeteorLake` classification and Linux's `mtl_desc`
 display descriptor. Lunar, Panther and Wildcat Lake and Nova Lake-S keep
 their headless execution profile unless their per-device route is requested
@@ -1469,7 +1472,11 @@ Public interface:
   DG1 has no Gen12 modeset path and is not wired; with
   `narf.intel.dg1_kms=1` its firmware-lit Pipe A gets the
   discrete KMS owner DG2 has (`DiscreteDisplayIp::Dg1`,
-  display 12, the Tiger Lake KMS profile).
+  display 12, the Tiger Lake KMS profile) and, unlike DG2,
+  the presenter Battlemage has: no integrated Gen12 primary
+  owner, Gen12 local-memory PTEs, and VRAM framebuffers only
+  (Linux migrates DG1 framebuffers to `LMEM_0`,
+  `intel_fb_pin_to_ggtt`; another is presented by CPU copy).
 
 Invariants:
 
@@ -2105,6 +2112,15 @@ programme's last lane; `external_display_supported()` and
   a trigger runs the external-output pass, and
   `intel_irq_suspend` / `intel_irq_resume` bracket system
   sleep (DC9 also refuses while its software flag is set).
+  PW_2 coming up after the install sets pipes B/C up again
+  (`gen8_irq_power_well_post_enable`); the pipe IMRs follow
+  `bdw_update_pipe_irq`; VBLANK is unmasked while a vblank
+  reference is held and the KMS vblank wait takes one
+  (`drm_crtc_wait_one_vblank`: 100 ms, then the frame
+  counter); FIFO underruns are armed by the Gen9 modeset,
+  reported once and disabled until the next modeset
+  (`intel_fifo_underrun.c`). The plane-1 flip done is
+  modelled but unused: the Intel KMS has no async flip.
 - HPD / external sessions: the session layer
   (`enable_external_hpd`, `poll_external_hpd`, `dp_connect` /
   `hdmi_connect` / `mst_connect`) admits Gen9 through

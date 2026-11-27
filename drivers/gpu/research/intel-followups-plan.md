@@ -37,12 +37,12 @@ Boot options, each strict and default off:
 | `narf.intel.prime_p2p=1` | Peer-to-peer VRAM PRIME attachments |
 | `narf.intel.pxp=1` | Xe PXP on MTL/Arrow GT1 (with `media_gt=1` and `gsc=1`) |
 | `narf.intel.hdcp=1` | HDCP 1.4 and 2.2 on external SST DP and HDMI, display 12+ |
-| `narf.intel.gen9_irq=1` | Gen9 and Gen9 LP interrupt owner: MSI, hotplug-driven external pass, `intel_irq_suspend`/`resume` |
+| `narf.intel.gen9_irq=1` | Gen9 and Gen9 LP interrupt owner: MSI, hotplug-driven external pass, `intel_irq_suspend`/`resume`, pipes B/C after PW_2, the vblank wait and FIFO underrun reporting |
 | `narf.intel.execlists_suspend=1` | Gen9/Gen11 execlists GT stopped for system sleep (drain, RPS/RC6 off, reset, `GT_IRQ` dropped) and brought up after |
 | `narf.intel.pp_divisor=1` | `PP_DIVISOR` on display-9 panels with an SPT/KBP/CMP-V south display |
 | `narf.intel.gen9_dpll=1` | Gen9 DPLL1-3 arbitration and sharing between external outputs |
-| `narf.intel.rkl_edp=1` | The Rocket Lake internal panel on the owned eDP route |
-| `narf.intel.dg1_kms=1` | The DG1 KMS owner over its firmware-lit Pipe A |
+| `narf.intel.rkl_edp=1` | The Rocket Lake internal panel on the owned eDP route, with PSR1 and the KMS presenter |
+| `narf.intel.dg1_kms=1` | The DG1 KMS owner over its firmware-lit Pipe A, with a VRAM presenter |
 | `narf.intel.hdmi14_ext=1` | Display 14+ external deep colour, YCbCr 4:4:4 into a DP PCON, and HDMI/DP audio with its component |
 | `narf.intel.svm=1` | Xe CPU-address-mirror VMs on fault-mode VMs of USM devices (LNL, PTL/WCL, NVL-S, BMG) |
 
@@ -88,12 +88,15 @@ work had.
   `PP_DIVISOR` on pre-CNP south displays (`narf.intel.pp_divisor=1`), Gen9
   DPLL1-3 arbitration between external outputs (`narf.intel.gen9_dpll=1`),
   the Rocket Lake internal panel (`narf.intel.rkl_edp=1`) and a DG1 KMS
-  owner (`narf.intel.dg1_kms=1`) have native fixtures and no silicon run.
-  Still open there: Gen9 pipe B/C interrupts once PW_2 comes up after the
-  install (`gen8_irq_power_well_post_enable`), vblank, flip-done and
-  underrun consumers, PSR (PSR1; PSR2 is defeatured, Wa_16011181250) and a
-  KMS presenter on the Rocket Lake panel, and the DG1 presenter (refused,
-  as DG2's is, by the integrated Gen12 primary owner).
+  owner (`narf.intel.dg1_kms=1`) have native fixtures and no silicon run,
+  as have Gen9 pipe B/C interrupts after PW_2, the Gen9 vblank wait and
+  FIFO underrun reporting, PSR1 and the KMS presenter on the Rocket Lake
+  panel, and the DG1 VRAM presenter. Still open there: a flip-done
+  consumer (modelled; the Intel KMS has no async flip), WAIT_VBLANK on
+  Gen9 cards (no `vblank_source`), display interrupts on Gen11/Gen12 (no
+  display interrupt owner: their waits stay polled), color, the cursor
+  and tiled views on the Rocket Lake panel, and DG1 framebuffers outside
+  VRAM (Linux migrates them to LMEM; here they are copied).
 - PXP: protected planes decrypt or go black in every layout the plane
   takes (CPU and DSB arms), and the runtime wiring, the RUN_ALONE value and
   a protected queue's LRC through the GuC model have native fixtures; open
