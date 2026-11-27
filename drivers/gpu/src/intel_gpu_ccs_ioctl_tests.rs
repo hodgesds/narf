@@ -135,3 +135,69 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dsb",
     smoke_intel_ccs_primary_commits_through_the_presenter
 );
+
+/// `PLANE_OFFSET(A, 1)`.
+const PLANE_OFFSET: u64 = 0x701a4;
+
+/// A panned compressed primary (`skl_check_plane_surface`): the AUX plane
+/// first (`skl_check_ccs_aux_surface`), then the main surface stepped back
+/// in 16 KiB units until its x/y match the AUX plane's
+/// (`skl_check_main_surface`), values worked from Linux 7.4's arithmetic
+/// for the 256x96 `_RC_CCS_CC` framebuffer above: main pitch 1024 (8 Tile4
+/// tiles), AUX plane 24 pages in at pitch 128 (2 AUX tiles of 64 bytes x 64
+/// lines; `intel_fb_offset_to_xy` gives it x/y (0, 768) in AUX units), AUX
+/// subsampling 2 x 32 (`intel_fb_plane_get_subsampling`).
+///
+/// - At (160, 0) the AUX tile is (768 / 64) * 2 + 80 / 64 = 25, 0x19000,
+///   with x/y (16 * 2, 0) = (32, 0); the main tile 5 rounds down to the
+///   16 KiB offset 0x4000 with x 32 (`tgl_plane_min_alignment`): they
+///   match, so `PLANE_SURF` is 0x4000 into the framebuffer's 16 KiB-aligned
+///   GGTT base (0x0a000000, the arena's first), `PLANE_OFFSET` 0x20 and
+///   `PLANE_AUX_DIST` 0x19000 - 0x4000 = 0x15000.
+/// - At (33, 33) the AUX tile stays 0x18000 with x/y (33, 33); the main
+///   offset 0x8000 (x/y 33, 1) never matches until offset 0 (x/y 33, 33):
+///   `PLANE_OFFSET` 0x210021, `PLANE_AUX_DIST` 0x18000, in a second
+///   mapping 16 KiB aligned past the first one's 26 pages (0x0a01c000).
+fn smoke_intel_ccs_panned_primary_takes_linux_offsets() -> TestResult {
+    let mode = ccs_mode();
+    let Some(ccs) = frame(&mode, I915_FORMAT_MOD_4_TILED_MTL_RC_CCS_CC) else {
+        return TestResult::Pass;
+    };
+    let Ok(ccs) = ccs else {
+        return TestResult::Fail("ADDFB2 must take the CCS framebuffer");
+    };
+    let queue = queue::Queue::new(mode.clone());
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    request(&cpu, ccs, 160, 0, NONBLOCK, None);
+    let first = submit(&queue, &cpu, &events);
+    let p = MockPlatform::new();
+    let mut worker = worker(&p);
+    run(queue.run(&mut worker));
+    if first.status() != 1
+        || p.read32(CTL) != 0x8400_9400
+        || p.read32(SURF) != 0x0a00_4000
+        || p.read32(PLANE_OFFSET) != 0x20
+        || p.read32(AUX_DIST) != 0x1_5000
+        || p.read32(AUX_OFFSET) != 0
+        || [p.read32(CC_VAL[0]), p.read32(CC_VAL[1])] != [0x89ab_cdef, 0x0123_4567]
+    {
+        return TestResult::Fail("the (160, 0) pan must take Linux's SURF, OFFSET and AUX_DIST");
+    }
+    request(&cpu, ccs, 33, 33, NONBLOCK, None);
+    let second = submit(&queue, &cpu, &events);
+    run(queue.run(&mut worker));
+    if second.status() != 1
+        || p.read32(SURF) != 0x0a01_c000
+        || p.read32(PLANE_OFFSET) != 0x0021_0021
+        || p.read32(AUX_DIST) != 0x1_8000
+        || p.read32(CTL) != 0x8400_9400
+    {
+        return TestResult::Fail("the (33, 33) pan must keep the main surface at offset 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_dsb",
+    smoke_intel_ccs_panned_primary_takes_linux_offsets
+);

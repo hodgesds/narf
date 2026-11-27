@@ -268,16 +268,23 @@ impl View {
             return Err(ScanoutError::Unsupported);
         }
         if let Some(ccs) = self.ccs {
-            // A compressed primary is Tile4 at origin zero: the AUX plane's
-            // x/y must follow the main plane's (`intel_fb_check_ccs_xy`),
-            // which a panned view would move. The mapping then covers the
-            // AUX plane the display fetches at PLANE_AUX_DIST.
-            if self.layout != Layout::Tile4 || self.origin != Viewport::default() {
+            // A compressed primary is Tile4 with its CCS planes, in GGTT at
+            // Linux's placement for the view's origin (`skl_check_main_surface`
+            // over `skl_check_ccs_aux_surface`: the main surface 16 KiB
+            // aligned, its x/y matching the AUX plane's, which has none of
+            // its own). The mapping covers the main rows the view fetches and
+            // the AUX plane the display fetches at PLANE_AUX_DIST. A
+            // display-20 flat-CCS view is placed through its DPT instead
+            // ([`DptLayout::ccs`]).
+            if self.layout != Layout::Tile4 {
                 return Err(ScanoutError::Unsupported);
             }
             let view = View { ccs: None, ..self };
-            let (base, offset, bytes) = view.footprint(geometry)?;
-            return Ok((base, offset, bytes.max(ccs.fetch_end)));
+            let (_, _, bytes) = view.footprint(geometry)?;
+            let placed = ccs
+                .place(geometry.pitch, ccs::MAIN_ALIGNMENT, self.origin.x, self.origin.y)
+                .ok_or(ScanoutError::Unsupported)?;
+            return Ok((placed.main, placed.plane_offset(), bytes.max(ccs.fetch_end)));
         }
         if self.layout == Layout::Linear {
             return self.origin.layout(geometry);
@@ -334,6 +341,11 @@ impl View {
         if ![4096, 16384].contains(&alignment) {
             return Err(ScanoutError::Unsupported);
         }
+        // A compressed view's main offset is already Linux's 16 KiB-aligned
+        // one, with the x/y its AUX plane requires.
+        if self.ccs.is_some() {
+            return Ok((base, offset, bytes));
+        }
         let aligned = base & !(alignment - 1);
         if self.layout == Layout::Linear {
             let start =
@@ -366,6 +378,23 @@ impl View {
                 Layout::X => 512,
                 Layout::Tile4 => 128,
             }
+    }
+    /// `PLANE_AUX_DIST` of this view's compressed layout in GGTT
+    /// ([`ccs::CcsPlacement::aux_dist`] at the view's origin); `None`
+    /// without an AUX plane.
+    pub(crate) fn ccs_aux_dist(self, geometry: Geometry) -> Option<u32> {
+        let ccs = self.ccs.filter(|c| c.aux.is_some())?;
+        ccs.place(geometry.pitch, ccs::MAIN_ALIGNMENT, self.origin.x, self.origin.y)?.aux_dist()
+    }
+    /// The GGTT alignment a surface of this view needs: `fallback`, or a
+    /// compressed view's 16 KiB (`tgl_plane_min_alignment`), so its main
+    /// offsets stay 16 KiB aligned in GGTT.
+    pub(crate) fn surface_alignment(self, fallback: u32) -> u32 {
+        if self.ccs.is_some() {
+            fallback.max(ccs::MAIN_ALIGNMENT)
+        } else {
+            fallback
+        }
     }
     pub(crate) fn tiled(self) -> u32 {
         if let Some(ccs) = self.ccs {
@@ -475,6 +504,30 @@ impl DptLayout {
             plane_offset,
         ))
     }
+    /// A display-20 flat-CCS (`_LNL_CCS`) view through its DPT, as Linux
+    /// scans one out: the framebuffer's remapped view from origin zero
+    /// (`intel_fb_needs_pot_stride_remap`, at the whole source stride for
+    /// CCS, [`Self::with_origin_for`]) through the last row and column the
+    /// view fetches, and the main surface at its DPT-aligned offset in that
+    /// view with the rest in `PLANE_OFFSET` ([`ccs::CcsPlanes::place`] at
+    /// the remapped stride with [`ccs::DPT_MAIN_ALIGNMENT`]; a CCS plane is
+    /// never remapped to the view, `intel_plane_can_remap`). Returns the
+    /// layout, `PLANE_SURF`'s byte offset into the table (`skl_surf_address`:
+    /// the DPT offset >> 9) and `PLANE_OFFSET`.
+    pub(crate) fn ccs(
+        geometry: Geometry,
+        origin: Viewport,
+        ccs: &ccs::CcsPlanes,
+    ) -> Option<(Self, u32, u32)> {
+        let whole = Geometry {
+            width: origin.x.checked_add(geometry.width)?,
+            height: origin.y.checked_add(geometry.height)?,
+            pitch: geometry.pitch,
+        };
+        let (layout, ..) = Self::with_origin_for(whole, Layout::Tile4, Viewport::default(), true)?;
+        let placed = ccs.place(layout.dst * 128, ccs::DPT_MAIN_ALIGNMENT, origin.x, origin.y)?;
+        Some((layout, placed.main >> 9, placed.plane_offset()))
+    }
     /// The layout of `geometry` in `layout`, or `None` for a linear surface,
     /// an invalid tiled geometry or a source stride wider than `dst`.
     pub(crate) fn new(geometry: Geometry, layout: Layout) -> Option<Self> {
@@ -507,8 +560,12 @@ struct Surface {
     /// `offset`/`pages` then map the table, not the framebuffer.
     _dpt: Option<Arc<GemObject>>,
     /// Sub-tile `PLANE_OFFSET` when `_dpt` is present (whole-tile offsets are
-    /// folded directly into the DPT entries starting at `offset`).
+    /// folded directly into the DPT entries starting at `offset`); a
+    /// compressed view's is Linux's x/y ([`DptLayout::ccs`]).
     dpt_plane_offset: Option<u32>,
+    /// `PLANE_SURF`'s byte offset into the table: 0, or a compressed view's
+    /// DPT-aligned main offset >> 9 ([`DptLayout::ccs`]).
+    dpt_surf: u32,
     offset: u32,
     pages: u32,
     geometry: Geometry,
@@ -986,9 +1043,19 @@ impl<M: ScanoutIo> Presenter<M> {
         if extent > object.size() {
             return Err(ScanoutError::Bounds);
         }
-        let (layout, start_col, start_row, plane_offset) =
-            DptLayout::with_origin_for(geometry, view.layout, view.origin, view.ccs.is_some())
-                .ok_or(ScanoutError::Unsupported)?;
+        let (layout, start_col, start_row, plane_offset, dpt_surf) = match view.ccs {
+            Some(ccs) => {
+                let (layout, surf, plane_offset) = DptLayout::ccs(geometry, view.origin, &ccs)
+                    .ok_or(ScanoutError::Unsupported)?;
+                (layout, 0, 0, plane_offset, surf)
+            }
+            None => {
+                let (layout, col, row, plane_offset) =
+                    DptLayout::with_origin_for(geometry, view.layout, view.origin, false)
+                        .ok_or(ScanoutError::Unsupported)?;
+                (layout, col, row, plane_offset, 0)
+            }
+        };
         if !object.idle(false) {
             return Err(ScanoutError::Busy);
         }
@@ -1062,6 +1129,7 @@ impl<M: ScanoutIo> Presenter<M> {
                 object,
                 _dpt: Some(table),
                 dpt_plane_offset: Some(plane_offset),
+                dpt_surf,
                 offset,
                 pages,
                 geometry,
@@ -1138,12 +1206,15 @@ impl<M: ScanoutIo> Presenter<M> {
         if ptes.len() != pages as usize {
             return Err(ScanoutError::Bounds);
         }
+        // A compressed view's framebuffer is pinned 16 KiB aligned
+        // (`intel_plane_fb_min_alignment`), so its main offsets stay aligned.
+        let alignment = view.surface_alignment(self.alignment);
         let (slot, offset, prefix) = self
             .free
             .iter()
             .enumerate()
             .find_map(|(slot, &(start, n))| {
-                let aligned = (start + self.alignment - 1) & !(self.alignment - 1);
+                let aligned = (start + alignment - 1) & !(alignment - 1);
                 let prefix = (aligned - start) / 4096;
                 (n >= pages + prefix).then_some((slot, aligned, prefix))
             })
@@ -1171,6 +1242,7 @@ impl<M: ScanoutIo> Presenter<M> {
                 object,
                 _dpt: None,
                 dpt_plane_offset: None,
+                dpt_surf: 0,
                 offset,
                 pages,
                 geometry,
@@ -1217,7 +1289,7 @@ impl<M: ScanoutIo> Presenter<M> {
         } else {
             0
         };
-        let aux_dist = view.ccs.and_then(|c| c.aux_dist()).unwrap_or(0);
+        let aux_dist = view.ccs_aux_dist(geometry).unwrap_or(0);
         ctl != u32::MAX
             && ctl & !(ALLOWED_CTL | CTL_TILED_MASK | decompression) == 0
             && ctl
@@ -1323,7 +1395,7 @@ impl<M: ScanoutIo> Presenter<M> {
             return Err(ScanoutError::Unavailable);
         }
         let (base, plane_offset) = if let Some(dpt_offset) = surface.dpt_plane_offset {
-            (0, dpt_offset)
+            (surface.dpt_surf, dpt_offset)
         } else {
             let (base, plane_offset, _) = surface
                 .view
@@ -1411,7 +1483,9 @@ impl<M: ScanoutIo> Presenter<M> {
         // 14) precede the arm; a view leaving a compressed one clears the
         // AUX distance it no longer fetches.
         let noarm = match view.ccs {
-            Some(ccs) => ccs.noarm_registers(self.pipe_index(), ccval),
+            Some(ccs) => {
+                ccs.noarm_registers_at(self.pipe_index(), ccval, view.ccs_aux_dist(geometry))
+            }
             None if self.io().read32(self.plane() + AUX_DIST_OFFSET) != 0 => alloc::vec![
                 (self.plane() + AUX_DIST_OFFSET, 0),
                 (self.plane() + AUX_OFFSET_OFFSET, 0),
