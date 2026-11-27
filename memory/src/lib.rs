@@ -94,8 +94,8 @@ pub use address_space::{
     install_shared_page_write_hooks, with_address_space_shared_mapping_transaction,
     with_shared_mapping_transaction, AddressSpace, AddressSpaceError, BrkUpdateResult,
     FileFaultError, FixedRelocationError, FutureLockPolicy, HugeRegion, MappingReceipt, MmUser,
-    MremapLimits, NumaRegionSnapshot, Region, RegionMetadata, RegionPerms, RemoteAccess, RemoteBuf,
-    SharedMremapMode, StackGrowthLimits, ZapOutcome,
+    MmapPlacement, MremapLimits, NumaRegionSnapshot, Region, RegionMetadata, RegionPerms,
+    RemoteAccess, RemoteBuf, SharedMremapMode, StackGrowthLimits, ZapOutcome,
 };
 pub use memtype::{ram_alias_refusals, MemoryType};
 

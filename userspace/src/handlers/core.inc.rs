@@ -5621,7 +5621,7 @@ fn readlink_node(
 // Legacy global mmap cursor — kept until every internal caller of
 // `MMAP_CURSOR.fetch_add(...)` (FB shmem ring, NVMe queue maps, etc.
 // inside this crate) is migrated to the per-AS variant. New code
-// should always use `as_ref.reserve_mmap_va(...)` for the active
+// should always use `as_ref.place_mmap_va(...)` for the active
 // AS.
 static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 

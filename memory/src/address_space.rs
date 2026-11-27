@@ -1022,6 +1022,36 @@ impl MappingReceipt {
     }
 }
 
+/// A no-hint mmap interval chosen by [`AddressSpace::place_mmap_va`] and held
+/// for one mapping attempt: every gap search in the address space treats it
+/// as occupied until this drops. Publish the mapping at [`Self::base`] while
+/// it is alive; dropping it after a failed attempt gives the interval back,
+/// and after publication merely retires the hold the VMA now supersedes.
+#[must_use = "dropping the placement releases its interval"]
+#[derive(Debug)]
+pub struct MmapPlacement<'a> {
+    space: &'a AddressSpace,
+    base: u64,
+    end: u64,
+}
+
+impl MmapPlacement<'_> {
+    /// Page-aligned base of the held interval.
+    #[inline]
+    pub const fn base(&self) -> u64 {
+        self.base
+    }
+}
+
+impl Drop for MmapPlacement<'_> {
+    fn drop(&mut self) {
+        let mut held = self.space.mmap_placements.lock();
+        if let Some(index) = held.iter().position(|r| *r == (self.base, self.end)) {
+            held.swap_remove(index);
+        }
+    }
+}
+
 const INLINE_DEMAND_CLAIMS: usize = narf_lib::percpu::MAX_CPUS;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -2707,6 +2737,14 @@ pub struct AddressSpace {
     /// Linux ref: `arch_get_unmapped_area` searches from `mm->mmap_base`,
     /// which `arch_pick_mmap_base` randomizes at exec.
     mmap_floor: core::sync::atomic::AtomicU64,
+    /// No-hint intervals [`Self::place_mmap_va`] handed out whose mapping is
+    /// not published yet, as `[base, end)`. Linux holds `mmap_lock` from
+    /// `get_unmapped_area` through `mmap_region`; NARF's mmap paths prepare
+    /// file, device and SysV backing between choosing the address and
+    /// publishing the VMA, so the choice is held here instead and every gap
+    /// search treats it as occupied until its [`MmapPlacement`] drops. Lock
+    /// order: a leaf below `vma_transaction` → `huge_regions` → `regions`.
+    mmap_placements: IrqSafeSpinLock<Vec<(u64, u64)>>,
     /// Program break (top of the `brk(2)` heap), owned by the ADDRESS SPACE —
     /// not per-task. The heap is AS state: every `CLONE_VM` thread shares it and
     /// a real fork inherits it (see `clone_for_fork`). Keying it per-task let a
@@ -2789,8 +2827,10 @@ impl Drop for MmUser {
 // (1056: the maintained mm-counters [`RegionAcct`] added 40 inline bytes,
 // net +24 after the retired mapped_bytes_cache Cell; statm's file/shmem RSS
 // and data+stack counters add another 16 bytes; the demand-wait identity
-// adds 8 more, for a 1080-byte ceiling.)
-const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1080);
+// adds 8 more, for a 1080-byte ceiling. 1112: the in-flight no-hint mmap
+// placements add a lock and a Vec header, 32 bytes; the intervals
+// themselves live on the heap.)
+const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1112);
 
 const MEMBARRIER_STATE_MASK: u32 = 0xFF;
 const LIVE_USER_TASKS_SHIFT: u32 = 8;
@@ -2961,6 +3001,7 @@ impl AddressSpace {
             deferred_flush: IrqSafeSpinLock::new(DeferredFlush::default()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
+            mmap_placements: IrqSafeSpinLock::new(Vec::new()),
             brk_top: core::sync::atomic::AtomicU64::new(0),
             stack_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
@@ -3459,6 +3500,11 @@ impl AddressSpace {
     /// Atomically reserve `bytes` of contiguous virtual address
     /// from the per-AS mmap cursor and return the base. Bytes are
     /// page-rounded by the caller; this routine just bumps.
+    ///
+    /// The bump is the whole reservation, so it outlives the call but never
+    /// returns VA: it serves the exec-time loader, which places the
+    /// interpreter in a fresh address space. A runtime no-hint mapping uses
+    /// [`Self::place_mmap_va`], which reuses what munmap returned.
     #[inline]
     pub fn reserve_mmap_va(&self, bytes: u64) -> u64 {
         use core::sync::atomic::Ordering;
@@ -3494,10 +3540,13 @@ impl AddressSpace {
         }
     }
 
-    /// Read the current default mmap candidate without consuming it.
+    /// Read the current default mmap candidate without consuming it: the
+    /// high-water cursor when the interval there is free, otherwise the first
+    /// free hole above the floor, as [`Self::place_mmap_va`] chooses.
     /// Publication paths which must prepare file/SysV ownership for the exact
     /// destination use this under the VMA transaction, then rely on the
-    /// successful map/alias operation to advance the cursor.
+    /// successful map/alias operation to advance the cursor. `MappingLimit`
+    /// means no gap of `len` is free in the window.
     ///
     /// # Safety
     /// The caller must hold this address space's VMA transaction continuously
@@ -3509,13 +3558,72 @@ impl AddressSpace {
         if len == 0 || len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
-        let candidate = self.mmap_cursor.load(core::sync::atomic::Ordering::Relaxed);
-        let (_, window_top) = self.mmap_window();
-        candidate
-            .checked_add(len)
-            .filter(|end| *end <= window_top)
-            .ok_or(AddressSpaceError::MappingLimit)?;
-        Ok(VirtAddr::new(candidate))
+        let huge = self.huge_regions.lock();
+        let regions = self.regions.lock();
+        let placements = self.mmap_placements.lock();
+        let floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
+        let cursor = self.mmap_cursor.load(core::sync::atomic::Ordering::Relaxed);
+        Self::find_unmapped_area_locked(
+            &regions,
+            &huge,
+            &placements,
+            self.mmap_window(),
+            floor,
+            cursor,
+            len,
+            4096,
+        )
+        .map(VirtAddr::new)
+    }
+
+    /// Choose where a no-hint mapping of `bytes` aligned to `align` goes —
+    /// Linux's `get_unmapped_area` for `mmap(NULL, ...)`, `shmat(id, NULL)`:
+    /// the high-water candidate when the interval there is free, else the
+    /// first aligned hole above the floor. Address space that munmap returned
+    /// is therefore used again, and the only failure (`None`, which callers
+    /// report as ENOMEM) is that no free gap of that length lies in the
+    /// window — Linux's condition. A monotonic bump made the 2.6 GiB IA-32
+    /// window run out after that much mapping and unmapping, however little
+    /// stayed mapped (pressure-vessel's i386 `capsule-capture-libs` maps and
+    /// unmaps several GiB of libraries one at a time).
+    ///
+    /// `bytes` is rounded up to whole pages (at least one). The interval is
+    /// held until the returned [`MmapPlacement`] drops: publish the mapping
+    /// at its base first; on any failure dropping it gives the VA back.
+    pub fn place_mmap_va(&self, bytes: u64, align: u64) -> Option<MmapPlacement<'_>> {
+        use core::sync::atomic::Ordering;
+        if align < 4096 || !align.is_power_of_two() {
+            return None;
+        }
+        let len = bytes.max(4096).checked_add(0xFFF)? & !0xFFF;
+        let _vma = self.vma_transaction.lock();
+        let base = {
+            let huge = self.huge_regions.lock();
+            let regions = self.regions.lock();
+            let mut placements = self.mmap_placements.lock();
+            placements.try_reserve(1).ok()?;
+            let base = Self::find_unmapped_area_locked(
+                &regions,
+                &huge,
+                &placements,
+                self.mmap_window(),
+                self.mmap_floor.load(Ordering::Relaxed),
+                self.mmap_cursor.load(Ordering::Relaxed),
+                len,
+                align,
+            )
+            .ok()?;
+            placements.push((base, base + len));
+            base
+        };
+        // Keep the high-water fast path ahead of this interval, as the bump
+        // did, so the next placement does not try it first.
+        self.bump_mmap_cursor_past(base, len);
+        Some(MmapPlacement {
+            space: self,
+            base,
+            end: base + len,
+        })
     }
 
     /// Select the first aligned free interval in the ordinary mmap window
@@ -3537,9 +3645,10 @@ impl AddressSpace {
         }
         let huge = self.huge_regions.lock();
         let regions = self.regions.lock();
+        let placements = self.mmap_placements.lock();
         let floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
         let window = self.mmap_window();
-        Self::find_unmapped_area_locked(&regions, &huge, window, floor, 0, len, align)
+        Self::find_unmapped_area_locked(&regions, &huge, &placements, window, floor, 0, len, align)
             .map(VirtAddr::new)
     }
 
@@ -3991,6 +4100,7 @@ impl AddressSpace {
             deferred_flush: IrqSafeSpinLock::new(DeferredFlush::default()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
+            mmap_placements: IrqSafeSpinLock::new(Vec::new()),
             brk_top: core::sync::atomic::AtomicU64::new(0),
             stack_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
@@ -4044,6 +4154,7 @@ impl AddressSpace {
             deferred_flush: IrqSafeSpinLock::new(DeferredFlush::default()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(floor),
             mmap_floor: core::sync::atomic::AtomicU64::new(floor),
+            mmap_placements: IrqSafeSpinLock::new(Vec::new()),
             brk_top: core::sync::atomic::AtomicU64::new(0),
             stack_top: core::sync::atomic::AtomicU64::new(0),
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
@@ -4246,9 +4357,11 @@ impl AddressSpace {
                 self.mmap_cursor.load(core::sync::atomic::Ordering::Relaxed)
             };
             let floor = self.mmap_floor.load(core::sync::atomic::Ordering::Relaxed);
+            let placements = self.mmap_placements.lock();
             Self::find_unmapped_area_locked(
                 &regions,
                 &huge,
+                &placements,
                 window,
                 floor,
                 placement_hint,
@@ -4281,10 +4394,13 @@ impl AddressSpace {
     /// ([`Self::mmap_window`]): a hint is honoured only inside it and the
     /// search never returns an interval ending above `top` — for an IA-32
     /// address space that is what keeps every kernel-chosen address
-    /// representable in a 32-bit pointer.
+    /// representable in a 32-bit pointer. `placements` are the in-flight
+    /// [`Self::place_mmap_va`] intervals, occupied as surely as a VMA.
+    #[allow(clippy::too_many_arguments)]
     fn find_unmapped_area_locked(
         regions: &RegionTable,
         huge: &[HugeRegion],
+        placements: &[(u64, u64)],
         window: (u64, u64),
         floor: u64,
         hint: u64,
@@ -4319,19 +4435,20 @@ impl AddressSpace {
                     )
                 })
                 .filter(|(start, _)| *start < end);
+            let placed = placements
+                .iter()
+                .filter(|(_, placed_end)| *placed_end > candidate)
+                .map(|(placed_base, placed_end)| ((*placed_base).max(candidate), *placed_end))
+                .filter(|(start, _)| *start < end)
+                .min_by_key(|(start, _)| *start);
 
-            match (regular, huge_region) {
-                (Some((regular_start, regular_end)), Some((huge_start, huge_end))) => {
-                    Some(if regular_start <= huge_start {
-                        regular_end
-                    } else {
-                        huge_end
-                    })
-                }
-                (Some((_, regular_end)), None) => Some(regular_end),
-                (None, Some((_, huge_end))) => Some(huge_end),
-                (None, None) => None,
-            }
+            // The earliest obstacle decides where the search resumes; on a
+            // tie the regular VMA wins, as before placements existed.
+            [regular, huge_region, placed]
+                .into_iter()
+                .flatten()
+                .min_by_key(|(start, _)| *start)
+                .map(|(_, obstacle_end)| obstacle_end)
         };
         let interval_is_free = |candidate: u64| {
             candidate
@@ -6812,9 +6929,10 @@ impl AddressSpace {
     }
 
     /// Apply non-fixed DONTUNMAP using Linux's fifth argument as a preferred
-    /// address. An occupied hint falls back to the monotonic mmap arena. The
-    /// arena cursor advances only when publication succeeds, so allocation or
-    /// resource-limit failures cannot consume virtual address space.
+    /// address. An occupied hint falls back to the default mmap candidate (the
+    /// high-water cursor, else the first free hole). The cursor advances only
+    /// when publication succeeds, so allocation or resource-limit failures
+    /// cannot consume virtual address space.
     ///
     /// # Safety
     /// Same VMA-transaction/live-root contract as
@@ -6838,7 +6956,7 @@ impl AddressSpace {
         // SAFETY: this API requires the same caller-held VMA transaction as
         // the cursor candidate helper.
         let destination = unsafe { self.mmap_cursor_candidate_locked(len) }?;
-        // SAFETY: the monotonic cursor is kept past every VMA in its arena;
+        // SAFETY: the candidate overlaps no VMA and no in-flight placement;
         // the caller's VMA transaction prevents a concurrent publication in
         // this address space before the operation bumps the cursor on success.
         unsafe { self.dontunmap_region_locked_limited(old_base, len, destination, limits) }?;

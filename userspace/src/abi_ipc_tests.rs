@@ -4424,7 +4424,7 @@ fn smoke_abi_ipc_shmat_neg() -> TestResult {
         // `invalid_op` leaves `value` at 0 though, and 0 is a legitimate
         // shmat return — an attachment at address 0 — so the guard now
         // answers -ENOMEM, the same thing this function already returns two
-        // arms up when `reserve_mmap_va_aligned` comes back empty. Asserting
+        // arms up when `place_mmap_va` comes back empty. Asserting
         // that specific value is strictly better than asserting a
         // non-answer: -EINVAL still means the flag was rejected, but so did
         // every other non-Ok status before.

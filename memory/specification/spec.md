@@ -1197,9 +1197,31 @@ impl AddressSpace {
     /// overlapping a range while the same transaction is held.
     pub unsafe fn range_intersects_perms_locked(/* ... */) -> bool;
     /// Read, but do not consume, the default mmap candidate while the VMA
-    /// transaction is held. Successful publication advances the cursor.
+    /// transaction is held: the high-water cursor when that interval is free,
+    /// otherwise the first free hole above the floor (`MappingLimit` only
+    /// when no gap fits). Successful publication advances the cursor.
     pub unsafe fn mmap_cursor_candidate_locked(/* ... */)
         -> Result<VirtAddr, AddressSpaceError>;
+    /// Linux `get_unmapped_area` for a no-hint mapping whose backing is
+    /// prepared for an exact base before publication (file, shared, device,
+    /// huge, SysV attach): the high-water candidate when free, else the first
+    /// aligned hole above the floor, skipping VMAs and other held placements.
+    /// `None` (ENOMEM) only when no gap of that length lies in the window.
+    pub fn place_mmap_va(&self, bytes: u64, align: u64) -> Option<MmapPlacement<'_>>;
+    /// Monotonic cursor bump for the exec-time loader in a fresh address
+    /// space; never returns VA. Runtime no-hint mappings use place_mmap_va.
+    pub fn reserve_mmap_va_aligned(&self, bytes: u64, align: u64) -> u64;
+}
+
+/// An interval held by `place_mmap_va` for one mapping attempt. Every gap
+/// search treats it as occupied until it drops; publish at `base()` first,
+/// and dropping it after a failure returns the interval.
+pub struct MmapPlacement<'a> { /* address space, [base, end) */ }
+impl MmapPlacement<'_> {
+    pub const fn base(&self) -> u64;
+}
+
+impl AddressSpace {
     /// Shared insertion/replacement variants require VMA then shared-owner
     /// transactions to remain held across the external backing snapshot.
     pub unsafe fn map_shared_region_locked_limited(/* ... */)
@@ -1960,7 +1982,17 @@ slid addresses only through `/proc/kallsyms` under `kernel.kptr_restrict`
   compatibility cursor. Selection and VMA publication share the
   per-address-space transaction, so holes released by munmap remain reusable,
   later failure consumes no virtual interval, and no CLONE_VM peer can claim
-  the selected interval first.
+  the selected interval first. Every other no-hint mapping (file, shared,
+  device, huge, no-address shmat) and the default mremap/DONTUNMAP
+  destination choose by the same rule — the free high-water candidate, else
+  the first aligned hole above the floor — so an mmap is refused (ENOMEM)
+  only when no gap of its length is free in the window, as Linux's
+  `vm_unmapped_area` decides, however much the process mapped and unmapped
+  before. A mapping whose backing is prepared between choice and
+  publication holds its interval as an `MmapPlacement`; every gap search
+  treats a held interval as occupied, and dropping it after a failure
+  returns the VA. Only the exec-time loader still bumps the monotonic
+  cursor, in a fresh address space.
 - Non-fixed base-page relocation installs the disjoint destination before
   removing the source, publishes backing ownership exactly once, invalidates
   source translations before freeing a truncated tail, and leaves it intact
