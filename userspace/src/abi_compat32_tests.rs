@@ -2037,3 +2037,298 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_epoll_eventfd_and_fifo_nodes
 );
+
+// ── System V IPC ─────────────────────────────────────────────────────
+
+const IPC_CREAT_0600: u64 = 0o1000 | 0o600;
+const IPC_NOWAIT: u64 = 0o4000;
+const IPC_RMID: u64 = 0;
+const IPC_STAT: u64 = 2;
+const IPC_INFO: u64 = 3;
+const IPC_64: u64 = 0x100;
+const GETVAL: u64 = 12;
+const SETVAL: u64 = 16;
+
+/// A `struct sembuf { u16 sem_num; s16 sem_op; s16 sem_flg; }`.
+fn sembuf(num: u16, op: i16, flg: i16) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&num.to_le_bytes());
+    b.extend_from_slice(&op.to_le_bytes());
+    b.extend_from_slice(&flg.to_le_bytes());
+    b
+}
+
+/// A `struct compat_msgbuf { compat_long_t mtype; char mtext[]; }`.
+fn compat_msgbuf(mtype: i32, text: &[u8]) -> Vec<u8> {
+    let mut b = mtype.to_le_bytes().to_vec();
+    b.extend_from_slice(text);
+    b
+}
+
+/// Fill `len` bytes at `va` with 0xAA, so a test can see how much a call
+/// wrote.
+fn poison(va: u64, len: usize) -> Result<(), &'static str> {
+    put_user(va, &alloc::vec![0xAA; len])
+}
+
+/// Whether `[va + from, va + to)` still holds the 0xAA poison.
+fn untouched(va: u64, from: usize, to: usize) -> Result<bool, &'static str> {
+    Ok(get_user(va + from as u64, to - from)?
+        .iter()
+        .all(|b| *b == 0xAA))
+}
+
+/// i386 System V semaphores through the direct calls (`semget` 393,
+/// `semctl` 394, `semtimedop_time64` 420) and the `ipc` multiplexer (117,
+/// `compat_sys_ipc`) a pre-5.1 i386 glibc uses — Steam's
+/// `CThreadSemaphore`:
+///
+///   * SETVAL/GETVAL pass the `union semun` word, by value directly and by
+///     reference through `ipc(SEMCTL)`;
+///   * IPC_STAT | IPC_64 writes the 64-byte `compat_semid64_ds` (sem_nsems
+///     at 52) and nothing past it; IPC_STAT without IPC_64 (the old layout)
+///     is EINVAL;
+///   * `ipc(SEMOP)` applies a `struct sembuf` (same layout on both ABIs);
+///   * `ipc(SEMTIMEDOP)` reads an `old_timespec32`, so tv_nsec =
+///     1000000000 in its second word is EINVAL.
+fn smoke_compat32_table_sysv_semaphores() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["sem"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let semid = call32(393, [0, 1, IPC_CREAT_0600, 0, 0, 0]);
+            if semid < 0 {
+                return Err("i386 semget(IPC_PRIVATE) failed");
+            }
+            let id = semid as u64;
+            let result = (|| {
+                if call32(394, [id, 0, SETVAL, 5, 0, 0]) != 0
+                    || call32(394, [id, 0, GETVAL, 0, 0, 0]) != 5
+                {
+                    return Err("i386 semctl SETVAL/GETVAL did not round-trip");
+                }
+                poison(base + 0x100, 128)?;
+                if call32(394, [id, 0, IPC_STAT | IPC_64, base + 0x100, 0, 0]) != 0 {
+                    return Err("i386 semctl(IPC_STAT | IPC_64) failed");
+                }
+                let ds = get_user(base + 0x100, 64)?;
+                let nsems = u32::from_le_bytes([ds[52], ds[53], ds[54], ds[55]]);
+                let mode = u16::from_le_bytes([ds[20], ds[21]]);
+                if nsems != 1 || mode & 0o777 != 0o600 {
+                    return Err("i386 semctl(IPC_STAT) did not write a compat_semid64_ds");
+                }
+                if !untouched(base + 0x100, 64, 128)? {
+                    return Err("i386 semctl(IPC_STAT) wrote past the 64-byte compat_semid64_ds");
+                }
+                if call32(394, [id, 0, IPC_STAT, base + 0x100, 0, 0]) != EINVAL {
+                    return Err("i386 semctl(IPC_STAT) without IPC_64 must be EINVAL");
+                }
+                // ipc(SEMOP, semid, nsops = 1, 0, sops): 5 - 2 = 3.
+                put_user(base + 0x200, &sembuf(0, -2, 0))?;
+                if call32(117, [1, id, 1, 0, base + 0x200, 0]) != 0 {
+                    return Err("i386 ipc(SEMOP) failed");
+                }
+                // ipc(SEMCTL, semid, 0, GETVAL, &semun).
+                put_user(base + 0x240, &0u32.to_le_bytes())?;
+                if call32(117, [3, id, 0, GETVAL | IPC_64, base + 0x240, 0]) != 3 {
+                    return Err("i386 ipc(SEMCTL, GETVAL) did not see the ipc(SEMOP)");
+                }
+                // ipc(SEMTIMEDOP, semid, 1, 0, sops, timeout): an
+                // old_timespec32 { 0, 1000000000 } is out of range.
+                put_user(base + 0x280, &sembuf(0, -10, 0))?;
+                let mut ts = 0i32.to_le_bytes().to_vec();
+                ts.extend_from_slice(&1_000_000_000i32.to_le_bytes());
+                ts.extend_from_slice(&[0u8; 8]);
+                put_user(base + 0x2C0, &ts)?;
+                if call32(117, [4, id, 1, 0, base + 0x280, base + 0x2C0]) != EINVAL {
+                    return Err("i386 ipc(SEMTIMEDOP) did not read an old_timespec32 timeout");
+                }
+                // semtimedop_time64 with IPC_NOWAIT on a value that cannot go
+                // negative: EAGAIN.
+                put_user(base + 0x280, &sembuf(0, -10, IPC_NOWAIT as i16))?;
+                if call32(420, [id, base + 0x280, 1, 0, 0, 0]) != EAGAIN {
+                    return Err("i386 semtimedop_time64(IPC_NOWAIT) did not answer EAGAIN");
+                }
+                Ok(())
+            })();
+            let removed = call32(117, [3, id, 0, IPC_RMID, base + 0x240, 0]);
+            result?;
+            if removed != 0 {
+                return Err("i386 ipc(SEMCTL, IPC_RMID) failed");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!("userspace/compat32", smoke_compat32_table_sysv_semaphores);
+
+/// i386 System V message queues: `msgsnd` (400) and `msgrcv` (401) move a
+/// `struct compat_msgbuf` whose `mtype` is a 4-byte `compat_long_t`
+/// (`compat_ksys_msgsnd`, `compat_do_msg_fill`), so the text starts 4 bytes
+/// in; `ipc(MSGSND)` and a version-0 `ipc(MSGRCV)` (buffer and type in a
+/// `struct compat_ipc_kludge`) do the same; `msgctl(IPC_STAT | IPC_64)`
+/// writes the 88-byte `compat_msqid64_ds` (msg_qnum at 64, msg_qbytes at
+/// 68) and nothing past it.
+fn smoke_compat32_table_sysv_message_queues() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["msg"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let qid = call32(399, [0, IPC_CREAT_0600, 0, 0, 0, 0]);
+            if qid < 0 {
+                return Err("i386 msgget(IPC_PRIVATE) failed");
+            }
+            let id = qid as u64;
+            let result = (|| {
+                put_user(base + 0x100, &compat_msgbuf(7, b"ia32"))?;
+                if call32(400, [id, base + 0x100, 4, 0, 0, 0]) != 0 {
+                    return Err("i386 msgsnd of a compat_msgbuf failed");
+                }
+                poison(base + 0x200, 16)?;
+                if call32(401, [id, base + 0x200, 16, 0, IPC_NOWAIT, 0]) != 4 {
+                    return Err("i386 msgrcv did not return the 4-byte message");
+                }
+                let got = get_user(base + 0x200, 8)?;
+                if got[..4] != 7i32.to_le_bytes() || &got[4..8] != b"ia32" {
+                    return Err("i386 msgrcv did not write a compat_msgbuf (4-byte mtype)");
+                }
+                // ipc(MSGSND, msqid, msgsz, msgflg, ptr).
+                put_user(base + 0x300, &compat_msgbuf(9, b"abc"))?;
+                if call32(117, [11, id, 3, 0, base + 0x300, 0]) != 0 {
+                    return Err("i386 ipc(MSGSND) failed");
+                }
+                // ipc(MSGRCV) version 0: { msgp, msgtyp } at ptr.
+                let mut kludge = (base as u32 + 0x340).to_le_bytes().to_vec();
+                kludge.extend_from_slice(&9i32.to_le_bytes());
+                put_user(base + 0x380, &kludge)?;
+                if call32(117, [12, id, 16, IPC_NOWAIT, base + 0x380, 0]) != 3 {
+                    return Err("i386 ipc(MSGRCV) through the compat_ipc_kludge failed");
+                }
+                let got = get_user(base + 0x340, 7)?;
+                if got[..4] != 9i32.to_le_bytes() || &got[4..7] != b"abc" {
+                    return Err("i386 ipc(MSGRCV) did not write a compat_msgbuf");
+                }
+                poison(base + 0x400, 128)?;
+                if call32(402, [id, IPC_STAT | IPC_64, base + 0x400, 0, 0, 0]) != 0 {
+                    return Err("i386 msgctl(IPC_STAT | IPC_64) failed");
+                }
+                let ds = get_user(base + 0x400, 88)?;
+                let qnum = u32::from_le_bytes([ds[64], ds[65], ds[66], ds[67]]);
+                let qbytes = u32::from_le_bytes([ds[68], ds[69], ds[70], ds[71]]);
+                if qnum != 0 || qbytes == 0 {
+                    return Err("i386 msgctl(IPC_STAT) did not write a compat_msqid64_ds");
+                }
+                if !untouched(base + 0x400, 88, 128)? {
+                    return Err("i386 msgctl(IPC_STAT) wrote past the 88-byte compat_msqid64_ds");
+                }
+                Ok(())
+            })();
+            let removed = call32(402, [id, IPC_RMID, 0, 0, 0, 0]);
+            result?;
+            if removed != 0 {
+                return Err("i386 msgctl(IPC_RMID) failed");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_sysv_message_queues
+);
+
+/// i386 System V shared memory: `shmget` (395) and `shmat` (397) attach
+/// below `TASK_SIZE_32`; `ipc(SHMAT)` stores the address through `third` as
+/// a 4-byte `compat_ulong_t` and returns 0; `shmctl(IPC_STAT | IPC_64)`
+/// writes the 84-byte `compat_shmid64_ds` (shm_segsz at 36, shm_nattch at
+/// 72) and nothing past it; `shmctl(IPC_INFO | IPC_64)` writes the 36-byte
+/// `compat_shminfo64` with shmmax clamped to INT_MAX; `shmdt` (398) and
+/// `ipc(SHMDT)` detach and `ipc(SHMCTL, IPC_RMID)` removes.
+fn smoke_compat32_table_sysv_shared_memory() -> TestResult {
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["shm"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_setup(|| {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let shmid = call32(395, [0, 4096, IPC_CREAT_0600, 0, 0, 0]);
+            if shmid < 0 {
+                return Err("i386 shmget(IPC_PRIVATE) failed");
+            }
+            let id = shmid as u64;
+            let result = (|| {
+                let addr = call32(397, [id, 0, 0, 0, 0, 0]) as u32 as u64;
+                if addr == 0 || addr >= TASK_SIZE_32 || addr & 0xFFF != 0 {
+                    return Err("i386 shmat did not attach below TASK_SIZE_32");
+                }
+                if call32(117, [21, id, 0, base + 0x100, 0, 0]) != 0 {
+                    return Err("i386 ipc(SHMAT) did not return 0");
+                }
+                let raddr = u64::from(get_u32(base + 0x100)?);
+                if raddr == 0 || raddr >= TASK_SIZE_32 || raddr == addr {
+                    return Err("i386 ipc(SHMAT) did not store a second 32-bit address");
+                }
+                poison(base + 0x200, 128)?;
+                if call32(396, [id, IPC_STAT | IPC_64, base + 0x200, 0, 0, 0]) != 0 {
+                    return Err("i386 shmctl(IPC_STAT | IPC_64) failed");
+                }
+                let ds = get_user(base + 0x200, 84)?;
+                let segsz = u32::from_le_bytes([ds[36], ds[37], ds[38], ds[39]]);
+                let nattch = u32::from_le_bytes([ds[72], ds[73], ds[74], ds[75]]);
+                if segsz != 4096 || nattch != 2 {
+                    return Err("i386 shmctl(IPC_STAT) did not write a compat_shmid64_ds");
+                }
+                if !untouched(base + 0x200, 84, 128)? {
+                    return Err("i386 shmctl(IPC_STAT) wrote past the 84-byte compat_shmid64_ds");
+                }
+                poison(base + 0x300, 80)?;
+                if call32(396, [id, IPC_INFO | IPC_64, base + 0x300, 0, 0, 0]) < 0 {
+                    return Err("i386 shmctl(IPC_INFO | IPC_64) failed");
+                }
+                let shmmax = get_u32(base + 0x300)?;
+                if shmmax == 0 || shmmax > i32::MAX as u32 || !untouched(base + 0x300, 36, 80)? {
+                    return Err("i386 shmctl(IPC_INFO) did not write a clamped compat_shminfo64");
+                }
+                if call32(398, [addr, 0, 0, 0, 0, 0]) != 0 {
+                    return Err("i386 shmdt failed");
+                }
+                if call32(117, [22, 0, 0, 0, raddr, 0]) != 0 {
+                    return Err("i386 ipc(SHMDT) failed");
+                }
+                Ok(())
+            })();
+            let removed = call32(117, [24, id, IPC_RMID, 0, 0, 0]);
+            result?;
+            if removed != 0 {
+                return Err("i386 ipc(SHMCTL, IPC_RMID) failed");
+            }
+            Ok(())
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_sysv_shared_memory
+);
