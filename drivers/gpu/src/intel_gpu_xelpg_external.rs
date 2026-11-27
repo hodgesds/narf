@@ -1319,6 +1319,20 @@ pub(crate) fn probe_sink_profile_uhbr<M: MmioWindow + ?Sized>(
     probe_sink_link(io, link, uhbr, false)
 }
 
+/// [`probe_sink_profile`] with explicit `narf.intel.uhbr` and
+/// `narf.intel.hdmi14_ext` decisions.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) fn probe_sink_profile_link<M: MmioWindow + ?Sized>(
+    io: &M,
+    profile: ExternalDisplayProfile,
+    port: XeLpgPort,
+    uhbr: bool,
+    ext: bool,
+) -> Result<MtlSinkProbe, ExternalError> {
+    let link = probe_link_profile(io, profile, port, false)?;
+    probe_sink_link(io, link, uhbr, ext)
+}
+
 /// [`probe_sink_profile`] with an explicit `narf.intel.hdmi14_ext` decision
 /// (UHBR off).
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1459,7 +1473,7 @@ fn plan_uhbr_link<A: crate::dp_aux::AuxChannel + ?Sized>(
                     post_lt_adj_req: sink.post_lt_adj_req,
                     tunnel,
                     caps,
-                    max_bpp: max_bpp.min(dsc::PIPE_BPP) as u8,
+                    max_bpp: max_bpp.min(36) as u8,
                     dsc_sink: dsc_sink.copied(),
                 },
                 dsc: None,

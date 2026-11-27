@@ -4344,6 +4344,62 @@ kernel_test_in!(
     smoke_mtl_external_uhbr_option_off_refuses_over_budget
 );
 
+/// Deep colour over 128b/132b SST (`narf.intel.uhbr=1` with
+/// `narf.intel.hdmi14_ext=1`): the two-lane 4K60 DP 2.0 sink of
+/// [`uhbr_tc`] with an EDID 1.4 12 bpc depth. `intel_dp_compute_link_config_wide`
+/// walks the pipe bpp from 36 over every configuration in rate-lane order:
+/// 4K60 at 36 bpp needs 2673000 kBps, above UHBR10 x2 (2417750) and UHBR20
+/// x1, so UHBR20 x2 (4835500) carries 36 bpp, ahead of a shallower pipe on
+/// UHBR10. The retry keeps the 36 bpp maximum. Without
+/// `narf.intel.hdmi14_ext` the same sink runs 24 bpp on UHBR10 x2.
+fn smoke_mtl_external_uhbr_deep_colour_36_bpp() -> TestResult {
+    let deep = || {
+        let mut edid = edid_uhd(594_000);
+        edid[20] = 0xC0;
+        edid[127] = edid[127].wrapping_sub(0xC0);
+        let mut sink = Sink::dp20(0x14, edid, uhbr::DP_UHBR10 | uhbr::DP_UHBR20);
+        sink.ffe_request = [4, 9, 0, 0];
+        let io = ExtFake::new(XeLpgPort::Tc2, sink);
+        io.pin.set(crate::intel_gpu_xelpg_tc::PIN_ASSIGNMENT_D);
+        io
+    };
+    let profile = ExternalDisplayProfile::for_ip(DisplayIp::Xelpdp);
+    let io = deep();
+    let probe = match probe_sink_profile_link(&io, profile, XeLpgPort::Tc2, true, true) {
+        Ok(probe) => probe,
+        Err(_) => return TestResult::Fail("the 12 bpc DP 2.0 sink must probe"),
+    };
+    match probe.uhbr.as_deref() {
+        Some(plan)
+            if plan.link
+                == (uhbr::UhbrLink {
+                    rate: uhbr::UhbrRate::Uhbr20,
+                    lanes: 2,
+                    pipe_bpp: 36,
+                })
+                && plan.max_bpp == 36
+                && probe.pipe_bpp == 36
+                && probe.dsc.is_none() => {}
+        _ => return TestResult::Fail("36 bpp must take UHBR20 x2"),
+    }
+    let io = deep();
+    match probe_sink_profile_link(&io, profile, XeLpgPort::Tc2, true, false) {
+        Ok(probe)
+            if probe.pipe_bpp == 24
+                && probe.uhbr.as_deref().is_some_and(|plan| {
+                    (plan.link.rate, plan.link.lanes) == (uhbr::UhbrRate::Uhbr10, 2)
+                }) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("without narf.intel.hdmi14_ext the sink runs 24 bpp on UHBR10 x2"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_external",
+    smoke_mtl_external_uhbr_deep_colour_36_bpp
+);
+
 /// `narf.intel.uhbr=1` on Meteor Lake TC2: `intel_dp_compute_link_config_wide`
 /// picks UHBR10 x2 at 24 bpp; `mtl_ddi_pre_enable_dp` and `intel_ddi_enable`
 /// then run the 128b/132b route: the C20 MPLLA UHBR10 image with

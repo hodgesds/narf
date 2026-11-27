@@ -666,7 +666,9 @@ pub fn wide_search(
     cap: Option<u64>,
 ) -> Option<dsc::UncompressedLink> {
     let capped = |rate: u64| cap.map_or(rate, |cap| rate.min(cap));
-    let max_bpp = max_bpp.min(dsc::PIPE_BPP);
+    // intel_display_max_pipe_bpp: a deep-colour pipe maximum (30 or 36 bpp
+    // under narf.intel.hdmi14_ext=1) is searched as given.
+    let max_bpp = max_bpp.min(36);
     let (clock, hdisplay) = (mode.pixel_clock_khz, u32::from(mode.h_active));
     let (order, n) = caps.ordered(FallbackOrder::RateLane);
     let mut bpp = max_bpp - max_bpp % 6;
