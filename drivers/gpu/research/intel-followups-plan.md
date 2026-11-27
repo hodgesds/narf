@@ -80,13 +80,16 @@ work had.
 - DP 2.0 UHBR beyond the 128b/132b SST route behind `narf.intel.uhbr=1`
   (UHBR10/20 on C20 and LT ports, over display-30 Thunderbolt with DP
   tunnel BW allocation, through non-transparent LTTPRs, with the
-  reduced-parameter retry, HDCP, the VBT C20 UHBR override, DSC over
-  128b/132b SST with the Linux 7.4 DSC search, and 128b/132b MST; native
-  fixtures only): DSC over 128b/132b MST, 128b/132b MST through a DP tunnel
-  (per-stream tunnel bandwidth), the reduced-parameter retry for compressed
-  and MST UHBR links, per-hop 8b/10b LTTPR training
-  (`intel_dp_link_train_all_phys`), the VBT DP 1.4 C20 and C10 overrides,
-  and a silicon run.
+  reduced-parameter retry (compressed and MST links included), HDCP, the
+  VBT C20 UHBR and DP 1.4 C10/C20 overrides, DSC over 128b/132b SST with
+  the Linux 7.4 DSC search, 128b/132b MST, also through a DP tunnel with
+  per-stream bandwidth, per-hop 8b/10b LTTPR training on SST, and the
+  128b/132b MST DSC link math; native fixtures only): the DSC route over
+  128b/132b MST (the stream's decompression AUX, `drm_dp_mst_dsc_aux_for_port`,
+  exists only inside the amdgpu MST owner), per-hop LTTPR training on
+  8b/10b MST, the DPRX's `POST_LT_ADJ_REQ` phase, Linux 7.4's
+  same-parameter autoretrain before a fallback, the C10 eDP overrides on
+  the panel, and a silicon run.
 - Older display: the Gen9 interrupt owner (`narf.intel.gen9_irq=1`), the
   execlists GT across system sleep (`narf.intel.execlists_suspend=1`),
   `PP_DIVISOR` on pre-CNP south displays (`narf.intel.pp_divisor=1`), Gen9
