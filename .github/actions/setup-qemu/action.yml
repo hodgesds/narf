@@ -44,6 +44,28 @@ runs:
         curl -fL "https://download.qemu.org/qemu-${{ inputs.version }}.tar.xz" -o /tmp/qemu.tar.xz
         tar -xf /tmp/qemu.tar.xz -C /tmp
         cd "/tmp/qemu-${{ inputs.version }}"
+        # GCC 15 + glibc 2.43 (the ubuntu-latest runner image is now
+        # Ubuntu 26.04) rejects the vendored dtc's fdt_overlay.c: it
+        # assigns memchr() — whose result is now const-propagating —
+        # to `char *sep`, which -Werror=discarded-qualifiers makes
+        # fatal (fdt_overlay.c:461/471). Upstream dtc fixed this by
+        # making `sep` const (commit 9a1c801a, "Fix discarded const
+        # qualifiers"); apply that one-line fix to the vendored copy.
+        # The script asserts exactly one replacement and fails loudly
+        # if the bundled dtc ever changes shape.
+        python3 - <<'PYEOF'
+        import pathlib, re, sys
+        p = pathlib.Path("subprojects/dtc/libfdt/fdt_overlay.c")
+        s = p.read_text()
+        new, n = re.subn(r"^(\s*)char \*sep, \*endptr;$",
+                         r"\1const char *sep;\n\1char *endptr;",
+                         s, count=1, flags=re.M)
+        if n != 1:
+            print(f"dtc patch: expected exactly 1 'char *sep, *endptr;' "
+                  f"declaration, found {n}", file=sys.stderr)
+            sys.exit(1)
+        p.write_text(new)
+        PYEOF
         ./configure \
           --target-list=x86_64-softmmu \
           --prefix="$HOME/qemu-install" \
