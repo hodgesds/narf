@@ -3685,6 +3685,100 @@ kernel_test_in!(
     smoke_abi_proc_nproc_ucount_follows_credential_rows
 );
 
+/// Write `v` to `path` (NUL-terminated): `write(2)`'s return, or the open's
+/// -errno.
+#[cfg(feature = "cgroup")]
+fn cgroup_file_write(path: &[u8], v: &[u8]) -> i64 {
+    let fd = match call_open(path.as_ptr() as u64, 1) {
+        Some(fd) if fd >= 0 => fd,
+        Some(errno) => return errno,
+        None => return i64::MIN,
+    };
+    let n = call(
+        Syscall::Write.raw(),
+        a2(fd as u64, v.as_ptr() as u64, v.len() as u64),
+    )
+    .unwrap_or(i64::MIN);
+    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+    n
+}
+
+#[cfg(feature = "cgroup")]
+fn cgroup_file_read(path: &[u8]) -> alloc::string::String {
+    let Some(fd) = call_open(path.as_ptr() as u64, 0).filter(|fd| *fd >= 0) else {
+        return alloc::string::String::new();
+    };
+    let mut buf = [0u8; 64];
+    let n = call(
+        Syscall::Read.raw(),
+        a2(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+    )
+    .unwrap_or(0)
+    .max(0) as usize;
+    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+    alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// `kernel/cgroup/pids.c::pids_can_fork`: a fork that would take its cgroup
+/// past `pids.max` fails with -EAGAIN and counts a `max` event — how Linux
+/// contains a fork bomb confined to a cgroup — checked with the other
+/// copy_process admission checks, before any address-space work.
+#[cfg(feature = "cgroup")]
+fn smoke_abi_proc_pids_max_refuses_fork() -> TestResult {
+    const ROOT_CONTROL: &[u8] = b"/sys/fs/cgroup/cgroup.subtree_control\0";
+    const DIR: &[u8] = b"/sys/fs/cgroup/t_pids_fork\0";
+    const MAX: &[u8] = b"/sys/fs/cgroup/t_pids_fork/pids.max\0";
+    const EVENTS: &[u8] = b"/sys/fs/cgroup/t_pids_fork/pids.events\0";
+    let mut built_in = true;
+    let result = with_setup(|| {
+        if cgroup_file_write(ROOT_CONTROL, b"+pids") < 0 {
+            built_in = false;
+            return Ok(());
+        }
+        let me = crate::handlers::task_to_pid_raw(FAKE_TASK).unwrap_or(FAKE_TASK);
+        let _ = call_rmdir(DIR.as_ptr() as u64);
+        let outcome = (|| {
+            if call_mkdir(DIR.as_ptr() as u64, 0o755) != Some(0) {
+                return Err("mkdir of the pids test cgroup failed");
+            }
+            if cgroup_file_write(MAX, b"1") != 1 {
+                return Err("setting pids.max failed");
+            }
+            narf_filesystem::cgroupfs::attach_by_path("/t_pids_fork", me)
+                .map_err(|_| "attaching the harness task to the pids cgroup failed")?;
+            // pids.current == pids.max: one more task would exceed it.
+            match call(Syscall::Fork.raw(), a0(0)) {
+                Some(v) if v == EAGAIN => {}
+                Some(v) if v == ENOMEM => {
+                    return Err("a fork past pids.max reached the address-space path")
+                }
+                _ => return Err("a fork past pids.max was not -EAGAIN"),
+            }
+            if cgroup_file_read(EVENTS).trim() != "max 1" {
+                return Err("a fork refused by pids.max did not count a max event");
+            }
+            if cgroup_file_write(MAX, b"2") != 1 {
+                return Err("raising pids.max failed");
+            }
+            match call(Syscall::Fork.raw(), a0(0)) {
+                Some(v) if v == ENOMEM => Ok(()),
+                _ => Err("a fork under pids.max did not reach the address-space path"),
+            }
+        })();
+        narf_filesystem::cgroupfs::task_exited(me);
+        let _ = call_rmdir(DIR.as_ptr() as u64);
+        let _ = cgroup_file_write(ROOT_CONTROL, b"-pids");
+        outcome
+    });
+    if built_in {
+        result
+    } else {
+        TestResult::Skip("the pids controller is not built in")
+    }
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!("syscall_abi/pids_max", smoke_abi_proc_pids_max_refuses_fork);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_rlimit_nproc_refuses_fork() -> TestResult {
     with_setup(|| {
