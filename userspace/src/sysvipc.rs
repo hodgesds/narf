@@ -185,6 +185,76 @@ const MSQID64_SIZE: usize = 120;
 const MSGINFO_SIZE: usize = 32;
 const SEMINFO_SIZE: usize = 40;
 
+/// A System V IPC control structure an `IPC_STAT`/`IPC_SET`-style command
+/// copies, for the i386 conversion in `compat32::ipc`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IpcDs {
+    /// `struct semid64_ds`.
+    Sem,
+    /// `struct msqid64_ds`.
+    Msg,
+    /// `struct shmid64_ds`.
+    Shm,
+    /// `struct shminfo64` (`shmctl(IPC_INFO)`).
+    ShmInfo,
+    /// `struct shm_info` (`shmctl(SHM_INFO)`).
+    ShmUsage,
+}
+
+/// Copy the native-layout `kind` structure `native` out to `uptr`. An i386
+/// call (`in_ia32_syscall()`) gets its `struct compat_*` form, as Linux's
+/// `copy_compat_semid_to_user` and friends write it.
+pub(crate) fn ipc_ds_to_user(
+    ctx: &dyn TrapContext,
+    uptr: u64,
+    native: &[u8],
+    kind: IpcDs,
+) -> Result<(), ()> {
+    #[cfg(target_arch = "x86_64")]
+    if ctx.in_ia32_syscall() {
+        return crate::compat32::ipc::ds_to_user(kind, uptr, native);
+    }
+    let _ = (ctx, kind);
+    // SAFETY: copy_to_user range-validates and SMAP-brackets the whole copy.
+    unsafe { crate::handlers::copy_to_user(uptr, native) }.map_err(|_| ())
+}
+
+/// Copy the `kind` structure at `uptr` in, in its native layout
+/// (`native_len` bytes): an i386 call's compat form is read and widened.
+pub(crate) fn ipc_ds_from_user(
+    ctx: &dyn TrapContext,
+    uptr: u64,
+    native_len: usize,
+    kind: IpcDs,
+) -> Result<Vec<u8>, ()> {
+    #[cfg(target_arch = "x86_64")]
+    if ctx.in_ia32_syscall() {
+        return crate::compat32::ipc::ds_from_user(kind, uptr);
+    }
+    let _ = (ctx, kind);
+    // SAFETY: copy_from_user_vec validates the complete range.
+    unsafe { crate::handlers::copy_from_user_vec(uptr, native_len) }.map_err(|_| ())
+}
+
+/// Bytes of `struct msgbuf`'s `long mtype`: 4 in an i386 caller's
+/// `struct compat_msgbuf` (`compat_long_t`), 8 natively.
+fn msg_long_bytes(ctx: &dyn TrapContext) -> usize {
+    if ctx.in_ia32_syscall() {
+        4
+    } else {
+        8
+    }
+}
+
+/// The `mtype` held in the first `long_bytes` of `hdr`, sign-extended.
+fn msg_long_from(hdr: &[u8; 8], long_bytes: usize) -> i64 {
+    if long_bytes == 4 {
+        i64::from(i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]))
+    } else {
+        i64::from_le_bytes(*hdr)
+    }
+}
+
 fn put_u32(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
 }
@@ -3285,18 +3355,29 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     let timeout = if let Some((_, timeout, _, _)) = staged {
         timeout
     } else if timed && a.arg3 != 0 {
+        // The i386 `ipc(SEMTIMEDOP)` passes an `old_timespec32`
+        // (`compat_ksys_semtimedop`); every other caller a `__kernel_timespec`.
+        let time32 = ctx.ia32_abi().time32;
+        let len = if time32 { 8 } else { 16 };
         let mut raw = [0u8; 16];
-        // SAFETY: copy_from_user validates the complete __kernel_timespec.
-        if unsafe { crate::handlers::copy_from_user(&mut raw, a.arg3) }.is_err() {
+        // SAFETY: copy_from_user validates the complete timespec.
+        if unsafe { crate::handlers::copy_from_user(&mut raw[..len], a.arg3) }.is_err() {
             finish_semtimedop_wait(timed);
             unlink_sem_wait_if_present(object, task, may_have_wait);
             ctx.set_return(err(EFAULT));
             return;
         }
-        Some((
-            i64::from_ne_bytes(raw[..8].try_into().unwrap()),
-            i64::from_ne_bytes(raw[8..].try_into().unwrap()),
-        ))
+        if time32 {
+            Some((
+                i64::from(i32::from_ne_bytes(raw[..4].try_into().unwrap())),
+                i64::from(i32::from_ne_bytes(raw[4..8].try_into().unwrap())),
+            ))
+        } else {
+            Some((
+                i64::from_ne_bytes(raw[..8].try_into().unwrap()),
+                i64::from_ne_bytes(raw[8..].try_into().unwrap()),
+            ))
+        }
     } else {
         None
     };
@@ -3673,9 +3754,9 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 }
             };
             let out = encode_sem_stat(snapshot);
-            // SAFETY: copy_to_user validates the complete architecture-specific
-            // semid64_ds output range after the object snapshot is taken.
-            if unsafe { crate::handlers::copy_to_user(arg, &out) }.is_err() {
+            // The complete architecture-specific semid64_ds (an i386 caller's
+            // compat_semid64_ds) after the object snapshot is taken.
+            if ipc_ds_to_user(ctx, arg, &out, IpcDs::Sem).is_err() {
                 ctx.set_return(err(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(if cmd == IPC_STAT {
@@ -3686,9 +3767,9 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             }
         }
         IPC_SET => {
-            // SAFETY: copy_from_user_vec validates the full semid64_ds. Linux
+            // The full semid64_ds (an i386 caller's compat_semid64_ds). Linux
             // imports it before lookup; ignored/padding fields remain required.
-            let input = match unsafe { crate::handlers::copy_from_user_vec(arg, SEMID64_SIZE) } {
+            let input = match ipc_ds_from_user(ctx, arg, SEMID64_SIZE, IpcDs::Sem) {
                 Ok(input) => input,
                 Err(_) => {
                     ctx.set_return(err(EFAULT));
@@ -4340,14 +4421,17 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         let msgsz = a.arg2 as usize;
         let msgflg = a.arg3;
         // ksys_msgsnd imports mtype before do_msgsnd validates size, id, or type.
+        // An i386 caller's `struct compat_msgbuf` has a 4-byte `mtype`
+        // (`compat_ksys_msgsnd`), so its text starts 4 bytes in.
+        let long_bytes = msg_long_bytes(ctx);
         let mut hdr = [0u8; 8];
         // SAFETY: copy_from_user validates and brackets the complete mtype read.
-        if unsafe { crate::handlers::copy_from_user(&mut hdr, msgp) }.is_err() {
+        if unsafe { crate::handlers::copy_from_user(&mut hdr[..long_bytes], msgp) }.is_err() {
             clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
             ctx.set_return(err(EFAULT));
             return;
         }
-        let mtype = i64::from_le_bytes(hdr);
+        let mtype = msg_long_from(&hdr, long_bytes);
         if msgsz > current_limits().msgmax || msqid_raw < 0 || mtype <= 0 {
             clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
             ctx.set_return(err(EINVAL));
@@ -4361,7 +4445,7 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         }
         payload.resize(msgsz, 0);
         if msgsz != 0 {
-            let Some(payload_ptr) = msgp.checked_add(8) else {
+            let Some(payload_ptr) = msgp.checked_add(long_bytes as u64) else {
                 clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
                 ctx.set_return(err(EFAULT));
                 return;
@@ -4653,15 +4737,19 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
         drain_msg_wakes(&queue);
     }
     let copied_len = core::cmp::min(payload.len(), msgsz);
+    // `compat_do_msg_fill` writes an i386 caller's 4-byte `compat_long_t`
+    // mtype, its text 4 bytes in.
+    let long_bytes = msg_long_bytes(ctx);
+    let mtype_bytes = mtype.to_le_bytes();
     // Linux's do_msg_fill publishes mtype first, then mtext.  Either copy may
     // fault after an ordinary message has already been unlinked.
     // SAFETY: copy_to_user range-validates and SMAP-brackets each output.
-    let copy_result = unsafe { crate::handlers::copy_to_user(msgp, &mtype.to_le_bytes()) }
+    let copy_result = unsafe { crate::handlers::copy_to_user(msgp, &mtype_bytes[..long_bytes]) }
         .and_then(|()| {
             if copied_len == 0 {
                 return Ok(());
             }
-            let payload_ptr = msgp.checked_add(8).ok_or(EFAULT as u64)?;
+            let payload_ptr = msgp.checked_add(long_bytes as u64).ok_or(EFAULT as u64)?;
             // SAFETY: payload_ptr was checked above; copy_to_user validates
             // the complete destination range.
             unsafe { crate::handlers::copy_to_user(payload_ptr, &payload[..copied_len]) }
@@ -4880,9 +4968,9 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
             put_u64(&mut out, 88, max_bytes as u64);
             put_i32(&mut out, 96, last_send_pid);
             put_i32(&mut out, 100, last_recv_pid);
-            // SAFETY: copy_to_user validates the full native msqid64_ds range
-            // after the readable queue has been snapshotted.
-            if unsafe { crate::handlers::copy_to_user(buf, &out) }.is_err() {
+            // The full msqid64_ds (an i386 caller's compat_msqid64_ds) after
+            // the readable queue has been snapshotted.
+            if ipc_ds_to_user(ctx, buf, &out, IpcDs::Msg).is_err() {
                 ctx.set_return(err(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(if cmd == IPC_STAT {
@@ -4893,9 +4981,10 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
             }
         }
         IPC_SET => {
-            // SAFETY: Linux imports the complete msqid64_ds before queue lookup
-            // or owner checks, including all ignored and padding fields.
-            let input = match unsafe { crate::handlers::copy_from_user_vec(buf, MSQID64_SIZE) } {
+            // Linux imports the complete msqid64_ds (compat_msqid64_ds for an
+            // i386 caller) before queue lookup or owner checks, including all
+            // ignored and padding fields.
+            let input = match ipc_ds_from_user(ctx, buf, MSQID64_SIZE, IpcDs::Msg) {
                 Ok(input) => input,
                 Err(_) => {
                     ctx.set_return(err(EFAULT));

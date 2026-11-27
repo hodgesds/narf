@@ -21,6 +21,7 @@
 
 pub(crate) mod conv;
 pub(crate) mod ctx;
+pub(crate) mod ipc;
 pub mod mm;
 pub mod table;
 pub mod tls;

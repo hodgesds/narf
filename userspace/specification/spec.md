@@ -2881,6 +2881,24 @@ epoll_pwait2's compat entry takes the 64-bit `__kernel_timespec`. (An
 S_IFIFO node is created as NARF creates every non-directory node, as a
 regular file.)
 
+**System V IPC.** The direct calls semget (393), semctl (394), shmget
+(395), shmctl (396), shmat (397), shmdt (398), msgget (399), msgsnd (400),
+msgrcv (401), msgctl (402) and semtimedop_time64 (420), and the `ipc`
+multiplexer (117, `compat_sys_ipc`) that an i386 libc built for kernels
+before 5.1 uses. `ipc` decodes its version and call: SEMCTL reads the `union
+semun` word through `ptr`, version-0 MSGRCV its buffer and type from a
+`struct compat_ipc_kludge`, SEMTIMEDOP takes an `old_timespec32`
+(`Ia32Abi::time32` in `sys_semtimedop`), and SHMAT stores the address as a
+4-byte `compat_ulong_t` through `third` and returns 0. The control commands
+strip IPC_64 (`compat_ipc_parse_version`). Those with an IPC_64 structure
+move it in its compat layout through `sysvipc::ipc_ds_to_user` /
+`ipc_ds_from_user` (`compat32::ipc`): `compat_semid64_ds`,
+`compat_msqid64_ds`, `compat_shmid64_ds`, `compat_shminfo64` (shmmax
+clamped to INT_MAX) and `compat_shm_info`. The same commands without IPC_64
+mean the pre-2.4 layouts and answer EINVAL. msgsnd and msgrcv use `struct
+compat_msgbuf`, whose `mtype` is a 4-byte `compat_long_t`
+(`sysvipc::msg_long_bytes`).
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

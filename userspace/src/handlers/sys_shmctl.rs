@@ -188,8 +188,11 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             shm_put_u64(&mut out, 16, shmmni);
             shm_put_u64(&mut out, 24, shmmni);
             shm_put_u64(&mut out, 32, shmall);
-            // SAFETY: Linux snapshots limits/index before validating copyout.
-            if unsafe { copy_to_user(a.arg2, &out) }.is_err() {
+            // Linux snapshots limits/index before validating copyout; an i386
+            // caller gets `struct compat_shminfo64`.
+            if crate::sysvipc::ipc_ds_to_user(ctx, a.arg2, &out, crate::sysvipc::IpcDs::ShmInfo)
+                .is_err()
+            {
                 ctx.set_return(errno_ret(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(max_index));
@@ -228,8 +231,11 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             shm_put_u64(&mut out, 8, total_pages);
             shm_put_u64(&mut out, 16, resident_pages); // live backing is resident
                                                        // shm_swp, swap_attempts, and swap_successes remain zero.
-                                                       // SAFETY: Linux snapshots namespace usage before copyout.
-            if unsafe { copy_to_user(a.arg2, &out) }.is_err() {
+                                                       // Linux snapshots namespace usage before copyout; an
+                                                       // i386 caller gets `struct compat_shm_info`.
+            if crate::sysvipc::ipc_ds_to_user(ctx, a.arg2, &out, crate::sysvipc::IpcDs::ShmUsage)
+                .is_err()
+            {
                 ctx.set_return(errno_ret(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(max_index));
@@ -275,9 +281,11 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 )
             };
             let out = encode_shm_stat(snapshot);
-            // SAFETY: `buf` is the native shmid64_ds output pointer; the
-            // guarded helper validates and copies the complete structure.
-            if unsafe { copy_to_user(a.arg2, &out) }.is_err() {
+            // `buf` is the shmid64_ds output pointer (compat_shmid64_ds for an
+            // i386 caller); the guarded helper copies the complete structure.
+            if crate::sysvipc::ipc_ds_to_user(ctx, a.arg2, &out, crate::sysvipc::IpcDs::Shm)
+                .is_err()
+            {
                 ctx.set_return(errno_ret(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(if cmd == IPC_STAT { 0 } else { shmid }));
@@ -285,9 +293,15 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
         }
         IPC_SET => {
             // Linux imports the complete shmid64_ds before looking up shmid.
-            // SAFETY: the guarded helper validates the entire native input
-            // structure before returning its kernel-owned copy.
-            let input = match unsafe { copy_from_user_vec(a.arg2, SHMID64_SIZE) } {
+            // The guarded helper validates the entire input structure (an
+            // i386 caller's compat_shmid64_ds, widened) before returning its
+            // kernel-owned copy.
+            let input = match crate::sysvipc::ipc_ds_from_user(
+                ctx,
+                a.arg2,
+                SHMID64_SIZE,
+                crate::sysvipc::IpcDs::Shm,
+            ) {
                 Ok(input) => input,
                 Err(_) => {
                     ctx.set_return(errno_ret(EFAULT));

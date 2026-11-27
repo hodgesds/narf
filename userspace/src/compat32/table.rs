@@ -59,6 +59,7 @@ pub mod nr {
     pub const READLINK: u32 = 85;
     pub const MMAP: u32 = 90;
     pub const MUNMAP: u32 = 91;
+    pub const IPC: u32 = 117;
     pub const CLONE: u32 = 120;
     pub const UNAME: u32 = 122;
     pub const MPROTECT: u32 = 125;
@@ -118,7 +119,18 @@ pub mod nr {
     pub const STATX: u32 = 383;
     pub const ARCH_PRCTL: u32 = 384;
     pub const RSEQ: u32 = 386;
+    pub const SEMGET: u32 = 393;
+    pub const SEMCTL: u32 = 394;
+    pub const SHMGET: u32 = 395;
+    pub const SHMCTL: u32 = 396;
+    pub const SHMAT: u32 = 397;
+    pub const SHMDT: u32 = 398;
+    pub const MSGGET: u32 = 399;
+    pub const MSGSND: u32 = 400;
+    pub const MSGRCV: u32 = 401;
+    pub const MSGCTL: u32 = 402;
     pub const CLOCK_GETTIME64: u32 = 403;
+    pub const SEMTIMEDOP_TIME64: u32 = 420;
     pub const FUTEX_TIME64: u32 = 422;
     pub const CLONE3: u32 = 435;
     pub const FACCESSAT2: u32 = 439;
@@ -294,6 +306,31 @@ pub fn dispatch(nr: u32, ctx: &mut dyn TrapContext) -> Option<Syscall> {
         // fs/namei.c
         MKNOD => forward(ctx, Syscall::Mknod),
         MKNODAT => forward_sx(ctx, Syscall::Mknodat, 0b1),
+        // ipc/: the direct System V calls (i386 has had them since 5.1) and
+        // the `ipc` multiplexer before them. `struct sembuf` is the same on
+        // both ABIs; message buffers and the control structures are not, and
+        // the native handlers convert them under `in_ia32_syscall()`.
+        IPC => compat_sys_ipc(ctx),
+        SEMGET => forward_sx(ctx, Syscall::Semget, 0b111),
+        SEMCTL => {
+            let a = *ctx.args();
+            compat_semctl(ctx, a.arg0, a.arg1, a.arg2, a.arg3)
+        }
+        SEMTIMEDOP_TIME64 => forward_sx(ctx, Syscall::Semtimedop, 0b1),
+        MSGGET => forward_sx(ctx, Syscall::Msgget, 0b11),
+        MSGSND => forward_sx(ctx, Syscall::Msgsnd, 0b1101),
+        MSGRCV => forward_sx(ctx, Syscall::Msgrcv, 0b11101),
+        MSGCTL => {
+            let a = *ctx.args();
+            compat_msgctl(ctx, a.arg0, a.arg1, a.arg2)
+        }
+        SHMGET => forward_sx(ctx, Syscall::Shmget, 0b101),
+        SHMAT => forward_sx(ctx, Syscall::Shmat, 0b101),
+        SHMDT => forward(ctx, Syscall::Shmdt),
+        SHMCTL => {
+            let a = *ctx.args();
+            compat_shmctl(ctx, a.arg0, a.arg1, a.arg2)
+        }
         _ => {
             ctx.set_return(SyscallReturn::not_implemented());
             None
@@ -413,6 +450,237 @@ fn signed_args(args: &SyscallArgs, signed: u8) -> SyscallArgs {
 #[inline]
 fn succeeded(ret: &SyscallReturn) -> bool {
     ret.status == SyscallReturn::OK && (ret.value as i64) >= 0
+}
+
+// ── System V IPC ─────────────────────────────────────────────────────
+
+/// `IPC_64`, the flag an i386 libc ORs into a control command to ask for the
+/// `*id64_ds` layouts.
+const IPC_64: u32 = 0x100;
+
+/// `compat_ipc_parse_version`: the command without `IPC_64`. Without the
+/// flag a structured command means the pre-2.4 layouts (`struct
+/// compat_semid_ds` and friends, with 16-bit ids), which NARF does not
+/// convert: `None`, and the call answers EINVAL. `structured` lists the
+/// commands whose structure depends on the version.
+fn ipc_compat_cmd(cmd: u64, structured: &[u32]) -> Option<u64> {
+    let raw = cmd as u32;
+    let base = raw & !IPC_64;
+    if raw & IPC_64 == 0 && structured.contains(&base) {
+        None
+    } else {
+        Some(u64::from(base))
+    }
+}
+
+/// `semctl(semid, semnum, cmd, arg)` (i386 394, `compat_sys_semctl`). `arg`
+/// is the `union semun` word: SETVAL's value or a pointer. IPC_STAT,
+/// SEM_STAT(_ANY) and IPC_SET move a `compat_semid64_ds`.
+fn compat_semctl(
+    ctx: &mut dyn TrapContext,
+    semid: u64,
+    semnum: u64,
+    cmd: u64,
+    arg: u64,
+) -> Option<Syscall> {
+    const STRUCTURED: [u32; 4] = [1, 2, 18, 20]; // IPC_SET, IPC_STAT, SEM_STAT, SEM_STAT_ANY
+    let Some(cmd) = ipc_compat_cmd(cmd, &STRUCTURED) else {
+        ctx.set_return(to_ret(EINVAL));
+        return Some(Syscall::Semctl);
+    };
+    let args = SyscallArgs {
+        arg0: conv::sext(semid),
+        arg1: conv::sext(semnum),
+        arg2: cmd,
+        arg3: arg,
+        arg4: 0,
+        arg5: 0,
+    };
+    forward_args(ctx, Syscall::Semctl, args, Ia32Abi::default())
+}
+
+/// `msgctl(msqid, cmd, buf)` (i386 402, `compat_sys_msgctl`): IPC_STAT,
+/// MSG_STAT(_ANY) and IPC_SET move a `compat_msqid64_ds`; `struct msginfo`
+/// is all ints, the same on both ABIs.
+fn compat_msgctl(ctx: &mut dyn TrapContext, msqid: u64, cmd: u64, buf: u64) -> Option<Syscall> {
+    const STRUCTURED: [u32; 4] = [1, 2, 11, 13]; // IPC_SET, IPC_STAT, MSG_STAT, MSG_STAT_ANY
+    let Some(cmd) = ipc_compat_cmd(cmd, &STRUCTURED) else {
+        ctx.set_return(to_ret(EINVAL));
+        return Some(Syscall::Msgctl);
+    };
+    let args = SyscallArgs {
+        arg0: conv::sext(msqid),
+        arg1: cmd,
+        arg2: buf,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
+    };
+    forward_args(ctx, Syscall::Msgctl, args, Ia32Abi::default())
+}
+
+/// `shmctl(shmid, cmd, buf)` (i386 396, `compat_sys_shmctl`): IPC_STAT,
+/// SHM_STAT(_ANY) and IPC_SET move a `compat_shmid64_ds`, IPC_INFO a
+/// `compat_shminfo64`, SHM_INFO a `compat_shm_info`.
+fn compat_shmctl(ctx: &mut dyn TrapContext, shmid: u64, cmd: u64, buf: u64) -> Option<Syscall> {
+    // IPC_SET, IPC_STAT, IPC_INFO, SHM_STAT, SHM_STAT_ANY
+    const STRUCTURED: [u32; 5] = [1, 2, 3, 13, 15];
+    let Some(cmd) = ipc_compat_cmd(cmd, &STRUCTURED) else {
+        ctx.set_return(to_ret(EINVAL));
+        return Some(Syscall::Shmctl);
+    };
+    let args = SyscallArgs {
+        arg0: conv::sext(shmid),
+        arg1: cmd,
+        arg2: buf,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
+    };
+    forward_args(ctx, Syscall::Shmctl, args, Ia32Abi::default())
+}
+
+/// `ipc(call, first, second, third, ptr, fifth)` (i386 117,
+/// `compat_sys_ipc`): the System V IPC multiplexer an i386 libc built for
+/// kernels before 5.1 calls for every operation. `call`'s upper half is the
+/// interface version: version 0 `msgrcv` passes its buffer and type through
+/// a `struct compat_ipc_kludge` at `ptr`, version 1 `shmat` is refused.
+fn compat_sys_ipc(ctx: &mut dyn TrapContext) -> Option<Syscall> {
+    const SEMOP: u64 = 1;
+    const SEMGET: u64 = 2;
+    const SEMCTL: u64 = 3;
+    const SEMTIMEDOP: u64 = 4;
+    const MSGSND: u64 = 11;
+    const MSGRCV: u64 = 12;
+    const MSGGET: u64 = 13;
+    const MSGCTL: u64 = 14;
+    const SHMAT: u64 = 21;
+    const SHMDT: u64 = 22;
+    const SHMGET: u64 = 23;
+    const SHMCTL: u64 = 24;
+    let a = *ctx.args();
+    let version = (a.arg0 >> 16) & 0xFFFF;
+    let call = a.arg0 & 0xFFFF;
+    let (first, second, third, ptr, fifth) = (a.arg1, a.arg2, a.arg3, a.arg4, a.arg5);
+    let args = |arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64| SyscallArgs {
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        arg5: 0,
+    };
+    let none = Ia32Abi::default();
+    let sx = conv::sext;
+    match call {
+        SEMOP => forward_args(
+            ctx,
+            Syscall::Semop,
+            args(sx(first), ptr, second, 0, 0),
+            none,
+        ),
+        SEMTIMEDOP => {
+            let args = args(sx(first), ptr, second, fifth, 0);
+            forward_args(ctx, Syscall::Semtimedop, args, TIME32)
+        }
+        SEMGET => {
+            let args = args(sx(first), sx(second), sx(third), 0, 0);
+            forward_args(ctx, Syscall::Semget, args, none)
+        }
+        SEMCTL => {
+            // The `union semun` comes by reference: `get_user(pad, ptr)`.
+            if ptr == 0 {
+                ctx.set_return(to_ret(EINVAL));
+                return Some(Syscall::Semctl);
+            }
+            let mut pad = [0u8; 4];
+            if let Err(e) = conv::read_user(ptr, &mut pad) {
+                ctx.set_return(to_ret(e));
+                return Some(Syscall::Semctl);
+            }
+            compat_semctl(
+                ctx,
+                first,
+                second,
+                third,
+                u64::from(u32::from_le_bytes(pad)),
+            )
+        }
+        MSGSND => {
+            let args = args(sx(first), ptr, sx(second), sx(third), 0);
+            forward_args(ctx, Syscall::Msgsnd, args, none)
+        }
+        MSGRCV => {
+            if (first as u32 as i32) < 0 || (second as u32 as i32) < 0 {
+                ctx.set_return(to_ret(EINVAL));
+                return Some(Syscall::Msgrcv);
+            }
+            let (msgp, msgtyp) = if version == 0 {
+                // struct compat_ipc_kludge { compat_uptr_t msgp; compat_long_t msgtyp; }
+                if ptr == 0 {
+                    ctx.set_return(to_ret(EINVAL));
+                    return Some(Syscall::Msgrcv);
+                }
+                let mut kludge = [0u8; 8];
+                if let Err(e) = conv::read_user(ptr, &mut kludge) {
+                    ctx.set_return(to_ret(e));
+                    return Some(Syscall::Msgrcv);
+                }
+                (
+                    u64::from(conv::word(&kludge, 0)),
+                    sx(u64::from(conv::word(&kludge, 1))),
+                )
+            } else {
+                (ptr, sx(fifth))
+            };
+            let args = args(sx(first), msgp, sx(second), msgtyp, sx(third));
+            forward_args(ctx, Syscall::Msgrcv, args, none)
+        }
+        MSGGET => forward_args(
+            ctx,
+            Syscall::Msgget,
+            args(sx(first), sx(second), 0, 0, 0),
+            none,
+        ),
+        MSGCTL => compat_msgctl(ctx, first, second, ptr),
+        SHMAT => {
+            if version == 1 {
+                ctx.set_return(to_ret(EINVAL));
+                return Some(Syscall::Shmat);
+            }
+            // `do_shmat`, then `put_user(raddr, (compat_ulong_t *)third)`.
+            let Some(ret) = call_native(
+                ctx,
+                Syscall::Shmat,
+                args(sx(first), ptr, sx(second), 0, 0),
+                none,
+            ) else {
+                return Some(Syscall::Shmat);
+            };
+            if !succeeded(&ret) {
+                ctx.set_return(ret);
+                return Some(Syscall::Shmat);
+            }
+            ctx.set_return(
+                match conv::write_user(third, &(ret.value as u32).to_le_bytes()) {
+                    Ok(()) => SyscallReturn::ok(0),
+                    Err(e) => to_ret(e),
+                },
+            );
+            Some(Syscall::Shmat)
+        }
+        SHMDT => forward_args(ctx, Syscall::Shmdt, args(ptr, 0, 0, 0, 0), none),
+        SHMGET => {
+            // `ksys_shmget(first, (unsigned int)second, third)`.
+            let args = args(sx(first), second, sx(third), 0, 0);
+            forward_args(ctx, Syscall::Shmget, args, none)
+        }
+        SHMCTL => compat_shmctl(ctx, first, second, ptr),
+        _ => {
+            ctx.set_return(SyscallReturn::not_implemented());
+            None
+        }
+    }
 }
 
 // ── mm ───────────────────────────────────────────────────────────────
