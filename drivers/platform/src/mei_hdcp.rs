@@ -10,7 +10,7 @@
 //!
 //! ## What it is for
 //!
-//! On Coffee, Comet, Tiger and Alder Lake the HDCP 2.2 transmitter keys, the
+//! From Kaby Lake to Alder Lake the HDCP 2.2 transmitter keys, the
 //! receiver-certificate check, km/ks generation and the H' / L' / V / M'
 //! checks all live in the CSME's HDCP firmware client. The display driver
 //! relays the sink's messages to it and back (`intel_hdcp.c`'s
@@ -39,11 +39,12 @@
 //!
 //! - Linux binds this client on any HECI function that carries the UUID.
 //!   NARF binds only on the HECI-1 functions of the PCHs paired with
-//!   display 12 and 13 and, of those the MEI driver claims, the Coffee and
-//!   Comet Lake PCHs whose display 9 `is_hdcp2_supported` admits
+//!   display 9 to 13 whose platforms `is_hdcp2_supported` can admit
 //!   ([`HDCP_HECI_IDS`]), and only with
 //!   `narf.intel.hdcp=1` on the command line, so every other board and
-//!   every boot without the option is unchanged. Anything else is refused
+//!   every boot without the option is unchanged (the MEI driver claims the
+//!   display 9-11 PCHs only with that option,
+//!   [`crate::mei::HDCP_GATED_DEVICE_IDS`]). Anything else is refused
 //!   with [`HdcpProbeError::NotHdcpHeci`] before any I/O.
 //! - The client never logs a command or reply: they carry receiver IDs,
 //!   encrypted keys and the topology.
@@ -59,7 +60,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::mei::{
     uuid_le, BarRegs, HeciRegs, MeClientInfo, MeiClHandle, MeiDevState, MeiDevice, MeiUuid,
     MEI_DEV_ADP_LP, MEI_DEV_ADP_N, MEI_DEV_ADP_P, MEI_DEV_ADP_S, MEI_DEV_CMP_H, MEI_DEV_CMP_LP,
-    MEI_DEV_CNP_H, MEI_DEV_RPL_S, MEI_DEV_TGP_H, MEI_DEV_TGP_LP,
+    MEI_DEV_CNP_H, MEI_DEV_CNP_LP, MEI_DEV_ICP_LP, MEI_DEV_ICP_N, MEI_DEV_JSP_N, MEI_DEV_KBP,
+    MEI_DEV_MCC, MEI_DEV_RPL_S, MEI_DEV_SPT, MEI_DEV_SPT_H, MEI_DEV_TGP_H, MEI_DEV_TGP_LP,
 };
 
 /// `MEI_UUID_HDCP`: `UUID_LE(0xB638AB7E, 0x94E2, 0x4EA2, 0xA5, 0x52,
@@ -77,9 +79,12 @@ pub const MEI_UUID_HDCP: MeiUuid = uuid_le(
 /// the MEI HDCP client (`intel_hdcp.c::is_hdcp2_supported` without
 /// `USE_HDCP_GSC`), then the Cannon Point H and Comet Point LP/H PCHs of
 /// Coffee and Comet Lake, whose display 9 it admits too (`kabylake ||
-/// coffeelake || cometlake`). The other display 9-11 PCHs (Sunrise,
-/// Kaby, Cannon LP, Ice, Jasper and Mule Creek Point) are not claimed by
-/// the MEI driver, so HDCP 2.2 there falls back to HDCP 1.4.
+/// coffeelake || cometlake`), then the display 9-11 PCHs the MEI driver
+/// claims only with `narf.intel.hdcp=1`: Sunrise Point LP/H and Kaby Point
+/// (Kaby Lake; Skylake on the same PCHs is refused by the display's
+/// `is_hdcp2_supported`), Cannon Point LP (Coffee and Whiskey Lake U),
+/// Ice Lake Point LP/N, Jasper Lake Point N and Mule Creek Canyon
+/// (display 11).
 pub const HDCP_HECI_IDS: &[u16] = &[
     MEI_DEV_TGP_LP,
     MEI_DEV_TGP_H,
@@ -91,6 +96,14 @@ pub const HDCP_HECI_IDS: &[u16] = &[
     MEI_DEV_CNP_H,
     MEI_DEV_CMP_LP,
     MEI_DEV_CMP_H,
+    MEI_DEV_SPT,
+    MEI_DEV_SPT_H,
+    MEI_DEV_KBP,
+    MEI_DEV_CNP_LP,
+    MEI_DEV_ICP_LP,
+    MEI_DEV_ICP_N,
+    MEI_DEV_JSP_N,
+    MEI_DEV_MCC,
 ];
 
 /// `KBUILD_MODNAME` of the Linux driver; the registry's master name.

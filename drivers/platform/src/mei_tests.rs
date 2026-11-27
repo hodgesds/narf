@@ -922,3 +922,181 @@ fn smoke_mei_gsc_proxy_refusals() -> TestResult {
     r
 }
 kernel_test_in!("drivers/platform/mei", smoke_mei_gsc_proxy_refusals);
+
+// ── Display 9-11 PCHs, firmware SKU quirks and the HBM version ──────
+
+/// `hw-me-regs.h` and `pci-me.c` (Linux 7.4-rc4) for the display 9-11
+/// PCHs: the HECI-1 IDs of Sunrise Point (0x9D3A, H 0xA13A), Kaby Point
+/// (0xA2BA), Cannon Point LP (0x9DE0), Ice Lake Point LP/N (0x34E0,
+/// 0x38E0), Jasper Lake Point N (0x4DE0) and Mule Creek Canyon (0x4B70),
+/// claimed only with the HDCP option; their second HECI and iTouch
+/// functions never. The `mei_cfg` quirks: `MEI_ME_PCH8_SPS_4_CFG` (SPT-H)
+/// refuses an SPS <= 4.0 opmode in HFS_1 (`mei_me_fw_type_sps_4`),
+/// `MEI_ME_PCH12_SPS_CFG` / `MEI_ME_PCH15_SPS_CFG` (CNP-H, TGP-H, RPL-S)
+/// an IGN or SPS SKU in HFS_3 (`mei_me_fw_type_sps_ign`); the other
+/// configurations have no `quirk_probe`.
+fn smoke_mei_display9_11_pch_ids_and_fw_sku_quirks() -> TestResult {
+    use mei::MeiFwQuirk as Q;
+    let gated = [
+        (mei::MEI_DEV_SPT, 0x9D3A),
+        (mei::MEI_DEV_SPT_H, 0xA13A),
+        (mei::MEI_DEV_KBP, 0xA2BA),
+        (mei::MEI_DEV_CNP_LP, 0x9DE0),
+        (mei::MEI_DEV_ICP_LP, 0x34E0),
+        (mei::MEI_DEV_ICP_N, 0x38E0),
+        (mei::MEI_DEV_JSP_N, 0x4DE0),
+        (mei::MEI_DEV_MCC, 0x4B70),
+    ];
+    if gated.iter().any(|&(got, want)| got != want)
+        || mei::HDCP_GATED_DEVICE_IDS != gated.map(|(id, _)| id)
+    {
+        return TestResult::Fail("display 9-11 HECI-1 ids differ from hw-me-regs.h");
+    }
+    for (did, _) in gated {
+        if mei::is_supported_device(did) || mei::claims(did, false) || !mei::claims(did, true) {
+            return TestResult::Fail("display 9-11 HECI-1 claimed without, or not with, the option");
+        }
+    }
+    // SPT_2, SPT_3 (iTouch), SPT_H_2, KBP_2, KBP_3, CNP_LP_3, ICP_LP_3, MCC_4.
+    for did in [0x9D3B, 0x9D3E, 0xA13B, 0xA2BB, 0xA2BE, 0x9DE4, 0x34E4, 0x4B75] {
+        if mei::claims(did, true) {
+            return TestResult::Fail("a second HECI or iTouch function claimed");
+        }
+    }
+    if mei::SUPPORTED_DEVICE_IDS
+        .iter()
+        .any(|&did| !mei::claims(did, false))
+    {
+        return TestResult::Fail("an always-claimed id needs the option");
+    }
+    let quirks = [
+        (mei::MEI_DEV_SPT_H, Q::Sps4),
+        (mei::MEI_DEV_CNP_H, Q::SpsIgn),
+        (mei::MEI_DEV_TGP_H, Q::SpsIgn),
+        (mei::MEI_DEV_RPL_S, Q::SpsIgn),
+        (mei::MEI_DEV_SPT, Q::None),
+        (mei::MEI_DEV_KBP, Q::None),
+        (mei::MEI_DEV_CNP_LP, Q::None),
+        (mei::MEI_DEV_CMP_LP, Q::None),
+        (mei::MEI_DEV_CMP_H, Q::None),
+        (mei::MEI_DEV_ICP_LP, Q::None),
+        (mei::MEI_DEV_ICP_N, Q::None),
+        (mei::MEI_DEV_TGP_LP, Q::None),
+        (mei::MEI_DEV_JSP_N, Q::None),
+        (mei::MEI_DEV_MCC, Q::None),
+        (mei::MEI_DEV_ADP_S, Q::None),
+        (mei::MEI_DEV_MTL_M, Q::None),
+        (mei::MEI_DEV_PTL_H, Q::None),
+    ];
+    if quirks.iter().any(|&(did, q)| mei::fw_quirk(did) != q) {
+        return TestResult::Fail("mei_cfg quirk_probe differs from mei_me_pci_tbl");
+    }
+    if mei::PCI_CFG_HFS_3 != 0x60
+        || mei::PCI_CFG_HFS_1_OPMODE_MSK != 0xf0000
+        || mei::PCI_CFG_HFS_1_OPMODE_SPS != 0xf0000
+        || mei::PCI_CFG_HFS_3_FW_SKU_MSK != 0x70
+        || mei::PCI_CFG_HFS_3_FW_SKU_IGN != 0
+        || mei::PCI_CFG_HFS_3_FW_SKU_SPS != 0x60
+    {
+        return TestResult::Fail("HFS opmode / SKU fields");
+    }
+    // (quirk, HFS_1, HFS_3, no valid ME interface).
+    let cases = [
+        (Q::Sps4, 0x000f_0000, 0, true),
+        (Q::Sps4, 0x800f_0245, 0x60, true),
+        (Q::Sps4, 0x0005_0000, 0, false),
+        (Q::Sps4, 0x0000_0000, 0x60, false),
+        (Q::SpsIgn, 0x000f_0000, 0x50, false),
+        (Q::SpsIgn, 0, 0x30, false),
+        (Q::SpsIgn, 0, 0x00, true),
+        (Q::SpsIgn, 0, 0x0f, true),
+        (Q::SpsIgn, 0, 0x60, true),
+        (Q::SpsIgn, 0, 0x6f, true),
+        (Q::None, 0x000f_0000, 0x60, false),
+        // A failed read is `PCI_ERROR_RESPONSE`: SPS opmode, but neither
+        // the IGN nor the SPS SKU.
+        (Q::Sps4, mei::PCI_ERROR_RESPONSE, mei::PCI_ERROR_RESPONSE, true),
+        (Q::SpsIgn, mei::PCI_ERROR_RESPONSE, mei::PCI_ERROR_RESPONSE, false),
+    ];
+    if cases
+        .iter()
+        .any(|&(q, hfs_1, hfs_3, want)| mei::no_valid_me_interface(q, hfs_1, hfs_3) != want)
+    {
+        return TestResult::Fail("mei_me_fw_type_sps_4 / mei_me_fw_type_sps_ign");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/mei",
+    smoke_mei_display9_11_pch_ids_and_fw_sku_quirks
+);
+
+/// `hbm.c` (Linux 7.4-rc4): the host asks for HBM 2.2
+/// (`mei_hbm_start_req`: {cmd, 0, minor 2, major 2}); firmware that does
+/// not support it answers `host_version_supported = 0` with its highest
+/// version, which `mei_hbm_dispatch` adopts when
+/// `mei_hbm_version_is_supported` (not above 2.2), so CSME firmware at HBM
+/// 2.0 or 2.1 brings the link up, enumerates and connects. HBM 1.x is
+/// refused (NARF runs only the 2.0 disconnect-on-connect-timeout path),
+/// and a version above 2.2 that does not support 2.2 is Linux's
+/// "version mismatch".
+fn smoke_mei_hbm_version_falls_back_to_the_firmware_version() -> TestResult {
+    use mei::HbmVersionResponse as V;
+    let v = |supported, major, minor| V {
+        host_version_supported: supported,
+        me_major: major,
+        me_minor: minor,
+    };
+    if v(true, 2, 2).negotiated() != Some((2, 2))
+        || v(true, 3, 0).negotiated() != Some((2, 2))
+        || v(false, 2, 1).negotiated() != Some((2, 1))
+        || v(false, 2, 0).negotiated() != Some((2, 0))
+        || v(false, 1, 1).negotiated().is_some()
+        || v(false, 2, 3).negotiated().is_some()
+        || v(false, 3, 0).negotiated().is_some()
+    {
+        return TestResult::Fail("mei_hbm_version_is_supported");
+    }
+    for (major, minor, supported, negotiated) in [
+        (2u8, 0u8, false, (2u8, 0u8)),
+        (2, 1, false, (2, 1)),
+        (2, 2, true, (2, 2)),
+        (2, 3, true, (2, 2)),
+    ] {
+        let model = HeciModel::new(32, 32, vec![gsc()]);
+        model.set_fw_hbm_version(major, minor);
+        let Some(dev) = up_as(&model, mei::MEI_DEV_KBP) else {
+            return TestResult::Fail("bring-up refused a supported firmware HBM version");
+        };
+        if hbm_sent(&model, mei::HOST_START_REQ_CMD) != [vec![mei::HOST_START_REQ_CMD, 0, 2, 2]] {
+            return TestResult::Fail("HOST_START_REQ_CMD not HBM 2.2");
+        }
+        if dev.hbm_version != v(supported, major, minor)
+            || dev.hbm_version.negotiated() != Some(negotiated)
+            || dev.client_count() != 1
+        {
+            return TestResult::Fail("negotiated HBM version");
+        }
+        match dev.cl_connect(GSC) {
+            Ok(h) if dev.cl_connected(h) => {}
+            _ => return TestResult::Fail("connect at the negotiated version"),
+        }
+    }
+    let model = HeciModel::new(32, 32, vec![gsc()]);
+    model.set_fw_hbm_version(1, 1);
+    match MeiDevice::<ModelRegs>::bring_up_with(model.regs(), mei::MEI_DEV_KBP, 0, 0, FAST) {
+        Err(MeiError::HbmVersionRejected {
+            me_major: 1,
+            me_minor: 1,
+        }) => {}
+        _ => return TestResult::Fail("HBM 1.1 firmware not refused"),
+    }
+    if !hbm_sent(&model, mei::HOST_ENUM_REQ_CMD).is_empty() {
+        return TestResult::Fail("a refused version went on to enumerate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/mei",
+    smoke_mei_hbm_version_falls_back_to_the_firmware_version
+);

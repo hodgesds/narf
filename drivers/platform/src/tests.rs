@@ -2446,7 +2446,11 @@ fn smoke_mei_pci_match_table() -> TestResult {
     __reset_for_test();
     mei::register_pci_driver();
     let regs = registered_pci_drivers();
-    for did in mei::SUPPORTED_DEVICE_IDS.iter().copied() {
+    for did in mei::SUPPORTED_DEVICE_IDS
+        .iter()
+        .chain(mei::HDCP_GATED_DEVICE_IDS)
+        .copied()
+    {
         let found = regs.iter().any(|m| {
             matches!(m.kind, MatchKind::VendorDevice {
                 vendor: mei::MEI_VENDOR, device,
