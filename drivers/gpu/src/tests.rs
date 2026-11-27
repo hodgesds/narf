@@ -1259,6 +1259,16 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_from_vbios_topology);
 /// with its die's asic name and firmware placeholder, and
 /// `kms_from_vbios` mints 4 CRTCs for Navi3 — Navi31 has 4 pipes
 /// (`num_timing_generator = 4` in `dcn32_resource.c`), not 6.
+///
+/// This test pins identity and pipes only. It deliberately does NOT
+/// assert anything about `fw_list`: the Navi31 SKUs already carry
+/// audited tables — the 12-entry `NAVI31_FW` for 0x7448/0x7449/
+/// 0x744A/0x744C/0x745E and the kicker variant for 0x744B (pinned by
+/// `smoke_amdgpu_navi31_fw_table` and
+/// `smoke_amdgpu_navi31_sku_fw_tables`), while Navi32/33 stay
+/// unaudited — so a blanket "every DID has empty firmware" assertion
+/// goes stale on each bring-up. Per-DID firmware tables are pinned by
+/// the dedicated fw-table tests instead.
 #[cfg(feature = "amdgpu")]
 fn smoke_navi3_chip_identity_and_four_pipes() -> TestResult {
     use crate::amdgpu::Family;
@@ -1278,8 +1288,8 @@ fn smoke_navi3_chip_identity_and_four_pipes() -> TestResult {
         if info.asic != want_asic || info.fw_name != want_fw {
             return TestResult::Fail("a Navi3 device id has the wrong asic or firmware name");
         }
-        if info.is_apu() || !info.fw_list.is_empty() {
-            return TestResult::Fail("a Navi3 device id must be discrete with unaudited firmware");
+        if info.is_apu() {
+            return TestResult::Fail("a Navi3 device id must be discrete");
         }
     }
     // 0x744D is a hole in pci.ids v2026.11.22: an unlisted
@@ -10812,13 +10822,63 @@ fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
 
     // Silicon with no bring-up must not borrow another family's firmware.
     // Strix used to be in this list; it now has its own audited bundle
-    // (see the Strix check below and `amdgpu_strix`).
-    for did in [amdgpu::REMBRANDT, amdgpu::RAPHAEL] {
+    // (see the Strix check below and `amdgpu_strix`). Rembrandt left
+    // the list the same way: it now has its own audited bundle (see the
+    // Rembrandt check below and `amdgpu::REMBRANDT_FW`).
+    for did in [amdgpu::RAPHAEL] {
         match amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, did) {
             Some(info) if info.fw_list.is_empty() => {}
             Some(_) => return TestResult::Fail("unaudited silicon was given a firmware bundle"),
             None => return TestResult::Fail("an id in the match table resolves to no chip"),
         }
+    }
+    // Rembrandt (0x1681) is RDNA2 (GC 10.3.3), not Phoenix, and now has
+    // its own audited bundle: the 11 `yellow_carp_*` names from Linux's
+    // `MODULE_FIRMWARE` for the Yellow Carp IP set, TOC first, TA last,
+    // no SMU entry (APU PMFW is BIOS-resident).
+    let Some(rembrandt) =
+        amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, amdgpu::REMBRANDT)
+    else {
+        return TestResult::Fail("Rembrandt's device id resolves to no chip");
+    };
+    if rembrandt.family != amdgpu::Family::Navi2
+        || !rembrandt.is_apu()
+        || !amdgpu::gc_version_is_apu(10, 3, 3)
+    {
+        return TestResult::Fail("Rembrandt is RDNA2 (GC 10.3.3), not Navi3");
+    }
+    let want_rembrandt: &[&str] = &[
+        "amdgpu/yellow_carp_toc.bin",
+        "amdgpu/yellow_carp_sdma.bin",
+        "amdgpu/yellow_carp_ce.bin",
+        "amdgpu/yellow_carp_pfp.bin",
+        "amdgpu/yellow_carp_me.bin",
+        "amdgpu/yellow_carp_mec.bin",
+        "amdgpu/yellow_carp_mec2.bin",
+        "amdgpu/yellow_carp_rlc.bin",
+        "amdgpu/yellow_carp_vcn.bin",
+        "amdgpu/yellow_carp_dmcub.bin",
+        "amdgpu/yellow_carp_ta.bin",
+    ];
+    if rembrandt.fw_list.len() != want_rembrandt.len() {
+        return TestResult::Fail("the Rembrandt firmware bundle changed size");
+    }
+    for (entry, expected) in rembrandt.fw_list.iter().zip(want_rembrandt) {
+        if entry.name != *expected {
+            return TestResult::Fail("a Rembrandt firmware blob name is not Linux's");
+        }
+    }
+    if !rembrandt.fw_list[0].name.contains("_toc.bin")
+        || !rembrandt
+            .fw_list
+            .last()
+            .is_some_and(|e| e.name.contains("_ta.bin"))
+        || rembrandt
+            .fw_list
+            .iter()
+            .any(|e| e.cmd == amdgpu::SMU_LOAD_PMFW_MP1)
+    {
+        return TestResult::Fail("Rembrandt bundle is not the audited Yellow Carp set");
     }
     // Strix Point (0x150E) has its own family and bundle now: the PSP
     // 14.0.1 TOC first, no SMU entry (APU PMFW is BIOS-resident), the
