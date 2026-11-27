@@ -2966,3 +2966,148 @@ kernel_test_in!(
     "userspace/compat32",
     smoke_compat32_table_time_limits_statfs_select_and_offsets
 );
+
+// ── 32-bit times and 16-bit ids ──────────────────────────────────────
+
+/// The i386 entries that predate 64-bit time and 32-bit ids:
+///
+///   * `nanosleep` (162), `clock_getres` (266), `timerfd_settime` /
+///     `timerfd_gettime` (325/326, an `old_itimerspec32` of two
+///     `old_timespec32`s written and nothing past it), `sched_rr_get_interval`
+///     (161);
+///   * `utimensat` (320, `old_timespec32[2]`), `utimes` (271,
+///     `old_timeval32[2]`) and `utime` (30, `old_utimbuf32`) setting the
+///     mtime `stat64` then reads back;
+///   * the 16-bit ids (`kernel/uid16.c`): `getresuid` (165) narrowing with
+///     `high2lowuid`, `setresuid` (164) / `chown` (182) / `lchown` (16) /
+///     `fchown` (95) with 0xFFFF widened to -1 ("unchanged"), `setfsuid`
+///     (138) answering as the native call, `getgroups` (80) counting and
+///     filling 16-bit groups.
+fn smoke_compat32_table_time32_and_uid16_calls() -> TestResult {
+    const CLOCK_MONOTONIC: u64 = 1;
+    const O_RDWR: u64 = 2;
+    let image = i386_static_image();
+    let proc = match load_i386(&image, &["old"], &[]) {
+        Ok(p) => p,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let outcome = with_memfs("/compat32-old", "compat32-old", &[("f", b"x")], || {
+        install_compat_as(&proc);
+        with_live_as(&proc, || {
+            let base = u64::from(STATIC_DATA_VA);
+            let sp = base + 0x1000;
+            let mut fds = Vec::new();
+            let result = (|| {
+                put_user(base + 0x100, &words(&[0, 1000]))?;
+                if call32_sp(162, [base + 0x100, base + 0x108, 0, 0, 0, 0], sp) != 0 {
+                    return Err("i386 nanosleep of an old_timespec32 failed");
+                }
+                poison(base + 0x110, 16)?;
+                if call32_sp(266, [CLOCK_MONOTONIC, base + 0x110, 0, 0, 0, 0], sp) != 0
+                    || get_u32(base + 0x114)? == 0
+                    || !untouched(base + 0x110, 8, 16)?
+                {
+                    return Err("i386 clock_getres did not write an old_timespec32");
+                }
+                let tfd = call32(322, [CLOCK_MONOTONIC, 0, 0, 0, 0, 0]);
+                if tfd < 0 {
+                    return Err("i386 timerfd_create failed");
+                }
+                fds.push(tfd as u64);
+                put_user(base + 0x120, &words(&[0, 0, 5, 0]))?;
+                poison(base + 0x140, 32)?;
+                if call32_sp(325, [tfd as u64, 0, base + 0x120, 0, 0, 0], sp) != 0
+                    || call32_sp(326, [tfd as u64, base + 0x140, 0, 0, 0, 0], sp) != 0
+                {
+                    return Err("i386 timerfd_settime/gettime of an old_itimerspec32 failed");
+                }
+                let left = get_u32(base + 0x148)?;
+                if left > 5 || !untouched(base + 0x140, 16, 32)? {
+                    return Err("i386 timerfd_gettime did not write a 16-byte old_itimerspec32");
+                }
+                poison(base + 0x160, 16)?;
+                if call32_sp(161, [0, base + 0x160, 0, 0, 0, 0], sp) != 0
+                    || !untouched(base + 0x160, 8, 16)?
+                {
+                    return Err("i386 sched_rr_get_interval did not write an old_timespec32");
+                }
+                // utimensat / utimes / utime, checked through stat64's st_mtime.
+                put_user(base + 0x200, b"/compat32-old/f\0")?;
+                let mtime = || -> Result<u32, &'static str> {
+                    if call32(195, [base + 0x200, base + 0x300, 0, 0, 0, 0]) != 0 {
+                        return Err("i386 stat64 failed");
+                    }
+                    get_u32(base + 0x300 + 72)
+                };
+                put_user(base + 0x220, &words(&[1, 0, 2, 0]))?;
+                if call32_sp(320, [AT_FDCWD32, base + 0x200, base + 0x220, 0, 0, 0], sp) != 0
+                    || mtime()? != 2
+                {
+                    return Err("i386 utimensat of old_timespec32[2] did not set the mtime");
+                }
+                put_user(base + 0x220, &words(&[3, 0, 4, 0]))?;
+                if call32_sp(271, [base + 0x200, base + 0x220, 0, 0, 0, 0], sp) != 0
+                    || mtime()? != 4
+                {
+                    return Err("i386 utimes of old_timeval32[2] did not set the mtime");
+                }
+                put_user(base + 0x220, &words(&[5, 6]))?;
+                if call32_sp(30, [base + 0x200, base + 0x220, 0, 0, 0, 0], sp) != 0 || mtime()? != 6
+                {
+                    return Err("i386 utime of an old_utimbuf32 did not set the mtime");
+                }
+                // 16-bit ids.
+                let ruid = call32(199, [0; 6]);
+                poison(base + 0x400, 8)?;
+                if call32_sp(165, [base + 0x400, base + 0x402, base + 0x404, 0, 0, 0], sp) != 0 {
+                    return Err("i386 getresuid16 failed");
+                }
+                let got = get_user(base + 0x400, 2)?;
+                let r16 = u16::from_le_bytes([got[0], got[1]]);
+                let want = if ruid > 0xFFFF { 65534 } else { ruid as u16 };
+                if r16 != want || !untouched(base + 0x400, 6, 8)? {
+                    return Err("i386 getresuid16 did not write three high2lowuid old_uid_ts");
+                }
+                if call32_sp(164, [0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0], sp) != 0
+                    || call32(199, [0; 6]) != ruid
+                {
+                    return Err("i386 setresuid16(0xFFFF, ...) must leave the ids unchanged");
+                }
+                if call32_sp(182, [base + 0x200, 0xFFFF, 0xFFFF, 0, 0, 0], sp) != 0
+                    || call32_sp(16, [base + 0x200, 0xFFFF, 0xFFFF, 0, 0, 0], sp) != 0
+                {
+                    return Err("i386 chown16/lchown16(-1, -1) failed");
+                }
+                let fd = call32(5, [base + 0x200, O_RDWR, 0, 0, 0, 0]);
+                if fd < 0 {
+                    return Err("opening the fixture file failed");
+                }
+                fds.push(fd as u64);
+                if call32_sp(95, [fd as u64, 0xFFFF, 0xFFFF, 0, 0, 0], sp) != 0 {
+                    return Err("i386 fchown16(-1, -1) failed");
+                }
+                same_as_native(138, Syscall::Setfsuid, [0xFFFF_FFFF, 0, 0, 0, 0, 0])
+                    .map_err(|_| "i386 setfsuid16(-1) did not answer as setfsuid(-1)")?;
+                let n = call32_sp(80, [0, 0, 0, 0, 0, 0], sp);
+                if n < 0 || n != call32(205, [0, 0, 0, 0, 0, 0]) {
+                    return Err("i386 getgroups16(0) did not count the groups");
+                }
+                if n > 0 && call32_sp(80, [n as u64, base + 0x500, 0, 0, 0, 0], sp) != n {
+                    return Err("i386 getgroups16 did not fill its 16-bit list");
+                }
+                Ok(())
+            })();
+            for fd in fds {
+                let _ = call32(6, [fd, 0, 0, 0, 0, 0]);
+            }
+            result
+        })
+    });
+    clear_compat_as();
+    unload(proc);
+    outcome
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_table_time32_and_uid16_calls
+);
