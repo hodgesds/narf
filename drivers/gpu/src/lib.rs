@@ -343,6 +343,8 @@ pub mod amdgpu_gfx;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx10_topology;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_gfx11_submit;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_gfx11_topology;
 #[cfg(feature = "amdgpu")]
 mod amdgpu_gfx12_draw;
