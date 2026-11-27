@@ -123,6 +123,7 @@ hardware registers**. Use the right primitive from `narf_scheduler`:
 | `block_on(fut)` | Sync caller bridging to async path; **no IrqSafeSpinLock held** | **no** (halts on IRQ) | idles between IRQs |
 | `block_on_spin(fut)` | Same as above but caller holds an `IrqSafeSpinLock`, is in an IRQ handler, or runs in a panic / SMP-startup path with IRQs disabled | yes | 100% spin |
 | `sleep_pumps::run()` | Inside any waiting loop (or as a periodic tick) — drives FB drain, cursor pump, future audio drain | yes | trivial |
+| `sleep_pumps::block_nested()` | Hold for as long as you hold a lock another task may take (a driver request gate) across a sync wait: that CPU's waits then run IO/timer pumps only, never a nested executor step that could poll the contender on top of your stack | yes | trivial |
 
 **`block_on` takes interrupts.** Entered with IRQs masked from process
 context (only the kernel-test harness, on the BSP), it unmasks them for

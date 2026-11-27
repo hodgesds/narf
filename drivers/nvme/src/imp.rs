@@ -4788,6 +4788,29 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 /// spinlock — the caller's interrupt state is preserved.
 pub struct ControllerGuard {
     slot: &'static InstalledController,
+    /// While the gate is held, sync waits on this CPU poll no other task:
+    /// one that wanted this controller would spin on top of the holder's
+    /// stack until `GATE_STALL_FAIL_MS` (`sleep_pumps::NestedBlock`).
+    _nested: narf_scheduler::sleep_pumps::NestedBlock,
+}
+
+impl ControllerGuard {
+    /// The guard for a gate this context just took ([`try_take_gate`]).
+    fn taken(slot: &'static InstalledController) -> Self {
+        Self {
+            slot,
+            _nested: narf_scheduler::sleep_pumps::block_nested(),
+        }
+    }
+}
+
+/// Take `slot`'s gate and keep it, with no guard: an in-flight command as
+/// the shutdown / suspend tests model it. Released by storing `false` into
+/// `req_gate`. Unlike a forgotten [`ControllerGuard`], it leaves no
+/// `NestedBlock` behind on this CPU.
+#[doc(hidden)]
+fn hold_gate_for_test(slot: &'static InstalledController) -> bool {
+    try_take_gate(slot)
 }
 
 impl core::fmt::Debug for ControllerGuard {
@@ -5021,7 +5044,7 @@ fn acquire(slot: &'static InstalledController) -> Result<ControllerGuard, NvmeEr
     loop {
         for _ in 0..64 {
             if try_take_gate(slot) {
-                return Ok(ControllerGuard { slot });
+                return Ok(ControllerGuard::taken(slot));
             }
             core::hint::spin_loop();
         }
@@ -6080,7 +6103,7 @@ fn shutdown_slot(
     let name = ns::controller_name(slot.instance);
     let got = drain_ms > 0 && wait(&mut || try_take_gate(slot), drain_ms);
     if got {
-        let mut ctrl = ControllerGuard { slot };
+        let mut ctrl = ControllerGuard::taken(slot);
         return match ctrl.shutdown() {
             Some(report) => SlotShutdown::Normal(report),
             None => SlotShutdown::NotReady,
@@ -6245,7 +6268,7 @@ fn suspend_slot(
     if !got {
         return SlotSuspend::Busy;
     }
-    let mut ctrl = ControllerGuard { slot };
+    let mut ctrl = ControllerGuard::taken(slot);
     if ctrl.suspended {
         return SlotSuspend::AlreadySuspended;
     }
@@ -6274,7 +6297,7 @@ fn resume_slot(
     if !got {
         return SlotResume::Busy;
     }
-    let mut ctrl = ControllerGuard { slot };
+    let mut ctrl = ControllerGuard::taken(slot);
     if !ctrl.suspended {
         return SlotResume::NotSuspended;
     }

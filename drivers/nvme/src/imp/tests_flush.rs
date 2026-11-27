@@ -284,7 +284,9 @@ fn smoke_nvme_shutdown_waits_for_in_flight_io() -> TestResult {
     };
     let vwc = super::with_controller_at(1, |c| c.has_volatile_write_cache()).unwrap_or(false);
     // "In flight": hold the gate the way an I/O path does.
-    core::mem::forget(super::acquire(slot));
+    if !super::hold_gate_for_test(slot) {
+        return TestResult::Fail("the gate was already held");
+    }
     let mut polls = 0u32;
     let outcome = super::shutdown_slot(
         slot,
@@ -468,7 +470,9 @@ fn smoke_nvme_suspend_drains_in_flight_io() -> TestResult {
     let vwc = super::with_controller_at(1, |c| c.has_volatile_write_cache()).unwrap_or(false);
     let flushes_before = super::with_controller_at(1, |c| c.flushes_completed()).unwrap_or(0);
     // "In flight": hold the gate the way an I/O path does.
-    core::mem::forget(super::acquire(slot));
+    if !super::hold_gate_for_test(slot) {
+        return TestResult::Fail("the gate was already held");
+    }
     // A wait that never observes the gate free: Busy, nothing touched.
     let busy = super::suspend_slot(slot, &pm.cap, 50, &mut |cond, ms| (0..ms).any(|_| cond()));
     if busy != super::SlotSuspend::Busy {
