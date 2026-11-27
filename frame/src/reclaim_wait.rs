@@ -312,6 +312,43 @@ mod tests {
     }
     kernel_test_in!("frame", smoke_reclaim_wait_registration_is_lost_wake_free);
 
+    /// More fault waiters than the old fixed table held (one slot per task
+    /// the scheduler could admit) all park on one reclaim cycle and all wake
+    /// when it completes. Linux parks a reclaim-throttled task on a wait
+    /// queue (`reclaim_throttle` → `pgdat->reclaim_wait`), which has no
+    /// capacity; with task admission sized from RAM neither may this.
+    fn smoke_reclaim_wait_has_no_waiter_capacity() -> TestResult {
+        const NODE: usize = FRAME_MAX_NUMA_NODES - 1;
+        const WAITERS: usize = 1100;
+        WAKES.store(0, Ordering::Relaxed);
+        let ticket = next_ticket(NODE);
+        let mut registrations = alloc::vec::Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            match register_waiter(ticket, counting_waker()) {
+                RegisterResult::Armed(registration) => registrations.push(registration),
+                RegisterResult::Full => {
+                    drop(registrations);
+                    return TestResult::Fail("a reclaim waiter past 1024 found the table full");
+                }
+                RegisterResult::RetryNow => {
+                    drop(registrations);
+                    return TestResult::Fail("an unfinished reclaim cycle forced a retry");
+                }
+            }
+        }
+        notify_reclaim_progress(ticket);
+        let woken = WAKES.load(Ordering::Relaxed);
+        drop(registrations);
+        if woken != WAITERS {
+            return TestResult::Fail("reclaim progress did not wake every waiter");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "frame/reclaim_wait",
+        smoke_reclaim_wait_has_no_waiter_capacity
+    );
+
     fn smoke_reclaim_wait_retry_is_bounded() -> TestResult {
         let ticket = ReclaimTicket {
             node: 0,
