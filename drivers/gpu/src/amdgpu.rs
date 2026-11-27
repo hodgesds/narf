@@ -305,11 +305,12 @@ pub fn navi3_device(did: u16) -> Option<&'static Navi3Device> {
 /// `ChipInfo` for a Navi31/32/33 board id. All three dies share
 /// `Family::Navi3`; only the asic name and firmware placeholder name
 /// differ per die. The `amdgpu/navi3*.bin` names are placeholders, not
-/// real blobs — except 0x744C (Navi31 RX 7900 XT/XTX/GRE), whose
-/// `NAVI31_FW` table this PR supplies (PSP 13.0.0 / SMU 13.0.0). The
-/// other Navi31 SKUs and Navi32/33 stay on `UNAUDITED_FW` until their
-/// tables land; the per-DID (not per-die) gate keeps this table scoped
-/// to the one DID the PSP13/SMU lane audited.
+/// real blobs — except the Navi31 SKUs, whose tables are wired by the
+/// per-DID gate below: `NAVI31_FW` (PSP 13.0.0 / SMU 13.0.0) for
+/// 0x744C/0x7448/0x7449/0x744A/0x745E, and the kicker variant
+/// `NAVI31_W7900D_FW` for 0x744B. Navi32/33 stay on `UNAUDITED_FW`
+/// until their tables land; the per-DID (not per-die) gate keeps each
+/// table scoped to the DIDs its audit covers.
 fn navi3_chip_info(vid: u16, did: u16, device: &Navi3Device) -> ChipInfo {
     let (asic, fw_name) = match device.die {
         Navi3Die::Navi31 => ("navi31", "amdgpu/navi31.bin"),
@@ -322,10 +323,22 @@ fn navi3_chip_info(vid: u16, did: u16, device: &Navi3Device) -> ChipInfo {
     // here. The table is wired here instead, so the Navi31 firmware
     // test (`smoke_amdgpu_navi31_fw_table`) sees the real 12-entry
     // table rather than the empty placeholder.
-    let fw_list = if did == NAVI31 {
-        NAVI31_FW
-    } else {
-        UNAUDITED_FW
+    //
+    // Per-DID, not per-die: Linux selects every blob in these tables
+    // by discovered IP version, not by board id — GC 11.0.0, SDMA
+    // 6.0.0, VCN 4.0.0, DCN 3.2.0, PSP 13.0.0 are one die's set, shared
+    // by all five non-kicker Navi31 SKUs (`Rdna3Chip::Navi31` is
+    // already documented GC 11.0.0 for the Pro parts). The only
+    // DID-keyed firmware branch in Linux for Navi31 is
+    // `amdgpu_is_kicker_fw` (`amdgpu_ucode.c::kicker_device_list`),
+    // which names exactly (0x744B, rev 0x00) — so 0x744B takes the
+    // kicker table and the other four take the base table. 0x7446
+    // (USB function, excluded at probe time) keeps `UNAUDITED_FW`,
+    // and Navi32/33 keep `UNAUDITED_FW`.
+    let fw_list = match did {
+        0x744B => NAVI31_W7900D_FW,
+        0x7448 | 0x7449 | 0x744A | NAVI31 | 0x745E => NAVI31_FW,
+        _ => UNAUDITED_FW,
     };
     ChipInfo {
         vid,
@@ -792,8 +805,9 @@ static PHOENIX_FW: &[FwEntry] = &[
 /// * No IMU entry. No `gc_11_0_0_imu.bin` exists in the Linux tree
 ///   (unlike Phoenix's `gc_11_0_1_imu.bin`).
 /// * No `rlc_1` / kicker RLC. `gc_11_0_0_rlc_1.bin` is GC 11.0.0 with
-///   PCI revision 0xCE only, and the `_kicker` variants follow the
-///   ungrounded `amdgpu_is_kicker_fw` rule (see `amdgpu_psp13`).
+///   PCI revision 0xCE only, and the `_kicker` RLC/TA variants belong
+///   to the 0x744B table below (`NAVI31_W7900D_FW`), not this one —
+///   Linux keys them on `amdgpu_is_kicker_fw` (see `amdgpu_psp13`).
 ///
 /// Wiring this table in does not make `initialize()` succeed yet: the
 /// dispatch still fails closed on the shared GPCOM-ring gap
@@ -820,11 +834,72 @@ static NAVI31_FW: &[FwEntry] = &[
     FwEntry::ta("amdgpu/psp_13_0_0_ta.bin"),
 ];
 
+/// Navi31 Pro W7900D (0x744B) — the same 12-entry `NAVI31_FW` set with
+/// the two kicker variants Linux loads for an `amdgpu_is_kicker_fw`
+/// board: RLC `gc_11_0_0_rlc_kicker.bin` and TA
+/// `psp_13_0_0_ta_kicker.bin`. Every other entry is identical to
+/// `NAVI31_FW` (same GC 11.0.0 / SDMA 6.0.0 / VCN 4.0.0 / DCN 3.2.0 /
+/// PSP 13.0.0 die), in the same load order.
+///
+/// Grounding (Linux ref tree, 7.4-rc2):
+///
+/// * `amdgpu_ucode.c::kicker_device_list` is exactly
+///   `{(0x744B, 0x00), (0x7551, 0xC8)}` — 0x744B at PCI revision 0x00
+///   is the only Navi31 kicker board, and no other Navi31 SKU is
+///   listed. `amdgpu_is_kicker_fw` is the only DID-keyed firmware
+///   branch for Navi31 in the ref tree; every other blob is selected
+///   by discovered IP version.
+/// * RLC: `gfx_v11_0.c` `MODULE_FIRMWARE("amdgpu/gc_11_0_0_rlc_kicker.bin")`
+///   and the `amdgpu_is_kicker_fw` arm of `gfx_v11_0_init_microcode`
+///   (`"amdgpu/%s_rlc_kicker.bin"`), taken only when the board is
+///   neither rev 0xCE (`rlc_1`) nor non-kicker.
+/// * TA: `psp_v13_0.c` `MODULE_FIRMWARE("amdgpu/psp_13_0_0_ta_kicker.bin")`,
+///   loaded by `psp_init_ta_microcode`'s `amdgpu_is_kicker_fw` arm
+///   (`amdgpu_psp.c`, `"amdgpu/%s_ta_kicker.bin"`).
+/// * SOS/SMU kicker variants (`psp_13_0_0_sos_kicker.bin`,
+///   `smu_13_0_0_kicker.bin` — `psp_v13_0.c`, `smu_v13_0.c`) are NOT
+///   in this table, for the same reason the base SOS/SMU are not in
+///   `NAVI31_FW`: SOS loads on the PSP bootloader path and SMU is
+///   PSP-loaded; both are tabled in `amdgpu_psp13`
+///   (`Psp13FirmwareSet::select(kicker)`).
+///
+/// Remainder: Linux keys the kicker rule on `(did, revision)` =
+/// (0x744B, 0x00), but this static per-DID gate cannot see the PCI
+/// revision — `ChipInfo::revision` is only populated later, at probe
+/// time. No non-0x00 0x744B revision is attested anywhere (the
+/// W7900D is a single-SKU card; the kicker list pairs 0x744B with
+/// 0x00 only), so the static table is correct for every known board;
+/// a hypothetical non-0x00 0x744B would mis-select the kicker blobs.
+/// The load-time authority stays `amdgpu_rdna4::is_kicker(did,
+/// revision)`, which the PSP-boot path already consults.
+static NAVI31_W7900D_FW: &[FwEntry] = &[
+    FwEntry::toc("amdgpu/gc_11_0_0_toc.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_0_0.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_me.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_mec.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_mes.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_mes_2.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_mes1.bin"),
+    // RLC last of the graphics firmwares, as in `NAVI31_FW` — the
+    // PSP's autoload state machine starts the moment this one lands.
+    // Kicker variant: `amdgpu_is_kicker_fw` boards load
+    // `gc_11_0_0_rlc_kicker.bin` instead of `gc_11_0_0_rlc.bin`.
+    FwEntry::ip_fw("amdgpu/gc_11_0_0_rlc_kicker.bin"),
+    FwEntry::ip_fw("amdgpu/vcn_4_0_0.bin"),
+    FwEntry::ip_fw("amdgpu/dcn_3_2_0_dmcub.bin"),
+    FwEntry::ta("amdgpu/psp_13_0_0_ta_kicker.bin"),
+];
+
 /// Whether `name` is the RLC blob, which is what triggers the PSP's autoload.
 ///
 /// Matched by name because `FwEntry` carries no ucode id — the names are
 /// Linux's own `MODULE_FIRMWARE` strings and a `_rlc.bin` suffix identifies
-/// the blob across every family in this file.
+/// the blob across every family in this file. The one exception is the
+/// kicker RLC (`gc_11_0_0_rlc_kicker.bin` in `NAVI31_W7900D_FW`), which
+/// this does not match — harmless, because the only caller gates on
+/// `autoload`, which is Phoenix/Strix-only, and no Phoenix/Strix table
+/// carries a kicker RLC.
 fn is_rlc_blob(name: &str) -> bool {
     name.ends_with("_rlc.bin")
 }

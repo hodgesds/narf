@@ -13,8 +13,9 @@ pub const PSP14_0_3_SOS_KICKER: &str = "amdgpu/psp_14_0_3_sos_kicker.bin";
 /// `psp_v13_0_init_microcode` (SOS + TA, no TOC).
 pub const PSP13_0_0_SOS: &str = "amdgpu/psp_13_0_0_sos.bin";
 /// PSP 13.0.0 SOS container for an `amdgpu_is_kicker_fw` board.
-/// Same `psp_v13_0.c` `MODULE_FIRMWARE` list; which Navi31 boards
-/// take the kicker variant is UNRESOLVED (see `amdgpu_psp13`).
+/// Same `psp_v13_0.c` `MODULE_FIRMWARE` list; the Navi31 board that
+/// takes it is 0x744B at PCI revision 0x00
+/// (`amdgpu_ucode.c::kicker_device_list`, see `amdgpu_psp13`).
 pub const PSP13_0_0_SOS_KICKER: &str = "amdgpu/psp_13_0_0_sos_kicker.bin";
 /// PSP 13.0.0 trusted application.
 /// `psp_v13_0.c` `MODULE_FIRMWARE`, loaded by

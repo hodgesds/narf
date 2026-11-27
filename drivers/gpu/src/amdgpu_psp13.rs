@@ -24,16 +24,18 @@
 //! The SMU name is tabled here so the PSP boot owner knows which blob the
 //! PSP side expects; the MP1-mailbox PMFW sentinel stays Phoenix-only.
 //!
-//! Kicker selection is UNRESOLVED: Linux branches on
-//! `amdgpu_is_kicker_fw(adev)` for the SOS, TA and RLC variants, but the
-//! rule that decides it for a Navi31 board (which `(did, revision)` pairs)
-//! is not in the ref tree — `amdgpu_psp.c` is outside the sparse checkout
-//! and the definition was not found in `amdgpu_device.c` either. The
-//! selector therefore takes an explicit `kicker: bool` and the caller
-//! owns the rule. One unexamined lead, NOT a rule: NARF's RDNA4 table
-//! (`amdgpu_rdna4::KICKER_DEVICES`) lists `(0x744B, 0x00)` — a Navi31
-//! board (Pro W7900D) sitting in the RDNA4 list. A later lane must
-//! ground the rule before any board is wired to the kicker set.
+//! Kicker selection is GROUNDED (Navi31 SKU firmware lane, tip
+//! 00f4141dd): Linux's `amdgpu_is_kicker_fw(adev)` is
+//! `amdgpu_ucode.c::kicker_device_list`, exactly
+//! `{(0x744B, 0x00), (0x7551, 0xC8)}` — 0x744B (Pro W7900D) at PCI
+//! revision 0x00 is the only Navi31 kicker board. The rule is also
+//! mirrored in-tree as `amdgpu_rdna4::KICKER_DEVICES` / `is_kicker`
+//! (the 0x744B entry there is a firmware-selection kicker, not a
+//! probe registration). The selector still takes an explicit
+//! `kicker: bool` and the caller owns the rule — the PSP boot owner
+//! wires `is_kicker(did, revision)` when it lands — and the Navi31
+//! per-DID firmware gate (`navi3_chip_info`) already routes 0x744B
+//! to the kicker table (`NAVI31_W7900D_FW`).
 //!
 //! (GPL-2.0-or-later; NARF relicensed 2026-05-20).
 
@@ -63,9 +65,10 @@ pub struct Psp13FirmwareSet {
 impl Psp13FirmwareSet {
     /// Select the set for a board. `kicker` is Linux's
     /// `amdgpu_is_kicker_fw(adev)` branch: `true` takes the `_kicker`
-    /// SOS/TA/SMU variants, `false` the base ones. The Navi31 rule for
-    /// `kicker` is unresolved (see the module docs) — callers must not
-    /// guess it; the PSP boot owner wires the grounded rule when it lands.
+    /// SOS/TA/SMU variants, `false` the base ones. The grounded rule
+    /// is `amdgpu_rdna4::is_kicker(did, revision)` — (0x744B, 0x00)
+    /// for Navi31 — but the caller owns applying it; the PSP boot
+    /// owner wires the rule when it lands.
     pub const fn select(kicker: bool) -> Self {
         if kicker {
             Self {

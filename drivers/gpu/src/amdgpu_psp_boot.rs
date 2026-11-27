@@ -59,9 +59,10 @@ enum Target {
     /// Navi31 only (GC 11.0.0, MP0 13.0.0). Navi32/33 are refused by the
     /// `profile` guard: per-die scoping, their bring-up is a follow-up
     /// lane, not a silent extension. The kicker variant is deliberately
-    /// absent: the `amdgpu_is_kicker_fw` rule for a Navi31 board is
-    /// unresolved (`amdgpu_psp13`), so no board is wired to the kicker
-    /// set until a later lane grounds the rule.
+    /// absent: the `amdgpu_is_kicker_fw` rule for a Navi31 board is now
+    /// grounded (`amdgpu_psp13`: (0x744B, rev 0x00)), but no board is
+    /// wired to the kicker set here until the PSP-boot owner adds a
+    /// `Psp13_0_0Kicker` target selected by `is_kicker(did, revision)`.
     Psp13_0_0,
     Psp14_0_2,
     Psp14_0_3,
