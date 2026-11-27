@@ -30,6 +30,9 @@ use narf_memory::mmu_notifier::{
 
 #[path = "intel_gpu_xe_svm.rs"]
 pub(crate) mod svm;
+pub(crate) use crate::intel_gpu_xe_usm as usm;
+#[path = "intel_gpu_xe_madvise.rs"]
+pub(crate) mod madvise;
 
 static NEXT_VM: AtomicU64 = AtomicU64::new(1);
 pub(crate) const MAX_MAPPINGS: usize = 4096;
@@ -56,6 +59,9 @@ pub(crate) struct Vm {
     /// `vm->svm`: the CPU-address-mirror state of a fault-mode VM on a USM
     /// device under `narf.intel.svm=1`. Without it a mirror bind is EINVAL.
     pub svm: Option<svm::Svm>,
+    /// `vm->usm.asid` on a device with USM state; `None` before allocation
+    /// and after VM_DESTROY.
+    asid: IrqSafeSpinLock<Option<usm::Asid>>,
 }
 #[derive(Debug)]
 pub(crate) struct State {
@@ -70,13 +76,14 @@ impl Vm {
     }
 
     /// A VM whose fault mode mirrors the address space `svm` names
-    /// (`xe_svm_init` with `current->mm`); `None`, or a VM without fault
-    /// mode, has no mirror.
+    /// (`xe_svm_init` with `current->mm`), grabbed as the remote handle when
+    /// the creator offers one; `None`, or a VM without fault mode, has no
+    /// mirror.
     pub fn with_svm(
         scratch: bool,
         lr: bool,
         fault: bool,
-        svm: Option<u64>,
+        svm: Option<svm::Mirror>,
     ) -> Result<Arc<Self>, FsError> {
         let identity = NEXT_VM
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
@@ -94,7 +101,26 @@ impl Vm {
             userptrs: IrqSafeSpinLock::new(Vec::new()),
             userptr_ops: Arc::new(UserptrNotifier),
             svm: svm.filter(|_| fault).map(svm::Svm::new),
+            asid: IrqSafeSpinLock::new(None),
         }))
+    }
+
+    /// `xe_vm_create`'s ASID from the device's USM state.
+    pub fn assign_asid(self: &Arc<Self>, usm: &Arc<usm::Usm>) -> Result<(), FsError> {
+        let asid = usm.alloc_asid(self)?;
+        *self.asid.lock() = Some(asid);
+        Ok(())
+    }
+
+    /// `vm->usm.asid`, or 0 without one (the `CTX_ASID` Linux leaves unset).
+    pub fn asid(&self) -> u32 {
+        self.asid.lock().as_ref().map_or(0, usm::Asid::id)
+    }
+
+    /// `xe_vm_close_and_put`: erase the VM's ASID from the device.
+    pub fn release_asid(&self) {
+        let asid = self.asid.lock().take();
+        drop(asid);
     }
     pub fn check(&self) -> Result<(), FsError> {
         if self.dead.load(Ordering::Acquire) {
@@ -600,12 +626,13 @@ impl Bind {
                 userptr: None,
                 mirror: None,
                 prefetch_region: 0,
-                mirror_vma: Some(svm::MirrorVma {
-                    start: address,
-                    end: address + length,
-                    pat: pat as u8,
-                    read_only: flags & 1 != 0,
-                }),
+                mirror_vma: Some(svm::MirrorVma::new(
+                    address,
+                    address + length,
+                    pat as u8,
+                    flags & 1 != 0,
+                    flags & svm::BIND_FLAG_MADVISE_AUTORESET != 0,
+                )),
             });
         }
         let null = flags & 4 != 0;

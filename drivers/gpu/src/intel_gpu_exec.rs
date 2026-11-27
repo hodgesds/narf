@@ -190,6 +190,7 @@ impl ExecRequest {
             skip_batch: false,
             implicit_sync: true,
             parallel: None,
+            fault_vm: None,
         })
     }
 
@@ -570,6 +571,18 @@ pub struct ResidentBatch {
     /// All lanes share this owned immutable VM graph. Lane zero retains
     /// the ordinary address; children are copied before any wait.
     parallel: Option<Vec<u64>>,
+    /// The job of a VM with an ASID (`narf.intel.svm=1` on a USM device).
+    fault_vm: Option<FaultVm>,
+}
+
+/// A job's VM as the GPU page-fault service sees it: the ASID its LRC
+/// carries (`CTX_ASID`), whether unmapped pages read scratch, and the bytes
+/// its tables map against the 512 MiB job budget.
+#[derive(Clone, Copy, Debug)]
+struct FaultVm {
+    asid: u32,
+    scratch: bool,
+    bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -852,6 +865,7 @@ impl ResidentBatch {
             skip_batch: address.is_none(),
             implicit_sync: false,
             parallel: None,
+            fault_vm: None,
         })
     }
 
@@ -903,6 +917,167 @@ impl ResidentBatch {
     }
     pub(crate) fn parallel(&self) -> Option<&[u64]> {
         self.parallel.as_deref()
+    }
+
+    /// Tag the job with its VM's ASID (`xe_lrc_init`'s `CTX_ASID`), built
+    /// from `mappings` on a VM with `scratch` pages; 0 leaves it untagged.
+    pub(crate) fn set_fault_vm(&mut self, asid: u32, scratch: bool, mappings: &[VmMapping]) {
+        if asid == 0 {
+            return;
+        }
+        let bytes = mappings
+            .iter()
+            .filter(|m| m.object.is_some() || !scratch)
+            .map(|m| m.length)
+            .fold(0, u64::saturating_add);
+        self.fault_vm = Some(FaultVm {
+            asid,
+            scratch,
+            bytes,
+        });
+    }
+
+    /// The ASID the job's LRC carries, or 0 for none.
+    pub(crate) fn asid(&self) -> u32 {
+        self.fault_vm.map_or(0, |vm| vm.asid)
+    }
+
+    /// The GPU page-fault service's rebind of `mappings` into this job's
+    /// tables, which a running job may be walking (`xe_vma_rebind`,
+    /// `xe_svm_range_bind`): each page is bound with [`Ppgtt::rebind`], which
+    /// never frees a table, and each object is retained, and reserved for
+    /// the job's `completion` as at submission, before any of its pages is
+    /// written, so the job keeps every page it can reach until it retires and
+    /// no eviction moves one meanwhile. Returns whether any leaf changed; the
+    /// caller publishes the tables and invalidates the TLB before the GPU
+    /// retries. The job budget still holds: past 512 MiB of mapped bytes is
+    /// ENOMEM.
+    pub(crate) fn fault_map(
+        &mut self,
+        mappings: &[VmMapping],
+        completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
+    ) -> Result<bool, FsError> {
+        let mut vm = self.fault_vm.ok_or(FsError::InvalidData)?;
+        let platform = self.platform.ok_or(FsError::InvalidData)?;
+        let bits = platform.physical_bits();
+        let mut changed = false;
+        for m in mappings {
+            if m.va % PAGE != 0
+                || m.length == 0
+                || m.length % PAGE != 0
+                || m.offset % PAGE != 0
+                || m.va.checked_add(m.length).is_none_or(|end| end > VA_SIZE)
+            {
+                return Err(FsError::InvalidData);
+            }
+            let counted = m.object.is_some() || !vm.scratch;
+            if counted
+                && vm
+                    .bytes
+                    .checked_add(m.length)
+                    .is_none_or(|bytes| bytes > 512 * 1024 * 1024)
+            {
+                return Err(FsError::OutOfMemory);
+            }
+            let mut written = 0u64;
+            if let Some(object) = &m.object {
+                // A 64 KiB VRAM page (DG2 only, no USM) is never rebound in
+                // place, nor VRAM on an iGPU; every page must fit the DMA mask.
+                if m.offset
+                    .checked_add(m.length)
+                    .is_none_or(|end| end > object.size())
+                    || (object.is_vram()
+                        && (object.vram_page_size() == 65536 || platform.is_headless_integrated()))
+                    || object
+                        .pages()
+                        .skip((m.offset / PAGE) as usize)
+                        .take((m.length / PAGE) as usize)
+                        .any(|phys| phys >> bits != 0)
+                {
+                    return Err(FsError::InvalidData);
+                }
+                let reserve = if let Some((_, writable)) = self
+                    .space
+                    .objects
+                    .iter_mut()
+                    .find(|(old, _)| Arc::ptr_eq(old, object))
+                {
+                    let upgrade = m.writable && !*writable;
+                    *writable |= m.writable;
+                    upgrade
+                } else {
+                    self.space
+                        .objects
+                        .try_reserve(1)
+                        .map_err(|_| FsError::OutOfMemory)?;
+                    self.space.objects.push((object.clone(), m.writable));
+                    true
+                };
+                if reserve {
+                    crate::intel_gpu_gem::reserve_gpu_explicit(
+                        &[(object.clone(), m.writable)],
+                        completion,
+                    );
+                }
+                let mut pages = 0u64;
+                for (i, phys) in object
+                    .pages()
+                    .skip((m.offset / PAGE) as usize)
+                    .take((m.length / PAGE) as usize)
+                    .enumerate()
+                {
+                    pages += 1;
+                    let page = if object.is_vram() {
+                        crate::intel_gpu_ppgtt::Rebind::Device(phys)
+                    } else {
+                        crate::intel_gpu_ppgtt::Rebind::System(phys)
+                    };
+                    let tables = self.space.tables.as_mut().expect("owned tables");
+                    if tables
+                        .rebind(
+                            &mut self.space.memory,
+                            m.va + i as u64 * PAGE,
+                            page,
+                            m.pat,
+                            m.writable,
+                        )
+                        .map_err(map_error)?
+                    {
+                        written += 1;
+                    }
+                }
+                // An import whose exporter moved has no pages: the GPU faults
+                // again once it is mapped (`intel_gpu_prime`).
+                if pages != m.length / PAGE {
+                    return Err(FsError::WouldBlock);
+                }
+            } else if !vm.scratch {
+                for page in 0..m.length / PAGE {
+                    let tables = self.space.tables.as_mut().expect("owned tables");
+                    if tables
+                        .rebind(
+                            &mut self.space.memory,
+                            m.va + page * PAGE,
+                            crate::intel_gpu_ppgtt::Rebind::Null,
+                            m.pat,
+                            true,
+                        )
+                        .map_err(map_error)?
+                    {
+                        written += 1;
+                    }
+                }
+            }
+            if counted {
+                vm.bytes += written * PAGE;
+                self.fault_vm = Some(vm);
+            }
+            changed |= written != 0;
+        }
+        if !self.space.within_dma_bits(platform) {
+            return Err(FsError::InvalidData);
+        }
+        Ok(changed)
     }
 
     pub(crate) fn user_fence(&self) -> Option<(u64, u64)> {

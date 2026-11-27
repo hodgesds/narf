@@ -1061,6 +1061,8 @@ mod intel_gpu_xe_sync;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_xe_uapi;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_xe_usm;
+#[cfg(feature = "intel")]
 mod intel_gpu_xe_vm;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_xelpg;

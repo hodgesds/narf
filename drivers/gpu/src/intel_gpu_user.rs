@@ -208,6 +208,11 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn cpu_addr_mirror(&self) -> bool {
         false
     }
+    /// `xe->usm` of a USM device under `narf.intel.svm=1`: its ASIDs and GPU
+    /// page-fault queue. Default: none, so VMs carry no ASID.
+    fn usm(&self) -> Option<Arc<crate::intel_gpu_xe_usm::Usm>> {
+        None
+    }
     /// The Gen9/Gen11 SSEU layout the execlists owner read from the fuses,
     /// for the i915 topology query and SSEU GETPARAMs. Default: none (later
     /// generations publish a `GtTopology` instead).

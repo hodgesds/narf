@@ -344,6 +344,30 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     /// Opt-in GuC error capture: the preallocated manual node and the
     /// pending STATE_CAPTURE_NOTIFICATION (xe_guc_capture.c).
     error_capture: Option<ErrorCapture>,
+    /// GPU page faults of a USM device under `narf.intel.svm=1`
+    /// (`xe_guc_pagefault.c`); primary GT only.
+    faults: Option<Faults>,
+}
+
+/// This GuC's end of the device's page-fault service: decoded faults go to
+/// `usm`, and its resolutions come back to be written into the running jobs'
+/// tables before the GuC is answered.
+struct Faults {
+    usm: Arc<crate::intel_gpu_xe_usm::Usm>,
+    /// The PPGTT invalidation the replies in it wait for.
+    inval: Option<FaultInval>,
+    /// `PAGE_FAULT_RES_DESC` replies due, in order (CT full keeps them).
+    replies: alloc::collections::VecDeque<crate::intel_gpu_xe_usm::Reply>,
+}
+
+/// One `send_tlb_inval_ppgtt` covering jobs the fault service rebound.
+struct FaultInval {
+    seqno: u32,
+    payload: Vec<u32>,
+    /// Queued on the CT; its deadline (`tlb_inval_timeout_delay`).
+    sent: Option<u64>,
+    /// Released once TLB_INVALIDATION_DONE names `seqno`.
+    replies: Vec<crate::intel_gpu_xe_usm::Reply>,
 }
 
 struct ErrorCapture {
@@ -496,6 +520,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             media_gt,
             ggtt: crate::intel_gpu_ggtt_tlb::Inval::new(),
             error_capture: None,
+            faults: None,
         })
     }
 
@@ -1304,6 +1329,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         let live = |stamp| {
             self.resources.contexts.iter().any(|c| c.stamp == stamp)
                 || self.ggtt.inflight_seqno() == Some(stamp)
+                || self.fault_seqno() == Some(stamp)
         };
         let (id, stamp) = if width == 1 {
             self.identities.candidate(live)?
@@ -1429,6 +1455,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
             // slots are identical in the RCS and BCS register tables.
             image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
             image.write32(REGS + 0x33 * 4, root as u32);
+            // xe_lrc_init on a has_asid device: CTX_ASID (0x2e + 1) carries
+            // the VM's ASID, which the GuC reports in a page fault.
+            if batch.asid() != 0 {
+                image.write32(REGS + 0x2f * 4, batch.asid());
+            }
             if engine.is_media() {
                 // The standalone media GT's AUX_INV sits at its GSI base.
                 crate::intel_gpu_engine::media_ring_at(
@@ -1668,11 +1699,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 self.resources.allocator.ggtt_tlb_complete(gt, generation);
                 continue;
             }
+            if self.fault_inval_done(&message) {
+                continue;
+            }
             self.event(message, now)?;
         }
         // Ahead of every other H2G of this poll, so an update published
         // before it is invalidated before GuC sees later requests.
         self.service_ggtt_tlb(ct, now)?;
+        self.service_faults(ct, now)?;
         self.progress_slpc(ct, now)?;
         self.huc
             .progress(ct, now)
@@ -2156,6 +2191,168 @@ impl<A: BootAllocator> GuCScheduler<A> {
         Ok(())
     }
 
+    /// Route this GuC's GPU page faults to `usm`'s service
+    /// (`xe_pagefault_init`), its queue sized for `total_eus`. The primary
+    /// GT of a USM device only; the standalone media GT keeps none.
+    pub(crate) fn set_usm(
+        &mut self,
+        usm: Arc<crate::intel_gpu_xe_usm::Usm>,
+        total_eus: usize,
+    ) -> Result<(), SchedulingError> {
+        if self.media_gt || !crate::intel_gpu_xe_vm::svm::has_usm(self.platform) {
+            return Err(SchedulingError::State);
+        }
+        usm.size_queue(total_eus)
+            .map_err(SchedulingError::Residency)?;
+        self.faults = Some(Faults {
+            usm,
+            inval: None,
+            replies: alloc::collections::VecDeque::new(),
+        });
+        Ok(())
+    }
+
+    /// The seqno of the fault service's PPGTT invalidation in flight.
+    fn fault_seqno(&self) -> Option<u32> {
+        self.faults
+            .as_ref()
+            .and_then(|faults| faults.inval.as_ref())
+            .filter(|inval| inval.sent.is_some())
+            .map(|inval| inval.seqno)
+    }
+
+    /// TLB_INVALIDATION_DONE for the fault service's invalidation: its
+    /// replies are now due.
+    fn fault_inval_done(&mut self, message: &GuCMessage) -> bool {
+        let Some(seqno) = self.fault_seqno() else {
+            return false;
+        };
+        if message.kind != 1
+            || message.auxiliary != crate::intel_gpu_ggtt_tlb::DONE
+            || message.payload != [seqno]
+        {
+            return false;
+        }
+        let faults = self.faults.as_mut().expect("fault service");
+        let inval = faults.inval.take().expect("in-flight invalidation");
+        faults.replies.extend(inval.replies);
+        true
+    }
+
+    /// The GT owner's half of the page-fault service. Due replies go first
+    /// (`guc_ack_fault`: fire-and-forget fast requests). Then each
+    /// resolution is written into the tables of every job this GuC holds for
+    /// its ASID (`ResidentBatch::fault_map`); if any leaf changed, the tables
+    /// are published, one page-selective PPGTT invalidation covers the
+    /// mapped range (`send_tlb_inval_ppgtt`) and the replies wait for its
+    /// DONE, as Linux acks only after the rebind fence. A resolution that
+    /// changed nothing is answered at once. One invalidation is in flight at
+    /// a time; one past `tlb_inval_timeout_delay` loses the GT.
+    fn service_faults<M: MmioWindow>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        use crate::intel_gpu_xe_vm::svm::guc::ACTION_PAGE_FAULT_RES_DESC;
+        if self.faults.is_none() {
+            return Ok(());
+        }
+        let candidate = {
+            let contexts = &self.resources.contexts;
+            let ggtt = self.ggtt.inflight_seqno();
+            self.ggtt
+                .candidate(|stamp| contexts.iter().any(|c| c.stamp == stamp) || ggtt == Some(stamp))
+        };
+        let resources = &mut *self.resources;
+        let faults = self.faults.as_mut().expect("fault service");
+        loop {
+            while let Some(reply) = faults.replies.front() {
+                match ct.send(0, ACTION_PAGE_FAULT_RES_DESC as u16, 0, reply, true) {
+                    Ok(()) => {
+                        faults.replies.pop_front();
+                    }
+                    Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => return Ok(()),
+                    Err(error) => return Err(SchedulingError::Transport(error)),
+                }
+            }
+            if let Some(inval) = &mut faults.inval {
+                match inval.sent {
+                    Some(deadline) if now >= deadline => return Err(SchedulingError::Timeout),
+                    Some(_) => return Ok(()),
+                    None => {
+                        // The rebound tables are published before GuC reads
+                        // the request (xe_device_wmb).
+                        fence(Ordering::SeqCst);
+                        match ct.send(0, crate::intel_gpu_ggtt_tlb::ACTION, 0, &inval.payload, true)
+                        {
+                            Ok(()) => {
+                                inval.sent = Some(
+                                    now.checked_add(crate::intel_gpu_ggtt_tlb::TIMEOUT_NS)
+                                        .ok_or(SchedulingError::Timeout)?,
+                                );
+                                return Ok(());
+                            }
+                            Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {
+                                return Ok(())
+                            }
+                            Err(error) => return Err(SchedulingError::Transport(error)),
+                        }
+                    }
+                }
+            }
+            let Some(resolution) = faults.usm.pop_resolved() else {
+                return Ok(());
+            };
+            let mut failed = resolution.result.is_err();
+            let mut changed = false;
+            if let Ok(mappings) = &resolution.result {
+                // Only jobs that have not completed; a retired one never
+                // walks its tables again.
+                for context in resources
+                    .contexts
+                    .iter_mut()
+                    .filter(|context| context.fence.result().is_none())
+                {
+                    let Some(batch) = context
+                        .resident
+                        .as_mut()
+                        .filter(|batch| batch.asid() == resolution.asid)
+                    else {
+                        continue;
+                    };
+                    match batch.fault_map(mappings, &context.fence) {
+                        Ok(written) => {
+                            if written && !batch.publish_for_device() {
+                                return Err(SchedulingError::Cache);
+                            }
+                            changed |= written;
+                        }
+                        Err(_) => failed = true,
+                    }
+                }
+            }
+            let replies = resolution.replies(failed);
+            if !changed {
+                faults.replies.extend(replies);
+                continue;
+            }
+            let mappings = resolution.result.as_deref().unwrap_or(&[]);
+            let start = mappings.iter().map(|m| m.va).min().unwrap_or(0);
+            let end = mappings.iter().map(|m| m.va + m.length).max().unwrap_or(start);
+            faults.inval = Some(FaultInval {
+                seqno: candidate,
+                payload: crate::intel_gpu_xe_usm::ppgtt_invalidation(
+                    candidate,
+                    resolution.asid,
+                    start,
+                    end,
+                ),
+                sent: None,
+                replies: replies.collect(),
+            });
+        }
+    }
+
     fn tlb_gt(&self) -> crate::intel_gpu_ggtt_tlb::GuCTlb {
         if self.media_gt {
             crate::intel_gpu_ggtt_tlb::GuCTlb::Media
@@ -2189,9 +2386,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Ok(());
         };
         let contexts = &self.resources.contexts;
+        let fault = self.fault_seqno();
         let seqno = self
             .ggtt
-            .candidate(|stamp| contexts.iter().any(|c| c.stamp == stamp));
+            .candidate(|stamp| contexts.iter().any(|c| c.stamp == stamp) || fault == Some(stamp));
         match ct.send(0, tlb::ACTION, 0, &[seqno, tlb::OP_GUC], true) {
             Ok(()) => self
                 .ggtt
@@ -2235,6 +2433,22 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 capture.nospace = capture.nospace.saturating_add(1);
             }
             capture.notified = true;
+            return Ok(());
+        }
+        // xe_guc_pagefault_handler: a malformed descriptor (-EPROTO) or a
+        // full queue (-ENOSPC) kills Linux's CT; here it loses the GT, as
+        // does a fault on a GuC without the service.
+        if u32::from(action) == crate::intel_gpu_xe_vm::svm::guc::ACTION_REPORT_PAGE_FAULT_REQ_DESC {
+            let faults = self
+                .faults
+                .as_ref()
+                .ok_or_else(|| protocol!("g2h page fault without USM"))?;
+            let fault = crate::intel_gpu_xe_vm::svm::guc::PageFault::from_guc(&message.payload)
+                .map_err(|_| protocol!("page fault payload={:x?}", &message.payload[..]))?;
+            faults
+                .usm
+                .push(fault)
+                .map_err(|_| protocol!("page fault queue full"))?;
             return Ok(());
         }
         // ENGINE_FAILURE_NOTIFICATION (0x1009, GuC could not reset an engine)

@@ -604,8 +604,17 @@ impl XeFile {
                 // xe_svm_init: a fault-mode VM mirrors its creator's address
                 // space (current->mm) once GPUSVM is admitted.
                 let fault = flags & 4 != 0;
+                // The creator's address space is grabbed for the GPU fault
+                // service (gpusvm->mm).
                 let mirror = (fault && crate::intel_gpu_xe_vm::svm::admitted(info))
-                    .then(|| user.address_space_identity())
+                    .then(|| {
+                        user.address_space_identity()
+                            .map(|space| crate::intel_gpu_xe_vm::svm::Mirror {
+                                space,
+                                remote: user.remote_mm(),
+                                discrete: info.platform.is_discrete(),
+                            })
+                    })
                     .flatten();
                 let vm = Vm::with_svm(
                     flags & 1 != 0 || info.platform == crate::intel_gpu_gt::GtPlatform::Battlemage,
@@ -613,6 +622,11 @@ impl XeFile {
                     fault,
                     mirror,
                 )?;
+                // xe_vm_create: every userspace VM of a has_asid device takes
+                // an ASID (-EBUSY once all are taken).
+                if let Some(usm) = crate::intel_gpu_xe_usm::for_device(info) {
+                    vm.assign_asid(&usm)?;
+                }
                 put32(&mut wire, 12, id);
                 user.write(address, &wire)?;
                 names.vms.insert(id, vm);
@@ -630,6 +644,7 @@ impl XeFile {
                 }
                 let vm = names.vms.remove(&id).expect("retained VM");
                 vm.dead.store(true, Ordering::Release);
+                vm.release_asid();
                 Ok(())
             }
             abi::EXEC_QUEUE_CREATE => self.create_queue(info, address, user),
@@ -659,7 +674,9 @@ impl XeFile {
                     &u64::from(queue.context.banned()).to_le_bytes(),
                 )
             }
-            abi::VM_BIND | abi::EXEC | abi::WAIT_USER_FENCE => Err(FsError::WouldBlock),
+            abi::VM_BIND | abi::EXEC | abi::WAIT_USER_FENCE | abi::MADVISE => {
+                Err(FsError::WouldBlock)
+            }
             abi::OBSERVATION => Err(FsError::NotImplemented),
             _ => Err(FsError::InvalidData),
         }
@@ -981,6 +998,7 @@ impl XeFile {
             }
             abi::WAIT_USER_FENCE => Some(self.wait_user(address, user).await.map(|_| 0)),
             abi::OBSERVATION => Some(self.observation(info, address, user, syncobjs).await),
+            abi::MADVISE => Some(self.madvise(info, address, user).await.map(|_| 0)),
             _ => self.dispatch(info, cmd, address, user, gem),
         }
     }
@@ -1328,7 +1346,16 @@ impl XeFile {
             state.prepare_all(&binds, vm.scratch, &vm.svm_vmas(&state), &|start, end| {
                 vm.svm_has_mapping(start, end)
             })?;
-        state.retire().await?;
+        // With GPUSVM published (`narf.intel.svm=1` on a USM device) a
+        // fault-mode VM's bind does not wait for its jobs, as Linux zaps
+        // and refaults instead of waiting there: a running job keeps the
+        // private tables and pages it was built with (the snapshot USERPTR
+        // relies on), and its GPU page faults need this VM state, which a
+        // bind waiting for that job would hold forever. Without the fault
+        // service nothing needs that state, and the bind waits as before.
+        if !(vm.fault && crate::intel_gpu_xe_vm::svm::admitted(info)) {
+            state.retire().await?;
+        }
         vm.check()?;
         if let Some(queue) = &queue {
             queue.check()?;
@@ -1519,7 +1546,7 @@ impl XeFile {
                     sync.user_fence,
                 )
             };
-            let resident = match built {
+            let mut resident = match built {
                 // An import notified of a move while the tables were built
                 // has no pages (`from_vm` refuses holes): map it again.
                 Err(FsError::WouldBlock) if crate::intel_gpu_prime::imports_stale(&imports) => {
@@ -1527,6 +1554,9 @@ impl XeFile {
                 }
                 built => built?,
             };
+            // xe_lrc_init: the job's LRC carries its VM's ASID, through which
+            // the GPU page-fault service finds the job's tables.
+            resident.set_fault_vm(queue.vm.asid(), queue.vm.scratch, job_mappings);
             // __xe_vm_userptr_needs_repin at the point of no return: a binding
             // invalidated while the tables were built is re-collected and the
             // tables rebuilt (xe_exec_ioctl's -EAGAIN retry). A move notified
@@ -1570,6 +1600,32 @@ impl XeFile {
                 Err(error) => return Err(error),
             }
         }
+    }
+    /// `xe_vm_madvise_ioctl`. The ioctl exists only while the backend
+    /// publishes GPUSVM (`narf.intel.svm=1`); otherwise, as an ioctl number
+    /// past the driver's table, it is EINVAL. An unknown VM is EINVAL
+    /// (`xe_vm_lookup`), checked before the arguments.
+    async fn madvise(
+        &self,
+        info: &DeviceInfo,
+        address: u64,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
+        use crate::intel_gpu_xe_vm::madvise::{apply, Madvise};
+        if !info
+            .backend
+            .as_ref()
+            .is_some_and(|backend| backend.cpu_addr_mirror())
+        {
+            return Err(FsError::InvalidData);
+        }
+        let wire = read(user, address, 64)?;
+        let vm = self
+            .vm(u32_at(&wire, 24))
+            .map_err(|_| FsError::InvalidData)?;
+        let advice = Madvise::parse(&wire, info.platform)?;
+        let mut state = vm.state.lock().await;
+        apply(&vm, &mut state, &advice)
     }
     /// One GPU page fault on `vm_id`, as the GuC reports it in a
     /// `REPORT_PAGE_FAULT_REQ_DESC` payload (`xe_guc_pagefault_handler`),

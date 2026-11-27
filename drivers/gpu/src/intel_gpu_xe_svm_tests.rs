@@ -164,12 +164,7 @@ kernel_test_in!(
 fn smoke_xe_svm_mirror_vma_merge_carve_and_cover() -> TestResult {
     // fault_chunk_sizes: 2 MiB, 64 KiB, 4 KiB.
     assert_eq!(svm::CHUNK_SIZES, [0x20_0000, 0x1_0000, 0x1000]);
-    let vma = |start, end| svm::MirrorVma {
-        start,
-        end,
-        pat: 2,
-        read_only: false,
-    };
+    let vma = |start, end| svm::MirrorVma::new(start, end, 2, false, false);
     // xe_vm_find_cpu_addr_mirror_vma_range takes the VMAs holding start - 4K
     // and end + 1, not ones a page away.
     let vmas = [vma(0x1_0000, 0x2_0000), vma(0x3_0000, 0x4_0000), vma(0x5_1000, 0x6_0000)];

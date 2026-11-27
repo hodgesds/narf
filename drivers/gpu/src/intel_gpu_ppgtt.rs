@@ -85,6 +85,17 @@ pub(crate) const PTE_PS64: u64 = 1 << 8; // Xe-HPG contiguous 64 KiB TLB hint.
 const LEAF_ENTRY_ALLOWED: u64 =
     PTE_PRESENT | PTE_RW | PTE_PHYS_MASK | PTE_PAT0 | PTE_PAT1 | PTE_PAT2;
 
+/// The page [`Ppgtt::rebind`] installs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Rebind {
+    /// A system page.
+    System(u64),
+    /// A local-memory (VRAM) device address (XE_PPGTT_PTE_DM).
+    Device(u64),
+    /// A hardware NULL page.
+    Null,
+}
+
 /// Failure modes of the PPGTT walker.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PpgttError {
@@ -611,6 +622,63 @@ impl Ppgtt {
         self.map_encoded(mem, va, leaf)?;
         self.nulls.insert(va);
         Ok(())
+    }
+
+    /// Bind `page` at `va` in tables a running GPU job may be walking (the
+    /// `xe_pt` rebind of a faulted range): an absent or scratch leaf is mapped
+    /// as by [`Self::map_with_pat`], [`Self::map_device_with_pat`] or
+    /// [`Self::map_null`]; a live leaf is overwritten in place. Nothing is
+    /// unmapped, pruned or freed, so every table the hardware may hold in its
+    /// walk caches stays valid until the caller invalidates the TLB. Returns
+    /// whether the leaf changed.
+    pub(crate) fn rebind<M: PtMemory>(
+        &mut self,
+        mem: &mut M,
+        va: u64,
+        page: Rebind,
+        pat_index: u8,
+        writable: bool,
+    ) -> Result<bool, PpgttError> {
+        let (leaf, null) = match page {
+            Rebind::System(phys) => (self.format.encode_ppgtt(phys, pat_index, writable)?, false),
+            Rebind::Device(address) => (
+                self.format.encode_ppgtt(address, pat_index, writable)? | PTE_DM,
+                false,
+            ),
+            Rebind::Null => (
+                self.format.encode_ppgtt(0, pat_index, true)? | PTE_NULL,
+                true,
+            ),
+        };
+        match self.map_encoded(mem, va, leaf) {
+            Ok(()) => {}
+            Err(PpgttError::AlreadyMapped) => {
+                // map_encoded descended real tables to reach the live leaf.
+                let idx = self.indices(va);
+                let mut table = self.root;
+                for (level, &index) in idx.iter().enumerate().take(self.leaf_level as usize) {
+                    match self.follow(mem.read_entry(table, index), level as u8) {
+                        Ok(next) => table = next,
+                        Err(WalkOutcome::Corrupt { level }) => {
+                            return Err(PpgttError::CorruptEntry { level })
+                        }
+                        Err(_) => return Err(PpgttError::NotMapped),
+                    }
+                }
+                let index = idx[self.leaf_level as usize];
+                if mem.read_entry(table, index) == leaf {
+                    return Ok(false);
+                }
+                mem.write_entry(table, index, leaf);
+            }
+            Err(error) => return Err(error),
+        }
+        if null {
+            self.nulls.insert(va);
+        } else {
+            self.nulls.remove(&va);
+        }
+        Ok(true)
     }
 
     fn map_encoded<M: PtMemory>(
