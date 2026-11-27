@@ -1092,6 +1092,72 @@ pub fn mst_stream(rate: UhbrRate, lanes: u8, mode: &Mode, max_bpp: u32) -> Optio
     None
 }
 
+/// `intel_dp_mtp_tu_compute_config(dsc = true)` for one compressed bpp of a
+/// 128b/132b MST stream (`mst_stream_dsc_compute_link_config`): no FEC,
+/// display 14's DSC->DPT limit (as [`dsc_mtp_tu`]), the slice-aware local
+/// M/N, the remote PBN with the SSC margin and the slices, the remote TU
+/// aligned to `4 / lanes`, the PBN realigned to it and the slots
+/// `drm_dp_atomic_find_time_slots` derives, at most 64. `None` without a
+/// slice count, past the DPT limit or past the slots.
+///
+/// The MST route does not take it yet: a stream's DSC capabilities live
+/// behind its decompression AUX (`drm_dp_mst_dsc_aux_for_port`), which this
+/// tree has only inside the amdgpu MST owner.
+#[cfg(any(test, feature = "kernel-test"))]
+pub fn mst_dsc_stream(
+    rate: UhbrRate,
+    lanes: u8,
+    mode: &Mode,
+    bpp_x16: u32,
+    dsc_slices: u8,
+    display14: bool,
+) -> Option<MstUhbrStream> {
+    let l = u32::from(lanes);
+    if dsc_slices == 0 || !matches!(l, 1 | 2 | 4) {
+        return None;
+    }
+    if display14 {
+        let dpt = u64::from(rate.symbol_clock_khz()) * 72 * 967_100
+            / (u64::from(mode.pixel_clock_khz) * 1_030_000).max(1);
+        if dpt != 0 && u64::from(bpp_x16) > dpt * 16 {
+            return None;
+        }
+    }
+    let div = vc_payload_bw(rate, lanes);
+    let data_n = max_link_data_rate(rate, l);
+    if div == 0 || data_n == 0 {
+        return None;
+    }
+    let (clock, hactive) = (mode.pixel_clock_khz, u32::from(mode.h_active));
+    let slices = u32::from(dsc_slices);
+    let local = bw_overhead_with(l, hactive, slices, bpp_x16, true, false);
+    let data_m = effective_data_rate(clock, bpp_x16, local);
+    let remote = bw_overhead_with(l, hactive, slices, bpp_x16, true, true);
+    let pbn = (effective_data_rate(clock, bpp_x16, remote) * 64).div_ceil(54 * 1000);
+    let align = u64::from(4 / l);
+    let tu = (pbn << 12).div_ceil(div).div_ceil(align) * align;
+    let pbn_alloc = (tu * div) >> 12;
+    let slots = (pbn_alloc << 12).div_ceil(div);
+    if tu == 0 || tu > 64 || slots == 0 || slots > u64::from(MST_TOTAL_SLOTS) {
+        return None;
+    }
+    let (dm, dn) = compute_m_n(data_m, data_n, 0x800_0000);
+    let (lm, ln) = compute_m_n(
+        u64::from(clock),
+        u64::from(rate.symbol_clock_khz()),
+        0x8_0000,
+    );
+    Some(MstUhbrStream {
+        pipe_bpp: 0,
+        pbn: pbn_alloc as u32,
+        slots: slots as u8,
+        stream: UhbrStream {
+            tu: tu as u8,
+            m_n: [((tu as u32 - 1) << 25) | dm, dn, lm, ln],
+        },
+    })
+}
+
 /// `intel_dp_compute_min_hblank` for an uncompressed 128b/132b SST stream
 /// on display 30 (`DP_MIN_HBLANK_CTL`): the blanking symbol cycles at the
 /// fixed four-lane count, at least the 3 of BS/VBID/BE, minus 2 for the

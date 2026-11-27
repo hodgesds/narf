@@ -993,3 +993,79 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dp_uhbr",
     smoke_uhbr_dsc_mtp_slices_and_dpt_limit
 );
+
+/// The DSC link math of a 128b/132b MST stream (Linux 7.4
+/// `mst_stream_dsc_compute_link_config` -> `intel_dp_mtp_tu_compute_config`
+/// with `dsc`, then `intel_dp_dsc_compute_config` for MST), from
+/// `drm_dp_bw_overhead` with the slices, the SSC margin on the remote PBN
+/// and `drm_dp_get_vc_payload_bw`:
+///
+/// - 3840x2160 at 594 MHz on UHBR10 x1 in two slices: 16 bpp takes all 64
+///   slots (PBN 1432 over the 91695 divider, `DATA_M` = `TU_SIZE(64)` |
+///   0x7e505c, `LINK_M` 0xf34d6), 17 bpp needs 68; on UHBR10 x2 23 bpp
+///   takes 46 (PBN 2059, `TU_SIZE(46)` | 0x5aac67);
+/// - 4K120 (1188 MHz) on UHBR10 x4 in four slices: 18 bpp is past display
+///   14's DSC->DPT limit (17 bpp) but takes 36 slots on display 20+; 17 bpp
+///   takes 35 (PBN 3134, `TU_SIZE(35)` | 0x439caa; SST's local TU is 34);
+/// - with the monitor's DSC caps (two slices, 1/16 bpp increments, which an
+///   MST connector does not use: `intel_dp_dsc_bpp_step_x16` is one bpp),
+///   the whole-bpp walk from 23 bpp (`align_max_compressed_bpp_x16`) lands
+///   on 16 bpp at UHBR10 x1, pipe 24 bpp, two VDSC engines, no FEC; a sink
+///   without FEC or without DSC has none.
+fn smoke_uhbr_mst_dsc_link_math() -> TestResult {
+    use crate::intel_gpu_xelpg_dsc::{compute_mst, DscDpcd, DscRefusal, DscSink};
+    use crate::intel_gpu_xelpg_external::tests::MONITOR_DSC;
+    let uhd60 = mode(594_000, 3840, 4400, 2160, 2250);
+    let uhd120 = mode(1_188_000, 3840, 4400, 2160, 2250);
+    let r = UhbrRate::Uhbr10;
+    match mst_dsc_stream(r, 1, &uhd60, 256, 2, true) {
+        Some(s)
+            if (s.pbn, s.slots, s.stream.tu) == (1432, 64, 64)
+                && s.stream.m_n == [(63 << 25) | 0x7e_505c, 0x80_0000, 0xf_34d6, 0x8_0000] => {}
+        _ => return TestResult::Fail("16 bpp on UHBR10 x1 takes the 64 MST slots"),
+    }
+    if mst_dsc_stream(r, 1, &uhd60, 272, 2, true).is_some() {
+        return TestResult::Fail("17 bpp on UHBR10 x1 needs 68 slots");
+    }
+    match mst_dsc_stream(r, 2, &uhd60, 368, 2, true) {
+        Some(s)
+            if (s.pbn, s.slots, s.stream.tu) == (2059, 46, 46)
+                && s.stream.m_n[0] == (45 << 25) | 0x5a_ac67 => {}
+        _ => return TestResult::Fail("23 bpp on UHBR10 x2 takes 46 slots"),
+    }
+    if mst_dsc_stream(r, 4, &uhd120, 288, 4, true).is_some()
+        || mst_dsc_stream(r, 4, &uhd120, 288, 4, false).map(|s| s.slots) != Some(36)
+    {
+        return TestResult::Fail("display 14's DPT limit stops 18 bpp at 1188 MHz");
+    }
+    match mst_dsc_stream(r, 4, &uhd120, 272, 4, true) {
+        Some(s)
+            if (s.pbn, s.slots, s.stream.tu) == (3134, 35, 35)
+                && s.stream.m_n[0] == (34 << 25) | 0x43_9caa => {}
+        _ => return TestResult::Fail("17 bpp passes the DPT limit with 35 slots"),
+    }
+    if mst_dsc_stream(r, 1, &uhd60, 256, 0, true).is_some() {
+        return TestResult::Fail("no slice count, no MTP");
+    }
+    let sink = |fec: bool, dsc: bool| DscSink {
+        dpcd: DscDpcd(if dsc { MONITOR_DSC } else { [0; 16] }),
+        is_edp: false,
+        fec_capable: fec,
+    };
+    let fits = |bpp: u32, slices: u8| mst_dsc_stream(r, 1, &uhd60, bpp, slices, true).is_some();
+    match compute_mst(&sink(true, true), &uhd60, 24, 1_000_000, 1, &fits) {
+        Ok(p)
+            if (p.link_rate, p.lanes, p.pipe_bpp, p.compressed_bpp_x16) == (1_000_000, 1, 24, 256)
+                && (p.slice_count, p.num_streams, p.fec) == (2, 2, false) => {}
+        _ => return TestResult::Fail("the MST walk lands on 16 bpp in two slices"),
+    }
+    if compute_mst(&sink(false, true), &uhd60, 24, 1_000_000, 1, &fits).err()
+        != Some(DscRefusal::FecUnsupported)
+        || compute_mst(&sink(true, false), &uhd60, 24, 1_000_000, 1, &fits).err()
+            != Some(DscRefusal::SinkUnsupported)
+    {
+        return TestResult::Fail("intel_dp_supports_dsc: DSC and FEC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/intel_gpu_dp_uhbr", smoke_uhbr_mst_dsc_link_math);

@@ -3515,7 +3515,7 @@ kernel_test_in!(
 /// A DP 1.4 monitor's DSC 1.2 capabilities: 1/2/4 slices, 9-bit line
 /// buffer, block prediction, no maximum bpp, 1/16 bpp increments and an
 /// 850/340 MP/s per-slice throughput.
-const MONITOR_DSC: [u8; 16] = [
+pub(crate) const MONITOR_DSC: [u8; 16] = [
     0x01, 0x21, 0x00, 0x0f, 0x0b, 0x00, 0x01, 0x00, 0x00, 0x01, 0x06, 0x0b, 0x08, 0x00, 0x00, 0x00,
 ];
 
