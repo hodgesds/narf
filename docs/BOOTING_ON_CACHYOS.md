@@ -536,11 +536,13 @@ rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.targe
 - **The gate.** The root mounts read-only instead, with the reason on the
   boot banner, when the filesystem:
   - has recorded errors or was not cleanly unmounted (run e2fsck);
-  - has a journal needing recovery (boot CachyOS once);
-  - has an orphan list that isn't empty;
   - has features NARF cannot write: quota, project, bigalloc, verity,
     legacy `gdt_csum`;
   - has a default directory hash other than legacy, half-MD4 or TEA.
+
+  A journal needing recovery is replayed at mount, and files a crash left
+  deleted-but-open (the orphan file) are released then, as CachyOS does at
+  its next mount.
 
   A root with an incompat feature NARF cannot read (`meta_bg`,
   `inline_data`, `encrypt`, `casefold`, `largedir`, `ea_inode`, `mmp`) does

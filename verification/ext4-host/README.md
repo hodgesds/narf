@@ -35,7 +35,9 @@ Scenarios:
   "clean".
 - `gate`: root-rw must refuse, with EROFS and without changing a byte, an
   unclean filesystem (`ssv state 0`), one with recorded errors
-  (`ssv state 3`), and one with an orphan list (`ssv last_orphan 12`).
+  (`ssv state 3`), and one with a feature NARF cannot write
+  (`feature quota`). An orphan list is not refused: the root-rw mount
+  releases the inode on it, and `e2fsck -fn` is then clean.
 - `htree`: 1 KiB blocks, so the root index holds 123 leaves; a workload
   into the indexed `/usr/lib`, then 6000 long names, enough leaves that the
   index gains its second level and its nodes split, then every third
@@ -49,3 +51,30 @@ Scenarios:
   initialized (`BLOCK_UNINIT`, `INODE_UNINIT`), then 1.5 GiB of data and
   9000 files: allocation must move into those groups (dumpe2fs counts fewer
   uninit groups afterwards) with every bitmap, flag and count e2fsck-clean.
+- `replay`: a journal e2fsprogs wrote (`debugfs` `jo -c`, `jw`, `jc`: a
+  revoke, an escaped block, an uncommitted transaction) replayed by a NARF
+  mount, read-write and read-only, must leave the blocks exactly as
+  `e2fsck -fy` does, the log empty and `e2fsck -fn` clean.
+- `crash`: the device write stream of a journaled workload cut at every
+  commit and at random points, in four journal formats (csum v3 with 64-bit
+  tags, no checksums, 32-bit tags, 1 KiB blocks with the smallest journal,
+  which wraps the log). Each cut must recover by `e2fsck -fy` without a
+  repair to exactly the committed tree.
+- `reuse`: nothing reaches its home location before its transaction
+  commits, and a block freed in a transaction is not reused before that
+  commit.
+- `abort`: a write failing mid-commit aborts the journal; the volume
+  refuses writes (EROFS) and `e2fsck -fy` recovers the last commit.
+- `orphan`: files unlinked while open are recorded in the orphan file, on
+  the `s_last_orphan` list (`^orphan_file`), and on the list once a
+  one-block orphan file is full, in the unlink's transaction; remount
+  read-only is EBUSY while they are open; the last close releases them.
+  The same for a directory removed while open, in which nothing can then
+  be created (ENOENT). A crash with them open is recovered by a NARF read-write mount, a NARF
+  read-only mount and `e2fsck -fy` alike. Then Linux's rules: a
+  write-protected device writes nothing, `ERROR_FS` clears the list
+  read-write and keeps it read-only (remount read-write is then EINVAL),
+  an orphan file entry on a read-only mount with errors is EUCLEAN, a bad
+  orphan block is EIO, an interrupted truncate is finished with the tail
+  of its last block zeroed, and a bad orphan inode ends the list with an
+  error recorded.

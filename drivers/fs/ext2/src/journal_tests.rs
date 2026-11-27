@@ -1273,6 +1273,152 @@ kernel_test_in!(
     smoke_ext4_error_that_stops_writes_aborts_the_journal
 );
 
+// ── The orphan list at mount (`ext4_orphan_cleanup`) ────────────────
+
+/// [`ext3_image`] with its log empty plus inode 11: a regular file whose last
+/// link went while it was open, on the orphan list (`s_last_orphan`), as a
+/// crash with it open leaves it.
+fn ext3_orphan_image(recover: bool) -> Vec<u8> {
+    let mut img = ext3_image(recover, 1, 0x8000 | 0o600);
+    empty_log(&mut img);
+    put_le32(&mut img, 1024 + 84, 11); // s_first_ino
+    put_le32(&mut img, 1024 + 0xE8, 11); // s_last_orphan
+    img[4 * FS_BS + 1] |= 1 << 2; // inode 11 in use
+    put_le16(&mut img, 5 * FS_BS + 10 * 128, 0x8000 | 0o644);
+    img
+}
+
+/// `s_last_orphan`, and whether inode 11 is in use.
+fn orphan_state(img: &[u8]) -> (u32, bool) {
+    (
+        u32::from_le_bytes(img[1024 + 0xE8..1024 + 0xEC].try_into().unwrap()),
+        img[4 * FS_BS + 1] & (1 << 2) != 0,
+    )
+}
+
+fn sb_state(img: &[u8]) -> u16 {
+    u16::from_le_bytes([img[1024 + 58], img[1024 + 59]])
+}
+
+/// A read-write mount deletes the orphan (no links) and empties the list
+/// before anything else can see the filesystem.
+fn smoke_ext4_orphan_list_released_by_rw_mount() -> TestResult {
+    let device = RamBlockDevice::from_image(512, ext3_orphan_image(true));
+    let Ok(volume) = run(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) else {
+        return TestResult::Fail("read-write mount with an orphan list failed");
+    };
+    if volume.is_read_only() || orphan_state(&device.snapshot()) != (0, false) {
+        return TestResult::Fail("the mount must free the orphan and empty the list");
+    }
+    drop(volume);
+    if incompat(&device.snapshot()) & 0x4 != 0 {
+        return TestResult::Fail("the clean unmount must clear RECOVER");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_orphan_list_released_by_rw_mount
+);
+
+/// A read-only mount of a writable device does it too ("orphan cleanup on
+/// readonly fs"), stays read-only, and completes the recovery: `RECOVER`
+/// cleared, the log empty.
+fn smoke_ext4_orphan_list_released_by_ro_mount() -> TestResult {
+    let device = RamBlockDevice::from_image(512, ext3_orphan_image(true));
+    let Ok(volume) = run(Ext2Volume::mount_read_only(
+        device.clone(),
+        DomainId::DRIVER_0,
+    )) else {
+        return TestResult::Fail("read-only mount with an orphan list failed");
+    };
+    let img = device.snapshot();
+    if !volume.is_read_only() || orphan_state(&img) != (0, false) {
+        return TestResult::Fail("a read-only mount must still release the orphan");
+    }
+    if incompat(&img) & 0x4 != 0 || get32(jsb(&img), 0x1C) != 0 {
+        return TestResult::Fail("RECOVER must be cleared and the log empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_orphan_list_released_by_ro_mount
+);
+
+/// A device that cannot be written: "write access unavailable, skipping
+/// orphan cleanup", and not one byte written.
+fn smoke_ext4_orphan_list_kept_on_read_only_device() -> TestResult {
+    let image = ext3_orphan_image(false);
+    let ram = RamBlockDevice::from_image(512, image.clone());
+    let device = Arc::new(ReadOnlyRam(ram.clone()));
+    let Ok(volume) = run(Ext2Volume::mount_read_only(device, DomainId::DRIVER_0)) else {
+        return TestResult::Fail("read-only device mount with an orphan list failed");
+    };
+    drop(volume);
+    if ram.snapshot() != image {
+        return TestResult::Fail("the orphan cleanup must not write a read-only device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_orphan_list_kept_on_read_only_device
+);
+
+/// `ERROR_FS`: no cleanup. A read-write mount clears the list ("Errors on
+/// filesystem, clearing orphan list.") and leaves the inode to e2fsck; a
+/// read-only mount keeps the list.
+fn smoke_ext4_orphan_list_with_errors() -> TestResult {
+    let mut image = ext3_orphan_image(true);
+    put_le16(&mut image, 1024 + 58, 3);
+    let device = RamBlockDevice::from_image(512, image.clone());
+    let Ok(volume) = run(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) else {
+        return TestResult::Fail("read-write mount with errors failed");
+    };
+    if orphan_state(&device.snapshot()) != (0, true) {
+        return TestResult::Fail("with errors a read-write mount clears the list only");
+    }
+    drop(volume);
+    let device = RamBlockDevice::from_image(512, image);
+    let Ok(volume) = run(Ext2Volume::mount_read_only(
+        device.clone(),
+        DomainId::DRIVER_0,
+    )) else {
+        return TestResult::Fail("read-only mount with errors failed");
+    };
+    drop(volume);
+    if orphan_state(&device.snapshot()) != (11, true) {
+        return TestResult::Fail("with errors a read-only mount keeps the list");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_orphan_list_with_errors
+);
+
+/// A list naming an inode that is not allocated (`ext4_orphan_get`: "bad
+/// orphan inode"): a filesystem error, and the list ends there.
+fn smoke_ext4_bad_orphan_inode_ends_the_list() -> TestResult {
+    let mut image = ext3_orphan_image(true);
+    put_le32(&mut image, 1024 + 0xE8, 20);
+    let device = RamBlockDevice::from_image(512, image);
+    let Ok(volume) = run(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) else {
+        return TestResult::Fail("read-write mount with a bad orphan failed");
+    };
+    let img = device.snapshot();
+    drop(volume);
+    if orphan_state(&img) != (0, true) || sb_state(&img) & 2 == 0 {
+        return TestResult::Fail("a bad orphan must end the list and record an error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/journal",
+    smoke_ext4_bad_orphan_inode_ends_the_list
+);
+
 /// `noload` on a read-write mount of a filesystem that needs recovery:
 /// "required journal recovery suppressed and not mounted read-only", EINVAL.
 fn smoke_ext4_noload_rw_needing_recovery_is_einval() -> TestResult {

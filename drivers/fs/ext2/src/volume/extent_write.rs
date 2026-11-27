@@ -203,7 +203,7 @@ fn fix_keys(path: &mut [PathNode], from: usize) -> usize {
 }
 
 /// The errno an extent-tree failure is recorded with.
-fn fs_errno(error: &FsError) -> i64 {
+pub(crate) fn fs_errno(error: &FsError) -> i64 {
     use narf_lib::errno::{EBADMSG, EIO, ENOSPC, EUCLEAN};
     match error {
         FsError::Corrupted => EUCLEAN,

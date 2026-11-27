@@ -689,8 +689,26 @@ fn check_crash(plain: &Path) -> Result<()> {
     {
         bail!("ext4-rootrw-interop: crashed root does not say needs_recovery:\n{header}");
     }
+    // `/narf-crash/held`, unlinked while open: on the device, the one
+    // orphan recorded, with no link and its size.
+    let held = recorded_orphans(plain, &header)?;
+    let [held] = held[..] else {
+        bail!("ext4-rootrw-interop: the crashed root records orphans {held:?}, not just /narf-crash/held");
+    };
+    let stat = run(
+        Command::new("debugfs")
+            .args(["-R", &format!("stat <{held}>")])
+            .arg(plain),
+        "debugfs stat",
+    )?;
+    if !stat.contains("Links: 0") || !stat.contains(&format!("Size: {CRASH_HELD_LEN}")) {
+        bail!("ext4-rootrw-interop: orphan {held} is not the unlinked /narf-crash/held:\n{stat}");
+    }
     let fsck = Command::new("e2fsck").arg("-fy").arg(plain).output()?;
     let text = String::from_utf8_lossy(&fsck.stdout).into_owned();
+    if !text.contains(&format!("Clearing orphaned inode {held} ")) {
+        bail!("ext4-rootrw-interop: e2fsck did not release orphan {held}:\n{text}");
+    }
     let repaired = text
         .lines()
         .any(|l| (l.contains("Fix?") || l.contains("? yes")) && !l.contains("Optimize?"));
@@ -707,6 +725,15 @@ fn check_crash(plain: &Path) -> Result<()> {
             fsck.status.code(),
             String::from_utf8_lossy(&fsck.stdout)
         );
+    }
+    let testi = run(
+        Command::new("debugfs")
+            .args(["-R", &format!("testi <{held}>")])
+            .arg(plain),
+        "debugfs testi",
+    )?;
+    if testi.contains("is marked in use") {
+        bail!("ext4-rootrw-interop: orphan {held} still in use after e2fsck");
     }
     for (path, seed, len) in [
         ("/narf-crash/synced", CRASH_SYNCED_SEED, CRASH_SYNCED_LEN),
@@ -726,11 +753,42 @@ fn check_crash(plain: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The inodes `plain`'s orphan file lists, then the `s_last_orphan` list
+/// (`header` is its `dumpe2fs -h`).
+fn recorded_orphans(plain: &Path, header: &str) -> Result<Vec<u32>> {
+    let field = |name: &str| {
+        header
+            .lines()
+            .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+    };
+    let mut inos = Vec::new();
+    if let Some(orphan_file) = field("Orphan file inode:") {
+        let bs: usize = field("Block size:").unwrap_or_default().parse()?;
+        let cat = Command::new("debugfs")
+            .args(["-R", &format!("cat <{orphan_file}>")])
+            .arg(plain)
+            .output()?;
+        for block in cat.stdout.chunks(bs) {
+            for e in block[..block.len().saturating_sub(8)].chunks_exact(4) {
+                let ino = u32::from_le_bytes(e.try_into()?);
+                if ino != 0 {
+                    inos.push(ino);
+                }
+            }
+        }
+    }
+    if let Some(head) = field("First orphan inode:") {
+        inos.push(head.parse()?);
+    }
+    Ok(inos)
+}
+
 /// What the guest's `crash` mode writes (`drivers/fs/ext2/src/interop.rs`).
 const CRASH_SYNCED_SEED: u32 = 0x5359_4e43;
 const CRASH_SYNCED_LEN: usize = 300_000;
 const CRASH_TIMER_SEED: u32 = 0x5449_4d52;
 const CRASH_TIMER_LEN: usize = 50_000;
+const CRASH_HELD_LEN: usize = 70_000;
 
 #[cfg(test)]
 mod tests {

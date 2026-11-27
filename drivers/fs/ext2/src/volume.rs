@@ -41,6 +41,7 @@ mod extent_write;
 mod file_data;
 mod free_list;
 pub(crate) mod jbd;
+pub(crate) mod orphan;
 pub mod sb_state;
 pub(crate) mod uninit;
 pub(crate) mod xattr;
@@ -326,6 +327,9 @@ pub struct Ext2Volume<B: BlockDevice + 'static> {
     /// released (Linux's deferred `iput_final`). Drained by
     /// [`Self::lock_inode_updates`].
     orphans: IrqSafeSpinLock<Vec<u32>>,
+    /// The on-disk orphan record: the orphan file and the `s_last_orphan`
+    /// list (`orphan.rs`).
+    pub(crate) orphans_state: IrqSafeSpinLock<orphan::Orphans>,
     /// `s_feature_ro_compat & RO_COMPAT_LARGE_FILE`, as on disk now. Set
     /// once, when the first inode past 2 GiB is written.
     large_file: core::sync::atomic::AtomicBool,
@@ -814,12 +818,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let needs_recovery = superblock.last_orphan != 0
             || superblock.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT != 0
             || superblock.feature_incompat & recover_bit != 0;
-        // Whether the JBD2 log has nothing to replay, and the orphan file
-        // nothing to release: then a stale RECOVER / ORPHAN_PRESENT bit is
-        // repaired by the read-write mount's superblock update below.
+        // Whether the JBD2 log has nothing to replay: then a stale RECOVER
+        // bit is repaired by the read-write mount's superblock update below.
         let journal_clean;
         let mut jbd_state = None;
-        let mut orphans_empty = false;
         if superblock.flavour() != ExtFlavour::Ext2 && superblock.has_journal() && !noload {
             let (rewrote, loaded) = Self::load_journal_at_mount(
                 &*device,
@@ -848,18 +850,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         } else {
             journal_clean = superblock.feature_incompat & recover_bit == 0;
         }
-        if superblock.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT != 0 {
-            orphans_empty =
-                Self::orphan_file_is_empty_at_mount(&*device, &io, &superblock, &group_descs)
-                    .await
-                    .unwrap_or(false);
-        }
+        // `ext4_fill_super`: no recovery to complete without a journal, or
+        // on a device that cannot be written.
+        let needs_recovery = needs_recovery && jbd_state.is_some() && !really_read_only;
         // The write gate. Nothing has been written yet, whatever it says.
         let profile = sb_state::GateProfile::current();
         let refusal = if read_only_requested {
             None
         } else {
-            sb_state::rw_refusal(&superblock, journal_clean, orphans_empty, profile)
+            sb_state::rw_refusal(&superblock, journal_clean, profile)
         };
         if let Some(refusal) = refusal {
             sb_state::report_refusal(&superblock, refusal);
@@ -879,6 +878,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             bdev_mapping: BlockMapping::new(page_cache, 0),
             icache: IrqSafeSpinLock::new(BTreeMap::new()),
             orphans: IrqSafeSpinLock::new(Vec::new()),
+            orphans_state: IrqSafeSpinLock::new(orphan::Orphans::default()),
             large_file: core::sync::atomic::AtomicBool::new(
                 superblock.feature_ro_compat & super::superblock::ro_compat::LARGE_FILE != 0,
             ),
@@ -897,6 +897,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         });
         let root_inode = volume.read_inode(super::EXT2_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root_inode);
+        // `ext4_init_orphan_info`: a bad orphan block fails the mount (EIO).
+        // Before anything is written.
+        volume.init_orphan_info().await?;
         // `ext4_setup_super`: mark the filesystem dirty (and repair a stale
         // RECOVER / ORPHAN_PRESENT the gate found clean) before anything
         // else is written. If that cannot be written, `ext4_fill_super`
@@ -920,6 +923,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 }
             }
         }
+        // `ext4_orphan_cleanup`: what a crash left on the orphan file or list
+        // is finished now, on a read-only mount too when the device can be
+        // written; then `ext4_mark_recovery_complete`.
+        volume
+            .finish_orphans_at_mount(needs_recovery, journal_clean)
+            .await?;
         // Register the page cache with the central memory reclaimer so its
         // clean pages can be shed under pressure (shrinker). Done after the
         // owning Arc exists so a Weak can be held without keeping it alive.
@@ -944,14 +953,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     ///   overwrote them, and an error recorded in the journal
     ///   (`s_errno`) moves into the superblock's ERROR_FS
     ///   (`ext4_clear_journal_err`).
-    /// - With `needs_recovery`, the log is marked empty (`jbd2_journal_flush`)
-    ///   and, on a read-only mount, `RECOVER` and `ORPHAN_PRESENT` are
-    ///   cleared.
-    ///
-    /// LINUX-GAP: NARF has no orphan cleanup yet (`ext4_orphan_cleanup`).
-    /// When the orphan file still holds inodes, a read-only mount leaves
-    /// `RECOVER` and `ORPHAN_PRESENT` set for the next Linux mount to
-    /// process, where Linux would have processed them and cleared both.
+    /// - With `needs_recovery`, the replayed log is marked empty. Clearing
+    ///   `RECOVER` and `ORPHAN_PRESENT` on a read-only mount waits for the
+    ///   orphan cleanup (`orphan.rs`), as `ext4_mark_recovery_complete`
+    ///   follows `ext4_orphan_cleanup`.
     async fn load_journal_at_mount(
         device: &B,
         io: &VolumeIo,
@@ -1076,97 +1081,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
         }
 
-        // `ext4_mark_recovery_complete`.
+        // The replayed log is empty (`jbd2_journal_flush`).
         if how.needs_recovery {
             journal.mark_empty(&mut jio).await;
-            let incompat = u32::from_le_bytes(sb_bytes[0x60..0x64].try_into().expect("4 bytes"));
-            let ro_compat = u32::from_le_bytes(sb_bytes[0x64..0x68].try_into().expect("4 bytes"));
-            let orphan_present = super::superblock::ro_compat::ORPHAN_PRESENT;
-            let recover_bit = super::superblock::incompat::RECOVER;
-            if how.read_only && (incompat & recover_bit != 0 || ro_compat & orphan_present != 0) {
-                let current = Superblock::parse(sb_bytes).ok_or(FsError::InvalidData)?;
-                let orphans_empty =
-                    Self::orphan_file_is_empty_at_mount(device, io, &current, group_descs)
-                        .await
-                        .unwrap_or(false);
-                if orphans_empty {
-                    sb_bytes[0x60..0x64].copy_from_slice(&(incompat & !recover_bit).to_le_bytes());
-                    sb_bytes[0x64..0x68]
-                        .copy_from_slice(&(ro_compat & !orphan_present).to_le_bytes());
-                    commit_super_static(device, io, sb, sb_bytes).await?;
-                    wrote = true;
-                }
-            }
         }
         Ok((wrote, (journal, jio.inode)))
-    }
-
-    /// Verify that every slot in ext4's orphan file is empty. Only then may a
-    /// stale `ORPHAN_PRESENT` bit be cleared without deleting or truncating a
-    /// live orphan inode.
-    async fn orphan_file_is_empty_at_mount(
-        device: &B,
-        io: &VolumeIo,
-        sb: &Superblock,
-        group_descs: &[GroupDesc],
-    ) -> Result<bool, FsError> {
-        if sb.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT == 0 {
-            return Ok(true);
-        }
-        if sb.feature_compat & super::superblock::compat::ORPHAN_FILE == 0
-            || sb.orphan_file_inum == 0
-        {
-            return Ok(false);
-        }
-        let inode_no = sb.orphan_file_inum;
-        let zero = inode_no.checked_sub(1).ok_or(FsError::InvalidData)?;
-        let group = zero / sb.inodes_per_group;
-        let index = zero % sb.inodes_per_group;
-        let gd = group_descs
-            .get(group as usize)
-            .ok_or(FsError::InvalidData)?;
-        let inode_size = sb.inode_size_bytes();
-        let bs = sb.block_size() as usize;
-        let inode_off = gd.inode_table * bs as u64 + index as u64 * inode_size as u64;
-        let mut inode_bytes = vec![0u8; inode_size];
-        read_byte_range_into_static(device, io, inode_off, &mut inode_bytes).await?;
-        if !metadata_csum::verify_inode_checksum(sb, inode_no, &inode_bytes) {
-            return Err(FsError::InvalidData);
-        }
-        let inode = Inode::parse(&inode_bytes).ok_or(FsError::InvalidData)?;
-        let blocks = (inode.size as usize).div_ceil(bs);
-        if blocks > 512 {
-            return Err(FsError::InvalidData);
-        }
-        let mut inode_seed =
-            metadata_csum::crc32c(metadata_csum::seed(sb), &inode_no.to_le_bytes());
-        inode_seed = metadata_csum::crc32c(inode_seed, &inode.generation.to_le_bytes());
-        for logical in 0..blocks {
-            let physical =
-                Self::map_block_static(device, io, sb, group_descs, &inode, logical as u64).await?;
-            if physical == 0 {
-                return Err(FsError::InvalidData);
-            }
-            let mut block = vec![0u8; bs];
-            read_byte_range_into_static(device, io, physical * bs as u64, &mut block).await?;
-            if block[bs - 8..bs - 4] != 0x0b10_ca04u32.to_le_bytes() {
-                return Err(FsError::InvalidData);
-            }
-            let provided = u32::from_le_bytes(
-                block[bs - 4..]
-                    .try_into()
-                    .expect("orphan checksum is four bytes"),
-            );
-            let state = metadata_csum::crc32c(inode_seed, &physical.to_le_bytes());
-            let calculated = metadata_csum::crc32c(state, &block[..bs - 8]);
-            if provided != calculated {
-                return Err(FsError::InvalidData);
-            }
-            if block[..bs - 8].chunks_exact(4).any(|entry| entry != [0; 4]) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// Static block-map walk usable before the `Arc<Ext2Volume>`
@@ -1769,6 +1688,18 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         )
     }
 
+    /// Whether a live node holds an inode whose last link is gone (Linux's
+    /// `s_remove_count`).
+    pub(crate) fn has_open_unlinked(&self) -> bool {
+        let nodes: Vec<_> = self
+            .icache
+            .lock()
+            .values()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        nodes.iter().any(|node| node.is_orphaned())
+    }
+
     /// Queue an orphaned inode whose last node just dropped.
     pub(crate) fn queue_orphan(&self, inode_no: u32) {
         self.orphans.lock().push(inode_no);
@@ -1855,12 +1786,30 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Ok(());
         }
         let mut inode = self.read_inode(inode_no).await?;
-        // Linked again while open (`linkat` of an `O_TMPFILE`): it lives on.
+        // Linked again while open (`linkat` of an `O_TMPFILE`): it lives on,
+        // off the orphan record.
         if inode.links_count != 0 {
-            return Ok(());
+            self.orphan_del(inode_no, &mut inode).await?;
+            return self.write_inode(inode_no, &inode).await;
         }
-        self.truncate_inode(inode_no, &mut inode).await?;
-        self.write_inode(inode_no, &inode).await?;
+        self.evict_inode(inode_no, &mut inode).await
+    }
+
+    /// `ext4_evict_inode` for an inode with no link and no reference left:
+    /// its blocks, its orphan record, then the inode, with a directory's
+    /// `bg_used_dirs_count` (`ext4_free_inode`). Caller holds
+    /// `inode_update_lock`.
+    pub(crate) async fn evict_inode(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+    ) -> Result<(), FsError> {
+        self.truncate_inode(inode_no, inode).await?;
+        self.orphan_del(inode_no, inode).await?;
+        self.write_inode(inode_no, inode).await?;
+        if inode.is_dir() {
+            self.note_dir_count_delta(inode_no, -1).await?;
+        }
         self.free_inode(inode_no).await
     }
 
@@ -1869,9 +1818,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// and leave the inode, its size and its blocks to the last reference,
     /// as Linux's `iput_final` does. Caller holds `inode_update_lock`.
     ///
-    /// LINUX-GAP: ext4 also threads such an inode onto the on-disk orphan
-    /// list (`s_last_orphan`) so a crash before the release is recovered at
-    /// mount. NARF does not; e2fsck reclaims the inode instead.
+    /// A deferred release is recorded on disk first (`ext4_orphan_add`, in
+    /// `ext4_unlink`), in the same journal transaction, so a crash before
+    /// it is finished at the next mount (`orphan.rs`).
     pub(crate) async fn release_unlinked(
         &self,
         inode_no: u32,
@@ -1879,6 +1828,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     ) -> Result<(), FsError> {
         debug_assert_eq!(inode.links_count, 0);
         if let Some(node) = self.icache_get(inode_no) {
+            self.orphan_add(inode_no, inode).await?;
             self.write_inode(inode_no, inode).await?;
             node.mark_orphaned();
             // Ours may have been the last reference; release it now if so.
@@ -1891,9 +1841,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             return Ok(());
         }
-        self.truncate_inode(inode_no, inode).await?;
-        self.write_inode(inode_no, inode).await?;
-        self.free_inode(inode_no).await
+        self.evict_inode(inode_no, inode).await
     }
 
     /// `evict`: forget the icache entry of `inode_no` if it still names the

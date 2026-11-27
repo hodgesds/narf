@@ -601,6 +601,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if name.is_empty() || name.len() > 255 {
             return Err(FsError::InvalidPath);
         }
+        // A directory removed while open (`IS_DEADDIR`: `S_DEAD`, which
+        // `vfs_rmdir` sets in memory; its node is marked orphaned): ENOENT.
+        if self
+            .icache_get(parent_inode_no)
+            .is_some_and(|node| node.is_orphaned())
+        {
+            return Err(FsError::NotFound);
+        }
         let bs = self.block_size();
         let blocks = (parent_inode.size as usize).div_ceil(bs);
         let file_type = ftype_for_mode(target_mode);
@@ -1038,13 +1046,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let _ = self
             .dir_delete(parent_inode_no, &mut parent_inode, name)
             .await?;
-        // Unlinked before its blocks go, so the inode written with them
-        // gone is never a live directory with no blocks.
+        // `ext4_rmdir`: `clear_nlink`, `i_size = 0`, and the inode on the
+        // orphan record while it is open (a process's cwd); its blocks and
+        // the inode go with the last reference. Unlinked before its blocks
+        // go, so the inode written with them gone is never a live directory
+        // with no blocks.
         target.links_count = 0;
-        self.truncate_inode(target_ino, &mut target).await?;
-        self.write_inode(target_ino, &target).await?;
-        self.note_dir_count_delta(target_ino, -1).await?;
-        self.free_inode(target_ino).await?;
+        target.size = 0;
+        self.release_unlinked(target_ino, &mut target).await?;
         dec_count(&mut parent_inode);
         parent_inode.touch_ctime_mtime(now);
         self.write_inode(parent_inode_no, &parent_inode).await?;
@@ -1219,14 +1228,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let replaced = victim.is_some();
         if let Some((victim_ino, mut victim_inode)) = victim {
             if victim_inode.is_dir() {
-                // Released exactly as `dir_rmdir` does (`clear_nlink`): the
-                // empty directory's blocks and inode are freed.
+                // Released as `dir_rmdir` releases (`clear_nlink`, then
+                // `ext4_orphan_add` while it is open).
                 victim_inode.links_count = 0;
-                self.truncate_inode(victim_ino, &mut victim_inode).await?;
                 victim_inode.touch_ctime(now);
-                self.write_inode(victim_ino, &victim_inode).await?;
-                self.note_dir_count_delta(victim_ino, -1).await?;
-                self.free_inode(victim_ino).await?;
+                self.release_unlinked(victim_ino, &mut victim_inode).await?;
             } else {
                 // As dir_unlink does: drop a link, and free the blocks +
                 // inode when the last one goes. Skipping this would leak

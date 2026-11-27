@@ -211,19 +211,22 @@ async fn run_root(root: &Arc<dyn DirOps>) -> Result<(), (&'static str, FsError)>
     Ok(())
 }
 
-/// The root's filesystem UUID from its superblock (canonical lowercase).
 /// What `crash` mode writes; the host checks them
 /// (`build/xtask/src/ext4_interop.rs`).
 pub const CRASH_SYNCED_SEED: u32 = 0x5359_4e43;
 pub const CRASH_SYNCED_LEN: usize = 300_000;
 pub const CRASH_TIMER_SEED: u32 = 0x5449_4d52;
 pub const CRASH_TIMER_LEN: usize = 50_000;
+pub const CRASH_HELD_SEED: u32 = 0x4845_4c44;
+pub const CRASH_HELD_LEN: usize = 70_000;
 
 /// `narf.ext4_interop=crash`: the root is left mounted read-write for the
 /// host to kill NARF under it.
 /// - `/narf-crash/synced` is written, fsynced, renamed into place and
 ///   `syncfs`'d;
 /// - `/narf-crash/timer` is written with no sync at all;
+/// - `/narf-crash/held` is written, fsynced, and unlinked while still open,
+///   and that synced: the orphan file (or list) records it until the kill;
 /// - then this waits past twice the journal's commit interval, so only the
 ///   commit timer can have committed `timer`.
 async fn run_crash(root: &Arc<dyn DirOps>) -> Result<(), (&'static str, FsError)> {
@@ -246,11 +249,28 @@ async fn run_crash(root: &Arc<dyn DirOps>) -> Result<(), (&'static str, FsError)
     write_all(&timer, 0, &pattern(CRASH_TIMER_SEED, CRASH_TIMER_LEN))
         .await
         .map_err(|e| ("write /narf-crash/timer", e))?;
+    let held = dir
+        .create("held")
+        .await
+        .map_err(|e| ("create /narf-crash/held", e))?;
+    write_all(&held, 0, &pattern(CRASH_HELD_SEED, CRASH_HELD_LEN))
+        .await
+        .map_err(|e| ("write /narf-crash/held", e))?;
+    held.fsync(false)
+        .await
+        .map_err(|e| ("fsync /narf-crash/held", e))?;
+    dir.unlink("held")
+        .await
+        .map_err(|e| ("unlink /narf-crash/held", e))?;
+    root.syncfs().await.map_err(|e| ("syncfs", e))?;
+    // Open until the kill, as a process holding it would keep it.
+    core::mem::forget(held);
     let wait = 2 * crate::volume::jbd::COMMIT_INTERVAL_SECS + 2;
     narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(wait * 1_000_000_000)).await;
     Ok(())
 }
 
+/// The root's filesystem UUID from its superblock (canonical lowercase).
 fn ext4_uuid(dev: &dyn narf_block::BlockDeviceSync) -> Option<String> {
     let lba = dev.lba_size() as usize;
     if lba == 0 || lba > 1024 || 1024 % lba != 0 {

@@ -32,7 +32,7 @@ USAGE: narf-ext4-host [OPTIONS]
   --seeds N         seeds per scenario (default 2)
   --ops N           operations per run (default 1500)
   --scenario LIST   comma-separated subset of: baseline,lifecycle,gate,uninit,
-                    htree,extents,replay,crash,reuse,abort
+                    htree,extents,replay,crash,reuse,abort,orphan
                     (default all)
   --workdir DIR     scratch directory (default target/ext4-host)
   --keep            keep the images of passing runs
@@ -291,9 +291,11 @@ fn lifecycle(o: &Opts, seed: u64) -> Result<String, String> {
     Ok(report.join(", "))
 }
 
-/// root-rw refuses what e2fsck has not checked: an unclean filesystem, one
-/// with recorded errors, one with an orphan list. Each read-write request
-/// fails with EROFS and leaves the image bit-identical.
+/// root-rw refuses what e2fsck has not checked, an unclean filesystem or one
+/// with recorded errors, and a feature NARF cannot write (quota). Each
+/// read-write request fails with EROFS and leaves the image bit-identical.
+/// An orphan list is not refused: the root-rw mount finishes it
+/// (`ext4_orphan_cleanup`), and e2fsck then finds the filesystem clean.
 fn gate(o: &Opts, seed: u64) -> Result<String, String> {
     let name = format!("gate-{seed}");
     let spec = fixture::Spec {
@@ -306,7 +308,7 @@ fn gate(o: &Opts, seed: u64) -> Result<String, String> {
     for (cmd, what) in [
         ("ssv state 0", "an unclean filesystem"),
         ("ssv state 3", "a filesystem with errors"),
-        ("ssv last_orphan 12", "an orphan list"),
+        ("feature quota", "a feature NARF cannot write"),
     ] {
         let image = o.workdir.join(format!("{name}/case.img"));
         std::fs::copy(&fx.image, &image).unwrap();
@@ -327,10 +329,34 @@ fn gate(o: &Opts, seed: u64) -> Result<String, String> {
             return Err(format!("{what}: a refused mount changed the image"));
         }
     }
+    // An inode with no link on the orphan list, as a crash with it open
+    // leaves it (debugfs `unlink` leaves the link count alone).
+    let image = o.workdir.join(format!("{name}/orphan.img"));
+    std::fs::copy(&fx.image, &image).unwrap();
+    debugfs_w(&image, "write /dev/null orphan");
+    let ino = *root_inos(&image, "orphan")
+        .get("orphan")
+        .ok_or("no inode for /orphan")?;
+    debugfs_w(&image, "unlink /orphan");
+    debugfs_w(&image, &format!("sif <{ino}> links_count 0"));
+    debugfs_w(&image, &format!("ssv last_orphan {ino}"));
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&image, 512));
+    let fs = narf::mount_root_rw(dev, &uuid)
+        .map_err(|e| format!("root-rw must mount a filesystem with an orphan list: {e:?}"))?;
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    if orphan_record(&image).1 != 0 || inode_in_use(&image, ino) {
+        return Err("the root-rw mount must release the orphan and empty the list".into());
+    }
+    journal_left_clean(&image)?;
+    let (code, out) = check::e2fsck(&image);
+    if code != 0 {
+        return Err(format!("e2fsck -fn after the orphan cleanup:\n{out}"));
+    }
     if !o.keep {
         let _ = std::fs::remove_dir_all(o.workdir.join(&name));
     }
-    Ok("3 refusals".into())
+    Ok("3 refusals, orphan list finished".into())
 }
 
 /// Lazily initialized groups (`BLOCK_UNINIT` / `INODE_UNINIT`): a 4 GiB
@@ -1163,12 +1189,523 @@ fn abort(o: &Opts, seed: u64) -> Result<String, String> {
     Ok("aborted, recovered to the last commit".into())
 }
 
+/// Inode numbers in `image`'s orphan file (`debugfs cat <inode>`), and the
+/// head of its orphan list (`s_last_orphan`).
+fn orphan_record(image: &Path) -> (Vec<u32>, u32) {
+    let bs: usize = sb_field(image, "Block size").parse().unwrap();
+    let mut entries = Vec::new();
+    if let Ok(inode) = sb_field(image, "Orphan file inode").parse::<u32>() {
+        let cat = std::process::Command::new("debugfs")
+            .args(["-R", &format!("cat <{inode}>")])
+            .arg(image)
+            .output()
+            .expect("run debugfs cat");
+        for block in cat.stdout.chunks(bs) {
+            for e in block[..block.len().saturating_sub(8)].chunks_exact(4) {
+                let ino = u32::from_le_bytes(e.try_into().unwrap());
+                if ino != 0 {
+                    entries.push(ino);
+                }
+            }
+        }
+    }
+    let list = sb_field(image, "First orphan inode").parse().unwrap_or(0);
+    (entries, list)
+}
+
+/// `debugfs testi`: whether `ino` is allocated in the inode bitmap.
+fn inode_in_use(image: &Path, ino: u32) -> bool {
+    let out = std::process::Command::new("debugfs")
+        .args(["-R", &format!("testi <{ino}>")])
+        .arg(image)
+        .output()
+        .expect("run debugfs testi");
+    String::from_utf8_lossy(&out.stdout).contains("is marked in use")
+}
+
+/// `debugfs ls -l /`: the inode number of every root entry named
+/// `prefix*`.
+fn root_inos(image: &Path, prefix: &str) -> std::collections::BTreeMap<String, u32> {
+    let out = std::process::Command::new("debugfs")
+        .args(["-R", "ls -l /"])
+        .arg(image)
+        .output()
+        .expect("run debugfs ls");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let ino = words.next()?.parse().ok()?;
+            let name = words.last()?;
+            name.starts_with(prefix).then(|| (name.to_string(), ino))
+        })
+        .collect()
+}
+
+/// The physical block of logical block 0 of inode `ino` (`debugfs bmap`).
+fn first_block(image: &Path, ino: u32) -> u64 {
+    let out = std::process::Command::new("debugfs")
+        .args(["-R", &format!("bmap <{ino}> 0")])
+        .arg(image)
+        .output()
+        .expect("run debugfs bmap");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("a block number")
+}
+
+fn copy_image(dir: &Path, from: &Path, name: &str) -> PathBuf {
+    let image = dir.join(format!("{name}.img"));
+    std::fs::copy(from, &image).unwrap();
+    image
+}
+
+/// Mount `image` with NARF (`read_only`, mount `options`) and unmount it.
+fn mount_cycle(image: &Path, options: &str, read_only: bool) -> Result<(), String> {
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(image, 512));
+    let fs = narf::mount_with(dev, options, read_only)?;
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    Ok(())
+}
+
+/// A recovery of `crashed` (a copy of it) by `how`, judged by e2fsck:
+/// afterwards every inode of `inos` is free, nothing is recorded as an
+/// orphan, and `e2fsck -fn` is clean.
+fn recover_orphans(dir: &Path, crashed: &Path, inos: &[u32], how: &str) -> Result<(), String> {
+    let image = copy_image(dir, crashed, &format!("recover-{how}"));
+    match how {
+        "narf-rw" | "narf-ro" => {
+            mount_cycle(&image, "", how == "narf-ro")?;
+            journal_left_clean(&image)?;
+        }
+        _ => {
+            let fsck = std::process::Command::new("e2fsck")
+                .arg("-fy")
+                .arg(&image)
+                .output()
+                .expect("run e2fsck -fy");
+            if !matches!(fsck.status.code(), Some(0 | 1)) {
+                return Err(format!("{how}: e2fsck -fy exited {:?}", fsck.status.code()));
+            }
+        }
+    }
+    let (entries, list) = orphan_record(&image);
+    let still: Vec<u32> = inos
+        .iter()
+        .copied()
+        .filter(|&i| inode_in_use(&image, i))
+        .collect();
+    if !entries.is_empty() || list != 0 || !still.is_empty() {
+        return Err(format!(
+            "{how}: orphans not released (file {entries:?}, list {list}, in use {still:?})"
+        ));
+    }
+    let (code, out) = check::e2fsck(&image);
+    if code != 0 {
+        return Err(format!("{how}: e2fsck -fn:\n{out}"));
+    }
+    Ok(())
+}
+
+/// The orphan record (`fs/ext4/orphan.c`) in three layouts: the orphan
+/// file, the `s_last_orphan` list (`^orphan_file`), and an orphan file of
+/// one block that overflows onto the list.
+/// - Files kept open are unlinked and the change synced. On the device
+///   each inode then has no link and is recorded as an orphan, in the same
+///   transaction as its unlink. A snapshot here is a crash with them open.
+/// - With them open, remount read-only is EBUSY (`s_remove_count`).
+/// - Closing them releases them: the record is cleared and the inodes freed.
+/// - The snapshot is recovered by a NARF read-write mount, a NARF read-only
+///   mount (Linux's "orphan cleanup on readonly fs", which also clears
+///   `RECOVER`/`ORPHAN_PRESENT`) and `e2fsck -fy`. Each frees the inodes,
+///   leaves no record, and `e2fsck -fn` is clean.
+/// - Then the rules around it: a write-protected device (`noload`) skips the
+///   cleanup and writes nothing; `ERROR_FS` clears the list on a read-write
+///   mount and keeps it on a read-only one, which a remount read-write then
+///   refuses (EINVAL); an orphan file entry left on a read-only mount with
+///   errors fails it (EUCLEAN); an orphan file block with a bad magic or
+///   checksum fails the mount (EIO).
+///
+/// Last, a truncate Linux left on the list (`i_size` cut, blocks still
+/// mapped) is finished by a NARF mount, tail of the EOF block zeroed, and a
+/// list naming a free inode is a filesystem error that ends the list.
+fn orphan(o: &Opts, seed: u64) -> Result<String, String> {
+    use narf_filesystem::sb_flags::RDONLY;
+    let mut report = Vec::new();
+    for layout in ["file", "list", "overflow"] {
+        let name = format!("orphan-{seed}-{layout}");
+        let (block_size, mkfs_args, count) = match layout {
+            "file" => (4096, Vec::new(), 1),
+            "list" => (4096, vec!["-O".into(), "^orphan_file".into()], 1),
+            // One block of (1024 - 8) / 4 = 254 slots, then the list.
+            _ => (
+                1024,
+                vec!["-E".into(), "root_owner=0:0,orphan_file_size=1".into()],
+                256,
+            ),
+        };
+        let spec = fixture::Spec {
+            block_size,
+            size_mib: 64,
+            lib_files: 50,
+            packages: 10,
+            mkfs_args,
+            ..fixture::Spec::root()
+        };
+        let fx = fixture::build(&o.workdir, &name, &spec, seed);
+        let dir = o.workdir.join(&name);
+        let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+        let fs = narf::mount(dev)?;
+        let root = fs.root();
+        let mut rng = rng::Rng::new(seed);
+        let data: Vec<u8> = (0..if count == 1 { 200 * 1024 } else { 3000 })
+            .map(|_| rng.next() as u8)
+            .collect();
+        let names: Vec<String> = (0..count).map(|i| format!("held{i:03}")).collect();
+        let held = host::block_on(async {
+            let mut held = Vec::new();
+            for name in &names {
+                let f = create_with(&root, name, &data).await?;
+                f.fsync(false).await?;
+                held.push(f);
+            }
+            root.syncfs().await?;
+            Ok::<_, narf_filesystem::FsError>(held)
+        })
+        .map_err(|e| format!("write the held files: {e:?}"))?;
+        let by_name = root_inos(&fx.image, "held");
+        let inos: Vec<u32> = names
+            .iter()
+            .map(|n| by_name.get(n).copied().ok_or(format!("no inode for /{n}")))
+            .collect::<Result<_, _>>()?;
+        host::block_on(async {
+            for name in &names {
+                root.unlink(name).await?;
+            }
+            root.syncfs().await
+        })
+        .map_err(|e| format!("unlink the held files: {e:?}"))?;
+        match host::block_on(fs.reconfigure_sb_async(RDONLY, RDONLY, "")) {
+            Err(narf_filesystem::FsError::Busy) => {}
+            other => {
+                return Err(format!(
+                    "remount read-only with unlinked files open: {other:?}, not EBUSY"
+                ))
+            }
+        }
+        let (mut entries, list) = orphan_record(&fx.image);
+        let recorded = match layout {
+            "file" => entries == inos && list == 0,
+            "list" => entries.is_empty() && list == inos[0],
+            _ => {
+                // The first 254 fill the file; the rest go on the list,
+                // newest first, linked through `i_dtime`.
+                entries.sort_unstable();
+                let mut file = inos[..254].to_vec();
+                file.sort_unstable();
+                entries == file && list == inos[255]
+            }
+        };
+        let in_use = inos.iter().all(|&i| inode_in_use(&fx.image, i));
+        if !recorded || !in_use {
+            return Err(format!(
+                "{layout}: open unlinked inodes {inos:?} not recorded: file {entries:?}, list {list}, all in use {in_use}"
+            ));
+        }
+        let crashed = copy_image(&dir, &fx.image, "crashed");
+        // The last close releases them.
+        drop(held);
+        host::block_on(root.syncfs()).map_err(|e| format!("syncfs: {e:?}"))?;
+        let (entries, list) = orphan_record(&fx.image);
+        let still: Vec<u32> = inos
+            .iter()
+            .copied()
+            .filter(|&i| inode_in_use(&fx.image, i))
+            .collect();
+        if !entries.is_empty() || list != 0 || !still.is_empty() {
+            return Err(format!(
+                "{layout}: after the close: file {entries:?}, list {list}, in use {still:?}"
+            ));
+        }
+        drop(root);
+        drop(fs);
+        narf_block::registry::__reset_for_test();
+        journal_left_clean(&fx.image)?;
+        let (code, out) = check::e2fsck(&fx.image);
+        if code != 0 {
+            return Err(format!("{layout}: e2fsck -fn after the release:\n{out}"));
+        }
+        for how in ["narf-rw", "narf-ro", "e2fsck"] {
+            recover_orphans(&dir, &crashed, &inos, how).map_err(|e| format!("{layout}: {e}"))?;
+        }
+        match layout {
+            "list" => orphan_list_rules(&dir, &crashed, inos[0])?,
+            "file" => orphan_file_rules(&dir, &crashed, &fx.image)?,
+            _ => {}
+        }
+        report.push(layout);
+        if !o.keep {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    orphan_rmdir(o, seed)?;
+    report.push("rmdir while open");
+    orphan_truncate(o, seed)?;
+    report.push("interrupted truncate");
+    Ok(report.join(", "))
+}
+
+/// `rmdir` of a directory still open (a process's cwd), with and without an
+/// orphan file: `ext4_rmdir` empties it and records it as an orphan; a name
+/// cannot be created in it (ENOENT); the last reference frees it, with the
+/// group's directory count. A crash while it is open recovers as a file
+/// does.
+fn orphan_rmdir(o: &Opts, seed: u64) -> Result<(), String> {
+    for orphan_file in [true, false] {
+        let name = format!(
+            "orphan-{seed}-rmdir-{}",
+            if orphan_file { "file" } else { "list" }
+        );
+        let spec = fixture::Spec {
+            size_mib: 64,
+            lib_files: 50,
+            packages: 10,
+            mkfs_args: if orphan_file {
+                Vec::new()
+            } else {
+                vec!["-O".into(), "^orphan_file".into()]
+            },
+            ..fixture::Spec::root()
+        };
+        let fx = fixture::build(&o.workdir, &name, &spec, seed);
+        let dir = o.workdir.join(&name);
+        let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+        let fs = narf::mount(dev)?;
+        let root = fs.root();
+        let gone = host::block_on(async {
+            let gone = root.mkdir("gone").await?;
+            root.syncfs().await?;
+            Ok::<_, narf_filesystem::FsError>(gone)
+        })
+        .map_err(|e| format!("mkdir /gone: {e:?}"))?;
+        let ino = *root_inos(&fx.image, "gone")
+            .get("gone")
+            .ok_or("no inode for /gone")?;
+        host::block_on(async {
+            root.rmdir("gone").await?;
+            root.syncfs().await
+        })
+        .map_err(|e| format!("rmdir /gone: {e:?}"))?;
+        let (entries, list) = orphan_record(&fx.image);
+        let recorded = if orphan_file {
+            entries == [ino] && list == 0
+        } else {
+            entries.is_empty() && list == ino
+        };
+        if !recorded || !inode_in_use(&fx.image, ino) {
+            return Err(format!(
+                "rmdir of an open directory {ino} not recorded: file {entries:?}, list {list}"
+            ));
+        }
+        match host::block_on(gone.create("x")) {
+            Err(narf_filesystem::FsError::NotFound) => {}
+            other => {
+                return Err(format!(
+                    "create in a removed directory: {:?}, not ENOENT",
+                    other.map(|_| "created")
+                ))
+            }
+        }
+        let crashed = copy_image(&dir, &fx.image, "crashed");
+        drop(gone);
+        host::block_on(root.syncfs()).map_err(|e| format!("syncfs: {e:?}"))?;
+        let (entries, list) = orphan_record(&fx.image);
+        if !entries.is_empty() || list != 0 || inode_in_use(&fx.image, ino) {
+            return Err(format!(
+                "the removed directory {ino} was not released: file {entries:?}, list {list}"
+            ));
+        }
+        drop(root);
+        drop(fs);
+        narf_block::registry::__reset_for_test();
+        journal_left_clean(&fx.image)?;
+        let (code, out) = check::e2fsck(&fx.image);
+        if code != 0 {
+            return Err(format!(
+                "e2fsck -fn after the removed directory's release:\n{out}"
+            ));
+        }
+        for how in ["narf-rw", "narf-ro", "e2fsck"] {
+            recover_orphans(&dir, &crashed, &[ino], how).map_err(|e| format!("rmdir: {e}"))?;
+        }
+        if !o.keep {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    Ok(())
+}
+
+/// The list snapshot `crashed` (inode `ino` on it) under Linux's rules.
+fn orphan_list_rules(dir: &Path, crashed: &Path, ino: u32) -> Result<(), String> {
+    use narf_filesystem::sb_flags::RDONLY;
+    // A write-protected device, journal not loaded: nothing is written.
+    let image = copy_image(dir, crashed, "ro-device");
+    let before = std::fs::read(&image).unwrap();
+    {
+        let dev = ImageDev::open(&image, 512);
+        dev.set_read_only(true);
+        let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(dev);
+        let fs = narf::mount_with(dev, "noload", true)?;
+        drop(fs);
+        narf_block::registry::__reset_for_test();
+    }
+    if std::fs::read(&image).unwrap() != before {
+        return Err("a write-protected device was written".into());
+    }
+    // `ERROR_FS`, read-write: the list is cleared, the inode left to e2fsck.
+    let image = copy_image(dir, crashed, "errors-rw");
+    debugfs_w(&image, "ssv state 3");
+    mount_cycle(&image, "", false)?;
+    if orphan_record(&image).1 != 0 || !inode_in_use(&image, ino) {
+        return Err(
+            "with errors a read-write mount must clear the list and release nothing".into(),
+        );
+    }
+    // `ERROR_FS`, read-only: the list stays; recovery still completes.
+    let image = copy_image(dir, crashed, "errors-ro");
+    debugfs_w(&image, "ssv state 3");
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&image, 512));
+    let fs = narf::mount_with(dev, "", true)?;
+    if orphan_record(&image).1 != ino {
+        return Err("with errors a read-only mount must keep the list".into());
+    }
+    if sb_field(&image, "Filesystem features").contains("needs_recovery") {
+        return Err("a read-only mount must complete the recovery".into());
+    }
+    // An unprocessed list: no remount read-write.
+    match host::block_on(fs.reconfigure_sb_async(0, RDONLY, "")) {
+        Err(narf_filesystem::FsError::InvalidData) => {}
+        other => {
+            return Err(format!(
+                "remount read-write over an orphan list: {other:?}, not EINVAL"
+            ))
+        }
+    }
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    Ok(())
+}
+
+/// The orphan file snapshot `crashed`, and the released image `clean`,
+/// under Linux's rules.
+fn orphan_file_rules(dir: &Path, crashed: &Path, clean: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    // Read-only with errors: no cleanup, and an orphan file that is not
+    // empty fails the mount ("Orphan file not empty on read-only fs").
+    let image = copy_image(dir, crashed, "errors-ro");
+    debugfs_w(&image, "ssv state 3");
+    match mount_cycle(&image, "", true) {
+        Err(e) if e.contains("Corrupted") => {}
+        other => {
+            return Err(format!(
+                "read-only with errors and an orphan: {other:?}, not EUCLEAN"
+            ))
+        }
+    }
+    // A damaged orphan file block fails the mount with EIO.
+    let bs: u64 = sb_field(clean, "Block size").parse().unwrap();
+    let orphan_ino: u32 = sb_field(clean, "Orphan file inode").parse().unwrap();
+    let block = first_block(clean, orphan_ino);
+    for (what, at, bytes) in [
+        ("magic", bs - 8, [0xde, 0xad, 0xbe, 0xef]),
+        ("checksum", 0, [0x0d, 0, 0, 0]),
+    ] {
+        let image = copy_image(dir, clean, &format!("bad-{what}"));
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&image)
+            .unwrap();
+        f.write_all_at(&bytes, block * bs + at).unwrap();
+        drop(f);
+        match mount_cycle(&image, "", false) {
+            Err(e) if e.contains("Io") => {}
+            other => {
+                return Err(format!(
+                    "an orphan block with a bad {what}: {other:?}, not EIO"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A truncate Linux left on the orphan list, then a list naming a free
+/// inode.
+fn orphan_truncate(o: &Opts, seed: u64) -> Result<(), String> {
+    let name = format!("orphan-{seed}-truncate");
+    let spec = fixture::Spec {
+        size_mib: 64,
+        lib_files: 50,
+        packages: 10,
+        ..fixture::Spec::root()
+    };
+    let fx = fixture::build(&o.workdir, &name, &spec, seed);
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(ImageDev::open(&fx.image, 512));
+    let fs = narf::mount(dev)?;
+    let mut rng = rng::Rng::new(seed ^ 7);
+    let data: Vec<u8> = (0..64 * 1024).map(|_| rng.next() as u8).collect();
+    host::block_on(async {
+        create_with(&fs.root(), "t", &data)
+            .await?
+            .fsync(false)
+            .await
+    })
+    .map_err(|e| format!("write /t: {e:?}"))?;
+    drop(fs);
+    narf_block::registry::__reset_for_test();
+    let ino = *root_inos(&fx.image, "t")
+        .get("t")
+        .ok_or("no inode for /t")?;
+    debugfs_w(&fx.image, "sif /t size 100");
+    debugfs_w(&fx.image, &format!("ssv last_orphan {ino}"));
+    mount_cycle(&fx.image, "", false)?;
+    let (_, list) = orphan_record(&fx.image);
+    if list != 0 || debugfs_cat(&fx.image, "/t").as_deref() != Some(&data[..100]) {
+        return Err("the truncate on the orphan list was not finished".into());
+    }
+    let (code, out) = check::e2fsck(&fx.image);
+    if code != 0 {
+        return Err(format!("e2fsck -fn after finishing the truncate:\n{out}"));
+    }
+    // The rest of the EOF block is zero (`ext4_block_truncate_page`).
+    let bs: usize = sb_field(&fx.image, "Block size").parse().unwrap();
+    debugfs_w(&fx.image, &format!("sif /t size {bs}"));
+    let grown = debugfs_cat(&fx.image, "/t").unwrap_or_default();
+    if grown.len() != bs || grown[..100] != data[..100] || grown[100..].iter().any(|&b| b != 0) {
+        return Err("the bytes past the truncated EOF were not zeroed".into());
+    }
+    // A list naming a free inode: "bad orphan inode", an error, list ended.
+    let free = sb_field(&fx.image, "Inode count").parse::<u32>().unwrap();
+    debugfs_w(&fx.image, &format!("ssv last_orphan {free}"));
+    mount_cycle(&fx.image, "", false)?;
+    if orphan_record(&fx.image).1 != 0 || !sb_field(&fx.image, "Filesystem state").contains("error")
+    {
+        return Err("a bad orphan inode must end the list with an error recorded".into());
+    }
+    if !o.keep {
+        let _ = std::fs::remove_dir_all(o.workdir.join(&name));
+    }
+    Ok(())
+}
+
 fn main() {
     let o = parse_args();
     host::init();
     std::fs::create_dir_all(&o.workdir).unwrap();
     type Scenario = fn(&Opts, u64) -> Result<String, String>;
-    let all: [(&str, Scenario); 10] = [
+    let all: [(&str, Scenario); 11] = [
         ("baseline", baseline),
         ("lifecycle", lifecycle),
         ("gate", gate),
@@ -1179,6 +1716,7 @@ fn main() {
         ("crash", crash),
         ("reuse", reuse),
         ("abort", abort),
+        ("orphan", orphan),
     ];
     let mut failed = 0;
     for (name, run) in all {

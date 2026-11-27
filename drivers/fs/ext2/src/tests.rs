@@ -7264,16 +7264,15 @@ fn sb_bytes_with(f: impl FnOnce(&mut [u8])) -> Option<super::superblock::Superbl
 fn smoke_ext4_rw_gate_rules() -> TestResult {
     use crate::superblock::{compat, incompat, ro_compat, EXT2_ERROR_FS};
     use crate::volume::sb_state::{rw_refusal, GateProfile as P};
-    let gate = |f: &dyn Fn(&mut [u8]), j: bool, o: bool, p: P| {
-        sb_bytes_with(|b| f(b)).map(|sb| rw_refusal(&sb, j, o, p).is_some())
+    let gate = |f: &dyn Fn(&mut [u8]), j: bool, p: P| {
+        sb_bytes_with(|b| f(b)).map(|sb| rw_refusal(&sb, j, p).is_some())
     };
     let none = |_: &mut [u8]| {};
-    // (superblock edit, journal clean, orphans empty, profile, refused, rule)
-    type Case<'a> = (&'a dyn Fn(&mut [u8]), bool, bool, P, bool, &'static str);
+    // (superblock edit, journal clean, profile, refused, rule)
+    type Case<'a> = (&'a dyn Fn(&mut [u8]), bool, P, bool, &'static str);
     let cases: [Case<'_>; 12] = [
         (
             &none,
-            false,
             false,
             P::RootRw,
             false,
@@ -7282,14 +7281,12 @@ fn smoke_ext4_rw_gate_rules() -> TestResult {
         (
             &|b| put_u32(b, 100, 0x8000_0000),
             true,
-            true,
             P::Default,
             true,
             "unknown ro_compat",
         ),
         (
             &|b| put_u32(b, 100, ro_compat::GDT_CSUM),
-            true,
             true,
             P::Default,
             true,
@@ -7298,14 +7295,12 @@ fn smoke_ext4_rw_gate_rules() -> TestResult {
         (
             &|b| put_u32(b, 96, incompat::RECOVER),
             false,
-            true,
             P::Default,
             true,
             "dirty journal",
         ),
         (
             &|b| put_u32(b, 96, incompat::RECOVER),
-            true,
             true,
             P::Default,
             false,
@@ -7314,14 +7309,12 @@ fn smoke_ext4_rw_gate_rules() -> TestResult {
         (
             &|b| put_u32(b, 100, ro_compat::ORPHAN_PRESENT),
             true,
-            false,
             P::Default,
-            true,
-            "orphans",
+            false,
+            "orphans: the mount finishes them",
         ),
         (
             &|b| put_u32(b, 100, ro_compat::ORPHAN_PRESENT),
-            true,
             true,
             P::Default,
             false,
@@ -7330,17 +7323,15 @@ fn smoke_ext4_rw_gate_rules() -> TestResult {
         (
             &|b| put_u32(b, 0xe8, 12),
             true,
-            true,
             P::Default,
-            true,
-            "s_last_orphan",
+            false,
+            "s_last_orphan: the mount finishes it",
         ),
         (
             &|b| {
                 put_u32(b, 92, compat::DIR_INDEX);
                 b[0xfc] = 3;
             },
-            true,
             true,
             P::Default,
             true,
@@ -7349,14 +7340,12 @@ fn smoke_ext4_rw_gate_rules() -> TestResult {
         (
             &|b| put_u16(b, 0x3a, 1 | EXT2_ERROR_FS),
             true,
-            true,
             P::Default,
             false,
             "errors, Linux rules",
         ),
         (
             &|b| put_u16(b, 0x3a, 1 | EXT2_ERROR_FS),
-            true,
             true,
             P::RootRw,
             true,
@@ -7365,26 +7354,24 @@ fn smoke_ext4_rw_gate_rules() -> TestResult {
         (
             &|b| put_u16(b, 0x3a, 0),
             true,
-            true,
             P::RootRw,
             true,
             "unclean under root-rw",
         ),
     ];
-    for (f, j, o, p, refused, _why) in cases {
-        if gate(f, j, o, p) != Some(refused) {
+    for (f, j, p, refused, _why) in cases {
+        if gate(f, j, p) != Some(refused) {
             return TestResult::Fail("the write gate disagrees with its rule");
         }
     }
     // Without root-rw an unclean filesystem mounts as Linux mounts it.
-    if gate(&|b| put_u16(b, 0x3a, 0), true, true, P::Default) != Some(false) {
+    if gate(&|b| put_u16(b, 0x3a, 0), true, P::Default) != Some(false) {
         return TestResult::Fail("Linux mounts an unchecked filesystem read-write");
     }
     // What the refusal means for a read-write request, as Linux decides it.
     use crate::volume::sb_state::Refusal;
     let kind = |ro_bits: u32| {
-        sb_bytes_with(|b| put_u32(b, 100, ro_bits))
-            .and_then(|sb| rw_refusal(&sb, true, true, P::Default))
+        sb_bytes_with(|b| put_u32(b, 100, ro_bits)).and_then(|sb| rw_refusal(&sb, true, P::Default))
     };
     if kind(ro_compat::READONLY | 0x8000_0000) != Some(Refusal::ReadOnlyFeature) {
         return TestResult::Fail("READONLY mounts read-only before anything else is checked");
@@ -7550,10 +7537,15 @@ fn smoke_ext4_refused_rw_mount_writes_nothing() -> TestResult {
 
     use crate::volume::Ext2Volume;
 
-    // An orphan list NARF does not walk: read-only, and not one byte of
+    // A feature NARF cannot write (quota): read-only, and not one byte of
     // the image changes, the gate's own repair included.
     let mut img = clean_ext4_extent_image(b"refused");
-    put_u32(&mut img, 1024 + 0xe8, 12);
+    let ro_bits = u32::from_le_bytes(img[1024 + 0x64..1024 + 0x68].try_into().unwrap());
+    put_u32(
+        &mut img,
+        1024 + 0x64,
+        ro_bits | super::superblock::ro_compat::QUOTA,
+    );
     let device = RamBlockDevice::from_image(512, img);
     let before = device.snapshot();
     let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
@@ -7564,7 +7556,7 @@ fn smoke_ext4_refused_rw_mount_writes_nothing() -> TestResult {
     let refusal = volume.refusal();
     drop(volume);
     if !ro || refusal.is_none() {
-        return TestResult::Fail("a non-empty orphan list must refuse read-write, with a reason");
+        return TestResult::Fail("quota must refuse read-write, with a reason");
     }
     if device.snapshot() != before {
         return TestResult::Fail("a refused read-write mount must write nothing");

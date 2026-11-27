@@ -111,6 +111,11 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         })
     }
 
+    /// Whether the inode's release waits for this node's drop.
+    pub(crate) fn is_orphaned(&self) -> bool {
+        self.orphaned.load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// Defer this inode's release to the drop of the node (see `orphaned`).
     pub(crate) fn mark_orphaned(&self) {
         self.orphaned

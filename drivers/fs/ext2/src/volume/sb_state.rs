@@ -114,14 +114,8 @@ impl Refusal {
 
 /// Why a read-write mount of `sb` is refused, or `None` when NARF may
 /// write it. `journal_clean` is whether the JBD2 log has nothing to replay
-/// (a stale `RECOVER` bit is then repaired); `orphans_empty` whether the
-/// orphan file lists nothing (a stale `ORPHAN_PRESENT` likewise).
-pub fn rw_refusal(
-    sb: &Superblock,
-    journal_clean: bool,
-    orphans_empty: bool,
-    profile: GateProfile,
-) -> Option<Refusal> {
+/// (a stale `RECOVER` bit is then repaired).
+pub fn rw_refusal(sb: &Superblock, journal_clean: bool, profile: GateProfile) -> Option<Refusal> {
     let ro = sb.feature_ro_compat;
     // `ext4_feature_set_ok(sb, readonly = 0)`, in its order: READONLY first,
     // then any bit Linux does not know.
@@ -150,17 +144,8 @@ pub fn rw_refusal(
             "its journal needs recovery; mount it once with Linux or run e2fsck",
         ));
     }
-    if ro & ro_compat::ORPHAN_PRESENT != 0 && !orphans_empty {
-        return Some(Refusal::Gate(
-            "its orphan file lists inodes still to be released; run e2fsck",
-        ));
-    }
-    // The pre-orphan-file list (`s_last_orphan`): NARF never walks it.
-    if sb.last_orphan != 0 {
-        return Some(Refusal::Gate(
-            "its orphan inode list is not empty; run e2fsck",
-        ));
-    }
+    // Orphans (the orphan file, the `s_last_orphan` list) are not a reason
+    // to refuse: the mount finishes them, as `ext4_orphan_cleanup` does.
     // `make_indexed_dir` would index new directories with this hash.
     if sb.feature_compat & compat::DIR_INDEX != 0 && sb.def_hash_version > hash_version::TEA {
         return Some(Refusal::Gate(
@@ -290,6 +275,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let platform_unsigned = core::ffi::c_char::MIN == 0;
         let journaled = self.journaling();
         let orphan_file = self.superblock.feature_compat & compat::ORPHAN_FILE != 0;
+        let orphans_clear = self.orphan_file_empty() && self.last_orphan().await? == 0;
         self.sb_update(|b| {
             let mut incompat_bits = get_u32(b, off::FEATURE_INCOMPAT);
             let mut ro_bits = get_u32(b, off::FEATURE_RO_COMPAT);
@@ -301,7 +287,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 }
             } else {
                 incompat_bits &= !incompat::RECOVER;
-                ro_bits &= !ro_compat::ORPHAN_PRESENT;
+                // Orphans the cleanup has yet to finish keep it.
+                if orphans_clear {
+                    ro_bits &= !ro_compat::ORPHAN_PRESENT;
+                }
                 put_u16(b, off::STATE, state & !EXT2_VALID_FS);
             }
             put_u32(b, off::FEATURE_INCOMPAT, incompat_bits);
@@ -336,8 +325,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     ///
     /// With the journal running, first `jbd2_journal_destroy`'s part: the
     /// running transaction is committed and checkpointed and the log
-    /// marked empty; then `RECOVER` and `ORPHAN_PRESENT` are cleared (NARF
-    /// puts nothing in the orphan file, so it is empty).
+    /// marked empty. Then `RECOVER` is cleared, and `ORPHAN_PRESENT` once the
+    /// orphan file is empty (as `ext4_freeze` / `ext4_mark_recovery_complete`
+    /// leave it; an inode the cleanup could not release keeps it).
     pub(crate) async fn mark_clean(&self) -> Result<(), FsError> {
         if !self.dirty_marked.load(Ordering::Acquire) {
             return Ok(());
@@ -351,12 +341,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if self.errors_seen.load(Ordering::Acquire) {
             state |= EXT2_ERROR_FS;
         }
+        let orphans_clear = self.orphan_file_empty();
         self.sb_update(|b| {
             put_u16(b, off::STATE, state);
-            if journaled {
-                let incompat_bits = get_u32(b, off::FEATURE_INCOMPAT) & !incompat::RECOVER;
+            let incompat_bits = get_u32(b, off::FEATURE_INCOMPAT) & !incompat::RECOVER;
+            put_u32(b, off::FEATURE_INCOMPAT, incompat_bits);
+            if orphans_clear {
                 let ro_bits = get_u32(b, off::FEATURE_RO_COMPAT) & !ro_compat::ORPHAN_PRESENT;
-                put_u32(b, off::FEATURE_INCOMPAT, incompat_bits);
                 put_u32(b, off::FEATURE_RO_COMPAT, ro_bits);
             }
         })
@@ -368,9 +359,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Remount read-only (`__ext4_remount` with `SB_RDONLY`): write back
     /// every dirty page and orphan, flush, mark the filesystem clean, then
     /// stop writing.
+    ///
+    /// An inode unlinked while open is EBUSY (`sb_prepare_remount_readonly`:
+    /// `s_remove_count`); its release needs to write.
     pub(crate) async fn remount_read_only(&self) -> Result<(), FsError> {
         if self.is_read_only() {
             return Ok(());
+        }
+        if self.has_open_unlinked() {
+            return Err(FsError::Busy);
         }
         self.sync_filesystem().await?;
         self.mark_clean().await?;
@@ -391,12 +388,21 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.read_byte_range(1024, &mut bytes).await?;
         let sb = Superblock::parse(&bytes).ok_or(FsError::InvalidData)?;
         // A read-only mount repaired nothing: the flags must be clear now.
-        if let Some(refusal) = rw_refusal(&sb, false, false, self.profile) {
+        // `__ext4_remount`: a feature set that cannot be written is EROFS.
+        if let Some(refusal) = rw_refusal(&sb, false, self.profile) {
             report_refusal(&self.superblock, refusal);
-            return Err(match refusal {
-                Refusal::Unsupported(_) => FsError::InvalidData,
-                Refusal::ReadOnlyFeature | Refusal::Gate(_) => FsError::ReadOnly,
-            });
+            return Err(FsError::ReadOnly);
+        }
+        // "If we have an unprocessed orphan list hanging around from a
+        // previously readonly bdev mount, require a full umount/remount".
+        if self.orphans_recorded().await? {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "EXT4-fs ({}): Couldn't remount RDWR because of unprocessed orphan inode list.  Please umount/remount instead",
+                uuid_string(&self.superblock)
+            );
+            return Err(FsError::InvalidData);
         }
         self.read_only.store(false, Ordering::Release);
         if let Err(error) = self.setup_super().await {

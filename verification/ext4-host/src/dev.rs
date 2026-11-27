@@ -36,6 +36,8 @@ pub struct ImageDev {
     flushes: AtomicU64,
     /// Writes left before every write fails (`u64::MAX`: never).
     fail_after: AtomicU64,
+    /// Reported write-protected (`bdev_read_only`).
+    read_only: AtomicBool,
 }
 
 #[allow(dead_code)] // recording is used by the crash scenario
@@ -62,7 +64,13 @@ impl ImageDev {
             writes: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
             fail_after: AtomicU64::new(u64::MAX),
+            read_only: AtomicBool::new(false),
         }
+    }
+
+    /// Report the device write-protected, as a read-only block device is.
+    pub fn set_read_only(&self, on: bool) {
+        self.read_only.store(on, Ordering::SeqCst);
     }
 
     /// After `n` more writes, every write fails with a driver error (a
@@ -159,6 +167,9 @@ impl BlockDeviceSync for ImageDev {
     }
     fn has_real_flush(&self) -> bool {
         true
+    }
+    fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::SeqCst)
     }
     fn capabilities(&self) -> BlockCaps {
         BlockCaps {

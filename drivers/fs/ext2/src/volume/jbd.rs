@@ -446,6 +446,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// (`ext4_set_journal_csum_feature_set`, the 64-bit format), written with
     /// the first commit.
     pub(crate) async fn journal_start(&self) -> Result<(), FsError> {
+        self.journal_enable(true).await
+    }
+
+    /// Turn journaled writes on (`journal_start`), or off. `timer` spawns the
+    /// periodic commit; a mount that writes only for its own cleanup (the
+    /// orphan cleanup of a read-only mount) flushes the journal itself.
+    pub(crate) async fn journal_enable(&self, timer: bool) -> Result<(), FsError> {
         let Some(jbd) = self.jbd.as_ref() else {
             return Ok(());
         };
@@ -461,7 +468,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 .map_err(|_| FsError::InvalidData)?;
         }
         jbd.set_active(true);
-        self.spawn_commit_timer();
+        if timer {
+            self.spawn_commit_timer();
+        }
         Ok(())
     }
 
@@ -480,6 +489,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 "Aborting journal on device {}.",
                 super::sb_state::uuid_string(&self.superblock)
             );
+        }
+    }
+
+    /// Journaled writes off again (after a read-only mount's cleanup).
+    pub(crate) fn journal_disable(&self) {
+        if let Some(jbd) = self.jbd.as_ref() {
+            jbd.set_active(false);
         }
     }
 
