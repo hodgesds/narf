@@ -409,6 +409,115 @@ kernel_test_in!(
     smoke_firmware_initramfs_scan_registers_under_suffix
 );
 
+/// WCN6855's AMSS and board database exceed the 4 MiB coherent-allocation
+/// limit. Exercise page-backed discovery and the module's chunked
+/// reads with synthetic payloads, without committing vendor firmware.
+fn smoke_firmware_large_initramfs_module_read() -> TestResult {
+    // Synthetic public test vectors: Ed25519 signatures from OpenSSL over
+    // BLAKE3 of the deterministic payload below, seed bytes 0..31. No vendor
+    // firmware or production signing key is embedded.
+    const PUBLIC: [u8; 32] = [
+        3, 161, 7, 191, 243, 206, 16, 190, 29, 112, 221, 24, 231, 75, 192, 153, 103, 228, 214, 48,
+        155, 165, 13, 95, 29, 220, 134, 100, 18, 85, 49, 184,
+    ];
+    const FINGERPRINT: [u8; 32] = [
+        86, 71, 90, 167, 84, 99, 71, 76, 2, 133, 223, 93, 191, 43, 202, 183, 61, 166, 81, 53, 136,
+        57, 233, 183, 116, 129, 178, 234, 177, 7, 112, 140,
+    ];
+    const SIGNATURES: [[u8; 64]; 2] = [
+        [
+            6, 175, 119, 172, 163, 195, 122, 141, 142, 143, 124, 4, 81, 44, 202, 34, 216, 164, 171,
+            46, 102, 161, 33, 176, 118, 72, 35, 178, 182, 10, 208, 166, 250, 240, 130, 116, 60,
+            156, 90, 242, 162, 220, 9, 55, 208, 150, 206, 250, 91, 80, 22, 108, 113, 38, 232, 100,
+            255, 12, 120, 52, 198, 244, 124, 7,
+        ],
+        [
+            127, 236, 220, 49, 197, 182, 219, 220, 40, 95, 100, 252, 23, 114, 46, 16, 120, 56, 41,
+            157, 156, 128, 219, 85, 193, 58, 86, 155, 178, 103, 51, 52, 243, 248, 180, 235, 244,
+            181, 142, 114, 39, 170, 126, 251, 191, 137, 242, 246, 97, 210, 120, 204, 117, 238, 255,
+            235, 246, 187, 54, 99, 23, 47, 225, 10,
+        ],
+    ];
+    const OWNER: u64 = u64::MAX - 11;
+    crate::register_trusted_signer(FINGERPRINT, PUBLIC);
+    let result = (|| -> Result<(), &'static str> {
+        for ((name, len), signature) in [
+            ("ath11k/WCN6855/hw2.1/amss.bin", 5 * 1024 * 1024 + 17),
+            ("ath11k/WCN6855/hw2.1/board-2.bin", 7 * 1024 * 1024 + 17),
+        ]
+        .into_iter()
+        .zip(SIGNATURES)
+        {
+            __reset_for_test();
+            // Control: the original whole-file coherent backing still
+            // refuses this size; the registry must use its paged fallback.
+            if !matches!(
+                narf_io::alloc_coherent(len, narf_lib::id::DomainId::DRIVER_0),
+                Err(narf_io::IoError::NoMemory)
+            ) {
+                return Err("control: the coherent allocation limit unexpectedly changed");
+            }
+            let payload: alloc::vec::Vec<u8> =
+                (0..len).map(|i| (i as u8) ^ ((i >> 12) as u8)).collect();
+            let mut blob = build_unsigned_blob(&payload, None);
+            blob[len..len + 64].copy_from_slice(&signature);
+            blob[len + 64..len + 96].copy_from_slice(&FINGERPRINT);
+            blob[0] ^= 1;
+            if install_blob(name, &blob, BlobSource::Initramfs)
+                != Err(FirmwareError::SignatureInvalid)
+            {
+                return Err("tampered large signed firmware was not rejected");
+            }
+            blob[0] ^= 1;
+            let path = alloc::format!("firmware/{name}");
+            let archive = make_cpio_newc(&[(&path, &blob)]);
+            let archive = alloc::boxed::Box::leak(archive.into_boxed_slice());
+            let fs = narf_filesystem::Initramfs::from_cpio("large-firmware", archive)
+                .map_err(|_| "large firmware CPIO parse failed")?;
+            let (write, read) = bootstrap_authority();
+            if scan_initramfs(&fs, &write).map_err(|_| "large firmware scan failed")? != 1 {
+                return Err("firmware larger than 4 MiB was not registered");
+            }
+            let cap = open(name, &read).map_err(|_| "large firmware open failed")?;
+            let view = view_of(&cap).map_err(|_| "large firmware view failed")?;
+            if view.bytes != payload || view.phys.is_some() {
+                return Err("large firmware backing does not preserve the payload");
+            }
+            let (handle, size) = crate::module_fetch::open(OWNER, name)
+                .map_err(|_| "module could not open large firmware")?;
+            if size != len || crate::module_fetch::signed(OWNER, handle) != Ok(true) {
+                return Err("module firmware size or verified signer was lost");
+            }
+            let mut chunk = alloc::vec![0u8; crate::module_fetch::MAX_CHUNK];
+            let mut offset = 0;
+            while offset < len {
+                let n = crate::module_fetch::read(OWNER, handle, offset as u64, &mut chunk)
+                    .map_err(|_| "module large-firmware read failed")?;
+                let want = chunk.len().min(len - offset);
+                if n != want || chunk[..n] != payload[offset..offset + n] {
+                    return Err("module large-firmware read was truncated or corrupted");
+                }
+                offset += n;
+            }
+            if crate::module_fetch::read(OWNER, handle, len as u64, &mut chunk) != Ok(0)
+                || crate::module_fetch::close(OWNER, handle) != 0
+            {
+                return Err("module large-firmware EOF or close failed");
+            }
+        }
+        Ok(())
+    })();
+    crate::module_fetch::retire_owner(OWNER);
+    __reset_for_test();
+    crate::signature::__reset_trusted_signers();
+    crate::signature::install_build_trusted_signers();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!("firmware", smoke_firmware_large_initramfs_module_read);
+
 fn smoke_firmware_priority_hot_install_overrides_in_tree() -> TestResult {
     // Spec §5: hot-install entries override initramfs which
     // overrides in-tree. Register an in-tree blob under "name/X",

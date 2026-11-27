@@ -12,7 +12,7 @@
   `amd/acp/sof-rn.ri`).
 - The **`Cap<FirmwareBlob, Read>` surface** drivers see — a
   capability-gated read-only handle to a specific blob whose
-  bytes live in DMA-coherent memory ready for staging via BHI /
+  bytes live in contiguous virtual memory ready for staging via BHI /
   ACP-DMA / wherever the device's loader expects.
 - **Discovery + load policy** — where blobs come from
   (initramfs, root-partition /lib/firmware/, in-tree fallback)
@@ -37,12 +37,12 @@
   for QCNFA, iwlwifi's `IWL_UCODE_*` phases, ACP `RI_LOAD`,
   HDA codec firmware patch streams). Each driver crate owns
   the protocol that its silicon understands; this crate only
-  hands the driver bytes + a phys address.
+  hands the driver verified bytes and, when available, a direct coherent address.
 - Filesystem decisions (`filesystem/`). Discovery uses the
   filesystem registry — `firmware/` itself is FS-agnostic.
-- DMA-coherent allocation (`io/`). Blob bytes land in
-  `DmaBuffer`s minted by `narf-io::alloc_coherent`; this crate
-  only owns the cap surface that wraps them.
+- DMA-coherent allocation (`io/`) or page-backed kernel mapping (`memory/`).
+  This crate owns the cap surface and backing lifetime; each device transport
+  owns its DMA staging.
 - Driver bring-up (`drivers/`). Drivers query the registry from
   inside their own probe; the framework doesn't gate probe on
   firmware presence — that's a per-driver decision (NIC drivers
@@ -52,7 +52,7 @@
 ## 2. Why this is a separate crate
 
 Firmware loading is a cross-cutting concern that wires three
-existing kernel surfaces together (filesystem reads, DMA-coherent
+existing kernel surfaces together (filesystem reads, owned kernel
 allocation, capability minting) plus signature verification. A
 single home prevents three failure modes the kernel has to
 prevent:
@@ -79,6 +79,19 @@ prevent:
    authoritative source for that record.
 
 ## 3. Design principles
+
+Registry payloads prefer a contiguous coherent allocation and fall back to
+`narf_memory::vmalloc::valloc`, which maps individual physical pages into a
+contiguous kernel virtual range. Thus a WCN6855 AMSS or board database larger
+than 4 MiB does not require a high-order DMA allocation. `BlobView::bytes`
+always exposes the complete verified payload; `phys: Option<u64>` is `Some`
+only for coherent backing. A driver requiring DMA must stage the bytes in its
+own transport buffers when `phys` is `None`. Both backings are retained by the
+same entry/cap-binding `Arc` and released on its last drop. Signature
+verification still precedes allocation. Buddy and DMA allocation limits are
+unchanged. Linux references: `fs/kernel_read_file.c::kernel_read_file` uses
+`vmalloc`; ath11k's `mhi.c` sets 512 KiB segments for MHI's
+`mhi_alloc_bhie_table`.
 
 Build configuration: `NARF_FIRMWARE_TRUSTED_KEYS` may name an absolute
 path to a text file containing one Ed25519 public key per line (64 hex
@@ -163,8 +176,8 @@ firmware-registry writes cannot replace this kernel asset or its trust roots.
 
 ```rust
 /// A loaded firmware blob, addressable by canonical name. Holds a
-/// reference-counted handle into the registry's DMA-coherent page
-/// pool; the bytes are dropped when the last `Cap<FirmwareBlob, _>`
+/// reference-counted handle into coherent or page-backed kernel storage;
+/// the bytes are dropped when the last `Cap<FirmwareBlob, _>`
 /// pointing at this entry is revoked.
 #[derive(Debug)]
 pub struct FirmwareBlob;
@@ -212,14 +225,12 @@ pub struct BlobView<'a> {
     /// Signer fingerprint (Ed25519 public-key hash). None when
     /// the build allows unsigned blobs and this one is unsigned.
     pub signer:  Option<[u8; 32]>,
-    /// The bytes themselves, mapped DMA-coherent so the driver
-    /// can hand the phys address straight to a device-side loader
-    /// (BHI, ACP RI_LOAD, iwlwifi UCODE_*, …).
+    /// Verified bytes in contiguous kernel virtual memory. The physical
+    /// backing may consist of separate pages; drivers stage transport DMA.
     pub bytes:   &'a [u8],
-    /// Phys address corresponding to `bytes`. Identity-mapped on
-    /// kernel-resident builds; userspace-driver builds get a
-    /// device-visible IOMMU-translated address.
-    pub phys:    u64,
+    /// Direct coherent physical address, or None for page-backed storage.
+    /// None requires copying into the driver's own DMA staging buffers.
+    pub phys:    Option<u64>,
 }
 
 /// Look up a blob by canonical name. Returns a fresh
@@ -392,13 +403,12 @@ mirrors that:
   the central registry; the returned `Cap<FirmwareBlob, Read>`
   is mapped into the user driver's cap table.
 - `BlobView::bytes` is a pointer into the user driver's address
-  space — the kernel maps the underlying DMA-coherent pages
+  space — the kernel maps the underlying backing pages
   read-only into the user AS at cap-grant time. This matches the
   shape used for `MmioRegion` and `DmaBuffer` in the userspace
   driver runtime (`drivers/runtime`).
-- `BlobView::phys` is the IOMMU-translated address the user
-  driver hands to the device — same as `DmaBuffer::phys_addr()`
-  in the userspace runtime.
+- `BlobView::phys` is optional. A physically scattered blob must be staged
+  in driver-owned DMA buffers before a device can read it.
 
 The signature verification step always happens kernel-side. A
 user driver never receives a blob that the kernel hasn't already
@@ -430,9 +440,9 @@ let amss_cap = firmware::open(
     &firmware_authority,
 ).map_err(|_| WifiError::FirmwareMissing)?;
 let amss = amss_cap.view()?;
-// SAFETY: BAR0 mapped, exclusive owner; phys is DMA-coherent.
-unsafe { self.bhi_load(amss.phys, amss.bytes.len() as u32)?; }
-// MHISTATUS.READY now asserts within ~200 ms.
+// MHI copies verified bytes into its own BHI/BHIe DMA staging buffers;
+// the registry's full image need not be physically contiguous.
+self.stage_and_load(amss.bytes)?;
 ```
 
 ### Intel ACP6.0 (laptop array mic)
