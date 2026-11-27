@@ -11962,6 +11962,107 @@ pub(crate) fn futex_waiter_count_key(key: FutexKey) -> usize {
     futex_wait_bucket(key).values.lock().iter().filter(|(_, w)| w.key == key).count()
 }
 
+/// A PI ordered-handoff designation: the head waiter `futex_unlock_pi`
+/// transferred a lock to. `linux_tid` is the waiter's raw Linux TID
+/// (masked to the futex word by the caller); `more_waiters` says other
+/// waiters remain queued behind it, so the transferred word keeps
+/// `FUTEX_WAITERS` set.
+pub(crate) struct FutexPiDesignation {
+    pub(crate) tid: u64,
+    pub(crate) linux_tid: u64,
+    pub(crate) more_waiters: bool,
+}
+
+/// Designate the head waiter on `key` as the next owner of the PI futex
+/// at `uaddr` (`kernel/futex/pi.c::futex_unlock_pi` ordered handoff).
+/// Records the grant on the waiter's task ctx (see
+/// `UserTaskCtx::futex_pi_granted_uaddr`) and returns what the unlock
+/// path must write into the word. The caller rewrites the word AFTER
+/// this returns, under no lock — the grant is set first, so a waiter
+/// that re-executes `FUTEX_LOCK_PI` between the designation and the
+/// word write sees the grant and re-parks instead of timing out (see
+/// `futex_lock_pi`), and one that re-executes after the write sees
+/// itself as owner with the grant and acquires.
+///
+/// Only the head waiter may be designated, and only when it is a
+/// genuine PI lock waiter (`FUTEX_PARK_SLOT` — a handler-driven
+/// `FUTEX_WAIT` parked on the same word never calls `LOCK_PI`, so
+/// handing it the lock would brick the word) with a live task ctx to
+/// carry the grant. Anything else returns `None` and the caller falls
+/// back to the old unowned-`FUTEX_WAITERS` word + wake-1 — unfair, but
+/// never stranded: the free-word take stays ungated, so the next
+/// locker still takes the word.
+///
+/// Locking: takes the bucket lock; `with_user_task_ctx` holds no
+/// registry lock across its callback (the refcount, not a deref-under-
+/// lock, keeps the ctx alive), so no new lock order is introduced.
+/// Never touches user memory — the word write stays outside the lock,
+/// as `cmpxchg_user_u32` requires (it must not run under an
+/// `IrqSafeSpinLock`).
+pub(crate) fn futex_pi_designate_head(key: FutexKey, uaddr: u64) -> Option<FutexPiDesignation> {
+    let queue = futex_wait_bucket(key).values.lock();
+    let handle = futex_select_waiter(&queue, key, FUTEX_BITSET_MATCH_ANY)?;
+    let waiter = queue.get(handle)?;
+    if waiter.slot != FUTEX_PARK_SLOT {
+        return None;
+    }
+    let tid = waiter.tid;
+    let more_waiters = queue.iter().filter(|(_, w)| w.key == key).count() > 1;
+    let linux_tid = linux_tid_for_task(tid);
+    if linux_tid == 0 {
+        return None;
+    }
+    let granted = crate::user_task::with_user_task_ctx(tid, |uc| {
+        uc.futex_pi_granted_uaddr.store(uaddr, Ordering::Release);
+    })
+    .is_some();
+    if !granted {
+        return None;
+    }
+    Some(FutexPiDesignation { tid, linux_tid, more_waiters })
+}
+
+/// Release a designation whose word write will not land (the unlock
+/// path's cmpxchg faulted, or the word's owner moved under it). Clears
+/// the designee's grant and bumps the key's wake generation so the
+/// designee's park-loop re-poll wakes promptly and re-evaluates the
+/// word instead of re-parking behind a stale grant. No-ops for `None`.
+pub(crate) fn futex_pi_release_designation(designation: &Option<FutexPiDesignation>, key: FutexKey, uaddr: u64) {
+    if let Some(designation) = designation {
+        crate::user_task::with_user_task_ctx(designation.tid, |uc| {
+            if uc.futex_pi_granted_uaddr.load(Ordering::Acquire) == uaddr {
+                uc.futex_pi_granted_uaddr.store(0, Ordering::Release);
+            }
+        });
+        futex_bump_counter_key(key);
+    }
+}
+
+/// Does the current task hold an unconsumed PI handoff grant for
+/// `uaddr`? Resolved through the task registry, not the
+/// scheduler-published current task, so it also works for the
+/// in-kernel test harness's registered tasks.
+pub(crate) fn futex_pi_has_grant(uaddr: u64) -> bool {
+    crate::user_task::with_user_task_ctx(current_task_id(), |uc| {
+        uc.futex_pi_granted_uaddr.load(Ordering::Acquire) == uaddr
+    })
+    .unwrap_or(false)
+}
+
+/// Consume the current task's PI handoff grant for `uaddr`, if held.
+/// Returns true when a grant was present (and is now cleared).
+pub(crate) fn futex_pi_take_grant(uaddr: u64) -> bool {
+    crate::user_task::with_user_task_ctx(current_task_id(), |uc| {
+        if uc.futex_pi_granted_uaddr.load(Ordering::Acquire) == uaddr {
+            uc.futex_pi_granted_uaddr.store(0, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
 pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
     futex_wake_waiters_key_bitset(key, n, FUTEX_BITSET_MATCH_ANY)
 }

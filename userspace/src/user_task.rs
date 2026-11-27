@@ -346,6 +346,21 @@ pub struct UserTaskCtx {
     /// `FUTEX_WAIT_BITSET` / futex2 mask and its futex2 NUMA node. Zero
     /// decodes as MATCH_ANY and `FUTEX_NO_NODE`.
     pub futex_key_meta: AtomicU64,
+    /// PI ordered-handoff grant: the user address of a PI futex whose
+    /// ownership the unlock path transferred directly to this task
+    /// (`handlers::futex_pi_designate_head` picked this task as the head
+    /// waiter and `futex_unlock_pi` rewrote the word with this task's
+    /// TID). `0` means no grant is outstanding. Set under the futex
+    /// bucket lock by the unlock path BEFORE the word is rewritten;
+    /// consumed by `futex_lock_pi` when it finds this task is the word's
+    /// owner, cleared by the unlock path when the transfer fails. The
+    /// grant is what tells a handoff apart from a recursive lock: the
+    /// word alone cannot — both present the caller's own TID as owner.
+    /// A live grant is only ever observed by this task's own next
+    /// `FUTEX_LOCK_PI` execution (it is set while the task is parked and
+    /// consumed on its re-execution, or cleared by the unlocker, or dies
+    /// with the task ctx), so no other path needs to clear it.
+    pub futex_pi_granted_uaddr: AtomicU64,
     /// Set non-null by `sys_execve` to hand a freshly-built
     /// `ExecRequest` to the polling routine. The routine takes
     /// ownership via `Box::from_raw` after the EXECVE longjmp
@@ -1021,6 +1036,7 @@ impl UserTaskCtx {
             futex_key_object: [AtomicU64::new(0), AtomicU64::new(0)],
             futex_key_addr: AtomicU64::new(0),
             futex_key_meta: AtomicU64::new(0),
+            futex_pi_granted_uaddr: AtomicU64::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
             pending_fs_base: AtomicU64::new(u64::MAX),
             wait_child_pending: AtomicBool::new(false),
