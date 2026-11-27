@@ -127,6 +127,11 @@ impl Sha1 {
     }
 
     fn process_block(&mut self, block: &[u8; 64]) {
+        Self::compress_block(&mut self.state, block);
+    }
+
+    /// One SHA-1 compression of `block` into `state` (FIPS 180-4 §6.1.2).
+    pub(crate) fn compress_block(state: &mut [u32; 5], block: &[u8; 64]) {
         // FIPS 180-4 §6.1.2 — message schedule W[0..80].
         let mut w = [0u32; 80];
         for i in 0..16 {
@@ -144,7 +149,7 @@ impl Sha1 {
         // FIPS 180-4 §4.2.1 round constants.
         const K: [u32; 4] = [0x5A82_7999, 0x6ED9_EBA1, 0x8F1B_BCDC, 0xCA62_C1D6];
 
-        let [mut a, mut b, mut c, mut d, mut e] = self.state;
+        let [mut a, mut b, mut c, mut d, mut e] = *state;
 
         for (i, wi) in w.iter().enumerate() {
             // FIPS 180-4 §6.1.2 round-function selector:
@@ -171,11 +176,11 @@ impl Sha1 {
             a = tmp;
         }
 
-        self.state[0] = self.state[0].wrapping_add(a);
-        self.state[1] = self.state[1].wrapping_add(b);
-        self.state[2] = self.state[2].wrapping_add(c);
-        self.state[3] = self.state[3].wrapping_add(d);
-        self.state[4] = self.state[4].wrapping_add(e);
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
     }
 }
 
@@ -242,37 +247,8 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
 /// the limit (PMK is 32 bytes, so two blocks).
 pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Vec<u8> {
     assert!(iterations >= 1, "PBKDF2 iteration count must be ≥1");
-    let h_len = 20usize;
     let mut dk = alloc::vec![0u8; dk_len];
-    let l = dk_len.div_ceil(h_len);
-
-    let mut block = [0u8; 4];
-    let mut salt_with_int: Vec<u8> = Vec::with_capacity(salt.len() + 4);
-
-    for i in 1..=l {
-        // S || INT(i) — INT is the 4-byte big-endian block index.
-        block.copy_from_slice(&(i as u32).to_be_bytes());
-        salt_with_int.clear();
-        salt_with_int.extend_from_slice(salt);
-        salt_with_int.extend_from_slice(&block);
-
-        // U_1 = HMAC(P, S || INT(i)).
-        let mut u = hmac_sha1(password, &salt_with_int);
-        let mut t = u;
-
-        // U_j = HMAC(P, U_{j-1}) for j = 2..c; T_i = U_1 ⊕ U_2 ⊕ ... ⊕ U_c.
-        for _ in 1..iterations {
-            u = hmac_sha1(password, &u);
-            for k in 0..h_len {
-                t[k] ^= u[k];
-            }
-        }
-
-        // Copy T_i into DK at offset (i-1)*hLen; truncate the last block.
-        let off = (i - 1) * h_len;
-        let take = (dk_len - off).min(h_len);
-        dk[off..off + take].copy_from_slice(&t[..take]);
-    }
+    crate::pbkdf2::pbkdf2_hmac_sha1(password, salt, iterations, &mut dk);
     dk
 }
 

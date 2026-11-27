@@ -21,6 +21,8 @@ narf-lib          = { path = "../lib", optional = true }
 narf-arch         = { path = "../arch", optional = true }
 narf-capabilities = { path = "../capabilities", optional = true }
 narf-ipc          = { path = "../ipc", optional = true }
+# The CR0.TS boundary the SSE sections cross (`simd.rs`).
+narf-scheduler    = { path = "../scheduler", optional = true }
 # Zero-dependency test registry; the algorithm files' smokes register
 # through it in every configuration.
 narf-kernel-test  = { path = "../verification/kernel-test" }
@@ -59,7 +61,13 @@ default = ["kernel"]
 # Everything that needs a kernel crate: `Cap<Key<Alg>, R>` and the cap-gated
 # primitives, hardware entropy (`try_fill_random_bytes` and friends), the
 # post-quantum cap types and the kernel-resident test suites.
-kernel = ["dep:narf-lib", "dep:narf-arch", "dep:narf-capabilities", "dep:narf-ipc"]
+kernel = [
+    "dep:narf-lib",
+    "dep:narf-arch",
+    "dep:narf-capabilities",
+    "dep:narf-ipc",
+    "dep:narf-scheduler",
+]
 # ECDSA/P-256 signing (RFC 6979 deterministic nonces). Off by default; the
 # verify path is always available. Pulled in by WPA3 SAE-PK AP-side generation.
 ecdsa-sign = []

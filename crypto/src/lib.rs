@@ -68,11 +68,13 @@ pub mod hdcp;
 pub mod hkdf;
 pub mod michael_mic;
 pub mod p256;
+pub mod pbkdf2;
 pub mod pbkdf2_sha1;
 pub mod poly1305;
 pub mod rsaes_oaep;
 pub mod sha256;
 pub mod sha512;
+pub mod simd;
 
 #[cfg(feature = "kernel")]
 mod e2e_tests;

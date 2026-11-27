@@ -12,8 +12,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_capabilities::{Cap, Grant};
-use narf_crypto::hkdf::hmac_sha256;
-use narf_crypto::pbkdf2_sha1::{hmac_sha1, Sha1};
+use narf_crypto::pbkdf2::{pbkdf2_hmac_sha1, pbkdf2_hmac_sha256, pbkdf2_hmac_sha512};
+use narf_crypto::pbkdf2_sha1::Sha1;
 use narf_crypto::sha256::Sha256;
 use narf_crypto::sha512::Sha512;
 use narf_crypto::{aes_xts_256_decrypt, AesXts256, CryptoError, Key};
@@ -468,80 +468,13 @@ pub(crate) fn pbkdf2(
     output_len: usize,
 ) -> Zeroizing<Vec<u8>> {
     debug_assert!(iterations > 0);
-    let digest_len = hash.digest_len();
     let mut output = Zeroizing::new(alloc::vec![0u8; output_len]);
-    let mut salt_block = Zeroizing::new(Vec::with_capacity(salt.len() + 4));
-    salt_block.extend_from_slice(salt);
-    salt_block.extend_from_slice(&[0u8; 4]);
-
-    for block_index in 1..=output_len.div_ceil(digest_len) {
-        let index = u32::try_from(block_index).expect("PBKDF2 output exceeds u32 blocks");
-        let suffix = salt_block.len() - 4;
-        salt_block[suffix..].copy_from_slice(&index.to_be_bytes());
-
-        let mut u = Zeroizing::new([0u8; 64]);
-        let mut t = Zeroizing::new([0u8; 64]);
-        hmac_into(hash, password, &salt_block, &mut u);
-        t[..digest_len].copy_from_slice(&u[..digest_len]);
-        for _ in 1..iterations {
-            let previous = Zeroizing::new(*u);
-            hmac_into(hash, password, &previous[..digest_len], &mut u);
-            for i in 0..digest_len {
-                t[i] ^= u[i];
-            }
-        }
-
-        let output_offset = (block_index - 1) * digest_len;
-        let take = (output_len - output_offset).min(digest_len);
-        output[output_offset..output_offset + take].copy_from_slice(&t[..take]);
+    match hash {
+        Luks1Hash::Sha1 => pbkdf2_hmac_sha1(password, salt, iterations, &mut output),
+        Luks1Hash::Sha256 => pbkdf2_hmac_sha256(password, salt, iterations, &mut output),
+        Luks1Hash::Sha512 => pbkdf2_hmac_sha512(password, salt, iterations, &mut output),
     }
     output
-}
-
-fn hmac_into(hash: Luks1Hash, key: &[u8], data: &[u8], out: &mut [u8; 64]) {
-    out.zeroize();
-    match hash {
-        Luks1Hash::Sha1 => {
-            let digest = Zeroizing::new(hmac_sha1(key, data));
-            out[..20].copy_from_slice(&digest[..]);
-        }
-        Luks1Hash::Sha256 => {
-            let digest = Zeroizing::new(hmac_sha256(key, data));
-            out[..32].copy_from_slice(&digest[..]);
-        }
-        Luks1Hash::Sha512 => {
-            let digest = Zeroizing::new(hmac_sha512(key, data));
-            out.copy_from_slice(&digest[..]);
-        }
-    }
-}
-
-fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
-    const BLOCK_BYTES: usize = 128;
-    let mut key_block = Zeroizing::new([0u8; BLOCK_BYTES]);
-    if key.len() > BLOCK_BYTES {
-        let mut hasher = Sha512::new();
-        hasher.update(key);
-        key_block[..64].copy_from_slice(&hasher.finalize());
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut inner_pad = Zeroizing::new([0x36u8; BLOCK_BYTES]);
-    let mut outer_pad = Zeroizing::new([0x5cu8; BLOCK_BYTES]);
-    for index in 0..BLOCK_BYTES {
-        inner_pad[index] ^= key_block[index];
-        outer_pad[index] ^= key_block[index];
-    }
-    let mut inner = Sha512::new();
-    inner.update(&inner_pad[..]);
-    inner.update(data);
-    let inner_digest = Zeroizing::new(inner.finalize());
-
-    let mut outer = Sha512::new();
-    outer.update(&outer_pad[..]);
-    outer.update(&inner_digest[..]);
-    outer.finalize()
 }
 
 fn hash_into(hash: Luks1Hash, prefix: &[u8], data: &[u8], out: &mut [u8; 64]) {
