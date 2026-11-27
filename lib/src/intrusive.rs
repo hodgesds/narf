@@ -157,6 +157,22 @@ impl<T> IntrusiveList<T> {
         self.len.set(self.len.get() + 1);
     }
 
+    /// The front node, without unlinking it. With [`Self::next`] this walks
+    /// the list (Linux `list_for_each_entry_safe` when the successor is read
+    /// before the current node is unlinked).
+    pub fn front(&self) -> Option<NonNull<Node<T>>> {
+        self.head.get()
+    }
+
+    /// The node after `node`.
+    ///
+    /// # Safety
+    /// `node` must currently be linked into *this* list.
+    pub unsafe fn next(&self, node: NonNull<Node<T>>) -> Option<NonNull<Node<T>>> {
+        // SAFETY: the caller guarantees `node` is live and in this list.
+        unsafe { node.as_ref().link.next.get() }
+    }
+
     /// Pop the front node. Returns a raw pointer; the caller re-wraps into
     /// `Pin<&mut Node<T>>` if they still hold the original pin.
     pub fn pop_front(&self) -> Option<NonNull<Node<T>>> {
@@ -281,5 +297,37 @@ mod tests {
         // SAFETY: Valid memory or trusted environment
         assert_eq!(unsafe { h.as_ref().value }, 3);
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn walk_and_unlink_while_walking() {
+        let list: IntrusiveList<u32> = IntrusiveList::new();
+        let mut a = pin!(Node::new(1));
+        let mut b = pin!(Node::new(2));
+        let mut c = pin!(Node::new(3));
+        list.push_back(a.as_mut());
+        list.push_back(b.as_mut());
+        list.push_back(c.as_mut());
+        // Read the successor before unlinking the current node.
+        let mut seen = 0u32;
+        let mut cursor = list.front();
+        while let Some(node) = cursor {
+            // SAFETY: `node` is linked into `list` until unlinked below.
+            cursor = unsafe { list.next(node) };
+            // SAFETY: as above; the pins outlive the walk.
+            let value = unsafe { node.as_ref().value };
+            seen = seen * 10 + value;
+            if value % 2 == 1 {
+                // SAFETY: `node` is linked into `list`.
+                unsafe { list.unlink(node) };
+            }
+        }
+        assert_eq!(seen, 123);
+        assert_eq!(list.len(), 1);
+        let rest = list.front().unwrap();
+        // SAFETY: the remaining node is linked and pinned.
+        assert_eq!(unsafe { rest.as_ref().value }, 2);
+        // SAFETY: `rest` is the only node.
+        assert!(unsafe { list.next(rest) }.is_none());
     }
 }
