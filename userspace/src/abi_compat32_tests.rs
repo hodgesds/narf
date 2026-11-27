@@ -1440,6 +1440,61 @@ kernel_test_in!(
     smoke_compat32_table_stat64_and_statx_layouts
 );
 
+/// No-hint file mappings reuse the address space munmap returns, as
+/// `vm_unmapped_area` does: Linux's only ENOMEM is "no free gap of the
+/// requested length below TASK_SIZE", whatever the process mapped and
+/// unmapped before. pressure-vessel's i386 `capsule-capture-libs` lives on
+/// that — libelf maps each candidate library whole (`ELF_C_READ_MMAP`),
+/// `PROT_READ`/`MAP_PRIVATE` with no hint, and unmaps it: on Linux about
+/// 6.8 GiB of such mappings with under 300 MiB live at once. The IA-32
+/// window is under 2.7 GiB, so mapping and unmapping 64 MiB of one file
+/// 48 times (3 GiB in all, never more than 64 MiB live) must keep working
+/// to the last round and stay inside the 32-bit window.
+fn smoke_compat32_file_mmap_reuses_unmapped_address_space() -> TestResult {
+    const PROT_READ: u64 = 0x1;
+    const MAP_PRIVATE: u64 = 0x02;
+    const LEN: u64 = 64 << 20;
+    const ROUNDS: u32 = 48;
+    with_p2_fixture(|base| {
+        let fd = call32(5, [base + 0xF00, 0, 0, 0, 0, 0]);
+        if fd < 0 {
+            return Err("i386 open of the fixture file failed");
+        }
+        let mut outcome = Ok(());
+        for _ in 0..ROUNDS {
+            let ret = call32(192, [0, LEN, PROT_READ, MAP_PRIVATE, fd as u64, 0]);
+            if ret == ENOMEM {
+                outcome = Err(
+                    "i386 mmap2 of a file ran out of address space although every \
+                               earlier mapping was unmapped",
+                );
+                break;
+            }
+            // eax is an address unless it is -4095..-1 (glibc's
+            // INTERNAL_SYSCALL_ERROR_P): mappings above 2 GiB read negative.
+            if (-4095..0).contains(&ret) {
+                outcome = Err("i386 file mmap2 failed");
+                break;
+            }
+            let addr = ret as u32 as u64;
+            if addr < COMPAT_MMAP_BASE || addr + LEN > TASK_SIZE_32 {
+                outcome = Err("i386 file mmap2 left the 32-bit window");
+                break;
+            }
+            if call32(91, [addr, LEN, 0, 0, 0, 0]) != 0 {
+                outcome = Err("i386 munmap of the file mapping failed");
+                break;
+            }
+        }
+        let _ = call32(6, [fd as u64, 0, 0, 0, 0, 0]);
+        outcome
+    })
+}
+kernel_test_in!(
+    "userspace/compat32",
+    smoke_compat32_file_mmap_reuses_unmapped_address_space
+);
+
 /// File offsets, locks, directories and path probes:
 ///
 ///   * `_llseek` (140) assembles `offset_high:offset_low` and stores the
