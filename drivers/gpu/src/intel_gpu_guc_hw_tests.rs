@@ -1511,10 +1511,22 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             w.0.borrow_mut().slpc_h2g.push(request.clone());
         }
         match action {
+            0x7000 if request.len() == 7 => {
+                // send_tlb_inval_ppgtt: XE_GUC_TLB_INVAL_PAGE_SELECTIVE,
+                // heavy, with the cache flush, by ASID.
+                assert_eq!(request[2], 0x80000001);
+                w.0.borrow_mut().fault_h2g.push(request.clone());
+                event(&memory, 0x7001, &[request[1]]);
+            }
             0x7000 => {
                 assert_eq!(request.len(), 3);
                 assert_eq!(request[2], 0x80000003);
                 event(&memory, 0x7001, &[request[1]]);
+            }
+            0x6003 => {
+                // guc_ack_fault: PAGE_FAULT_RES_DESC, no G2H reply.
+                assert_eq!(request.len(), 3);
+                w.0.borrow_mut().fault_h2g.push(request.clone());
             }
             0x4502 => {
                 // GUC_RENDER/BLITTER/COMPUTE_CLASS for the admitted engines;

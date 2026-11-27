@@ -387,8 +387,19 @@ kernel_test_in!(
 /// A Lunar Lake GT through context defaults (the LNL native fixture's
 /// prelude), with the contexts it registered.
 fn lnl_gt() -> (Window, Arena, GuCGt<Window, Arena>, BTreeMap<u32, u32>) {
+    lnl_gt_with(None)
+}
+
+/// [`lnl_gt`], its GuC's page faults routed to `usm` when given
+/// (`narf.intel.svm=1`).
+fn lnl_gt_with(
+    usm: Option<Arc<crate::intel_gpu_xe_usm::Usm>>,
+) -> (Window, Arena, GuCGt<Window, Arena>, BTreeMap<u32, u32>) {
     let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
     let (w, arena, mut gt) = hardware_model_with_identity(platform, 0xdfc, 1, Some(0x6420));
+    if let Some(usm) = usm {
+        gt.set_usm(usm);
+    }
     hardware_discovery(&mut gt, &w, 0xdfc);
     hardware_scheduling_reload_mode(&mut gt, &w, 4);
     hardware_enable_ct(&mut gt, &w);
@@ -581,4 +592,642 @@ fn smoke_xe_svm_gpu_fault_populates_zaps_and_refaults() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_xe_svm_gpu_fault_populates_zaps_and_refaults
+);
+
+/// Forwards to the fixture's backend and publishes GPUSVM and the device's
+/// USM state, as the GT owner does under `narf.intel.svm=1` on a USM device.
+#[derive(Debug)]
+struct MirroringUsm(Arc<dyn UserBackend>, Arc<crate::intel_gpu_xe_usm::Usm>);
+impl UserBackend for MirroringUsm {
+    fn status(&self) -> Option<UserStatus> {
+        self.0.status()
+    }
+    fn media_gt(&self) -> Option<crate::intel_gpu_user::MediaGtStatus> {
+        self.0.media_gt()
+    }
+    fn native_xe(&self) -> bool {
+        self.0.native_xe()
+    }
+    fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
+        self.0.device_facts()
+    }
+    fn cpu_addr_mirror(&self) -> bool {
+        true
+    }
+    fn usm(&self) -> Option<Arc<crate::intel_gpu_xe_usm::Usm>> {
+        Some(self.1.clone())
+    }
+    fn submit<'a>(
+        &'a self,
+        context: Arc<UserContext>,
+        batch: UserBatch,
+    ) -> FsFuture<'a, Arc<CompletionFence>> {
+        self.0.submit(context, batch)
+    }
+}
+
+/// xe->usm against xe_vm.c, xe_device.c, xe_pagefault.c and
+/// xe_guc_tlb_inval.c: cyclic ASIDs in [1, XE_MAX_ASID - 1] that are erased
+/// with their VM, the fault queue's size and -ENOSPC, the service's refusals
+/// before any VM state, and the page-selective PPGTT invalidation payload.
+/// Then NARF's in-place rebind of a live leaf, which frees no table.
+fn smoke_xe_usm_asids_fault_queue_and_ppgtt_invalidation() -> TestResult {
+    use crate::intel_gpu_ppgtt::{FramePtMemory, Ppgtt, Rebind, WalkOutcome};
+    use crate::intel_gpu_xe_usm::{self as usm, Usm};
+    use crate::intel_gpu_xe_vm::Vm;
+    // XE_MAX_ASID is BIT(20).
+    assert_eq!(usm::MAX_ASID, 0x10_0000);
+    let usm = Usm::new();
+    let vm = || Vm::new(false, true, true).unwrap();
+    let vms = [vm(), vm(), vm()];
+    for vm in &vms {
+        vm.assign_asid(&usm).unwrap();
+    }
+    // xa_alloc_cyclic from next_asid 0 over XA_LIMIT(1, XE_MAX_ASID - 1).
+    assert_eq!(vms.each_ref().map(|vm| vm.asid()), [1, 2, 3]);
+    assert!(Arc::ptr_eq(&usm.asid_to_vm(2).unwrap(), &vms[1]));
+    // xe_vm_close_and_put erases the ASID; the cyclic allocator moves on.
+    vms[0].release_asid();
+    assert_eq!(vms[0].asid(), 0);
+    assert!(usm.asid_to_vm(1).is_none());
+    let fourth = vm();
+    fourth.assign_asid(&usm).unwrap();
+    assert_eq!(fourth.asid(), 4);
+    // From next_asid XE_MAX_ASID - 1: that ASID, then the wrap to the
+    // lowest free one.
+    usm.set_next_asid(usm::MAX_ASID - 1);
+    let top = vm();
+    top.assign_asid(&usm).unwrap();
+    assert_eq!(top.asid(), 0xf_ffff);
+    let wrapped = vm();
+    wrapped.assign_asid(&usm).unwrap();
+    assert_eq!(wrapped.asid(), 1);
+    // A dropped VM's ASID is erased with it, so it is free again.
+    drop(top);
+    usm.set_next_asid(usm::MAX_ASID - 1);
+    let again = vm();
+    again.assign_asid(&usm).unwrap();
+    assert_eq!(again.asid(), 0xf_ffff);
+
+    // xe_pagefault_queue_init: roundup_pow_of_two((total_num_eus +
+    // XE_NUM_HW_ENGINES) * PF_MULTIPLIER) entries, one left free by
+    // xe_pagefault_queue_full. XE_NUM_HW_ENGINES is 27.
+    assert_eq!(usm::NUM_HW_ENGINES, 27);
+    // 64 EUs (eight Xe2 Xe-cores of eight XVEs): (64 + 27) * 8 = 728 -> 1024.
+    assert_eq!(usm::queue_capacity(64), 1023);
+    // 160 EUs (twenty Xe-cores): (160 + 27) * 8 = 1496 -> 2048.
+    assert_eq!(usm::queue_capacity(160), 2047);
+    let fault = |access: u32, asid: u32| guc::PageFault::from_guc(&fault_desc(0x1000, access, asid)).unwrap();
+    // Unsized (no producer): xe_pagefault_handler's -ENOSPC.
+    assert_eq!(usm.push(fault(0, 1)), Err(FsError::NoSpace));
+    usm.size_queue(0).unwrap();
+    for _ in 0..255 {
+        usm.push(fault(0, 0x777)).unwrap();
+    }
+    assert_eq!(usm.push(fault(0, 0x777)), Err(FsError::NoSpace));
+    assert_eq!(usm.queued(), 255);
+    narf_scheduler::block_on_spin(usm.drain());
+    assert_eq!(usm.queued(), 0);
+    for _ in 0..255 {
+        // No VM holds ASID 0x777: XE_PAGEFAULT_ERROR_VM_NOT_FOUND, -EINVAL.
+        let resolution = usm.pop_resolved().unwrap();
+        assert_eq!((resolution.asid, resolution.result.as_ref().err()), (0x777, Some(&FsError::InvalidData)));
+    }
+    assert!(usm.pop_resolved().is_none());
+    // A producer NACK (XE2_PFD_TRVA_FAULT, dw0 bit 18) is -EFAULT; a VM not
+    // in fault mode -EINVAL; a fault-mode VM without the address in any VMA
+    // -EINVAL. Each reply sets PFR_SUCCESS (!!err).
+    let lr = Vm::new(false, true, false).unwrap();
+    lr.assign_asid(&usm).unwrap();
+    let mut nack = fault_desc(0x1000, 0, wrapped.asid());
+    nack[0] |= 1 << 18;
+    usm.push(guc::PageFault::from_guc(&nack).unwrap()).unwrap();
+    usm.push(fault(0, lr.asid())).unwrap();
+    usm.push(fault(0, wrapped.asid())).unwrap();
+    narf_scheduler::block_on_spin(usm.drain());
+    for expected in [FsError::BadAddress, FsError::InvalidData, FsError::InvalidData] {
+        let resolution = usm.pop_resolved().unwrap();
+        assert_eq!(resolution.result.as_ref().err(), Some(&expected));
+        let replies: Vec<_> = resolution.replies(true).collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0][0] & 2, 2);
+    }
+
+    // normalize_invalidation_range: at least 4 KiB, a naturally aligned
+    // power of two covering the range, 16 MiB once it reaches 2 MiB.
+    assert_eq!(usm::normalize_invalidation_range(0x1000, 0x2000), (0x1000, 0x1000));
+    assert_eq!(usm::normalize_invalidation_range(0x1234_5000, 0x1234_5800), (0x1234_5000, 0x1000));
+    assert_eq!(usm::normalize_invalidation_range(0x3000, 0x5000), (0, 0x8000));
+    assert_eq!(usm::normalize_invalidation_range(0x20_0000, 0x40_0000), (0, 0x100_0000));
+    // send_tlb_inval_ppgtt: seqno, MAKE_INVAL_OP(XE_GUC_TLB_INVAL_PAGE_SELECTIVE)
+    // (type 1, MODE_HEAVY 0 << 8, FLUSH_CACHE bit 31), the ASID, the start's
+    // low and high dwords and ilog2(length) - ilog2(SZ_4K).
+    assert_eq!(
+        usm::ppgtt_invalidation(9, 0x1_2345, 0x2345_0000_3000, 0x2345_0000_5000),
+        [9, 0x8000_0001, 0x1_2345, 0, 0x2345, 3]
+    );
+    // Past MAX_RANGE_TLB_INVALIDATION_LENGTH: MAKE_INVAL_OP(XE_GUC_TLB_INVAL_FULL).
+    assert_eq!(usm::ppgtt_invalidation(9, 1, 0, u64::MAX), [9, 0x8000_0000]);
+
+    // Ppgtt::rebind (NARF): an absent leaf is bound, the same page again
+    // changes nothing, another page and then NULL replace it in place, and no
+    // table is allocated or freed past the first bind.
+    let mut memory = FramePtMemory::new();
+    let mut tables =
+        Ppgtt::with_root_level(&mut memory, crate::intel_gpu_gtt::PteFormat::Xe2, 2, 4).unwrap();
+    let page = |phys| Rebind::System(phys);
+    assert_eq!(tables.rebind(&mut memory, 0x4000, page(0x1_0000_0000), 2, true), Ok(true));
+    let live = memory.diagnostic_tables().count();
+    assert_eq!(tables.translate(&memory, 0x4000), Ok(WalkOutcome::Mapped(0x1_0000_0000)));
+    assert_eq!(tables.rebind(&mut memory, 0x4000, page(0x1_0000_0000), 2, true), Ok(false));
+    assert_eq!(tables.rebind(&mut memory, 0x4000, page(0x2_0000_0000), 2, true), Ok(true));
+    assert_eq!(tables.translate(&memory, 0x4000), Ok(WalkOutcome::Mapped(0x2_0000_0000)));
+    assert_eq!(tables.rebind(&mut memory, 0x4000, Rebind::Null, 2, true), Ok(true));
+    assert_eq!(tables.translate(&memory, 0x4000), Ok(WalkOutcome::Null));
+    assert_eq!(memory.diagnostic_tables().count(), live);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe",
+    smoke_xe_usm_asids_fault_queue_and_ppgtt_invalidation
+);
+
+/// A GPU page fault routed from the GuC on a Lunar Lake mirror VM
+/// (`narf.intel.svm=1`, xe_guc_pagefault.c, xe_pagefault.c, xe_svm.c,
+/// xe_guc_tlb_inval.c). The VM takes the device's first ASID and its copy
+/// job's LRC carries it in CTX_ASID. The job's tables lack the mirror page
+/// (no scratch). Two REPORT_PAGE_FAULT_REQ_DESCs for that page are queued; the
+/// service collects the CPU page once through the grabbed address space and
+/// answers the second from its cache; the GT owner binds the page into the
+/// running job, sends one page-selective invalidation for the ASID, and only
+/// after its DONE the two PAGE_FAULT_RES_DESCs. The job's store then lands in
+/// the CPU page, and VM_DESTROY erases the ASID.
+fn smoke_xe_svm_guc_fault_rebinds_running_job_and_acks() -> TestResult {
+    use core::sync::atomic::Ordering::Relaxed;
+    use narf_memory::RegionPerms;
+    const CPU: u64 = 0x2345_0000_0000;
+    const VALUE: u32 = 0x4e41_5246;
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
+    let usm = crate::intel_gpu_xe_usm::Usm::new();
+    let (w, arena, mut gt, mut registered) = lnl_gt_with(Some(usm.clone()));
+    let (mailbox, mut info) = setup(&mut gt, &w, platform);
+    info.backend = Some(Arc::new(MirroringUsm(info.backend.take().unwrap(), usm.clone())));
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    // The process's one page at CPU, grabbed at VM_CREATE (gpusvm->mm).
+    let host = create_bo(&file, &info, &user, 4096, 0);
+    let host = file.gem.object(host).unwrap();
+    let mm = user.grab(host.backing(0, 4096).unwrap().frames[0]);
+    user.space
+        .map_region(cpu_vma(CPU, RegionPerms::READ | RegionPerms::WRITE))
+        .unwrap();
+    let vm = vm_with(&file, &info, &user, LR_FAULT);
+    let asid = 1;
+    assert!(usm.asid_to_vm(asid).is_some(), "xe_vm_create's first ASID");
+    // DRM_XE_ENGINE_CLASS_COPY: the batch stores VALUE to CPU + 0x80.
+    let queue = create_queue(&file, &info, &user, vm, 1);
+    let code = create_bo(&file, &info, &user, 8192, 0);
+    let words = [0x1000_0002u32, 0x80, (CPU >> 32) as u32, VALUE, 0x0500_0000, 0];
+    let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    file.gem.object(code).unwrap().write(4096, &bytes).unwrap();
+    let pat = batch_pat(platform);
+    assert_eq!(
+        bind_ops(&file, &info, &user, vm, &[mapping(code, 0x1234_0000_0000, 4096, 4096, pat, 1)]),
+        Ok(0)
+    );
+    assert_eq!(bind_ops(&file, &info, &user, vm, &[mirror_op(CPU, 0x20_0000, pat, 0)]), Ok(0));
+
+    // The job is registered and enabled but not run.
+    let before: alloc::collections::BTreeSet<u32> = registered.values().copied().collect();
+    exec_wire(&user, queue, true, &[]);
+    let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+    assert!(call
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let (_, fence) = mailbox.accept(&mut gt, 1_000_000);
+    assert_eq!(
+        call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Some(Ok(0)))
+    );
+    for now in 1_000_001..1_000_040 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        service_contexts(&w, &mut registered, false);
+    }
+    let image = registered
+        .values()
+        .copied()
+        .find(|base| !before.contains(base))
+        .expect("registered job");
+    // xe_lrc_init: CTX_ASID (0x2e + 1) holds vm->usm.asid.
+    assert_eq!(w.0.borrow().memory[&image].borrow()[1024 + 0x2f], asid);
+    assert!(fence.result().is_none());
+
+    // Two write faults on the page, read from the G2H ring in one poll.
+    for _ in 0..2 {
+        event(&ct_memory(&w), 0x6002, &fault_desc(CPU, guc::ACCESS_WRITE as u32, asid));
+    }
+    assert_eq!(gt.poll(1_000_100), Poll::Ready(Ok(GtState::SchedulingReady)));
+    assert_eq!(usm.queued(), 2);
+    narf_scheduler::block_on_spin(usm.drain());
+    // The 2 MiB and 64 KiB chunks hold unmapped pages; the 4 KiB one pins.
+    // The second fault hits the service's cache and collects nothing.
+    assert_eq!(mm.pin_calls.load(Relaxed), 3);
+    assert_eq!(user.pin_calls.load(Relaxed), 0);
+    assert!(w.0.borrow().fault_h2g.is_empty());
+    assert_eq!(gt.poll(1_000_101), Poll::Ready(Ok(GtState::SchedulingReady)));
+    service_contexts(&w, &mut registered, false);
+    assert_eq!(gt.poll(1_000_102), Poll::Ready(Ok(GtState::SchedulingReady)));
+    service_contexts(&w, &mut registered, false);
+    let h2g = core::mem::take(&mut w.0.borrow_mut().fault_h2g);
+    assert_eq!(h2g.len(), 3, "{h2g:x?}");
+    // send_tlb_inval_ppgtt over the 4 KiB range: page selective, the ASID,
+    // the range's start and ilog2(SZ_4K) - ilog2(SZ_4K).
+    assert_eq!(h2g[0][0] as u16, 0x7000);
+    assert_eq!(&h2g[0][2..], &[0x8000_0001, asid, CPU as u32, (CPU >> 32) as u32, 0]);
+    // guc_ack_fault, after the DONE: PFR_VALID, PFR_SUCCESS 0, PFR_REPLY =
+    // PFR_ACCESS, FAULT_RESPONSE_DESC, PFR_ASID; then fault_desc's PDATA
+    // 0x1235. The cached fault needed no invalidation of its own.
+    for reply in &h2g[1..] {
+        assert_eq!(reply[0] as u16, 0x6003);
+        assert_eq!(&reply[1..], &[1 | 1 << 10 | asid << 12, 0x1235 << 16]);
+    }
+
+    // The job runs: its store reaches the CPU page through the rebound PTE.
+    execute_copy(&w, image);
+    finish(&mut gt, &w, &fence, &mut registered, 1_000_200);
+    let mut value = [0; 4];
+    host.read(0x80, &mut value).unwrap();
+    assert_eq!(u32::from_le_bytes(value), VALUE);
+
+    assert_eq!(close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue), Ok(0));
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+    assert!(usm.asid_to_vm(asid).is_none(), "xe_vm_close_and_put");
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_xe_svm_guc_fault_rebinds_running_job_and_acks
+);
+
+/// `struct drm_xe_madvise` with the union's first two dwords and its
+/// reserved qword: start 8, range 16, vm_id 24, type 28, union 32..48.
+fn madvise_wire(start: u64, range: u64, kind: u32, value: u32, word36: u32, reserved: u64) -> [u8; 64] {
+    let mut wire = [0; 64];
+    put64(&mut wire, 8, start);
+    put64(&mut wire, 16, range);
+    put32(&mut wire, 24, 7);
+    put32(&mut wire, 28, kind);
+    put32(&mut wire, 32, value);
+    put32(&mut wire, 36, word36);
+    put64(&mut wire, 40, reserved);
+    wire
+}
+
+/// DRM_IOCTL_XE_MADVISE (xe_vm_madvise.c, xe_drm.h): madvise_args_are_sane
+/// per type; then on a Lunar Lake mirror VM, the VMA split at the range's
+/// edges, unchanged advice skipped, a preferred device other than the
+/// defaults -ENOENT, PAT advice splitting a buffer-side VMA, a VMA-less range
+/// doing nothing, default-attribute merging, and MADVISE_AUTORESET returning
+/// a CPU-unmapped range's part to default attributes
+/// (xe_svm_range_set_default_attr).
+fn smoke_xe_madvise_args_split_zap_and_autoreset() -> TestResult {
+    use crate::intel_gpu_xe_vm::{
+        madvise::{self, Advice, Madvise},
+        svm::{Mirror, MirrorVma},
+        Vm,
+    };
+    use narf_memory::{RegionPerms, VirtAddr};
+    let lnl = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
+    let parse = |wire: [u8; 64]| Madvise::parse(&wire, lnl);
+    let at = |advice| Madvise {
+        vm_id: 7,
+        start: 0x1000,
+        end: 0x2000,
+        advice,
+    };
+    // 4 KiB aligned start and range, at least 4 KiB; an unknown type (4).
+    assert_eq!(parse(madvise_wire(0x1800, 0x1000, 1, 1, 0, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1800, 1, 1, 0, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0, 1, 1, 0, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 4, 0, 0, 0)), Err(FsError::InvalidData));
+    // ATOMIC: val at most DRM_XE_ATOMIC_CPU (3), pad and reserved zero.
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 1, 4, 0, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 1, 3, 1, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 1, 3, 0, 1)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 1, 2, 0, 0)), Ok(at(Advice::Atomic(2))));
+    // PREFERRED_LOC: devmem_fd at least DEFAULT_SYSTEM (-1); region_instance
+    // (offset 38) MBZ for fd <= DEFAULT_DEVICE; migration_policy (offset 36)
+    // at most ONLY_SYSTEM_PAGES (1); reserved zero.
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 0, -2i32 as u32, 0, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 0, 0, 1 << 16, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 0, u32::MAX, 2, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 0, 0, 0, 1)), Err(FsError::InvalidData));
+    assert_eq!(
+        parse(madvise_wire(0x1000, 0x1000, 0, 5, 1 << 16, 0)),
+        Ok(at(Advice::PreferredLoc {
+            devmem_fd: 5,
+            migration_policy: 0
+        }))
+    );
+    assert_eq!(
+        parse(madvise_wire(0x1000, 0x1000, 0, u32::MAX, 1, 0)),
+        Ok(at(Advice::PreferredLoc {
+            devmem_fd: u32::MAX,
+            migration_policy: 1
+        }))
+    );
+    // PAT (xe2_pat_table): an index below n_entries (32) with a coherency
+    // mode. 0 and the compressed 9 are XE_COH_NONE; 16 is reserved; 1 is
+    // one-way, 2 two-way and 22 one-way with L3 CLOS 1.
+    for (pat, admitted) in [(0, false), (1, true), (2, true), (9, false), (16, false), (22, true), (32, false)] {
+        let parsed = parse(madvise_wire(0x1000, 0x1000, 2, pat, 0, 0));
+        let expected = if admitted {
+            Ok(at(Advice::Pat(pat as u8)))
+        } else {
+            Err(FsError::InvalidData)
+        };
+        assert_eq!(parsed, expected, "PAT {pat}");
+    }
+    // reserved[2] MBZ.
+    let mut reserved = madvise_wire(0x1000, 0x1000, 1, 1, 0, 0);
+    put64(&mut reserved, 56, 1);
+    assert_eq!(parse(reserved), Err(FsError::InvalidData));
+    // PURGEABLE_STATE: WILLNEED (0) or DONTNEED (1) with pad zero, then
+    // EOPNOTSUPP: NARF objects have no purgeable state.
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 3, 2, 0, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 3, 1, 1, 0)), Err(FsError::InvalidData));
+    assert_eq!(parse(madvise_wire(0x1000, 0x1000, 3, 1, 0, 0)), Err(FsError::Unsupported));
+    // xe_device_uncanonicalize_addr keeps the low 48 bits.
+    assert_eq!(
+        parse(madvise_wire(0xffff_8000_0000_0000, 0x1000, 1, 1, 0, 0)).map(|m| m.start),
+        Ok(0x8000_0000_0000)
+    );
+
+    // A mirror VM; the mirror VMA [1 MiB, 3 MiB) was bound with AUTORESET,
+    // and a NULL VMA [4 MiB, 4 MiB + 16 KiB).
+    let info = DeviceInfo {
+        device_id: 0x6420,
+        platform: lnl,
+        memory_bytes: 0x8000_0000,
+        hwconfig: None,
+        topology: None,
+        vram: None,
+        backend: Some(Arc::new(Facts {
+            platform: lnl,
+            svm: true,
+        })),
+    };
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let page = create_bo(&file, &info, &user, 4096, 0);
+    *user.mapping.lock() = Some(file.gem.object(page).unwrap().backing(0, 4096).unwrap());
+    let vm = Vm::with_svm(
+        false,
+        true,
+        true,
+        Some(Mirror {
+            space: user.space.identity(),
+            remote: None,
+            discrete: false,
+        }),
+    )
+    .unwrap();
+    let svm = vm.svm.as_ref().unwrap();
+    let mut state = narf_scheduler::block_on_spin(vm.state.lock());
+    svm.set_vmas(&state, alloc::vec![MirrorVma::new(0x10_0000, 0x30_0000, 2, false, true)]);
+    state.publish(alloc::vec![crate::intel_gpu_exec::VmMapping {
+        object: None,
+        va: 0x40_0000,
+        offset: 0,
+        length: 0x4000,
+        writable: true,
+        pat: 2,
+        dumpable: false,
+    }]);
+    let advise = |state: &mut _, start, end, advice| {
+        madvise::apply(
+            &vm,
+            state,
+            &Madvise {
+                vm_id: 0,
+                start,
+                end,
+                advice,
+            },
+        )
+    };
+    let attrs = |state: &_| -> Vec<(u64, u64, u32, u32, u8)> {
+        vm.svm_vmas(state)
+            .iter()
+            .map(|vma| (vma.start, vma.end, vma.attr.atomic, vma.attr.devmem_fd, vma.pat))
+            .collect()
+    };
+    // xe_vm_alloc_madvise_vma, then madvise_atomic on the middle part.
+    let global = Advice::Atomic(madvise::ATOMIC_GLOBAL);
+    advise(&mut state, 0x18_0000, 0x20_0000, global).unwrap();
+    let split = alloc::vec![
+        (0x10_0000, 0x18_0000, madvise::ATOMIC_UNDEFINED, 0, 2),
+        (0x18_0000, 0x20_0000, madvise::ATOMIC_GLOBAL, 0, 2),
+        (0x20_0000, 0x30_0000, madvise::ATOMIC_UNDEFINED, 0, 2),
+    ];
+    assert_eq!(attrs(&state), split);
+    // The same advice again is skip_invalidation: nothing changes.
+    advise(&mut state, 0x18_0000, 0x20_0000, global).unwrap();
+    assert_eq!(attrs(&state), split);
+    // is_cpu_addr_vma_with_default_attr: a neighbour with advice is not
+    // absorbed (start stays), a default one is (end grows).
+    let vmas = vm.svm_vmas(&state);
+    assert_eq!(svm::merge_extent(&vmas, 0x20_0000, 0x20_1000), (0x20_0000, 0x30_0000));
+    assert_eq!(svm::merge_extent(&vmas, 0x30_0000, 0x40_0000), (0x20_0000, 0x40_0000));
+    // A range with no VMA does nothing; PAT advice splits the NULL VMA.
+    advise(&mut state, 0x80_0000, 0x80_1000, Advice::Atomic(1)).unwrap();
+    assert_eq!(attrs(&state), split);
+    advise(&mut state, 0x40_1000, 0x40_2000, Advice::Pat(1)).unwrap();
+    let pats: Vec<_> = state.mappings.iter().map(|m| (m.va, m.length, m.pat)).collect();
+    assert_eq!(pats, [(0x40_0000, 0x1000, 2), (0x40_1000, 0x1000, 1), (0x40_2000, 0x2000, 2)]);
+    assert_eq!(attrs(&state), split);
+
+    // MADVISE_AUTORESET: a range PREFETCH collected in the advised part, then
+    // unmapped by the CPU. The garbage collector returns the range's part to
+    // default attributes, merged with the default VMA before it.
+    user.space
+        .map_region(cpu_vma(0x18_0000, RegionPerms::READ | RegionPerms::WRITE))
+        .unwrap();
+    svm.prefetch(&vm, &state, 0x18_0000, 0x1000, 0, &user).unwrap();
+    assert!(svm.has_mapping(0x18_0000, 0x18_1000));
+    user.space.punch_fixed(VirtAddr::new(0x18_0000), 4096).unwrap();
+    vm.svm_collect_garbage(&state);
+    assert!(!svm.has_mapping(0x18_0000, 0x18_1000));
+    assert_eq!(
+        attrs(&state),
+        [
+            (0x10_0000, 0x18_1000, madvise::ATOMIC_UNDEFINED, 0, 2),
+            (0x18_1000, 0x20_0000, madvise::ATOMIC_GLOBAL, 0, 2),
+            (0x20_0000, 0x30_0000, madvise::ATOMIC_UNDEFINED, 0, 2),
+        ]
+    );
+
+    // A preferred device other than the defaults: xe_drm_pagemap_from_fd's
+    // -ENOENT without CONFIG_DRM_XE_PAGEMAP. DEFAULT_SYSTEM (-1) applies.
+    let device = Advice::PreferredLoc {
+        devmem_fd: 5,
+        migration_policy: 0,
+    };
+    assert_eq!(advise(&mut state, 0x10_0000, 0x30_0000, device), Err(FsError::NotFound));
+    let system = Advice::PreferredLoc {
+        devmem_fd: u32::MAX,
+        migration_policy: 0,
+    };
+    advise(&mut state, 0x10_0000, 0x30_0000, system).unwrap();
+    assert!(vm.svm_vmas(&state).iter().all(|vma| vma.attr.devmem_fd == u32::MAX));
+    // A closed VM: xe_vm_is_closed_or_banned's -ENOENT.
+    vm.dead.store(true, core::sync::atomic::Ordering::Release);
+    assert_eq!(advise(&mut state, 0x10_0000, 0x30_0000, global), Err(FsError::NotFound));
+    drop(state);
+    user.mapping.lock().take();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe",
+    smoke_xe_madvise_args_split_zap_and_autoreset
+);
+
+/// DRM_IOCTL_XE_MADVISE exists only with GPUSVM published: with the option
+/// off it is EINVAL like any ioctl past the table, and with it an unknown VM
+/// is EINVAL (xe_vm_lookup) before the arguments. On Battlemage, Linux built
+/// without CONFIG_DRM_XE_PAGEMAP (drm_pagemap needs ZONE_DEVICE, which NARF
+/// lacks): a PREFETCH to VRAM and an atomic fault under DEVICE advice collect
+/// system pages, a preferred device is -ENOENT, and an atomic fault under
+/// DRM_XE_ATOMIC_CPU advice is xe_vma_need_vram_for_atomic's -EACCES.
+fn smoke_xe_madvise_option_off_and_battlemage_system_pages() -> TestResult {
+    use crate::intel_gpu_xe_vm::{
+        madvise::{self, Advice, Madvise},
+        svm::{Mirror, MirrorVma},
+        Vm,
+    };
+    use narf_memory::RegionPerms;
+    // DRM_IOW(DRM_COMMAND_BASE + DRM_XE_MADVISE (0x0c), 64 bytes).
+    assert_eq!(xe::MADVISE, 0x4040_644c);
+    let lnl = GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake);
+    let mtl = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    for (platform, device, opted) in [
+        (lnl, 0x6420, false),
+        (lnl, 0x6420, true),
+        (GtPlatform::Battlemage, 0xe20b, true),
+        (mtl, 0x7d55, true),
+    ] {
+        let info = DeviceInfo {
+            device_id: device,
+            platform,
+            memory_bytes: 0x8000_0000,
+            hwconfig: None,
+            topology: None,
+            vram: None,
+            backend: Some(Arc::new(Facts {
+                platform,
+                svm: opted,
+            })),
+        };
+        let file = RenderFile::new();
+        let user = Cpu::new();
+        let vm = vm_with(&file, &info, &user, LR);
+        let mut wire = madvise_wire(0x10_0000, 0x1000, 1, 1, 0, 0);
+        put32(&mut wire, 24, vm);
+        user.wire.store(64, &wire);
+        let call = |user: &Cpu| {
+            narf_scheduler::block_on_spin(file.dispatch_user(&info, xe::MADVISE, 64, user))
+                .expect("native ioctl handled")
+        };
+        // No VMA in the range: nothing to advise.
+        let expected = if opted { Ok(0) } else { Err(FsError::InvalidData) };
+        assert_eq!(call(&user), expected, "{platform:?}");
+        // An unknown VM, and bad arguments on a known one.
+        put32(&mut wire, 24, vm + 100);
+        user.wire.store(64, &wire);
+        assert_eq!(call(&user), Err(FsError::InvalidData));
+        put32(&mut wire, 24, vm);
+        put32(&mut wire, 32, 9);
+        user.wire.store(64, &wire);
+        assert_eq!(call(&user), Err(FsError::InvalidData));
+    }
+
+    // Battlemage: a discrete mirror VM with one CPU page at CPU.
+    const CPU: u64 = 0x50_0000;
+    let info = DeviceInfo {
+        device_id: 0xe20b,
+        platform: GtPlatform::Battlemage,
+        memory_bytes: 0x8000_0000,
+        hwconfig: None,
+        topology: None,
+        vram: None,
+        backend: Some(Arc::new(Facts {
+            platform: GtPlatform::Battlemage,
+            svm: true,
+        })),
+    };
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let page = create_bo(&file, &info, &user, 4096, 0);
+    *user.mapping.lock() = Some(file.gem.object(page).unwrap().backing(0, 4096).unwrap());
+    user.space
+        .map_region(cpu_vma(CPU, RegionPerms::READ | RegionPerms::WRITE))
+        .unwrap();
+    let vm = Vm::with_svm(
+        true,
+        true,
+        true,
+        Some(Mirror {
+            space: user.space.identity(),
+            remote: None,
+            discrete: true,
+        }),
+    )
+    .unwrap();
+    let svm = vm.svm.as_ref().unwrap();
+    let mut state = narf_scheduler::block_on_spin(vm.state.lock());
+    svm.set_vmas(&state, alloc::vec![MirrorVma::new(0x40_0000, 0x60_0000, 2, false, false)]);
+    let advise = |state: &mut _, advice| {
+        madvise::apply(
+            &vm,
+            state,
+            &Madvise {
+                vm_id: 0,
+                start: 0x40_0000,
+                end: 0x60_0000,
+                advice,
+            },
+        )
+    };
+    // DEFAULT_DEVICE is admitted; a device fd needs a drm_pagemap.
+    let preferred = |devmem_fd| Advice::PreferredLoc {
+        devmem_fd,
+        migration_policy: 0,
+    };
+    advise(&mut state, preferred(0)).unwrap();
+    assert_eq!(advise(&mut state, preferred(3)), Err(FsError::NotFound));
+    // PREFETCH to region 1 (VRAM): prefetch_ranges collects system pages.
+    svm.prefetch(&vm, &state, CPU, 0x1000, 1, &user).unwrap();
+    let range = svm.range_mapping(CPU).expect("prefetched range");
+    assert!(!range.object.as_ref().unwrap().is_vram());
+    // Atomic faults: DRM_XE_ATOMIC_CPU is -EACCES on a dGPU; under DEVICE
+    // the range (already valid) is served from system memory.
+    let atomic = guc::PageFault::from_guc(&fault_desc(CPU, guc::ACCESS_ATOMIC as u32, 1)).unwrap();
+    advise(&mut state, Advice::Atomic(madvise::ATOMIC_CPU)).unwrap();
+    assert_eq!(guc::service(&vm, &state, &atomic, &user), Err(FsError::PermissionDenied));
+    advise(&mut state, Advice::Atomic(madvise::ATOMIC_DEVICE)).unwrap();
+    // The advice zapped the range: the fault collects it again.
+    assert_eq!(guc::service(&vm, &state, &atomic, &user), Ok((CPU, CPU + 0x1000)));
+    let range = svm.range_mapping(CPU).expect("refaulted range");
+    assert!(!range.object.as_ref().unwrap().is_vram());
+    drop(state);
+    user.mapping.lock().take();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xe",
+    smoke_xe_madvise_option_off_and_battlemage_system_pages
 );
