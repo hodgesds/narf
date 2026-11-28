@@ -508,6 +508,26 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             }
             ctx.set_return(SyscallReturn::ok(task_mdwe(current_task_id())));
         }
+        PR_FUTEX_HASH => {
+            // `kernel/sys.c`: `prctl_get_futex_hash` returns the number
+            // of slots in the process's private futex hash, or 0 when
+            // the global hash is in use.
+            //
+            // LINUX-GAP (deliberate divergence): NARF has no private
+            // hash — one global table of `FUTEX_BUCKET_COUNT` (64)
+            // buckets backs every futex — so GET_SLOTS reports 64, the
+            // actual global bucket count, rather than Linux-literal 0.
+            // That is what the perf bench footer needs: it prints
+            // "global hash" only when the prctl fails, and a 0 here
+            // would hide the real table size. SET_SLOTS is out of scope
+            // (nothing to resize); any other sub-op is EINVAL.
+            match arg_a {
+                PR_FUTEX_HASH_GET_SLOTS => {
+                    ctx.set_return(SyscallReturn::ok(FUTEX_BUCKET_COUNT as u64));
+                }
+                _ => ctx.set_return(errno_ret(EINVAL)),
+            }
+        }
         _ => {
             // `kernel/sys.c::SYSCALL_DEFINE5(prctl)` `default:` arm:
             //     trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);

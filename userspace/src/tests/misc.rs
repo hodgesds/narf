@@ -1510,6 +1510,29 @@ fn smoke_userspace_prctl_name_round_trip() -> TestResult {
         return TestResult::Fail("prctl(99) must return -EINVAL");
     }
 
+    // PR_FUTEX_HASH = 78: GET_SLOTS (2) reports NARF's global 64-bucket
+    // futex table (`FUTEX_BUCKET_COUNT`); SET_SLOTS (1) and unknown
+    // sub-ops are EINVAL (SET_SLOTS is out of scope — there is no
+    // per-process private hash to resize).
+    let r = call(78, 2);
+    let slots_ok = matches!(
+        r,
+        Some(rr) if rr.status == SyscallReturn::OK && rr.value == 64,
+    );
+    if !slots_ok {
+        return TestResult::Fail("PR_FUTEX_HASH GET_SLOTS did not return 64");
+    }
+    for sub in [1u64, 99] {
+        let r = call(78, sub);
+        let rejected = matches!(
+            r,
+            Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-22i64) as u64,
+        );
+        if !rejected {
+            return TestResult::Fail("PR_FUTEX_HASH non-GET_SLOTS must return -EINVAL");
+        }
+    }
+
     crate::handlers::__test_prctl_reset();
     __test_clear_global();
     TestResult::Pass
