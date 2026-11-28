@@ -767,6 +767,13 @@ fn place(pid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
     dst.members.lock().insert(pid);
     mutate_task_cgroup(|membership| membership.insert(pid, dst.clone()));
     migrate_domain_threads(pid, dst);
+    // An explicit move to a different cgroup: one cgroup switch for the
+    // moved process's task. A same-cgroup write returned above, a failed
+    // move returned an error, and fork/boot inheritance goes through
+    // `place_forced` — none of those count.
+    if let Some(task) = narf_scheduler::cgroup::task_id_for_process(pid) {
+        narf_lib::perf::note_sw_event(task, narf_lib::perf::SW_CGROUP_SWITCHES);
+    }
     if let Some(prev) = &prev {
         prev.notify_events();
     }
@@ -873,7 +880,9 @@ fn migrate_domain_threads(pid: u64, dst: &Arc<Cgroup>) {
     }
 }
 
-fn place_thread(tid: u64, tgid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
+/// Move one thread into `dst`. Returns whether the thread actually moved
+/// (false when it was already there) so the caller can count a real move.
+fn place_thread(tid: u64, tgid: u64, dst: &Arc<Cgroup>) -> Result<bool, FsError> {
     if tid == 0 {
         return Err(FsError::InvalidData);
     }
@@ -889,7 +898,7 @@ fn place_thread(tid: u64, tgid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
         if tgid != 0 {
             THREAD_TGID.lock().entry(tid).or_insert(tgid);
         }
-        return Ok(());
+        return Ok(false);
     }
     if let Some(old) = &previous {
         detach_chain(old, tid);
@@ -910,7 +919,7 @@ fn place_thread(tid: u64, tgid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
         THREAD_TGID.lock().insert(tid, tgid);
     }
     dst.notify_events();
-    Ok(())
+    Ok(true)
 }
 
 /// Ordinary CLONE_THREAD inheritance: the new Linux TID starts in the
@@ -938,7 +947,14 @@ pub fn attach_thread_by_path(
     if !Arc::ptr_eq(&threaded_domain(&src), &threaded_domain(&dst)) {
         return Err(FsError::Unsupported);
     }
-    place_thread(child_tid, parent_tgid, &dst)
+    if place_thread(child_tid, parent_tgid, &dst)? {
+        // An explicit single-thread move to a different cgroup: one
+        // cgroup switch for the moved thread. Inheritance
+        // (`fork_thread_inherit`) goes through `place_thread` directly
+        // and never counts; a same-cgroup move returns false.
+        narf_lib::perf::note_sw_event(child_tid, narf_lib::perf::SW_CGROUP_SWITCHES);
+    }
+    Ok(())
 }
 
 /// `CLONE_INTO_CGROUP` (clone3): place the freshly-cloned `pid` into the

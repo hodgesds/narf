@@ -2652,6 +2652,9 @@ pub fn install_user_task_hooks() {
     // CPU time needs no hook: the scheduler's `cputime` accounting follows
     // the trap boundary and every switch of the own-stack continuation.
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
+    // Task-bound software counters (page faults, migrations, alignment,
+    // cgroup switches) are attributed through this hook by `narf_lib::perf`.
+    narf_lib::perf::set_sw_event_hook(crate::perf_event::note_task_sw_event);
     // Lets the scheduler's park-with-CPU-local-state report name the system
     // call the offending task is in.
     narf_scheduler::stackful::set_park_syscall_hook(crate::handlers::park_syscall_frame);
@@ -4409,6 +4412,9 @@ pub fn install_user_task_hooks() {
     install_execve_hook(user_task_execve_hook);
     install_freezer_hooks();
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
+    // Task-bound software counters (page faults, migrations, alignment,
+    // cgroup switches) are attributed through this hook by `narf_lib::perf`.
+    narf_lib::perf::set_sw_event_hook(crate::perf_event::note_task_sw_event);
     narf_scheduler::stackful::set_park_syscall_hook(crate::handlers::park_syscall_frame);
     narf_scheduler::stackful::enable_user_own_stack();
 }

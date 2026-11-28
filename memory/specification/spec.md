@@ -907,6 +907,20 @@ impl AddressSpace {
         &self,
         vaddr: VirtAddr,
     ) -> Result<(), AddressSpaceError>;
+    /// The fault-serving twin of `demand_alloc_page`: identical, except the
+    /// faulting task's id rides along as `fault_task` so the resolution can
+    /// be counted as a minor or major fault for that task (swap-in: major;
+    /// already-backed repair, device-revoke refault, anonymous zero fill,
+    /// and page-cache hit: minor; file read: major, counted at the fill
+    /// decision inside `demand_frame_inner`). `fault_task == 0` means a
+    /// non-fault caller and counts nothing; every other caller (mlock, GUP,
+    /// remote access, tests) keeps the unattributed entry point.
+    ///
+    /// pub unsafe fn demand_alloc_page_for_fault(
+    ///     &self,
+    ///     vaddr: VirtAddr,
+    ///     fault_task: u64,
+    /// ) -> Result<(), AddressSpaceError>;
     /// When a peer owns the exact page's demand ticket, release the region
     /// lock and wait through `install_demand_page_wait_hook` before retrying
     /// the instruction. It is not a resolved fault while that ticket is live.

@@ -2060,7 +2060,22 @@ Linux perf wire definitions are owned by the separate
 `narf-linux-perf-uapi` crate, transcribed through `PERF_ATTR_SIZE_VER9` from
 Linux `include/uapi/linux/perf_event.h`. Defining a UAPI value does not admit
 it: userspace accepts only implemented attribute bits and exact event
-backends. Software events are currently limited to `PERF_COUNT_SW_DUMMY`.
+backends. Software events count for real: `PERF_COUNT_SW_DUMMY` (specified
+zero), `PERF_COUNT_SW_CPU_CLOCK` / `PERF_COUNT_SW_TASK_CLOCK` (scheduler
+ledgers), and `PERF_COUNT_SW_PAGE_FAULTS`, `PERF_COUNT_SW_CONTEXT_SWITCHES`,
+`PERF_COUNT_SW_CPU_MIGRATIONS`, `PERF_COUNT_SW_PAGE_FAULTS_MIN`,
+`PERF_COUNT_SW_PAGE_FAULTS_MAJ`, `PERF_COUNT_SW_ALIGNMENT_FAULTS`,
+`PERF_COUNT_SW_CGROUP_SWITCHES` (per-CPU counters in `narf_lib::perf` for
+CPU-wide events, direct attribution to task-bound events through the
+`note_sw_event` hook — fault entry for page faults, trap-handler heal sites
+for minor/major, the switch hook for context switches and migrations, the
+cgroup move commit for cgroup switches). All seven are counting-only:
+sampling one declines as EOPNOTSUPP. `PERF_COUNT_SW_EMULATION_FAULTS` has
+no countable source (no instruction-emulation path in the tree) and
+`PERF_COUNT_SW_BPF_OUTPUT` is a sink, not a counter (no PERF_EVENT_ARRAY
+map type, no `bpf_perf_event_output` helper); both still decline as
+EOPNOTSUPP. On aarch64 a major fault on a swapped page has no counting site
+yet (swap-in batching lives only in the x86_64 demand path).
 Hardware events require x86_64 and a real programmable PMU. Task-scoped events
 follow scheduler execution across CPUs; per-CPU events currently require a
 uniprocessor target matching the calling CPU.

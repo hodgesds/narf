@@ -1434,20 +1434,74 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
 }
 kernel_test_in!("syscall_abi/perf", smoke_abi_perf_event_open_validation);
 
-/// Software events Linux defines that NARF recognizes but does not count:
-/// page faults, context switches, CPU migrations, minor/major faults,
-/// alignment/emulation faults, BPF output, and cgroup switches have no
-/// scheduler, fault, emulation, BPF-output, or cgroup attribution backend
-/// yet, so the open declines them as EOPNOTSUPP — never estimated and
-/// never silently zero. The three implemented software events (dummy,
-/// cpu-clock, task-clock) still open.
-fn smoke_perf_software_unsupported_events() -> TestResult {
+/// Seven software events count for real; two still do not.
+///
+/// For each implemented event, open it task-bound (pid 0) and CPU-wide
+/// (pid -1, this CPU), enable both, drive exactly one occurrence through
+/// the `note_sw_event` hook the trap/switch/cgroup paths call, and assert
+/// both reads move by the driven amount. A note for a foreign task moves
+/// the CPU-wide total but never the task-bound event. Sampling stays
+/// counting-only (`sample_period != 0` → EOPNOTSUPP), and the two events
+/// with no countable source (emulation-faults, bpf-output) still decline
+/// as EOPNOTSUPP.
+///
+/// Preemption bounds: a timer tick can switch this task out mid-test,
+/// which adds a real context switch (and, if the task resumes on another
+/// CPU, a real migration). The context-switch and migration deltas are
+/// therefore `>= 1` where a tick could add, never exact; the other five
+/// events have no background source in this harness and assert exact.
+fn smoke_perf_software_counting_events() -> TestResult {
     with_setup(|| {
-        let open = |attr: &PerfEventAttr| {
-            call(
+        // Install the attribution hook explicitly: the test drives the
+        // hook the phenomenon paths call, so it must not depend on boot
+        // order having installed it already.
+        narf_lib::perf::set_sw_event_hook(crate::perf_event::note_task_sw_event);
+        let cpu = narf_lib::percpu::current_cpu();
+        let open_event = |config: u64, pid: i64, cpu: i64| -> Result<u32, &'static str> {
+            let attr = PerfEventAttr {
+                type_: PERF_TYPE_SOFTWARE,
+                size: core::mem::size_of::<PerfEventAttr>() as u32,
+                config,
+                ..PerfEventAttr::default()
+            };
+            match call(
                 Syscall::PerfEventOpen.raw(),
-                a3(attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
-            )
+                a3(
+                    &attr as *const _ as u64,
+                    pid as u64,
+                    cpu as u64,
+                    -1i32 as u64,
+                ),
+            ) {
+                Some(fd) if fd >= 0 => Ok(fd as u32),
+                _ => Err("perf_event_open rejected an implemented software event"),
+            }
+        };
+        let read_count = |fd: u32| -> Result<u64, &'static str> {
+            let mut buf = [0u64; 1];
+            match call(
+                Syscall::Read.raw(),
+                a2(fd as u64, buf.as_mut_ptr() as u64, 8),
+            ) {
+                Some(8) => Ok(buf[0]),
+                _ => Err("perf event read did not return one u64 count"),
+            }
+        };
+        let enable = |fd: u32| -> Result<(), &'static str> {
+            if call(Syscall::Ioctl.raw(), a2(fd as u64, PERF_EVENT_IOC_RESET, 0)) != Some(0)
+                || call(
+                    Syscall::Ioctl.raw(),
+                    a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+                ) != Some(0)
+            {
+                return Err("perf reset/enable ioctl failed");
+            }
+            Ok(())
+        };
+        // A preemption can add a real switch (and a real migration) to
+        // these two; every other event has no background source here.
+        let preemption_adds = |config: u64| {
+            config == PERF_COUNT_SW_CONTEXT_SWITCHES || config == PERF_COUNT_SW_CPU_MIGRATIONS
         };
         for config in [
             PERF_COUNT_SW_PAGE_FAULTS,
@@ -1456,17 +1510,84 @@ fn smoke_perf_software_unsupported_events() -> TestResult {
             PERF_COUNT_SW_PAGE_FAULTS_MIN,
             PERF_COUNT_SW_PAGE_FAULTS_MAJ,
             PERF_COUNT_SW_ALIGNMENT_FAULTS,
-            PERF_COUNT_SW_EMULATION_FAULTS,
-            PERF_COUNT_SW_BPF_OUTPUT,
+            PERF_COUNT_SW_CGROUP_SWITCHES,
+        ] {
+            let task_fd = open_event(config, 0, -1)?;
+            let cpu_fd = open_event(config, -1, cpu as i64)?;
+            enable(task_fd)?;
+            enable(cpu_fd)?;
+            let base_task = read_count(task_fd)?;
+            let base_cpu = read_count(cpu_fd)?;
+            narf_lib::perf::note_sw_event(FAKE_TASK, config);
+            let task_after = read_count(task_fd)?;
+            let cpu_after = read_count(cpu_fd)?;
+            if preemption_adds(config) {
+                if task_after < base_task + 1 || cpu_after < base_cpu + 1 {
+                    return Err("software counter did not move on a driven occurrence");
+                }
+            } else if task_after != base_task + 1 || cpu_after != base_cpu + 1 {
+                return Err("software counter did not move by exactly one driven occurrence");
+            }
+            // A foreign task's occurrence moves the CPU-wide total but
+            // never this task's event. (For the two switch events a
+            // preemption could add to the task-bound count too, so the
+            // no-move check runs only for the other five.)
+            narf_lib::perf::note_sw_event(FAKE_TASK + 1, config);
+            if !preemption_adds(config) {
+                if read_count(task_fd)? != task_after {
+                    return Err("foreign task occurrence leaked into a task-bound counter");
+                }
+                if read_count(cpu_fd)? != cpu_after + 1 {
+                    return Err("foreign task occurrence did not move the CPU-wide counter");
+                }
+            } else if read_count(cpu_fd)? < cpu_after + 1 {
+                return Err("foreign task occurrence did not move the CPU-wide counter");
+            }
+            let _ = call(Syscall::Close.raw(), a0(task_fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(cpu_fd as u64));
+        }
+        // Counting-only: sampling a software counter still declines.
+        for config in [
+            PERF_COUNT_SW_PAGE_FAULTS,
+            PERF_COUNT_SW_CONTEXT_SWITCHES,
+            PERF_COUNT_SW_CPU_MIGRATIONS,
+            PERF_COUNT_SW_PAGE_FAULTS_MIN,
+            PERF_COUNT_SW_PAGE_FAULTS_MAJ,
+            PERF_COUNT_SW_ALIGNMENT_FAULTS,
             PERF_COUNT_SW_CGROUP_SWITCHES,
         ] {
             let attr = PerfEventAttr {
                 type_: PERF_TYPE_SOFTWARE,
                 size: core::mem::size_of::<PerfEventAttr>() as u32,
                 config,
+                sample_type: 1, // PERF_SAMPLE_IP
+                sample_period_or_freq: 1000,
                 ..PerfEventAttr::default()
             };
-            match open(&attr) {
+            match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+            ) {
+                Some(EOPNOTSUPP) => {}
+                _ => {
+                    return Err("perf_event_open sampled a counting-only software event");
+                }
+            }
+        }
+        // Still no countable source, still EOPNOTSUPP — never estimated
+        // and never silently zero: emulation has no instruction-emulation
+        // path in the tree, and bpf-output is a sink, not a counter.
+        for config in [PERF_COUNT_SW_EMULATION_FAULTS, PERF_COUNT_SW_BPF_OUTPUT] {
+            let attr = PerfEventAttr {
+                type_: PERF_TYPE_SOFTWARE,
+                size: core::mem::size_of::<PerfEventAttr>() as u32,
+                config,
+                ..PerfEventAttr::default()
+            };
+            match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+            ) {
                 Some(EOPNOTSUPP) => {}
                 _ => {
                     return Err(
@@ -1480,22 +1601,179 @@ fn smoke_perf_software_unsupported_events() -> TestResult {
             PERF_COUNT_SW_CPU_CLOCK,
             PERF_COUNT_SW_TASK_CLOCK,
         ] {
+            let fd = open_event(config, 0, -1)?;
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/perf", smoke_perf_software_counting_events);
+
+/// The switch hook itself counts context switches and detects migrations:
+/// a switch-out/in pair on one CPU is one context switch and no migration;
+/// the migration table counts a switch-in on a different CPU than the
+/// recorded switch-out, counts nothing for a same-CPU pair, and counts
+/// nothing once the slot is cleared on thread exit.
+fn smoke_perf_software_switch_migration() -> TestResult {
+    with_setup(|| {
+        narf_lib::perf::set_sw_event_hook(crate::perf_event::note_task_sw_event);
+        let cpu = narf_lib::percpu::current_cpu();
+        let open_event = |config: u64, pid: i64, cpu: i64| -> Result<u32, &'static str> {
             let attr = PerfEventAttr {
                 type_: PERF_TYPE_SOFTWARE,
                 size: core::mem::size_of::<PerfEventAttr>() as u32,
                 config,
                 ..PerfEventAttr::default()
             };
-            let fd = match open(&attr) {
-                Some(fd) if fd >= 0 => fd as u32,
-                _ => return Err("perf_event_open rejected an implemented software event"),
-            };
+            match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(
+                    &attr as *const _ as u64,
+                    pid as u64,
+                    cpu as u64,
+                    -1i32 as u64,
+                ),
+            ) {
+                Some(fd) if fd >= 0 => Ok(fd as u32),
+                _ => Err("perf_event_open rejected a switch/migration event"),
+            }
+        };
+        let read_count = |fd: u32| -> Result<u64, &'static str> {
+            let mut buf = [0u64; 1];
+            match call(
+                Syscall::Read.raw(),
+                a2(fd as u64, buf.as_mut_ptr() as u64, 8),
+            ) {
+                Some(8) => Ok(buf[0]),
+                _ => Err("perf event read did not return one u64 count"),
+            }
+        };
+        let enable = |fd: u32| -> Result<(), &'static str> {
+            if call(Syscall::Ioctl.raw(), a2(fd as u64, PERF_EVENT_IOC_RESET, 0)) != Some(0)
+                || call(
+                    Syscall::Ioctl.raw(),
+                    a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+                ) != Some(0)
+            {
+                return Err("perf reset/enable ioctl failed");
+            }
+            Ok(())
+        };
+        let ctx_task = open_event(PERF_COUNT_SW_CONTEXT_SWITCHES, 0, -1)?;
+        let ctx_cpu = open_event(PERF_COUNT_SW_CONTEXT_SWITCHES, -1, cpu as i64)?;
+        let mig_task = open_event(PERF_COUNT_SW_CPU_MIGRATIONS, 0, -1)?;
+        let mig_cpu = open_event(PERF_COUNT_SW_CPU_MIGRATIONS, -1, cpu as i64)?;
+        for fd in [ctx_task, ctx_cpu, mig_task, mig_cpu] {
+            enable(fd)?;
+        }
+        let base_ctx_task = read_count(ctx_task)?;
+        let base_ctx_cpu = read_count(ctx_cpu)?;
+        let base_mig_task = read_count(mig_task)?;
+        let base_mig_cpu = read_count(mig_cpu)?;
+        // One switch-out/in pair through the hook this scheduler calls.
+        // A timer tick can add a real switch, so the context-switch
+        // delta is a lower bound; a same-CPU pair is never a migration.
+        crate::perf_event::on_task_switch(FAKE_TASK, false);
+        crate::perf_event::on_task_switch(FAKE_TASK, true);
+        if read_count(ctx_task)? < base_ctx_task + 1 || read_count(ctx_cpu)? < base_ctx_cpu + 1 {
+            return Err("switch hook did not count a driven context switch");
+        }
+        if read_count(mig_task)? != base_mig_task || read_count(mig_cpu)? != base_mig_cpu {
+            return Err("same-CPU switch pair counted a migration");
+        }
+        // The table itself: out on CPU 0, in on CPU 1 is one migration.
+        crate::perf_event::note_migration_switch_out(FAKE_TASK, 0);
+        crate::perf_event::note_migration_switch_in(FAKE_TASK, 1);
+        if read_count(mig_task)? != base_mig_task + 1 || read_count(mig_cpu)? != base_mig_cpu + 1 {
+            return Err("cross-CPU switch-in did not count exactly one migration");
+        }
+        // Same CPU out/in: no migration.
+        crate::perf_event::note_migration_switch_out(FAKE_TASK, 2);
+        crate::perf_event::note_migration_switch_in(FAKE_TASK, 2);
+        if read_count(mig_task)? != base_mig_task + 1 || read_count(mig_cpu)? != base_mig_cpu + 1 {
+            return Err("same-CPU switch-in counted a migration");
+        }
+        // A cleared slot (thread exit) cannot migrate on its next switch-in.
+        crate::perf_event::clear_migration_slot(FAKE_TASK);
+        crate::perf_event::note_migration_switch_in(FAKE_TASK, 5);
+        if read_count(mig_task)? != base_mig_task + 1 || read_count(mig_cpu)? != base_mig_cpu + 1 {
+            return Err("cleared migration slot counted a migration");
+        }
+        for fd in [ctx_task, ctx_cpu, mig_task, mig_cpu] {
             let _ = call(Syscall::Close.raw(), a0(fd as u64));
         }
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi/perf", smoke_perf_software_unsupported_events);
+kernel_test_in!("syscall_abi/perf", smoke_perf_software_switch_migration);
+
+/// An explicit cgroup move counts one cgroup switch for the moved task;
+/// a same-cgroup write counts nothing.
+#[cfg(feature = "cgroup")]
+fn smoke_perf_software_cgroup_switch_counts() -> TestResult {
+    with_setup(|| {
+        narf_lib::perf::set_sw_event_hook(crate::perf_event::note_task_sw_event);
+        let attr = PerfEventAttr {
+            type_: PERF_TYPE_SOFTWARE,
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: PERF_COUNT_SW_CGROUP_SWITCHES,
+            ..PerfEventAttr::default()
+        };
+        let fd = match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("perf_event_open rejected a cgroup-switches event"),
+        };
+        if call(Syscall::Ioctl.raw(), a2(fd as u64, PERF_EVENT_IOC_RESET, 0)) != Some(0)
+            || call(
+                Syscall::Ioctl.raw(),
+                a2(fd as u64, PERF_EVENT_IOC_ENABLE, 0),
+            ) != Some(0)
+        {
+            return Err("perf reset/enable ioctl failed");
+        }
+        let read_count = || -> Result<u64, &'static str> {
+            let mut buf = [0u64; 1];
+            match call(
+                Syscall::Read.raw(),
+                a2(fd as u64, buf.as_mut_ptr() as u64, 8),
+            ) {
+                Some(8) => Ok(buf[0]),
+                _ => Err("perf event read did not return one u64 count"),
+            }
+        };
+        let base = read_count()?;
+        let dir = b"/sys/fs/cgroup/t_perf_cg\0";
+        // Keep the hierarchy clean even if an assertion below fails.
+        narf_filesystem::cgroupfs::task_exited(FAKE_TASK);
+        let _ = call_rmdir(dir.as_ptr() as u64);
+        let outcome = (|| {
+            if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+                return Err("mkdir of perf test cgroup failed");
+            }
+            narf_filesystem::cgroupfs::attach_by_path("/t_perf_cg", FAKE_TASK)
+                .map_err(|_| "attaching the test task to the perf test cgroup failed")?;
+            if read_count()? != base + 1 {
+                return Err("explicit cgroup move did not count exactly one switch");
+            }
+            // A same-cgroup write is not a move: no count.
+            narf_filesystem::cgroupfs::attach_by_path("/t_perf_cg", FAKE_TASK)
+                .map_err(|_| "re-attaching to the same cgroup failed")?;
+            if read_count()? != base + 1 {
+                return Err("same-cgroup write counted a switch");
+            }
+            Ok(())
+        })();
+        narf_filesystem::cgroupfs::task_exited(FAKE_TASK);
+        let _ = call_rmdir(dir.as_ptr() as u64);
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        outcome
+    })
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!("syscall_abi/perf", smoke_perf_software_cgroup_switch_counts);
 
 /// The context-switch hook's fast gates (Linux `perf_sched_events` plus the
 /// per-task `perf_event_ctxp` test) follow event lifetime exactly: a

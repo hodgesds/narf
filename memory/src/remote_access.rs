@@ -272,7 +272,9 @@ impl AddressSpace {
                 PageStep::FaultIn => {
                     // SAFETY: forwarded caller contract; the demand path is
                     // the one a hardware fault on this page would take.
-                    match unsafe { self.demand_page_in(VirtAddr::new(page), access.force) } {
+                    // A remote access is not a fault: fault_task 0, so the
+                    // fill counts nothing.
+                    match unsafe { self.demand_page_in(VirtAddr::new(page), access.force, 0) } {
                         Ok(()) => {}
                         Err(_) => return false,
                     }
