@@ -720,11 +720,6 @@ fn mmput(space: &Arc<AddressSpace>) {
 /// enough that an exec storm still defers in the common case.
 const MAX_DEFERRED_AS_TEARDOWNS: usize = 4;
 
-/// Do not defer an address-space teardown while the frame allocator is this
-/// low: under pressure the frames come back now, inline, instead of after a
-/// worker round-trip. 4096 base pages = 16 MiB.
-const DEFER_MIN_FREE_FRAMES: usize = 4096;
-
 /// Teardowns accepted by `mmput_deferred` and not yet run by the reclaimer.
 static DEFERRED_AS_TEARDOWNS: AtomicUsize = AtomicUsize::new(0);
 
@@ -757,6 +752,29 @@ fn as_teardown_work_fn(r: workqueue::WorkRef) {
     let _ = unsafe { Box::from_raw(container as *mut AsTeardownWork) };
 }
 
+/// True when the executing CPU's NUMA node is under its `low` watermark —
+/// the per-node signal its `kswapd<node>` should reclaim — or, when SRAT
+/// topology wasn't published, when free memory is under the global `low`
+/// watermark. `mmput_deferred` keys its inline fallback off this instead of
+/// a global free-frames count: on a multi-node machine one pressured node
+/// must not force every teardown inline, and a low global count with no node
+/// under reclaim pressure is not a reason to stop deferring.
+///
+/// Why the local node, not the displaced space's exact nodes:
+/// `AddressSpace` only exposes per-node residency via
+/// `numa_regions_snapshot()`, which walks all regions and allocates a `Vec`
+/// — too expensive for a fallback predicate on the execve path. The
+/// exec'ing task runs on the current CPU and its pages were allocated
+/// preferentially on that node, so the local node is the faithful cheap
+/// proxy. `low`, not `min`: `low` is the "reclaim should run" signal;
+/// `min` is the emergency reserve.
+fn node_under_reclaim_pressure() -> bool {
+    match local_node() {
+        Some(node) => narf_memory::reclaim::under_low_watermark_node(node as usize),
+        None => narf_memory::reclaim::under_low_watermark(),
+    }
+}
+
 /// Deferred `mmput` for a displaced address space (execve E2).
 ///
 /// Instead of running `exit_mmap` inline on the execve path, hand the
@@ -780,13 +798,13 @@ fn as_teardown_work_fn(r: workqueue::WorkRef) {
 /// thereby prevent the zero transition.
 ///
 /// Falls back to inline `mmput` when the deferred queue is at its bound,
-/// when free frames are below the watermark, or when no workqueue pool
-/// exists yet (pre-boot). `exit_mm` (process exit) keeps the inline path.
+/// when the executing CPU's NUMA node is under its `low` watermark (or the
+/// global `low` watermark when topology is unpublished), or when no
+/// workqueue pool exists yet (pre-boot). `exit_mm` (process exit) keeps the
+/// inline path.
 fn mmput_deferred(space: &Arc<AddressSpace>) {
     let previous = DEFERRED_AS_TEARDOWNS.fetch_add(1, Ordering::AcqRel);
-    if previous >= MAX_DEFERRED_AS_TEARDOWNS
-        || narf_memory::frame::stats().free < DEFER_MIN_FREE_FRAMES
-    {
+    if previous >= MAX_DEFERRED_AS_TEARDOWNS || node_under_reclaim_pressure() {
         DEFERRED_AS_TEARDOWNS.fetch_sub(1, Ordering::AcqRel);
         mmput(space);
         return;

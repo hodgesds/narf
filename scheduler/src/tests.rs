@@ -2412,6 +2412,127 @@ kernel_test_in!(
     smoke_scheduler_deferred_as_teardown_falls_back_inline_when_bounded
 );
 
+/// At the local node's `low` watermark the execve path falls back to inline
+/// `mmput` (execve E2): with the node driven under `low`, `replace` runs
+/// `exit_mmap` synchronously — the count has already advanced by the time
+/// the task records it — and queues no reclaimer work, so the pending count
+/// is unchanged. The live watermark band is restored before asserting.
+fn smoke_scheduler_deferred_as_teardown_falls_back_inline_when_node_under_low_watermark(
+) -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::task::{Context, Poll};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    static GATE: AtomicBool = AtomicBool::new(false);
+    static RECORDED: AtomicU64 = AtomicU64::new(u64::MAX);
+    GATE.store(false, Ordering::Relaxed);
+    RECORDED.store(u64::MAX, Ordering::Relaxed);
+
+    struct Gate;
+    impl Future for Gate {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if GATE.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    let Some(node) = crate::local_node() else {
+        return TestResult::Skip("NUMA topology unpublished");
+    };
+
+    crate::__reset_queues_for_test();
+    // SAFETY: paging is live in the kernel-test environment.
+    let old_mm = Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc old AS"));
+    let frame = narf_memory::alloc_frame().expect("fixture frame");
+    let phys = frame.start_address();
+    unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0x5a, 4096) };
+    old_mm
+        .map_region(Region {
+            base: VirtAddr::new(AddressSpace::USER_FIXED_FLOOR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![phys].into(),
+        })
+        .expect("map fixture region");
+    let old_weak = Arc::downgrade(&old_mm);
+    let replacement =
+        Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc replacement AS"));
+    let replacement_for_poll = Arc::clone(&replacement);
+    let task = crate::alloc_task_id();
+    let before = crate::exit_mmap_stats().0;
+
+    // Save the live watermark band so it can be restored before asserting.
+    let saved_total = narf_memory::frame::stats().total;
+    let saved_min = narf_memory::reclaim::watermark_min();
+    let saved_scale = narf_memory::reclaim::watermark_scale_factor();
+    let restore_watermarks = || {
+        narf_memory::reclaim::init_watermarks(saved_total);
+        narf_memory::reclaim::set_min_free_pages(saved_min);
+        narf_memory::reclaim::set_watermark_scale_factor(saved_scale);
+    };
+    // Drive every node under `low`: with total 512 the node's share of
+    // `low` is 1.25x its total pages, strictly above its free pages on any
+    // RAM size, on either node — so whichever CPU runs the task, the
+    // fallback predicate fires.
+    narf_memory::reclaim::init_watermarks(512);
+    if !narf_memory::reclaim::under_low_watermark_node(node as usize) {
+        restore_watermarks();
+        return TestResult::Fail("watermark drive did not put the local node under low");
+    }
+
+    crate::spawn_user(
+        task,
+        async move {
+            let _ = crate::replace_address_space(task, Arc::clone(&replacement_for_poll));
+            let _ = replacement_for_poll.activate();
+            RECORDED.store(crate::exit_mmap_stats().0, Ordering::Release);
+            Gate.await;
+        },
+        crate::TaskSpec::unthrottled(),
+        Arc::clone(&old_mm),
+    );
+
+    // Drive until the task has run its replace (recorded) — no worker
+    // should ever fire on this path.
+    if !rounds_until(1000, || RECORDED.load(Ordering::Acquire) != u64::MAX) {
+        restore_watermarks();
+        GATE.store(true, Ordering::Release);
+        crate::run_until_empty();
+        return TestResult::Fail("watermark test task never ran its replace");
+    }
+    let recorded = RECORDED.load(Ordering::Acquire);
+    let pending = crate::__deferred_as_teardowns_for_test();
+    restore_watermarks();
+    GATE.store(true, Ordering::Release);
+    crate::run_until_empty();
+    drop(old_mm);
+    drop(replacement);
+    if recorded != before + 1 {
+        return TestResult::Fail("watermark teardown did not run exit_mmap inline");
+    }
+    if pending != 0 {
+        return TestResult::Fail("watermark teardown queued reclaimer work it should not have");
+    }
+    if old_weak.upgrade().is_some() {
+        return TestResult::Fail("watermark teardown leaked the old address space");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_deferred_as_teardown_falls_back_inline_when_node_under_low_watermark
+);
+
 // ── relocated from verification ──
 
 fn smoke_sleep_future_waits() -> TestResult {
