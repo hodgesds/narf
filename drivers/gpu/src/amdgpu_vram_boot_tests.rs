@@ -1061,10 +1061,16 @@ fn navi31_vram_checks_gmc11_dcn32_and_training() -> TestResult {
         return TestResult::Fail("Navi31 plan accepted mismatched FB geometry");
     }
     regs[0x477] -= 1;
+    // The size comes from RCC_CONFIG_MEMSIZE, not FB_LOCATION_TOP: Linux
+    // amdgpu_gmc_vram_location derives fb_end = fb_start + mc_vram_size - 1
+    // and never consults FB TOP, so a MEMSIZE smaller than the FB triplet's
+    // implied aperture is accepted with a MEMSIZE-sized plan, exactly as
+    // the Navi22 sibling test documents for the same arm.
     gpu.vram.size = 8 << 30;
     // SAFETY: same RAM-only read fixture.
-    if unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
-        return TestResult::Fail("Navi31 plan accepted a bar smaller than the framebuffer");
+    match unsafe { Plan::read_navi31(&gpu, &cap, None, &[]) } {
+        Ok(plan) if plan.vram_size() == 8 << 30 => {}
+        _ => return TestResult::Fail("8 GiB VRAM not inventoried from MEMSIZE"),
     }
     gpu.vram.size = 16 << 30;
     // A fourth-pipe cursor is a protected client, not a free page. DCN 3.1.4
