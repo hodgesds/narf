@@ -2732,6 +2732,16 @@ task and provides `procfs::ProcessIo`. Both syscall dispatch paths contribute
 completed read/write-family calls. Block submission retains the issuing thread
 group's storage counters across asynchronous completion and process exit.
 
+Character and syscall counters (`rchar`, `wchar`, `syscr`, `syscw`) live on each
+refcounted `Task`, start at zero for a new task (including a thread clone), and
+follow it across CPU migration. Syscall accounting borrows the current task's
+published owner and updates relaxed atomic counters without a shared lock,
+registry lookup, allocation, or interrupt masking. Remote `/proc` readers pin
+the task and sample each counter atomically; the fields are not one transactional
+snapshot. Counters saturate at `u64::MAX`. Failed and zero-byte calls still count
+as attempts; a parked call reissued by the kernel adds only transferred bytes.
+Exec retains the task's counters, and the last task reference releases them.
+
 ### 3.7 IA-32 compat ABI (x86_64)
 
 NARF runs i386 Linux programs the way Linux does with `CONFIG_IA32_EMULATION`

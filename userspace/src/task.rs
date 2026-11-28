@@ -127,6 +127,10 @@ pub struct Task {
     /// threads and reaped children. Shared by every `CLONE_THREAD` sibling.
     pub(crate) process_cputime: Arc<crate::proc_cpu_time::ProcessCputime>,
     pub(crate) storage_io: Arc<narf_block::stats::ProcessStorageIo>,
+    /// This task's read/write bytes and syscall attempts. Unlike storage I/O,
+    /// these counters are not shared with CLONE_THREAD siblings. Current-task
+    /// updates borrow the published owner; remote procfs reads use atomics.
+    pub(crate) io_accounting: crate::io_accounting::TaskIoCounters,
     /// Slices that ended because the task PARKED (`nr_voluntary_switches`).
     voluntary_switches: AtomicU64,
     /// Slices that ended any other way — the trap returned and the task was
@@ -280,6 +284,7 @@ impl Task {
             cputime,
             process_cputime,
             storage_io,
+            io_accounting: crate::io_accounting::TaskIoCounters::default(),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
             parked_this_slice: AtomicU32::new(0),

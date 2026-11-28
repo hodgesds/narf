@@ -4192,47 +4192,51 @@ kernel_test_in!(
 /// drives a failing read as well and asserts `syscr` moved while `rchar`
 /// did not. Every field used to be hardcoded to 0.
 fn smoke_proc_pid_io_counts_reads_and_failures() -> TestResult {
+    crate::abi_test_support::with_setup(check_proc_pid_io_counts_reads_and_failures)
+}
+
+fn check_proc_pid_io_counts_reads_and_failures() -> Result<(), &'static str> {
     use crate::handlers::{__test_io_accounting_reset, io_accounting_of};
     __test_io_accounting_reset();
     let task = crate::handlers::current_task_id();
 
     let before = io_accounting_of(task);
     if before.rchar != 0 || before.syscr != 0 {
-        return TestResult::Fail("reset should zero the accounting");
+        return Err("reset should zero the accounting");
     }
 
     // A successful read moves both halves.
     crate::handlers::io_account_read(task, 128);
     let a = io_accounting_of(task);
     if a.rchar != 128 || a.syscr != 1 {
-        return TestResult::Fail("a successful read must move rchar and syscr");
+        return Err("a successful read must move rchar and syscr");
     }
 
     // A failed read (-EBADF) moves ONLY the syscall counter.
     crate::handlers::io_account_read(task, -9);
     let b = io_accounting_of(task);
     if b.rchar != 128 {
-        return TestResult::Fail("a failed read must not move rchar");
+        return Err("a failed read must not move rchar");
     }
     if b.syscr != 2 {
-        return TestResult::Fail("a failed read must still count in syscr");
+        return Err("a failed read must still count in syscr");
     }
 
     // EOF (0 bytes) is likewise a call but no bytes.
     crate::handlers::io_account_read(task, 0);
     let c = io_accounting_of(task);
     if c.rchar != 128 || c.syscr != 3 {
-        return TestResult::Fail("a zero-byte read must count in syscr only");
+        return Err("a zero-byte read must count in syscr only");
     }
 
     // The write side is independent of the read side.
     crate::handlers::io_account_write(task, 64);
     let d = io_accounting_of(task);
     if d.wchar != 64 || d.syscw != 1 {
-        return TestResult::Fail("a write must move wchar and syscw");
+        return Err("a write must move wchar and syscw");
     }
     if d.rchar != 128 || d.syscr != 3 {
-        return TestResult::Fail("a write must not disturb the read counters");
+        return Err("a write must not disturb the read counters");
     }
 
     // ── The dispatch shim, end to end ──
@@ -4284,10 +4288,10 @@ fn smoke_proc_pid_io_counts_reads_and_failures() -> TestResult {
     kernel_syscall_entry(crate::Syscall::Read.raw(), &mut ctx);
     let e = io_accounting_of(crate::handlers::current_task_id());
     if e.syscr != 1 {
-        return TestResult::Fail("a read(2) through the syscall entry must count in syscr");
+        return Err("a read(2) through the syscall entry must count in syscr");
     }
     if e.rchar != 0 {
-        return TestResult::Fail("a failing read(2) must not move rchar");
+        return Err("a failing read(2) must not move rchar");
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -4306,13 +4310,66 @@ fn smoke_proc_pid_io_counts_reads_and_failures() -> TestResult {
         );
         let counts = io_accounting_of(crate::handlers::current_task_id());
         if ret.value as i64 != -9 || counts.syscw != 1 || counts.wchar != 0 || counts.syscr != 1 {
-            return TestResult::Fail("x86 SYSCALL must count one failed write and preserve EBADF");
+            return Err("x86 SYSCALL must count one failed write and preserve EBADF");
         }
     }
     __test_io_accounting_reset();
-    TestResult::Pass
+    Ok(())
 }
 kernel_test_in!(
     "userspace/io_accounting",
     smoke_proc_pid_io_counts_reads_and_failures
+);
+
+fn smoke_task_io_accounting_isolation_reissue_and_lifetime() -> TestResult {
+    crate::abi_test_support::with_setup(|| {
+        use crate::handlers::{io_accounting_of, TaskIoAccounting};
+        let parent = crate::handlers::current_task_id();
+        crate::handlers::__test_io_accounting_reset();
+        crate::handlers::io_account_read(parent, 16);
+        let parent_before = io_accounting_of(parent);
+
+        // A CLONE_THREAD sibling shares a pid and storage-I/O owner, but has
+        // fresh character/syscall counters. Retaining its Arc also models a
+        // procfs reader racing the removal of the task's registry reference.
+        let tid = narf_scheduler::alloc_task_id().raw();
+        let child = crate::task::Task::new_registered(tid, parent);
+        struct Reap(u64);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                crate::task::release_task(self.0);
+            }
+        }
+        let reap = Reap(tid);
+        if io_accounting_of(tid) != TaskIoAccounting::default() {
+            return Err("new sibling inherited another task's I/O counters");
+        }
+        crate::handlers::io_account_read(tid, -11);
+        crate::handlers::io_account_reissued(tid, true, 32);
+        crate::handlers::io_account_reissued(tid, true, 0);
+        crate::handlers::io_account_write(tid, -11);
+        crate::handlers::io_account_reissued(tid, false, 8);
+        crate::handlers::io_account_reissued(tid, false, -11);
+        let expected = TaskIoAccounting {
+            rchar: 32,
+            wchar: 8,
+            syscr: 1,
+            syscw: 1,
+        };
+        if io_accounting_of(tid) != expected || io_accounting_of(parent) != parent_before {
+            return Err("reissued I/O counted twice or changed another task's counters");
+        }
+        drop(reap);
+        crate::handlers::io_account_read(tid, 64);
+        if io_accounting_of(tid) != TaskIoAccounting::default()
+            || child.io_accounting.snapshot() != expected
+        {
+            return Err("reaped task was recreated or its retained snapshot was invalidated");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/io_accounting",
+    smoke_task_io_accounting_isolation_reissue_and_lifetime
 );
