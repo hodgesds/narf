@@ -20,6 +20,7 @@ Start with the guide that matches the job at hand:
   manifests, signing, loading, and isolation-domain selection.
 - [Pluggability](PLUGGABILITY.md) — capability-gated policy replacement; this
   is distinct from loading a new binary module.
+- [Communication](COMMUNICATION.md) — how communication in this project works.
 - [Testing](../TESTING.md) and [current status](../STATUS.md) — authoritative
   verification commands and milestone state.
 
