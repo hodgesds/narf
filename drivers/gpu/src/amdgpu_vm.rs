@@ -28,18 +28,14 @@
 //! with an HDP flush, `amdgpu_vm_cpu_commit`), else in system RAM.
 //!
 //! Native submitters bind each client's materialised root to a per-job VMID
-//! and emit ring-side invalidations when tlb_seq changes. Removed mappings
-//! retain their BOs until the jobs that could still use them have completed;
-//! the next grant flushes stale translations before executing another IB.
-//!
-//! LINUX-GAP: `AMDGPU_VM_PAGE_PRT` (partially-resident textures) is validated
-//! but refused. PRT maps a range with no backing at all and relies on the
-//! `PRT`/`TF` PTE bits to fault gracefully; it is a sparse-residency feature no
-//! client needs before basic submission works.
+//! and emit ring-side invalidations when tlb_seq changes. Destructive VA
+//! updates wait for this space's jobs before changing its live tables;
+//! retaining only the removed BOs would not preserve their translations.
+//! The next grant flushes stale translations before executing another IB.
 //!
 //! LINUX-GAP: `AMDGPU_VM_DELAY_UPDATE` is accepted and ignored. It asks the
-//! kernel to batch the page-table write until the next submission, and with no
-//! page-table writes at all there is nothing to defer.
+//! kernel to batch the page-table write until the next submission; this
+//! implementation performs CPU updates synchronously with the VA ioctl.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -1132,8 +1128,10 @@ impl VmInner {
     /// `amdgpu_vm_clear_freed` and then the BO references: count the removal
     /// in the TLB sequence (so any later job flushes its VMID), restore the
     /// invalid pattern over `[va, va+size)`, and only then release `removed`
-    /// — deferred past every job already submitted in this space, which may
-    /// still hold the old translations in its TLB.
+    /// through the deferred lifetime path. A destructive ioctl must retire
+    /// this space's jobs before reaching here; retaining the BO alone cannot
+    /// keep a running shader's translation valid. MAP rollback only removes
+    /// a fresh range that was never admitted for submission.
     fn retire_range(&self, va: u64, size: u64, removed: Vec<alloc::sync::Arc<MappedObject>>) {
         if !removed.is_empty() {
             self.tlb_seq
@@ -1251,15 +1249,23 @@ pub fn dispatch(
     if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA {
         return Err(FsError::Unsupported);
     }
+    let bytes = copy_va_request(cmd, arg)?;
     let _placement = match vm.card() {
         Some(card) => Some(crate::amdgpu_gem::try_placement_live(card)?.ok_or(FsError::Busy)?),
         None => None,
     };
-    dispatch_inner(cmd, arg, vm, gem, syncobjs)
+    if let Some(MappingDependencies { engine, jobs }) = mapping_dependencies(vm, &bytes)? {
+        for ticket in jobs {
+            if !engine.retired(ticket) {
+                return Err(engine.error(ticket).unwrap_or(FsError::Busy));
+            }
+        }
+    }
+    dispatch_inner(&bytes, vm, gem, syncobjs)
 }
 
-/// User ioctl path parks for an in-progress relocation instead of reporting
-/// transient contention as a VA mapping failure.
+/// User ioctl path parks for relocation admission and, for destructive
+/// updates, the VM's outstanding jobs before editing live page tables.
 pub async fn dispatch_async(
     cmd: u32,
     arg: usize,
@@ -1270,6 +1276,12 @@ pub async fn dispatch_async(
     if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_VA {
         return None;
     }
+    // Snapshot before parking and execute that same request afterwards. A
+    // second user copy could turn a MAP into an unchecked destructive edit.
+    let bytes = match copy_va_request(cmd, arg) {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(Err(error)),
+    };
     let _placement = match vm.card() {
         Some(card) => match crate::amdgpu_gem::lock_placement_live(card).await {
             Ok(guard) => Some(guard),
@@ -1277,16 +1289,64 @@ pub async fn dispatch_async(
         },
         None => None,
     };
-    Some(dispatch_inner(cmd, arg, vm, gem, syncobjs))
+    Some(
+        async {
+            if let Some(MappingDependencies { engine, jobs }) = mapping_dependencies(vm, &bytes)? {
+                let deadline = narf_time::monotonic_ns().saturating_add(5_000_000_000);
+                for ticket in jobs {
+                    if engine.retired(ticket) {
+                        continue;
+                    }
+                    let result = engine.wait(ticket, deadline).await;
+                    // A failed fence can wake its clients before hardware has
+                    // stopped using the mapping. Only retirement permits edits.
+                    // Conversely, a completed queue reset may retire an errored
+                    // job: allow cleanup in that case.
+                    if !engine.retired(ticket) {
+                        result?;
+                        return Err(engine.error(ticket).unwrap_or(FsError::Busy));
+                    }
+                }
+            }
+            dispatch_inner(&bytes, vm, gem, syncobjs)
+        }
+        .await,
+    )
 }
 
-fn dispatch_inner(
-    cmd: u32,
-    arg: usize,
+/// Linux `amdgpu_vm_clear_freed` collects same-VM submissions, and
+/// `amdgpu_vm_cpu_prepare` waits for them before the first CPU PTE store.
+/// Placement admission covers sampling through mutation, excluding new CS
+/// publication (including `note_job`), VA edits and relocation. MAP adds a
+/// disjoint range and does not need to drain work already using other ranges.
+struct MappingDependencies {
+    engine: Arc<dyn crate::amdgpu_cs::Submitter>,
+    jobs: Vec<u64>,
+}
+
+fn mapping_dependencies(
     vm: &VmState,
-    gem: &crate::amdgpu_gem::GemState,
-    syncobjs: Option<&IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
-) -> Result<u64, FsError> {
+    bytes: &[u8],
+) -> Result<Option<MappingDependencies>, FsError> {
+    let operation = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if !matches!(
+        operation,
+        uapi::AMDGPU_VA_OP_UNMAP | uapi::AMDGPU_VA_OP_CLEAR | uapi::AMDGPU_VA_OP_REPLACE
+    ) {
+        return Ok(None);
+    }
+    let Some(card) = vm.card() else {
+        return Ok(None);
+    };
+    let jobs = vm.last_jobs();
+    if jobs.is_empty() {
+        return Ok(None);
+    }
+    let engine = crate::amdgpu_cs::submitter(card).ok_or(FsError::NoDevice)?;
+    Ok(Some(MappingDependencies { engine, jobs }))
+}
+
+fn copy_va_request(cmd: u32, arg: usize) -> Result<Vec<u8>, FsError> {
     // `struct drm_amdgpu_gem_va`: handle u32, _pad u32, operation u32,
     // flags u32, va_address u64, offset_in_bo u64, map_size u64,
     // vm_timeline_point u64, vm_timeline_syncobj_out u32, num_syncobj_handles u32,
@@ -1299,7 +1359,15 @@ fn dispatch_inner(
     };
     // SAFETY: `arg` is the ioctl pointer the trap layer validated (or
     // kernel-owned on the test path); `copy_in` bounds-checks and brackets it.
-    let bytes = unsafe { copy_in(arg, in_size)? };
+    unsafe { copy_in(arg, in_size) }
+}
+
+fn dispatch_inner(
+    bytes: &[u8],
+    vm: &VmState,
+    gem: &crate::amdgpu_gem::GemState,
+    syncobjs: Option<&IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
+) -> Result<u64, FsError> {
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let operation = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let flags = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
@@ -1311,7 +1379,7 @@ fn dispatch_inner(
         vm_timeline_syncobj_out,
         num_syncobj_handles,
         input_fence_syncobj_handles,
-    ) = if in_size >= 64 {
+    ) = if bytes.len() >= 64 {
         let point = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
         let syncobj_out = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
         let num_in = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
@@ -2292,3 +2360,7 @@ where
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_vm_tables_tests.rs"]
 mod tables_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_vm_retirement_tests.rs"]
+mod retirement_tests;
