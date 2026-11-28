@@ -26,9 +26,11 @@ reach the hand-off (that's `frame/`), paging after hand-off (`memory/`).
 ## 3. Public interface
 
 `KernelCmdline::distro_init()` selects the installed distro init for a
-`boot-init` kernel. The bare flag `openrc_pid1` selects OpenRC and takes
-precedence over `systemd_pid1` if both appear. With neither flag the kernel
-launches the in-tree init and getty.
+`boot-init` kernel from `init=<path>`: `init=/usr/lib/systemd/systemd`
+selects systemd, `init=/sbin/openrc-init` selects OpenRC. Any other value
+selects nothing and the kernel launches the in-tree init and getty. The
+`systemd_pid1` / `openrc_pid1` bare flags were removed; they no longer
+select anything.
 
 The Ethernet registry consumes repeatable `ifname=ethN:aa:bb:cc:dd:ee:ff`
 arguments when naming ports at probe time (net §3).

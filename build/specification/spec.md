@@ -40,8 +40,8 @@ kernel IPC. CI checks both native-ring feature configurations.
   self-contained PE/COFF application embedding the kernel, CPIO initramfs, and
   command line. Defaults to `boot-init` and `narf.disks=boot-only`; smoke mode
   adds `boot-smoke` and writes a distinct artifact. Building with either
-  `openrc_pid1` or `systemd_pid1` on the command line enables `cgroup-all`
-  and `container` for the installed distribution. `--prebuilt ELF` selects an
+  `init=/sbin/openrc-init` or `init=/usr/lib/systemd/systemd` on the command
+  line enables `cgroup-all` and `container` for the installed distribution. `--prebuilt ELF` selects an
   exact existing kernel without rebuilding it; `--initramfs CPIO` supplies the
   complete uncompressed `newc` archive; `--cmdline STRING` binds boot policy;
   `--output EFI` selects the output path. The generated archive includes
@@ -367,7 +367,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   stanza loads that ELF directly; on x86_64 UEFI it chainloads the bundled
   Limine EFI app from `target/grub-x86_64/esp/`, which also contains the
   canonical kernel, initramfs, and Limine configuration for installation to
-  the ESP. With `--root-policy`, `--cmdline-extra openrc_pid1` selects the
+  the ESP. With `--root-policy`, `--cmdline-extra init=/sbin/openrc-init` selects the
   installed OpenRC init and omits the generated systemd options.
 - `packaging/build-release.sh --version X.Y.Z [--arch x86_64|aarch64]
   [--uefi-loader FILE] [--limine-efi FILE] [--limine-tool FILE]

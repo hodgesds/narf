@@ -735,7 +735,7 @@ fn root_cmdline(uuid: &str, rootflags: Option<&str>, rw: bool, extra: &[String])
         tokens.push(format!("rootflags={flags}"));
     }
     tokens.extend([
-        "systemd_pid1".to_string(),
+        "init=/usr/lib/systemd/systemd".to_string(),
         format!("narf.disks={}", if rw { "root-rw" } else { "root-ro" }),
     ]);
     // Same as the grub-image bundle: no zram device, so no zram swap units.
@@ -1198,7 +1198,7 @@ mod tests {
     fn an_ext4_root_gets_no_rootflags() {
         assert_eq!(
             root_cmdline("u", None, false, &[]),
-            "root=UUID=u systemd_pid1 narf.disks=root-ro systemd.zram=0"
+            "root=UUID=u init=/usr/lib/systemd/systemd narf.disks=root-ro systemd.zram=0"
         );
     }
 
@@ -1244,11 +1244,11 @@ mod tests {
     fn cmdline_is_the_bare_metal_shape() {
         assert_eq!(
             smoke_cmdline("u", false, &[]),
-            "root=UUID=u rootflags=subvol=/@ systemd_pid1 narf.disks=root-ro systemd.zram=0"
+            "root=UUID=u rootflags=subvol=/@ init=/usr/lib/systemd/systemd narf.disks=root-ro systemd.zram=0"
         );
         assert_eq!(
             smoke_cmdline("u", true, &["quiet".into()]),
-            "root=UUID=u rootflags=subvol=/@ systemd_pid1 narf.disks=root-rw systemd.zram=0 quiet"
+            "root=UUID=u rootflags=subvol=/@ init=/usr/lib/systemd/systemd narf.disks=root-rw systemd.zram=0 quiet"
         );
     }
 }

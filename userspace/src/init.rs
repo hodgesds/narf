@@ -23,7 +23,7 @@
 //! init process's argv (bare words + everything after a `--`) and
 //! environment (`key=value` tokens). NARF does **not** thread the
 //! cmdline into PID 1 today: the boot path (`frame::bare_main`) spawns
-//! init / getty with a fixed argv, and `systemd_pid1` mode spawns
+//! init / getty with a fixed argv, and `init=/usr/lib/systemd/systemd` mode spawns
 //! systemd with a fixed argv + envp. systemd instead reads its own
 //! `systemd.*` params directly from `/proc/cmdline` (kept faithful to
 //! the full bootloader string). The structural Linux split is

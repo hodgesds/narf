@@ -85,7 +85,7 @@ installed root for the existing kernel root-mount path, build a separate image:
 
 ```sh
 cargo narf build efi-image --output target/narf-installed.efi \
-  --cmdline 'root=UUID=YOUR-FILESYSTEM-UUID systemd_pid1 narf.disks=root-ro'
+  --cmdline 'root=UUID=YOUR-FILESYSTEM-UUID init=/usr/lib/systemd/systemd narf.disks=root-ro'
 ```
 
 For Gentoo with OpenRC, select the installed `/sbin/openrc-init` as PID 1.
@@ -99,7 +99,7 @@ On a desktop installation, the default runlevel typically includes
 
 ```sh
 cargo narf build efi-image --output target/narf-openrc.efi \
-  --cmdline 'root=UUID=YOUR-FILESYSTEM-UUID narf.disks=root-ro openrc_pid1 console=ttyS0 console=tty0'
+  --cmdline 'root=UUID=YOUR-FILESYSTEM-UUID narf.disks=root-ro init=/sbin/openrc-init console=ttyS0 console=tty0'
 ```
 
 For a disk log before OpenRC starts, replace `narf.disks=root-ro` with
@@ -111,7 +111,7 @@ read the newest numbered file on the same root. Gentoo's `syslogd` can also
 save its usual `/var/log/kern.log` after OpenRC starts.
 
 To capture OpenRC startup on the same writable root, install the optional
-trace configuration in the Gentoo root before booting with `openrc_pid1` and
+trace configuration in the Gentoo root before booting with `init=/sbin/openrc-init` and
 `narf.rootlog`.
 
 ```sh
@@ -298,7 +298,7 @@ The prompt consumes raw serial input; USB keyboard and graphical password
 entry require a later early-userspace design and are not available here.
 
 `narf.disks=root-ro` preserves all media and can supply the existing RAM-backed
-overlay to `openrc_pid1` or `systemd_pid1`. `root-rw` additionally requires btrfs inside the
+overlay to `init=/sbin/openrc-init` or `init=/usr/lib/systemd/systemd`. `root-rw` additionally requires btrfs inside the
 container and its existing write-safety gate; the designated container
 partition, its decrypted view, and the verified root-disk ESP gain write
 permission. Other partitions and the whole-disk device remain read-only.

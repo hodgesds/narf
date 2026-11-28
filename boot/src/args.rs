@@ -134,23 +134,33 @@ impl<'a> KernelCmdline<'a> {
         print
     }
 
-    /// Select the installed root's init. An explicit OpenRC boot takes priority
-    /// over the legacy systemd flag if a bootloader supplies both.
+    /// Select the installed root's init from `init=<path>`, the Linux
+    /// canonical form: `/usr/lib/systemd/systemd` selects systemd,
+    /// `/sbin/openrc-init` selects OpenRC. Any other value — including the
+    /// removed `systemd_pid1` / `openrc_pid1` bare flags — selects nothing,
+    /// and the kernel launches the in-tree init and getty.
     #[must_use]
     pub fn distro_init(&self) -> Option<DistroInit> {
-        if self.has_flag("openrc_pid1") {
-            Some(DistroInit::OpenRc)
-        } else if self.has_flag("systemd_pid1") {
-            Some(DistroInit::Systemd)
-        } else {
-            None
+        match self.value("init") {
+            Some("/usr/lib/systemd/systemd") => Some(DistroInit::Systemd),
+            Some("/sbin/openrc-init") => Some(DistroInit::OpenRc),
+            _ => None,
         }
+    }
+
+    /// True iff the command line selects an installed distro init via
+    /// `init=` — the boolean form of [`KernelCmdline::distro_init`], for
+    /// callers that only need to know a distro root is in play (e.g. the
+    /// root-mount overlay plan).
+    #[must_use]
+    pub fn has_distro_init(&self) -> bool {
+        self.distro_init().is_some()
     }
 
     /// True iff a token is exactly `name` — a bare flag with no `=`.
     ///
-    /// Use this for boolean switches like `nosmp`, `systemd_pid1`,
-    /// `no_redis`, `bpf_bench`. A `name=...` token does **not** match.
+    /// Use this for boolean switches like `nosmp`, `no_redis`, `bpf_bench`.
+    /// A `name=...` token does **not** match.
     #[must_use]
     pub fn has_flag(&self, name: &str) -> bool {
         self.tokens().any(|t| t == name)
@@ -235,22 +245,26 @@ mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    // The real CachyOS / systemd-pid1 boot cmdline shape, plus the
+    // The real CachyOS / init= boot cmdline shape, plus the
     // hardware root selector — the regression fixture.
-    const REAL: &str =
-        "quiet root=PARTLABEL=NARF_ROOT trace_comm=plasmalogin systemd_pid1 nosmp mt_echo_threads=4";
+    const REAL: &str = "quiet root=PARTLABEL=NARF_ROOT trace_comm=plasmalogin \
+        init=/usr/lib/systemd/systemd nosmp mt_echo_threads=4";
 
     fn smoke_recognizes_flags_and_values() -> TestResult {
         let a = KernelCmdline::new(REAL);
         // Bare flags present.
-        if !a.has_flag("systemd_pid1") {
-            return TestResult::Fail("systemd_pid1 flag not recognized");
-        }
         if !a.has_flag("nosmp") {
             return TestResult::Fail("nosmp flag not recognized");
         }
         if !a.has_flag("quiet") {
             return TestResult::Fail("quiet flag not recognized");
+        }
+        // The distro init is selected by init=, not by a bare flag.
+        if a.value("init") != Some("/usr/lib/systemd/systemd") {
+            return TestResult::Fail("init= value wrong");
+        }
+        if a.distro_init() != Some(DistroInit::Systemd) {
+            return TestResult::Fail("init= did not select systemd");
         }
         // key=value values (first `=` splits, value may contain `=`).
         if a.value("root") != Some("PARTLABEL=NARF_ROOT") {
@@ -269,11 +283,24 @@ mod tests {
     fn smoke_distro_init_selection() -> TestResult {
         for (line, want) in [
             ("", None),
+            ("init=", None),
+            ("init=/bin/sh", None),
+            ("init=/usr/lib/systemd/systemd", Some(DistroInit::Systemd)),
+            ("init=/sbin/openrc-init", Some(DistroInit::OpenRc)),
+            // The first init= wins.
+            (
+                "init=/usr/lib/systemd/systemd init=/sbin/openrc-init",
+                Some(DistroInit::Systemd),
+            ),
+            (
+                "init=/sbin/openrc-init init=/usr/lib/systemd/systemd",
+                Some(DistroInit::OpenRc),
+            ),
+            // The old bare-flag selectors no longer select anything.
+            ("systemd_pid1", None),
+            ("openrc_pid1", None),
             ("openrc_pid1=0", None),
-            ("systemd_pid1", Some(DistroInit::Systemd)),
-            ("openrc_pid1", Some(DistroInit::OpenRc)),
-            ("systemd_pid1 openrc_pid1", Some(DistroInit::OpenRc)),
-            ("openrc_pid1 systemd_pid1", Some(DistroInit::OpenRc)),
+            ("systemd_pid1 openrc_pid1", None),
         ] {
             if KernelCmdline::new(line).distro_init() != want {
                 return TestResult::Fail("installed init selection differs");
@@ -340,7 +367,7 @@ mod tests {
             return TestResult::Fail("has_flag matched a key=value token");
         }
         // A bare flag has no value.
-        if a.value("systemd_pid1").is_some() {
+        if a.value("nosmp").is_some() {
             return TestResult::Fail("bare flag yielded a key=value value");
         }
         // Unparseable / absent numeric → None.

@@ -323,7 +323,7 @@ pub fn try_mount_root(
     // same wrapper there before PID 1 is spawned.
     let options = plan_root(
         narf_block::disk_policy::policy(),
-        narf_boot::args().distro_init().is_some(),
+        narf_boot::args().has_distro_init(),
         &spec,
     );
     let result = try_mount_root_with_options(authority, spec.selector.as_ref(), options);

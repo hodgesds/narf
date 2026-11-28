@@ -8,7 +8,7 @@
 //! NARF mirrors that:
 //!
 //! - the program is resolved and loaded under PID 1's root (the installed
-//!   distro root a `systemd_pid1` boot runs in; the global root otherwise),
+//!   distro root an `init=/usr/lib/systemd/systemd` boot runs in; the global root otherwise),
 //!   in the initial mount namespace, with root credentials;
 //! - the process has no parent, so it is reaped by the kernel when it exits,
 //!   as `kthreadd`'s children are;

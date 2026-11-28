@@ -1521,7 +1521,7 @@ impl Gate {
             .filter(|l| {
                 l.contains("REFUSING read-write mount")
                     || l.contains("ROOT MOUNT FAILED")
-                    || l.contains("systemd_pid1 requested but")
+                    || l.contains("init=/usr/lib/systemd/systemd requested but")
             })
             .map(|l| l.trim().to_string())
             .collect()
@@ -2362,7 +2362,10 @@ pub fn run(args: &Args) -> Result<()> {
     for (p, c) in [Policy::Ro, Policy::Rw].iter().zip(&cmdlines) {
         println!("cachyos-gate: {} bundle cmdline: {c}", p.name());
         let want = format!("root=UUID={}", disk.fsid);
-        if !c.contains(&want) || !c.contains("systemd_pid1") || !c.contains("rootflags=subvol=/@") {
+        if !c.contains(&want)
+            || !c.contains("init=/usr/lib/systemd/systemd")
+            || !c.contains("rootflags=subvol=/@")
+        {
             bail!(
                 "the {} bundle's command line lacks the installed-root arguments",
                 p.name()

@@ -271,7 +271,7 @@ default_entry: 2
 /NARF KDE Plasma (read-write)
     protocol: multiboot2
     path: boot():/boot/narf-frame
-    kernel_cmdline: narf.disks=root-rw root=UUID=test rw systemd_pid1 systemd.unit=graphical.target
+    kernel_cmdline: narf.disks=root-rw root=UUID=test rw init=/usr/lib/systemd/systemd systemd.unit=graphical.target
     module_path: boot():/boot/initramfs.cpio
     module_string: initramfs
 /CachyOS

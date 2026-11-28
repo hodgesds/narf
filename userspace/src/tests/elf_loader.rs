@@ -5604,7 +5604,7 @@ fn smoke_userspace_boot_path_load_demand_pages() -> TestResult {
     // boot happened to call.
     //
     // `load_user_process_from_path` is the fix, and it is tested HERE rather than
-    // through boot because the systemd path needs a `systemd_pid1` flag and a
+    // through boot because the systemd path needs an `init=/usr/lib/systemd/systemd` token and a
     // real rootfs that CI does not have — the same "wired but never executed"
     // trap that this loader's demand paging fell into once already. Driving the
     // function directly is what makes the change verified rather than plausible.

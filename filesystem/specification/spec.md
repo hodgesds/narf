@@ -239,7 +239,7 @@ the development initramfs login.
 
 `try_mount_root_with_options` additionally accepts
 `RootMountOptions::tmpfs_overlay`. When set (the explicit-`root=`
-`openrc_pid1` or `systemd_pid1` installed-distro boot path under `root-ro`), the selected filesystem is the
+`init=/sbin/openrc-init` or `init=/usr/lib/systemd/systemd` installed-distro boot path under `root-ro`), the selected filesystem is the
 immutable OverlayFS lower and a Linux-compatible `TmpFs` upper becomes the
 visible `/` before PID 1 starts. The selector-free installed-root fallback
 uses the same wrapper at `/mnt` before PID 1 is rooted there.

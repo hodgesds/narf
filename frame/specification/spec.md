@@ -23,7 +23,7 @@ those subsystems the hooks they need.
 
 ## 3. Public interface
 
-With `boot-init` and `openrc_pid1`, the framekernel directly starts the
+With `boot-init` and `init=/sbin/openrc-init`, the framekernel directly starts the
 selected root's `/sbin/openrc-init` as PID 1 with the system executable
 search path. It installs the distro root before scheduling the task. OpenRC
 selects the runlevels and services from that root. A loader error is reported
