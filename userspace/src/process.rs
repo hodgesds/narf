@@ -507,14 +507,15 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             // cannot collide with pages already mapped.
             // SAFETY: Valid memory or trusted environment
             let interp_entry = match interp_fs_owned.as_ref() {
-                // SAFETY: Live AS, well-separated `interp_bias` (argument
-                // above): the interp segments cannot collide with pages
-                // already mapped.
                 Some((file, size)) => {
                     let source = crate::handlers::ExecSource::File {
                         ops: alloc::sync::Arc::clone(file),
                         size: *size,
                     };
+                    // SAFETY: Live AS, well-separated `interp_bias`
+                    // (argument above): the interp segments cannot collide
+                    // with pages already mapped; `source` is the resolved
+                    // interpreter file.
                     unsafe {
                         load_elf_into_at_file(
                             &source,
@@ -525,10 +526,13 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
                         )
                     }?
                 }
-                // SAFETY: As above.
                 None => {
                     let interp_bytes =
                         registered.expect("registered interpreter present when no FS interpreter");
+                    // SAFETY: Live AS, well-separated `interp_bias`
+                    // (argument above): the interp segments cannot collide
+                    // with pages already mapped; `interp_bytes` is the
+                    // registered in-memory interpreter.
                     unsafe { load_elf_into_at(interp_bytes, &address_space, interp_bias) }?
                 }
             };
