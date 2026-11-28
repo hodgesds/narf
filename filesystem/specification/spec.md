@@ -2123,8 +2123,11 @@ The task layer supplies `procfs::ProcessIo` for `/proc/<pid>/io`. Read and
 write syscall counts include completed errors. Storage bytes count successful
 block transfers issued on behalf of the process, including its threads.
 Cached reads and memory files do not issue disk transfers. Kernel-originated
-background I/O appears in disk totals, and `cancelled_write_bytes` is zero
-until dirty-page cancellation is tracked.
+background I/O appears in disk totals, and `cancelled_write_bytes` counts the
+dirty page-cache bytes the process caused to never reach disk by truncating
+or evicting them before writeback, per folio at page granularity. Truncate
+and punch callers normally write back first, so it fires only for pages
+dirtied after the writeback or dropped at inode eviction without a sync.
 
 Network devices have canonical kobjects below `/sys/devices`: a PCI-backed
 interface lives at `/sys/devices/pci<segment>:<bus>/<BDF>/net/<dev>`, with

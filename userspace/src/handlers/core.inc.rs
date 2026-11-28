@@ -10311,7 +10311,15 @@ pub fn io_accounting_of(task: u64) -> TaskIoAccounting {
 pub fn io_accounting_for_pid(pid: u64) -> narf_filesystem::procfs::ProcessIo {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     let a = io_accounting_of(task);
-    let (read_bytes, write_bytes) = crate::task::with_task_local(task, |t| t.storage_io.bytes())
+    let (read_bytes, write_bytes, cancelled_write_bytes) =
+        crate::task::with_task_local(task, |t| {
+            let (read_bytes, write_bytes) = t.storage_io.bytes();
+            (
+                read_bytes,
+                write_bytes,
+                t.storage_io.cancelled_write_bytes(),
+            )
+        })
         .unwrap_or_default();
     narf_filesystem::procfs::ProcessIo {
         rchar: a.rchar,
@@ -10320,6 +10328,7 @@ pub fn io_accounting_for_pid(pid: u64) -> narf_filesystem::procfs::ProcessIo {
         syscw: a.syscw,
         read_bytes,
         write_bytes,
+        cancelled_write_bytes,
     }
 }
 
