@@ -128,7 +128,7 @@ def main():
         command = f"narf.disks=root-ro root=UUID={OUTER} rd.luks.uuid={OUTER} rd.luks.prompt=serial rd.luks.timeout=10 console=ttyS0"
         efi = work / "esp/EFI/BOOT/BOOTX64.EFI"
         efi.parent.mkdir(parents=True)
-        run("cargo", "xtask", "efi-image", "--prebuilt", kernel, "--initramfs", archive,
+        run("cargo", "narf", "build", "efi-image", "--prebuilt", kernel, "--initramfs", archive,
             "--cmdline", command, "--output", efi, cwd=ROOT)
 
         def boot_case(name, version, interaction):
@@ -250,7 +250,7 @@ def main():
             output.truncate(128 * 1024**2)
         run("mkfs.btrfs", "-q", "-f", "-d", "single", "-m", "single", "--rootdir", tree, plain_btrfs)
         disks["luks2-rw"] = make_disk(work, "luks2", plain_btrfs)
-        run("cargo", "xtask", "efi-image", "--prebuilt", kernel, "--initramfs", archive,
+        run("cargo", "narf", "build", "efi-image", "--prebuilt", kernel, "--initramfs", archive,
             "--cmdline", command.replace("narf.disks=root-ro", "narf.disks=root-rw") + " rootflags=subvolid=5", "--output", efi, cwd=ROOT)
         boot_case("luks2-btrfs-write", "luks2-rw", "write")
 

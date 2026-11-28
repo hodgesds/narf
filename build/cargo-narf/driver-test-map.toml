@@ -1,4 +1,4 @@
-# Leaf-driver test map for `cargo xtask affected`.
+# Leaf-driver test map for `cargo narf ci affected`.
 #
 # When EVERY non-ignorable changed file falls under a mapped leaf path,
 # the kernel-test filter narrows to just that driver's tests (plus the
@@ -15,7 +15,7 @@
 # crate, e.g. `drivers/net/src` registers `drivers/net/igc` tests).
 # A path whose tags do not match the scanned tag universe disqualifies
 # the leaf rule for that change (fall through to the closure logic),
-# and `cargo xtask host-test` fails if any entry is stale — so keep this
+# and `cargo narf test host-test` fails if any entry is stale — so keep this
 # file in sync with the tree; do not invent entries.
 #
 # Deliberately NOT mapped (fall through to the closure logic):

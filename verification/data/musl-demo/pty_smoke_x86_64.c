@@ -33,7 +33,7 @@
  * wrong count or wrong bytes) the program writes "pty-fail-<step>\n"
  * to stdout and exits non-zero so the run-interactive matcher sees
  * exactly which step blew up. The success token `pty-ok` is what the
- * musl-demo xtask matches on.
+ * musl-demo cargo narf matches on.
  *
  * Rebuild via REGEN_pty.sh in this directory (requires musl-gcc).
  */

@@ -139,7 +139,7 @@ RX 6750 XT. `NARF_MESA_SOFTWARE=1` restores the unconditional fallback.
 
 ```sh
 NARF_VBLK_IMG=target/narf-amd-gl-vblk.img XTASK_RI_ECHO_TIMEOUT_SECS=600 \
-    cargo xtask run-interactive \
+    cargo narf run run-interactive \
     --cmd "chroot_run /bin/busybox sh /mesa-amd-smoke.sh" --expect "MESA-AMD-OK"
 ```
 

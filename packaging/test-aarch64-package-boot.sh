@@ -7,7 +7,7 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 
 if [[ ${NARF_UEFI_SKIP_BASE_ISO_BOOT:-0} != 1 ]]; then
-    cargo xtask iso-boot --arch=aarch64
+    cargo narf build iso-boot --arch=aarch64
 fi
 
 for command_name in mformat mcopy qemu-system-aarch64 sfdisk; do

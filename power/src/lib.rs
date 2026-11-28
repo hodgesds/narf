@@ -237,7 +237,7 @@ pub fn register_initcalls() {
         let _ = hibernate::software_resume();
         InitResult::Ok
     });
-    // `cargo xtask hibernate-e2e`'s guest half; inert without
+    // `cargo narf smoke hibernate-e2e`'s guest half; inert without
     // `narf.hibernate_e2e=`. After the resume, so a restored image never
     // reaches it.
     narf_init::register(Stage::Late, "hibernate-e2e", hibernate::e2e::initcall);

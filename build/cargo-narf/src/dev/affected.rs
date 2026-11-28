@@ -1,4 +1,4 @@
-//! `cargo xtask affected` — compute which CI jobs and kernel-test
+//! `cargo narf ci affected` — compute which CI jobs and kernel-test
 //! subsystems a change can affect, so CI can skip work a diff cannot
 //! influence.
 //!
@@ -30,7 +30,7 @@
 //! The policy (which crates are hubs, which crates map to which job) lives
 //! in this one file so there is a single place to reason about correctness;
 //! the leaf-driver map is the one exception — it lives in the data file
-//! `build/xtask/driver-test-map.toml` so it can be reviewed and extended
+//! `build/cargo-narf/driver-test-map.toml` so it can be reviewed and extended
 //! without touching the decision code. Everything below the I/O helpers
 //! is pure and unit-tested in `host-test`.
 
@@ -104,7 +104,7 @@ const DIR_NARROW_CRATES: &[(&str, usize)] = &[("narf-drivers-wireless", 2)];
 const GPU_CRATES: &[&str] = &["narf-drivers-gpu", "narf-boot"];
 
 /// The final bootable binary. Its presence in the closure is the signal
-/// that a real kernel crate changed (as opposed to xtask/docs), which is
+/// that a real kernel crate changed (as opposed to cargo narf/docs), which is
 /// what the boot-based gates (`boot-smoke`, `kernel-test`) key on.
 const KERNEL_BIN: &str = "narf-frame";
 
@@ -120,7 +120,7 @@ fn is_infra_path(rel: &str) -> bool {
         || rel == ".cargo/config.toml"
         || rel == ".cargo/config"
         || rel.starts_with(".github/")
-        || rel.starts_with("build/xtask/")
+        || rel.starts_with("build/cargo-narf/")
         || rel == "run_ci_locally.sh"
 }
 
@@ -435,9 +435,9 @@ fn parse_leaf_driver_map(text: &str) -> Result<LeafDriverMap> {
     Ok(map)
 }
 
-/// Load `build/xtask/driver-test-map.toml` under the workspace `root`.
+/// Load `build/cargo-narf/driver-test-map.toml` under the workspace `root`.
 pub fn load_leaf_driver_map(root: &Path) -> Result<LeafDriverMap> {
-    let path = root.join("build/xtask/driver-test-map.toml");
+    let path = root.join("build/cargo-narf/driver-test-map.toml");
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     parse_leaf_driver_map(&text)
@@ -550,7 +550,7 @@ pub fn plan(
         if is_infra_path(f) {
             p.full = true;
             p.reasons.push(format!("infra path `{f}`"));
-            lint_all |= !f.starts_with("build/xtask/");
+            lint_all |= !f.starts_with("build/cargo-narf/");
         }
         if is_ignorable_path(f) {
             continue;
@@ -627,11 +627,7 @@ pub fn plan(
         .filter(|c| {
             matches!(
                 c.as_str(),
-                "xtask"
-                    | "cargo-narf"
-                    | "narf-btrfs-host"
-                    | "narf-boot-protocol"
-                    | "narf-ext4-host"
+                "cargo-narf" | "narf-btrfs-host" | "narf-boot-protocol" | "narf-ext4-host"
             )
         })
         .cloned()
@@ -671,7 +667,7 @@ pub fn plan(
     // non-hub inputs changed, a frame/verification change re-links the
     // test harness (its registrations and cmdline dispatch included),
     // or the run is full — infra and hub changes included, so a change
-    // to this split itself (ci.yml / build/xtask) exercises the GPU job.
+    // to this split itself (ci.yml / build/cargo-narf) exercises the GPU job.
     p.run_gpu_tests =
         p.full || has_any(GPU_CRATES) || seeds.contains(KERNEL_BIN) || seeds.contains(VERIFICATION);
 
@@ -688,7 +684,7 @@ pub fn plan(
 
     // Boot-based gates: only when a real kernel crate is in the closure
     // (frame links ~everything, so frame ∈ closure ⟺ a kernel crate
-    // changed; xtask/doc-only changes never pull it in).
+    // changed; cargo narf/doc-only changes never pull it in).
     p.run_boot_smoke = has(KERNEL_BIN) || p.run_uefi;
     p.run_kernel_test = has(KERNEL_BIN) || has(VERIFICATION);
 
@@ -1027,7 +1023,7 @@ fn extract_tags(text: &str, out: &mut BTreeSet<String>) -> Result<()> {
                                     serde_json::from_str(&literal)
                                         .context("kernel-test tag literal")?
                                 };
-                                crate::validate_test_subsystems(&tag)?;
+                                crate::dev::validate_test_subsystems(&tag)?;
                                 out.insert(tag);
                             }
                         }
@@ -1092,13 +1088,13 @@ fn plan_to_github(p: &Plan) -> String {
         .collect()
 }
 
-/// `cargo xtask affected` entry point.
+/// `cargo narf ci affected` entry point.
 pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
     let crates = load_workspace(root)?;
     let ((tag_map, dir_map), scan_failed) = match scan_test_tags(root, &crates) {
         Ok(maps) => (maps, false),
         Err(e) => {
-            eprintln!("xtask affected: test inventory failed ({e:#}); using full matrix");
+            eprintln!("cargo narf ci affected: test inventory failed ({e:#}); using full matrix");
             ((BTreeMap::new(), BTreeMap::new()), true)
         }
     };
@@ -1115,7 +1111,9 @@ pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
         match git_changed_files(root, &args.base, &args.head, &event) {
             Ok(f) => (f, false),
             Err(e) => {
-                eprintln!("xtask affected: git diff failed ({e}); defaulting to a full run");
+                eprintln!(
+                    "cargo narf ci affected: git diff failed ({e}); defaulting to a full run"
+                );
                 (Vec::new(), true)
             }
         }
@@ -1126,7 +1124,9 @@ pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
     let (leaf_map, map_failed) = match load_leaf_driver_map(root) {
         Ok(map) => (map, false),
         Err(e) => {
-            eprintln!("xtask affected: driver-test-map failed to load ({e:#}); using full matrix");
+            eprintln!(
+                "cargo narf ci affected: driver-test-map failed to load ({e:#}); using full matrix"
+            );
             (LeafDriverMap::default(), true)
         }
     };
@@ -1326,7 +1326,7 @@ mod tests {
         assert!(!p.run_gpu_tests, "unrelated change skips the GPU job");
         // Forced full (the ci-full label; infra changes land here too via
         // `full`) always runs it, so a change to the split itself
-        // (ci.yml / build/xtask) exercises the GPU job.
+        // (ci.yml / build/cargo-narf) exercises the GPU job.
         let p = plan(
             &["drivers/gpu/src/lib.rs".to_string()],
             &cr,
@@ -1407,7 +1407,7 @@ mod tests {
         for f in [
             "Cargo.lock",
             ".github/workflows/ci.yml",
-            "build/xtask/src/main.rs",
+            "build/cargo-narf/src/main.rs",
             "rust-toolchain.toml",
         ] {
             let p = plan(
@@ -1964,12 +1964,11 @@ mod tests {
     #[test]
     fn host_and_loader_changes_have_separate_lint_gates() {
         let mut crates = fixture();
-        crates.push(ci("xtask", "build/xtask", &[]));
         crates.push(ci("cargo-narf", "build/cargo-narf", &[]));
         crates.push(ci("narf-boot-protocol", "boot/protocol", &[]));
         crates.push(ci("narf-ext4-host", "verification/ext4-host", &[]));
         let p = plan(
-            &["build/xtask/src/main.rs".into()],
+            &["build/cargo-narf/src/main.rs".into()],
             &crates,
             &tags(),
             &BTreeMap::new(),
@@ -1978,7 +1977,7 @@ mod tests {
             false,
         );
         assert!(p.full);
-        assert_eq!(p.host_clippy_crates, strings(&["xtask"]));
+        assert_eq!(p.host_clippy_crates, strings(&["cargo-narf"]));
         assert!(p.clippy_crates.is_empty());
         let p = plan(
             &["build/uefi-loader/src/main.rs".into()],

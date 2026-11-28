@@ -44,7 +44,7 @@ kernel. Its isolation domain is a compile-time constant (e1000 currently uses
 
 ```sh
 cat /sys/kernel/abi_hash
-cargo xtask build-module --package narf-drivers-net-e1000 \
+cargo narf build build-module --package narf-drivers-net-e1000 \
   --no-default-features --features module \
   --arch x86_64 --kernel-abi 0x1f3a90c2
 ```
@@ -57,7 +57,7 @@ that kernel rather than being guessed when the crate is written.
 An out-of-tree crate is accepted directly:
 
 ```sh
-cargo xtask build-module --manifest-path ../acme/Cargo.toml \
+cargo narf build build-module --manifest-path ../acme/Cargo.toml \
   --package acme-driver --no-default-features --features module \
   --arch x86_64 --kernel-abi 0x1f3a90c2
 ```
@@ -109,9 +109,9 @@ trusted Ed25519 public keys from the absolute build-time
 then attach the signature:
 
 ```sh
-cargo xtask build-module --package <crate> --arch x86_64 \
+cargo narf build build-module --package <crate> --arch x86_64 \
   --kernel-abi 0x1f3a90c2 --compress --out module.ko.lz4
-cargo xtask attach-module-signature --module module.ko.lz4 \
+cargo narf build attach-module-signature --module module.ko.lz4 \
   --signature module.sig --public-key module.pub
 ```
 

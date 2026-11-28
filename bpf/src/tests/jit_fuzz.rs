@@ -70,7 +70,7 @@
 //! run without changing what CI does:
 //!
 //! ```text
-//! XTASK_QEMU_APPEND='bpf_fuzz_n=4000' cargo xtask test --arch=x86_64 \
+//! XTASK_QEMU_APPEND='bpf_fuzz_n=4000' cargo narf test test --arch=x86_64 \
 //!     --subsystem bpf/fuzz
 //! ```
 //!
@@ -111,7 +111,7 @@ macro_rules! note {
 
 /// Programs per run of the straight-line/branch fuzzer.
 ///
-/// Small on purpose: this runs in the default `xtask test` suite, and a
+/// Small on purpose: this runs in the default `cargo narf test test` suite, and a
 /// differential that doubles the suite's runtime gets disabled rather than
 /// fixed. `bpf_fuzz_n=` raises it for a soak.
 const DEFAULT_ITERS: u32 = 128;

@@ -6,7 +6,7 @@ console, run the test suite, and run **real, unmodified Linux software**
 on top of the NARF kernel.
 
 Everything here is grounded in the actual build orchestrator
-(`build/xtask/src/main.rs`), the rootfs regeneration scripts under
+(`build/cargo-narf/src/main.rs`), the rootfs regeneration scripts under
 `verification/data/musl-demo/`, and the CI workflow (`.github/workflows/ci.yml`).
 See also [`README.md`](../README.md) (project overview) and
 [`TESTING.md`](../TESTING.md) (the full testing surface).
@@ -75,9 +75,9 @@ What each is for:
 | `qemu-system-arm` | `qemu-system-aarch64` | `--arch=aarch64` runs |
 | `qemu-efi-aarch64` | AAVMF firmware | aarch64 UEFI ISO boots |
 | `cpio` | (also built in-process) | initramfs firmware CPIO |
-| `mtools` / `dosfstools` | FAT tooling | `xtask image` / `iso-boot` (ESP) |
+| `mtools` / `dosfstools` | FAT tooling | `cargo narf build image` / `iso-boot` (ESP) |
 | `e2fsprogs` | `mke2fs`, `debugfs` | building/editing the ext2 rootfs image |
-| `ovmf` | OVMF UEFI firmware | `xtask iso-boot` (UEFI boot path) |
+| `ovmf` | OVMF UEFI firmware | `cargo narf build iso-boot` (UEFI boot path) |
 | `xorriso` | ISO authoring | removable-media ISO construction |
 
 Linux-compatibility fixture regeneration and some CI smokes additionally use
@@ -112,11 +112,11 @@ git clone <your-narf-remote> narf
 cd narf
 
 # Cross-compile the kernel (default: narf-frame, x86_64-unknown-none, release)
-cargo xtask build --arch=x86_64
+cargo narf build build --arch=x86_64
 ```
 
-`cargo xtask build` (dispatched to `cargo_build` in
-`build/xtask/src/main.rs`) runs, in effect:
+`cargo narf build build` (dispatched to `cargo_build` in
+`build/cargo-narf/src/main.rs`) runs, in effect:
 
 ```sh
 cargo build -p narf-frame --target x86_64-unknown-none \
@@ -152,9 +152,9 @@ builds are incremental.
 To boot through UEFI without Limine, build the single-file source artifact:
 
 ```sh
-cargo xtask efi-image
-cargo xtask efi-image --run
-cargo xtask efi-image --smoke
+cargo narf build efi-image
+cargo narf build efi-image --run
+cargo narf build efi-image --smoke
 ```
 
 The normal output is `target/narf-x86_64.efi`; smoke mode writes a separate
@@ -167,7 +167,7 @@ on an ESP, GRUB/systemd-boot entries, firmware selection, and current limits.
 ### 3.1 The async demo
 
 ```sh
-cargo xtask run --arch=x86_64
+cargo narf run run --arch=x86_64
 ```
 
 This builds the kernel and launches `qemu-system-x86_64` with a q35
@@ -177,18 +177,18 @@ full virtio + legacy device set (see `qemu_args` in main.rs). Without
 
 ### 3.1.1 Pass through a physical PCIe device
 
-PCIe assignment is configured before the guest starts, so this is an xtask
+PCIe assignment is configured before the guest starts, so this is an cargo narf
 boot option rather than a NARF kernel command-line parameter. Linux must have
 IOMMU support enabled and must already bind every assigned endpoint to
-`vfio-pci`; xtask deliberately does not detach devices from host drivers.
+`vfio-pci`; cargo narf deliberately does not detach devices from host drivers.
 For a multifunction GPU, pass both the graphics and audio functions:
 
 ```sh
 # Inspect readiness without launching QEMU.
-cargo xtask passthrough -d 03:00.0 -d 03:00.1
+cargo narf run passthrough -d 03:00.0 -d 03:00.1
 
 # Run the same preflight, then actually attach both functions and boot NARF.
-cargo xtask run --arch=x86_64 \
+cargo narf run run --arch=x86_64 \
   --passthrough-device 03:00.0 \
   --passthrough-device 03:00.1
 ```
@@ -197,7 +197,7 @@ The preflight requires usable KVM, non-empty Linux IOMMU groups, `vfio-pci`
 ownership, every non-bridge endpoint in each selected group, and BARs that fit
 NARF's mapped physical-address windows. It also rejects a forced TCG
 accelerator. Leave `NARF_QEMU_CPU` unset unless you know the replacement keeps
-the PCI hole below NARF's 1-TiB physical mapping ceiling; xtask clamps its
+the PCI hole below NARF's 1-TiB physical mapping ceiling; cargo narf clamps its
 default `max` CPU model to 40 physical-address bits for this reason.
 
 The preflight also refuses a group whose
@@ -228,7 +228,7 @@ with an unhelpful message:
   add a udev rule `SUBSYSTEM=="vfio", OWNER="<user>"`.
 - **`RLIMIT_MEMLOCK` must cover the guest's RAM.** VFIO pins every page of
   guest RAM for DMA; the usual default is 8 MiB. Raise it for the shell you
-  run xtask from (`sudo prlimit --pid $$ --memlock=unlimited`) or add
+  run cargo narf from (`sudo prlimit --pid $$ --memlock=unlimited`) or add
   `<user> - memlock unlimited` under `/etc/security/limits.d/` and log in
   again. The check uses `NARF_QEMU_MEM_MB` (default 1024; 4096 for
   `cachyos-root-smoke`) plus 256 MiB.
@@ -249,30 +249,30 @@ done
 `driver_override` lasts until the next host boot. Undo it by writing an empty
 line to each `driver_override` and repeating the unbind and `drivers_probe`.
 
-When a passed-through device is a display controller, xtask drops QEMU's own
+When a passed-through device is a display controller, cargo narf drops QEMU's own
 display adapters (`-vga none`, no virtio-gpu), so the card is the guest's only
 GPU and the kernel console and any compositor use it. Firmware the card needs
 before the root mounts goes into the initramfs automatically (Navi 22:
 `amdgpu/navy_flounder*`, imported first with
-`cargo xtask import-firmware --source /usr/lib/firmware --vendor amdgpu`);
+`cargo narf firmware import-firmware --source /usr/lib/firmware --vendor amdgpu`);
 `--initramfs-firmware` overrides the choice.
 
 #### Booting an installed CachyOS on the passed-through card
 
-`cargo xtask cachyos-root-smoke` boots CachyOS's own systemd as PID 1 under
+`cargo narf smoke cachyos-root-smoke` boots CachyOS's own systemd as PID 1 under
 `narf.disks=root-ro`. With `--disk` it boots an existing installed image, for
 example a desktop VM image with plymouth and plasmalogin, instead of the
 generated fixture:
 
 ```sh
-cargo xtask cachyos-root-smoke --arch=x86_64 \
+cargo narf smoke cachyos-root-smoke --arch=x86_64 \
   --disk ~/vms/cachyos-fresh.raw \
   --passthrough-device 03:00.0 --passthrough-device 03:00.1 \
   --interactive --serial-log /tmp/narf-gpu.serial
 ```
 
 - The image is only ever a read-only backing file. The guest's NVMe is a fresh
-  qcow2 overlay (`target/narf-cachyos-disk-overlay.qcow2`); xtask refuses an
+  qcow2 overlay (`target/narf-cachyos-disk-overlay.qcow2`); cargo narf refuses an
   image another process has open, and afterwards checks that the base image's
   size and mtime are unchanged and that a root-ro boot left no data in the
   overlay.
@@ -284,7 +284,7 @@ cargo xtask cachyos-root-smoke --arch=x86_64 \
   text boot.
 - `--interactive` attaches the terminal to the serial console until the guest
   powers off or Ctrl-C. Without it the run stops at the serial login prompt
-  (the image's root password is not known to xtask). Either way the
+  (the image's root password is not known to cargo narf). Either way the
   units systemd reported as slow start jobs are listed at the end.
 - The picture is on the card's own outputs, not in a QEMU window.
 
@@ -310,7 +310,7 @@ for you, waits for the prompt, types a command, and asserts output:
 
 ```sh
 # Type `echo hello world` at the shell and assert `hello world`
-cargo xtask run-interactive --arch=x86_64 \
+cargo narf run run-interactive --arch=x86_64 \
   --cmd "echo hello world" --expect "hello world"
 ```
 
@@ -326,7 +326,7 @@ To drive the console **yourself**, boot with a display and interact over
 
 ```sh
 # boot-init on, GTK window; the serial console is your terminal
-cargo xtask run --arch=x86_64 --features boot-init --display=gtk
+cargo narf run run --arch=x86_64 --features boot-init --display=gtk
 ```
 
 **Boot flow and login.** With `boot-init`, the kernel spawns `init`, then
@@ -352,7 +352,7 @@ through the real execve + ELF loader + syscall-instruction dispatch
 path. Example:
 
 ```sh
-cargo xtask run-interactive --arch=x86_64 \
+cargo narf run run-interactive --arch=x86_64 \
   --cmd "oci_smoke" --expect "oci-smoke-ok"
 ```
 
@@ -363,7 +363,7 @@ cargo xtask run-interactive --arch=x86_64 \
 ### 4.1 Full kernel-test suite
 
 ```sh
-cargo xtask test --arch=x86_64
+cargo narf test test --arch=x86_64
 ```
 
 By default `Cmd::Test` runs the kernel suite and then the production-path
@@ -371,7 +371,7 @@ postflight checks:
 
 1. **Kernel-test phase** — forces the `kernel-test` feature on, boots,
    and runs every in-kernel smoke. The runner calls `exit_kernel(0)`
-   only when all pass; xtask gates on QEMU's exit status (a failing
+   only when all pass; cargo narf gates on QEMU's exit status (a failing
    suite → nonzero → the command fails). Kernel-test builds use a
    separate disk (`target/narf-vblk-test.img`) so they never clobber
    your Alpine rootfs.
@@ -387,7 +387,7 @@ postflight checks.
 ### 4.2 Real-init boot smoke
 
 ```sh
-cargo xtask boot-smoke --arch=x86_64
+cargo narf test boot-smoke --arch=x86_64
 ```
 
 Forces the `boot-smoke` feature on (ACPI S5 on x86_64 or PSCI
@@ -400,7 +400,7 @@ without a natural QEMU power-off. Timeout: `XTASK_BOOT_SMOKE_TIMEOUT_SECS`
 ### 4.3 The linux-compat demo binaries
 
 ```sh
-cargo xtask musl-demo --arch=x86_64   # x86_64 only
+cargo narf smoke musl-demo --arch=x86_64   # x86_64 only
 ```
 
 Runs two `run-interactive` boots verifying `/bin/hello` (hand-rolled
@@ -411,9 +411,9 @@ through the shell + execve + ELF loader + `syscall` dispatch +
 ### 4.4 Off-box network smokes
 
 ```sh
-cargo xtask net-smoke   --arch=x86_64   # TCP + UDP + guest DNS through SLIRP
-cargo xtask e1000-module-net-smoke --arch=x86_64 # same over module-owned e1000
-cargo xtask redis-smoke --arch=x86_64   # unmodified redis-server, host SET/GET
+cargo narf smoke net-smoke   --arch=x86_64   # TCP + UDP + guest DNS through SLIRP
+cargo narf smoke e1000-module-net-smoke --arch=x86_64 # same over module-owned e1000
+cargo narf smoke redis-smoke --arch=x86_64   # unmodified redis-server, host SET/GET
 ```
 
 All force `boot-init` + `firmware-allow-unsigned` + `qemu-net` on.
@@ -458,9 +458,9 @@ mke2fs -q -F -t ext2 -b 1024 \
 
 The plain-ext2 options (no journal/extents/64bit/csum) deliberately
 exercise NARF's indirect-block + fast-symlink read paths. `target/narf-vblk.img`
-is exactly the path `xtask`'s `virtio_blk_image_path()` uses: if the file
-already exists xtask uses it **verbatim**; only when it's absent does
-xtask drop a tiny placeholder ext2 image (a single `/hello.txt`) so the
+is exactly the path `cargo narf`'s `virtio_blk_image_path()` uses: if the file
+already exists cargo narf uses it **verbatim**; only when it's absent does
+cargo narf drop a tiny placeholder ext2 image (a single `/hello.txt`) so the
 `mnt-mount-ext2` boot step has something to mount. So build the Alpine
 image *before* running the distro/chroot demos.
 
@@ -470,7 +470,7 @@ The Alpine launcher is `distro_init`, which chroots into `/mnt` and execs
 Alpine's own busybox:
 
 ```sh
-cargo xtask run-interactive --arch=x86_64 \
+cargo narf run run-interactive --arch=x86_64 \
   --cmd distro_init --expect alpine-shell-ran
 ```
 
@@ -493,7 +493,7 @@ So the "run real Linux software, see what breaks" loop is: put a
 `/probe.sh` into the rootfs image, then:
 
 ```sh
-cargo xtask run-interactive --arch=x86_64 --cmd chroot_run --expect PROBE-DONE
+cargo narf run run-interactive --arch=x86_64 --cmd chroot_run --expect PROBE-DONE
 ```
 
 (By convention `/probe.sh` ends by printing `PROBE-DONE`, so
@@ -564,7 +564,7 @@ QEMU `hostfwd`.
   unmodified `redis-server` to print `Ready to accept connections`, then
   does RESP `SET`/`GET` from the host.
 
-You can also request forwarding manually for `xtask run` by exporting
+You can also request forwarding manually for `cargo narf run run` by exporting
 `XTASK_QEMU_HOSTFWD` yourself (form: `tcp:HOSTIP:HOSTPORT-:GUESTPORT`).
 For higher-fidelity / multi-queue networking, `XTASK_QEMU_TAP=<ifname>`
 switches to a real host tap backend (the guest is reachable directly at
@@ -581,7 +581,7 @@ TAP while `XTASK_QEMU_TAP` remains assigned to virtio-net.
 ## 7. Performance knobs
 
 All of these are environment variables read by `qemu_args`/the command
-handlers in `build/xtask/src/main.rs`:
+handlers in `build/cargo-narf/src/main.rs`:
 
 | Env var | Effect | Default |
 |---|---|---|
@@ -609,7 +609,7 @@ skip the expensive 16-AP bring-up for user-program smokes.
 
 ## 8. Feature flags (reference)
 
-xtask enables the right features per command via `ensure_feature`, so you
+cargo narf enables the right features per command via `ensure_feature`, so you
 rarely pass `--features` by hand. The ones worth knowing (defined in
 `frame/Cargo.toml` and forwarded to sub-crates):
 
@@ -638,11 +638,11 @@ with `XTASK_QEMU_ACCEL=kvm` (fail loudly if KVM is unavailable) or
 `XTASK_QEMU_ACCEL=tcg`.
 
 **Missing rootfs image / distro demo prints `chroot-fail`.** If
-`target/narf-vblk.img` doesn't hold a real distro, xtask drops a tiny
+`target/narf-vblk.img` doesn't hold a real distro, cargo narf drops a tiny
 placeholder (just `/hello.txt`) and the chroot launchers fail. Run
 `sh verification/data/musl-demo/REGEN_alpine_rootfs.sh` first. Note the
 kernel-test suite uses a *separate* disk (`narf-vblk-test.img`), so
-running `cargo xtask test` won't clobber your rootfs — but any command
+running `cargo narf test test` won't clobber your rootfs — but any command
 that *creates* the placeholder does so only when the file is absent.
 
 **`chroot_run` runs but nothing happens / `exec-fail`.** You haven't put
@@ -669,7 +669,7 @@ them, run on a KVM host or use `XTASK_QEMU_ACCEL=tcg,thread=multi` with a
 CPU model that exposes x2APIC.
 
 **Boot hangs.** `run` kills a hung QEMU after `XTASK_QEMU_TIMEOUT_SECS`
-(default 2400 seconds). The kernel-test phase of `xtask test` also stops a
+(default 2400 seconds). The kernel-test phase of `cargo narf test test` also stops a
 guest that prints nothing for `XTASK_QEMU_IDLE_SECS` (default 300 seconds),
 or that reports a kernel panic/fault and does not exit within 10 seconds,
 and names the last serial line, which is the last smoke that finished. For a live debug session, attach gdb with
@@ -682,4 +682,4 @@ and names the last serial line, which is the last smoke that finished. For a liv
 - [`README.md`](../README.md) — project overview & quick start
 - [`TESTING.md`](../TESTING.md) — the full testing surface (ISO, USB, real hardware)
 - [`docs/PERSONAS.md`](PERSONAS.md) — the `linux-compat` + `container` feature personas
-- `build/xtask/src/main.rs` — the orchestrator every command here comes from
+- `build/cargo-narf/src/main.rs` — the orchestrator every command here comes from

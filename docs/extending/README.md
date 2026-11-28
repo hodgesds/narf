@@ -30,7 +30,7 @@ crate. The subsystems this reference covers:
 | `narf-capabilities` / `narf-security` | `capabilities/`, `security/` | [capabilities.md](capabilities.md) |
 | syscall table         | `userspace/`    | [syscalls.md](syscalls.md) |
 | runtime modules       | `modules/`      | [modules.md](modules.md) |
-| external composition  | `build/xtask/`  | [composition.md](composition.md) |
+| external composition  | `build/cargo-narf/`  | [composition.md](composition.md) |
 
 > `security-model/` is a spec-only crate (README + `specification/` +
 > `research/`; no `src/`). The runtime security code lives in `security/`

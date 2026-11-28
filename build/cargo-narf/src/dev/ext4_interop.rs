@@ -1,11 +1,11 @@
-//! `cargo xtask ext4-rootrw-interop`: prove that `narf.disks=root-rw` with
+//! `cargo narf smoke ext4-rootrw-interop`: prove that `narf.disks=root-rw` with
 //! `rd.luks.prompt=console` unlocks a LUKS1 root from the keyboard and
 //! writes the ext4 inside it so that e2fsprogs finds nothing wrong.
 //!
 //! 1. Build, unprivileged, a GPT disk shaped like the 21ME's: an ESP and a
 //!    LUKS1 (aes-xts-plain64, sha256) partition around a `mkfs.ext4 -d`
 //!    filesystem with the host's default features, its directories indexed
-//!    by `e2fsck -fyD`. `cryptsetup luksFormat` takes a volume key xtask
+//!    by `e2fsck -fyD`. `cryptsetup luksFormat` takes a volume key cargo narf
 //!    chose, so the host can encrypt the payload itself (AES-XTS, plain64)
 //!    with no device mapper. The keyslots are the 21ME's too: the
 //!    passphrase in slot 0 and a keyfile in slot 1, with the iteration
@@ -66,7 +66,7 @@ const TRUNC_TO: usize = 100_000;
 /// Names `/usr/lib/narf-many` starts with: enough for e2fsck -D to index it.
 const MANY_INITIAL: u32 = 400;
 
-/// Options for `cargo xtask ext4-rootrw-interop`.
+/// Options for `cargo narf smoke ext4-rootrw-interop`.
 #[derive(clap::Args, Clone)]
 pub struct Args {
     #[command(flatten)]

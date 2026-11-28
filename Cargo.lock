@@ -263,8 +263,28 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "cargo-narf"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
+ "blake3",
  "clap",
+ "ed25519-dalek",
+ "narf-boot-protocol",
+ "narf-kallsyms",
+ "proc-macro2",
+ "quinn",
+ "rcgen",
+ "rustc-demangle",
+ "rustls",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "wait-timeout",
+ "xts-mode",
+ "zstd",
 ]
 
 [[package]]
@@ -4895,34 +4915,6 @@ dependencies = [
  "rusticata-macros",
  "thiserror",
  "time",
-]
-
-[[package]]
-name = "xtask"
-version = "0.0.0"
-dependencies = [
- "aes",
- "anyhow",
- "blake3",
- "clap",
- "ed25519-dalek",
- "narf-boot-protocol",
- "narf-kallsyms",
- "proc-macro2",
- "quinn",
- "rcgen",
- "rustc-demangle",
- "rustls",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
- "toml_edit",
- "wait-timeout",
- "xts-mode",
- "zstd",
 ]
 
 [[package]]

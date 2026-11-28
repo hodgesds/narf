@@ -29,7 +29,7 @@ The drivers are split into per-family crates:
 
 The eight driver crates are dual-build. With the default `builtin` feature
 they link into the kernel through the umbrella crate. Built with
-`--no-default-features --features module` (`cargo xtask build-module`),
+`--no-default-features --features module` (`cargo narf build build-module`),
 the same source becomes a loadable `.ko` that reaches the kernel only
 through `narf-module-rt` and the KABI (most crates through a `platform/`
 layer, iwlwifi through `src/iwlwifi/module/`). Each module carries a subset of its built-in driver, mostly the

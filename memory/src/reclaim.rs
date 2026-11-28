@@ -1221,7 +1221,7 @@ pub fn __reset_anon_reclaimer_for_test() {
 }
 
 /// `AnonReclaimer` seam tests. Always compiled so they register + run under
-/// `cargo xtask test`. A mock reclaimer verifies target forwarding, the
+/// `cargo narf test test`. A mock reclaimer verifies target forwarding, the
 /// released-page return, and the unregistered no-op; the registry is cleared
 /// after so the mock never leaks into the live kernel.
 mod anon_reclaimer_tests {
@@ -1276,7 +1276,7 @@ mod anon_reclaimer_tests {
 }
 
 /// Swappiness-knob tests. Always compiled so they register + run under
-/// `cargo xtask test`. Exercise the default, the [0, 200] clamp, a
+/// `cargo narf test test`. Exercise the default, the [0, 200] clamp, a
 /// set/get round-trip, and the pure `split_reclaim_target` balance math;
 /// the live value is restored afterwards so the boot default is unperturbed.
 mod swappiness_tests {
@@ -1354,7 +1354,7 @@ mod swappiness_tests {
 
 /// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
 /// register in the in-kernel `narf.tests` section and actually run under
-/// `cargo xtask test` — unlike the host-only `#[cfg(test)] mod tests`
+/// `cargo narf test test` — unlike the host-only `#[cfg(test)] mod tests`
 /// below. They exercise the pure `compute_watermarks`, so they never
 /// touch the live boot-installed watermark globals.
 mod watermark_tests {
@@ -1547,7 +1547,7 @@ mod range_planner_tests {
 }
 
 /// Shrinker-registry tests. Always compiled so they register + run under
-/// `cargo xtask test`. The proportional scan is exercised against a private
+/// `cargo narf test test`. The proportional scan is exercised against a private
 /// snapshot so live production shrinkers are neither invoked nor removed.
 mod shrinker_tests {
     use super::{
@@ -1650,7 +1650,7 @@ mod shrinker_tests {
 }
 
 /// Frame-LRU ↔ `try_to_free` integration tests. Always compiled so they
-/// register + run under `cargo xtask test`. (The crate's `#[cfg(test)] mod
+/// register + run under `cargo narf test test`. (The crate's `#[cfg(test)] mod
 /// tests` cannot link on the host — it references kernel-only symbols such
 /// as `__text_start` — so those host-only tests never execute anywhere;
 /// this module gives the direct-reclaim path real in-kernel coverage.)

@@ -33,7 +33,7 @@ launches the in-tree init and getty.
 The Ethernet registry consumes repeatable `ifname=ethN:aa:bb:cc:dd:ee:ff`
 arguments when naming ports at probe time (net §3).
 
-The native x86_64 EFI application (`cargo xtask efi-image`) embeds its
+The native x86_64 EFI application (`cargo narf build efi-image`) embeds its
 kernel, initramfs and command line, then produces the existing Multiboot2
 handoff. `narf-boot-protocol` (`boot/protocol/`) validates the ELF load plan
 and constructs the information block without kernel or EFI dependencies.
@@ -237,10 +237,10 @@ for x86_64 CI. All normalize through the same `BootInfo` consumed by `frame/`.
 - **Limine** remains the existing x86_64 media bootloader: well-maintained,
   modern, supports the protocol features we care about
   (high-half kernel, KASLR, Smarter ACPI handoff).
-- **Native EFI** is built with `cargo xtask efi-image`; its standard
+- **Native EFI** is built with `cargo narf build efi-image`; its standard
   Multiboot2 handoff reuses the existing kernel entry. It is not yet the
   default for existing media or distribution-package commands.
-- **Xen PVH** is QEMU's x86_64 `-kernel` direct-load path; it lets xtask
+- **Xen PVH** is QEMU's x86_64 `-kernel` direct-load path; it lets cargo narf
   boot fresh kernels without re-imaging. Multiboot2 remains supported for
   Limine, GRUB and the native EFI application.
 - **UEFI loader** on aarch64 is the SystemReady-compatible removable

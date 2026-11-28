@@ -136,7 +136,7 @@ macro_rules! kernel_abi {
     };
 }
 
-// USB datapath export helpers. Kept above the `kernel_abi!` block: xtask
+// USB datapath export helpers. Kept above the `kernel_abi!` block: cargo narf
 // compiles that block alone (to compute the ABI hash), without kernel crates.
 
 /// Build a completion notification from an export's raw callback argument.

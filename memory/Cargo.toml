@@ -98,7 +98,7 @@ rmap-free-audit = []
 # and the slab poisons freed blocks so a dangling cross-CPU write trips the
 # compiler-emitted inline shadow check, panicking IN the corruptor's frame
 # (its RIP appears in the backtrace) instead of blaming the victim. Requires
-# the build to also pass `-Zsanitizer=kernel-address` (via `cargo xtask
+# the build to also pass `-Zsanitizer=kernel-address` (via `cargo narf
 # <cmd> --kasan`, which injects it into the kernel rustflags). Off by default.
 kasan = []
 

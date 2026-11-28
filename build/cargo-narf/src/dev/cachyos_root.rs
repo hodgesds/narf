@@ -1,4 +1,4 @@
-//! `cargo xtask cachyos-root-smoke`: boot a CachyOS-layout btrfs root with
+//! `cargo narf smoke cachyos-root-smoke`: boot a CachyOS-layout btrfs root with
 //! systemd as PID 1 and wait for the getty login prompt.
 //!
 //! The disk is a regular file built unprivileged by
@@ -371,7 +371,7 @@ fn boot_and_login(args: &Args) -> Result<()> {
         .map(|b| format!("{b:02x}"))
         .collect();
     println!(
-        "xtask cachyos-root-smoke: kernel {} SHA-256 {digest}",
+        "cargo narf smoke cachyos-root-smoke: kernel {} SHA-256 {digest}",
         kernel.display()
     );
     // Firmware the display needs before the root mounts (a passed-through
@@ -388,7 +388,7 @@ fn boot_and_login(args: &Args) -> Result<()> {
         std::fs::write(&path, super::encode_cpio_newc(&entries))
             .with_context(|| format!("write {}", path.display()))?;
         println!(
-            "xtask cachyos-root-smoke: {} firmware blob(s) in the initramfs",
+            "cargo narf smoke cachyos-root-smoke: {} firmware blob(s) in the initramfs",
             firmware.len()
         );
         Some(path)
@@ -643,7 +643,7 @@ fn boot_and_login(args: &Args) -> Result<()> {
     drop(rx);
     let _ = reader.join();
     report_start_jobs(&serial);
-    result.map_err(|e| anyhow::anyhow!("xtask cachyos-root-smoke: {e}"))
+    result.map_err(|e| anyhow::anyhow!("cargo narf smoke cachyos-root-smoke: {e}"))
 }
 
 /// Print the units systemd reported as slow start jobs: a unit that hangs
@@ -703,22 +703,22 @@ fn interactive(
 
 fn interactive_outcome(serial: &str, status: std::process::ExitStatus) -> Result<()> {
     if let Some(marker) = PANIC_MARKERS.iter().find(|marker| serial.contains(*marker)) {
-        bail!("xtask cachyos-root-smoke: guest fatal marker: {marker}");
+        bail!("cargo narf smoke cachyos-root-smoke: guest fatal marker: {marker}");
     }
     if !status.success() {
-        bail!("xtask cachyos-root-smoke: QEMU failed ({status})");
+        bail!("cargo narf smoke cachyos-root-smoke: QEMU failed ({status})");
     }
     if serial.is_empty() {
-        bail!("xtask cachyos-root-smoke: guest exited without serial output");
+        bail!("cargo narf smoke cachyos-root-smoke: guest exited without serial output");
     }
     Ok(())
 }
 
 fn report_completion(interactive: bool) {
     if interactive {
-        println!("xtask cachyos-root-smoke: interactive session ended; boot checks were not run");
+        println!("cargo narf smoke cachyos-root-smoke: interactive session ended; boot checks were not run");
     } else {
-        println!("xtask cachyos-root-smoke: OK");
+        println!("cargo narf smoke cachyos-root-smoke: OK");
     }
 }
 
@@ -765,7 +765,10 @@ pub(crate) fn ensure_image(root: &Path, rebuild: bool) -> Result<PathBuf> {
     if image.exists() && !rebuild {
         return Ok(image);
     }
-    println!("xtask cachyos-root-smoke: building {}", image.display());
+    println!(
+        "cargo narf smoke cachyos-root-smoke: building {}",
+        image.display()
+    );
     let status = Command::new("bash")
         .arg(root.join(SCRIPT))
         .env("CACHYOS_ROOT_IMG", &image)
@@ -773,7 +776,7 @@ pub(crate) fn ensure_image(root: &Path, rebuild: bool) -> Result<PathBuf> {
         .status()
         .context("run the CachyOS image script")?;
     if !status.success() {
-        bail!("xtask cachyos-root-smoke: image build failed ({status})");
+        bail!("cargo narf smoke cachyos-root-smoke: image build failed ({status})");
     }
     Ok(image)
 }
@@ -973,7 +976,7 @@ pub fn run(args: &Args) -> Result<()> {
         if prepared {
             if !copy.is_file() {
                 bail!(
-                    "xtask cachyos-root-smoke: NARF_CACHYOS_RW_PREPARED=1 but {} does not exist",
+                    "cargo narf smoke cachyos-root-smoke: NARF_CACHYOS_RW_PREPARED=1 but {} does not exist",
                     copy.display()
                 );
             }
@@ -986,7 +989,7 @@ pub fn run(args: &Args) -> Result<()> {
                 .status()
                 .context("copy the image for the root-rw boot")?;
             if !status.success() {
-                bail!("xtask cachyos-root-smoke: copying the image failed");
+                bail!("cargo narf smoke cachyos-root-smoke: copying the image failed");
             }
         }
         copy
@@ -1004,7 +1007,7 @@ pub fn run(args: &Args) -> Result<()> {
 
     let cmdline = smoke_cmdline(IMAGE_BTRFS_UUID, args.rw, &args.cmdline);
     println!(
-        "xtask cachyos-root-smoke: disk {} cmdline `{cmdline}`",
+        "cargo narf smoke cachyos-root-smoke: disk {} cmdline `{cmdline}`",
         disk.display()
     );
     set_boot_env(&decoy, &disk, &cmdline);
@@ -1013,21 +1016,21 @@ pub fn run(args: &Args) -> Result<()> {
 
     if sha256_file(&decoy)? != decoy_before {
         bail!(
-            "xtask cachyos-root-smoke: the boot MODIFIED the decoy disk {}",
+            "cargo narf smoke cachyos-root-smoke: the boot MODIFIED the decoy disk {}",
             decoy.display()
         );
     }
-    println!("xtask cachyos-root-smoke: decoy NVMe disk unchanged (SHA-256 verified)");
+    println!("cargo narf smoke cachyos-root-smoke: decoy NVMe disk unchanged (SHA-256 verified)");
     if let Some(before) = before {
         let after = sha256_file(&disk)?;
         if before != after {
             bail!(
-                "xtask cachyos-root-smoke: narf.disks=root-ro boot MODIFIED {}",
+                "cargo narf smoke cachyos-root-smoke: narf.disks=root-ro boot MODIFIED {}",
                 disk.display()
             );
         }
         println!(
-            "xtask cachyos-root-smoke: image unchanged by the root-ro boot (SHA-256 verified)"
+            "cargo narf smoke cachyos-root-smoke: image unchanged by the root-ro boot (SHA-256 verified)"
         );
     }
     result?;
@@ -1063,7 +1066,7 @@ fn run_disk(args: &Args, root: &Path, base: &Path) -> Result<()> {
         None => {
             let (uuid, fs) = find_root_partition(&disk.base)?;
             println!(
-                "xtask cachyos-root-smoke: {} root {fs} UUID {uuid}",
+                "cargo narf smoke cachyos-root-smoke: {} root {fs} UUID {uuid}",
                 disk.base.display()
             );
             // CachyOS's btrfs layout puts / in `@`.
@@ -1075,7 +1078,7 @@ fn run_disk(args: &Args, root: &Path, base: &Path) -> Result<()> {
     let decoy_before = sha256_file(&decoy)?;
     let cmdline = root_cmdline(&uuid, rootflags, args.rw, &args.cmdline);
     println!(
-        "xtask cachyos-root-smoke: disk {} (overlay {}) cmdline `{cmdline}`",
+        "cargo narf smoke cachyos-root-smoke: disk {} (overlay {}) cmdline `{cmdline}`",
         disk.base.display(),
         disk.overlay.display()
     );
@@ -1095,24 +1098,26 @@ fn run_disk(args: &Args, root: &Path, base: &Path) -> Result<()> {
     }
     let written = overlay_written_bytes(&disk.overlay)?;
     if args.rw {
-        println!("xtask cachyos-root-smoke: root-rw wrote {written} bytes to the overlay");
+        println!(
+            "cargo narf smoke cachyos-root-smoke: root-rw wrote {written} bytes to the overlay"
+        );
     } else if written != 0 {
         verdict = Err(anyhow::anyhow!(
             "narf.disks=root-ro WROTE {written} bytes to the overlay {}",
             disk.overlay.display()
         ));
     } else {
-        println!("xtask cachyos-root-smoke: root-ro boot wrote nothing (overlay holds no data)");
+        println!("cargo narf smoke cachyos-root-smoke: root-ro boot wrote nothing (overlay holds no data)");
     }
     if args.keep_overlay || verdict.is_err() {
         println!(
-            "xtask cachyos-root-smoke: overlay kept at {}",
+            "cargo narf smoke cachyos-root-smoke: overlay kept at {}",
             disk.overlay.display()
         );
     } else {
         let _ = std::fs::remove_file(&disk.overlay);
     }
-    verdict.map_err(|e| anyhow::anyhow!("xtask cachyos-root-smoke: {e}"))?;
+    verdict.map_err(|e| anyhow::anyhow!("cargo narf smoke cachyos-root-smoke: {e}"))?;
     result?;
     report_completion(args.interactive);
     Ok(())

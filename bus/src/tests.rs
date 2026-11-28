@@ -73,7 +73,7 @@ fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
     // base, and runs the shared walker. Other smokes that do
     // `init(None)` reset the registry; re-init explicitly with the
     // DTB boot handed to `init`, so this test is order-independent.
-    // xtask places the DTB per image, so no fixed address is right.
+    // cargo narf places the DTB per image, so no fixed address is right.
     use crate::{devices, BusKind};
     let Some(dtb) = crate::boot_dtb() else {
         return TestResult::Skip("boot passed no DTB");

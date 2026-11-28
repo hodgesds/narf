@@ -12,7 +12,7 @@ use crate::{decode_file_entry, FwCfgFile, FILE_ENTRY_SIZE, FILE_NAME_LEN, MAGIC}
 #[cfg(target_arch = "x86_64")]
 use crate::{find, is_present, read_directory, read_string};
 
-// 1. Live presence — QEMU always exposes fw_cfg under `cargo xtask
+// 1. Live presence — QEMU always exposes fw_cfg under `cargo narf
 //    test`. Skip cleanly on bare-metal / non-QEMU runs.
 #[cfg(target_arch = "x86_64")]
 fn smoke_fw_cfg_signature_detected() -> TestResult {

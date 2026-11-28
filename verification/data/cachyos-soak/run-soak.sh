@@ -3,7 +3,7 @@
 #
 #   run-soak.sh <name> [mem-mib] [load-seconds]
 #
-# Boots `cargo xtask cachyos-root-smoke --rw` (CachyOS userspace, systemd as
+# Boots `cargo narf smoke cachyos-root-smoke --rw` (CachyOS userspace, systemd as
 # PID 1, btrfs root read-write on an emulated NVMe disk, the bare-metal
 # command line) with the lockup detector's thresholds shortened, and lets
 # narf-soak.service in the image run soak-guest.sh for <load-seconds>. The
@@ -172,11 +172,11 @@ main() {
   exec 8< <(exec sleep $((DEADLINE + 600)))
   QUIET_PID=$!
   # shellcheck disable=SC2086
-  $SOAK_WRAPPER timeout -k 15 $((DEADLINE + 240)) cargo xtask cachyos-root-smoke --rw \
+  $SOAK_WRAPPER timeout -k 15 $((DEADLINE + 240)) cargo narf smoke cachyos-root-smoke --rw \
     --interactive --serial-log "$RUN/serial.log" "${ARGS[@]}" \
-    <&8 > "$RUN/xtask.log" 2>&1 || rc=$?
+    <&8 > "$RUN/cargo narf.log" 2>&1 || rc=$?
   kill "$QUIET_PID" 2> /dev/null || true
-  echo "run-soak: xtask exited $rc"
+  echo "run-soak: cargo narf exited $rc"
 
   for _ in $(seq 1 30); do
     kill -0 $HOST_PID 2> /dev/null || break

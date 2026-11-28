@@ -50,11 +50,11 @@ kernel-test = ["narf-ctap2/kernel-test"]
 # Leave FTDI parts to a loadable `ftdi_sio` module (`narf-drivers-usb-ftdi`,
 # `--features module`): the built-in serial cascade skips the FTDI family, so
 # the device falls through to the module's `narf_register_usb_driver` match.
-# Used by `cargo xtask ftdi-module-serial-smoke`; off in every normal build.
+# Used by `cargo narf smoke ftdi-module-serial-smoke`; off in every normal build.
 ftdi-module-only = []
 # Leave USB mass storage (BOT, 08/06/50) to `usb-storage.ko`: the built-in
 # binder skips it and does not register its class entry, so the stick falls
-# through to module matches. Used by `cargo xtask usb-storage-module-block-smoke`.
+# through to module matches. Used by `cargo narf smoke usb-storage-module-block-smoke`.
 msc-module-only = []
 # Bind USB CCID smart-card readers in the kernel and publish /dev/ccid<N>.
 # Off by default: as on Linux, pcscd drives readers itself through usbfs,

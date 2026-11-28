@@ -9,7 +9,7 @@
     the token algorithm exactly; `tests.rs` checks it against a verbatim
     port. `KSYM_NAME_LEN` = 512 (`include/linux/kallsyms.h`).
   - `scripts/mksysmap` — the name filters (`$` mapping symbols, `.L` locals,
-    `__crc_`, `__kstrtab_`, …) the xtask extractor applies.
+    `__crc_`, `__kstrtab_`, …) the cargo narf extractor applies.
   - `scripts/link-vmlinux.sh` — the two/three-pass link that makes the
     table's own size stop moving symbols. NARF reaches the same fixed point in
     one link by filling a fixed-size reservation (as `.kaslr_relocs` does).
@@ -25,5 +25,5 @@
     `_edata`/`_etext` as the kernel map end, `/proc/modules` handling.
   - `tools/perf/util/symbol.c` — `symbol__read_kptr_restrict`,
     `demangle_kernel = false` (why the table stores demangled names).
-- `rustc-demangle` (crates.io) — the demangler the xtask uses; `{:#}` is the
+- `rustc-demangle` (crates.io) — the demangler the cargo narf uses; `{:#}` is the
   hash-free form binutils' `nm -C` prints for legacy and v0 Rust symbols.

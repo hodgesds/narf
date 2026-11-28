@@ -170,7 +170,7 @@ pub fn register_initcalls() {
 
 For an in-tree crate, the kernel's boot code may call
 `my_driver::register_initcalls()` directly. An external crate instead exposes
-a direct entry such as `register()` that publishes the bus match; xtask wraps
+a direct entry such as `register()` that publishes the bus match; cargo narf wraps
 that entry in the composition's init stage and supplies the retention
 dependency without changing the checkout. Do not nest a same-stage
 `register_initcalls()` call inside that wrapper because the stage registry is

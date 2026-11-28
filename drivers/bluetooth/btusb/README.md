@@ -16,7 +16,7 @@ KSYMTAB export and is registration-only: the USB transfer datapath exists
 stack its events and ACL data yet.
 
 ```
-cargo xtask build-module --package narf-drivers-bluetooth-btusb \
+cargo narf build build-module --package narf-drivers-bluetooth-btusb \
   --no-default-features --features module
 ```
 

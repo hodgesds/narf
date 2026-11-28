@@ -1,5 +1,5 @@
 //! `narf.rootrw_interop=<mode>`: the in-guest half of
-//! `cargo xtask btrfs-rootrw-interop`.
+//! `cargo narf smoke btrfs-rootrw-interop`.
 //!
 //! Booted under `narf.disks=root-rw` against a host-built btrfs image with
 //! the installed CachyOS root's feature set and subvolume layout, this runs
@@ -767,7 +767,7 @@ pub fn run(mode: &str) -> narf_init::InitResult {
         line(&format!("REFUSED ({why})"));
         return narf_init::InitResult::Error("btrfs root-rw interop refused a non-harness root");
     }
-    // `cargo xtask btrfs-cycles`: detaches this root and runs its own
+    // `cargo narf smoke btrfs-cycles`: detaches this root and runs its own
     // mount/unmount cycles over the same image.
     if mode == "cycles" {
         return crate::cycles::run(fs);

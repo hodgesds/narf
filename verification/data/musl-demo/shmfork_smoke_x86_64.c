@@ -23,7 +23,7 @@
 //                    restored after phase2's handler or this SIGALRM stays masked.
 //
 // Not in the musl-demo CI auto-run list (like chroot_run); run manually:
-//   XTASK_QEMU_ACCEL=kvm cargo xtask run-interactive --arch=x86_64 \
+//   XTASK_QEMU_ACCEL=kvm cargo narf run run-interactive --arch=x86_64 \
 //       --cmd shmfork_smoke --expect ALL-CHILDREN-SAW-FLAG
 //
 // Build: musl-gcc -O2 -Wall -fPIE -pie -mcmodel=large (uniform musl-demo recipe).

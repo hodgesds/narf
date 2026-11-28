@@ -352,7 +352,7 @@ Bound (fails loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels. Trees
 taller than two levels are exercised in-kernel (`smoke_btrfs_tall_tree` writes and
 reads back a three-level fs tree); host `btrfs check` in CI covers up to two
 levels — a taller tree has the identical on-disk node format, just stacked. The
-write-interop guarantee is CI-enforced: `cargo xtask test` runs host `btrfs check`
+write-interop guarantee is CI-enforced: `cargo narf test test` runs host `btrfs check`
 on the NARF-written image when `btrfs-progs` is available — on a plain image, a
 `space_cache=v2` image (including a multi-level fs tree), and a **96 MiB image
 carrying the 64 MiB superblock mirror, a bitmap-tracked block group, and an extent
@@ -430,6 +430,6 @@ btrfs-progs pinned at **v6.17.1** (update `regen_fixture.sh`'s header if you
 regenerate with a newer one). The parser rejects every assumption it cannot
 meet, so a drifted mkfs default fails loudly rather than mis-reading.
 
-Run the tests with `cargo xtask test --subsystem drivers/fs/btrfs`.
+Run the tests with `cargo narf test test --subsystem drivers/fs/btrfs`.
 The host-side harness (no QEMU; root-rw workload, Linux interop and crash
-replay) is `cargo xtask btrfs-host-rw` — see `verification/btrfs-host`.
+replay) is `cargo narf smoke btrfs-host-rw` — see `verification/btrfs-host`.

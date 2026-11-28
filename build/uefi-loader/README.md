@@ -1,7 +1,7 @@
 # NARF UEFI loader
 
 The x86_64 build is a self-contained EFI application with embedded kernel,
-initramfs, and command line. Build it with `cargo xtask efi-image`, run it
+initramfs, and command line. Build it with `cargo narf build efi-image`, run it
 through OVMF with `--run`, or require a clean shutdown with `--smoke`.
 See [build, install, and run instructions](../../docs/NATIVE_UEFI.md).
 Its `.narf` PE section contains a versioned payload manifest; the loader
@@ -15,7 +15,7 @@ map are retained. The kernel goes to its link address, or a multiple of
 ## aarch64
 
 This `aarch64-unknown-uefi` application is staged as the standard
-`EFI/BOOT/BOOTAA64.EFI` removable-media loader by `cargo xtask image
+`EFI/BOOT/BOOTAA64.EFI` removable-media loader by `cargo narf build image
 --arch=aarch64`. It loads the NARF ELF from the native-package path
 `EFI/NARF/narf-frame`, falling back to `boot/narf-frame` for removable
 media. It validates and loads the ELF at its physical `PT_LOAD` addresses,

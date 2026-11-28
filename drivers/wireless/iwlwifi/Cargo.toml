@@ -10,7 +10,7 @@
 #     driver (PCIe transport, firmware TLV/ladder, MLD station path) lives
 #     here, gated under `builtin`.
 #   * `module`: built to a relocatable `.ko` via
-#     `cargo xtask build-module --package narf-drivers-wireless-iwlwifi \
+#     `cargo narf build build-module --package narf-drivers-wireless-iwlwifi \
 #        --no-default-features --features module`. The kernel crates drop from
 #     the graph. For every id of the built-in table the driver's own
 #     transport, firmware and Gen2/Gen3 station code runs inside the `.ko` over
@@ -35,7 +35,7 @@ repository.workspace   = true
 name = "narf_drivers_wireless_iwlwifi"
 path = "src/lib.rs"
 # rlib for the built-in facade dependency and the kernel link. The `.ko` build
-# overrides this to `staticlib` via `cargo xtask build-module`.
+# overrides this to `staticlib` via `cargo narf build build-module`.
 
 [features]
 default = ["builtin"]
@@ -52,7 +52,7 @@ builtin = [
 ]
 # Module: NO kernel crates. The kernel-free protocol crates and the module
 # runtime are linked into the `.ko`; everything else comes through the KABI.
-# The only undefined symbols are C-ABI KSYMTAB exports; `xtask
+# The only undefined symbols are C-ABI KSYMTAB exports; `cargo narf
 # build-module`'s `nm -u` gate enforces that.
 module = [
     "dep:narf-module-rt", "dep:narf-crypto", "dep:narf-wireless", "dep:zeroize",

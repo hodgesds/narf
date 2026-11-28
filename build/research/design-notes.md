@@ -39,17 +39,17 @@ The spec understates this challenge.
 ## Divergences from precedent
 
 **vs. Hubris:** Hubris pins an exact nightly in its `rust-toolchain.toml` and
-has a `xtask` that validates the toolchain version before any build operation.
+has a `cargo narf` that validates the toolchain version before any build operation.
 NARF's spec leaves toolchain pinning as an open question. This should not be
 open — it must be resolved at Stage 1 because every `build-std` invocation
 depends on it.
 
 **vs. Redox:** Redox uses a `mk`-based build system with a manifest for each
-component. NARF uses `xtask`, which is pure Rust and strictly better for
+component. NARF uses `cargo narf`, which is pure Rust and strictly better for
 cross-platform consistency. However, Redox's component manifests make it easy
 to trace what goes into each artifact. NARF's single-binary LTO model makes
 this tracing harder — there is no clear boundary between what is in the TCB
-binary and what is a loadable module. The spec should specify that `cargo xtask
+binary and what is a loadable module. The spec should specify that `cargo narf
 image` produces a manifest listing every crate in the final image.
 
 **LTO + domain isolation code:** The rustc-linker-plugin-lto summary notes a
@@ -103,7 +103,7 @@ defining a custom `.json` target that locks the CPU feature flags explicitly
   binaries, which conflicts with the security model (profiling can reveal
   addresses). BOLT is an LTO post-pass that is safe but requires symbol
   tables. Decision: **defer BOLT/FDO to post-1.0; document in §7 that Stage 4
-  may add a `cargo xtask bolt` command as a separate, optional post-link step.**
+  may add a `cargo narf bolt` command as a separate, optional post-link step.**
 
 ## Open invariants / cross-subsystem hazards
 
@@ -116,16 +116,16 @@ spec's `§6 Dependencies`.
 
 **build ↔ frame:** The `frame/` crate defines the `#[panic_handler]`. It must
 be linked into the final binary before any other crate that might define one.
-With fat LTO and `build-std`, link order is non-trivial. `xtask` must ensure
+With fat LTO and `build-std`, link order is non-trivial. `cargo narf` must ensure
 `frame` appears first in the link order or use `--allow-multiple-definition`
 with an explicit symbol override. The spec does not mention this.
 
 **build ↔ verification:** The `verification/` spec (from ROADMAP) describes a
 statistical performance protocol requiring dedicated cores, fixed frequency, and
-ASLR off. `cargo xtask test` must support a `--perf` flag that configures the
+ASLR off. `cargo narf test test` must support a `--perf` flag that configures the
 QEMU invocation to match these constraints. Without it, CI performance tests
 are invalid. Neither `build/` §3 nor `verification/` spec mentions this
-requirement on `xtask`.
+requirement on `cargo narf`.
 
 **build ↔ all:** The `build-std` approach recompiles `core` with NARF's
 profiles. If a crate conditionally enables features via `cfg(feature = "...")`,
@@ -138,7 +138,7 @@ section that is validated at CI time.
 The spec is appropriately thin for a build subsystem in the design phase, but
 it makes one strategic mistake: treating fat LTO as a done deal without
 budgeting its cost. Fat LTO on a large Rust codebase (100+ crates) can
-take 20–40 minutes on a developer machine. If every `cargo xtask run` triggers
+take 20–40 minutes on a developer machine. If every `cargo narf run run` triggers
 a fat LTO link, developer iteration becomes painful enough to encourage
 workarounds (like `lto = false` in developer configs) that then break the
 single-binary optimization guarantee.

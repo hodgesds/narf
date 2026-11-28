@@ -84,7 +84,7 @@ narf-modules      = { path = "../modules" }
 # user address spaces and embed instructions directly, without boot-init or
 # filesystem input. Disabled by default because they leave subsystem state
 # that other suites do not need to pay for; enable with
-# `cargo xtask test --arch=<x86_64|aarch64> --features=user-mode-e2e`.
+# `cargo narf test test --arch=<x86_64|aarch64> --features=user-mode-e2e`.
 user-mode-e2e = []
 # Opt-in real-Rust-binary end-to-end test. This implies
 # `user-mode-e2e` and additionally enables

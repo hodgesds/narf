@@ -12,7 +12,7 @@ registers 1022:15E2 through the `narf_register_pci_driver` KSYMTAB export and
 is registration-only until the device datapath ABI covers a PCM device.
 
 ```
-cargo xtask build-module --package narf-drivers-audio-acp \
+cargo narf build build-module --package narf-drivers-audio-acp \
   --no-default-features --features module
 ```
 

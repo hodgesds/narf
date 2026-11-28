@@ -69,7 +69,7 @@ jobs:
               args+=(--set "$assignment")
             done
           fi
-          cargo xtask "${args[@]}"
+          cargo narf "${args[@]}"
           if [[ -s target/crate-release-selected.txt ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -84,8 +84,8 @@ jobs:
           while IFS= read -r package; do
             [[ -n "$package" ]] && args+=(--package "$package")
           done < target/crate-release-selected.txt
-          cargo xtask "${args[@]}"
-          cargo test -p xtask crate_release::tests
+          cargo narf "${args[@]}"
+          cargo test -p cargo-narf crate_release::tests
           cargo fmt --all --check
           git diff --check
 

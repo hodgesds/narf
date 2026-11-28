@@ -1,4 +1,4 @@
-//! `narf.rootrw_interop=cycles`: the guest half of `cargo xtask btrfs-cycles`.
+//! `narf.rootrw_interop=cycles`: the guest half of `cargo narf smoke btrfs-cycles`.
 //!
 //! One boot runs many mount → write → sync → unmount → remount → verify
 //! cycles against the harness image, which booted as a `narf.disks=root-rw`

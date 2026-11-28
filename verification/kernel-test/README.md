@@ -28,8 +28,8 @@ driver or library crate turns on that feature, depends on
 `narf-kernel-test`, and registers subsystem-aware smokes without pulling
 in the full harness. The higher-level `narf-verification` crate re-exports
 these types and adds the runner that executes the collected tests and
-prints results to the console. `cargo xtask test` is what boots the kernel
+prints results to the console. `cargo narf test test` is what boots the kernel
 with the test feature enabled and drives the suite, optionally narrowed to
 a single subsystem. The subsystem strings registered here are the same
-ones `xtask affected` maps changed crates onto when selecting which
+ones `cargo narf ci affected` maps changed crates onto when selecting which
 subsystems a diff can affect.

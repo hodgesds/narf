@@ -1,6 +1,6 @@
 // Real userspace coverage of kernel-global credentials and procfs user maps.
 // Reference: /usr/src/linux/{kernel/user_namespace.c,kernel/sys.c,fs/proc/base.c}.
-// Run with: cargo xtask musl-demo --features=container --group=userns
+// Run with: cargo narf smoke musl-demo --features=container --group=userns
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

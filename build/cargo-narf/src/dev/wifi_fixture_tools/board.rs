@@ -357,7 +357,7 @@ mod tests {
         let records = synthetic().unwrap();
         let encoded = encode(&records, Path::new("."), true).unwrap();
         let text =
-            include_str!("../../../../drivers/wireless/brcm/src/brcmfmac/provision/golden.rs");
+            include_str!("../../../../../drivers/wireless/brcm/src/brcmfmac/provision/golden.rs");
         let expected = text
             .split("= [")
             .nth(1)

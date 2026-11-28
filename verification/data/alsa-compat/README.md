@@ -25,7 +25,7 @@ Then, from the NARF root:
 gcc -O2 -Wall -static -I/tmp/narf-alsa-host/include \
   verification/data/alsa-compat/alsa_probe.c /tmp/narf-alsa-host/lib/libasound.a \
   -lm -ldl -lpthread -o /tmp/narf-alsa-probe
-XTASK_STAGE_BIN=/tmp/narf-alsa-probe:alsa-probe cargo xtask run-interactive \
+XTASK_STAGE_BIN=/tmp/narf-alsa-probe:alsa-probe cargo narf run run-interactive \
   --arch=x86_64 --features cgroup-all,container \
   --cmd /alsa-probe --expect alsa-compat-ok
 ```

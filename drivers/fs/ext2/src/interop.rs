@@ -1,5 +1,5 @@
 //! `narf.ext4_interop=root`: the in-guest half of
-//! `cargo xtask ext4-rootrw-interop`.
+//! `cargo narf smoke ext4-rootrw-interop`.
 //!
 //! Booted under `narf.disks=root-rw` against a host-built GPT disk whose
 //! root is LUKS1 around a `mkfs.ext4 -d` filesystem (unlocked through the
@@ -26,7 +26,7 @@ use narf_filesystem::{DirOps, FileOps, FsError};
 
 /// Verdict-line prefix the host matches.
 pub const MARKER: &str = "EXT4-INTEROP:";
-/// UUID prefix of every disposable image xtask builds (the btrfs harness's).
+/// UUID prefix of every disposable image cargo narf builds (the btrfs harness's).
 pub const HARNESS_UUID_PREFIX: &str = "c4c405ee-0000-4a11-9e57-";
 
 /// `/etc/hostname` after the workload (write + fsync + rename over).
@@ -212,7 +212,7 @@ async fn run_root(root: &Arc<dyn DirOps>) -> Result<(), (&'static str, FsError)>
 }
 
 /// What `crash` mode writes; the host checks them
-/// (`build/xtask/src/ext4_interop.rs`).
+/// (`build/cargo-narf/src/ext4_interop.rs`).
 pub const CRASH_SYNCED_SEED: u32 = 0x5359_4e43;
 pub const CRASH_SYNCED_LEN: usize = 300_000;
 pub const CRASH_TIMER_SEED: u32 = 0x5449_4d52;

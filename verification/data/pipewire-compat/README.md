@@ -27,7 +27,7 @@ splits the problem space in half whenever the graph misbehaves — it separates
 negotiated is one the card advertises but cannot configure".
 
 One verdict line reaches the console, `NARF-AUDIO-CHECK: OK` or
-`... FAIL <reason>`, and `cargo xtask systemd-pid1` keys its success and
+`... FAIL <reason>`, and `cargo narf run systemd-pid1` keys its success and
 failure markers to it.
 
 ## Running it
@@ -44,7 +44,7 @@ NARF_VBLK_IMG=target/narf-fedora-vblk.img \
   XTASK_SYSTEMD_PID1_TIMEOUT_SECS=2100 \
   XTASK_SYSTEMD_PID1_SUCCESS_MARKER="NARF-AUDIO-CHECK: OK" \
   XTASK_SYSTEMD_PID1_FAILURE_MARKER="NARF-AUDIO-CHECK: FAIL" \
-  cargo xtask systemd-pid1 --arch=x86_64
+  cargo narf run systemd-pid1 --arch=x86_64
 ```
 
 The x86_64 QEMU profile provides HDA as card 0 and VirtIO sound as card 1;
@@ -141,7 +141,7 @@ NARF_VBLK_IMG=target/narf-fedora-vblk.img \
   XTASK_QEMU_APPEND=narf_ptrace_check \
   XTASK_SYSTEMD_PID1_SUCCESS_MARKER="PTRACE-PROBE: OK" \
   XTASK_SYSTEMD_PID1_FAILURE_MARKER="PTRACE-PROBE: FAIL" \
-  cargo xtask systemd-pid1 --arch=x86_64
+  cargo narf run systemd-pid1 --arch=x86_64
 ```
 
 It covers the door `strace -p` uses, which is not the one the musl strace

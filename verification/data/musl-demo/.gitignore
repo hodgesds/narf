@@ -65,7 +65,7 @@ dmabuf_sync_smoke_x86_64
 profloop_smoke_x86_64
 
 # Host-derived / downloaded binaries used by the busybox + off-box redis
-# smokes. Reproduced on demand by xtask (copied from the host busybox /
+# smokes. Reproduced on demand by cargo narf (copied from the host busybox /
 # fetched musl libc); never committed.
 busybox_static_x86_64
 busybox_alpine_x86_64

@@ -36,7 +36,7 @@ static mut MEMORY_MAP_LEN: usize = 0;
 /// userspace (systemd's `systemd.*` params, etc.) reads its own
 /// tokens from there, so any truncation here silently drops them.
 /// The test harness's tokens ride the same string: on affected-filter
-/// runs xtask appends `test_subsystem=<~430-byte list>
+/// runs cargo narf appends `test_subsystem=<~430-byte list>
 /// test_subsystem_exclude=drivers/gpu` (~480 bytes), and the previous
 /// 256-byte cap silently ate the exclude token — and the last wanted
 /// subsystems — on this arch only (#960).
@@ -53,7 +53,7 @@ static mut CMDLINE_TRUNCATED: bool = false;
 /// [`crate::cmdline`] had no aarch64 arm and returned `""` unconditionally, so
 /// every cmdline-driven feature was silently inert on this architecture even
 /// though the parsing worked. The visible symptom was
-/// `cargo xtask test --subsystem <name>` filtering nothing on aarch64: xtask
+/// `cargo narf test test --subsystem <name>` filtering nothing on aarch64: cargo narf
 /// passes the filter as `test_subsystem=` via `-append`, the kernel read an
 /// empty cmdline, and `run_all_and_exit()` was taken every time — quietly, with
 /// the run still reporting success.
@@ -653,9 +653,9 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
     }
 }
 
-/// Physical address xtask's QEMU runner loads the DTB at for a raw-ELF boot:
+/// Physical address cargo narf's QEMU runner loads the DTB at for a raw-ELF boot:
 /// the image's link-time physical end, raised to 0x4800_0000 and rounded up
-/// to 1 MiB — `dtb_load_addr` in build/xtask/src/aarch64_initrd.rs, from the
+/// to 1 MiB — `dtb_load_addr` in build/cargo-narf/src/aarch64_initrd.rs, from the
 /// same ELF extents. The boot stub's `.Lfdt_pick` probes the same address.
 fn runner_dtb_addr() -> u64 {
     const FLOOR: u64 = 0x4800_0000;
@@ -675,7 +675,7 @@ fn runner_dtb_addr() -> u64 {
 /// exact offset isn't predictable from outside; scanning is the
 /// reliable fallback when the bootloader-provided pointer is absent.
 ///
-/// Checks the historical fixed address, then where xtask's runner loads
+/// Checks the historical fixed address, then where cargo narf's runner loads
 /// it ([`runner_dtb_addr`]), then walks 4-byte-aligned positions in the
 /// first 256 MiB of the virt RAM region. Returns the first match.
 ///
@@ -685,7 +685,7 @@ fn runner_dtb_addr() -> u64 {
 unsafe fn scan_for_dtb() -> Option<PhysAddr> {
     // First, fast-path: a loader may still place the QEMU virt DTB at
     // the historical fixed address via `-device loader`, so a single
-    // direct check usually wins. xtask now places the DTB dynamically
+    // direct check usually wins. cargo narf now places the DTB dynamically
     // above the kernel image (`dtb_load_addr`), so this usually misses
     // and the runner address below is the operative path.
     const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
@@ -695,8 +695,8 @@ unsafe fn scan_for_dtb() -> Option<PhysAddr> {
         return Some(PhysAddr::new(DTB_LOAD_ADDR));
     }
 
-    // Where xtask's QEMU runner loads it for a raw-ELF boot (`dtb_load_addr`
-    // in build/xtask/src/aarch64_initrd.rs): the first 1 MiB boundary at or
+    // Where cargo narf's QEMU runner loads it for a raw-ELF boot (`dtb_load_addr`
+    // in build/cargo-narf/src/aarch64_initrd.rs): the first 1 MiB boundary at or
     // above both the image's physical end and 0x4800_0000. Once the image
     // reaches past the scan window below, this is the only step that finds
     // it. Probed only inside the identity-mapped 1 GiB block.
@@ -733,7 +733,7 @@ mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    /// The guest cmdline xtask builds on an affected-filter test
+    /// The guest cmdline cargo narf builds on an affected-filter test
     /// run (#960): a ~430-byte `test_subsystem=` include list
     /// followed by the `test_subsystem_exclude=` token, ~480 bytes
     /// total — past both old 256-byte caps, well inside the new one.

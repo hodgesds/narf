@@ -537,7 +537,7 @@ fn skip_props(blob: &[u8], mut cur: usize, end: usize) -> usize {
 /// Capacity of the buffer [`chosen_bootargs`] copies `/chosen/bootargs`
 /// into. Sized to match the boot store's `CMDLINE_CAP` and Linux's
 /// `COMMAND_LINE_SIZE` (2048): tooling-built guest cmdlines (e.g.
-/// xtask's `test_subsystem=<list> test_subsystem_exclude=<prefix>`
+/// cargo narf's `test_subsystem=<list> test_subsystem_exclude=<prefix>`
 /// append on affected-filter test runs) run to ~480 bytes, and the
 /// previous 256-byte cap silently dropped every token past byte 255
 /// on the FDT path (#960).

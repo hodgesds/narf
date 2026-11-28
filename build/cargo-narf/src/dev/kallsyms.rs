@@ -272,8 +272,8 @@ pub struct Extracted {
 pub fn extract(bytes: &[u8]) -> Result<Extracted> {
     let elf = parse_sections(bytes)?;
     let base = match elf.machine {
-        EM_X86_64 => crate::relocs::KERNEL_VIRT_BASE,
-        EM_AARCH64 => crate::relocs::KIMAGE_VOFFSET_AARCH64,
+        EM_X86_64 => crate::dev::relocs::KERNEL_VIRT_BASE,
+        EM_AARCH64 => crate::dev::relocs::KIMAGE_VOFFSET_AARCH64,
         other => bail!("unsupported e_machine {other:#x} for a kernel symbol table"),
     };
     // The kernel-half image extent; `.boot` sits below it at its physical
@@ -372,7 +372,7 @@ pub fn patch(elf_path: &Path) -> Result<Stats> {
     file.write_all_at(&image, sec.offset)
         .with_context(|| format!("writing {SECTION} into {}", elf_path.display()))?;
     eprintln!(
-        "xtask kallsyms: {} symbols ({} names, {} truncated), {} name bytes -> {} \
+        "cargo narf build kallsyms: {} symbols ({} names, {} truncated), {} name bytes -> {} \
          ({} tokens); table {} of {} reserved bytes",
         stats.symbols,
         stats.names,
@@ -407,7 +407,7 @@ pub fn render(bytes: &[u8], slide: u64) -> Result<String> {
         Some(data) => data,
         None => {
             eprintln!(
-                "xtask kallsyms: image carries no patched {SECTION}; generating from .symtab"
+                "cargo narf build kallsyms: image carries no patched {SECTION}; generating from .symtab"
             );
             generated = generate(bytes)?.0;
             &generated[..]
@@ -542,7 +542,7 @@ mod tests {
         }
     }
 
-    const BASE: u64 = crate::relocs::KERNEL_VIRT_BASE;
+    const BASE: u64 = crate::dev::relocs::KERNEL_VIRT_BASE;
 
     /// An x86_64-shaped image: boot stub low, kernel half above.
     fn kernel_image(reserve: u64) -> Vec<u8> {

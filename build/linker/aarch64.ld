@@ -48,7 +48,7 @@ KIMAGE_VOFFSET = 0xFFFFFF7F80000000;
  * mask down to 254 MiB. */
 MODULE_VA_BASE_LD = 0xFFFFFF7FE8000000;
 
-/* Bytes reserved in-image for the KASLR relocation table. `xtask` fills it
+/* Bytes reserved in-image for the KASLR relocation table. `cargo narf` fills it
  * after the link; the header magic is what the apply pass keys on, so an
  * unfilled reserve is a skipped slide rather than a slide by garbage.
  *
@@ -58,19 +58,19 @@ MODULE_VA_BASE_LD = 0xFFFFFF7FE8000000;
  * ~86k: the wifi + Intel merges roughly tripled it to ~270k sites
  * (1,079,276 bytes on main), past the old 1M reserve. 4M leaves ~3.9x
  * headroom over that table; a bare bump to 2M would be only ~1.9x, less
- * than the growth one merge wave just demonstrated. `xtask` fails the build
+ * than the growth one merge wave just demonstrated. `cargo narf` fails the build
  * if the table outgrows it. */
 KASLR_RELOC_RESERVE = 4M;
 
 /* Space reserved for the kernel symbol table (`/proc/kallsyms`). Filled after
- * linking by `xtask kallsyms`, the same reserve-then-patch scheme as the
+ * linking by `cargo narf build kallsyms`, the same reserve-then-patch scheme as the
  * relocation table: the table is computed from the linked image, so its size
  * has to be fixed before the link or every address it records would move —
  * the reason Linux links vmlinux two or three times. Measured tables: the
- * x86_64 `xtask test` image (every kernel test linked in) 4.4 MiB for 384k
+ * x86_64 `cargo narf test test` image (every kernel test linked in) 4.4 MiB for 384k
  * symbols, a native x86_64 release image 2.4 MiB for 195k, aarch64 release
  * 4.0 MiB for 351k, debug builds ~1.8 MiB. 8 MiB leaves ~1.8x over the
- * largest, the same margin `KASLR_RELOC_RESERVE` keeps. `xtask` fails the
+ * largest, the same margin `KASLR_RELOC_RESERVE` keeps. `cargo narf` fails the
  * build rather than truncating if a table outgrows it. */
 KALLSYMS_RESERVE = 8M;
 
@@ -103,7 +103,7 @@ KASLR_SLIDE_FIXED = 0x00000000;
  * 0x1000_0000 puts the copy at 0x5008_0000..0x541e_6db0. QEMU's virt machine
  * places the kernel, the initrd and the DTB all inside the first 256 MiB of RAM
  * (the DTB sits immediately above the kernel image and the initrd above the
- * DTB, both placed dynamically by xtask), so starting above that clears every
+ * DTB, both placed dynamically by cargo narf), so starting above that clears every
  * one of them; it also still fits inside boot-smoke's 512 MiB, not just the
  * suite's 1 GiB. */
 /* Master switch for physical relocation. With it on and KASLR_PHYS_FIXED at 0,
@@ -155,10 +155,10 @@ SECTIONS
     } :text
 
     /* KASLR relocation table. Reserved here at link time and filled by
-     * `xtask` after the link, because the site list is only knowable once
+     * `cargo narf` after the link, because the site list is only knowable once
      * addresses are final.
      *
-     * In-image and PROGBITS on purpose: `.bss` has no file bytes for `xtask`
+     * In-image and PROGBITS on purpose: `.bss` has no file bytes for `cargo narf`
      * to write into, and anything outside a PT_LOAD segment never reaches
      * memory. The leading QUAD(0) is the header magic slot — `boot.S` checks
      * it and skips the slide entirely if the table was never filled, so a
@@ -177,7 +177,7 @@ SECTIONS
 
     /* Kernel symbol table, read by `/proc/kallsyms`.
      *
-     * Reserved here and filled after linking by `xtask kallsyms` (see
+     * Reserved here and filled after linking by `cargo narf build kallsyms` (see
      * `KALLSYMS_RESERVE`). The table holds symbol offsets from `_text`, never
      * absolute addresses, so it carries no relocation records and the KASLR
      * pass leaves it alone; the kernel adds the runtime `_text` when it reads

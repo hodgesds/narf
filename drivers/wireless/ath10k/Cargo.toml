@@ -8,7 +8,7 @@
 #
 #   * `builtin` (default): rlib dependency of the `narf-drivers-wireless`
 #     facade, registered from the kernel's Stage::Subsys initcall.
-#   * `module`: built to a loadable `.ko` via `cargo xtask build-module
+#   * `module`: built to a loadable `.ko` via `cargo narf build build-module
 #     --package narf-drivers-wireless-ath10k --no-default-features --features
 #     module`. The same driver source runs inside the `.ko` over
 #     `narf-module-rt` and the KABI (`src/ath10k/platform/`): BMI, firmware

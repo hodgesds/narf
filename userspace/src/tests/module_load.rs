@@ -8,7 +8,7 @@
 //! consisting of `name=` alone. No synthesized-ELF test could have caught it,
 //! because every one of them writes a single hand-built `.modinfo`.
 //!
-//! `cargo xtask image` stages `modules/test-module` into the initramfs at
+//! `cargo narf build image` stages `modules/test-module` into the initramfs at
 //! `/lib/modules/narf_test_module.ko`. This is what a module's whole life
 //! looks like end to end:
 //!
@@ -35,7 +35,7 @@ fn read_test_module() -> Option<alloc::vec::Vec<u8>> {
 ///
 /// A module's `kernel_abi=` has to match the kernel it loads into, and that
 /// hash is derived from the kernel's export table at runtime — so it is not
-/// knowable when the module is compiled. `cargo xtask build-module` takes a
+/// knowable when the module is compiled. `cargo narf build build-module` takes a
 /// `--kernel-abi` for exactly this, but a value baked in at image-build time
 /// would have to come from a kernel booted earlier, which makes a test run a
 /// two-phase build.

@@ -3,7 +3,7 @@
 //! No module text runs here. Disks are registered under the kernel's own
 //! owner id, so the request path calls the kernel-side fake callback below
 //! directly instead of through the module call gate. The end-to-end proof
-//! with real module text driving a real controller is `cargo xtask
+//! with real module text driving a real controller is `cargo narf
 //! nvme-module-block-smoke`.
 
 use alloc::sync::Arc;

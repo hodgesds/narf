@@ -4,15 +4,16 @@
     clippy::never_loop,
     clippy::manual_strip
 )]
-// NARF xtask orchestrator.
+// NARF build orchestrator (the `cargo narf` dev frontend).
 // Spec: build/specification/spec.md §3.
 //
-// `cargo xtask run   --arch=x86_64 [--release]`  — cross-build + QEMU boot
-// `cargo xtask test  --arch=aarch64`             — boot + run kernel tests
-// `cargo xtask host-test`                        — fast host unit-test gate
-// `cargo xtask image --arch=<arch>`              — bootable UEFI media
-// `cargo xtask grub-image --arch=x86_64`         — GRUB bundle (direct BIOS + UEFI shim)
+// `cargo narf run run   --arch=x86_64 [--release]` — cross-build + QEMU boot
+// `cargo narf test test --arch=aarch64`            — boot + run kernel tests
+// `cargo narf test host-test`                      — fast host unit-test gate
+// `cargo narf build image --arch=<arch>`           — bootable UEFI media
+// `cargo narf build grub-image --arch=x86_64`      — GRUB bundle (direct BIOS + UEFI shim)
 
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -25,10 +26,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod aarch64_initrd;
 mod affected;
 /// `verification/specification/spec.md` §8's statistics, split out because
-/// they are the only part of xtask with unit tests — a wrong t-distribution
+/// they are the only part of cargo narf with unit tests — a wrong t-distribution
 /// tail invalidates every number that passes through it, silently.
 mod bench_stats;
-/// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
+/// The `bpf` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
 mod btrfs_crash;
 mod btrfs_cycles;
@@ -58,15 +59,303 @@ mod usb_image;
 mod wifi_firmware;
 mod wifi_fixture_tools;
 
+/// NARF build orchestrator (`cargo narf`).
+///
+/// The top level is one group per area; each group holds the commands that
+/// used to be flat `cargo xtask <command>` invocations, e.g.
+/// `cargo xtask build` is now `cargo narf build build` and
+/// `cargo xtask test` is now `cargo narf test test`. `cargo xtask` itself
+/// keeps working as a deprecated shim (see `normalized_args`).
 #[derive(Parser)]
-#[command(author, version, about = "NARF build orchestrator")]
-struct Cli {
+#[command(
+    name = "cargo narf",
+    bin_name = "cargo narf",
+    author,
+    version,
+    about = "NARF build orchestrator"
+)]
+pub(crate) struct Cli {
+    /// NARF source checkout. Defaults to the current directory or an ancestor.
+    /// Only the `pkg` group uses it; the dev groups locate the workspace
+    /// themselves via `workspace_root()`.
+    #[arg(long, global = true)]
+    repo: Option<PathBuf>,
+
     #[command(subcommand)]
-    cmd: Cmd,
+    command: TopCommand,
+}
+
+/// Top-level command groups for `cargo narf`.
+#[derive(Subcommand)]
+pub(crate) enum TopCommand {
+    /// Cross-compile the kernel and build artifacts.
+    #[command(subcommand)]
+    Build(BuildCmd),
+    /// Run kernel tests and host unit tests.
+    #[command(subcommand)]
+    Test(TestCmd),
+    /// Cross-compile and boot under QEMU.
+    #[command(subcommand)]
+    Run(RunCmd),
+    /// Live smoke checks (network, filesystems, CachyOS, modules).
+    #[command(subcommand)]
+    Smoke(SmokeCmd),
+    /// Performance benchmarks with a Linux baseline.
+    #[command(subcommand)]
+    Bench(BenchCmd),
+    /// Firmware packaging and Wi-Fi deployment tools.
+    #[command(subcommand)]
+    Firmware(FirmwareCmd),
+    /// Native distribution packages (build / install / detect).
+    #[command(subcommand)]
+    Pkg(crate::pkg::PkgCmd),
+    /// CI tooling: affected-set computation, clippy, crate releases.
+    #[command(subcommand)]
+    Ci(CiCmd),
+    /// USB sticks and disk images.
+    #[command(subcommand)]
+    Disk(DiskCmd),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BuildCmd {
+    /// Cross-compile the kernel.
+    Build(BuildArgs),
+    /// Cross-compile a kernel-module crate into a single relocatable
+    /// object — the NARF equivalent of a `.ko`.
+    BuildModule(BuildModuleArgs),
+    /// Verify and append an Ed25519 trailer to an already-built raw or
+    /// compressed module image.
+    AttachModuleSignature(AttachModuleSignatureArgs),
+    /// Build a self-contained x86_64 EFI image; optionally run it through OVMF.
+    EfiImage(efi_image::Args),
+    /// Produce a bootable image.
+    Image(BuildArgs),
+    /// Produce a GRUB bundle. BIOS boots the generated Multiboot2 ELF
+    /// directly; x86_64 UEFI chainloads the bundled Limine EFI app.
+    GrubImage(GrubImageArgs),
+    /// Build removable media and boot it under OVMF/AAVMF UEFI.
+    IsoBoot(BuildArgs),
+    /// Extract the kernel's relocation table for KASLR and report what a
+    /// boot-time slide would have to patch.
+    Relocs(RelocsArgs),
+    /// Generate the kernel symbol table (`/proc/kallsyms`) from a linked
+    /// image, optionally patching it into the `.kallsyms` reservation.
+    Kallsyms(KallsymsArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum TestCmd {
+    /// Cross-compile and run kernel tests under QEMU.
+    Test(TestArgs),
+    /// Run the fast, hardware-independent unit-test suite on the host.
+    HostTest,
+    /// Cross-compile and boot under QEMU as a real init pass (no
+    /// kernel-test feature), parsing serial output for panic markers
+    /// and known success markers.
+    BootSmoke(BuildArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RunCmd {
+    /// Cross-compile and boot under QEMU.
+    Run(BuildArgs),
+    /// Cross-compile and boot under QEMU with `boot-init` on, drive
+    /// the serial port programmatically, and assert the guest echoes.
+    RunInteractive(RunInteractiveArgs),
+    /// Boot under QEMU with a graphical display + the user-mode
+    /// testbin running.
+    Demo(BuildArgs),
+    /// Cross-compile and boot the mounted /mnt rootfs's
+    /// `/lib/systemd/systemd` as REAL PID 1.
+    SystemdPid1(BuildArgs),
+    /// Check the host is set up to pass a PCIe device through to QEMU, and
+    /// print the launch recipe. Checks only; it launches nothing.
+    /// (Lives in `run` because it is the QEMU-boot preflight check.)
+    Passthrough(PassthroughArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SmokeCmd {
+    /// Live TCP/UDP/DNS network-stack smoke over virtio-net.
+    NetSmoke(BuildArgs),
+    /// Off-box redis smoke over virtio-net.
+    RedisSmoke(BuildArgs),
+    /// Boot a CachyOS-layout btrfs root as an NVMe disk and wait for
+    /// agetty's login prompt.
+    CachyosRootSmoke(cachyos_root::Args),
+    /// Build a CachyOS-shaped btrfs disk image, boot it root-rw, and
+    /// require host `btrfs check` clean.
+    BtrfsRootrwInterop(btrfs_interop::Args),
+    /// Kill QEMU right after a btrfs `fsync` returns, reboot, and require
+    /// the data back plus a clean host `btrfs check`.
+    BtrfsCrashSmoke(btrfs_crash::Args),
+    /// Many btrfs mount -> write -> sync -> unmount -> remount -> verify
+    /// cycles in one boot per guest.
+    BtrfsCycles(btrfs_cycles::Args),
+    /// Hibernate on one boot and resume on the next (S4).
+    HibernateE2e(hibernate_e2e::Args),
+    /// Host-side (no QEMU) root-rw btrfs harness.
+    BtrfsHostRw(btrfs_host::Args),
+    /// Host-side (no QEMU) ext4 write harness.
+    Ext4HostRw(ext4_host::Args),
+    /// Build a GPT disk whose root is LUKS1 around an ext4 filesystem,
+    /// boot it root-rw, type the passphrase, and verify on the host.
+    Ext4RootrwInterop(ext4_interop::Args),
+    /// Pre-hardware validation gate for booting the installed CachyOS root.
+    CachyosGate(cachyos_gate::Args),
+    /// Exercise real HTTP/3 from a running CachyOS guest through SLIRP.
+    Http3Smoke(http3_smoke::Args),
+    /// NVMe flush + clean-shutdown check.
+    NvmePoweroffCheck(RunInteractiveArgs),
+    /// The same live TCP/UDP/DNS smoke over an exclusively module-driven
+    /// QEMU e1000.
+    E1000ModuleNetSmoke(BuildArgs),
+    /// USB datapath C-ABI proof over QEMU's `usb-serial`.
+    FtdiModuleSerialSmoke(BuildArgs),
+    /// Block datapath C-ABI proof over QEMU's NVMe controller.
+    NvmeModuleBlockSmoke(BuildArgs),
+    /// USB + block datapath C-ABI proof over QEMU's `usb-storage`.
+    UsbStorageModuleBlockSmoke(BuildArgs),
+    /// The same live TCP/UDP/DNS smoke over the built-in igb driver.
+    IgbNetSmoke(BuildArgs),
+    /// Internal: net-smoke's namespace TCP peer. Runs inside `unshare -rn`.
+    #[command(hide = true)]
+    NetPeer(NetPeerArgs),
+    /// Boot under QEMU and verify both linux-compat demo binaries.
+    MuslDemo(MuslDemoArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BenchCmd {
+    /// Off-box redis PERFORMANCE benchmark with a Linux baseline.
+    Redis(BuildArgs),
+    /// stress-ng PERFORMANCE sweep with a Linux baseline.
+    Stress(BuildArgs),
+    /// `perf bench` PERFORMANCE sweep with a Linux baseline.
+    Perf(BuildArgs),
+    /// Multi-queue / RSS throughput+latency benchmark.
+    MtEcho(BuildArgs),
+    /// BPF microbenchmark suite under the `verification/` §8 statistical
+    /// protocol.
+    Bpf(bpf_bench::BpfBenchArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum FirmwareCmd {
+    /// Wrap a raw firmware payload with the NARF trailer.
+    PackFirmware(PackFirmwareArgs),
+    /// Bulk-import firmware blobs from a source directory tree.
+    ImportFirmware(ImportFirmwareArgs),
+    /// Inventory Wi-Fi firmware payloads and unresolved deployment prerequisites.
+    WifiFirmware(wifi_firmware::Args),
+    /// Encode explicit Wi-Fi deployment board facts in Rust.
+    WifiFixtures(wifi_fixture_tools::Args),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CiCmd {
+    /// Compute which CI jobs and kernel-test subsystems a change can
+    /// affect, from the git diff against a base ref + the workspace
+    /// reverse-dependency closure.
+    Affected(affected::AffectedArgs),
+    /// Lint changed packages, without linting their dependencies.
+    ClippyChanged(ci_clippy::Args),
+    /// Plan, validate, or prepare independently versioned crates for release.
+    CrateRelease(crate_release::Args),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DiskCmd {
+    /// Wipe and burn the NARF ISO to a USB stick, with verification
+    /// after a logical detach.
+    DiskWrite(DiskWriteArgs),
+    /// Wipe a USB stick and lay out a partitioned NARF disk.
+    DiskWritePartitioned(DiskWritePartitionedArgs),
+    /// Build a UEFI USB-stick image file (MBR + FAT32 ESP) with the
+    /// persistent boot log enabled.
+    UsbImage(Box<usb_image::UsbImageArgs>),
+}
+
+/// Translate the nested `cargo narf` CLI into the flat internal `Cmd`
+/// dispatch form. `Pkg` is never translated: `main()` dispatches it to
+/// the packaging frontend before calling this.
+fn to_flat(cmd: TopCommand) -> Cmd {
+    match cmd {
+        TopCommand::Build(c) => match c {
+            BuildCmd::Build(a) => Cmd::Build(a),
+            BuildCmd::BuildModule(a) => Cmd::BuildModule(a),
+            BuildCmd::AttachModuleSignature(a) => Cmd::AttachModuleSignature(a),
+            BuildCmd::EfiImage(a) => Cmd::EfiImage(a),
+            BuildCmd::Image(a) => Cmd::Image(a),
+            BuildCmd::GrubImage(a) => Cmd::GrubImage(a),
+            BuildCmd::IsoBoot(a) => Cmd::IsoBoot(a),
+            BuildCmd::Relocs(a) => Cmd::Relocs(a),
+            BuildCmd::Kallsyms(a) => Cmd::Kallsyms(a),
+        },
+        TopCommand::Test(c) => match c {
+            TestCmd::Test(a) => Cmd::Test(a),
+            TestCmd::HostTest => Cmd::HostTest,
+            TestCmd::BootSmoke(a) => Cmd::BootSmoke(a),
+        },
+        TopCommand::Run(c) => match c {
+            RunCmd::Run(a) => Cmd::Run(a),
+            RunCmd::RunInteractive(a) => Cmd::RunInteractive(a),
+            RunCmd::Demo(a) => Cmd::Demo(a),
+            RunCmd::SystemdPid1(a) => Cmd::SystemdPid1(a),
+            RunCmd::Passthrough(a) => Cmd::Passthrough(a),
+        },
+        TopCommand::Smoke(c) => match c {
+            SmokeCmd::NetSmoke(a) => Cmd::NetSmoke(a),
+            SmokeCmd::RedisSmoke(a) => Cmd::RedisSmoke(a),
+            SmokeCmd::CachyosRootSmoke(a) => Cmd::CachyosRootSmoke(a),
+            SmokeCmd::BtrfsRootrwInterop(a) => Cmd::BtrfsRootrwInterop(a),
+            SmokeCmd::BtrfsCrashSmoke(a) => Cmd::BtrfsCrashSmoke(a),
+            SmokeCmd::BtrfsCycles(a) => Cmd::BtrfsCycles(a),
+            SmokeCmd::HibernateE2e(a) => Cmd::HibernateE2e(a),
+            SmokeCmd::BtrfsHostRw(a) => Cmd::BtrfsHostRw(a),
+            SmokeCmd::Ext4HostRw(a) => Cmd::Ext4HostRw(a),
+            SmokeCmd::Ext4RootrwInterop(a) => Cmd::Ext4RootrwInterop(a),
+            SmokeCmd::CachyosGate(a) => Cmd::CachyosGate(a),
+            SmokeCmd::Http3Smoke(a) => Cmd::Http3Smoke(a),
+            SmokeCmd::NvmePoweroffCheck(a) => Cmd::NvmePoweroffCheck(a),
+            SmokeCmd::E1000ModuleNetSmoke(a) => Cmd::E1000ModuleNetSmoke(a),
+            SmokeCmd::FtdiModuleSerialSmoke(a) => Cmd::FtdiModuleSerialSmoke(a),
+            SmokeCmd::NvmeModuleBlockSmoke(a) => Cmd::NvmeModuleBlockSmoke(a),
+            SmokeCmd::UsbStorageModuleBlockSmoke(a) => Cmd::UsbStorageModuleBlockSmoke(a),
+            SmokeCmd::IgbNetSmoke(a) => Cmd::IgbNetSmoke(a),
+            SmokeCmd::NetPeer(a) => Cmd::NetPeer(a),
+            SmokeCmd::MuslDemo(a) => Cmd::MuslDemo(a),
+        },
+        TopCommand::Bench(c) => match c {
+            BenchCmd::Redis(a) => Cmd::RedisBench(a),
+            BenchCmd::Stress(a) => Cmd::StressBench(a),
+            BenchCmd::Perf(a) => Cmd::PerfBench(a),
+            BenchCmd::MtEcho(a) => Cmd::MtEchoBench(a),
+            BenchCmd::Bpf(a) => Cmd::BpfBench(a),
+        },
+        TopCommand::Firmware(c) => match c {
+            FirmwareCmd::PackFirmware(a) => Cmd::PackFirmware(a),
+            FirmwareCmd::ImportFirmware(a) => Cmd::ImportFirmware(a),
+            FirmwareCmd::WifiFirmware(a) => Cmd::WifiFirmware(a),
+            FirmwareCmd::WifiFixtures(a) => Cmd::WifiFixtures(a),
+        },
+        TopCommand::Ci(c) => match c {
+            CiCmd::Affected(a) => Cmd::Affected(a),
+            CiCmd::ClippyChanged(a) => Cmd::ClippyChanged(a),
+            CiCmd::CrateRelease(a) => Cmd::CrateRelease(a),
+        },
+        TopCommand::Disk(c) => match c {
+            DiskCmd::DiskWrite(a) => Cmd::DiskWrite(a),
+            DiskCmd::DiskWritePartitioned(a) => Cmd::DiskWritePartitioned(a),
+            DiskCmd::UsbImage(a) => Cmd::UsbImage(*a),
+        },
+        TopCommand::Pkg(_) => unreachable!("pkg is dispatched in main() before to_flat()"),
+    }
 }
 
 #[derive(clap::Args)]
-struct RelocsArgs {
+pub(crate) struct RelocsArgs {
     /// Linked kernel ELF to read.
     elf: std::path::PathBuf,
     /// Write the encoded table here instead of only reporting counts.
@@ -78,7 +367,7 @@ struct RelocsArgs {
 }
 
 #[derive(clap::Args)]
-struct KallsymsArgs {
+pub(crate) struct KallsymsArgs {
     /// Linked kernel ELF to read.
     elf: std::path::PathBuf,
     /// Write the table into the image's reserved `.kallsyms` section.
@@ -97,7 +386,7 @@ enum Cmd {
     ///
     /// This intentionally names an allowlist: crates that require the
     /// kernel linker script, privileged instructions, or QEMU belong in
-    /// `xtask test`, not in this gate.
+    /// `cargo narf test test`, not in this gate.
     HostTest,
     /// Compute which CI jobs and kernel-test subsystems a change can
     /// affect, from the git diff against a base ref + the workspace
@@ -129,7 +418,7 @@ enum Cmd {
     Relocs(RelocsArgs),
     /// Generate the kernel symbol table (`/proc/kallsyms`) from a linked
     /// image, optionally patching it into the `.kallsyms` reservation or
-    /// printing it. Every `xtask build` already patches; this is for
+    /// printing it. Every `cargo narf build build` already patches; this is for
     /// inspecting an image or symbolising a capture.
     Kallsyms(KallsymsArgs),
     /// Cross-compile the kernel.
@@ -402,7 +691,7 @@ enum Cmd {
     /// (`firmware/specification/spec.md` §6). Accepts a detached signature
     /// and public key; omitting both produces a developer-only unsigned
     /// blob. The wrapped output goes into
-    /// `target/firmware/<name>` (so `xtask image` stages it either
+    /// `target/firmware/<name>` (so `cargo narf build image` stages it either
     /// into the initramfs CPIO if matched by `--initramfs-firmware`,
     /// or onto the root partition's /lib/firmware/ otherwise).
     PackFirmware(PackFirmwareArgs),
@@ -410,7 +699,7 @@ enum Cmd {
     /// (default `/lib/firmware/`) into `target/firmware/`.
     /// Recursively walks, decompresses `.zst` entries on the fly
     /// (Arch's linux-firmware ships everything zstd-compressed), and
-    /// wraps each with an unsigned developer NARF trailer. `xtask image` then splits
+    /// wraps each with an unsigned developer NARF trailer. `cargo narf build image` then splits
     /// the result: blobs matched by `--initramfs-firmware` go into
     /// the initramfs CPIO; everything else stages onto the root
     /// partition's /lib/firmware/ (Linux hybrid model).
@@ -422,7 +711,7 @@ enum Cmd {
 }
 
 #[derive(Parser, Clone)]
-struct ImportFirmwareArgs {
+pub(crate) struct ImportFirmwareArgs {
     /// Source firmware directory to walk. Defaults to the system's
     /// `/lib/firmware/` (matches Arch + Debian conventions).
     #[arg(long, default_value = "/lib/firmware")]
@@ -467,7 +756,7 @@ struct ImportFirmwareArgs {
 }
 
 #[derive(Parser, Clone)]
-struct PackFirmwareArgs {
+pub(crate) struct PackFirmwareArgs {
     /// Canonical blob name as the kernel sees it, e.g.
     /// `amdgpu/phoenix.bin`. This drives the on-disk path under
     /// `firmware/` AND the registry key the driver opens with
@@ -498,14 +787,14 @@ struct PackFirmwareArgs {
     public_key: Option<PathBuf>,
 
     /// Output path. Defaults to `target/firmware/<name>` under the
-    /// workspace root so subsequent `xtask image` runs pick it up.
+    /// workspace root so subsequent `cargo narf build image` runs pick it up.
     #[arg(long)]
     out: Option<String>,
 }
 
-/// `xtask grub-image`: the image build plus the host-install disk policy.
+/// `cargo narf build grub-image`: the image build plus the host-install disk policy.
 #[derive(Parser, Clone)]
-struct GrubImageArgs {
+pub(crate) struct GrubImageArgs {
     #[command(flatten)]
     build: BuildArgs,
 
@@ -597,7 +886,7 @@ fn with_bootlog_token(cmdline: String, grub: &GrubImageArgs) -> Result<String> {
     })
 }
 
-/// `narf.disks=` root policies `xtask grub-image --root-policy` emits.
+/// `narf.disks=` root policies `cargo narf build grub-image --root-policy` emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum RootPolicy {
     /// `narf.disks=root-ro`.
@@ -834,9 +1123,11 @@ mod disk_policy_tests {
     }
 
     fn grub(args: &[&str]) -> GrubImageArgs {
-        let mut argv = vec!["xtask", "grub-image"];
+        let mut argv = vec!["cargo-narf", "build", "grub-image"];
         argv.extend_from_slice(args);
-        let Cmd::GrubImage(args) = Cli::try_parse_from(argv).expect("parse").cmd else {
+        let TopCommand::Build(BuildCmd::GrubImage(args)) =
+            Cli::try_parse_from(argv).expect("parse").command
+        else {
             panic!("grub-image")
         };
         args
@@ -927,9 +1218,17 @@ mod disk_policy_tests {
             "kernel_cmdline: narf.disks=root-rw root=UUID={UUID}"
         )));
         // Root policies need a UUID and exclude --allow-all-disks.
-        assert!(Cli::try_parse_from(["xtask", "grub-image", "--root-policy", "root-rw"]).is_err());
         assert!(Cli::try_parse_from([
-            "xtask",
+            "cargo-narf",
+            "build",
+            "grub-image",
+            "--root-policy",
+            "root-rw"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cargo-narf",
+            "build",
             "grub-image",
             "--allow-all-disks",
             "--root-policy",
@@ -1033,18 +1332,20 @@ mod disk_policy_tests {
 
     #[test]
     fn grub_image_and_installed_root_parse_the_opt_out() {
-        let cli = Cli::try_parse_from(["xtask", "grub-image"]).expect("grub-image must parse");
-        let Cmd::GrubImage(args) = cli.cmd else {
+        let cli = Cli::try_parse_from(["cargo-narf", "build", "grub-image"])
+            .expect("grub-image must parse");
+        let TopCommand::Build(BuildCmd::GrubImage(args)) = cli.command else {
             panic!("grub-image")
         };
         assert!(!args.allow_all_disks);
-        let cli = Cli::try_parse_from(["xtask", "grub-image", "--allow-all-disks"]).unwrap();
-        let Cmd::GrubImage(args) = cli.cmd else {
+        let cli = Cli::try_parse_from(["cargo-narf", "build", "grub-image", "--allow-all-disks"])
+            .unwrap();
+        let TopCommand::Build(BuildCmd::GrubImage(args)) = cli.command else {
             panic!("grub-image")
         };
         assert!(args.allow_all_disks);
-        let cli = Cli::try_parse_from(["xtask", "disk-write-partitioned"]).unwrap();
-        let Cmd::DiskWritePartitioned(args) = cli.cmd else {
+        let cli = Cli::try_parse_from(["cargo-narf", "disk", "disk-write-partitioned"]).unwrap();
+        let TopCommand::Disk(DiskCmd::DiskWritePartitioned(args)) = cli.command else {
             panic!("disk-write-partitioned")
         };
         assert!(!args.allow_all_disks);
@@ -1054,7 +1355,7 @@ mod disk_policy_tests {
 }
 
 #[derive(Parser, Clone)]
-struct DiskWritePartitionedArgs {
+pub(crate) struct DiskWritePartitionedArgs {
     /// Block device to format (e.g. /dev/sda). Auto-detected USB
     /// when omitted.
     #[arg(long)]
@@ -1109,9 +1410,9 @@ impl RootFs {
 }
 
 #[derive(Parser, Clone)]
-struct DiskWriteArgs {
+pub(crate) struct DiskWriteArgs {
     /// Block device to burn (e.g. /dev/sda). Auto-detected if omitted —
-    /// xtask picks the first USB-attached disk it finds.
+    /// cargo narf picks the first USB-attached disk it finds.
     #[arg(long)]
     device: Option<String>,
 
@@ -1137,7 +1438,7 @@ struct DiskWriteArgs {
 }
 
 #[derive(Parser, Clone)]
-struct BuildArgs {
+pub(crate) struct BuildArgs {
     /// Target architecture.
     #[arg(long, value_enum, default_value_t = Arch::X86_64)]
     arch: Arch,
@@ -1196,7 +1497,7 @@ struct BuildArgs {
     /// Host PCI functions to attach to an x86_64 QEMU guest through VFIO.
     /// Repeat for every function in the device's IOMMU group (for example,
     /// a GPU and its HDMI-audio function). The host must already have bound
-    /// each function to vfio-pci; xtask checks but never rebinds hardware.
+    /// each function to vfio-pci; cargo narf checks but never rebinds hardware.
     #[arg(long = "passthrough-device", value_name = "BDF")]
     passthrough_devices: Vec<passthrough::Bdf>,
 
@@ -1230,7 +1531,7 @@ struct BuildArgs {
 }
 
 #[derive(Parser, Clone)]
-struct TestArgs {
+pub(crate) struct TestArgs {
     #[command(flatten)]
     build: BuildArgs,
 
@@ -1278,9 +1579,9 @@ struct TestArgs {
     split: bool,
 }
 
-/// Args for the hidden `xtask net-peer` (see `net_robust::net_peer_main`).
+/// Args for the hidden `cargo narf run net-peer` (see `net_robust::net_peer_main`).
 #[derive(Parser, Clone)]
-struct NetPeerArgs {
+pub(crate) struct NetPeerArgs {
     /// Unix socket QEMU's `-netdev stream` connects to.
     #[arg(long)]
     sock: PathBuf,
@@ -1292,12 +1593,12 @@ struct NetPeerArgs {
     long: bool,
 }
 
-/// Wave-49 — args for `xtask run-interactive`. Inherits BuildArgs
+/// Wave-49 — args for `cargo narf run run-interactive`. Inherits BuildArgs
 /// (flatten) so all the usual `--features`, `--release`,
 /// `--display`, `--arch` knobs work, plus `--cmd <LINE>` /
 /// `--expect <SUBSTR>` for scripted command testing.
 #[derive(Parser, Clone)]
-struct RunInteractiveArgs {
+pub(crate) struct RunInteractiveArgs {
     #[command(flatten)]
     build: BuildArgs,
 
@@ -1330,12 +1631,12 @@ struct RunInteractiveArgs {
     prebuilt: Option<String>,
 }
 
-/// Args for `xtask musl-demo`. Inherits BuildArgs; adds subsystem-group
+/// Args for `cargo narf smoke musl-demo`. Inherits BuildArgs; adds subsystem-group
 /// sharding (`--group`/`--list-groups`) and prebuilt-kernel boot so CI can
 /// build once and fan the cases out across a handful of parallel jobs by
 /// subsystem rather than one slow ~80-case boot.
 #[derive(Parser, Clone)]
-struct MuslDemoArgs {
+pub(crate) struct MuslDemoArgs {
     #[command(flatten)]
     build: BuildArgs,
 
@@ -1437,12 +1738,12 @@ fn resolve_gpu_backend(arch: Arch, display: &str, requested: GpuBackend) -> GpuB
         GpuBackend::Auto
             if display != "none" && qemu_supports_device(arch.qemu_bin(), "virtio-gpu-gl-pci") =>
         {
-            eprintln!("xtask: GPU auto selected VirGL");
+            eprintln!("cargo narf: GPU auto selected VirGL");
             GpuBackend::Virgl
         }
         GpuBackend::Auto => {
             if display != "none" {
-                eprintln!("xtask: GPU auto fell back to virtio-gpu 2D");
+                eprintln!("cargo narf: GPU auto fell back to virtio-gpu 2D");
             }
             GpuBackend::Virtio2d
         }
@@ -1506,8 +1807,9 @@ mod gpu_backend_tests {
 
     #[test]
     fn default_gpu_backend_is_auto() {
-        let cli = Cli::try_parse_from(["xtask", "run"]).expect("default CLI must parse");
-        let Cmd::Run(args) = cli.cmd else {
+        let cli =
+            Cli::try_parse_from(["cargo-narf", "run", "run"]).expect("default CLI must parse");
+        let TopCommand::Run(RunCmd::Run(args)) = cli.command else {
             panic!("run subcommand parsed as another variant");
         };
         assert_eq!(args.gpu_backend, GpuBackend::Auto);
@@ -1519,9 +1821,9 @@ mod gpu_backend_tests {
 
     #[test]
     fn virgl_gpu_backend_selects_qemu_gl_device() {
-        let cli = Cli::try_parse_from(["xtask", "run", "--gpu-backend", "virgl"])
+        let cli = Cli::try_parse_from(["cargo-narf", "run", "run", "--gpu-backend", "virgl"])
             .expect("virgl CLI must parse");
-        let Cmd::Run(args) = cli.cmd else {
+        let TopCommand::Run(RunCmd::Run(args)) = cli.command else {
             panic!("run subcommand parsed as another variant");
         };
         assert_eq!(args.gpu_backend, GpuBackend::Virgl);
@@ -1601,7 +1903,8 @@ mod gpu_backend_tests {
     #[test]
     fn passthrough_devices_are_repeatable_typed_boot_options() {
         let cli = Cli::try_parse_from([
-            "xtask",
+            "cargo-narf",
+            "run",
             "run",
             "--passthrough-device",
             "03:00.0",
@@ -1609,7 +1912,7 @@ mod gpu_backend_tests {
             "0000:03:00.1",
         ])
         .expect("valid PCI functions must parse");
-        let Cmd::Run(args) = cli.cmd else {
+        let TopCommand::Run(RunCmd::Run(args)) = cli.command else {
             panic!("run subcommand parsed as another variant");
         };
         assert_eq!(
@@ -1620,9 +1923,14 @@ mod gpu_backend_tests {
             ]
         );
 
-        assert!(
-            Cli::try_parse_from(["xtask", "run", "--passthrough-device", "not-a-bdf"]).is_err()
-        );
+        assert!(Cli::try_parse_from([
+            "cargo-narf",
+            "run",
+            "run",
+            "--passthrough-device",
+            "not-a-bdf"
+        ])
+        .is_err());
     }
 }
 
@@ -1652,7 +1960,7 @@ fn classify_serial_marker(
 fn emit_serial_line(writer: &mut impl Write, line: &str) {
     // A tmux/PTY consumer can transiently return EAGAIN when a noisy distro
     // boot fills its host-side buffer. `println!` panics on that error and,
-    // under this workspace's panic=abort profile, used to kill xtask and its
+    // under this workspace's panic=abort profile, used to kill cargo narf and its
     // QEMU child. The in-memory capture remains authoritative; mirroring to
     // the interactive console is best-effort.
     let _ = writeln!(writer, "{line}");
@@ -1663,9 +1971,15 @@ mod systemd_marker_tests {
     use super::*;
 
     fn systemd_pid1_features(net_check: bool) -> Vec<String> {
-        let cli = Cli::try_parse_from(["xtask", "systemd-pid1", "--features", "user-requested"])
-            .expect("systemd-pid1 CLI must parse");
-        let Cmd::SystemdPid1(mut args) = cli.cmd else {
+        let cli = Cli::try_parse_from([
+            "cargo-narf",
+            "run",
+            "systemd-pid1",
+            "--features",
+            "user-requested",
+        ])
+        .expect("systemd-pid1 CLI must parse");
+        let TopCommand::Run(RunCmd::SystemdPid1(mut args)) = cli.command else {
             panic!("systemd-pid1 subcommand parsed as another variant");
         };
         configure_distro_pid1_build(&mut args, net_check);
@@ -2512,7 +2826,7 @@ static TEST_INITRD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(No
 /// address. QEMU only injects `-append` into a device tree it *builds* (or one
 /// given via `-dtb`), so with a generic-loader blob the command line was
 /// silently dropped and `narf_boot::cmdline()` read empty on aarch64. The
-/// visible symptom was `cargo xtask test --subsystem <name>` filtering nothing
+/// visible symptom was `cargo narf test test --subsystem <name>` filtering nothing
 /// there: the kernel never saw `test_subsystem=`, took `run_all_and_exit()`,
 /// ran the whole suite, and still reported success.
 ///
@@ -2736,7 +3050,7 @@ fn virtio_blk_image_path() -> PathBuf {
     let path = root.join("target").join("narf-vblk.img");
     // CREATE-ONLY — do NOT overwrite an existing image. This path is shared:
     // `REGEN_alpine_rootfs.sh` builds the real ~28 MiB Alpine rootfs here for
-    // the musl-demo / stress-ng / oci chroot tests, and xtask "uses it
+    // the musl-demo / stress-ng / oci chroot tests, and cargo narf "uses it
     // verbatim when it already exists". Only when it's ABSENT do we drop a
     // minimal ext2 placeholder containing `/hello.txt` (so the boot's
     // `mnt-mount-ext2` initcall has something to mount at /mnt, plus a seeded
@@ -2948,11 +3262,11 @@ fn verify_btrfs_image(img: &Path) -> Result<()> {
         .output()
         .is_err()
     {
-        println!("xtask: skipping btrfs write-interop check (btrfs-progs not found)");
+        println!("cargo narf: skipping btrfs write-interop check (btrfs-progs not found)");
         return Ok(());
     }
     println!(
-        "xtask: verifying NARF-written btrfs image {} with `btrfs check`...",
+        "cargo narf: verifying NARF-written btrfs image {} with `btrfs check`...",
         img.display()
     );
     let out = std::process::Command::new("btrfs")
@@ -2966,7 +3280,7 @@ fn verify_btrfs_image(img: &Path) -> Result<()> {
         String::from_utf8_lossy(&out.stderr)
     );
     if out.status.success() && combined.contains("no error found") {
-        println!("xtask: btrfs write-interop OK — NARF-written image is `btrfs check` clean");
+        println!("cargo narf: btrfs write-interop OK — NARF-written image is `btrfs check` clean");
         verify_btrfs_block_group_tree(img)
     } else {
         eprintln!("{combined}");
@@ -3012,13 +3326,13 @@ fn verify_btrfs_block_group_tree(img: &Path) -> Result<()> {
         );
     }
     println!(
-        "xtask: block-group tree OK — {bg_items} block groups in tree 11 match the chunk tree"
+        "cargo narf: block-group tree OK — {bg_items} block groups in tree 11 match the chunk tree"
     );
     Ok(())
 }
 
 /// The kernel's btrfs read/write smokes mutate whichever btrfs volume they
-/// find, so they run only with `narf.btrfs_smoke`, which xtask passes solely
+/// find, so they run only with `narf.btrfs_smoke`, which cargo narf passes solely
 /// when it serves its own disposable `narf-nvme-btrfs.img` on nvme0.
 fn btrfs_smoke_bootarg() -> &'static str {
     // A caller-supplied image (`XTASK_BTRFS_NVME_IMAGE`) is not xtask's
@@ -3074,7 +3388,7 @@ fn nvme_image_path() -> PathBuf {
         return path;
     }
     // `NARF_NVME_IMG` selects an alternate NVMe disk verbatim (e.g. the
-    // CachyOS-layout root image `cargo xtask cachyos-root-smoke` builds).
+    // CachyOS-layout root image `cargo narf smoke cachyos-root-smoke` builds).
     // Must already exist; we never synthesize an override path.
     if let Some(p) = std::env::var_os("NARF_NVME_IMG") {
         return PathBuf::from(p);
@@ -3792,7 +4106,7 @@ fn effective_qemu_queues() -> usize {
 
 fn workspace_root() -> Result<PathBuf> {
     let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .context("CARGO_MANIFEST_DIR not set — run via `cargo xtask`")?;
+        .context("CARGO_MANIFEST_DIR not set — run via `cargo narf`")?;
     let root = Path::new(&manifest)
         .parent()
         .ok_or_else(|| anyhow!("manifest dir has no parent"))?
@@ -3802,9 +4116,9 @@ fn workspace_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Args for `xtask build-module`.
+/// Args for `cargo narf build build-module`.
 #[derive(clap::Args)]
-struct BuildModuleArgs {
+pub(crate) struct BuildModuleArgs {
     /// Target architecture.
     #[arg(long, value_enum, default_value_t = Arch::X86_64)]
     arch: Arch,
@@ -3865,7 +4179,7 @@ struct BuildModuleArgs {
 }
 
 #[derive(clap::Args)]
-struct AttachModuleSignatureArgs {
+pub(crate) struct AttachModuleSignatureArgs {
     /// Raw `.ko` or compressed `.ko.lz4` to update in place.
     #[arg(long)]
     module: PathBuf,
@@ -4014,7 +4328,7 @@ fn push_lz4_sequence(out: &mut Vec<u8>, literals: &[u8], offset: usize, match_le
 /// The output is standard LZ4 block format; the kernel decodes it with its
 /// bounded, fully general decoder (`narf_memory::compress::lz4_decode`,
 /// which takes any offset and copies overlapping matches byte by byte).
-/// The encoder stays in xtask so the build tool needs no kernel crate and
+/// The encoder stays in cargo narf so the build tool needs no kernel crate and
 /// no external `lz4` binary.
 fn lz4_encode_module(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + input.len() / 255 + 16);
@@ -4709,22 +5023,22 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         let value = u32::from_str_radix(hex, 16)
             .with_context(|| format!("--kernel-abi {raw} is not a 32-bit hex value"))?;
         stamp_kernel_abi(&out, value)?;
-        println!("xtask build-module: stamped kernel_abi=0x{value:08x}");
+        println!("cargo narf build build-module: stamped kernel_abi=0x{value:08x}");
     }
 
     if args.compress {
         compress_module(&out)?;
-        println!("xtask build-module: wrapped module in bounded LZ4 envelope");
+        println!("cargo narf build build-module: wrapped module in bounded LZ4 envelope");
     }
 
     if let (Some(signature), Some(public_key)) = (&args.signature, &args.public_key) {
         sign_module(&out, signature, public_key)?;
-        println!("xtask build-module: attached verified Ed25519 signature");
+        println!("cargo narf build build-module: attached verified Ed25519 signature");
     }
 
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!(
-        "xtask build-module: {} -> {} ({size} bytes, {} object(s), {triple})",
+        "cargo narf build build-module: {} -> {} ({size} bytes, {} object(s), {triple})",
         args.package,
         out.display(),
         members.len()
@@ -4781,7 +5095,7 @@ fn build_module_fixture_inner(
 /// Compute exactly the ABI hash that `modules/src/kabi.rs` publishes.
 ///
 /// The signature CRCs are built from `stringify!($type)` inside the kernel's
-/// `kernel_abi!` macro. Reimplementing Rust token stringification in xtask
+/// `kernel_abi!` macro. Reimplementing Rust token stringification in cargo narf
 /// would be a second, subtly different ABI definition, so this helper extracts
 /// the real macro invocation and feeds it to a tiny host-side macro with the
 /// same matcher and hash expressions. Function bodies remain unexpanded token
@@ -5210,7 +5524,7 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
                 format!("patching the KASLR relocation table into {}", elf.display())
             })?;
             println!(
-                "xtask: KASLR relocation table -> {} sites ({} bytes)",
+                "cargo narf: KASLR relocation table -> {} sites ({} bytes)",
                 table.total(),
                 table.encoded_len()
             );
@@ -5222,7 +5536,7 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
                 format!("patching the kernel symbol table into {}", elf.display())
             })?;
             println!(
-                "xtask: kernel symbol table -> {} symbols, {} names ({} bytes)",
+                "cargo narf: kernel symbol table -> {} symbols, {} names ({} bytes)",
                 ksyms.symbols, ksyms.names, ksyms.total
             );
             if matches!(args.arch, Arch::Aarch64) {
@@ -5232,7 +5546,7 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
                 kaslr_knob::set_slide(&elf, slide)
                     .with_context(|| format!("patching the KASLR slide into {}", elf.display()))?;
                 if slide != 0 {
-                    println!("xtask: KASLR slide pinned to {slide:#x} (NARF_KASLR_SLIDE)");
+                    println!("cargo narf: KASLR slide pinned to {slide:#x} (NARF_KASLR_SLIDE)");
                 }
             }
             // Stack-frame budget on the image the merge gates test: every
@@ -5288,7 +5602,10 @@ fn add_passthrough_firmware(args: &mut BuildArgs) {
     }
     let globs = passthrough::firmware_globs(&args.passthrough_devices);
     if !globs.is_empty() {
-        println!("xtask: passthrough: initramfs firmware {}", globs.join(" "));
+        println!(
+            "cargo narf: passthrough: initramfs firmware {}",
+            globs.join(" ")
+        );
     }
     args.initramfs_firmware = globs;
 }
@@ -5302,7 +5619,7 @@ fn initramfs_firmware_entries(args: &BuildArgs, root: &Path) -> Result<Vec<(Stri
     let (blobs, _) = collect_firmware_blobs(&fw_dir, &args.initramfs_firmware)?;
     if blobs.is_empty() {
         bail!(
-            "--initramfs-firmware {:?} matched nothing under {} (run `cargo xtask \
+            "--initramfs-firmware {:?} matched nothing under {} (run `cargo narf \
              import-firmware --source /usr/lib/firmware --vendor amdgpu` first)",
             args.initramfs_firmware,
             fw_dir.display()
@@ -5313,7 +5630,7 @@ fn initramfs_firmware_entries(args: &BuildArgs, root: &Path) -> Result<Vec<(Stri
 
 /// Validate a requested VFIO assignment and return the exact QEMU argv
 /// entries used to attach it. Host-driver rebinding is deliberately outside
-/// xtask: detaching a live display adapter is an administrator decision.
+/// cargo narf: detaching a live display adapter is an administrator decision.
 fn passthrough_qemu_args(args: &BuildArgs) -> Result<Vec<String>> {
     use passthrough::{explain, note, preflight};
 
@@ -5361,7 +5678,7 @@ fn passthrough_qemu_args(args: &BuildArgs) -> Result<Vec<String>> {
     }
 
     println!(
-        "xtask: PCI passthrough preflight passed; attaching {}",
+        "cargo narf: PCI passthrough preflight passed; attaching {}",
         devices
             .iter()
             .map(|device| device.0.as_str())
@@ -5510,7 +5827,7 @@ const QEMU_CPU_MIN_ACTIVITY_WINDOW: Duration = Duration::from_secs(1);
 /// QEMU process CPU use over a trailing observation window.
 ///
 /// Linux reports a process's user + system time in `/proc/<pid>/stat` in
-/// clock ticks (USER_HZ: 100 ticks per second on the Linux platforms xtask
+/// clock ticks (USER_HZ: 100 ticks per second on the Linux platforms cargo narf
 /// supports). QEMU has several host threads, so this measures emulator work
 /// in aggregate rather than identifying a particular vCPU. That aggregate is
 /// the useful distinction here: a guest doing TCG compute keeps QEMU busy,
@@ -5834,20 +6151,20 @@ fn capture_serial_stream(
                 }
                 if let Some(file) = log.as_mut() {
                     if let Err(error) = file.write_all(chunk) {
-                        eprintln!("xtask: serial log write failed: {error}");
+                        eprintln!("cargo narf: serial log write failed: {error}");
                         log = None;
                     }
                 }
                 if let Some(stdout) = live.as_mut() {
                     if let Err(error) = stdout.write_all(chunk).and_then(|()| stdout.flush()) {
-                        eprintln!("xtask: live serial output failed: {error}");
+                        eprintln!("cargo narf: live serial output failed: {error}");
                         live = None;
                     }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                eprintln!("xtask: serial read failed: {error}");
+                eprintln!("cargo narf: serial read failed: {error}");
                 break;
             }
         }
@@ -5920,7 +6237,7 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
     if !firmware.is_empty() {
         let bytes: usize = firmware.iter().map(|(_, b)| b.len()).sum();
         println!(
-            "xtask: staged {} firmware blob(s), {bytes} bytes, into the initramfs",
+            "cargo narf: staged {} firmware blob(s), {bytes} bytes, into the initramfs",
             firmware.len()
         );
         fixtures.extend(firmware);
@@ -5953,11 +6270,11 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
         };
         match build_fixture(false) {
             Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko".into(), bytes)),
-            Err(e) => println!("xtask: raw test module unavailable ({e})"),
+            Err(e) => println!("cargo narf: raw test module unavailable ({e})"),
         }
         match build_fixture(true) {
             Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko.lz4".into(), bytes)),
-            Err(e) => println!("xtask: compressed test module unavailable ({e})"),
+            Err(e) => println!("cargo narf: compressed test module unavailable ({e})"),
         }
         // A module built on `narf-module-rt`: out-of-line core/alloc code and
         // a dependency crate, linked from the archive and section-GC'd. The
@@ -5976,7 +6293,7 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
         };
         match build_module(&rt_smoke, &root).and_then(|ko| Ok(std::fs::read(&ko)?)) {
             Ok(bytes) => fixtures.push(("lib/modules/narf_module_rt_smoke.ko".into(), bytes)),
-            Err(e) => println!("xtask: runtime smoke module unavailable ({e})"),
+            Err(e) => println!("cargo narf: runtime smoke module unavailable ({e})"),
         }
         // A real dual-build driver `.ko` for the loadable-driver e2e smoke.
         match build_module_fixture("narf-drivers-net-e1000", args.arch, &root) {
@@ -5988,7 +6305,7 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
                 fixtures.push(("lib/modules/narf_drivers_net_e1000.ko".into(), bytes));
             }
             Ok(_) => {}
-            Err(e) => println!("xtask: e1000 driver module unavailable ({e})"),
+            Err(e) => println!("cargo narf: e1000 driver module unavailable ({e})"),
         }
         // Whole drivers as loadable modules, for the `modules/e2e` registration
         // smokes. They are the bulk of the initramfs, which stays resident in
@@ -6018,7 +6335,7 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
                 Ok(bytes) => {
                     fixtures.push((format!("lib/modules/test-fixtures/{guest}.ko.lz4"), bytes))
                 }
-                Err(e) => println!("xtask: {what} driver module unavailable ({e})"),
+                Err(e) => println!("cargo narf: {what} driver module unavailable ({e})"),
             }
         }
     }
@@ -6034,7 +6351,7 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
             Ok(()) => {
                 for (name, bytes) in fixtures.iter().filter(|(n, _)| !n.starts_with("firmware/")) {
                     println!(
-                        "xtask: staged module ({} bytes) -> guest /{}",
+                        "cargo narf: staged module ({} bytes) -> guest /{}",
                         bytes.len(),
                         name
                     );
@@ -6043,7 +6360,7 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
                     *initrd = Some(p);
                 }
             }
-            Err(e) => println!("xtask: could not write module initramfs ({e})"),
+            Err(e) => println!("cargo narf: could not write module initramfs ({e})"),
         }
     }
 
@@ -6057,7 +6374,7 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
         cmd.stdout(Stdio::piped());
     }
 
-    println!("xtask: launching {} {}", qemu, kernel.display());
+    println!("cargo narf: launching {} {}", qemu, kernel.display());
 
     // Optional host-side copy of the existing serial stream. This leaves
     // guest instrumentation unchanged and makes an in-progress stall
@@ -6149,7 +6466,7 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
     // is chosen from how long this actually takes, and the only way that stays
     // true is if every run says what it took.
     println!(
-        "xtask: {qemu} exited with {status} after {}s (cap {secs}s)",
+        "cargo narf: {qemu} exited with {status} after {}s (cap {secs}s)",
         started.elapsed().as_secs()
     );
     Ok(BootOutcome::Exited { status, serial })
@@ -6174,7 +6491,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             let qemu = args.arch.qemu_bin();
             emit_serial_tail(&serial);
             bail!(
-                "xtask: {qemu} {reason} after {elapsed_secs}s; QEMU process CPU at kill: {cpu_state}; \
+                "cargo narf: {qemu} {reason} after {elapsed_secs}s; QEMU process CPU at kill: {cpu_state}; \
                  last serial line: {}",
                 last_serial_line(&serial)
             );
@@ -6188,7 +6505,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         if status.code() != expected {
             emit_serial_tail(&serial);
             bail!(
-                "xtask test: kernel-test suite reported failures — QEMU exited \
+                "cargo narf test test: kernel-test suite reported failures — QEMU exited \
                  with {status} (status code {:?}; all-pass is {:?} on {}). See the \
                  `── summary` / `── failing tests ──` lines above.",
                 status.code(),
@@ -6212,7 +6529,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
                 // Surface datapath microbenchmark metrics: `net/bench` logs
                 // `NETBENCH ...` lines to the console (ns/packet + the pps /
                 // Gb/s ceiling each primitive implies). They scroll past in the
-                // full suite, so relay them here — `cargo xtask test
+                // full suite, so relay them here — `cargo narf test test
                 // --kernel-tests-only --subsystem=net/bench` is the net-bench
                 // invocation and this is where its numbers show.
                 for line in text.lines().filter(|l| l.contains("NETBENCH")) {
@@ -6220,7 +6537,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
                 }
                 if pass == 0 {
                     println!(
-                        "xtask test: WARNING — no test passed; did the subsystem filter \
+                        "cargo narf test test: WARNING — no test passed; did the subsystem filter \
                          (or a missing feature) leave nothing to run?"
                     );
                 }
@@ -6228,14 +6545,14 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             Some(KernelTestSummary { fail, .. }) => {
                 emit_serial_tail(&serial);
                 bail!(
-                    "xtask test: QEMU exited all-pass but the kernel reported {fail} failing \
+                    "cargo narf test test: QEMU exited all-pass but the kernel reported {fail} failing \
                      test(s). See the `── failing tests ──` lines above."
                 );
             }
             None => {
                 emit_serial_tail(&serial);
                 bail!(
-                    "xtask test: QEMU exited {:?} but the kernel never printed its `── summary` \
+                    "cargo narf test test: QEMU exited {:?} but the kernel never printed its `── summary` \
                      line — QEMU failed to start or the kernel died before finishing the suite. \
                      See the QEMU output above.",
                     status.code(),
@@ -6566,7 +6883,11 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
 
-    println!("xtask boot-smoke: launching {} {}", qemu, kernel.display());
+    println!(
+        "cargo narf test boot-smoke: launching {} {}",
+        qemu,
+        kernel.display()
+    );
 
     let child = cmd
         .spawn()
@@ -6579,7 +6900,7 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
 ///
 /// The whole suite is one boot: every subsystem's smokes run in a single
 /// kernel, so this bound has to cover all of them, not the slowest one. A
-/// measured full local run (`cargo xtask test` with no `--subsystem`, 8041
+/// measured full local run (`cargo narf test test` with no `--subsystem`, 8041
 /// smokes) spends 1228 s in this phase on this KVM host. The default is
 /// roughly double that, because what it has to survive is not the median run
 /// but the worst one on a loaded machine — and because being generous costs
@@ -7072,7 +7393,7 @@ fn interpret_boot(
     }
 }
 
-/// Phase 1 of `cargo xtask test --split`: boot the kernel once per
+/// Phase 1 of `cargo narf test test --split`: boot the kernel once per
 /// group, each boot capped at [`kernel_test_group_timeout_secs`], and
 /// aggregate the per-group results into the same
 /// `── summary: P pass, F fail, S skip ──` + `── failing tests ──`
@@ -7104,7 +7425,7 @@ fn run_kernel_test_phase_split(
     // boot and the base is restored after each one.
     let base_append = std::env::var("XTASK_QEMU_APPEND").ok();
     println!(
-        "xtask: kernel-test phase (split): {} group(s), per-group cap {cap}s",
+        "cargo narf: kernel-test phase (split): {} group(s), per-group cap {cap}s",
         groups.len()
     );
     let mut outcomes: Vec<GroupOutcome> = Vec::new();
@@ -7128,7 +7449,7 @@ fn run_kernel_test_phase_split(
             std::env::set_var("XTASK_QEMU_APPEND", parts.join(" "));
         }
         println!(
-            "xtask: kernel-test group {}/{} ({}) — booting",
+            "cargo narf: kernel-test group {}/{} ({}) — booting",
             idx + 1,
             groups.len(),
             group.label
@@ -7162,7 +7483,7 @@ fn run_kernel_test_phase_split(
         );
         if outcome.verdict == GroupVerdict::Passed && outcome.passed == 0 {
             println!(
-                "xtask test: warning: kernel-test group {} reported zero passing \
+                "cargo narf test test: warning: kernel-test group {} reported zero passing \
                  tests — check the group filter",
                 outcome.label
             );
@@ -7201,7 +7522,7 @@ fn run_kernel_test_phase_split(
             .map(|o| format!("{} ({:?})", o.label, o.verdict))
             .collect();
         bail!(
-            "xtask test: kernel-test phase (split) failed — {} of {} group(s) did not \
+            "cargo narf test test: kernel-test phase (split) failed — {} of {} group(s) did not \
              pass: {}. See the per-group lines and the `── failing tests ──` list above.",
             bad.len(),
             outcomes.len(),
@@ -7279,7 +7600,7 @@ fn wait_for_boot_smoke(
     };
     let transcript = reader_handle
         .join()
-        .map_err(|_| anyhow!("xtask {label}: serial-reader thread panicked"))?;
+        .map_err(|_| anyhow!("cargo narf {label}: serial-reader thread panicked"))?;
     let transcript_text = String::from_utf8_lossy(&transcript);
     let panic_line = transcript_text
         .lines()
@@ -7288,18 +7609,18 @@ fn wait_for_boot_smoke(
 
     if let Some(p) = panic_line {
         emit_serial_tail(&transcript);
-        bail!("xtask {label}: kernel panic during boot — '{}'", p);
+        bail!("cargo narf {label}: kernel panic during boot — '{}'", p);
     }
     if timed_out {
         emit_serial_tail(&transcript);
         bail!(
-            "xtask {label}: kernel did not power off within {}s — possible boot hang",
+            "cargo narf {label}: kernel did not power off within {}s — possible boot hang",
             timeout_secs
         );
     }
     if !clean_exit_seen {
         emit_serial_tail(&transcript);
-        bail!("xtask {label}: QEMU exited without the kernel clean-exit marker");
+        bail!("cargo narf {label}: QEMU exited without the kernel clean-exit marker");
     }
     // ACPI S5 and PSCI SYSTEM_OFF both make QEMU exit naturally with status
     // zero. This deliberately differs from the test-only x86 isa-debug-exit
@@ -7308,13 +7629,13 @@ fn wait_for_boot_smoke(
     if status.code() != expected {
         emit_serial_tail(&transcript);
         bail!(
-            "xtask {label}: QEMU exited with non-success status {:?} (expected {:?} on {})",
+            "cargo narf {label}: QEMU exited with non-success status {:?} (expected {:?} on {})",
             status.code(),
             expected,
             arch.triple(),
         );
     }
-    println!("xtask {label}: kernel cleanly exited, no panic markers");
+    println!("cargo narf {label}: kernel cleanly exited, no panic markers");
     Ok(())
 }
 
@@ -7327,7 +7648,7 @@ fn wait_for_boot_smoke(
 /// at `target/narf-vblk.img` (built out-of-band; not committed).
 fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask systemd-pid1: only x86_64 is wired (aarch64 boot-init is a stub)");
+        bail!("cargo narf run systemd-pid1: only x86_64 is wired (aarch64 boot-init is a stub)");
     }
     // XTASK_SYSTEMD_PID1_NET_CHECK=1 turns the boot into a network
     // acceptance run: a host-side listener answers the in-guest
@@ -7343,7 +7664,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     let disk = virtio_blk_image_path();
     if !disk.exists() {
         bail!(
-            "xtask systemd-pid1: no rootfs disk at {} — build a systemd rootfs image first",
+            "cargo narf run systemd-pid1: no rootfs disk at {} — build a systemd rootfs image first",
             disk.display()
         );
     }
@@ -7351,7 +7672,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     let net_check_port = if net_check {
         let port = spawn_net_check_listener()?;
         println!(
-            "xtask systemd-pid1: net-check listener on 127.0.0.1:{port} \
+            "cargo narf run systemd-pid1: net-check listener on 127.0.0.1:{port} \
              (guest fetches http://10.0.2.2:{port}/)"
         );
         Some(port)
@@ -7400,7 +7721,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         .or_else(|| net_check.then(|| "NARF-NET-CHECK: FAIL".to_string()));
 
     println!(
-        "xtask systemd-pid1: launching {} {} (capturing serial for {}s)",
+        "cargo narf run systemd-pid1: launching {} {} (capturing serial for {}s)",
         qemu,
         kernel.display(),
         secs
@@ -7512,25 +7833,25 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         println!("  {l}");
     }
     if let Some(p) = panic_hit {
-        bail!("xtask systemd-pid1: kernel panic during boot — {p}");
+        bail!("cargo narf run systemd-pid1: kernel panic during boot — {p}");
     }
     match marker_state.load(Ordering::Acquire) {
         2 => bail!(
-            "xtask systemd-pid1: observed failure marker {:?}",
+            "cargo narf run systemd-pid1: observed failure marker {:?}",
             failure_marker.unwrap_or_default()
         ),
         1 => println!(
-            "xtask systemd-pid1: observed success marker {:?}",
+            "cargo narf run systemd-pid1: observed success marker {:?}",
             success_marker.as_deref().unwrap_or_default()
         ),
         _ if success_marker.is_some() => bail!(
-            "xtask systemd-pid1: timed out without success marker {:?}",
+            "cargo narf run systemd-pid1: timed out without success marker {:?}",
             success_marker.unwrap_or_default()
         ),
         _ => {}
     }
     println!(
-        "xtask systemd-pid1: capture window elapsed ({} total serial lines)",
+        "cargo narf run systemd-pid1: capture window elapsed ({} total serial lines)",
         lines.len()
     );
     Ok(())
@@ -7587,10 +7908,10 @@ fn systemd_pid1_cmdline(existing: &str, net_check_port: Option<u16>) -> String {
 /// the SLIRP gateway (guest `10.0.2.2:<port>` lands on host
 /// `127.0.0.1:<port>` — no hostfwd needed for guest-to-host). Returns the
 /// bound port; the accept loop runs on a detached thread for the life of
-/// the xtask process.
+/// the cargo narf process.
 fn spawn_net_check_listener() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .context("xtask systemd-pid1: cannot bind the net-check listener")?;
+        .context("cargo narf run systemd-pid1: cannot bind the net-check listener")?;
     let port = listener.local_addr()?.port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -8256,7 +8577,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     // locally via `--group <name>`: the GUI/Wayland compositor cases are
     // boot-flaky under GHA's TCG (multi-process fresh boots that
     // occasionally die before login), so they don't gate CI for now. Run
-    // them by hand with `cargo xtask musl-demo --group gui`.
+    // them by hand with `cargo narf smoke musl-demo --group gui`.
     // User namespaces run in nightly-oci with the container feature.
     const CI_EXCLUDED_GROUPS: &[&str] = &["gui", "userns"];
     if args.list_groups {
@@ -8320,7 +8641,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
             && (args.smoke.is_empty() || args.smoke.iter().any(|name| name == cmd))
     };
     if let Some(g) = &args.group {
-        eprintln!("xtask musl-demo: running subsystem group `{g}`");
+        eprintln!("cargo narf smoke musl-demo: running subsystem group `{g}`");
     }
 
     // Lightweight cases in this group → one shared boot. A boot-level flake
@@ -8388,7 +8709,7 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
     Ok(())
 }
 
-/// `xtask nvme-poweroff-check` (see the `Cmd` doc).
+/// `cargo narf smoke nvme-poweroff-check` (see the `Cmd` doc).
 fn nvme_poweroff_check_cmd(args: &RunInteractiveArgs) -> Result<()> {
     const TOKEN: &str = "NARF-FLUSH-TOKEN-7";
     let root = workspace_root()?;
@@ -8410,7 +8731,7 @@ fn nvme_poweroff_check_cmd(args: &RunInteractiveArgs) -> Result<()> {
         let mut first = args.clone();
         first.cmd = format!("/bin/echo {TOKEN} > /dev/nvme0n1; poweroff");
         first.expect = "CC.SHN normal shutdown: Complete".into();
-        println!("xtask nvme-poweroff-check: boot 1 — write the token, poweroff");
+        println!("cargo narf smoke nvme-poweroff-check: boot 1 — write the token, poweroff");
         run_interactive_cmd(&first)?;
         let bytes = std::fs::read(&img)?;
         if !bytes.starts_with(TOKEN.as_bytes()) {
@@ -8419,7 +8740,7 @@ fn nvme_poweroff_check_cmd(args: &RunInteractiveArgs) -> Result<()> {
         let mut second = args.clone();
         second.cmd = "cat /dev/nvme0n1".into();
         second.expect = TOKEN.into();
-        println!("xtask nvme-poweroff-check: boot 2 — read the token back");
+        println!("cargo narf smoke nvme-poweroff-check: boot 2 — read the token back");
         run_interactive_cmd(&second)
     })();
     match prior {
@@ -8427,7 +8748,9 @@ fn nvme_poweroff_check_cmd(args: &RunInteractiveArgs) -> Result<()> {
         None => std::env::remove_var("NARF_QEMU_EXTRA"),
     }
     result?;
-    println!("xtask nvme-poweroff-check: ok — flushed write survived poweroff + restart");
+    println!(
+        "cargo narf smoke nvme-poweroff-check: ok — flushed write survived poweroff + restart"
+    );
     Ok(())
 }
 
@@ -8435,7 +8758,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     if !matches!(args.build.arch, Arch::X86_64) {
         // The shell + boot_userspace_init are x86_64-only today
         // (`cfg(all(feature = "boot-init", target_arch = "x86_64"))`).
-        bail!("xtask run-interactive: only x86_64 is wired (aarch64 boot-init is a stub)");
+        bail!("cargo narf run run-interactive: only x86_64 is wired (aarch64 boot-init is a stub)");
     }
 
     let root = workspace_root()?;
@@ -8478,7 +8801,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     // `XTASK_STAGE_BIN=/host/path[:guest/name]` puts an arbitrary host file
     // into the guest's initramfs, so a Linux binary can be driven with
-    // `--cmd` without teaching xtask about that binary. The default guest path
+    // `--cmd` without teaching cargo narf about that binary. The default guest path
     // is `/usr/bin/<basename>` because boot-init mounts baked coreutils over
     // `/bin`; explicit destinations hidden by a boot mount are rejected.
     // Used for the stress-ng sweep, where the SAME file has to reach NARF and
@@ -8489,7 +8812,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
             let bytes =
                 std::fs::read(&host).with_context(|| format!("XTASK_STAGE_BIN: reading {host}"))?;
             println!(
-                "xtask: staging {host} ({} bytes) -> guest /{guest}",
+                "cargo narf: staging {host} ({} bytes) -> guest /{guest}",
                 bytes.len()
             );
             Some((guest, bytes))
@@ -8521,7 +8844,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     for attempt in 1..=attempts {
         if attempts > 1 {
             eprintln!(
-                "xtask run-interactive: attempt {attempt}/{attempts} for `{}`",
+                "cargo narf run run-interactive: attempt {attempt}/{attempts} for `{}`",
                 args.cmd
             );
         }
@@ -8534,7 +8857,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         ) {
             Ok(_) => return Ok(()),
             Err(e) => {
-                eprintln!("xtask run-interactive: attempt {attempt} failed: {e:#}");
+                eprintln!("cargo narf run run-interactive: attempt {attempt} failed: {e:#}");
                 last_err = Some(e);
             }
         }
@@ -8545,7 +8868,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 /// Boot `kernel` under QEMU, log in as root, type `typed_cmd`, and assert
 /// `expect` appears on the serial console. One attempt; the caller retries.
 /// Returns the full captured serial transcript so callers that measure
-/// (stress-bench) can parse guest-printed metrics out of it.
+/// (stress) can parse guest-printed metrics out of it.
 fn run_interactive_boot(
     kernel: &Path,
     cpio_path: Option<&PathBuf>,
@@ -8570,7 +8893,7 @@ fn run_interactive_boot(
     cmd.stderr(Stdio::piped());
 
     println!(
-        "xtask run-interactive: launching {} {}",
+        "cargo narf run run-interactive: launching {} {}",
         qemu,
         kernel.display()
     );
@@ -8763,7 +9086,7 @@ fn run_interactive_boot(
                 let _ = child.wait();
                 let _ = reader_handle.join();
                 bail!(
-                    "xtask run-interactive: did not see login prompt within {}s",
+                    "cargo narf run run-interactive: did not see login prompt within {}s",
                     prompt_secs
                 );
             }
@@ -8776,7 +9099,7 @@ fn run_interactive_boot(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader_handle.join();
-                bail!("xtask run-interactive: stdin write failed during login");
+                bail!("cargo narf run run-interactive: stdin write failed during login");
             }
             // The password prompt should follow even a garbled username (the
             // line still completes at the newline). If it doesn't, wait for the
@@ -8791,7 +9114,7 @@ fn run_interactive_boot(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader_handle.join();
-                bail!("xtask run-interactive: stdin write failed during login");
+                bail!("cargo narf run run-interactive: stdin write failed during login");
             }
             // Success prints "Welcome to NARF"; a bad (garbled) attempt prints
             // "Login incorrect" and re-prompts. Poll for whichever comes first so
@@ -8823,7 +9146,7 @@ fn run_interactive_boot(
             let _ = child.wait();
             let _ = reader_handle.join();
             bail!(
-                "xtask run-interactive: could not log in after {} attempts",
+                "cargo narf run run-interactive: could not log in after {} attempts",
                 MAX_LOGIN_ATTEMPTS
             );
         }
@@ -8845,14 +9168,14 @@ fn run_interactive_boot(
                 let _ = child.wait();
                 let _ = reader_handle.join();
                 bail!(
-                    "xtask run-interactive: kernel panic before prompt — '{}'",
+                    "cargo narf run run-interactive: kernel panic before prompt — '{}'",
                     p
                 );
             }
             Ok(Ev::Eof) => {
                 let _ = child.wait();
                 let _ = reader_handle.join();
-                bail!("xtask run-interactive: QEMU stdout EOF before prompt appeared");
+                bail!("cargo narf run run-interactive: QEMU stdout EOF before prompt appeared");
             }
             Err(RecvTimeoutError::Timeout) => break,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -8863,7 +9186,7 @@ fn run_interactive_boot(
         let _ = child.wait();
         let _ = reader_handle.join();
         bail!(
-            "xtask run-interactive: did not see `narf> ` prompt within {}s — \
+            "cargo narf run run-interactive: did not see `narf> ` prompt within {}s — \
              is boot-init wired? did the shell crash before main()?",
             prompt_secs
         );
@@ -8900,7 +9223,7 @@ fn run_interactive_boot(
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader_handle.join();
-            bail!("xtask run-interactive: stdin write failed while typing line");
+            bail!("cargo narf run run-interactive: stdin write failed while typing line");
         }
         let _ = stdin.flush();
         std::thread::sleep(Duration::from_millis(5));
@@ -8951,7 +9274,7 @@ fn run_interactive_boot(
                     &cap_str
                 };
                 bail!(
-                    "xtask run-interactive: panic after typing — '{}'\nCapture Tail:\n{}",
+                    "cargo narf run run-interactive: panic after typing — '{}'\nCapture Tail:\n{}",
                     p,
                     tail
                 );
@@ -8987,7 +9310,7 @@ fn run_interactive_boot(
                 }
                 let _ = child.wait();
                 let _ = reader_handle.join();
-                bail!("xtask run-interactive: QEMU stdout EOF before echo reply");
+                bail!("cargo narf run run-interactive: QEMU stdout EOF before echo reply");
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -9025,7 +9348,7 @@ fn run_interactive_boot(
 
     if !got_echo {
         bail!(
-            "xtask run-interactive: typed `{}` but did not \
+            "cargo narf run run-interactive: typed `{}` but did not \
              see `{}` echoed back within {}s",
             typed_cmd,
             expect,
@@ -9061,7 +9384,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     net_smoke_cmd_with_nic(args, NetSmokeNic::Virtio)
 }
 
-/// `cargo xtask ftdi-module-serial-smoke` — see [`Cmd::FtdiModuleSerialSmoke`].
+/// `cargo narf smoke ftdi-module-serial-smoke` — see [`Cmd::FtdiModuleSerialSmoke`].
 fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
@@ -9071,7 +9394,9 @@ fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
     const PING: &[u8] = b"NARF-FTDI-PING";
     const PONG: &[u8] = b"HOST-FTDI-PONG";
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask ftdi-module-serial-smoke: only x86_64 is wired (boot-init is x86_64-only)");
+        bail!(
+            "cargo narf smoke ftdi-module-serial-smoke: only x86_64 is wired (boot-init is x86_64-only)"
+        );
     }
     let root = workspace_root()?;
     let mut build = args.clone();
@@ -9088,7 +9413,9 @@ fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
         .join("target")
         .join("ftdi-module-serial-smoke-initramfs.cpio");
     std::fs::write(&initrd, cpio).with_context(|| format!("writing {}", initrd.display()))?;
-    println!("xtask ftdi-module-serial-smoke: staged ABI 0x{abi:08x} ftdi.ko for autoload");
+    println!(
+        "cargo narf smoke ftdi-module-serial-smoke: staged ABI 0x{abi:08x} ftdi.ko for autoload"
+    );
 
     let out_dir = cargo_build(&build, &root)?;
     let kernel = out_dir.join(&build.package);
@@ -9186,14 +9513,14 @@ fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
     ];
     for (needle, why) in required {
         if !transcript.contains(needle) {
-            bail!("xtask ftdi-module-serial-smoke: {why} (missing `{needle}`)");
+            bail!("cargo narf smoke ftdi-module-serial-smoke: {why} (missing `{needle}`)");
         }
     }
     if !host_saw_ping {
-        bail!("xtask ftdi-module-serial-smoke: the host end never received the guest's bytes");
+        bail!("cargo narf smoke ftdi-module-serial-smoke: the host end never received the guest's bytes");
     }
     println!(
-        "xtask ftdi-module-serial-smoke: PASS — guest→host bulk-OUT and host→guest bulk-IN through ftdi.ko"
+        "cargo narf smoke ftdi-module-serial-smoke: PASS — guest→host bulk-OUT and host→guest bulk-IN through ftdi.ko"
     );
     Ok(())
 }
@@ -9216,7 +9543,7 @@ struct ModuleBlockSmoke {
     token: &'static str,
 }
 
-/// `cargo xtask nvme-module-block-smoke` — see [`Cmd::NvmeModuleBlockSmoke`].
+/// `cargo narf smoke nvme-module-block-smoke` — see [`Cmd::NvmeModuleBlockSmoke`].
 fn nvme_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
     module_block_smoke(
         args,
@@ -9243,7 +9570,7 @@ fn nvme_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
     )
 }
 
-/// `cargo xtask usb-storage-module-block-smoke` — see
+/// `cargo narf smoke usb-storage-module-block-smoke` — see
 /// [`Cmd::UsbStorageModuleBlockSmoke`].
 fn usb_storage_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
     module_block_smoke(
@@ -9284,7 +9611,7 @@ fn module_block_smoke(args: &BuildArgs, smoke: &ModuleBlockSmoke) -> Result<()> 
     const IMAGE_LEN: usize = 32 * 1024;
     let name = smoke.name;
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask {name}: only x86_64 is wired (boot-init is x86_64-only)");
+        bail!("cargo narf {name}: only x86_64 is wired (boot-init is x86_64-only)");
     }
     let root = workspace_root()?;
     let mut build = args.clone();
@@ -9299,7 +9626,7 @@ fn module_block_smoke(args: &BuildArgs, smoke: &ModuleBlockSmoke) -> Result<()> 
     let initrd = root.join("target").join(format!("{name}-initramfs.cpio"));
     std::fs::write(&initrd, cpio).with_context(|| format!("writing {}", initrd.display()))?;
     println!(
-        "xtask {name}: staged ABI 0x{abi:08x} {} for autoload",
+        "cargo narf {name}: staged ABI 0x{abi:08x} {} for autoload",
         smoke.ko_path
     );
 
@@ -9355,29 +9682,29 @@ fn module_block_smoke(args: &BuildArgs, smoke: &ModuleBlockSmoke) -> Result<()> 
 
     for (needle, why) in smoke.required {
         if !transcript.contains(needle) {
-            bail!("xtask {name}: {why} (missing `{needle}`)");
+            bail!("cargo narf {name}: {why} (missing `{needle}`)");
         }
     }
     // Once in the typed command line, once from `cat` of sector 0.
     if transcript.matches(smoke.token).count() < 2 {
-        bail!("xtask {name}: reading the disk back did not return the guest's write");
+        bail!("cargo narf {name}: reading the disk back did not return the guest's write");
     }
 
     let written = format!("{}\n", smoke.token);
     let after = std::fs::read(&disk).with_context(|| format!("reading {}", disk.display()))?;
     if after.len() != IMAGE_LEN || !after.starts_with(written.as_bytes()) {
-        bail!("xtask {name}: the guest's write did not reach the image at byte 0");
+        bail!("cargo narf {name}: the guest's write did not reach the image at byte 0");
     }
     if after[written.len()..] != before[written.len()..] {
         bail!(
-            "xtask {name}: the write disturbed bytes past the token \
+            "cargo narf {name}: the write disturbed bytes past the token \
              (the partial-sector read-modify-write lost data)"
         );
     }
     let _ = std::fs::remove_file(&disk);
     let _ = std::fs::remove_file(&initrd);
     println!(
-        "xtask {name}: PASS — reads, a partial-sector write and read-back through {}",
+        "cargo narf {name}: PASS — reads, a partial-sector write and read-back through {}",
         smoke.ko_path
     );
     Ok(())
@@ -9403,7 +9730,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         NetSmokeNic::Igb => "igb-net-smoke",
     };
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask {smoke_name}: only x86_64 is wired (boot-init is x86_64-only)");
+        bail!("cargo narf {smoke_name}: only x86_64 is wired (boot-init is x86_64-only)");
     }
 
     let tcp_host_port: u16 = 17777;
@@ -9465,7 +9792,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
             .lock()
             .map_err(|_| anyhow!("e1000 module smoke initramfs state is poisoned"))? = Some(initrd);
         println!(
-            "xtask e1000-module-net-smoke: staged ABI 0x{abi:08x} e1000.ko for pre-probe autoload"
+            "cargo narf smoke e1000-module-net-smoke: staged ABI 0x{abi:08x} e1000.ko for pre-probe autoload"
         );
     }
     if nic == NetSmokeNic::Igb {
@@ -9477,7 +9804,9 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         build.hw_profile = HwProfile::LegacyOnly;
         ensure_feature(&mut build.features, "narf-drivers-net/qemu-static-ipv4");
         std::env::set_var("XTASK_QEMU_IGB", "1");
-        println!("xtask igb-net-smoke: QEMU -device igb (82576) on the legacy n1 backend");
+        println!(
+            "cargo narf smoke igb-net-smoke: QEMU -device igb (82576) on the legacy n1 backend"
+        );
     }
     let out_dir = cargo_build(&build, &root)?;
     let kernel = out_dir.join(&build.package);
@@ -9545,7 +9874,9 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     // server streams DOWNLOAD_LEN patterned bytes then closes; the UDP server
     // echoes every datagram until the smoke ends.
     let download_listener = std::net::TcpListener::bind(("127.0.0.1", download_port))
-        .with_context(|| format!("xtask {smoke_name}: binding download server :{download_port}"))?;
+        .with_context(|| {
+            format!("cargo narf {smoke_name}: binding download server :{download_port}")
+        })?;
     let download_server = std::thread::spawn(move || -> Result<u64, String> {
         let (mut conn, _) = download_listener
             .accept()
@@ -9565,7 +9896,9 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     // one byte, then gets PARALLEL_LEN patterned bytes and a close. Each is
     // served on its own thread so the streams genuinely run concurrently.
     let parallel_listener = std::net::TcpListener::bind(("127.0.0.1", parallel_port))
-        .with_context(|| format!("xtask {smoke_name}: binding parallel server :{parallel_port}"))?;
+        .with_context(|| {
+            format!("cargo narf {smoke_name}: binding parallel server :{parallel_port}")
+        })?;
     let parallel_served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     {
         let served = parallel_served.clone();
@@ -9594,8 +9927,9 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
             }
         });
     }
-    let udp_client_server = UdpSocket::bind(("127.0.0.1", udp_client_port))
-        .with_context(|| format!("xtask {smoke_name}: binding UDP server :{udp_client_port}"))?;
+    let udp_client_server = UdpSocket::bind(("127.0.0.1", udp_client_port)).with_context(|| {
+        format!("cargo narf {smoke_name}: binding UDP server :{udp_client_port}")
+    })?;
     udp_client_server.set_read_timeout(Some(Duration::from_millis(200)))?;
     let udp_server_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let udp_server_echoed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9661,7 +9995,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     cmd.stderr(Stdio::inherit());
 
     println!(
-        "xtask {smoke_name}: launching {} {} (TCP 127.0.0.1:{tcp_host_port} -> guest :{tcp_guest_port}; UDP 127.0.0.1:{udp_host_port} -> guest :{udp_guest_port})",
+        "cargo narf {smoke_name}: launching {} {} (TCP 127.0.0.1:{tcp_host_port} -> guest :{tcp_guest_port}; UDP 127.0.0.1:{udp_host_port} -> guest :{udp_guest_port})",
         qemu,
         kernel.display()
     );
@@ -9782,16 +10116,16 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         let _ = child.wait();
         let _ = reader.join();
         if let Some(p) = panic {
-            bail!("xtask {smoke_name}: kernel panic before module probe — '{p}'");
+            bail!("cargo narf {smoke_name}: kernel panic before module probe — '{p}'");
         }
         bail!(
-            "xtask {smoke_name}: e1000.ko did not reach its live datapath within {timeout_secs}s"
+            "cargo narf {smoke_name}: e1000.ko did not reach its live datapath within {timeout_secs}s"
         );
     }
     if nic == NetSmokeNic::E1000Module {
         let transcript = captured
             .lock()
-            .map_err(|_| anyhow!("xtask {smoke_name}: serial transcript state is poisoned"))?;
+            .map_err(|_| anyhow!("cargo narf {smoke_name}: serial transcript state is poisoned"))?;
         let placed_in_driver2 = transcript
             .windows(b"modules: autoloaded e1000 from lib/modules/e1000.ko in DomainId(11)".len())
             .any(|window| {
@@ -9806,9 +10140,9 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
             let _ = child.wait();
             let _ = reader.join();
             if !placed_in_driver2 {
-                bail!("xtask {smoke_name}: autoload did not confirm placement in driver2");
+                bail!("cargo narf {smoke_name}: autoload did not confirm placement in driver2");
             }
-            bail!("xtask {smoke_name}: built-in e1000 registration was not suppressed");
+            bail!("cargo narf {smoke_name}: built-in e1000 registration was not suppressed");
         }
     }
 
@@ -9819,10 +10153,10 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         let _ = child.wait();
         let _ = reader.join();
         if let Some(p) = panic {
-            bail!("xtask {smoke_name}: kernel panic before listen — '{p}'");
+            bail!("cargo narf {smoke_name}: kernel panic before listen — '{p}'");
         }
         bail!(
-            "xtask {smoke_name}: guest server did not print `netserve: listening` within {timeout_secs}s"
+            "cargo narf {smoke_name}: guest server did not print `netserve: listening` within {timeout_secs}s"
         );
     }
     println!(
@@ -9847,7 +10181,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("xtask {smoke_name}: could not connect to 127.0.0.1:{tcp_host_port} within 20s");
+            bail!("cargo narf {smoke_name}: could not connect to 127.0.0.1:{tcp_host_port} within 20s");
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
@@ -9857,7 +10191,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     if stream.write_all(payload).is_err() {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask {smoke_name}: host write failed");
+        bail!("cargo narf {smoke_name}: host write failed");
     }
     let _ = stream.flush();
     let mut got = Vec::new();
@@ -9878,13 +10212,13 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
         bail!(
-            "xtask {smoke_name}: echo mismatch — sent {:?}, got {:?}",
+            "cargo narf {smoke_name}: echo mismatch — sent {:?}, got {:?}",
             String::from_utf8_lossy(payload),
             String::from_utf8_lossy(&got)
         );
     }
     println!(
-        "xtask {smoke_name}: host received the echo ({:?})",
+        "cargo narf {smoke_name}: host received the echo ({:?})",
         String::from_utf8_lossy(&got)
     );
 
@@ -9900,13 +10234,13 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
 
     // 4. Wait until the guest has completed the TCP echo.
     if !wait_for(b"netserve-tcp-ok", timeout_secs) {
-        abort!("xtask {smoke_name}: guest did not confirm the TCP round-trip");
+        abort!("cargo narf {smoke_name}: guest did not confirm the TCP round-trip");
     }
 
     // 4a. Bulk echo: stream BULK_LEN patterned bytes in while reading the
     //     guest's echo out, then verify every echoed byte and the EOF.
     if !wait_for(b"netserve: bulk listening", timeout_secs) {
-        abort!("xtask {smoke_name}: guest bulk server did not become ready");
+        abort!("cargo narf {smoke_name}: guest bulk server did not become ready");
     }
     let bulk_start = Instant::now();
     let mut bulk = None;
@@ -9920,12 +10254,12 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         }
     }
     let Some(bulk) = bulk else {
-        abort!("xtask {smoke_name}: could not connect to the bulk port within 20s");
+        abort!("cargo narf {smoke_name}: could not connect to the bulk port within 20s");
     };
     let _ = bulk.set_read_timeout(Some(Duration::from_secs(30)));
     let mut bulk_writer = match bulk.try_clone() {
         Ok(w) => w,
-        Err(e) => abort!("xtask {smoke_name}: cloning the bulk stream: {e}"),
+        Err(e) => abort!("cargo narf {smoke_name}: cloning the bulk stream: {e}"),
     };
     let bulk_tx = std::thread::spawn(move || -> Result<(), String> {
         let mut buf = vec![0u8; 64 * 1024];
@@ -9951,55 +10285,59 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
             Ok(n) => {
                 if let Some(k) = (0..n).find(|&k| rbuf[k] != pat(echoed + k as u64, BULK_SEED)) {
                     abort!(
-                        "xtask {smoke_name}: bulk echo byte mismatch at offset {}",
+                        "cargo narf {smoke_name}: bulk echo byte mismatch at offset {}",
                         echoed + k as u64
                     );
                 }
                 echoed += n as u64;
             }
-            Err(e) => abort!("xtask {smoke_name}: bulk echo stalled after {echoed} bytes: {e}"),
+            Err(e) => {
+                abort!("cargo narf {smoke_name}: bulk echo stalled after {echoed} bytes: {e}")
+            }
         }
     }
     match bulk_tx.join() {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => abort!("xtask {smoke_name}: bulk send failed: {e}"),
-        Err(_) => abort!("xtask {smoke_name}: bulk sender panicked"),
+        Ok(Err(e)) => abort!("cargo narf {smoke_name}: bulk send failed: {e}"),
+        Err(_) => abort!("cargo narf {smoke_name}: bulk sender panicked"),
     }
     if echoed != BULK_LEN {
-        abort!("xtask {smoke_name}: bulk echo returned {echoed} of {BULK_LEN} bytes");
+        abort!("cargo narf {smoke_name}: bulk echo returned {echoed} of {BULK_LEN} bytes");
     }
     drop(bulk_reader);
     println!(
-        "xtask {smoke_name}: bulk echo verified ({BULK_LEN} bytes each way in {:.2?})",
+        "cargo narf {smoke_name}: bulk echo verified ({BULK_LEN} bytes each way in {:.2?})",
         bulk_start.elapsed()
     );
     if !wait_for(b"netserve-bulk-ok", timeout_secs) {
-        abort!("xtask {smoke_name}: guest did not confirm the bulk echo");
+        abort!("cargo narf {smoke_name}: guest did not confirm the bulk echo");
     }
 
     // 4b. The guest now downloads from the host server as a client.
     if !wait_for(b"netserve-download-ok", timeout_secs) {
-        abort!("xtask {smoke_name}: guest did not verify the {DOWNLOAD_LEN}-byte download");
+        abort!("cargo narf {smoke_name}: guest did not verify the {DOWNLOAD_LEN}-byte download");
     }
     match download_server.join() {
-        Ok(Ok(n)) => println!("xtask {smoke_name}: guest downloaded and verified {n} bytes"),
-        Ok(Err(e)) => abort!("xtask {smoke_name}: download server: {e}"),
-        Err(_) => abort!("xtask {smoke_name}: download server panicked"),
+        Ok(Ok(n)) => println!("cargo narf {smoke_name}: guest downloaded and verified {n} bytes"),
+        Ok(Err(e)) => abort!("cargo narf {smoke_name}: download server: {e}"),
+        Err(_) => abort!("cargo narf {smoke_name}: download server panicked"),
     }
 
     // 4c. Concurrent downloads: 8 then 16 streams, read by one epoll loop and
     //     by one thread per socket, then a fresh connection. The guest checks
     //     every byte, the EOFs and that no stream lags far behind the others.
     if !wait_for(b"netserve-parallel-ok", timeout_secs) {
-        abort!("xtask {smoke_name}: guest parallel downloads did not all complete");
+        abort!("cargo narf {smoke_name}: guest parallel downloads did not all complete");
     }
     let par_streams = parallel_served.load(std::sync::atomic::Ordering::Relaxed);
-    println!("xtask {smoke_name}: served {par_streams} concurrent {PARALLEL_LEN}-byte streams");
+    println!(
+        "cargo narf {smoke_name}: served {par_streams} concurrent {PARALLEL_LEN}-byte streams"
+    );
 
     if !wait_for(b"netserve: udp listening", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask {smoke_name}: guest UDP server did not become ready");
+        bail!("cargo narf {smoke_name}: guest UDP server did not become ready");
     }
 
     // 5. Round-trip a datagram through QEMU's independent UDP forwarding
@@ -10009,19 +10347,19 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("xtask {smoke_name}: could not bind the host UDP socket: {e}");
+            bail!("cargo narf {smoke_name}: could not bind the host UDP socket: {e}");
         }
     };
     if let Err(e) = udp.set_read_timeout(Some(Duration::from_secs(20))) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask {smoke_name}: could not set the host UDP timeout: {e}");
+        bail!("cargo narf {smoke_name}: could not set the host UDP timeout: {e}");
     }
     let udp_payload = b"hello-narf-udp\n";
     if let Err(e) = udp.send_to(udp_payload, ("127.0.0.1", udp_host_port)) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask {smoke_name}: host UDP send failed: {e}");
+        bail!("cargo narf {smoke_name}: host UDP send failed: {e}");
     }
     let mut udp_buf = [0u8; 256];
     let (udp_len, _) = match udp.recv_from(&mut udp_buf) {
@@ -10029,20 +10367,20 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("xtask {smoke_name}: host UDP receive failed: {e}");
+            bail!("cargo narf {smoke_name}: host UDP receive failed: {e}");
         }
     };
     if &udp_buf[..udp_len] != udp_payload {
         let _ = child.kill();
         let _ = child.wait();
         bail!(
-            "xtask {smoke_name}: UDP echo mismatch — sent {:?}, got {:?}",
+            "cargo narf {smoke_name}: UDP echo mismatch — sent {:?}, got {:?}",
             String::from_utf8_lossy(udp_payload),
             String::from_utf8_lossy(&udp_buf[..udp_len])
         );
     }
     println!(
-        "xtask {smoke_name}: host received the UDP echo ({:?})",
+        "cargo narf {smoke_name}: host received the UDP echo ({:?})",
         String::from_utf8_lossy(&udp_buf[..udp_len])
     );
 
@@ -10054,14 +10392,16 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         let mut out = vec![0u8; len];
         fill(&mut out, 0, 0x10 + i as u8);
         if let Err(e) = udp.send_to(&out, ("127.0.0.1", udp_host_port)) {
-            abort!("xtask {smoke_name}: host UDP send of {len} bytes failed: {e}");
+            abort!("cargo narf {smoke_name}: host UDP send of {len} bytes failed: {e}");
         }
         match udp.recv_from(&mut big) {
             Ok((n, _)) if n == len && big[..n] == out[..] => {}
             Ok((n, _)) => {
-                abort!("xtask {smoke_name}: UDP {len}-byte echo came back as {n} wrong bytes")
+                abort!("cargo narf {smoke_name}: UDP {len}-byte echo came back as {n} wrong bytes")
             }
-            Err(e) => abort!("xtask {smoke_name}: no echo for the {len}-byte UDP datagram: {e}"),
+            Err(e) => {
+                abort!("cargo narf {smoke_name}: no echo for the {len}-byte UDP datagram: {e}")
+            }
         }
     }
     // 5b. A back-to-back burst; the echoes may reorder but none may be lost
@@ -10071,7 +10411,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         fill(&mut out, 0, 0x80);
         out[..2].copy_from_slice(&(i as u16).to_be_bytes());
         if let Err(e) = udp.send_to(&out, ("127.0.0.1", udp_host_port)) {
-            abort!("xtask {smoke_name}: host UDP burst send {i} failed: {e}");
+            abort!("cargo narf {smoke_name}: host UDP burst send {i} failed: {e}");
         }
     }
     let mut seen = [false; UDP_BURST];
@@ -10079,7 +10419,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         let n = match udp.recv_from(&mut big) {
             Ok((n, _)) => n,
             Err(e) => abort!(
-                "xtask {smoke_name}: UDP burst lost datagrams ({} of {UDP_BURST} echoed): {e}",
+                "cargo narf {smoke_name}: UDP burst lost datagrams ({} of {UDP_BURST} echoed): {e}",
                 seen.iter().filter(|s| **s).count()
             ),
         };
@@ -10088,32 +10428,32 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         fill(&mut want, 0, 0x80);
         if n != UDP_BURST_LEN || idx >= UDP_BURST || seen[idx] || big[2..n] != want[2..] {
             abort!(
-                "xtask {smoke_name}: UDP burst echo corrupt or duplicated (len {n}, index {idx})"
+                "cargo narf {smoke_name}: UDP burst echo corrupt or duplicated (len {n}, index {idx})"
             );
         }
         seen[idx] = true;
     }
     println!(
-        "xtask {smoke_name}: UDP sizes {UDP_SIZES:?} and a {UDP_BURST}-datagram burst echoed intact"
+        "cargo narf {smoke_name}: UDP sizes {UDP_SIZES:?} and a {UDP_BURST}-datagram burst echoed intact"
     );
     if !wait_for(b"netserve-udp-ok", timeout_secs) {
-        abort!("xtask {smoke_name}: guest did not confirm the UDP round-trip");
+        abort!("cargo narf {smoke_name}: guest did not confirm the UDP round-trip");
     }
 
     // 5c. The guest's connect()ed UDP client round-trips with our server.
     if !wait_for(b"netserve-udp-client-ok", timeout_secs) {
-        abort!("xtask {smoke_name}: guest connected-UDP client did not complete");
+        abort!("cargo narf {smoke_name}: guest connected-UDP client did not complete");
     }
     let echoed_client = udp_server_echoed.load(std::sync::atomic::Ordering::Relaxed);
     if echoed_client < UDP_CLIENT_ROUNDS {
-        abort!("xtask {smoke_name}: host UDP server echoed {echoed_client} of {UDP_CLIENT_ROUNDS}");
+        abort!("cargo narf {smoke_name}: host UDP server echoed {echoed_client} of {UDP_CLIENT_ROUNDS}");
     }
 
     // 5d. UDP GSO: the guest sent UDP_GSO_SEGS x UDP_GSO_LEN bytes in ONE
     // sendmsg with a UDP_SEGMENT cmsg; this host must have received them as
     // UDP_GSO_SEGS separate UDP_GSO_LEN-byte datagrams, each exactly once.
     if !wait_for(b"netserve-udp-gso-ok", timeout_secs) {
-        abort!("xtask {smoke_name}: guest UDP GSO phase did not complete");
+        abort!("cargo narf {smoke_name}: guest UDP GSO phase did not complete");
     }
     let gso_seen: Vec<Vec<u8>> = udp_server_seen
         .lock()
@@ -10124,7 +10464,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         .any(|d| d.len() == UDP_GSO_SEGS * UDP_GSO_LEN)
     {
         abort!(
-            "xtask {smoke_name}: host received the GSO batch as one {}-byte datagram",
+            "cargo narf {smoke_name}: host received the GSO batch as one {}-byte datagram",
             UDP_GSO_SEGS * UDP_GSO_LEN
         );
     }
@@ -10135,13 +10475,13 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         let copies = gso_seen.iter().filter(|d| **d == want).count();
         if copies != 1 {
             abort!(
-                "xtask {smoke_name}: host received GSO segment {i} {copies} times (want exactly 1)"
+                "cargo narf {smoke_name}: host received GSO segment {i} {copies} times (want exactly 1)"
             );
         }
         gso_sizes.push(want.len());
     }
     println!(
-        "xtask {smoke_name}: UDP GSO sendmsg arrived as {} separate datagrams of {:?} bytes",
+        "cargo narf {smoke_name}: UDP GSO sendmsg arrived as {} separate datagrams of {:?} bytes",
         gso_sizes.len(),
         gso_sizes
     );
@@ -10150,7 +10490,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     if !wait_for(b"netserve-dns-ok", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask {smoke_name}: guest DNS query did not return a valid answer");
+        bail!("cargo narf {smoke_name}: guest DNS query did not return a valid answer");
     }
 
     // 6a. connect(2): non-blocking (EINPROGRESS → POLLOUT → SO_ERROR), refused
@@ -10159,7 +10499,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     if !wait_for(b"netserve-nbconnect-ok", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask {smoke_name}: guest connect(2) state checks failed");
+        bail!("cargo narf {smoke_name}: guest connect(2) state checks failed");
     }
 
     // 6b. The TCP robustness phases, in the guest's order.
@@ -10170,7 +10510,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
                 why.extend(p.failures());
             }
             abort!(
-                "xtask {smoke_name}: guest did not print `{token}` within {secs}s; host-side: {why:?}"
+                "cargo narf {smoke_name}: guest did not print `{token}` within {secs}s; host-side: {why:?}"
             );
         }
         let mut why = robust_report.failures();
@@ -10179,7 +10519,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         }
         if !why.is_empty() {
             abort!(
-                "xtask {smoke_name}: robustness phase failed host-side after `{token}`: {why:?}"
+                "cargo narf {smoke_name}: robustness phase failed host-side after `{token}`: {why:?}"
             );
         }
     }
@@ -10192,7 +10532,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     if !wait_for(b"netserve-ok", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask {smoke_name}: guest did not print `netserve-ok` within {timeout_secs}s");
+        bail!("cargo narf {smoke_name}: guest did not print `netserve-ok` within {timeout_secs}s");
     }
 
     udp_server_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -10205,7 +10545,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         NetSmokeNic::Igb => "built-in igb (QEMU 82576)",
     };
     println!(
-        "xtask {smoke_name}: ok — live TCP (echo, {BULK_LEN}-byte bulk echo, {DOWNLOAD_LEN}-byte client download), UDP (sizes incl. fragmented, burst, connected client, GSO) and DNS passed over {transport}"
+        "cargo narf {smoke_name}: ok — live TCP (echo, {BULK_LEN}-byte bulk echo, {DOWNLOAD_LEN}-byte client download), UDP (sizes incl. fragmented, burst, connected client, GSO) and DNS passed over {transport}"
     );
     Ok(())
 }
@@ -10220,7 +10560,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
     use std::time::{Duration, Instant};
 
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask redis-smoke: only x86_64 is wired (boot-init is x86_64-only)");
+        bail!("cargo narf smoke redis-smoke: only x86_64 is wired (boot-init is x86_64-only)");
     }
 
     let host_port: u16 = 16379;
@@ -10267,7 +10607,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
     cmd.stderr(Stdio::piped());
 
     println!(
-        "xtask redis-smoke: launching {} {} (hostfwd 127.0.0.1:{host_port} -> guest :{guest_port})",
+        "cargo narf smoke redis-smoke: launching {} {} (hostfwd 127.0.0.1:{host_port} -> guest :{guest_port})",
         qemu,
         kernel.display()
     );
@@ -10356,10 +10696,10 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
         let _ = child.wait();
         let _ = reader.join();
         if let Some(p) = panic {
-            bail!("xtask redis-smoke: kernel panic before redis ready — '{p}'");
+            bail!("cargo narf smoke redis-smoke: kernel panic before redis ready — '{p}'");
         }
         bail!(
-            "xtask redis-smoke: redis-server did not print `Ready to accept connections` within {timeout_secs}s"
+            "cargo narf smoke redis-smoke: redis-server did not print `Ready to accept connections` within {timeout_secs}s"
         );
     }
     println!(
@@ -10383,7 +10723,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("xtask redis-smoke: could not connect to 127.0.0.1:{host_port} within 20s");
+            bail!("cargo narf smoke redis-smoke: could not connect to 127.0.0.1:{host_port} within 20s");
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
@@ -10498,28 +10838,36 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
         (vec!["DBSIZE"], posint()),
     ];
 
-    let mut reader_io = std::io::BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|e| fail(&mut child, format!("xtask redis-smoke: clone stream: {e}")))?,
-    );
+    let mut reader_io = std::io::BufReader::new(stream.try_clone().map_err(|e| {
+        fail(
+            &mut child,
+            format!("cargo narf smoke redis-smoke: clone stream: {e}"),
+        )
+    })?);
 
     let total = battery.len();
     for (i, (args, check)) in battery.iter().enumerate() {
         if stream.write_all(&resp(args)).is_err() {
             return Err(fail(
                 &mut child,
-                format!("xtask redis-smoke: host write failed for {:?}", args),
+                format!(
+                    "cargo narf smoke redis-smoke: host write failed for {:?}",
+                    args
+                ),
             ));
         }
         let _ = stream.flush();
-        let reply = read_one_resp(&mut reader_io)
-            .map_err(|e| anyhow!("xtask redis-smoke: read reply for {:?}: {e}", args))?;
+        let reply = read_one_resp(&mut reader_io).map_err(|e| {
+            anyhow!(
+                "cargo narf smoke redis-smoke: read reply for {:?}: {e}",
+                args
+            )
+        })?;
         if !check(&reply) {
             let _ = child.kill();
             let _ = child.wait();
             bail!(
-                "xtask redis-smoke: command {:?} got unexpected reply: {:?}",
+                "cargo narf smoke redis-smoke: command {:?} got unexpected reply: {:?}",
                 args,
                 String::from_utf8_lossy(&reply)
             );
@@ -10593,7 +10941,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
                 return Err(fail(
                     &mut child,
                     format!(
-                        "xtask redis-smoke: stress write failed after {ops} ops ({:?})",
+                        "cargo narf smoke redis-smoke: stress write failed after {ops} ops ({:?})",
                         refs
                     ),
                 ));
@@ -10603,7 +10951,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
                 fail(
                     &mut child,
                     format!(
-                        "xtask redis-smoke: STALL/read failure after {ops} ops on {:?}: {e} \
+                        "cargo narf smoke redis-smoke: STALL/read failure after {ops} ops on {:?}: {e} \
                          (sustained-load regression)",
                         refs
                     ),
@@ -10613,7 +10961,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
                 return Err(fail(
                     &mut child,
                     format!(
-                        "xtask redis-smoke: stress error reply after {ops} ops on {:?}: {:?}",
+                        "cargo narf smoke redis-smoke: stress error reply after {ops} ops on {:?}: {:?}",
                         refs,
                         String::from_utf8_lossy(&reply)
                     ),
@@ -10638,21 +10986,21 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
         let pong = read_one_resp(&mut reader_io).map_err(|e| {
             fail(
                 &mut child,
-                format!("xtask redis-smoke: post-stress PING failed: {e}"),
+                format!("cargo narf smoke redis-smoke: post-stress PING failed: {e}"),
             )
         })?;
         if !pong.windows(5).any(|w| w == b"+PONG") {
             return Err(fail(
                 &mut child,
                 format!(
-                    "xtask redis-smoke: post-stress PING unexpected: {:?}",
+                    "cargo narf smoke redis-smoke: post-stress PING unexpected: {:?}",
                     String::from_utf8_lossy(&pong)
                 ),
             ));
         }
         let el = start.elapsed().as_secs_f64().max(0.001);
         println!(
-            "xtask redis-smoke: stress ok — {ops} sustained round-trips in {:.0}s \
+            "cargo narf smoke redis-smoke: stress ok — {ops} sustained round-trips in {:.0}s \
              ({:.0} ops/s), 0 errors, server live after",
             el,
             ops as f64 / el
@@ -10663,13 +11011,13 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
     let _ = child.wait();
     let _ = reader.join();
     println!(
-        "xtask redis-smoke: ok — unmodified redis-server served {total} commands \
+        "cargo narf smoke redis-smoke: ok — unmodified redis-server served {total} commands \
          (strings/lists/hashes/sets/zsets/expiry/server) to an off-box client over virtio-net"
     );
     Ok(())
 }
 
-// ── redis-bench shared helpers ──────────────────────────────────────
+// ── redis shared helpers ──────────────────────────────────────
 
 /// RESP-encode a command as an array of bulk strings.
 fn resp_encode(parts: &[&str]) -> Vec<u8> {
@@ -11000,11 +11348,11 @@ fn boot_narf_redis(
 /// loader + an `/init` that brings up virtio-net and execs redis) and
 /// boot a stock Linux kernel under QEMU with the same hostfwd. Returns
 /// the QEMU child and a connected host `TcpStream`. This is the
-/// Resolve the QEMU accelerator for the perf benches (redis-bench, mt-echo).
+/// Resolve the QEMU accelerator for the perf benches (redis, mt-echo).
 /// `XTASK_QEMU_ACCEL` overrides verbatim; otherwise default to `kvm` when
 /// `/dev/kvm` is usable. Bare QEMU does NOT auto-select KVM, and TCG inflates
 /// the guest ~10x AND distorts the profile — running a perf bench under TCG
-/// silently invalidates it (the redis-bench TCG-vs-KVM confound). Returns `None`
+/// silently invalidates it (the redis TCG-vs-KVM confound). Returns `None`
 /// only when no accelerator should be injected (no /dev/kvm, no override), i.e.
 /// QEMU's TCG default. `label()` renders the same choice for the banner.
 fn bench_accel() -> Option<String> {
@@ -11397,7 +11745,7 @@ fn boot_linux_mt_echo(guest_port: u16, server_threads: usize) -> Result<std::pro
 
     let mem = std::env::var("NARF_QEMU_MEM_MB").unwrap_or_else(|_| "2048".into());
     let cpu = std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into());
-    // Match NARF's vCPU count (mt-echo-bench defaults NARF_QEMU_SMP to
+    // Match NARF's vCPU count (mt-echo defaults NARF_QEMU_SMP to
     // server_threads+1 too) so the comparison is on equal cores.
     let smp = std::env::var("NARF_QEMU_SMP").unwrap_or_else(|_| format!("{}", server_threads + 1));
     // ≥2 for a multi_queue tap (else QEMU can't open it single-queue).
@@ -11499,7 +11847,7 @@ fn boot_linux_mt_echo(guest_port: u16, server_threads: usize) -> Result<std::pro
 
 /// Off-box redis performance benchmark — see [`Cmd::RedisBench`].
 /// Run the host's `redis-benchmark` against a guest's hostfwd port with
-/// real concurrency (`-c` clients). Unlike the single-connection xtask
+/// real concurrency (`-c` clients). Unlike the single-connection cargo narf
 /// workload (which idles the guest between synchronous batches → RTT-
 /// bound), N concurrent clients keep the guest CPU-saturated, so this
 /// measures COMPUTE-bound throughput. Gated on `XTASK_REDIS_BENCHMARK`.
@@ -11798,7 +12146,7 @@ fn boot_narf_mt_echo(
 
 fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask mt-echo-bench: only x86_64 is wired");
+        bail!("cargo narf bench mt-echo: only x86_64 is wired");
     }
     let guest_port = 7000u16;
     let host_port = 17000u16;
@@ -11838,7 +12186,7 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
     };
 
     println!(
-        "xtask mt-echo-bench: {conns} conns / {client_threads} client thread(s), \
+        "cargo narf bench mt-echo: {conns} conns / {client_threads} client thread(s), \
          {secs}s measured, backend={backend}, queues={queues}, accel={accel}\n\
          server thread sweep: {sweep:?}\n\
          NOTE: real multi-queue/RSS scaling needs tap (XTASK_QEMU_TAP=<if>) + \
@@ -11954,7 +12302,7 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
 
 fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask redis-bench: only x86_64 is wired");
+        bail!("cargo narf bench redis: only x86_64 is wired");
     }
     let ops: usize = std::env::var("XTASK_REDIS_BENCH_OPS")
         .ok()
@@ -11971,7 +12319,7 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
 
     let accel = bench_accel_label();
     println!(
-        "xtask redis-bench: workload = {ops} pipelined ops (depth {pipeline}) SET + GET, \
+        "cargo narf bench redis: workload = {ops} pipelined ops (depth {pipeline}) SET + GET, \
          {lat_ops} sequential PINGs for latency\n\
          both guests: 1 vCPU, accel={accel}, -cpu max, same virtio-net + hostfwd\n"
     );
@@ -12444,13 +12792,13 @@ fn parse_perf_metrics(serial: &str) -> Vec<PerfMetric> {
 /// [`stress_bench_cmd`], driving `/perfbench.sh` instead of `/sweep.sh`.
 fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask perf-bench: only x86_64 is wired");
+        bail!("cargo narf bench perf: only x86_64 is wired");
     }
     let root = workspace_root()?;
     let disk = virtio_blk_image_path();
     if !disk.exists() {
         bail!(
-            "xtask perf-bench: no rootfs at {} — run \
+            "cargo narf bench perf: no rootfs at {} — run \
              `sh verification/data/musl-demo/REGEN_stress_rootfs.sh` first",
             disk.display()
         );
@@ -12477,7 +12825,7 @@ fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
     }
 
     println!(
-        "xtask perf-bench: perf-bench sweep, {threads}-thread scale\n\
+        "cargo narf bench perf: perf sweep, {threads}-thread scale\n\
          both guests: same rootfs (snapshot), same -cpu/-smp/RAM/topology, accel={}\n",
         bench_accel_label()
     );
@@ -12489,7 +12837,7 @@ fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
     let narf = parse_perf_metrics(&narf_serial);
     if narf.is_empty() {
         bail!(
-            "xtask perf-bench: no `PBMETRIC` rows in the NARF transcript — \
+            "cargo narf bench perf: no `PBMETRIC` rows in the NARF transcript — \
              is /perfbench.sh in the rootfs? (re-run REGEN_stress_rootfs.sh)"
         );
     }
@@ -12645,13 +12993,13 @@ fn boot_narf_guest_script(
 /// See [`Cmd::StressBench`].
 fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask stress-bench: only x86_64 is wired");
+        bail!("cargo narf bench stress: only x86_64 is wired");
     }
     let root = workspace_root()?;
     let disk = virtio_blk_image_path();
     if !disk.exists() {
         bail!(
-            "xtask stress-bench: no stress rootfs at {} — run \
+            "cargo narf bench stress: no stress rootfs at {} — run \
              `sh verification/data/musl-demo/REGEN_stress_rootfs.sh` first",
             disk.display()
         );
@@ -12675,7 +13023,7 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     }
 
     println!(
-        "xtask stress-bench: sequential sweep, {workers} workers/stressor, {dur} each\n\
+        "cargo narf bench stress: sequential sweep, {workers} workers/stressor, {dur} each\n\
          both guests: same rootfs (snapshot), same -cpu/-smp/RAM/topology, accel={}\n",
         bench_accel_label()
     );
@@ -12691,7 +13039,7 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     let narf = parse_stress_metrics(&narf_serial);
     if narf.is_empty() {
         bail!(
-            "xtask stress-bench: no `stress-ng: metrc:` rows in the NARF transcript — \
+            "cargo narf bench stress: no `stress-ng: metrc:` rows in the NARF transcript — \
              is /sweep.sh in the rootfs? (re-run REGEN_stress_rootfs.sh)"
         );
     }
@@ -12858,7 +13206,7 @@ fn run_interactive_multi(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     println!(
-        "xtask musl-demo: launching {} {} (single boot for {} commands)",
+        "cargo narf smoke musl-demo: launching {} {} (single boot for {} commands)",
         qemu,
         kernel.display(),
         cases.len()
@@ -13015,14 +13363,14 @@ fn run_interactive_multi(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader_handle.join();
-                bail!("xtask musl-demo: did not see login prompt within {prompt_secs}s");
+                bail!("cargo narf smoke musl-demo: did not see login prompt within {prompt_secs}s");
             }
             Wait::Died(why) => {
                 let _ = child.kill();
                 let status = child.wait().ok();
                 let _ = reader_handle.join();
                 bail!(
-                    "xtask musl-demo: {why} before login prompt ({})",
+                    "cargo narf smoke musl-demo: {why} before login prompt ({})",
                     status
                         .map(|status| status.to_string())
                         .unwrap_or_else(|| "QEMU status unavailable".into())
@@ -13050,7 +13398,7 @@ fn run_interactive_multi(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader_handle.join();
-                bail!("xtask musl-demo: stdin write failed during login");
+                bail!("cargo narf smoke musl-demo: stdin write failed during login");
             }
             let _ = stdin.flush();
             std::thread::sleep(Duration::from_millis(20));
@@ -13064,14 +13412,14 @@ fn run_interactive_multi(
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader_handle.join();
-            bail!("xtask musl-demo: did not see `narf> ` prompt within {prompt_secs}s");
+            bail!("cargo narf smoke musl-demo: did not see `narf> ` prompt within {prompt_secs}s");
         }
         Wait::Died(why) => {
             let _ = child.kill();
             let status = child.wait().ok();
             let _ = reader_handle.join();
             bail!(
-                "xtask musl-demo: {why} before first prompt ({})",
+                "cargo narf smoke musl-demo: {why} before first prompt ({})",
                 status
                     .map(|status| status.to_string())
                     .unwrap_or_else(|| "QEMU status unavailable".into())
@@ -13129,7 +13477,7 @@ fn run_interactive_multi(
         match wait_for(pre, expect.as_bytes(), true, echo_to) {
             Wait::Found(_) => {
                 passed += 1;
-                println!("xtask musl-demo: ok — `{cmdline}` saw `{expect}`");
+                println!("cargo narf smoke musl-demo: ok — `{cmdline}` saw `{expect}`");
             }
             Wait::TimedOut => {
                 failed += 1;
@@ -13235,7 +13583,7 @@ fn validate_test_subsystems(subsystems: &str) -> Result<()> {
 }
 
 /// Remove features whose contract is to select the in-kernel test runner.
-/// `xtask test` reuses the caller's feature list for its second, production
+/// `cargo narf test test` reuses the caller's feature list for its second, production
 /// boot-smoke phase, where retaining any of these would transitively re-enable
 /// `kernel-test` and make the kernel run tests instead of real init.
 fn without_kernel_test_features(features: &str) -> String {
@@ -13256,8 +13604,8 @@ fn without_kernel_test_features(features: &str) -> String {
 #[cfg(test)]
 mod kernel_test_feature_tests {
     use super::{
-        legacy_qemu_netdev_from, validate_test_subsystems, without_kernel_test_features, Cli, Cmd,
-        VIRTIO_MODETEST_CASE,
+        legacy_qemu_netdev_from, validate_test_subsystems, without_kernel_test_features, Cli,
+        TestCmd, TopCommand, VIRTIO_MODETEST_CASE,
     };
     use clap::Parser;
 
@@ -13277,15 +13625,16 @@ mod kernel_test_feature_tests {
 
     #[test]
     fn kernel_test_only_is_opt_in() {
-        let cli = Cli::try_parse_from(["xtask", "test"]).expect("default test CLI must parse");
-        let Cmd::Test(args) = cli.cmd else {
+        let cli = Cli::try_parse_from(["cargo-narf", "test", "test"])
+            .expect("default test CLI must parse");
+        let TopCommand::Test(TestCmd::Test(args)) = cli.command else {
             panic!("test subcommand parsed as another variant");
         };
         assert!(!args.kernel_tests_only);
 
-        let cli = Cli::try_parse_from(["xtask", "test", "--kernel-tests-only"])
+        let cli = Cli::try_parse_from(["cargo-narf", "test", "test", "--kernel-tests-only"])
             .expect("kernel-tests-only CLI must parse");
-        let Cmd::Test(args) = cli.cmd else {
+        let TopCommand::Test(TestCmd::Test(args)) = cli.command else {
             panic!("test subcommand parsed as another variant");
         };
         assert!(args.kernel_tests_only);
@@ -13313,7 +13662,7 @@ mod kernel_test_feature_tests {
         // suffices: hand it a real minimal ELF fixture instead (the
         // x86_64 arm never opens the file, so the same path works there).
         let (_kernel_temp, kernel) =
-            crate::aarch64_initrd::tests::write_minimal_kernel_elf(&[(0x4008_0000, 0x1000)]);
+            crate::dev::aarch64_initrd::tests::write_minimal_kernel_elf(&[(0x4008_0000, 0x1000)]);
         for arch in [Arch::X86_64, Arch::Aarch64] {
             for profile in [
                 HwProfile::Full,
@@ -14236,7 +14585,7 @@ mod firmware_import_tests {
 
 /// Bulk-import firmware blobs. Walks the source tree, decompresses
 /// any `.zst` entries, wraps each with the NARF trailer, and writes
-/// the result under the output directory for `xtask image` staging.
+/// the result under the output directory for `cargo narf build image` staging.
 fn import_firmware_cmd(args: &ImportFirmwareArgs) -> Result<()> {
     let source = PathBuf::from(&args.source);
     if !source.is_dir() {
@@ -14482,7 +14831,7 @@ fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
     std::fs::write(&out_path, &blob)
         .with_context(|| format!("writing wrapped blob to {}", out_path.display()))?;
     println!(
-        "xtask pack-firmware: wrote {} ({} payload bytes + {} trailer bytes = {} total)",
+        "cargo narf firmware pack-firmware: wrote {} ({} payload bytes + {} trailer bytes = {} total)",
         out_path.display(),
         payload.len(),
         blob.len() - payload.len(),
@@ -14589,7 +14938,11 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         let elf = build_user_binary(&root, &crate_dir, name, &ld_name)?;
         let bytes = std::fs::read(&elf)
             .with_context(|| format!("reading {} ELF at {}", name, elf.display()))?;
-        println!("xtask image: coreutil {} = {} bytes", name, bytes.len());
+        println!(
+            "cargo narf build image: coreutil {} = {} bytes",
+            name,
+            bytes.len()
+        );
         coreutil_bytes.push((format!("bin/{}", name), bytes));
     }
 
@@ -14628,7 +14981,7 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         match std::fs::read(&host_path) {
             Ok(b) => {
                 println!(
-                    "xtask image: ld-musl staged from {} ({} bytes) → lib/ld-musl-x86_64.so.1",
+                    "cargo narf build image: ld-musl staged from {} ({} bytes) → lib/ld-musl-x86_64.so.1",
                     host_path,
                     b.len()
                 );
@@ -14636,7 +14989,7 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
             }
             Err(e) => {
                 println!(
-                    "xtask image: no ld-musl at {} ({}); skipping dynamic-linker stage",
+                    "cargo narf build image: no ld-musl at {} ({}); skipping dynamic-linker stage",
                     host_path, e
                 );
                 None
@@ -14652,7 +15005,7 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     // exercise the loader's parsing and layout but never the compiler's
     // actual relocation output, which is where the two can disagree.
     //
-    // Built here rather than as a separate step so `cargo xtask test` needs
+    // Built here rather than as a separate step so `cargo narf test test` needs
     // no extra invocation. A failure to build it is NOT fatal: the module is
     // a test fixture, not part of the kernel, and the smoke that loads it
     // skips cleanly when the file is absent.
@@ -14673,18 +15026,18 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
             Ok(path) => match std::fs::read(&path) {
                 Ok(b) => {
                     println!(
-                        "xtask image: test module staged ({} bytes) → lib/modules/narf_test_module.ko",
+                        "cargo narf build image: test module staged ({} bytes) → lib/modules/narf_test_module.ko",
                         b.len()
                     );
                     Some(b)
                 }
                 Err(e) => {
-                    println!("xtask image: test module unreadable ({e}); skipping");
+                    println!("cargo narf build image: test module unreadable ({e}); skipping");
                     None
                 }
             },
             Err(e) => {
-                println!("xtask image: test module build failed ({e}); skipping");
+                println!("cargo narf build image: test module build failed ({e}); skipping");
                 None
             }
         }
@@ -14748,18 +15101,18 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         }
     }
     println!(
-        "xtask image: initramfs firmware: {} entries ({})",
+        "cargo narf build image: initramfs firmware: {} entries ({})",
         fw_initramfs.len(),
         fmt_mib(initramfs_fw_bytes),
     );
     println!(
-        "xtask image: rootfs firmware:    {} entries ({})",
+        "cargo narf build image: rootfs firmware:    {} entries ({})",
         fw_rootfs.len(),
         fmt_mib(rootfs_fw_bytes),
     );
     let coreutil_total: usize = coreutil_bytes.iter().map(|(_, b)| b.len()).sum();
     println!(
-        "xtask image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes, coreutils={} bytes [{}])",
+        "cargo narf build image: bundled initramfs ({} bytes; init={} bytes, shell={} bytes, coreutils={} bytes [{}])",
         cpio.len(),
         init_bytes.len(),
         shell_bytes.len(),
@@ -14855,13 +15208,13 @@ interface_resolution: 1024x768
             }
         } else {
             eprintln!(
-                "xtask image: skipping `limine bios-install` (binary not on $PATH); \
+                "cargo narf build image: skipping `limine bios-install` (binary not on $PATH); \
                  ISO will still UEFI-boot, but legacy BIOS boot will be disabled."
             );
         }
     }
 
-    println!("xtask image: wrote {}", iso.display());
+    println!("cargo narf build image: wrote {}", iso.display());
     let ovmf = ovmf_code_path();
     println!(
         "  test under QEMU UEFI:  qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file={} -machine q35 -cpu max -m 1024M \\\n\
@@ -14951,7 +15304,7 @@ fn grub_image_cmd(grub: &GrubImageArgs) -> Result<()> {
     ] {
         if !path.exists() {
             bail!(
-                "{} missing at {}; `xtask image` did not stage the UEFI handoff assets",
+                "{} missing at {}; `cargo narf build image` did not stage the UEFI handoff assets",
                 label,
                 path.display()
             );
@@ -15039,7 +15392,7 @@ menuentry "NARF" {
         eprintln!("warning: `grub-file` not on $PATH; skipped the host GRUB header check");
     }
 
-    println!("xtask grub-image: wrote {}", bundle.display());
+    println!("cargo narf build grub-image: wrote {}", bundle.display());
     println!("  kernel:    {}", grub_kernel.display());
     println!("  initramfs: {}", boot_dir.join("initramfs.cpio").display());
     println!("  ESP:       {}", esp_dir.display());
@@ -15102,13 +15455,13 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     match build_userspace_disk_image(&root, &nvme_image_path()) {
         Ok(()) => {
             println!(
-                "xtask iso-boot: FAT16 disk image populated with /init + /shell at {}",
+                "cargo narf build iso-boot: FAT16 disk image populated with /init + /shell at {}",
                 nvme_image_path().display()
             );
         }
         Err(e) => {
             println!(
-                "xtask iso-boot: skipping disk-userspace populate ({e}); falling back to single-file FAT12 fixture"
+                "cargo narf build iso-boot: skipping disk-userspace populate ({e}); falling back to single-file FAT12 fixture"
             );
             // Force the legacy hand-crafted image to be regenerated.
             let _ = nvme_image_path();
@@ -15220,7 +15573,7 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     cmd.args(vfio_args);
 
     println!(
-        "xtask iso-boot: launching qemu-system-x86_64 with ISO {}",
+        "cargo narf build iso-boot: launching qemu-system-x86_64 with ISO {}",
         iso.display()
     );
 
@@ -15317,7 +15670,7 @@ fn build_aarch64_uefi_image(args: &BuildArgs) -> Result<PathBuf> {
     let composition = composition_plan(args, &root)?;
     if composition.modules().next().is_some() {
         bail!(
-            "aarch64 UEFI images do not yet carry an initramfs; use built-in components or `cargo xtask run --arch aarch64 --composition ...`"
+            "aarch64 UEFI images do not yet carry an initramfs; use built-in components or `cargo narf run run --arch aarch64 --composition ...`"
         );
     }
     let out_dir = cargo_build(args, &root)?;
@@ -15460,7 +15813,7 @@ fn build_aarch64_uefi_image(args: &BuildArgs) -> Result<PathBuf> {
         "copying aarch64 kernel",
     )?;
     println!(
-        "xtask image: wrote {} ({} MiB ESP)",
+        "cargo narf build image: wrote {} ({} MiB ESP)",
         image.display(),
         image_bytes / MIB
     );
@@ -15539,7 +15892,7 @@ fn aarch64_uefi_boot_cmd(args: &BuildArgs) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     println!(
-        "xtask iso-boot: launching qemu-system-aarch64 with ESP {}",
+        "cargo narf build iso-boot: launching qemu-system-aarch64 with ESP {}",
         image.display()
     );
     let child = command
@@ -15588,7 +15941,7 @@ fn disk_write_cmd(args: &DiskWriteArgs) -> Result<()> {
     let iso = PathBuf::from(&iso_path);
     if !iso.exists() {
         bail!(
-            "ISO not found at {}; run `cargo xtask image` first",
+            "ISO not found at {}; run `cargo narf build image` first",
             iso.display()
         );
     }
@@ -15828,11 +16181,11 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     // without the kernel + init binaries to populate it with.
     let root = workspace_root().context("locating workspace root")?;
     let target_dir = root.join("target");
-    // Pull every artifact from the `cargo xtask image` staging dir —
+    // Pull every artifact from the `cargo narf build image` staging dir —
     // that's where the kernel + initramfs + Limine binaries exist in
     // a known layout, regardless of debug-vs-release and
-    // bootloader-path quirks. `xtask image` builds without launching
-    // QEMU; `xtask iso-boot` would also produce these (it calls
+    // bootloader-path quirks. `cargo narf build image` builds without launching
+    // QEMU; `cargo narf build iso-boot` would also produce these (it calls
     // image internally) but it boots the ISO afterwards which we
     // don't want for a disk-burn workflow.
     let stage = target_dir.join("iso-x86_64");
@@ -15848,7 +16201,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     ] {
         if !p.exists() {
             bail!(
-                "{} not found at {}; run `cargo xtask image` first to \
+                "{} not found at {}; run `cargo narf build image` first to \
                  build the kernel + initramfs + Limine staging",
                 label,
                 p.display()
@@ -16126,7 +16479,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
     cp_root(&shell_elf, &mnt_fs.join("bin/sh"))?;
 
     // ── 5c. Copy staged rootfs firmware onto the root partition ──
-    // `xtask image` populated target/rootfs-firmware-staging/lib/firmware/
+    // `cargo narf build image` populated target/rootfs-firmware-staging/lib/firmware/
     // with every blob NOT matched by --initramfs-firmware globs.
     // Copy that whole tree onto the root partition so the kernel's
     // `firmware-scan-rootfs` initcall finds it at /lib/firmware/ after
@@ -16186,7 +16539,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
             fw_bytes as f64 / (1024.0 * 1024.0),
         );
     } else {
-        println!("  root partition: no staged rootfs firmware (run `cargo xtask image` first, or no firmware imported)");
+        println!("  root partition: no staged rootfs firmware (run `cargo narf build image` first, or no firmware imported)");
     }
 
     // ── 6. Unmount + sync ────────────────────────────────────────
@@ -16335,16 +16688,46 @@ fn sha256_first_n(dev: &str, n: u64) -> Result<String> {
     Ok(s.split_whitespace().next().unwrap_or("").to_string())
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.cmd {
+/// Cargo may pass the external subcommand name as argv[1]. Accept
+/// `cargo narf <group> <command>` and direct `cargo-narf <group>
+/// <command>` invocation shapes. The deprecated `cargo xtask` alias
+/// passes `__xtask_shim` as argv[1]; that prints the deprecation notice
+/// once and forwards to the new frontend.
+fn normalized_args() -> Vec<OsString> {
+    let mut args: Vec<OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|arg| arg == "narf") {
+        args.remove(1);
+    }
+    if args.get(1).is_some_and(|arg| arg == "__xtask_shim") {
+        eprintln!(
+            "cargo xtask is deprecated; use `cargo narf` instead \
+             (e.g. `cargo narf build build` for the old `cargo xtask build`)"
+        );
+        args.remove(1);
+    }
+    args
+}
+
+/// Binary entry point (called from `crate::main`): parse the nested
+/// `cargo narf` CLI, dispatch `pkg` to the packaging frontend, and
+/// everything else through the flat internal `Cmd` dispatch in `run_flat`.
+pub(crate) fn main() -> Result<()> {
+    let cli = Cli::parse_from(normalized_args());
+    match cli.command {
+        TopCommand::Pkg(cmd) => crate::pkg::run(cli.repo.as_deref(), cmd),
+        other => run_flat(to_flat(other)),
+    }
+}
+
+fn run_flat(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::HostTest => host_test_cmd(),
         Cmd::Passthrough(args) => passthrough_cmd(&args),
         Cmd::Relocs(args) => {
             let table = if args.patch {
                 let t = relocs::patch(&args.elf)?;
                 println!(
-                    "xtask relocs: patched {} sites into {}",
+                    "cargo narf build relocs: patched {} sites into {}",
                     t.total(),
                     args.elf.display()
                 );
@@ -16355,7 +16738,7 @@ fn main() -> Result<()> {
             if let Some(out) = args.out.as_ref() {
                 std::fs::write(out, table.encode())?;
                 println!(
-                    "xtask relocs: wrote {} bytes to {}",
+                    "cargo narf build relocs: wrote {} bytes to {}",
                     table.encoded_len(),
                     out.display()
                 );
@@ -16369,7 +16752,7 @@ fn main() -> Result<()> {
                 let bytes = std::fs::read(&args.elf)?;
                 let (_, stats, ex) = kallsyms::generate(&bytes)?;
                 println!(
-                    "xtask kallsyms: {} symbols, {} names ({} truncated), table {} bytes",
+                    "cargo narf build kallsyms: {} symbols, {} names ({} truncated), table {} bytes",
                     stats.symbols, stats.names, ex.truncated, stats.total
                 );
             }
@@ -16403,7 +16786,7 @@ fn main() -> Result<()> {
         Cmd::AttachModuleSignature(args) => {
             sign_module(&args.module, &args.signature, &args.public_key)?;
             println!(
-                "xtask attach-module-signature: attached verified Ed25519 trailer to {}",
+                "cargo narf build attach-module-signature: attached verified Ed25519 trailer to {}",
                 args.module.display()
             );
             Ok(())
@@ -16527,11 +16910,11 @@ fn main() -> Result<()> {
             // Default-on boot-init for parity with `iso-boot`. An
             // image without it boots to the async-demo loop and
             // never spawns /init or /shell, which is almost never
-            // what someone running `xtask image` wants — they're
+            // what someone running `cargo narf build image` wants — they're
             // building an ISO to actually run.
             //
             // Default-on firmware-allow-unsigned so bring-up blobs
-            // packed via `xtask pack-firmware` load. Production
+            // packed via `cargo narf firmware pack-firmware` load. Production
             // signed-key infrastructure isn't wired yet; until it
             // is, the bring-up arc needs unsigned acceptance.
             ensure_feature(&mut args.features, "boot-init");
@@ -16558,7 +16941,7 @@ fn main() -> Result<()> {
         Cmd::DiskWrite(args) => disk_write_cmd(&args),
         Cmd::DiskWritePartitioned(args) => disk_write_partitioned_cmd(&args),
         Cmd::UsbImage(mut args) => {
-            // Same kernel configuration as `xtask image`.
+            // Same kernel configuration as `cargo narf build image`.
             ensure_feature(&mut args.build.features, "boot-init");
             ensure_feature(&mut args.build.features, "firmware-allow-unsigned");
             usb_image::usb_image_cmd(&args)
@@ -16619,15 +17002,13 @@ fn host_test_cmd() -> Result<()> {
                 // token algorithm. Both are pure and host-testable.
                 "-p",
                 "narf-kallsyms",
-                // xtask itself: `bench_stats` implements the §8 protocol, and
+                // cargo-narf itself: `bench_stats` implements the §8 protocol, and
                 // its distribution functions are anchored on closed forms
                 // (Cauchy at ν=1, the ν=2 closed form, the normal at ±1.96).
                 // A wrong tail there does not fail loudly — it silently
-                // invalidates every perf conclusion drawn through it.
-                "-p",
-                "xtask",
-                // Developer-facing native package frontend. Its os-release
-                // detection and command construction must remain host-safe.
+                // invalidates every perf conclusion drawn through it. Its
+                // os-release detection and command construction (the `pkg`
+                // group) must remain host-safe.
                 "-p",
                 "cargo-narf",
                 // The loadable-module runtime: its executor, locks and
@@ -16751,7 +17132,7 @@ mod dma_addr_source_guard {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
-            .expect("xtask manifest dir has a workspace grandparent")
+            .expect("cargo narf manifest dir has a workspace grandparent")
             .to_path_buf();
         let mut files = Vec::new();
         rust_sources(&root, &mut files);
@@ -16852,7 +17233,7 @@ mod dma_addr_source_guard {
 }
 
 #[derive(Parser, Debug)]
-struct PassthroughArgs {
+pub(crate) struct PassthroughArgs {
     /// A device to pass through, as `03:00.0` or `0000:03:00.0`. Repeat for
     /// each function — an AMD GPU is normally two, the GPU and its HD-audio
     /// function.
@@ -16860,7 +17241,7 @@ struct PassthroughArgs {
     devices: Vec<passthrough::Bdf>,
 }
 
-/// `cargo xtask passthrough -d 03:00.0 -d 03:00.1`
+/// `cargo narf run passthrough -d 03:00.0 -d 03:00.1`
 fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
     use passthrough::{explain, note, preflight, qemu_fragment};
 
@@ -16894,7 +17275,7 @@ fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
         .collect::<Vec<_>>()
         .join(" ");
     println!(
-        "\nhost is ready. Launch with:\n\n  cargo xtask run --arch=x86_64 {cli_devices}\n\n\
+        "\nhost is ready. Launch with:\n\n  cargo narf run run --arch=x86_64 {cli_devices}\n\n\
          Equivalent QEMU arguments: {}\n",
         qemu_fragment(&args.devices)
     );

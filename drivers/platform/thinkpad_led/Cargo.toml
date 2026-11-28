@@ -10,7 +10,7 @@
 #     registers from its `Stage::Device` initcall. The builtin backend
 #     calls the moved setters (AML evaluation + state cache) directly.
 #   * `module`: built to a relocatable `.ko` via
-#     `cargo xtask build-module --package narf-drivers-platform-thinkpad-led \
+#     `cargo narf build build-module --package narf-drivers-platform-thinkpad-led \
 #        --no-default-features --features module`. The kernel crates drop
 #     from the graph; the driver registers through the `narf_register_acpi_driver`
 #     / `narf_led_register` KSYMTAB exports (tracker #2448, KABI design §4).
@@ -40,7 +40,7 @@ repository.workspace   = true
 name = "narf_drivers_platform_thinkpad_led"
 path = "src/lib.rs"
 # rlib for the built-in facade dependency and the kernel link. The `.ko` build
-# overrides this to `staticlib` via `cargo xtask build-module`.
+# overrides this to `staticlib` via `cargo narf build build-module`.
 
 [features]
 default = ["builtin"]
@@ -52,7 +52,7 @@ builtin = [
     "dep:narf-lib",
 ]
 # Module: NO kernel crates. The only undefined symbols in the `.ko` are the
-# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
+# C-ABI KSYMTAB exports; `cargo narf build build-module`'s `nm -u` gate enforces that.
 module = []
 # Enables the AML fixture tests (narf_aml test-only namespace helpers).
 # The fixture tests also require the builtin build (default feature).

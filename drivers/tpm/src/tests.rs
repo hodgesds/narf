@@ -1,6 +1,6 @@
 //! Smoke tests for narf-drivers-tpm.
 //!
-//! Tests are collected by `narf-kernel-test` and run by the xtask
+//! Tests are collected by `narf-kernel-test` and run by the cargo narf
 //! smoke harness. No async needed — all tests are synchronous
 //! codec / mock-register exercises.
 

@@ -667,7 +667,7 @@ fn smoke_microcode_vendor_detect() -> TestResult {
     use crate::x86_64::microcode;
     match microcode::vendor() {
         microcode::Vendor::Intel | microcode::Vendor::Amd => TestResult::Pass,
-        // Under QEMU TCG with `-cpu max` (how `xtask test` and GHA run — no
+        // Under QEMU TCG with `-cpu max` (how `cargo narf test test` and GHA run — no
         // KVM), the guest gets no real CPUID vendor identity, so the microcode
         // vendor probe reads back Unknown. It only reports a true
         // AuthenticAMD/GenuineIntel with `-accel kvm -cpu host` (host-CPU

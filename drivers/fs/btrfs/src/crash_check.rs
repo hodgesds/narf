@@ -1,5 +1,5 @@
 //! `narf.btrfs_crash=write|verify`: the guest half of
-//! `cargo xtask btrfs-crash-smoke`.
+//! `cargo narf smoke btrfs-crash-smoke`.
 //!
 //! `write` mounts the first btrfs device, writes a patterned file, `fsync`s
 //! it, prints [`COMMITTED`], and then keeps writing uncommitted noise until
@@ -9,7 +9,7 @@
 //! abrupt stop with I/O in flight.
 //!
 //! Test scaffolding that writes to a disk. It runs only when the command line
-//! asks for it, and xtask passes that flag only with its own disposable image.
+//! asks for it, and cargo narf passes that flag only with its own disposable image.
 
 use alloc::sync::Arc;
 use core::fmt::Write as _;

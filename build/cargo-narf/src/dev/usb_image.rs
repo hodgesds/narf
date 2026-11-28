@@ -1,8 +1,8 @@
-//! `cargo xtask usb-image` — a UEFI USB-stick image with the persistent
+//! `cargo narf disk usb-image` — a UEFI USB-stick image with the persistent
 //! boot log enabled.
 //!
 //! The image is a plain file (MBR, one FAT32 ESP partition) built without
-//! root privileges from the `xtask image` staging tree:
+//! root privileges from the `cargo narf build image` staging tree:
 //!
 //! ```text
 //! /EFI/BOOT/BOOTX64.EFI        Limine
@@ -17,7 +17,7 @@
 //! `narf.disks=boot-only` (default; `--allow-all-disks` drops it) makes every
 //! other disk read-only at the block layer and excludes it from automatic
 //! mounts, so the machine's internal disks are never written.
-//! Write the file to a stick with `cargo xtask disk-write --iso <image>`.
+//! Write the file to a stick with `cargo narf disk disk-write --iso <image>`.
 //!
 //! `--qemu` boots a copy of the image under OVMF as a USB mass-storage
 //! device (the bare-metal path: xHCI → MSC → FAT), once ending with a shell
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use crate::{image_cmd, ovmf_code_path, run_checked, which, workspace_root, BuildArgs};
+use crate::dev::{image_cmd, ovmf_code_path, run_checked, which, workspace_root, BuildArgs};
 
 /// Byte offset of the ESP inside the image (1 MiB alignment).
 const ESP_OFFSET: u64 = 1024 * 1024;
@@ -163,7 +163,7 @@ fn staged_cmdline(stage: &Path) -> String {
 }
 
 pub(crate) fn usb_image_cmd(args: &UsbImageArgs) -> Result<()> {
-    if !matches!(args.build.arch, crate::Arch::X86_64) {
+    if !matches!(args.build.arch, crate::dev::Arch::X86_64) {
         bail!("usb-image currently builds the x86_64 UEFI stick only");
     }
     for tool in ["sfdisk", "mformat", "mmd", "mcopy"] {
@@ -192,7 +192,7 @@ pub(crate) fn usb_image_cmd(args: &UsbImageArgs) -> Result<()> {
     let bootx64 = stage.join("EFI/BOOT/BOOTX64.EFI");
     for p in [&kernel, &initramfs, &bootx64] {
         if !p.is_file() {
-            bail!("{} missing after `xtask image`", p.display());
+            bail!("{} missing after `cargo narf build image`", p.display());
         }
     }
     let payload: u64 = [&kernel, &initramfs, &bootx64]
@@ -310,7 +310,7 @@ default_entry: 1
         mcopy(&out, &tmp.join("NARFLOG.ID"), "/NARFLOG.ID")?;
     }
 
-    println!("xtask usb-image: wrote {}", out.display());
+    println!("cargo narf disk usb-image: wrote {}", out.display());
     println!("  kernel cmdline: {cmdline}");
     match &token {
         Some(token) => println!("  persistent boot log: on (token {token})"),
@@ -323,7 +323,7 @@ default_entry: 1
     }
     println!(
         "  write it (USB only, never the NVMe): \
-         cargo xtask disk-write --iso {} --device /dev/sdX --fast-wipe",
+         cargo narf disk disk-write --iso {} --device /dev/sdX --fast-wipe",
         out.display()
     );
 
@@ -369,7 +369,7 @@ fn qemu_check(
         // Pristine copy, so a change can be localised afterwards.
         std::fs::copy(&decoy.path, pristine_path(&decoy.path))?;
         println!(
-            "xtask usb-image --qemu: decoy {} {} sha256 {hash}",
+            "cargo narf disk usb-image --qemu: decoy {} {} sha256 {hash}",
             decoy.kind.label(),
             decoy.path.display()
         );
@@ -402,7 +402,7 @@ fn qemu_check(
             );
         }
         println!(
-            "xtask usb-image --qemu: narf-boot-{n}.log OK ({} bytes, {ending:?} path)",
+            "cargo narf disk usb-image --qemu: narf-boot-{n}.log OK ({} bytes, {ending:?} path)",
             text.len()
         );
         logs.push(log);
@@ -427,7 +427,7 @@ fn qemu_check(
             "CHANGED"
         };
         println!(
-            "xtask usb-image --qemu: decoy {} sha256 before {hash} after {after}: {verdict}",
+            "cargo narf disk usb-image --qemu: decoy {} sha256 before {hash} after {after}: {verdict}",
             decoy.name()
         );
         if &after != hash {
@@ -454,7 +454,7 @@ fn qemu_check(
             );
         }
         println!(
-            "xtask usb-image --qemu: decoy internal disks unchanged under narf.disks=boot-only"
+            "cargo narf disk usb-image --qemu: decoy internal disks unchanged under narf.disks=boot-only"
         );
     } else {
         // The `--allow-all-disks` control: without the gate NARF's own
@@ -464,7 +464,7 @@ fn qemu_check(
             bail!("--allow-all-disks control changed no decoy: the decoy check is blind");
         }
         println!(
-            "xtask usb-image --qemu: control run changed {} decoy(s): {}",
+            "cargo narf disk usb-image --qemu: control run changed {} decoy(s): {}",
             changed.len(),
             changed.join(", ")
         );
@@ -849,7 +849,7 @@ fn boot_once(image: &Path, decoys: &[Decoy], ending: Ending, usb_keyboard: bool)
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    println!("xtask usb-image --qemu: booting the stick image ({ending:?} ending)");
+    println!("cargo narf disk usb-image --qemu: booting the stick image ({ending:?} ending)");
     let mut child = cmd.spawn().context("spawning qemu-system-x86_64")?;
     let stdout = child.stdout.take().unwrap();
     let mut stdin = child.stdin.take();
@@ -878,7 +878,7 @@ fn boot_once(image: &Path, decoys: &[Decoy], ending: Ending, usb_keyboard: bool)
     loop {
         if let Some(status) = child.try_wait()? {
             ok |= matches!(ending, Ending::Reboot) && sent;
-            println!("xtask usb-image --qemu: QEMU exited ({status})");
+            println!("cargo narf disk usb-image --qemu: QEMU exited ({status})");
             break;
         }
         if Instant::now() > deadline {

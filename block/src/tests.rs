@@ -487,7 +487,7 @@ kernel_test_in!("block/opal", smoke_opal_token_constants);
 fn smoke_block_registry_uniform_read() -> TestResult {
     // Walk crate::block_devices() and read sector 0 from each. The smoke
     // exercises the unified BlockDeviceSync surface across NVMe /
-    // virtio-blk-pci / AHCI. cargo xtask test runs without the boot-time
+    // virtio-blk-pci / AHCI. cargo narf test test runs without the boot-time
     // pci-probe-all path that normally binds those drivers, so register
     // synthetic stubs under the canonical names before checking.
     use crate::block_devices;

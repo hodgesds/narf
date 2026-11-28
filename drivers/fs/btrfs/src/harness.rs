@@ -6,7 +6,7 @@
 //! flags are not enough of a guard on their own: a mistyped or copied command
 //! line on a bare-metal host whose root is btrfs would point them at real
 //! data. So each workload also requires that the filesystem it is about to
-//! touch carries a harness marker — an fsid only xtask's own fixture builders
+//! touch carries a harness marker — an fsid only cargo narf's own fixture builders
 //! produce — and the smokes, which never run on the root, refuse the
 //! filesystem the command line names as `root=UUID=` outright.
 
@@ -15,12 +15,12 @@ use alloc::sync::Arc;
 
 use narf_block::BlockDeviceSync;
 
-/// fsid prefix of every whole-system harness image xtask builds
+/// fsid prefix of every whole-system harness image cargo narf builds
 /// (`btrfs-rootrw-interop`, `cachyos-root-smoke`, `cachyos-gate`, the
 /// snapshot fixture): `c4c405ee-0000-4a11-9e57-…`.
 pub const HARNESS_FSID_PREFIX: &str = "c4c405ee-0000-4a11-9e57-";
 
-/// fsids of the committed `testdata/` fixtures xtask serves on nvme0 to the
+/// fsids of the committed `testdata/` fixtures cargo narf serves on nvme0 to the
 /// boot-time smokes (`fixture-bitmap`, `fixture-bgt`, `fixture-tall`).
 pub const FIXTURE_FSIDS: &[&str] = &[
     "78fa8eab-8bfc-4252-b88b-aa552ffa3e01",
@@ -28,7 +28,7 @@ pub const FIXTURE_FSIDS: &[&str] = &[
     "4f3892c4-269c-4188-90c1-4a459a979daf",
 ];
 
-/// Whether `fsid` (canonical lowercase) is one of xtask's disposable images.
+/// Whether `fsid` (canonical lowercase) is one of cargo narf's disposable images.
 pub fn is_harness_fsid(fsid: &str) -> bool {
     fsid.starts_with(HARNESS_FSID_PREFIX) || FIXTURE_FSIDS.contains(&fsid)
 }
@@ -67,7 +67,7 @@ pub fn check_disposable(
     on_root: bool,
 ) -> Result<(), &'static str> {
     if !is_harness_fsid(fsid) {
-        return Err("filesystem carries no xtask harness marker (fsid)");
+        return Err("filesystem carries no cargo narf harness marker (fsid)");
     }
     if !on_root && root_uuid.is_some_and(|root| root.eq_ignore_ascii_case(fsid)) {
         return Err("filesystem is the root=UUID= named on the command line");

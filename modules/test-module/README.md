@@ -10,7 +10,7 @@ kernel rather than bundling kernel crates of its own.
 ## What it demonstrates
 
 The module compiles to a relocatable object — NARF's equivalent of a
-`.ko`, produced by `cargo xtask build-module`. It shows every element of
+`.ko`, produced by `cargo narf build build-module`. It shows every element of
 the authoring shape: the `.modinfo` key/value lines emitted into a
 dedicated ELF section (the way Linux's `MODULE_INFO` macros do), the
 lifecycle C-ABI entry points the loader invokes after relocations are

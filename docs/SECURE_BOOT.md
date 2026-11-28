@@ -75,7 +75,7 @@ packaging/build-release.sh \
 For aarch64, first build the UEFI image/payload, then package its loader:
 
 ```sh
-cargo xtask image --arch=aarch64
+cargo narf build image --arch=aarch64
 packaging/build-release.sh \
   --version 0.5.0 \
   --arch aarch64 \

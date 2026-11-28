@@ -778,7 +778,7 @@ kernel_test_in!("drivers/usb/msc", smoke_msc_stale_adapter_generation_gate);
 // registry-level bind/activity stamping the fix adds. The
 // transfer-path half of the fix (MSC funnels resume before the
 // CBW and feed on completion) is exercised end-to-end only on
-// real hub hardware; QEMU's xtask topology attaches storage to
+// real hub hardware; QEMU's cargo narf topology attaches storage to
 // root ports, where hub_port is None and the hooks are no-ops.
 //
 // The fix-round fixtures at the end of this section pin the

@@ -32,24 +32,24 @@ each dependency is in [Running on Linux](RUNNING_ON_LINUX.md#1-prerequisites).
 The x86_64 native EFI path builds one file with its kernel and initramfs:
 
 ```sh
-cargo xtask efi-image
-cargo xtask efi-image --run
-cargo xtask efi-image --smoke
+cargo narf build efi-image
+cargo narf build efi-image --run
+cargo narf build efi-image --smoke
 ```
 
 See [native EFI installation and running](NATIVE_UEFI.md) for prerequisites,
 custom archives/command lines, ESP installation, and the distinction from the
 existing Limine-backed media commands; native x86 packages use EFI images.
 
-The `xtask` command is the supported front end. Optimized (`release`) builds
+The `cargo narf` command is the supported front end. Optimized (`release`) builds
 are the default; pass `--debug` when debug assertions or debug symbols matter.
 
 ```sh
-cargo xtask build --arch=x86_64
-cargo xtask build --arch=aarch64
-cargo xtask run --arch=x86_64
-cargo xtask test --arch=x86_64
-cargo xtask test --arch=aarch64
+cargo narf build build --arch=x86_64
+cargo narf build build --arch=aarch64
+cargo narf run run --arch=x86_64
+cargo narf test test --arch=x86_64
+cargo narf test test --arch=aarch64
 ```
 
 Use `--features a,b`, `--hw-profile full|minimal|virtio-only|legacy-only`, and
@@ -58,16 +58,16 @@ interactive Linux userspace and network/application smokes are currently
 x86_64-only:
 
 ```sh
-cargo xtask run-interactive --arch=x86_64 \
+cargo narf run run-interactive --arch=x86_64 \
   --cmd "echo hello world" --expect "hello world"
-cargo xtask net-smoke --arch=x86_64
-cargo xtask e1000-module-net-smoke --arch=x86_64
+cargo narf smoke net-smoke --arch=x86_64
+cargo narf smoke e1000-module-net-smoke --arch=x86_64
 ```
 
 For a faster focused cycle, kernel test names are prefix-filtered:
 
 ```sh
-cargo xtask test --arch=x86_64 --subsystem net --kernel-tests-only
+cargo narf test test --arch=x86_64 --subsystem net --kernel-tests-only
 ```
 
 Before review, run the checks relevant to the changed crates and both kernel
@@ -76,14 +76,14 @@ targets. The repository-wide baseline is:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo xtask host-test
-cargo xtask test --arch=x86_64
-cargo xtask test --arch=aarch64
+cargo narf test host-test
+cargo narf test test --arch=x86_64
+cargo narf test test --arch=aarch64
 git diff --check
 ```
 
 Some target-specific crates need `--target x86_64-unknown-none` or
-`aarch64-unknown-none` when invoked directly. Prefer `cargo xtask` for kernel
+`aarch64-unknown-none` when invoked directly. Prefer `cargo narf` for kernel
 builds and tests because it supplies the build-std flags and linker settings.
 
 ## Navigate the workspace
@@ -91,7 +91,7 @@ builds and tests because it supplies the build-std flags and linker settings.
 The root `Cargo.toml` is a single workspace. Kernel mechanism is split into
 small `no_std` crates: `frame/`, `memory/`, `scheduler/`, `capabilities/`,
 `ipc/`, `io/`, `net/`, `filesystem/`, `userspace/`, and the driver crates under
-`drivers/`. `build/xtask/` owns build and QEMU orchestration. Consult the repo
+`drivers/`. `build/cargo-narf/` owns build and QEMU orchestration. Consult the repo
 map in [AGENTS.md](../AGENTS.md) and the current progress in
 [STATUS.md](../STATUS.md).
 
@@ -123,8 +123,8 @@ Keep the integrator's manifest beside the external crates and pass it to
 `build`, `run`, `test`, or `image`:
 
 ```sh
-cargo xtask build --composition ../my-kernel/narf.toml
-cargo xtask run --composition ../my-kernel/narf.toml
+cargo narf build build --composition ../my-kernel/narf.toml
+cargo narf run run --composition ../my-kernel/narf.toml
 ```
 
 A `mode = "builtin"` component joins the frame's Cargo graph through a
@@ -163,7 +163,7 @@ domain chosen by the loader:
 
 ```sh
 cat /sys/kernel/abi_hash
-cargo xtask build-module --package narf-drivers-net-e1000 \
+cargo narf build build-module --package narf-drivers-net-e1000 \
   --no-default-features --features module \
   --arch x86_64 --kernel-abi 0x1f3a90c2
 ```
@@ -185,7 +185,7 @@ ABI-stamped image in the initramfs and boot with, for example,
 placements. Autoload runs after
 KABI/trust initialization and before `Stage::Device`; the e1000 facade's
 `e1000-module-only` profile suppresses its built-in PCI registration for this
-fixture. `cargo xtask e1000-module-net-smoke --arch=x86_64` is the executable
+fixture. `cargo narf smoke e1000-module-net-smoke --arch=x86_64` is the executable
 reference for that complete path.
 
 The module manifest declares identity, ABI hash, dependencies, required
@@ -215,11 +215,11 @@ automation; crates that inherit `workspace.package.version` are left alone.
 
 ```sh
 # Show the current opt-in set and its publication-tag names.
-cargo xtask crate-release list
+cargo narf ci crate-release list
 
 # Prepare and locally package-check one crate. Repeat --package as needed.
-cargo xtask crate-release bump --package narf-tpm
-cargo xtask crate-release check --package narf-tpm
+cargo narf ci crate-release bump --package narf-tpm
+cargo narf ci crate-release check --package narf-tpm
 ```
 
 The bump command also supplies registry versions for local path dependencies.

@@ -22,7 +22,7 @@
 # GitHub-hosted runners); local root invocations are unaffected.
 #
 #   sh verification/data/musl-demo/REGEN_stress_rootfs.sh
-#   cargo xtask run-interactive --kasan --cmd chroot_run --expect STRESS-DONE
+#   cargo narf run run-interactive --kasan --cmd chroot_run --expect STRESS-DONE
 #
 # Output: target/narf-vblk.img (virtio_blk_image_path()). NOT committed.
 # Requires: curl, tar, mke2fs (e2fsprogs >= 1.43 for `-d`), network to the
@@ -141,7 +141,7 @@ echo "STRESS-DONE"
 PROBE
 chmod +x "$RD/probe.sh"
 
-# The pure-performance sweep `cargo xtask stress-bench` drives — on NARF via
+# The pure-performance sweep `cargo narf bench stress` drives — on NARF via
 # `chroot_run /bin/busybox sh /sweep.sh <dur> <workers> [list]`, and on a stock
 # Linux kernel booted against this SAME image, so the per-stressor bogo-ops/s
 # comparison uses identical userspace bits. Unlike /probe.sh this is a
@@ -174,7 +174,7 @@ echo "SWEEP-DONE"
 SWEEP
 chmod +x "$RD/sweep.sh"
 
-# The `cargo xtask perf-bench` sweep drives the upstream `perf bench`
+# The `cargo narf bench perf` sweep drives the upstream `perf bench`
 # micro-benchmarks — on NARF via `chroot_run /bin/busybox sh /perfbench.sh
 # <threads>`, and on a stock Linux kernel booted against this SAME image.
 # These exercise the scheduler/IPC fast paths (wakeup, context switch,

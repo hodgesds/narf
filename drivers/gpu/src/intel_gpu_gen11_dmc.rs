@@ -36,7 +36,7 @@
 //! handler on TGL/ADL-S only).
 //!
 //! Blobs are never vendored into git (repo rule: firmware is
-//! imported at build time via `cargo xtask import-firmware` /
+//! imported at build time via `cargo narf firmware import-firmware` /
 //! `--initramfs-firmware` and lives in the registry). This module
 //! only names the registry key.
 

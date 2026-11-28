@@ -383,7 +383,7 @@ pub unsafe fn idle_halt_then_disable() {
 /// End the kernel run with an exit code. Under QEMU this triggers a clean
 /// VM exit; on real hardware / other VMMs it falls back to `halt_forever`.
 /// `code == 0` is "normal success"; non-zero is "failure" — verification
-/// harnesses map these to `cargo xtask test` pass/fail.
+/// harnesses map these to `cargo narf test test` pass/fail.
 ///
 /// # Safety
 /// Per-arch backend may touch a platform-specific exit device; see

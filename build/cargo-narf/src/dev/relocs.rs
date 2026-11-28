@@ -152,7 +152,7 @@ pub const RELOC_MAGIC: u32 = 0x4B41_534C; // "KASL"
 /// Refuse an ELF that still exposes ordinary linker relocation sections.
 ///
 /// NARF's loadable `.kaslr_relocs` section is deliberately *not* an ELF REL or
-/// RELA section: `xtask relocs --patch` has already materialized the compact
+/// RELA section: `cargo narf build relocs --patch` has already materialized the compact
 /// table consumed by the early boot stub. GRUB's Multiboot2 ELF loader rejects
 /// ELFs carrying the original linker REL/RELA sections, even when they are not
 /// loadable, so the direct-GRUB compatibility artifact removes them only after
@@ -450,7 +450,7 @@ pub fn extract(elf_path: &Path) -> Result<RelocTable> {
         bail!("no absolute relocations found — was the kernel linked with --emit-relocs?");
     }
     eprintln!(
-        "xtask relocs: {} abs64 + {} abs32s + {} cross-half pcrel + {} low abs64 \
+        "cargo narf build relocs: {} abs64 + {} abs32s + {} cross-half pcrel + {} low abs64 \
          = {} sites ({} bytes), {skipped_low} low + {skipped_static} non-moving left alone",
         table.abs64.len(),
         table.abs32s.len(),

@@ -637,7 +637,7 @@ allocator recursion under the pool lock. `alloc_hugepage_2m` /
 | Acceptance | Status | Notes |
 |---|---|---|
 | #1 HW boot, no panic | ✅ | Boots on Zen2 laptop |
-| #2 cargo xtask test passes | ✅ | 1402 / 0 / 34 |
+| #2 cargo narf test test passes | ✅ | 1402 / 0 / 34 |
 | #3 Memory accounting | 🟡 | `frame_stats` + `slab::stats` exist; per-domain accounting waits on Stage 4 |
 | #4 Steady-state under churn | ✅ | `smoke_slab_steady_state_under_churn` (1000-iter × 5 classes) + `_large_alloc_` |
 | #5 Sleepable assert | ✅ | `AllocContext::Sleepable.debug_assert_consistent()` panics from IRQ ctx; `slab::alloc` asserts on entry |
@@ -650,7 +650,7 @@ allocator recursion under the pool lock. `alloc_hugepage_2m` /
 
 1. Real-hardware boot completes through `tick 4` + halting, no alloc
    panic, with workloads that today exhaust 128 MiB.
-2. `cargo xtask test` passes — same coverage, no regressions.
+2. `cargo narf test test` passes — same coverage, no regressions.
 3. Memory accounting: `frame_stats()` and a new `slab_stats()` give
    accurate live-allocation counts; per-domain accounting populated.
 4. Reclaim works: a 1000-iteration alloc/free loop holds steady at

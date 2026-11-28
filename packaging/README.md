@@ -1,8 +1,8 @@
 # NARF release packaging
 
 The default x86_64 payload is a self-contained native NARF EFI application.
-`cargo xtask efi-image` builds it without Limine; `cargo narf package` and
-`cargo narf install` use that same build path. See [native EFI](../docs/NATIVE_UEFI.md)
+`cargo narf build efi-image` builds it without Limine; `cargo narf pkg package` and
+`cargo narf pkg install` use that same build path. See [native EFI](../docs/NATIVE_UEFI.md)
 for source builds, firmware selection, encrypted root, and manual installation.
 
 Packages own `/boot/narf-kernel-<version>` (including the legacy-BIOS GRUB
@@ -109,8 +109,8 @@ subcommand:
 
 ```sh
 cargo install --path build/cargo-narf
-cargo narf detect
-cargo narf package --version 0.5.0 --formats auto
+cargo narf pkg detect
+cargo narf pkg package --version 0.5.0 --formats auto
 ```
 
 `auto` reads `/etc/os-release`. The wrapper locates the checkout and calls the
@@ -121,11 +121,11 @@ For a local installation, build one native artifact and delegate installation
 to the host package manager:
 
 ```sh
-cargo narf install --version 0.5.0
+cargo narf pkg install --version 0.5.0
 # Inspect the final privileged command without executing it:
-cargo narf install --version 0.5.0 --dry-run
+cargo narf pkg install --version 0.5.0 --dry-run
 # Embed an installed-root policy in the image being packaged:
-cargo narf package --version 0.5.0 --formats tar \
+cargo narf pkg package --version 0.5.0 --formats tar \
   --cmdline 'root=UUID=YOUR-ROOT-UUID narf.disks=root-ro'
 ```
 
@@ -145,15 +145,15 @@ Build every format available on the current host:
 
 ```sh
 packaging/build-release.sh --version 0.5.0 --formats all
-cargo narf package --version 0.5.0 --formats all
+cargo narf pkg package --version 0.5.0 --formats all
 ```
 
 For aarch64, `--arch aarch64` builds and binds NARF's own UEFI loader. An
 already-built loader can be supplied explicitly:
 
 ```sh
-cargo xtask image --arch=aarch64
-cargo narf package --version 0.5.0 --arch aarch64 --formats all \
+cargo narf build image --arch=aarch64
+cargo narf pkg package --version 0.5.0 --arch aarch64 --formats all \
   --uefi-loader target/narf-uefi-aarch64/narf.efi
 ```
 
@@ -173,7 +173,7 @@ line or firmware archive cannot be inferred from the new embedded policy.
 
 Distributions may pass `--secure-boot-key` and `--secure-boot-cert`; the builder
 signs with `sbsign` and verifies the result with `sbverify`. Both arguments are
-also available through `cargo narf package` and `cargo narf install`. Keys are
+also available through `cargo narf pkg package` and `cargo narf pkg install`. Keys are
 inputs only and are never copied into staging or release assets.
 
 To package an existing complete image without compiling:
@@ -211,8 +211,8 @@ Workspace-inherited versions are intentionally ignored. Prepare one or more
 point releases locally with:
 
 ```sh
-cargo xtask crate-release bump --package narf-tpm --package narf-i3c
-cargo xtask crate-release check --package narf-tpm --package narf-i3c
+cargo narf ci crate-release bump --package narf-tpm --package narf-i3c
+cargo narf ci crate-release check --package narf-tpm --package narf-i3c
 ```
 
 Use `--set narf-tpm=0.2.0` when an exact non-patch version is required. The

@@ -414,7 +414,7 @@ fn drive_all(
 }
 
 /// The bytes of `nvme0n<nsid>` at `lba`, saved so a writing smoke can put
-/// them back: the kernel-test disk is the btrfs image xtask verifies with
+/// them back: the kernel-test disk is the btrfs image cargo narf verifies with
 /// `btrfs check` after the run.
 struct SavedRange {
     nsid: u32,

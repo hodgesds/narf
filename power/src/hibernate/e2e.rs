@@ -1,4 +1,4 @@
-//! `narf.hibernate_e2e=`: the guest half of `cargo xtask hibernate-e2e`
+//! `narf.hibernate_e2e=`: the guest half of `cargo narf smoke hibernate-e2e`
 //! (S4 lane 9).
 //!
 //! - `hibernate` (first boot): once the image file's directory sits on a

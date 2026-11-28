@@ -13,7 +13,7 @@
 # SCM_RIGHTS + sealed-memfd transport, and a realtime data thread.
 #
 # Six stages, strongest last. Exactly one verdict line lands on the console;
-# `cargo xtask systemd-pid1` keys its success/failure markers to it. Keep the
+# `cargo narf run systemd-pid1` keys its success/failure markers to it. Keep the
 # prefix stable.
 #
 #   udev     — the sound cards reached udev's database with the properties

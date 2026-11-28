@@ -19,7 +19,7 @@ run_record() {
     NARF_QEMU_CPU=host \
     XTASK_RI_PROMPT_TIMEOUT_SECS=180 \
     XTASK_RI_ECHO_TIMEOUT_SECS=300 \
-    cargo xtask run-interactive \
+    cargo narf run run-interactive \
         --cmd "busybox chroot /mnt sh -c 'rm -f perf.data; perf record ${mode} -e cycles -- sleep 1 && test -s perf.data && echo ${record_marker}'" \
         --expect "$record_marker"
 
@@ -29,7 +29,7 @@ run_record() {
     NARF_QEMU_CPU=host \
     XTASK_RI_PROMPT_TIMEOUT_SECS=180 \
     XTASK_RI_ECHO_TIMEOUT_SECS=300 \
-    cargo xtask run-interactive \
+    cargo narf run run-interactive \
         --cmd "busybox chroot /mnt sh -c 'PERF_PAGER=cat perf report --stdio >/dev/null 2>&1 && echo ROK'" \
         --expect "ROK"
 }

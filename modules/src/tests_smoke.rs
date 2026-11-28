@@ -1,6 +1,6 @@
 //! Module-loader smoke tests.
 //!
-//! These run under `cargo xtask test`'s in-tree QEMU smoke suite.
+//! These run under `cargo narf test test`'s in-tree QEMU smoke suite.
 //! They synthesize minimal Elf64 byte sequences in memory so we can
 //! exercise the parser, the relocator, the manifest, the symbol
 //! table, the lifecycle state machine, and the /proc + /sys

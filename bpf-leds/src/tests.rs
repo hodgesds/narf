@@ -1,6 +1,6 @@
 //! In-kernel smoke for the `narf_led_submit` kfunc.
 //!
-//! Registers under `bpf/leds` (so `xtask test --subsystem bpf` prefix-matches).
+//! Registers under `bpf/leds` (so `cargo narf test test --subsystem bpf` prefix-matches).
 //! Loads a real BPF program that calls the kfunc and proves the whole path:
 //! the kfunc is resolvable cross-crate (its `narf.kfuncs` entry survived the
 //! link), the program's call enqueues a command, and the LED engine worker's

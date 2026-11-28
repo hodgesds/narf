@@ -487,7 +487,7 @@ local timer, IPIs and the other fixed vectors are never judged.
   to the boot CPU, level, priority 0xA0, disabled at distributor init;
   `GICC_PMR` = 0xFF, `GICC_BPR` = 0, `GICC_CTLR` enable with firmware's
   bypass-disable bits kept; EOImode 0. GICv2m MSI frames are not
-  implemented. `cargo xtask test --arch=aarch64` boots v2 with
+  implemented. `cargo narf test test --arch=aarch64` boots v2 with
   `NARF_GIC_VERSION=2`.
 - ITS bring-up follows Linux `irq-gic-v3-its.c` (`its_alloc_tables`,
   `its_setup_baser`, `its_cpu_init_lpis`, `its_create_device`); DeviceIDs

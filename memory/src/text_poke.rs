@@ -1271,7 +1271,7 @@ kernel_test_in!("memory", smoke_text_poke_protect_round_trip);
 /// and — the part that actually bit — clear of the arena's guard slots.
 ///
 /// A kernel test rather than a `#[cfg(test)]` unit test because this crate is
-/// built for bare-metal targets and `cargo xtask host-test` never compiles it:
+/// built for bare-metal targets and `cargo narf test host-test` never compiles it:
 /// anything in the `mod tests` below is documentation, not coverage. The
 /// `const` assertions next to `POKE_VA_BASE` are the build-time half of this;
 /// this is the half that runs on the machine the addresses are used on.

@@ -898,7 +898,7 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
     let _ = writeln!(buf, "\n*** KERNEL PANIC ***");
     let _ = writeln!(buf, "{info}");
     // The KASLR offset, so the slid addresses below can be symbolised
-    // (`xtask kallsyms --print-slide`). Linux prints it from its panic
+    // (`cargo narf build kallsyms --print-slide`). Linux prints it from its panic
     // notifier and nowhere else; the boot log deliberately does not carry
     // it. Early in the report so the fixed-size buffer cannot cut it off.
     let _ = writeln!(buf, "{}", narf_memory::kaslr::KernelOffset::current());

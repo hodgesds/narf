@@ -7,23 +7,23 @@ QEMU boot to a full real-hardware install on a Renoir-class laptop.
 
 | Goal | Command |
 |------|---------|
-| Boot under QEMU, async demo | `cargo xtask run --arch=x86_64` |
-| Boot under QEMU, graphical | `cargo xtask run --arch=x86_64 --display=gtk` |
-| Run the full kernel-test suite | `cargo xtask test --arch=x86_64` |
-| Run the real-init boot-smoke | `cargo xtask boot-smoke --arch=x86_64` |
-| btrfs root-rw harness on the host (no QEMU, ~1–2 min) | `cargo xtask btrfs-host-rw [--seeds N --ops N --cuts N --exhaustive]` |
-| Build a bootable ISO | `cargo xtask image --arch=x86_64` |
-| ISO + boot under OVMF UEFI | `cargo xtask iso-boot --arch=x86_64` |
-| Build a self-contained EFI application without Limine | `cargo xtask efi-image` |
-| Native EFI + clean shutdown under OVMF | `cargo xtask efi-image --smoke` |
-| Native EFI + serial login/shell | `cargo xtask efi-image --run` |
-| NVMe regression with no controller installed | `cargo xtask test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme` |
+| Boot under QEMU, async demo | `cargo narf run run --arch=x86_64` |
+| Boot under QEMU, graphical | `cargo narf run run --arch=x86_64 --display=gtk` |
+| Run the full kernel-test suite | `cargo narf test test --arch=x86_64` |
+| Run the real-init boot-smoke | `cargo narf test boot-smoke --arch=x86_64` |
+| btrfs root-rw harness on the host (no QEMU, ~1–2 min) | `cargo narf smoke btrfs-host-rw [--seeds N --ops N --cuts N --exhaustive]` |
+| Build a bootable ISO | `cargo narf build image --arch=x86_64` |
+| ISO + boot under OVMF UEFI | `cargo narf build iso-boot --arch=x86_64` |
+| Build a self-contained EFI application without Limine | `cargo narf build efi-image` |
+| Native EFI + clean shutdown under OVMF | `cargo narf build efi-image --smoke` |
+| Native EFI + serial login/shell | `cargo narf build efi-image --run` |
+| NVMe regression with no controller installed | `cargo narf test test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme` |
 | Installed x86_64 UEFI package | `packaging/test-uefi-boot.sh` |
 | Installed aarch64 UEFI package | `packaging/test-aarch64-package-boot.sh` |
 | Enforced Secure Boot + tamper rejection | `packaging/test-secure-boot.sh` |
-| Demo with user-mode testbin + shell | `cargo xtask demo --arch=x86_64 --display=gtk` |
-| Burn ISO to USB stick | `sudo cargo xtask disk-write --device /dev/sdX` |
-| Lay down GPT + ESP + ext4 install | `sudo cargo xtask disk-write-partitioned --device /dev/sdX --yes` |
+| Demo with user-mode testbin + shell | `cargo narf run demo --arch=x86_64 --display=gtk` |
+| Burn ISO to USB stick | `sudo cargo narf disk disk-write --device /dev/sdX` |
+| Lay down GPT + ESP + ext4 install | `sudo cargo narf disk disk-write-partitioned --device /dev/sdX --yes` |
 
 Kernel build/test and the established UEFI image paths also accept
 `--arch=aarch64`. The self-contained `efi-image` command and interactive
@@ -49,7 +49,7 @@ for artifact layout, installation, configuration, and current limits.
 - **Secure Boot gate** — `sbsigntool`, OpenSSL, and `virt-fw-vars` from
   virt-firmware. Its key and OVMF variable store are disposable test fixtures.
 
-xtask cross-builds against `x86_64-unknown-none` / `aarch64-unknown-none`
+cargo narf cross-builds against `x86_64-unknown-none` / `aarch64-unknown-none`
 with `-Z build-std=core,compiler_builtins,alloc`. NVMe disk images and
 the QEMU virt DTB are generated lazily into `target/`.
 
@@ -60,7 +60,7 @@ the QEMU virt DTB are generated lazily into `target/`.
 ### Async-demo boot (the simplest path)
 
 ```sh
-cargo xtask run --arch=x86_64
+cargo narf run run --arch=x86_64
 ```
 
 Boots a kernel build that runs the cooperative async executor for five
@@ -72,9 +72,9 @@ no graphical window.
 
 ```sh
 # host UI determined automatically:
-cargo xtask run --arch=x86_64 --display=gtk      # GTK (Linux)
-cargo xtask run --arch=x86_64 --display=sdl      # SDL (cross-platform)
-cargo xtask run --arch=x86_64 --display=cocoa    # macOS native
+cargo narf run run --arch=x86_64 --display=gtk      # GTK (Linux)
+cargo narf run run --arch=x86_64 --display=sdl      # SDL (cross-platform)
+cargo narf run run --arch=x86_64 --display=cocoa    # macOS native
 ```
 
 The kernel's framebuffer driver paints on the QEMU VGA / virtio-gpu
@@ -89,7 +89,7 @@ with the framebuffer from your laptop:
 
 ```sh
 # Server-side (the host running QEMU):
-cargo xtask run --arch=x86_64 --display=vnc:127.0.0.1:5
+cargo narf run run --arch=x86_64 --display=vnc:127.0.0.1:5
 
 # Client-side, on your laptop:
 vncviewer <server-ip>:5905
@@ -104,7 +104,7 @@ real CI use, prefer an SSH tunnel:
 
 ```sh
 # Server-side:
-cargo xtask run --arch=x86_64 --display=vnc:127.0.0.1:5
+cargo narf run run --arch=x86_64 --display=vnc:127.0.0.1:5
 
 # Client-side, via SSH tunnel:
 ssh -L 5905:127.0.0.1:5905 <server>
@@ -117,9 +117,9 @@ Default is `full` — all supported emulated devices enabled. Useful for
 isolating driver paths when one is misbehaving:
 
 ```sh
-cargo xtask run --arch=x86_64 --hw-profile=minimal      # serial only
-cargo xtask run --arch=x86_64 --hw-profile=virtio-only  # VirtIO + serial
-cargo xtask run --arch=x86_64 --hw-profile=legacy-only  # non-VirtIO + serial
+cargo narf run run --arch=x86_64 --hw-profile=minimal      # serial only
+cargo narf run run --arch=x86_64 --hw-profile=virtio-only  # VirtIO + serial
+cargo narf run run --arch=x86_64 --hw-profile=legacy-only  # non-VirtIO + serial
 ```
 
 `minimal` is the right profile when you're debugging the boot path or
@@ -133,8 +133,8 @@ without the VirtIO shortcuts.
 ## Running the kernel-test suite
 
 ```sh
-cargo xtask test --arch=x86_64
-cargo xtask test --arch=aarch64
+cargo narf test test --arch=x86_64
+cargo narf test test --arch=aarch64
 ```
 
 This:
@@ -146,7 +146,7 @@ This:
 3. The in-kernel runner iterates every test, prints
    `[ OK ] / [FAIL] / [skip]` per test, and exits via `isa-debug-exit`
    with the pass/fail aggregate code.
-4. After the kernel-test phase completes, the xtask also runs a
+4. After the kernel-test phase completes, the cargo narf also runs a
    **boot-smoke** phase — a separate boot without `kernel-test` that
    exercises the real init flow and verifies the kernel reaches the
    "boot ready" milestone before powering off through the architecture's
@@ -158,7 +158,7 @@ The runner prints `── summary: <pass> pass, <fail> fail, <skip> skip ──`
 on the way out. Skips are tests that need a device QEMU doesn't
 emulate (e.g. Intel 82599); they exit cleanly without failing the run.
 
-By default xtask captures the guest serial stream and prints the concise
+By default cargo narf captures the guest serial stream and prints the concise
 summary at the end. Set `XTASK_QEMU_SERIAL_TEE=1` to see each kernel-test and
 boot-smoke line live while retaining the same final parsing and diagnostics.
 CI enables this so a long QEMU phase always shows forward progress.
@@ -166,13 +166,13 @@ CI enables this so a long QEMU phase always shows forward progress.
 ### Just the boot-smoke phase
 
 ```sh
-cargo xtask boot-smoke --arch=x86_64
+cargo narf test boot-smoke --arch=x86_64
 ```
 
 Boots the kernel **without** the `kernel-test` feature — i.e. the real
 init flow — and watches stdout for panic markers + the success
 milestone. After a ~2-second async-task drain, the kernel enters ACPI S5
-on x86_64 or calls PSCI `SYSTEM_OFF` on aarch64. The xtask requires QEMU
+on x86_64 or calls PSCI `SYSTEM_OFF` on aarch64. The cargo narf requires QEMU
 to power off naturally with exit code 0; the test-only x86 debug-exit
 status therefore cannot masquerade as a successful shutdown.
 
@@ -182,15 +182,15 @@ late-boot async task path).
 
 ### Running a single subsystem's tests
 
-There isn't a per-subsystem filter at the xtask level, but the inner
+There isn't a per-subsystem filter at the cargo narf level, but the inner
 runner accepts a regex via the test harness:
 
 ```sh
 # Run only USB tests:
-cargo xtask test --arch=x86_64 -- --filter usb
+cargo narf test test --arch=x86_64 -- --filter usb
 
 # Run only the wireless 4-way handshake:
-cargo xtask test --arch=x86_64 -- --filter four_way
+cargo narf test test --arch=x86_64 -- --filter four_way
 ```
 
 (The post-`--` flags are forwarded to the in-kernel runner.)
@@ -202,7 +202,7 @@ race the QEMU NVMe image's write lock under high parallelism. The
 convention is to re-run twice before declaring a regression:
 
 ```sh
-for i in 1 2 3; do cargo xtask test --arch=x86_64 ; done
+for i in 1 2 3; do cargo narf test test --arch=x86_64 ; done
 ```
 
 ---
@@ -212,7 +212,7 @@ for i in 1 2 3; do cargo xtask test --arch=x86_64 ; done
 ### Limine ISO + boot under OVMF
 
 ```sh
-cargo xtask iso-boot --arch=x86_64
+cargo narf build iso-boot --arch=x86_64
 ```
 
 Builds the Limine ISO (lands at `target/narf-x86_64.iso`) and boots it
@@ -221,17 +221,17 @@ under QEMU + OVMF UEFI in one step.
 To just produce the ISO without booting:
 
 ```sh
-cargo xtask image --arch=x86_64
+cargo narf build image --arch=x86_64
 ```
 
 To boot the ISO with a graphical display + the user-mode testbin
 running (you'll get an interactive shell at the `narf>` prompt):
 
 ```sh
-cargo xtask demo --arch=x86_64 --display=gtk
+cargo narf run demo --arch=x86_64 --display=gtk
 ```
 
-The ISO uses Limine as the bootloader on x86_64. On aarch64 `xtask image`
+The ISO uses Limine as the bootloader on x86_64. On aarch64 `cargo narf build image`
 produces a FAT UEFI image with `EFI/BOOT/BOOTAA64.EFI`; `iso-boot` boots it
 under AAVMF with an attached QEMU `virt` DTB. The loader is bound to the exact
 kernel digest before the image is created.
@@ -266,31 +266,31 @@ walker falls through to the initramfs shell since there's no
 
 ```sh
 # Auto-detect the first USB-attached disk:
-sudo cargo xtask disk-write
+sudo cargo narf disk disk-write
 
 # Or pin a specific device:
-sudo cargo xtask disk-write --device /dev/sdX
+sudo cargo narf disk disk-write --device /dev/sdX
 
 # Skip the slow full-device wipe if you know the USB has no leftover
 # bootable signatures past the ISO size:
-sudo cargo xtask disk-write --device /dev/sdX --no-wipe
+sudo cargo narf disk disk-write --device /dev/sdX --no-wipe
 
 # Fast wipe: zero the MBR / GPT / EFI / El Torito regions only
 # (first 100 MiB + last 4 MiB), skip the middle-of-disk zero-fill.
 # Same boot-correctness as a full wipe when the USB is larger than
 # the ISO.
-sudo cargo xtask disk-write --device /dev/sdX --fast-wipe
+sudo cargo narf disk disk-write --device /dev/sdX --fast-wipe
 
 # Burn a custom ISO path:
-sudo cargo xtask disk-write --device /dev/sdX --iso path/to/narf.iso
+sudo cargo narf disk disk-write --device /dev/sdX --iso path/to/narf.iso
 ```
 
-> **Safety**: writes are destructive. xtask refuses to write to a
+> **Safety**: writes are destructive. cargo narf refuses to write to a
 > device that isn't USB-attached (no `/dev/sda` that's actually your
 > system disk by accident). Always double-check the device path via
 > `lsblk` first.
 
-After the `dd` finishes, xtask does a logical detach + re-probe +
+After the `dd` finishes, cargo narf does a logical detach + re-probe +
 read-back verification so the burn is guaranteed to land on the USB
 stick's flash NAND, not the USB controller's write cache. The check
 catches the failure mode where a successful `dd` exit code paired
@@ -308,20 +308,20 @@ kernel auto-mounts on `/` via `root=PARTLABEL=NARF_ROOT` — use
 
 ```sh
 # Stage kernel + initramfs + Limine first (builds only, no QEMU):
-cargo xtask image --arch=x86_64
+cargo narf build image --arch=x86_64
 
 # Then lay down the partitioned disk:
-sudo cargo xtask disk-write-partitioned --device /dev/sdX --yes
+sudo cargo narf disk disk-write-partitioned --device /dev/sdX --yes
 
 # Tunables:
-sudo cargo xtask disk-write-partitioned --device /dev/sdX \
+sudo cargo narf disk disk-write-partitioned --device /dev/sdX \
      --esp-size-mib 512 \
      --root-fs ext4 \
      --root-label NARF_ROOT \
      --yes
 ```
 
-Host-tool requirements (xtask preflights them and names the missing
+Host-tool requirements (cargo narf preflights them and names the missing
 package up front):
 
 | Tool | Arch package | Debian/Ubuntu |
@@ -421,7 +421,7 @@ If you can't see the FB (e.g. headless boot, broken display), serial
 is the next stop:
 
 ```sh
-cargo xtask run --arch=x86_64 --display=none 2>&1 | tee boot.log
+cargo narf run run --arch=x86_64 --display=none 2>&1 | tee boot.log
 grep -E "panic|fault|init:" boot.log
 ```
 
@@ -430,7 +430,7 @@ display via the framebuffer.
 
 ### Wedged QEMU NVMe image
 
-The `cargo xtask test` runner uses a shared NVMe image
+The `cargo narf test test` runner uses a shared NVMe image
 (`target/narf-nvme.img`) for storage-driver smokes. If a previous run
 crashed without cleanup, QEMU's write lock will block the next run:
 
@@ -447,7 +447,7 @@ kill <pid>                         # Or wait for it to exit
 # Then retry.
 ```
 
-The xtask doesn't currently auto-detect this; it's on the cleanup
+The cargo narf doesn't currently auto-detect this; it's on the cleanup
 list.
 
 ---
@@ -483,10 +483,10 @@ timing.
 Every PR must pass:
 
 ```sh
-cargo xtask test --arch=x86_64
-cargo xtask test --arch=aarch64
-cargo xtask boot-smoke --arch=x86_64
-cargo xtask boot-smoke --arch=aarch64
+cargo narf test test --arch=x86_64
+cargo narf test test --arch=aarch64
+cargo narf test boot-smoke --arch=x86_64
+cargo narf test boot-smoke --arch=aarch64
 ```
 
 The boot-smoke phase is the load-bearing check — it catches the

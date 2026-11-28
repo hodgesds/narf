@@ -1,4 +1,4 @@
-//! Host tests. Run with `cargo test -p narf-bpf-isa` or `cargo xtask host-test`.
+//! Host tests. Run with `cargo test -p narf-bpf-isa` or `cargo narf test host-test`.
 //!
 //! Three tiers:
 //!   1. Golden encodings — hand-checked against `include/uapi/linux/bpf.h`, so

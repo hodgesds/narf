@@ -16,7 +16,7 @@
 //!   hardware-tests registration on the P14s.
 //!
 //! The module backend's KABI calls are exercised by the `.ko` build
-//! (`cargo xtask build-module` compiles + `nm -u` gate) and by the
+//! (`cargo narf build build-module` compiles + `nm -u` gate) and by the
 //! KABI-side smokes in `modules/src/kabi_platform.rs`; there is no
 //! fixture for a ThinkPad HKEY device.
 

@@ -14,7 +14,7 @@ This document is the checklist a filesystem MUST satisfy in tests before it is
 considered conformant. New drivers add their tests under
 `drivers/fs/<name>/src/tests.rs` (or `filesystem/src/<name>_tests.rs`) with
 `kernel_test_in!("drivers/fs/<name>", ...)`; they run in the standard
-`cargo xtask test` suite.
+`cargo narf test test` suite.
 
 ## Why this exists
 

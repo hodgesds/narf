@@ -2656,7 +2656,7 @@ fn dispatch_trap(frame: &mut TrapFrame) {
     let _ = writeln!(TrapWriter, "*** kernel core written ***");
 
     // SAFETY: after a fatal exception we have no policy to resume; exit with
-    // a non-zero code so xtask / verification can see the failure.
+    // a non-zero code so cargo narf / verification can see the failure.
     // SAFETY: Valid memory or trusted environment
     unsafe { narf_arch::exit_kernel(42) }
 }

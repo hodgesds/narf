@@ -107,7 +107,7 @@ not to:
   at the syscall level but doesn't try to mirror procfs/sysfs.
 - **Out-of-tree module support**: Linux has decades of out-of-tree
   driver convention (DKMS, signed modules). NARF has no out-of-tree
-  driver model — all drivers are in tree and pass `cargo xtask test`.
+  driver model — all drivers are in tree and pass `cargo narf test test`.
 - **Distro packaging**: NARF has none. You build it from source today.
 
 ## Where NARF and Linux are roughly equivalent

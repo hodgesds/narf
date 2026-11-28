@@ -391,7 +391,7 @@ kernel_test_in!("drivers/storage/ahci", smoke_ahci_identify_device);
 
 fn smoke_ahci_read_lba() -> TestResult {
     // Read sector 0 of the QEMU SATA disk and verify the pattern
-    // xtask seeds the image with: byte i = (i * 0x6D) ^ 0x42.
+    // cargo narf seeds the image with: byte i = (i * 0x6D) ^ 0x42.
     use crate::ahci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;

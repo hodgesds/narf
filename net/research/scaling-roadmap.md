@@ -672,8 +672,8 @@ vhost-net on a multi-queue tap, on this host, NARF sending first.** No driver
 for a fast physical card is closer. The host has KVM and `/dev/vhost-net`;
 its only wired NIC is the I225. What stands in the way, in order:
 
-1. `cargo xtask` never passes `vhost=on`
-   (`build/xtask/src/main.rs:2017`); `XTASK_QEMU_TAP` and `XTASK_QEMU_QUEUES`
+1. `cargo narf` never passes `vhost=on`
+   (`build/cargo-narf/src/main.rs:2017`); `XTASK_QEMU_TAP` and `XTASK_QEMU_QUEUES`
    exist and no job sets them.
 2. The driver drops received TCP frames that lack `DATA_VALID`, including
    `NEEDS_CSUM` ones (`drivers/virtio/src/net_pci.rs:3373-3410`). A host
@@ -866,7 +866,7 @@ Two to four months, largely parallel work once stage 2's locking exists.
 | Wake path: no global generation counter; no wake-all | `net/src/readiness.rs`; `userspace/` |
 | Memory accounting and pressure | `net/src/tcp/`; `lib/src/sysctl.rs` |
 | UDP: batching in `recvmmsg`/`sendmmsg`, receive coalescing, segmentation offload, per-socket wake | `net/src/udp_sock.rs`, `udp_gso.rs`; `userspace/src/socket/inet_dgram.rs` |
-| A driver that can carry it: virtio-net multi-queue over vhost, then i40e on hardware; the mlx5 data path begun | `drivers/virtio`, `drivers/net/i40e`, `drivers/net/mlx5`; `build/xtask` |
+| A driver that can carry it: virtio-net multi-queue over vhost, then i40e on hardware; the mlx5 data path begun | `drivers/virtio`, `drivers/net/i40e`, `drivers/net/mlx5`; `build/cargo-narf` |
 
 - **TCB-adjacent:** steering a woken reader toward its flow's CPU may need a
   placement hint in the executor core (`scheduler/`). If it does, that change
@@ -956,7 +956,7 @@ lock statistics facility; §3 counts them from the code.
 Run it with:
 
 ```
-cargo xtask test --arch=x86_64 --subsystem net/scale --kernel-tests-only
+cargo narf test test --arch=x86_64 --subsystem net/scale --kernel-tests-only
 ```
 
 The results are the `NETBENCH scale/...` lines printed after the summary.
@@ -1061,7 +1061,7 @@ performance. For this harness that means, on hardware:
   the suite, and treat a change as blocking only if it is significant and
   beyond the declared δ.
 
-`build/xtask/src/bench_stats.rs` already implements those statistics for the
+`build/cargo-narf/src/bench_stats.rs` already implements those statistics for the
 BPF benchmarks. A `net-scale-bench` command that boots, parses `NETBENCH`
 lines and feeds them to it is the remaining piece.
 

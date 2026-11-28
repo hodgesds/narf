@@ -7,7 +7,7 @@ Dual-build crate (`narf-drivers-usb-storage`):
   interface triple and CBW/CSW signatures from this codec. A
   `drivers/usb/msc` smoke checks its encoders against the codec byte for
   byte.
-- **Module** (`usb-storage.ko`): `cargo xtask build-module --package
+- **Module** (`usb-storage.ko`): `cargo narf build build-module --package
   narf-drivers-usb-storage --no-default-features --features module`. It
   matches BOT interfaces (08/06/50) and drives the stick through the
   `narf_usb_*` exports. Configure and `SET_CONFIGURATION` run from
@@ -19,7 +19,7 @@ The module handles LUN 0 and READ/WRITE(10) only, at most 4 KiB per
 command, with no BOT reset recovery: a stall or phase error takes the
 device offline. Build the kernel with `narf-drivers-usb/msc-module-only`
 so the built-in binder leaves the stick to the module. The proof is
-`cargo xtask usb-storage-module-block-smoke`.
+`cargo narf smoke usb-storage-module-block-smoke`.
 
 Design: `modules/DATAPATH_ABI_DESIGN.md` ("USB transfer datapath",
 "Block datapath").

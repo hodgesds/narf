@@ -1,4 +1,4 @@
-//! `cargo xtask btrfs-cycles`: many btrfs mount → write → sync → unmount →
+//! `cargo narf smoke btrfs-cycles`: many btrfs mount → write → sync → unmount →
 //! remount → verify cycles in ONE boot per guest, on a CachyOS-shaped root.
 //!
 //! 1. The host builds, unprivileged, a btrfs image shaped like the CachyOS
@@ -41,7 +41,7 @@ const HOST_MARGIN_MIB: u64 = 2048;
 /// Upper bound on `--jobs`.
 pub const MAX_JOBS: usize = 30;
 
-/// Options for `cargo xtask btrfs-cycles`.
+/// Options for `cargo narf smoke btrfs-cycles`.
 #[derive(clap::Args, Clone)]
 pub struct Args {
     #[command(flatten)]

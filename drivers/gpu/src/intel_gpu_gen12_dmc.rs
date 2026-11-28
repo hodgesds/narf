@@ -49,7 +49,7 @@
 //!   job (`set_dc_target` in [`crate::intel_gpu_dmc`]).
 //!
 //! Blobs are never vendored into git (repo rule: firmware is
-//! imported at build time via `cargo xtask import-firmware` /
+//! imported at build time via `cargo narf firmware import-firmware` /
 //! `--initramfs-firmware` and lives in the registry). This module
 //! only names the registry keys.
 

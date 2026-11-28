@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CATALOG: &str = include_str!("../../../verification/data/wifi-firmware/profiles.json");
+const CATALOG: &str = include_str!("../../../../verification/data/wifi-firmware/profiles.json");
 const MAX_PAYLOAD: u64 = 16 * 1024 * 1024;
 
 #[derive(clap::Args)]
@@ -324,12 +324,12 @@ mod tests {
         for (family, source, prefix) in [
             (
                 "ath10k",
-                include_str!("../../../drivers/wireless/ath10k/src/ath10k/profile.rs"),
+                include_str!("../../../../drivers/wireless/ath10k/src/ath10k/profile.rs"),
                 "",
             ),
             (
                 "ath11k",
-                include_str!("../../../drivers/wireless/ath11k/src/ath11k/hw.rs"),
+                include_str!("../../../../drivers/wireless/ath11k/src/ath11k/hw.rs"),
                 "ath11k/",
             ),
         ] {

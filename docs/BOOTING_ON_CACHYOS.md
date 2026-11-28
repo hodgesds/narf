@@ -78,10 +78,10 @@ and GRUB utilities.
 From a NARF checkout:
 
 ```sh
-cargo xtask host-test
-cargo xtask run --arch=x86_64
-cargo xtask boot-smoke --arch=x86_64
-cargo xtask test --arch=x86_64
+cargo narf test host-test
+cargo narf run run --arch=x86_64
+cargo narf test boot-smoke --arch=x86_64
+cargo narf test test --arch=x86_64
 ```
 
 The first Rust command installs the repository-pinned toolchain through
@@ -92,7 +92,7 @@ emulation.
 Exercise the same x86_64 UEFI/Limine image layout used for release media:
 
 ```sh
-cargo xtask iso-boot --arch=x86_64
+cargo narf build iso-boot --arch=x86_64
 ```
 
 This is the most useful first compatibility report because failure leaves the
@@ -102,8 +102,8 @@ QEMU command, serial log, CPU model, and the final test summary.
 Before testing networking on hardware, run both end-to-end virtual paths:
 
 ```sh
-cargo xtask net-smoke --arch=x86_64
-cargo xtask e1000-module-net-smoke --arch=x86_64
+cargo narf smoke net-smoke --arch=x86_64
+cargo narf smoke e1000-module-net-smoke --arch=x86_64
 ```
 
 Both require successful host-to-guest TCP and UDP exchanges plus a guest DNS
@@ -116,7 +116,7 @@ emulated NIC.
 Build the release image:
 
 ```sh
-cargo xtask image --arch=x86_64
+cargo narf build image --arch=x86_64
 sha256sum target/narf-x86_64.iso
 ```
 
@@ -130,10 +130,10 @@ For a dedicated USB device, first identify the exact target:
 lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINTS
 ```
 
-Then write it with the guarded xtask command:
+Then write it with the guarded cargo narf command:
 
 ```sh
-sudo cargo xtask disk-write --device=/dev/sdX
+sudo cargo narf disk disk-write --device=/dev/sdX
 sync
 sudo eject /dev/sdX
 ```
@@ -155,8 +155,8 @@ USB. This exercises GPT discovery, a FAT32 ESP, root-device selection, and an
 ext4 root without touching the CachyOS disk:
 
 ```sh
-cargo xtask image --arch=x86_64
-cargo xtask disk-write-partitioned \
+cargo narf build image --arch=x86_64
+cargo narf disk disk-write-partitioned \
   --device=/dev/sdX \
   --root-fs=ext4 \
   --root-label=NARF_ROOT
@@ -181,7 +181,7 @@ No particular CPU, GPU, network adapter or PCI address is required by this
 workflow.
 
 ```sh
-cargo xtask usb-image
+cargo narf disk usb-image
 # Add --initramfs-firmware "<device-firmware-pattern>" for each needed family.
 ```
 
@@ -197,7 +197,7 @@ Identify a dedicated USB device before writing it:
 
 ```sh
 lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINTS
-cargo xtask disk-write --iso target/narf-x86_64-usb.img --device /dev/sdX
+cargo narf disk disk-write --iso target/narf-x86_64-usb.img --device /dev/sdX
 ```
 
 After the attempt, inspect the saved log under CachyOS. Keep boot-specific
@@ -205,7 +205,7 @@ logs and hardware inventories outside the general boot instructions.
 
 ### Internal-disk safety (`narf.disks=boot-only`)
 
-`cargo xtask usb-image` puts `narf.disks=boot-only` on the command line
+`cargo narf disk usb-image` puts `narf.disks=boot-only` on the command line
 (`--allow-all-disks` leaves it off; never use that on this machine). With it:
 
 - **Every block device is read-only until it is identified as the stick.**
@@ -232,7 +232,7 @@ logs and hardware inventories outside the general boot instructions.
     at `/mnt`.
 
   The btrfs member discovery skips unidentified disks too. The btrfs disk
-  smokes additionally need `narf.btrfs_smoke`, which only xtask's own test
+  smokes additionally need `narf.btrfs_smoke`, which only cargo narf's own test
   run passes.
 - **Read-only mounts do not write.** An ext2/3/4 or btrfs volume on a
   read-only device is mounted read-only without a single write:
@@ -312,7 +312,7 @@ by a device name:
 
 ```sh
 # Read-only root, writable tmpfs overlay (nothing on any disk is written):
-cargo xtask grub-image --arch=x86_64 \
+cargo narf build grub-image --arch=x86_64 \
   --root-policy root-ro --root-uuid <ROOT_UUID> \
   --rootflags subvol=/@ --bootlog-token <token> \
   --cmdline-extra "systemd.unit=multi-user.target fsck.mode=skip"
@@ -429,7 +429,7 @@ device NARF does not have), then
   - Options that would change unmaintained state (`clear_cache`,
     `space_cache=v1`, `nodatasum`, `rescue=`, `degraded`, `device=`) are
     refused.
-- **Interop test.** `cargo xtask btrfs-rootrw-interop` builds a CachyOS-shaped
+- **Interop test.** `cargo narf smoke btrfs-rootrw-interop` builds a CachyOS-shaped
   image unprivileged and boots it under `root-rw`. The image has GPT, an ESP,
   btrfs with nodesize 16K, crc32c, FST, no-holes, `--compress zstd:1`, the
   seven `@` subvolumes and `+C` journals. It is built twice, with the host's
@@ -446,7 +446,7 @@ device NARF does not have), then
   --check-data-csum` to be clean and the GPT and ESP to be byte-identical. At
   the end, `btrfs restore` content must match in all seven subvolumes.
   `--bgt=refused` checks the opposite case (a writer without BGT support).
-  `cargo xtask btrfs-crash-smoke [--bgt]` checks fsync durability across a
+  `cargo narf smoke btrfs-crash-smoke [--bgt]` checks fsync durability across a
   SIGKILL. A host `mount -o loop,ro` runs only with passwordless sudo.
 - **Before a real `root-rw` boot**, take a read-only snapshot on CachyOS
   (`sudo btrfs subvolume snapshot -r / /.snapshots/pre-narf`) and keep a
@@ -498,7 +498,7 @@ partition by its own identity
 ([block spec](../block/specification/spec.md)).
 
 ```sh
-cargo xtask efi-image --output target/narf-root-ro.efi \
+cargo narf build efi-image --output target/narf-root-ro.efi \
   --cmdline "narf.disks=root-ro root=UUID=<LUKS_UUID> rd.luks.uuid=<LUKS_UUID> \
 rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
 ```
@@ -512,7 +512,7 @@ rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.targe
 LUKS-unlocked root above included:
 
 ```sh
-cargo xtask efi-image --output target/narf-root-rw.efi \
+cargo narf build efi-image --output target/narf-root-rw.efi \
   --cmdline "narf.disks=root-rw root=UUID=<LUKS_UUID> rd.luks.uuid=<LUKS_UUID> \
 rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
 ```
@@ -554,7 +554,7 @@ rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.targe
   `sudo dumpe2fs -h "$(findmnt -no SOURCE /)" | grep -i state` must say
   `clean`.
 - **Testing.** The writer runs against real `mkfs.ext4` images on the host
-  (`cargo xtask ext4-host-rw`, judged by `e2fsck -fn`, debugfs and a NARF
+  (`cargo narf smoke ext4-host-rw`, judged by `e2fsck -fn`, debugfs and a NARF
   remount) and in QEMU. It has not been validated on hardware.
 
 The exact accepted profiles and work limits are documented in the
@@ -613,11 +613,11 @@ decompress Arch-style `.zst` entries, and wrap each blob in the NARF firmware
 format:
 
 ```sh
-cargo xtask import-firmware \
+cargo narf firmware import-firmware \
   --source /usr/lib/firmware \
   --vendor iwlwifi \
   --skip-existing
-cargo xtask image --arch=x86_64
+cargo narf build image --arch=x86_64
 ```
 
 With a partitioned root, firmware not selected for the initramfs is staged at
@@ -653,7 +653,7 @@ set the directory when building:
 
 ```sh
 NARF_WIRELESS_REGDB=/usr/lib/firmware \
-  cargo xtask image --arch=x86_64
+  cargo narf build image --arch=x86_64
 ```
 
 Keep the device's required vendor-firmware selections. The directory must
@@ -669,7 +669,7 @@ with a detached Ed25519 signature over `BLAKE3(payload)` (64 raw bytes) and
 a raw 32-byte public key. Package that policy using:
 
 ```sh
-cargo xtask pack-firmware \
+cargo narf firmware pack-firmware \
   --name wireless-regulatory.bin \
   --payload /absolute/path/deployment/policy.nrgd \
   --signature /absolute/path/deployment/policy.sig \
@@ -684,7 +684,7 @@ no firmware signers. Include the policy in the early firmware selection:
 
 ```sh
 NARF_FIRMWARE_TRUSTED_KEYS=/absolute/path/deployment/trusted-keys.txt \
-  cargo xtask image --arch=x86_64 \
+  cargo narf build image --arch=x86_64 \
   --initramfs-firmware wireless-regulatory.bin
 ```
 
@@ -703,11 +703,11 @@ the ath11k firmware, include its HW2.1 subtree in the initramfs, and request a
 scan during a normal boot (not a `kernel-test` boot):
 
 ```sh
-cargo xtask import-firmware \
+cargo narf firmware import-firmware \
   --source /usr/lib/firmware \
   --vendor ath11k \
   --skip-existing
-cargo xtask usb-image --arch=x86_64 \
+cargo narf disk usb-image --arch=x86_64 \
   --initramfs-firmware "ath11k/WCN6855/hw2.1/*" \
   --cmdline "ath11k.scan=1"
 ```
@@ -723,7 +723,7 @@ step the built-in PCI claim aside, and pass the parameters on the kernel
 command line:
 
 ```sh
-cargo xtask usb-image --arch=x86_64 \
+cargo narf disk usb-image --arch=x86_64 \
   --module-crate drivers/wireless/ath11k --allow-unsigned-modules \
   --features narf-drivers-wireless/ath11k-module-only \
   --initramfs-firmware "ath11k/WCN6855/hw2.1/*" \
@@ -789,11 +789,11 @@ Developers can build the same package locally:
 
 ```sh
 cargo install --path build/cargo-narf
-cargo narf detect
-cargo narf install --version 0.5.0 \
+cargo narf pkg detect
+cargo narf pkg install --version 0.5.0 \
   --limine-efi /usr/share/limine/BOOTX64.EFI \
   --dry-run
-cargo narf install --version 0.5.0 \
+cargo narf pkg install --version 0.5.0 \
   --limine-efi /usr/share/limine/BOOTX64.EFI
 ```
 
@@ -904,9 +904,9 @@ production systemd kernel, then package that exact artifact with
 `--skip-build`:
 
 ```sh
-cargo xtask build --arch=x86_64 \
+cargo narf build build --arch=x86_64 \
   --features boot-init,cgroup-all,container,firmware-allow-unsigned
-cargo narf package --version 0.5.0 --skip-build \
+cargo narf pkg package --version 0.5.0 --skip-build \
   --limine-efi /usr/share/limine/BOOTX64.EFI
 ```
 
@@ -937,21 +937,21 @@ package cannot clean an unmounted filesystem after its helper has been removed.
 
 ## Pre-hardware validation gate
 
-Run `cargo xtask cachyos-gate` before booting the installed CachyOS root
+Run `cargo narf smoke cachyos-gate` before booting the installed CachyOS root
 under NARF on the real machine, and again after every change to storage,
 btrfs, the disk policy or the systemd path. It boots the same
-`cargo xtask grub-image` bundle that goes on the host's ESP, against disk
+`cargo narf build grub-image` bundle that goes on the host's ESP, against disk
 images that have the host's shape, and prints one PASS/FAIL row per check.
 It exits nonzero if any row fails. It never opens a host block device.
 Everything it writes is a regular file under `target/cachyos-gate/` (or
 `--work-dir`).
 
 ```sh
-cargo xtask cachyos-gate                       # full matrix (Gates A/B)
-cargo xtask cachyos-gate --cases ro,rw         # a subset, in matrix order
-cargo xtask cachyos-gate --crash-runs 3 --cycles 3 --seed 42
-cargo xtask cachyos-gate --skip-build --cases linux   # reuse the staged bundles
-cargo xtask cachyos-gate --real-root /mnt/sabrent/narf-gatec/cachyos-root-copy.img \
+cargo narf smoke cachyos-gate                       # full matrix (Gates A/B)
+cargo narf smoke cachyos-gate --cases ro,rw         # a subset, in matrix order
+cargo narf smoke cachyos-gate --crash-runs 3 --cycles 3 --seed 42
+cargo narf smoke cachyos-gate --skip-build --cases linux   # reuse the staged bundles
+cargo narf smoke cachyos-gate --real-root /mnt/sabrent/narf-gatec/cachyos-root-copy.img \
   --work-dir /mnt/sabrent/narf-gatec/work      # Gate C (see below)
 ```
 
@@ -982,7 +982,7 @@ host is the path tested. The bundle's `esp/` tree is copied onto the same
 ESP, as on the host. The gate builds two bundles:
 
 ```sh
-cargo xtask grub-image --features cgroup-all,container \
+cargo narf build grub-image --features cgroup-all,container \
   --root-policy root-ro --root-uuid <image fsid>      # and --root-policy root-rw
 ```
 
@@ -1147,7 +1147,7 @@ sudo chown "$USER": "$IMG"
 Then, unprivileged:
 
 ```sh
-cargo xtask cachyos-gate --real-root /mnt/sabrent/narf-gatec/cachyos-root-copy.img \
+cargo narf smoke cachyos-gate --real-root /mnt/sabrent/narf-gatec/cachyos-root-copy.img \
   --work-dir /mnt/sabrent/narf-gatec/work
 ```
 
@@ -1191,7 +1191,7 @@ Read-write, after the root-ro trial worked:
 narf.disks=root-rw root=UUID=<ROOT_UUID> rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
-`cargo xtask grub-image --root-policy root-ro|root-rw --root-uuid <uuid>
+`cargo narf build grub-image --root-policy root-ro|root-rw --root-uuid <uuid>
 --cmdline-extra "systemd.unit=multi-user.target fsck.mode=skip"` writes these
 lines (see
 [Booting the installed root](#booting-the-installed-root-narfdisksroot-ro--root-rw)
@@ -1351,7 +1351,7 @@ metadata or exec-credential bug can hide an existing setuid bit.
 
 ### What fails, and why that is harmless
 
-The QEMU acceptance run (`cargo xtask cachyos-root-smoke`, below) boots a
+The QEMU acceptance run (`cargo narf smoke cachyos-root-smoke`, below) boots a
 stock CachyOS `base` install. Under `root-ro` it reaches
 `systemctl is-system-running` = `running` with no failed units. Expect the
 host to add failures from the packages it has on top of `base`:
@@ -1397,9 +1397,9 @@ cover that FAT partition. Other data disks remain protected.
 ### QEMU rehearsal (no root needed, no host disk touched)
 
 ```sh
-cargo xtask cachyos-root-smoke          # root-ro, image SHA-256 must be unchanged
-cargo xtask cachyos-root-smoke --rw     # root-rw on a scratch copy
-cargo xtask cachyos-gate --cases ro,rw  # the same through OVMF -> GRUB -> Limine
+cargo narf smoke cachyos-root-smoke          # root-ro, image SHA-256 must be unchanged
+cargo narf smoke cachyos-root-smoke --rw     # root-rw on a scratch copy
+cargo narf smoke cachyos-gate --cases ro,rw  # the same through OVMF -> GRUB -> Limine
 ```
 
 `cachyos-root-smoke` builds `target/narf-cachyos-root.img` on first use

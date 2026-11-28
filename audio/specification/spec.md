@@ -340,7 +340,7 @@ builds) and `narf-drivers-audio-acp` (ACP PDM + SoundWire). Both share
 `narf-drivers-audio-core` (`native_pci` power-on, `native_irq` routing,
 `native_pcm::Ring`, `native_firmware` ACPI queries), which is always
 built-in. Either driver also builds as a registration-only loadable `.ko`
-(`cargo xtask build-module --package <crate> --no-default-features
+(`cargo narf build build-module --package <crate> --no-default-features
 --features module`, `target_domain=scratch`) whose probe returns
 `-ENOSYS` until the device datapath ABI covers a PCM device.
 

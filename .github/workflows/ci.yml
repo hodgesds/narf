@@ -24,7 +24,7 @@ env:
   # bring-up (a host bug; works on local/upstream QEMU). Drop the
   # balloon device from every QEMU boot here so boot-smoke / musl-demo /
   # kernel-test don't crash the emulator; the balloon smokes Skip and
-  # init skips the probe. See build/xtask/src/main.rs::qemu_args.
+  # init skips the probe. See build/cargo-narf/src/main.rs::qemu_args.
   XTASK_QEMU_NO_BALLOON: "1"
   # Extra buddy headroom for the QEMU jobs (boot-smoke / musl-demo /
   # kernel-test). The ~5129-smoke suite sits near the buddy margin at
@@ -42,7 +42,7 @@ env:
 jobs:
   # Change-based CI gate. Computes which jobs + kernel-test subsystems the
   # diff can affect (crate reverse-dependency closure, see
-  # `cargo xtask affected`) and exports the decision as job outputs the
+  # `cargo narf ci affected`) and exports the decision as job outputs the
   # downstream jobs gate on. On nightly / manual (and on a
   # hub-crate / build-infra / unknown-path change), `full` is true and every
   # job runs exactly as it did before this gate existed — the safety net.
@@ -95,7 +95,7 @@ jobs:
           # PRs use their actual head, not GitHub's synthetic merge commit.
           # Pushes diff against the before SHA; diffing origin/main after
           # checkout would compare main with itself and force a full run.
-          cargo xtask affected --github --event "$CI_EVENT" \
+          cargo narf ci affected --github --event "$CI_EVENT" \
             --base "${CI_BASE:-origin/main}" --head "$CI_HEAD" "${args[@]}"
 
   fmt:
@@ -123,7 +123,7 @@ jobs:
         uses: ./.github/actions/setup-rust-cache
 
       - name: Host unit-test gate
-        run: cargo xtask host-test
+        run: cargo narf test host-test
 
   packaging:
     name: native package and UEFI layout tests
@@ -141,7 +141,7 @@ jobs:
   # The eight wifi family crates (ath9k, ath10k, ath11k, iwlwifi, mt76,
   # brcm, rtw, rtl) are dual-build: `builtin` (default) links them into
   # the kernel, `module` builds them as a loadable `.ko` against the
-  # KABI (see `cargo xtask build-module`). The rtw88-USB `.ko` already
+  # KABI (see `cargo narf build build-module`). The rtw88-USB `.ko` already
   # carries a real datapath (PRs #2327/#2337/#2338) and every other
   # family crate builds a registration-only `.ko` — but no CI job ever
   # built any of them, so a break in the module configuration (a
@@ -151,7 +151,7 @@ jobs:
   # any build — or the `nm -u` KSYMTAB gate inside `build-module` — fails.
   #
   # Ungated (like `fmt` / `packaging`): gating on the affected plan
-  # would need a new `cargo xtask affected` output, which is a follow-up,
+  # would need a new `cargo narf ci affected` output, which is a follow-up,
   # not part of this config-only change. The job builds `.ko` outputs
   # only; it uploads no artifacts.
   build-module:
@@ -187,7 +187,7 @@ jobs:
             narf-drivers-wireless-rtw \
             narf-drivers-wireless-rtl; do
             echo "=== build-module $pkg (${{ matrix.arch }}) ==="
-            cargo xtask build-module --arch=${{ matrix.arch }} \
+            cargo narf build build-module --arch=${{ matrix.arch }} \
               --package "$pkg" --no-default-features --features module
           done
 
@@ -215,7 +215,7 @@ jobs:
       - name: Clippy on changed kernel crates
         env:
           CI_CLIPPY_CRATES: ${{ needs.changes.outputs.clippy_crates }}
-        run: cargo xtask clippy-changed --arch=${{ matrix.arch }} --packages "$CI_CLIPPY_CRATES"
+        run: cargo narf ci clippy-changed --arch=${{ matrix.arch }} --packages "$CI_CLIPPY_CRATES"
 
   clippy-host:
     name: clippy / changed host crates
@@ -230,7 +230,7 @@ jobs:
       - name: Clippy on changed host crates
         env:
           CI_CLIPPY_CRATES: ${{ needs.changes.outputs.host_clippy_crates }}
-        run: cargo xtask clippy-changed --arch=host --packages "$CI_CLIPPY_CRATES"
+        run: cargo narf ci clippy-changed --arch=host --packages "$CI_CLIPPY_CRATES"
 
   uefi-loader:
     name: UEFI loader unit tests and aarch64 lint
@@ -305,29 +305,29 @@ jobs:
         uses: ./.github/actions/setup-limine
 
       # Keep the debug link gate separate from which packages need linting.
-      - name: cargo xtask build (debug / ${{ matrix.arch }})
-        run: cargo xtask build --arch=${{ matrix.arch }} --debug
+      - name: cargo narf build build (debug / ${{ matrix.arch }})
+        run: cargo narf build build --arch=${{ matrix.arch }} --debug
 
-      - name: cargo xtask boot-smoke
-        run: cargo xtask boot-smoke --arch=${{ matrix.arch }}
+      - name: cargo narf test boot-smoke
+        run: cargo narf test boot-smoke --arch=${{ matrix.arch }}
 
-      - name: cargo xtask iso-boot (firmware UEFI)
-        run: cargo xtask iso-boot --arch=${{ matrix.arch }}
+      - name: cargo narf build iso-boot (firmware UEFI)
+        run: cargo narf build iso-boot --arch=${{ matrix.arch }}
 
       - name: Self-contained native EFI boot (OVMF -> NARF)
         if: matrix.arch == 'x86_64'
-        run: cargo xtask efi-image --smoke
+        run: cargo narf build efi-image --smoke
 
       # Firmware that owns part of the kernel's link range, as the ThinkPad
       # P14s Gen 5 AMD does: the loader places the kernel higher and boot.S
       # runs it there.
       - name: Native EFI boot with the kernel's link range held
         if: matrix.arch == 'x86_64'
-        run: cargo xtask efi-image --smoke --occupy-link-range
+        run: cargo narf build efi-image --smoke --occupy-link-range
 
       - name: NVMe supervisor without a controller
         if: matrix.arch == 'x86_64'
-        run: cargo xtask test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme
+        run: cargo narf test test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme
 
       - name: Native-package UEFI boot (GRUB -> native NARF EFI)
         if: matrix.arch == 'x86_64'
@@ -350,7 +350,7 @@ jobs:
       - name: Native encrypted root (cryptsetup LUKS1/LUKS2)
         if: matrix.arch == 'x86_64'
         run: |
-          cargo xtask efi-image
+          cargo narf build efi-image
           python3 packaging/test-native-luks.py \
             --kernel target/native-uefi-x86_64/kernel.elf \
             --initramfs target/native-uefi-x86_64/initramfs.cpio
@@ -362,18 +362,18 @@ jobs:
       # reached at its physical base and the first post-`init_mmu` access
       # #PF'd on 0xFEE0_0020, which only the nightly OCI job (the one other
       # place `-x2apic` is set) ever hit. This boot is the cheap guard.
-      - name: cargo xtask boot-smoke (xAPIC fallback, no x2APIC)
+      - name: cargo narf test boot-smoke (xAPIC fallback, no x2APIC)
         if: matrix.arch == 'x86_64' && needs.changes.outputs.run_xapic == 'true'
         env:
           NARF_QEMU_CPU: "max,-x2apic"
-        run: cargo xtask boot-smoke --arch=x86_64
+        run: cargo narf test boot-smoke --arch=x86_64
 
   # ── musl-demo, split into a build-once job + a per-subsystem-group matrix ──
   # The ~80 musl/linux-compat cases are bucketed into coarse subsystem groups
   # (gui, net, signals, ipc, fs, mem, process, linux-compat). `musl-build`
   # cross-builds the kernel once and uploads it; each `musl-demo` group job
   # downloads that artifact and boots it (no rebuild), so a flaky case reddens
-  # only its group and reruns re-run only that group. See `xtask musl-demo`.
+  # only its group and reruns re-run only that group. See `cargo narf smoke musl-demo`.
   musl-build:
     name: musl-demo build (x86_64)
     needs: changes
@@ -400,10 +400,10 @@ jobs:
             cpio mtools dosfstools e2fsprogs ovmf \
             musl-tools clang lld linux-libc-dev
 
-      # Build the same kernel image `xtask musl-demo` would boot (boot-init +
+      # Build the same kernel image `cargo narf smoke musl-demo` would boot (boot-init +
       # firmware-allow-unsigned, with the demo binaries embedded).
       - name: Build kernel image
-        run: cargo xtask build --arch=x86_64 --features boot-init,firmware-allow-unsigned
+        run: cargo narf build build --arch=x86_64 --features boot-init,firmware-allow-unsigned
 
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
@@ -415,7 +415,7 @@ jobs:
 
       - name: Enumerate subsystem groups
         id: groups
-        run: echo "groups=$(cargo run -q -p xtask -- musl-demo --list-groups)" >> "$GITHUB_OUTPUT"
+        run: echo "groups=$(cargo run -q -p cargo-narf -- musl-demo --list-groups)" >> "$GITHUB_OUTPUT"
 
   musl-demo:
     name: musl-demo / ${{ matrix.group }}
@@ -457,12 +457,12 @@ jobs:
       # Boot the prebuilt kernel and run only this group's cases (lightweight
       # cases share one boot; GUI cases each get a fresh boot). GHA's TCG QEMU
       # is ~5-10x slower than local KVM, so the per-boot timeouts are bumped.
-      - name: cargo xtask musl-demo --group ${{ matrix.group }}
+      - name: cargo narf smoke musl-demo --group ${{ matrix.group }}
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
           XTASK_RI_ECHO_TIMEOUT_SECS: "900"
         run: |
-          cargo xtask musl-demo \
+          cargo narf smoke musl-demo \
             --group "${{ matrix.group }}" \
             --prebuilt "$GITHUB_WORKSPACE/prebuilt/narf-frame"
 
@@ -510,7 +510,7 @@ jobs:
       # end-to-end with an external client. GHA's TCG QEMU is slow under
       # load; bump the prompt deadline.
       #
-      # `cargo xtask net-smoke` sets the `no_redis` kernel cmdline flag, so the
+      # `cargo narf smoke net-smoke` sets the `no_redis` kernel cmdline flag, so the
       # `qemu-net` boot-init runs netserve ALONE — without it, redis-server's
       # heavy multi-threaded startup starved netserve's RX forwarder on the
       # single CI vcpu under TCG and dragged the echo past the host deadline
@@ -525,9 +525,9 @@ jobs:
       # observes is correct), the guest side is now MTTCG-safe. SMP stays 1:
       # net-smoke is a single off-box connection and needs no extra vCPUs, and
       # 1-vCPU MTTCG still drives the exact BQL code path that used to abort.
-      # `cargo xtask net-smoke` sets `no_redis` (netserve alone). (Unset accel
+      # `cargo narf smoke net-smoke` sets `no_redis` (netserve alone). (Unset accel
       # locally → KVM.)
-      - name: cargo xtask net-smoke
+      - name: cargo narf smoke net-smoke
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
           NARF_QEMU_SMP: "1"
@@ -537,7 +537,7 @@ jobs:
           # handler writes an ELF core (NT_PRSTATUS + a PT_LOAD of the kernel
           # stack) out COM2 (see frame/src/x86_64/trap.rs).
           NARF_QEMU_COM2_FILE: "${{ runner.temp }}/netsmoke-core.bin"
-        run: cargo xtask net-smoke --arch=x86_64
+        run: cargo narf smoke net-smoke --arch=x86_64
       # Drop the core file unless it actually holds a crash dump (QEMU creates
       # it empty when no core is written), so the upload only fires on a crash.
       - name: keep core only if non-empty
@@ -598,7 +598,7 @@ jobs:
           for i in $(seq 1 6); do
             echo "=== task-#87 repro iteration $i/6 ==="
             rm -f "$core"
-            NARF_QEMU_COM2_FILE="$core" cargo xtask redis-smoke --arch=x86_64 2>&1 | tee "$log" || true
+            NARF_QEMU_COM2_FILE="$core" cargo narf smoke redis-smoke --arch=x86_64 2>&1 | tee "$log" || true
             if grep -q "CPU EXCEPTION" "$log" || [ -s "$core" ]; then
               echo "::warning::task-#87 CRASH reproduced on iteration $i — uploading core + serial log"
               cp "$core" "$out/kcore.bin" 2>/dev/null || true
@@ -656,7 +656,7 @@ jobs:
           XTASK_RI_ECHO_TIMEOUT_SECS: "120"
         run: |
           XTASK_QEMU_NO_BALLOON=1 \
-            cargo xtask run-interactive --cmd chroot_run \
+            cargo narf run run-interactive --cmd chroot_run \
               --expect MMAPFORK-DONE
       - name: stress-ng under KASAN
         env:
@@ -678,7 +678,7 @@ jobs:
           # timeout), and that status feeds the assertion below.
           rc=0
           NARF_QEMU_COM2_FILE="$core" \
-            timeout 3000 cargo xtask run-interactive --kasan --cmd chroot_run \
+            timeout 3000 cargo narf run run-interactive --kasan --cmd chroot_run \
               --expect STRESS-DONE > "$log" 2>&1 || rc=$?
           echo "=== stress-ng summary ==="
           grep -E "=== stressor:|passed:|failed:|SIGSEGV|SIGILL|STRESSOR-RC|KASAN:|CPU EXCEPTION|panicked" "$log" || true
@@ -727,7 +727,7 @@ jobs:
         # subsystem filter on both architectures.
         arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     # The full in-kernel smoke suite runs under TCG (no KVM on GHA).
-    # The primary invocation uses `cargo xtask test --split`: one QEMU
+    # The primary invocation uses `cargo narf test test --split`: one QEMU
     # boot per subsystem group, each capped separately (see the primary
     # step), plus the production boot + btrfs postflight once at the end.
     # Secondary hardware/feature shards use --kernel-tests-only so they
@@ -742,7 +742,7 @@ jobs:
           components: rust-src llvm-tools-preview
 
       - name: Install host build deps
-        # Same set as the musl-demo build job: `cargo xtask test` builds the
+        # Same set as the musl-demo build job: `cargo narf test test` builds the
         # kernel-test image, which pulls the verification crate whose
         # build.rs compiles the musl-demo smokes (needs musl-tools +
         # linux-libc-dev). QEMU + OVMF boot the image.
@@ -766,7 +766,7 @@ jobs:
         uses: ./.github/actions/setup-qemu
 
       # Phase 1 boots the kernel-test image and FAILS the job if any
-      # smoke fails (the runner exit_kernel(1)s on failure; xtask test
+      # smoke fails (the runner exit_kernel(1)s on failure; cargo narf test test
       # gates on that status). Phase 2 boots real init and checks for
       # panics. `cgroup-all` so every cgroup-v2 controller's smokes run.
       # GHA's TCG QEMU is far slower than local KVM; bump the per-phase
@@ -797,8 +797,8 @@ jobs:
       # its group one named timeout failure and the run continues.
       # 900 s is ≈2.25× the slowest group's measured guest time (the
       # btrfs subtree, ≈400 s on x86_64 TCG; slowest single test 307 s);
-      # see `kernel_test_group_timeout_secs` in build/xtask.
-      - name: cargo xtask test --features cgroup-all,container
+      # see `kernel_test_group_timeout_secs` in build/cargo-narf.
+      - name: cargo narf test test --features cgroup-all,container
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           XTASK_QEMU_GROUP_TIMEOUT_SECS: "900"
@@ -813,9 +813,9 @@ jobs:
           SUBS="${{ needs.changes.outputs.subsystems }}"
           if [ -n "$SUBS" ]; then
             echo "kernel-test: affected-subsystem filter = $SUBS"
-            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --split --subsystem "$SUBS" --exclude-subsystem drivers/gpu
+            cargo narf test test --arch=${{ matrix.arch }} --features cgroup-all,container --split --subsystem "$SUBS" --exclude-subsystem drivers/gpu
           else
-            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --split --exclude-subsystem drivers/gpu
+            cargo narf test test --arch=${{ matrix.arch }} --features cgroup-all,container --split --exclude-subsystem drivers/gpu
           fi
 
       # QEMU's `virt` machine carries virtio-mmio transports in its DTB but
@@ -831,13 +831,13 @@ jobs:
       # Scoped to the one subsystem that covers it — this is a guard against
       # regression, not a second full run. aarch64 only: x86_64's q35 has no
       # virtio-mmio bus to populate.
-      - name: cargo xtask test — virtio-mmio transport populated
+      - name: cargo narf test test — virtio-mmio transport populated
         if: matrix.arch == 'aarch64' && needs.changes.outputs.run_virtio_mmio == 'true'
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           NARF_QEMU_EXTRA: "-device virtio-rng-device -global virtio-mmio.force-legacy=false"
         run: |
-          cargo xtask test --arch=aarch64 --features cgroup-all,container \
+          cargo narf test test --arch=aarch64 --features cgroup-all,container \
             --subsystem verification --kernel-tests-only
 
       # Large-memory arm. Everything about frame placement — the bootstrap
@@ -855,13 +855,13 @@ jobs:
       # path (a 1 GiB boot never carves), and clears the 4 GiB line that the
       # reach-ceiling assertions are about. Scoped to the two subsystems that
       # own this code, so it is a guard rather than a second full run.
-      - name: cargo xtask test — large-memory frame placement
+      - name: cargo narf test test — large-memory frame placement
         if: needs.changes.outputs.run_large_memory == 'true'
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           NARF_QEMU_MEM_MB: "8192"
         run: |
-          cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container \
+          cargo narf test test --arch=${{ matrix.arch }} --features cgroup-all,container \
             --subsystem memory,memory/kaslr --kernel-tests-only
 
       # Same shape, same reason, x86_64 side: the xAPIC fallback (no x2APIC)
@@ -886,8 +886,8 @@ jobs:
       # 60-minute job before reporting. The subsystem itself is tiny (2s of
       # QEMU locally under KVM), so 600s is ~300x headroom for GHA's TCG
       # while still failing fast. `timeout-minutes` is a second backstop in
-      # case the hang is upstream of xtask's own cap.
-      - name: cargo xtask test — xAPIC fallback, SMP shootdown
+      # case the hang is upstream of cargo narf's own cap.
+      - name: cargo narf test test — xAPIC fallback, SMP shootdown
         if: matrix.arch == 'x86_64' && needs.changes.outputs.run_xapic == 'true'
         timeout-minutes: 15
         env:
@@ -895,7 +895,7 @@ jobs:
           NARF_QEMU_CPU: "max,-x2apic"
           NARF_QEMU_SMP: "4"
         run: |
-          cargo xtask test --arch=x86_64 --features cgroup-all,container \
+          cargo narf test test --arch=x86_64 --features cgroup-all,container \
             --subsystem interrupts --kernel-tests-only
 
       # APIC-ID-gapped topology. QEMU numbers APIC IDs per socket from a
@@ -907,14 +907,14 @@ jobs:
       # boot does: AP bring-up (INIT/SIPI to APIC IDs), the IPI fan-out
       # (shootdown acks from every peer), the block_on bridge's cross-CPU
       # kick, and NVMe completions by MSI-X with no missed interrupt.
-      - name: cargo xtask test — APIC-ID-gapped SMP topology
+      - name: cargo narf test test — APIC-ID-gapped SMP topology
         if: matrix.arch == 'x86_64' && needs.changes.outputs.run_xapic == 'true'
         timeout-minutes: 15
         env:
           XTASK_QEMU_TIMEOUT_SECS: "600"
           NARF_QEMU_SMP: "6,sockets=2,cores=3"
         run: |
-          cargo xtask test --arch=x86_64 --kernel-tests-only \
+          cargo narf test test --arch=x86_64 --kernel-tests-only \
             --subsystem interrupts,scheduler/bridge,drivers/nvme/mq
 
       # Two same-family NICs (issue #1632): `XTASK_QEMU_SECOND_NIC=1`
@@ -929,21 +929,21 @@ jobs:
       # `run_second_nic`: the e1000 driver, the net hub, or the bus
       # changed, a frame/verification change re-linked the test
       # harness, or the run is full.
-      - name: cargo xtask test — second legacy NIC, two-device e1000
+      - name: cargo narf test test — second legacy NIC, two-device e1000
         if: matrix.arch == 'x86_64' && needs.changes.outputs.run_second_nic == 'true'
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           XTASK_QEMU_SECOND_NIC: "1"
         run: |
-          cargo xtask test --arch=x86_64 --features cgroup-all,container \
+          cargo narf test test --arch=x86_64 --features cgroup-all,container \
             --subsystem drivers/net/e1000 --kernel-tests-only
 
-      - name: cargo xtask test — native ring opt-in
+      - name: cargo narf test test — native ring opt-in
         timeout-minutes: 20
         env:
           XTASK_QEMU_TIMEOUT_SECS: "1200"
         run: |
-          cargo xtask test --arch=${{ matrix.arch }} --features native-ring \
+          cargo narf test test --arch=${{ matrix.arch }} --features native-ring \
             --subsystem abi,scheduler,userspace/authority --kernel-tests-only
 
       # Run the tests the `user-mode-e2e` feature gates. The clippy pass in
@@ -969,13 +969,13 @@ jobs:
       # they are a pre-existing gap rather than something this step introduced.
       # Widening the scope means fixing those first; leaving them outside it
       # keeps this step honest instead of red-by-default.
-      - name: cargo xtask test — user-mode e2e harnesses
+      - name: cargo narf test test — user-mode e2e harnesses
         if: needs.changes.outputs.run_user_mode == 'true'
         timeout-minutes: 20
         env:
           XTASK_QEMU_TIMEOUT_SECS: "1200"
         run: |
-          cargo xtask test --arch=${{ matrix.arch }} --features user-mode-e2e \
+          cargo narf test test --arch=${{ matrix.arch }} --features user-mode-e2e \
             --subsystem verification,userspace --kernel-tests-only
 
   # ── GPU kernel tests, split out of the primary kernel-test job ──────
@@ -993,7 +993,7 @@ jobs:
   # of its non-hub inputs changed, the cmdline-parsing boot crate
   # changed, a frame/verification change re-linked the test harness, or
   # the run is full (infra / hub / nightly / manual). Infra forcing
-  # full is deliberate: `.github/` and `build/xtask/` are infra paths,
+  # full is deliberate: `.github/` and `build/cargo-narf/` are infra paths,
   # so a change to this split itself exercises this job.
   #
   # `--kernel-tests-only`: the primary job already ran the production
@@ -1051,11 +1051,11 @@ jobs:
         if: matrix.arch == 'x86_64'
         uses: ./.github/actions/setup-qemu
 
-      - name: cargo xtask test — GPU fixtures only
+      - name: cargo narf test test — GPU fixtures only
         env:
           XTASK_QEMU_TIMEOUT_SECS: "1200"
         run: |
-          cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container \
+          cargo narf test test --arch=${{ matrix.arch }} --features cgroup-all,container \
             --subsystem drivers/gpu --kernel-tests-only
 
   feature-matrix:

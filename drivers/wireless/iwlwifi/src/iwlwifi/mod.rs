@@ -1184,7 +1184,7 @@ pub fn firmware_filename_ladder(chip: &ChipConfig) -> Vec<String> {
         // matches the core-numbering family.
         let mut api = chip.api_max;
         loop {
-            // NARF uses vendor-qualified registry keys. `xtask
+            // NARF uses vendor-qualified registry keys. `cargo narf
             // import-firmware` maps linux-firmware's flat Intel files
             // into this iwlwifi/ namespace, including sibling PNVM.
             out.push(format!(

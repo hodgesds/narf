@@ -504,7 +504,7 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
     // ── fb probe ──────────────────────────────────────────────
     // Open the active scanout via libnarf-graphics, sanity-check
     // geometry, draw a colorful demo pattern (so a developer
-    // running `cargo xtask run --display gtk --features
+    // running `cargo narf run run --display gtk --features
     // user-mode-testbin` can actually SEE userspace pixels land
     // on the framebuffer), flush, and pause briefly so the demo
     // is visible before QEMU exits. Drop closes the connection.

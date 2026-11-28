@@ -1,4 +1,4 @@
-//! `cargo xtask hibernate-e2e`: hibernate NARF on one boot and resume it on
+//! `cargo narf smoke hibernate-e2e`: hibernate NARF on one boot and resume it on
 //! the next (S4 lane 9).
 //!
 //! 1. The host builds a fresh GPT disk with one ext4 partition (4 KiB
@@ -46,7 +46,7 @@ fn exit_status(arch: super::Arch, code: i32) -> i32 {
     }
 }
 
-/// Options for `cargo xtask hibernate-e2e`.
+/// Options for `cargo narf smoke hibernate-e2e`.
 #[derive(clap::Args, Clone)]
 pub struct Args {
     #[command(flatten)]

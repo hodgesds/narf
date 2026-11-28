@@ -4,7 +4,7 @@
 #     built-in binder stays in `narf-drivers-usb::msc` (multi-LUN, UAS
 #     fallback, error recovery); its encoders are checked byte-for-byte
 #     against this codec so both builds put the same commands on the wire.
-#   * `module`: `cargo xtask build-module --package narf-drivers-usb-storage
+#   * `module`: `cargo narf build build-module --package narf-drivers-usb-storage
 #     --no-default-features --features module`. A working loadable driver:
 #     it matches BOT interfaces (08/06/50) through `narf_register_usb_driver`,
 #     drives the stick through the `narf_usb_*` exports, and publishes it as

@@ -127,12 +127,12 @@ Cargo frontend and let it detect the host package manager:
 
 ```sh
 cargo install --path build/cargo-narf
-cargo narf detect
-cargo narf install --version 0.5.0 --dry-run
-cargo narf install --version 0.5.0
+cargo narf pkg detect
+cargo narf pkg install --version 0.5.0 --dry-run
+cargo narf pkg install --version 0.5.0
 ```
 
-`cargo narf install` builds a native package and delegates installation to
+`cargo narf pkg install` builds a native package and delegates installation to
 `apt`/`dpkg`, `dnf`/`rpm`, or `pacman`; it never copies files directly into
 `/boot`. Gentoo output is generated as an overlay-ready ebuild rather than
 installed automatically because overlay registration is host policy.
@@ -159,7 +159,7 @@ goal of running the installed CachyOS root as NARF userspace.
 ## Quick start
 
 For a self-contained x86_64 EFI application that firmware can boot directly,
-without Limine, run `cargo xtask efi-image`; add `--run` to boot through OVMF
+without Limine, run `cargo narf build efi-image`; add `--run` to boot through OVMF
 or `--smoke` for a clean-shutdown gate. See
 [Build, run, and install native EFI](docs/NATIVE_UEFI.md) for ESP installation,
 boot-manager entries, firmware inclusion, and current limits. Native x86
@@ -171,38 +171,38 @@ packages use this image by default; existing media layouts remain available.
 
 ```sh
 # Boot the async demo under QEMU
-cargo xtask run --arch=x86_64
-cargo xtask run --arch=aarch64
+cargo narf run run --arch=x86_64
+cargo narf run run --arch=aarch64
 
 # Boot the interactive shell — type `echo hello world` at the narf> prompt
-cargo xtask run --arch=x86_64 --display=gtk
+cargo narf run run --arch=x86_64 --display=gtk
 
 # Run the full kernel-test suite (prints a pass/fail/skip summary)
-cargo xtask test --arch=x86_64
+cargo narf test test --arch=x86_64
 
 # Run an OCI-style container end-to-end: the `oci_smoke` runtime reads a
 # kernel-seeded bundle at /oci, unshares namespaces, chroots into the
 # bundle rootfs, and execs the contained entrypoint, which proves it is
 # isolated (sees the container's own /etc/os-release). The nightly
 # `nightly-oci` CI job runs this same demo on a schedule.
-cargo xtask run-interactive --arch=x86_64 --cmd "oci_smoke" --expect "oci-smoke-ok"
+cargo narf run run-interactive --arch=x86_64 --cmd "oci_smoke" --expect "oci-smoke-ok"
 
 # Serve off-box: boot a guest TCP echo server reachable from the host via
 # a QEMU port-forward, then connect a real host socket and round-trip a
 # line over virtio-net (kernel TCP server path + blocking accept).
-cargo xtask net-smoke --arch=x86_64
+cargo narf smoke net-smoke --arch=x86_64
 
 # Boot via Limine ISO + OVMF UEFI and require a clean boot marker
-cargo xtask iso-boot --arch=x86_64
+cargo narf build iso-boot --arch=x86_64
 
 # Boot the AA64 fallback loader + ESP under AAVMF
-cargo xtask iso-boot --arch=aarch64
+cargo narf build iso-boot --arch=aarch64
 
 # Build the ISO without booting
-cargo xtask image --arch=x86_64
+cargo narf build image --arch=x86_64
 
 # Build a GRUB bundle (direct BIOS Multiboot2 + UEFI chainload assets)
-cargo xtask grub-image --arch=x86_64
+cargo narf build grub-image --arch=x86_64
 ```
 
 External developers and distributions can compose crates without editing this
@@ -210,12 +210,12 @@ checkout. Built-ins are linked into the frame Cargo graph; modules are
 ABI-stamped, staged, and optionally autoloaded:
 
 ```sh
-cargo xtask build --composition ../my-kernel/narf.toml
-cargo xtask run --composition ../my-kernel/narf.toml
+cargo narf build build --composition ../my-kernel/narf.toml
+cargo narf run run --composition ../my-kernel/narf.toml
 
 # One-off local development
-cargo xtask build --builtin-crate ../my-driver/Cargo.toml
-cargo xtask run --module-crate ../my-module/Cargo.toml \
+cargo narf build build --builtin-crate ../my-driver/Cargo.toml
+cargo narf run run --module-crate ../my-module/Cargo.toml \
   --allow-unsigned-modules
 ```
 
@@ -229,26 +229,26 @@ them to the kernel version. See the
 for point bumps, local package preflight, and the review-only monthly PR
 workflow. Crates.io publication is not enabled yet.
 
-**Hardware profiles** isolate driver paths under `cargo xtask run`:
+**Hardware profiles** isolate driver paths under `cargo narf run run`:
 
 ```sh
-cargo xtask run --arch=x86_64 --hw-profile=minimal      # serial only
-cargo xtask run --arch=x86_64 --hw-profile=virtio-only  # virtio + serial
-cargo xtask run --arch=x86_64 --hw-profile=legacy-only  # non-virtio + serial
+cargo narf run run --arch=x86_64 --hw-profile=minimal      # serial only
+cargo narf run run --arch=x86_64 --hw-profile=virtio-only  # virtio + serial
+cargo narf run run --arch=x86_64 --hw-profile=legacy-only  # non-virtio + serial
 ```
 
 **Burning to USB** for real-hardware boot:
 
 ```sh
 # Auto-detect the first USB-attached disk
-sudo cargo xtask disk-write
+sudo cargo narf disk disk-write
 
 # Or specify the device + fast-wipe (zeroes MBR/GPT/ESP regions only)
-sudo cargo xtask disk-write --device=/dev/sdX --fast-wipe
+sudo cargo narf disk disk-write --device=/dev/sdX --fast-wipe
 sync && sudo eject /dev/sdX
 ```
 
-xtask refuses to write to a non-USB-attached device — `/dev/sda`
+cargo narf refuses to write to a non-USB-attached device — `/dev/sda`
 that's your system disk won't be touched by accident. For a real
 partitioned install (GPT + ESP + ext4 root), use `disk-write-partitioned`
 with `--esp-size-mib` / `--root-fs` / `--root-label` flags.
@@ -285,7 +285,7 @@ narf/
 ├── arch/                       — HAL: x86_64 + aarch64
 ├── abi/                        — Kernel ↔ user boundary (async rings)
 ├── security-model/             — Threat model, capabilities × domains
-├── build/xtask/                — Cargo workspace orchestration + QEMU harness
+├── build/cargo-narf/                — Cargo workspace orchestration + QEMU harness
 ├── verification/               — Kernel-test harness, smoke registry
 ├── process/                    — Contribution flow, AI-agent rules, security
 │

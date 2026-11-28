@@ -9,7 +9,7 @@
 //!     initcall. No module glue is compiled, so nothing collides with the
 //!     kernel's single `#[panic_handler]`.
 //!   * **module** (`feature = "module"`): the crate builds to a relocatable
-//!     `.ko` (via `cargo xtask build-module`). The macro emits the
+//!     `.ko` (via `cargo narf build build-module`). The macro emits the
 //!     `narf_module_init` entry point the loader calls, the `.modinfo`
 //!     key=value lines it parses, and the module's own `#[panic_handler]` —
 //!     exactly the shape of `modules/test-module/`.
@@ -91,7 +91,7 @@ macro_rules! __modinfo_line {
 ///     `#[panic_handler]`.
 ///
 /// The `kernel_abi` modinfo line is emitted as a `0x00000000` placeholder;
-/// `cargo xtask build-module` stamps it with the running kernel's ABI hash.
+/// `cargo narf build build-module` stamps it with the running kernel's ABI hash.
 /// A fallible registrar uses `register: path => i32`. Its return value is
 /// forwarded to module init so the loader can undo partial registration.
 #[macro_export]
@@ -130,7 +130,7 @@ macro_rules! narf_driver {
             $crate::__modinfo_line!("description" = $description);
             $crate::__modinfo_line!("target_domain" = $domain);
             $($crate::__modinfo_line!("required_caps" = $required_caps);)?
-            // Overwritten in place by `xtask build-module` with the running
+            // Overwritten in place by `cargo narf build build-module` with the running
             // kernel's `/sys/kernel/abi_hash`; a mismatch is rejected at load.
             $crate::__modinfo_line!("kernel_abi" = "0x00000000");
 

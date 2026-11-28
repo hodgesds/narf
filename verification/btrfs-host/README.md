@@ -44,7 +44,7 @@ depth.
 Defaults are seed 1, 2 seeds per scenario, 3000 ops in `root` (the others
 scale from it), 48 crash cut points in `root` (0 disables the crash pass),
 and 3 concurrent `btrfs check` processes. Run it with
-`cargo xtask btrfs-host-rw`.
+`cargo narf smoke btrfs-host-rw`.
 
 | module | role |
 |---|---|

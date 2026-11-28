@@ -247,7 +247,7 @@ fn run_all_impl(excluded: &[&str]) -> Summary {
 }
 
 /// Run only the tests whose subsystem matches `wanted`. Useful when
-/// the user wants to drive `cargo xtask test --subsystem
+/// the user wants to drive `cargo narf test test --subsystem
 /// drivers/net/r8169` without firing every other suite.
 pub fn run_subsystem(wanted: &str) -> Summary {
     let _ = writeln!(Writer);
@@ -1946,7 +1946,7 @@ kernel_test!(smoke_smp_mark_online_offline);
 #[cfg(target_arch = "aarch64")]
 fn smoke_smp_aarch64_ap_online() -> TestResult {
     // After PSCI bring-up at boot, CPU 1 is online if QEMU was
-    // started with -smp >= 2. xtask sets -smp 2 by default.
+    // started with -smp >= 2. cargo narf sets -smp 2 by default.
     use narf_lib::smp;
     if smp::cpu_count() < 2 {
         return TestResult::Skip("BSP-only QEMU config");
@@ -2108,7 +2108,7 @@ kernel_test!(smoke_smp_aarch64_resched_flag);
 #[cfg(target_arch = "aarch64")]
 fn smoke_smp_aarch64_dtb_count() -> TestResult {
     // QEMU virt -smp 1 (default) reports 1 CPU. The number bumps
-    // when xtask switches to `-smp N`.
+    // when cargo narf switches to `-smp N`.
     use narf_lib::smp;
     let n = smp::cpu_count();
     if n == 0 || n > narf_lib::smp::MAX_CPUS as u32 {
@@ -2122,7 +2122,7 @@ kernel_test!(smoke_smp_aarch64_dtb_count);
 #[cfg(target_arch = "x86_64")]
 fn smoke_smp_x86_64_ap_online() -> TestResult {
     // After INIT-SIPI-SIPI bring-up at boot, CPU 1 is online if QEMU
-    // was started with -smp >= 2. xtask sets -smp 2 by default.
+    // was started with -smp >= 2. cargo narf sets -smp 2 by default.
     use narf_lib::smp;
     if smp::cpu_count() < 2 {
         return TestResult::Skip("BSP-only QEMU config");
@@ -2769,7 +2769,7 @@ kernel_test!(smoke_frame_aarch64_svc_dispatches_through_global);
 // kernel stack consumed through a trap) that hangs a specific
 // later test in the default suite. Gated behind a cfg flag so the
 // default test run stays stable; enable with
-// `RUSTFLAGS='--cfg user_mode_e2e' cargo xtask test --arch=x86_64`.
+// `RUSTFLAGS='--cfg user_mode_e2e' cargo narf test test --arch=x86_64`.
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 #[repr(C)]
@@ -4551,7 +4551,7 @@ pub const NARF_COREUTIL_PS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PS_EL
 // demo. Source + REGEN.sh live in `verification/data/musl-demo/`.
 // The binary uses Linux x86_64 syscall numbers (write=1,
 // exit_group=231) and is built with stock binutils — no libc, no
-// PT_INTERP, no PT_TLS. Seeded at /bin/hello so `cargo xtask
+// PT_INTERP, no PT_TLS. Seeded at /bin/hello so `cargo narf
 // run-interactive` → `hello` at the shell prompt exercises NARF's
 // linux-compat ABI translation against a binary built outside this
 // tree's toolchain.

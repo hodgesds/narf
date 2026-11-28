@@ -57,7 +57,7 @@ wake_by_ref on the test's Waker was at a vector OTHER than `v`.**
 ## Reproducer
 
 ```bash
-XTASK_QEMU_TIMEOUT_SECS=180 cargo xtask test --arch=x86_64 2>&1 | grep virtio_blk_pci_irq
+XTASK_QEMU_TIMEOUT_SECS=180 cargo narf test test --arch=x86_64 2>&1 | grep virtio_blk_pci_irq
 ```
 
 Failure is deterministic on QEMU TCG.

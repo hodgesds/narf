@@ -6,7 +6,7 @@
 //! `narf.disks=root-rw` boot does, runs a seeded random workload mirrored
 //! into a model, then judges the result with Linux userspace (`btrfs check`,
 //! `btrfs restore`), a fresh NARF remount, and a crash-consistency replay of
-//! the recorded write/flush stream. See `--help`; `cargo xtask btrfs-host-rw`
+//! the recorded write/flush stream. See `--help`; `cargo narf smoke btrfs-host-rw`
 //! is the usual entry point.
 
 mod crash;

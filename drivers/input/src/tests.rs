@@ -1261,7 +1261,7 @@ fn smoke_virtio_input_device_name_populated() -> TestResult {
     if !input_pci::is_probed() {
         return TestResult::Skip("virtio-input not probed in this QEMU config");
     }
-    // The default xtask test profile doesn't attach virtio-tablet
+    // The default cargo narf test test profile doesn't attach virtio-tablet
     // (which is what carries a meaningful CFG_ID_NAME); just verify
     // the accessor doesn't panic and that absence is reported as
     // an empty string rather than UB-via-uninit.

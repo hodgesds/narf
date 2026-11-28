@@ -8,7 +8,7 @@
 //!
 //! A module build links ONLY the `narf_register_pci_driver` KSYMTAB import —
 //! no kernel crates — so the `.ko`'s undefined-symbol set stays within the
-//! exported ABI (xtask's `nm -u` gate enforces it).
+//! exported ABI (cargo narf's `nm -u` gate enforces it).
 
 use crate::ids::{HDA_AMD_RADEON_VENDOR, HDA_ATI_HDMI_NS_DEVICES, HDA_PCI_IDS};
 

@@ -12,7 +12,7 @@
 //! instead of only at the hand-written negative tests.
 //!
 //! This cone is host-proven: narf-bpf-btf is in the CI host-test
-//! gate (`cargo xtask host-test`) precisely because its input
+//! gate (`cargo narf test host-test`) precisely because its input
 //! comes straight from a syscall argument.
 //!
 //! Invariant: never panic, never read out of bounds. A `BtfError`

@@ -149,7 +149,7 @@ partial sectors at its edges — nothing when it covers whole sectors (Linux
 `prepare_one_folio`). An overwrite of one page of a file with one extent per
 page therefore costs what an overwrite of any page costs
 (`smoke_btrfs_overwrite_cost_tracks_range_not_extent_count`, and the
-`overwrite` scenario of `cargo xtask btrfs-host-rw`); before, each write
+`overwrite` scenario of `cargo narf smoke btrfs-host-rw`); before, each write
 read every extent item of the file, so N page-sized writes into a file of N
 single-page extents read N² items. Every write is still its own
 synchronous operation — data written, items staged and the path's tree
@@ -283,7 +283,7 @@ come from `databuf::zeroed`, which allocates fallibly: a failure is
 `OutOfMemory` (ENOMEM) with nothing staged, never an abort
 (`smoke_btrfs_large_write_buffers_bounded`,
 `smoke_btrfs_write_buffer_failure_is_enomem`, and the `overwrite` scenario of
-`cargo xtask btrfs-host-rw` under `btrfs check`).
+`cargo narf smoke btrfs-host-rw` under `btrfs check`).
 
 A commit maintains the free-space tree incrementally (`write/free_space.rs`,
 Linux `btrfs_add_to_free_space_tree` / `btrfs_remove_from_free_space_tree`
@@ -311,7 +311,7 @@ address is handed out twice, so the passes end; a guard of 1024 passes fails
 the commit before anything is written. (The earlier fixed point, which
 recomputed all three trees from the committed ones every round until two
 rounds agreed, did not settle within its 64 rounds on a filesystem of 320
-block groups with three-level trees; `cargo xtask btrfs-host-rw --scenario
+block groups with three-level trees; `cargo narf smoke btrfs-host-rw --scenario
 scale` reproduces that shape.) What the trees hold afterwards is a function
 of the final block lists alone. Each new block's `METADATA_ITEM` key is
 checked absent from the committed extent tree before it is inserted. In
@@ -445,7 +445,7 @@ which returns `-EAGAIN` for its caller to restart the transaction;
 reserved at a time is a step's first-order need whatever the size of the
 file, and the batch commits between steps when its reservation runs out
 (`smoke_btrfs_release_reserves_in_steps`, and the `release` scenario of
-`cargo xtask btrfs-host-rw`). Dropping all of a file's extents in one
+`cargo narf smoke btrfs-host-rw`). Dropping all of a file's extents in one
 operation priced every one of them at its worst case at once — some thirty
 tree blocks an extent, 2.3 GiB for a 256 MiB file — which was refused on any
 filesystem, and the chunk allocation that follows a refusal converted
@@ -645,7 +645,7 @@ transaction; a batch it fills commits after it (`write::flush_if_full`).
 An ENOSPC retry still syncs between attempts. A fallocate inside an inline
 file's first sector preallocates nothing there.
 
-Testing: besides the in-kernel smokes, `cargo xtask btrfs-host-rw` runs the
+Testing: besides the in-kernel smokes, `cargo narf smoke btrfs-host-rw` runs the
 driver in a host process (`verification/btrfs-host`) against
 `mkfs.btrfs --rootdir` fixtures shaped like a CachyOS root and
 `testdata/fixture-snapshots.img.sparse`, mounted exactly as a
@@ -677,7 +677,7 @@ unlink on its own and replays the write stream with a crash at every flush:
 each image must pass `btrfs check` and remount with the file at one of the
 step sizes.
 
-`cargo xtask btrfs-cycles [--cycles 50] [--seed N] [--jobs N]` runs the
+`cargo narf smoke btrfs-cycles [--cycles 50] [--seed N] [--jobs N]` runs the
 in-kernel driver through many mount lifetimes in one boot per guest
 (`src/cycles.rs`, entered as `narf.rootrw_interop=cycles`). The host builds a
 CachyOS-shaped root (16 KiB nodes, crc32c, block-group + free-space tree,

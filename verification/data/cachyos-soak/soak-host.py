@@ -179,7 +179,7 @@ def cpu_summary(registers):
 
 
 class Serial:
-    """Follows the serial log the xtask writes."""
+    """Follows the serial log the cargo narf writes."""
 
     def __init__(self, path):
         self.path = path

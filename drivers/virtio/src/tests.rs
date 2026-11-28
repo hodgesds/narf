@@ -29,7 +29,7 @@ pub static SMOKE_VIRTIO_V_WAKES: core::sync::atomic::AtomicU32 =
 fn smoke_virtio_blk_pci_read_sector() -> TestResult {
     // End-to-end virtio-blk-pci modern transport smoke: register the
     // driver via the bus match table, run probe_all_pci, then read
-    // sector 0 and verify the pattern xtask wrote into the backing
+    // sector 0 and verify the pattern cargo narf wrote into the backing
     // image (`(i * 0x97) & 0xFF`).
     use crate::blk_pci;
     use narf_bus::driver_match::__reset_for_test;

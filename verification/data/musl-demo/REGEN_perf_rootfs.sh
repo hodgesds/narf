@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build an Alpine/musl rootfs containing the unmodified upstream Linux perf CLI.
 #
-# Output: target/narf-vblk.img (the virtio-blk image used by xtask).
+# Output: target/narf-vblk.img (the virtio-blk image used by cargo narf).
 # Requires: root (for chroot), curl, tar, and mke2fs.
 set -eu
 

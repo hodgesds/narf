@@ -12,6 +12,6 @@ no external compiler, source extraction or generated Rust comparison harness.
 Review literal values against documented descriptor fields when updating cases;
 do not regenerate expected bytes by calling the implementation under test.
 
-Run `cargo xtask test --arch=x86_64 --subsystem drivers/wireless/ath9k` (and the
+Run `cargo narf test test --arch=x86_64 --subsystem drivers/wireless/ath9k` (and the
 same command with `--arch=aarch64`). These model checks do not establish physical
 DMA behavior, firmware execution or RF acceptance.

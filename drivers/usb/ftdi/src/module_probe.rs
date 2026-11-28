@@ -17,7 +17,7 @@
 //!    two FTDI status bytes and hand the payload to the node's readers;
 //!    on every writer kick or TX completion, move queued bytes to bulk-OUT.
 //!
-//! A module build links ONLY KSYMTAB imports (xtask's `nm -u` gate), so
+//! A module build links ONLY KSYMTAB imports (cargo narf's `nm -u` gate), so
 //! there is no allocator here: device state is a fixed table of atomics.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

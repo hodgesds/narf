@@ -2381,7 +2381,7 @@ are installed it reads `0` and refuses writes.
 ### 3.14 Kernel symbols: `/proc/kallsyms` and `kernel.kptr_restrict`
 
 `/proc/kallsyms` (0444) renders the image's symbol table
-(`narf_observability::kallsyms`, built by `xtask kallsyms`) in Linux's
+(`narf_observability::kallsyms`, built by `cargo narf build kallsyms`) in Linux's
 `kernel/kallsyms.c::s_show` format, one `%px %c %s\n` line per symbol in
 ascending address order: 16 zero-padded lowercase hex digits, the `nm(1)`
 type letter, and the `nm -C` name (Rust names demangled without the hash,

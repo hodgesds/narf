@@ -101,11 +101,11 @@ the variable embeds no keys. `register_initcalls()` installs these roots
 before firmware discovery, with SHA-256 public-key fingerprints. Runtime
 firmware files cannot add trust roots. These are public keys only.
 
-`cargo xtask pack-firmware --name NAME --payload FILE --signature SIG
+`cargo narf firmware pack-firmware --name NAME --payload FILE --signature SIG
 --public-key KEY` verifies a detached 64-byte Ed25519 signature over the
 32-byte BLAKE3 payload digest using a raw 32-byte public key, then writes
 `target/firmware/NAME`. Omitting both signing arguments retains the unsigned
-developer format. Signing/private-key custody happens outside xtask.
+developer format. Signing/private-key custody happens outside cargo narf.
 
 Linux wireless regulatory data uses its existing upstream signature rather
 than this Ed25519 firmware format. The build requires the OpenSSL CLI and
@@ -298,7 +298,7 @@ The model mirrors Linux (`linux/drivers/base/firmware_loader/main.c`
    default the initramfs carries **no firmware** (so Limine can
    allocate it as a multiboot2 module without running out of
    memory on the 1.7 GiB linux-firmware bundle). Use
-   `cargo xtask image --initramfs-firmware <glob>` to add blobs
+   `cargo narf build image --initramfs-firmware <glob>` to add blobs
    needed BEFORE root mounts (CPU microcode, early-FB GPU
    firmware, storage-controller quirk blobs). Entries here
    override in-tree fallbacks of the same canonical name.
@@ -310,9 +310,9 @@ The model mirrors Linux (`linux/drivers/base/firmware_loader/main.c`
    `NRFW` marker and metadata length before reserving space for the payload.
    A candidate that fits is read to completion and goes through the usual
    trailer and signature verification. An allocation failure skips that file.
-   `xtask image` stages everything NOT matched by
+   `cargo narf build image` stages everything NOT matched by
    `--initramfs-firmware` into `target/rootfs-firmware-staging/
-   lib/firmware/`; `xtask disk-write-partitioned` copies that
+   lib/firmware/`; `cargo narf disk disk-write-partitioned` copies that
    tree onto the NARF_ROOT ext4 partition. Rootfs entries shadow
    Initramfs entries of the same name (later wins). In ISO-only
    boots (QEMU CD-only, no root partition mounted) this initcall
@@ -333,10 +333,10 @@ blob so observability tools can audit deployment.
 ### Build-time firmware split: `--initramfs-firmware`
 
 ```
-$ cargo xtask image --initramfs-firmware "amd-ucode/*" \
+$ cargo narf build image --initramfs-firmware "amd-ucode/*" \
                     --initramfs-firmware "intel-ucode/*"
-xtask image: initramfs firmware: 12 entries (4.2 MiB)
-xtask image: rootfs firmware:    38214 entries (1696.3 MiB)
+cargo narf build image: initramfs firmware: 12 entries (4.2 MiB)
+cargo narf build image: rootfs firmware:    38214 entries (1696.3 MiB)
 ```
 
 With no `--initramfs-firmware` flags (the default):
@@ -516,7 +516,7 @@ Stage-6 lands `firmware/` in three steps:
    initramfs` walks the (now-minimal) initramfs at `Stage::Late`;
    `firmware-scan-rootfs` walks `/lib/firmware/` on the root
    partition after `root-mount-auto`; `sys_firmware_install` ships
-   for runtime updates. `xtask image --initramfs-firmware` splits
+   for runtime updates. `cargo narf build image --initramfs-firmware` splits
    the firmware bundle between initramfs and rootfs so Limine can
    allocate the initramfs as a multiboot2 module. (2 PRs.)
 

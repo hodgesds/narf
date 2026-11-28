@@ -810,5 +810,5 @@ kernel_test_in!("tracing", smoke_tdigest_scale_function_monotonic);
 
 // Host-side `cargo test` doesn't work for this crate (missing
 // linker-synthesised `__narf_probes_*` symbols), so the only test
-// surface is the kernel-test registrations above — `cargo xtask test`
+// surface is the kernel-test registrations above — `cargo narf test test`
 // runs them under QEMU like every other crate in the tree.

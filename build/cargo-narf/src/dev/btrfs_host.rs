@@ -1,4 +1,4 @@
-//! `cargo xtask btrfs-host-rw`: the host-side (no QEMU) root-rw btrfs
+//! `cargo narf smoke btrfs-host-rw`: the host-side (no QEMU) root-rw btrfs
 //! harness, `verification/btrfs-host`.
 //!
 //! Builds the `narf-btrfs-host` binary for the host (release: the workload

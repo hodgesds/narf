@@ -24,8 +24,8 @@ counters and MICs. They run inside QEMU because the real network and crypto
 types depend on kernel linker symbols. For example:
 
 ```sh
-cargo xtask test --arch=x86_64 --subsystem verification/wifi-fixtures,drivers/wireless/mt7921/dhcp,drivers/wireless/ath11k/dhcp,drivers/wireless/iwlwifi/dhcp,drivers/wireless/rtl8xxxu/dhcp,drivers/wireless/brcmfmac/station,drivers/wireless/cyw43439/interface
-cargo xtask test --arch=aarch64 --subsystem verification/wifi-fixtures,drivers/wireless/mt7921/dhcp,drivers/wireless/iwlwifi/dhcp,drivers/wireless/rtl8xxxu/dhcp,drivers/wireless/brcmfmac/station,drivers/wireless/cyw43439/interface
+cargo narf test test --arch=x86_64 --subsystem verification/wifi-fixtures,drivers/wireless/mt7921/dhcp,drivers/wireless/ath11k/dhcp,drivers/wireless/iwlwifi/dhcp,drivers/wireless/rtl8xxxu/dhcp,drivers/wireless/brcmfmac/station,drivers/wireless/cyw43439/interface
+cargo narf test test --arch=aarch64 --subsystem verification/wifi-fixtures,drivers/wireless/mt7921/dhcp,drivers/wireless/iwlwifi/dhcp,drivers/wireless/rtl8xxxu/dhcp,drivers/wireless/brcmfmac/station,drivers/wireless/cyw43439/interface
 ```
 
 MT76 uses the reactive shared AP and its native CONNAC2 descriptor adapter.

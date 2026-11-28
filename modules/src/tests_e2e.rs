@@ -10,7 +10,7 @@
 //! the refcount, and confirm clean teardown end-to-end.
 //!
 //! The focused smokes synthesize small ELF images in memory. The final smoke
-//! also loads the rustc-built `narf-test-module.ko` staged by xtask, so the
+//! also loads the rustc-built `narf-test-module.ko` staged by cargo narf, so the
 //! compiler/linker's genuine relocation output is exercised on both arches.
 //!
 //! Linux refs for the equivalent test path:
@@ -787,9 +787,9 @@ fn e2e_real_rust_module_loads_raw_and_compressed() -> TestResult {
     let abi = crate::symbols::compute_abi_hash();
     crate::symbols::set_kernel_abi(abi);
 
-    // xtask also stages its own compressed artifact. It still carries the
+    // cargo narf also stages its own compressed artifact. It still carries the
     // zero ABI placeholder, so a successful decode must reach the manifest
-    // and fail specifically with AbiMismatch. This cross-checks xtask's small
+    // and fail specifically with AbiMismatch. This cross-checks cargo narf's small
     // host encoder against the kernel's independent bounded LZ4 decoder.
     let Some((_, staged_compressed)) = initramfs
         .iter_files()
@@ -807,9 +807,9 @@ fn e2e_real_rust_module_loads_raw_and_compressed() -> TestResult {
         _ => return TestResult::Fail("xtask-compressed fixture did not reach ABI validation"),
     }
 
-    // xtask cannot know the live export-table hash while compiling the test
+    // cargo narf cannot know the live export-table hash while compiling the test
     // fixture, so it stages the fixed-width zero placeholder. Stamp the test
-    // copy in memory exactly as `xtask build-module --kernel-abi` does.
+    // copy in memory exactly as `cargo narf build build-module --kernel-abi` does.
     let mut image = staged.to_vec();
     const PLACEHOLDER: &[u8] = b"kernel_abi=0x00000000";
     let Some(value_at) = image
@@ -886,7 +886,7 @@ kernel_test_in!("modules/e2e", e2e_real_rust_module_loads_raw_and_compressed);
 /// Load the rustc-built `narf-module-rt-smoke` `.ko`. Unlike the reference
 /// test module, its object carries out-of-line `core`/`alloc` code and the
 /// runtime crate, linked in from the staticlib archive and section-GC'd by
-/// `xtask build-module`; this is the proof that such an object relocates and
+/// `cargo narf build build-module`; this is the proof that such an object relocates and
 /// runs. Its `narf_module_init` allocates through its `#[global_allocator]`,
 /// formats with `alloc::format!`, and drives two futures on its own executor
 /// (a 3 ms sleep under an async mutex and a waiter on that mutex), returning
@@ -1042,7 +1042,7 @@ fn e2e_driver_module_drives_device() -> TestResult {
     // Start the bus match table clean so probe_all sees only this module.
     narf_bus::driver_match::__reset_for_test();
 
-    // Stamp the live ABI over xtask's zero placeholder, as the loader expects.
+    // Stamp the live ABI over cargo narf's zero placeholder, as the loader expects.
     let Some(image) = stamp_fixture_abi(staged, abi) else {
         return TestResult::Fail("driver module has no ABI placeholder");
     };

@@ -8,7 +8,7 @@
 #
 #   * `builtin` (default): rlib dependency of the `narf-drivers-wireless`
 #     facade, registered from the kernel's Stage::Subsys initcalls.
-#   * `module`: built to a loadable `.ko` via `cargo xtask build-module
+#   * `module`: built to a loadable `.ko` via `cargo narf build build-module
 #     --package narf-drivers-wireless-rtw --no-default-features --features
 #     module`. The rtw88 driver source runs inside the `.ko` for the USB
 #     parts (RTL8821CU/RTL8822BU) over `narf-module-rt`, the kernel-free

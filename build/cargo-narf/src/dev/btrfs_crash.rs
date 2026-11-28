@@ -1,4 +1,4 @@
-//! `cargo xtask btrfs-crash-smoke`: btrfs commit durability across an abrupt
+//! `cargo narf smoke btrfs-crash-smoke`: btrfs commit durability across an abrupt
 //! stop.
 //!
 //! Boot 1 (`narf.btrfs_crash=write`) writes and `fsync`s a patterned file on
@@ -143,7 +143,7 @@ pub fn run(args: &Args) -> Result<()> {
     let kernel = out_dir.join(&args.build.package);
     let timeout = Duration::from_secs(args.timeout_secs);
 
-    println!("xtask btrfs-crash-smoke: boot 1 (write + fsync, then SIGKILL)");
+    println!("cargo narf smoke btrfs-crash-smoke: boot 1 (write + fsync, then SIGKILL)");
     match boot_until(
         &args.build,
         &kernel,
@@ -158,7 +158,7 @@ pub fn run(args: &Args) -> Result<()> {
         None => bail!("btrfs-crash-smoke: write boot never reported {COMMITTED}"),
     }
 
-    println!("xtask btrfs-crash-smoke: boot 2 (verify after the kill)");
+    println!("cargo narf smoke btrfs-crash-smoke: boot 2 (verify after the kill)");
     match boot_until(
         &args.build,
         &kernel,
@@ -188,6 +188,8 @@ pub fn run(args: &Args) -> Result<()> {
     if !check.status.success() || !text.contains("no error found") {
         bail!("btrfs-crash-smoke: host `btrfs check` failed on the killed image");
     }
-    println!("xtask btrfs-crash-smoke: OK — fsynced data survived SIGKILL, image check-clean");
+    println!(
+        "cargo narf smoke btrfs-crash-smoke: OK — fsynced data survived SIGKILL, image check-clean"
+    );
     Ok(())
 }

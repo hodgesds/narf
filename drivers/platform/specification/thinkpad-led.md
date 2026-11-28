@@ -10,7 +10,7 @@ source, exactly like `drivers/wireless/mt76/`:
 
 - `builtin` (default): an rlib the `narf-drivers-platform` facade
   registers from its `Stage::Device` initcall.
-- `module`: a relocatable `.ko` via `cargo xtask build-module`,
+- `module`: a relocatable `.ko` via `cargo narf build build-module`,
   registering through the `PlatformDriver` KABI exports
   (tracker #2448).
 

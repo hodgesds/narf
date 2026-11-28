@@ -35,7 +35,7 @@
 //   * "netserve: udp listening" / "netserve-udp-ok" — UDP echo (4).
 //   * "netserve-udp-client-ok" — connected UDP client (5).
 //   * "netserve-udp-gso-ok" — UDP GSO send + UDP_GRO receive (5).
-// Sizes and the pattern MUST match `net_smoke_cmd_with_nic` in xtask.
+// Sizes and the pattern MUST match `net_smoke_cmd_with_nic` in cargo narf.
 //   * "netserve-dns-ok"     — after a valid DNS response.
 //   * "netserve-nbconnect-ok" — connect(2)'s non-blocking / refused / retry states.
 //   * "netserve-ok"         — all three paths passed.
@@ -633,7 +633,7 @@ static int udp_gso_client(void) {
 // segment shows up at its offset). Phases on 10.0.2.2 run through SLIRP; the
 // `ns` phases reach a Linux TCP peer (10.0.3.1) in an unprivileged network
 // namespace over the second NIC, where netem adds delay, loss, reordering and
-// duplication. Ports and the config layout MUST match xtask's net_robust.rs.
+// duplication. Ports and the config layout MUST match cargo narf's net_robust.rs.
 // ─────────────────────────────────────────────────────────────────────────
 #include <sys/ioctl.h>
 #include <netinet/tcp.h>
