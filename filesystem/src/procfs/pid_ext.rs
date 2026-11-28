@@ -505,12 +505,12 @@ fn render_io(pid: u64) -> String {
         ("syscw: ", io.syscw),
         ("read_bytes: ", io.read_bytes),
         ("write_bytes: ", io.write_bytes),
+        ("cancelled_write_bytes: ", io.cancelled_write_bytes),
     ] {
         s.push_str(label);
         super::put_decimal(&mut s, value);
         s.push('\n');
     }
-    s.push_str("cancelled_write_bytes: 0\n");
     s
 }
 
@@ -1615,13 +1615,14 @@ impl DirOps for ProcTaskDir {
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-/// Smoke: `render_io` produces an "rchar:" line.
+/// Smoke: `render_io` produces an "rchar:" line and a
+/// "cancelled_write_bytes:" line — the full seven-field Linux shape.
 fn smoke_io_has_rchar_line() -> TestResult {
     let out = render_io(1);
-    if out.contains("rchar:") {
+    if out.contains("rchar:") && out.contains("cancelled_write_bytes:") {
         TestResult::Pass
     } else {
-        TestResult::Fail("render_io missing 'rchar:' line")
+        TestResult::Fail("render_io missing 'rchar:' or 'cancelled_write_bytes:' line")
     }
 }
 kernel_test_in!("filesystem/procfs/pid_ext", smoke_io_has_rchar_line);

@@ -11,7 +11,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::page_cache::{
     default_capacity_pages, set_default_capacity_pages, set_free_pages_hook,
-    set_low_watermark_pages, CacheFolio, FileMapping, PageCache, PageKey,
+    set_low_watermark_pages, CacheFolio, FileMapping, PageCache, PageKey, PAGE_SIZE,
 };
 
 fn key(page_off: u64) -> PageKey {
@@ -119,6 +119,45 @@ fn smoke_page_cache_never_evicts_dirty() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/page_cache", smoke_page_cache_never_evicts_dirty);
+
+/// Dropping a still-dirty folio in `remove_range` counts its bytes as
+/// cancelled writeback on the removing task (Linux
+/// `cancelled_write_bytes`); dropping a clean folio counts nothing.
+/// The counter lives on the task's storage accumulator, reached through
+/// the block layer's submitter lookup — the same source
+/// `/proc/<pid>/io` renders.
+fn smoke_page_cache_remove_range_counts_cancelled_write_bytes() -> TestResult {
+    reset_globals();
+    let owner = match narf_block::stats::current_submitter() {
+        Some(owner) => owner,
+        None => return TestResult::Fail("no submitter installed for this task"),
+    };
+    let cache = PageCache::with_capacity(4);
+    cache.__insert_folio_for_test(key(0), clean_folio(0));
+    cache.__insert_folio_for_test(key(1), clean_folio(1));
+    if !cache.mark_dirty(key(0)) {
+        return TestResult::Fail("mark_dirty on a resident page must succeed");
+    }
+    let before = owner.cancelled_write_bytes();
+    // Clean page first: dropping it must not move the counter.
+    if cache.remove_range(0, 0, 1, 2) != 1 {
+        return TestResult::Fail("clean page was not dropped");
+    }
+    if owner.cancelled_write_bytes() != before {
+        return TestResult::Fail("dropping a clean page counted as cancelled");
+    }
+    if cache.remove_range(0, 0, 0, 1) != 1 {
+        return TestResult::Fail("dirty page was not dropped");
+    }
+    if owner.cancelled_write_bytes() != before + PAGE_SIZE as u64 {
+        return TestResult::Fail("dropping a dirty page did not count one page as cancelled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/page_cache",
+    smoke_page_cache_remove_range_counts_cancelled_write_bytes
+);
 
 /// A page installed in a borrowed user PTE carries an external folio hold.
 /// Reclaim may evict it only after the last PTE releases that hold.

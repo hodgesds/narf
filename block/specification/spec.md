@@ -237,6 +237,9 @@ and each transfer contributes once to the corresponding whole disk.
 `stats::install_submitter` supplies a reference-counted process accumulator
 at submission. Completed data reads and writes charge once across registry
 guards, including partition windows and authenticated encrypted roots.
+The accumulator also carries `cancelled_write_bytes`, charged by the page
+cache — not the block layer — when the truncating task drops a still-dirty
+folio before writeback (see the filesystem spec).
 `BlockDeviceSync::accounts_process_io()` follows the live backing handle,
 so a retained partition still charges its caller after the disk leaves the registry.
 

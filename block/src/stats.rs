@@ -10,6 +10,12 @@ use crate::{BlockOp, BoxedCompletion};
 pub struct ProcessStorageIo {
     read_bytes: AtomicU64,
     write_bytes: AtomicU64,
+    /// Dirty page-cache bytes this process caused to never reach disk, by
+    /// truncating or evicting them before writeback (Linux
+    /// `cancelled_write_bytes`). Charged to the process doing the
+    /// truncation, per folio, at the page granularity Linux uses — the
+    /// page cache records dirtiness, not the dirtier.
+    cancelled_write_bytes: AtomicU64,
 }
 
 impl ProcessStorageIo {
@@ -20,6 +26,21 @@ impl ProcessStorageIo {
             self.write_bytes.load(Ordering::Relaxed),
         )
     }
+
+    /// Bytes cancelled before writeback (see the field doc).
+    pub fn cancelled_write_bytes(&self) -> u64 {
+        self.cancelled_write_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Add `bytes` to the cancelled counter. Saturates like the
+    /// task-layer character counters rather than wrapping.
+    pub fn add_cancelled_write_bytes(&self, bytes: u64) {
+        let _ = self.cancelled_write_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(bytes)),
+        );
+    }
 }
 
 type Submitter = fn() -> Option<Arc<ProcessStorageIo>>;
@@ -29,6 +50,15 @@ static SUBMITTER: OnceLock<Submitter> = OnceLock::new();
 /// workers without a user owner contribute only to device statistics.
 pub fn install_submitter(lookup: fn() -> Option<Arc<ProcessStorageIo>>) {
     let _ = SUBMITTER.set(lookup);
+}
+
+/// The storage accumulator of the process submitting on this task, if
+/// the task layer installed its lookup and this task has an owner.
+/// Filesystem code that drops dirty pages before writeback (page-cache
+/// truncation) charges the cancellation here, without going through the
+/// task table.
+pub fn current_submitter() -> Option<Arc<ProcessStorageIo>> {
+    SUBMITTER.get().and_then(|lookup| lookup())
 }
 
 #[derive(Clone, Copy)]

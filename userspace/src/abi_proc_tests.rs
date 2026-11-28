@@ -86,6 +86,142 @@ fn smoke_process_storage_io() -> TestResult {
 }
 kernel_test_in!("userspace/io_accounting", smoke_process_storage_io);
 
+// A file read/write through a guarded ext2 volume charges the calling
+// task's storage bytes: the volume's SyncBlock submits through the
+// registry PolicyGuard, whose Accounting attributes completed transfers
+// to the submitting task. This is the end-to-end proof behind
+// `/proc/<pid>/io`'s read_bytes/write_bytes — the raw-device smoke above
+// only proves the guard itself, not that filesystem I/O reaches it.
+fn smoke_process_storage_io_through_ext2() -> TestResult {
+    use narf_block::disk_policy::{DiskPolicy, PolicyGuard};
+    use narf_drivers_fs_ext2::testing;
+    use narf_drivers_fs_ext2::volume::Ext2Volume;
+    use narf_filesystem::FsInstance;
+
+    // Heap-backed block device for the test image: the volume's
+    // write-through writes land here, through the PolicyGuard.
+    // (`RamBlockDevice` is async-only; the guard needs the sync trait.)
+    struct MemDisk {
+        bytes: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+    }
+    impl narf_block::BlockDeviceSync for MemDisk {
+        fn capacity(&self) -> u64 {
+            (self.bytes.lock().len() / 512) as u64
+        }
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn read(
+            &self,
+            lba: u64,
+            n_blocks: u16,
+            out: &mut [u8],
+        ) -> Result<(), narf_block::BlockIoError> {
+            let start = lba as usize * 512;
+            let len = n_blocks as usize * 512;
+            let bytes = self.bytes.lock();
+            let src = bytes
+                .get(start..start + len)
+                .ok_or(narf_block::BlockIoError::OutOfRange)?;
+            out.get_mut(..len)
+                .ok_or(narf_block::BlockIoError::BufferTooSmall)?
+                .copy_from_slice(src);
+            Ok(())
+        }
+        fn write(
+            &self,
+            lba: u64,
+            n_blocks: u16,
+            data: &[u8],
+        ) -> Result<(), narf_block::BlockIoError> {
+            let start = lba as usize * 512;
+            let len = n_blocks as usize * 512;
+            let mut bytes = self.bytes.lock();
+            let dst = bytes
+                .get_mut(start..start + len)
+                .ok_or(narf_block::BlockIoError::OutOfRange)?;
+            dst.copy_from_slice(&data[..len]);
+            Ok(())
+        }
+    }
+
+    with_setup(|| {
+        let image = testing::hard_link_image(b"narf-ext2-io\n");
+        let device = alloc::sync::Arc::new(MemDisk {
+            bytes: narf_lib::sync::IrqSafeSpinLock::new(image),
+        });
+        let guard = alloc::sync::Arc::new(PolicyGuard::new(
+            "proc-io-ext2-test",
+            u64::MAX - 0x10ca,
+            device as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
+        )) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
+        narf_block::disk_policy::__set_policy_for_test(Some(DiskPolicy::All));
+        let result = (|| {
+            let volume = match crate::handlers::poll_io_to_completion(Ext2Volume::mount(
+                narf_block::SyncBlock::new(guard),
+                narf_lib::id::DomainId::DRIVER_0,
+            )) {
+                Some(Ok(v)) => v,
+                _ => return Err("mounting the guarded ext2 volume failed"),
+            };
+            let file =
+                match crate::handlers::poll_io_to_completion(volume.root().lookup_async("data")) {
+                    Some(Ok(f)) => f,
+                    _ => return Err("lookup of `data` failed"),
+                };
+            // Cold read: the file's data block is not cached yet, so the
+            // fill issues a block read charged to this task.
+            let before = crate::handlers::io_accounting_for_pid(FAKE_TASK);
+            let mut buf = [0u8; 64];
+            let n = match crate::handlers::poll_io_to_completion(file.read(0, &mut buf)) {
+                Some(Ok(n)) => n,
+                _ => return Err("cold file read failed"),
+            };
+            if n == 0 || &buf[..n] != b"narf-ext2-io\n" {
+                return Err("cold read content mismatch");
+            }
+            let after_read = crate::handlers::io_accounting_for_pid(FAKE_TASK);
+            if after_read.read_bytes < before.read_bytes + n as u64 {
+                return Err("a cold file read did not charge read_bytes to the reader");
+            }
+            // Write-through write: the data reaches the block device
+            // synchronously and charges the writer.
+            let payload = b"freshly written exact-content";
+            let m = match crate::handlers::poll_io_to_completion(file.write(0, payload)) {
+                Some(Ok(m)) => m,
+                _ => return Err("file write failed"),
+            };
+            if m != payload.len() {
+                return Err("short write");
+            }
+            let after_write = crate::handlers::io_accounting_for_pid(FAKE_TASK);
+            if after_write.write_bytes < after_read.write_bytes + payload.len() as u64 {
+                return Err("a file write did not charge write_bytes to the writer");
+            }
+            // The written page stays cached: reading it back issues no
+            // block transfer, so read_bytes does not move again.
+            let m = match crate::handlers::poll_io_to_completion(file.read(0, &mut buf)) {
+                Some(Ok(m)) => m,
+                _ => return Err("cached read-back failed"),
+            };
+            if m != payload.len() || &buf[..m] != payload {
+                return Err("read-back mismatch");
+            }
+            let after_cached = crate::handlers::io_accounting_for_pid(FAKE_TASK);
+            if after_cached.read_bytes != after_write.read_bytes {
+                return Err("a page-cache hit charged read_bytes");
+            }
+            Ok(())
+        })();
+        narf_block::disk_policy::__set_policy_for_test(None);
+        result
+    })
+}
+kernel_test_in!(
+    "userspace/io_accounting",
+    smoke_process_storage_io_through_ext2
+);
+
 // ── getppid(2) — infallible, returns parent visible pid (0 if none) ──
 
 fn smoke_abi_proc_getppid_pos() -> TestResult {

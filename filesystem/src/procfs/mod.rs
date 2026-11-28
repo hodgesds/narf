@@ -1104,6 +1104,7 @@ pub struct ProcessIo {
     pub syscw: u64,
     pub read_bytes: u64,
     pub write_bytes: u64,
+    pub cancelled_write_bytes: u64,
 }
 
 pub type IoAccountingFn = fn(u64) -> ProcessIo;

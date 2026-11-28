@@ -1216,6 +1216,14 @@ impl PageCache {
     /// kept. Callers that may have the pages mapped into userspace must
     /// unmap them first; a removed folio stays alive for whoever still holds
     /// a reference to it. Returns the number of resident base pages dropped.
+    ///
+    /// A folio dropped while still dirty is a cancelled writeback: its
+    /// bytes never reach disk, so they count in the removing task's
+    /// `cancelled_write_bytes` (Linux charges the truncator, per folio, at
+    /// page granularity — the cache records dirtiness, not the dirtier).
+    /// Truncate/punch callers normally write back first, so this fires
+    /// only for pages dirtied after the writeback (a failed write, a
+    /// concurrent fault) or dropped at inode eviction without a sync.
     pub fn remove_range(&self, fs_id: u32, inode: u64, first_page: u64, end_page: u64) -> usize {
         if first_page >= end_page {
             return 0;
@@ -1232,6 +1240,7 @@ impl PageCache {
         };
         let mut wake: Vec<Waker> = Vec::new();
         let mut dropped = 0;
+        let mut cancelled_bytes: u64 = 0;
         let mut removed: Vec<Arc<CacheFolio>> = Vec::new();
         {
             let mut g = self.inner.lock();
@@ -1243,15 +1252,25 @@ impl PageCache {
             }
             for key in victims {
                 match g.folios.remove(&key).map(|slot| slot.state) {
-                    Some(SlotState::Resident { folio, .. }) => {
+                    Some(SlotState::Resident { folio, dirty, .. }) => {
                         let pages = folio.page_count();
                         g.resident_pages = g.resident_pages.saturating_sub(pages);
                         dropped += pages;
+                        if dirty {
+                            cancelled_bytes = cancelled_bytes.saturating_add(folio.len() as u64);
+                        }
                         removed.push(folio);
                     }
                     Some(SlotState::Filling { waiters, .. }) => wake.extend(waiters),
                     None => {}
                 }
+            }
+        }
+        // Charge the cancellation to the removing task, outside the cache
+        // lock: the submitter lookup may take task-table locks.
+        if cancelled_bytes > 0 {
+            if let Some(owner) = narf_block::stats::current_submitter() {
+                owner.add_cancelled_write_bytes(cancelled_bytes);
             }
         }
         // Frames return to the buddy (when last referenced) outside the lock.
