@@ -63,6 +63,15 @@ Implemented:
   and `LOST` wire layouts.
 - `PERF_EVENT_IOC_ENABLE`, `DISABLE`, `REFRESH`, `RESET`, and `ID`.
 
+Software-event admission (`PERF_TYPE_SOFTWARE`): `cpu-clock`,
+`task-clock`, and `dummy` are implemented. `page-faults`,
+`context-switches`, `cpu-migrations`, `page-faults-min`,
+`page-faults-maj`, `alignment-faults`, `emulation-faults`,
+`bpf-output`, and `cgroup-switches` are recognized and declined with
+`EOPNOTSUPP` — no scheduler, fault, emulation, BPF-output, or cgroup
+attribution backend exists yet, so the CLI reports them as
+`<not supported>` rather than receiving fabricated counts.
+
 Gaps:
 
 - Pinned/exclusive events, filters, SIGTRAP delivery, and

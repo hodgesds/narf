@@ -23,7 +23,10 @@ use narf_linux_perf_uapi::{
     PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_SIGTRAP, PERF_ATTR_FLAG_TASK,
     PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0, PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
     PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES,
-    PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK, PERF_COUNT_SW_DUMMY,
+    PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_ALIGNMENT_FAULTS, PERF_COUNT_SW_BPF_OUTPUT,
+    PERF_COUNT_SW_CGROUP_SWITCHES, PERF_COUNT_SW_CONTEXT_SWITCHES, PERF_COUNT_SW_CPU_CLOCK,
+    PERF_COUNT_SW_CPU_MIGRATIONS, PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_EMULATION_FAULTS,
+    PERF_COUNT_SW_PAGE_FAULTS, PERF_COUNT_SW_PAGE_FAULTS_MAJ, PERF_COUNT_SW_PAGE_FAULTS_MIN,
     PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
     PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM,
     PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
@@ -4949,10 +4952,25 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
         #[cfg(target_arch = "aarch64")]
         PERF_TYPE_HARDWARE | PERF_TYPE_RAW => aarch_pmu_event(attr).is_some(),
         // PERF_TYPE_SOFTWARE
-        PERF_TYPE_SOFTWARE => matches!(
-            attr.config,
-            PERF_COUNT_SW_DUMMY | PERF_COUNT_SW_CPU_CLOCK | PERF_COUNT_SW_TASK_CLOCK
-        ),
+        PERF_TYPE_SOFTWARE => match attr.config {
+            // Implemented: exact scheduler accounting (cpu/task clocks) and
+            // the dummy event whose specified count is exactly zero.
+            PERF_COUNT_SW_DUMMY | PERF_COUNT_SW_CPU_CLOCK | PERF_COUNT_SW_TASK_CLOCK => true,
+            // Recognized but uncounted: no scheduler, fault, emulation,
+            // BPF-output, or cgroup attribution backend exists yet. The
+            // open site declines these as EOPNOTSUPP — never estimated
+            // and never silently zero.
+            PERF_COUNT_SW_PAGE_FAULTS
+            | PERF_COUNT_SW_CONTEXT_SWITCHES
+            | PERF_COUNT_SW_CPU_MIGRATIONS
+            | PERF_COUNT_SW_PAGE_FAULTS_MIN
+            | PERF_COUNT_SW_PAGE_FAULTS_MAJ
+            | PERF_COUNT_SW_ALIGNMENT_FAULTS
+            | PERF_COUNT_SW_EMULATION_FAULTS
+            | PERF_COUNT_SW_BPF_OUTPUT
+            | PERF_COUNT_SW_CGROUP_SWITCHES => false,
+            _ => false,
+        },
         PERF_TYPE_TRACEPOINT => attr.config != 0,
         // PERF_TYPE_HW_CACHE (3)
         #[cfg(target_arch = "x86_64")]

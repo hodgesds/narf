@@ -11,7 +11,11 @@ use crate::abi_test_support::*;
 use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
     PERF_ATTR_FLAG_EXCLUDE_USER, PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT,
-    PERF_ATTR_FLAG_WATERMARK,
+    PERF_ATTR_FLAG_WATERMARK, PERF_COUNT_SW_ALIGNMENT_FAULTS, PERF_COUNT_SW_BPF_OUTPUT,
+    PERF_COUNT_SW_CGROUP_SWITCHES, PERF_COUNT_SW_CONTEXT_SWITCHES, PERF_COUNT_SW_CPU_CLOCK,
+    PERF_COUNT_SW_CPU_MIGRATIONS, PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_EMULATION_FAULTS,
+    PERF_COUNT_SW_PAGE_FAULTS, PERF_COUNT_SW_PAGE_FAULTS_MAJ, PERF_COUNT_SW_PAGE_FAULTS_MIN,
+    PERF_COUNT_SW_TASK_CLOCK, PERF_TYPE_SOFTWARE,
 };
 
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
@@ -1429,6 +1433,69 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/perf", smoke_abi_perf_event_open_validation);
+
+/// Software events Linux defines that NARF recognizes but does not count:
+/// page faults, context switches, CPU migrations, minor/major faults,
+/// alignment/emulation faults, BPF output, and cgroup switches have no
+/// scheduler, fault, emulation, BPF-output, or cgroup attribution backend
+/// yet, so the open declines them as EOPNOTSUPP — never estimated and
+/// never silently zero. The three implemented software events (dummy,
+/// cpu-clock, task-clock) still open.
+fn smoke_perf_software_unsupported_events() -> TestResult {
+    with_setup(|| {
+        let open = |attr: &PerfEventAttr| {
+            call(
+                Syscall::PerfEventOpen.raw(),
+                a3(attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+            )
+        };
+        for config in [
+            PERF_COUNT_SW_PAGE_FAULTS,
+            PERF_COUNT_SW_CONTEXT_SWITCHES,
+            PERF_COUNT_SW_CPU_MIGRATIONS,
+            PERF_COUNT_SW_PAGE_FAULTS_MIN,
+            PERF_COUNT_SW_PAGE_FAULTS_MAJ,
+            PERF_COUNT_SW_ALIGNMENT_FAULTS,
+            PERF_COUNT_SW_EMULATION_FAULTS,
+            PERF_COUNT_SW_BPF_OUTPUT,
+            PERF_COUNT_SW_CGROUP_SWITCHES,
+        ] {
+            let attr = PerfEventAttr {
+                type_: PERF_TYPE_SOFTWARE,
+                size: core::mem::size_of::<PerfEventAttr>() as u32,
+                config,
+                ..PerfEventAttr::default()
+            };
+            match open(&attr) {
+                Some(EOPNOTSUPP) => {}
+                _ => {
+                    return Err(
+                        "perf_event_open accepted a software event with no counting backend",
+                    );
+                }
+            }
+        }
+        for config in [
+            PERF_COUNT_SW_DUMMY,
+            PERF_COUNT_SW_CPU_CLOCK,
+            PERF_COUNT_SW_TASK_CLOCK,
+        ] {
+            let attr = PerfEventAttr {
+                type_: PERF_TYPE_SOFTWARE,
+                size: core::mem::size_of::<PerfEventAttr>() as u32,
+                config,
+                ..PerfEventAttr::default()
+            };
+            let fd = match open(&attr) {
+                Some(fd) if fd >= 0 => fd as u32,
+                _ => return Err("perf_event_open rejected an implemented software event"),
+            };
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/perf", smoke_perf_software_unsupported_events);
 
 /// The context-switch hook's fast gates (Linux `perf_sched_events` plus the
 /// per-task `perf_event_ctxp` test) follow event lifetime exactly: a
