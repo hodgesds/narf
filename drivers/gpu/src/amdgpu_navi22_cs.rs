@@ -1012,13 +1012,13 @@ mod tests {
     /// reports what its native queue takes: `validate` / `validate_media`,
     /// per ring (192 GFX, 125 compute, 49 SDMA, 16 media).
     fn navi22_cs_max_ibs_is_what_the_native_queues_take() -> TestResult {
-        for id in 0..RING_IDS {
+        for (id, ring) in RINGS.iter().enumerate().take(RING_IDS) {
             let media = (crate::amdgpu_vcn_navi22_cs::FIRST_ID..8).contains(&id);
             let native = if media {
                 crate::amdgpu_navi22_submit::MEDIA_MAX_IBS
             } else {
-                match RINGS[id] {
-                    Some(ring) => crate::amdgpu_navi22_submit::max_ibs(ring),
+                match ring {
+                    Some(r) => crate::amdgpu_navi22_submit::max_ibs(*r),
                     None => 0,
                 }
             };
