@@ -1103,6 +1103,10 @@ kernel_abi! {
 
     /// Publish physical carrier for this module's own device and ifindex.
     /// Administrative IFF_UP is unchanged. `carrier` must be 0 or 1.
+    ///
+    /// # Safety
+    /// The caller must use its module execution context. The kernel validates
+    /// device/interface ownership and rejects invalid carrier values.
     requires narf_capabilities::CapKind::NetIface;
     fn narf_netif_set_link(dev: u64, ifindex: u32, carrier: u32) -> i32 {
         if carrier > 1 { return -22; }
