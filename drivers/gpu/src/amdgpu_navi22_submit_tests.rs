@@ -1130,7 +1130,7 @@ fn navi22_vmid_clients_share_a_ring_and_flush_only_on_change() -> TestResult {
     let flushed = syncs_and_lut_writes(&ring_words(&e, from, e.queue.wptr));
     let flush_count = e.hw.io.flushes.len();
     // A new root in the same space no longer matches its VMID's context:
-    // it takes the most recently used idle VMID (grab_idle) and flushes.
+    // it takes the least recently used idle VMID (grab_idle) and flushes.
     let moved = Client {
         ptb: a.ptb + (64 << 12),
         ..a
@@ -1189,6 +1189,11 @@ fn navi22_vmid_exhaustion_waits_then_reuses_the_idle_vmid() -> TestResult {
     granted.sort_unstable();
     if granted != (first..=last).collect::<alloc::vec::Vec<_>>() {
         return TestResult::Fail("grants left VMIDs 1-7 or touched KFD's 8-15");
+    }
+    // The first grant from a fresh manager is the first client VMID
+    // (Linux walks `ids_lru` forward from its head).
+    if first_owner != first {
+        return TestResult::Fail("first grab must take the first client VMID");
     }
     // An eighth client waits: every client VMID has an unfinished job.
     let done = |t| job_done(0, none, t);
