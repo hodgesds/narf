@@ -24,18 +24,23 @@ impl Drop for Temp {
 fn cli_only_encodes_explicit_board_records() {
     use clap::Parser;
     for mode in ["check", "write", "extract"] {
-        assert!(crate::Cli::try_parse_from(["xtask", "wifi-fixtures", mode]).is_err());
+        assert!(
+            crate::dev::Cli::try_parse_from(["cargo-narf", "firmware", "wifi-fixtures", mode])
+                .is_err()
+        );
     }
-    assert!(crate::Cli::try_parse_from([
-        "xtask",
+    assert!(crate::dev::Cli::try_parse_from([
+        "cargo-narf",
+        "firmware",
         "wifi-fixtures",
         "board-manifest",
         "--output",
         "out.bin"
     ])
     .is_err());
-    assert!(crate::Cli::try_parse_from([
-        "xtask",
+    assert!(crate::dev::Cli::try_parse_from([
+        "cargo-narf",
+        "firmware",
         "wifi-fixtures",
         "board-manifest",
         "--input",

@@ -7,7 +7,7 @@
 #     registered from the kernel's Stage::Subsys initcall. The real driver
 #     (BAR map, DMA rings, MSI-X, net-stack registration) lives here.
 #   * `module`: built to a relocatable `.ko` via
-#     `cargo xtask build-module -p narf-drivers-net-e1000 --no-default-features
+#     `cargo narf build build-module -p narf-drivers-net-e1000 --no-default-features
 #     --features module`. The kernel crates are dropped from the graph and the
 #     driver registers through the `narf_register_pci_driver` KSYMTAB export.
 #     The loader assigns its isolation frame at runtime; the current datapath
@@ -28,7 +28,7 @@ name       = "narf_drivers_net_e1000"
 path       = "src/lib.rs"
 # rlib, for the built-in facade dependency and the kernel link (which supplies
 # the allocator + panic handler). The `.ko` build overrides this to `staticlib`
-# with `cargo rustc --crate-type staticlib` in `xtask build-module`, so the
+# with `cargo rustc --crate-type staticlib` in `cargo narf build build-module`, so the
 # standalone staticlib — which WOULD need its own allocator/panic handler — is
 # only ever produced in the `module` config, where it does not allocate and the
 # macro supplies the panic handler.
@@ -56,7 +56,7 @@ builtin = [
     "dep:narf-power",
 ]
 # Module: NO kernel crates. The only undefined symbols in the `.ko` are the
-# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
+# C-ABI KSYMTAB exports; `cargo narf build build-module`'s `nm -u` gate enforces that.
 module = []
 
 [dependencies]

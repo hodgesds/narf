@@ -12,7 +12,7 @@ name = "narf_kallsyms"
 path = "src/lib.rs"
 
 [features]
-# The encoder (`encode` module). Host-only: `build/xtask` enables it to write
+# The encoder (`encode` module). Host-only: `build/cargo-narf` enables it to write
 # the table after linking; the kernel only ever decodes.
 alloc = []
 

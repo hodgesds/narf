@@ -96,7 +96,7 @@ jobs:
         # reported directly. The login retry that tolerates TCG keystroke
         # garbling remains inside run-interactive itself.
         run: >
-          cargo xtask run-interactive
+          cargo narf run run-interactive
           --arch=x86_64
           --features container
           --retries 0
@@ -104,7 +104,7 @@ jobs:
           --expect "oci-uts-isolated"
       - name: user namespace credentials and procfs end to end
         run: >
-          cargo xtask run-interactive
+          cargo narf run run-interactive
           --arch=x86_64
           --features container
           --retries 0

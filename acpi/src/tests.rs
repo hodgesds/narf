@@ -1656,7 +1656,7 @@ fn smoke_acpi_srat_topology_present() -> TestResult {
             "needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs",
         );
     }
-    // The xtask QEMU config publishes 2 NUMA nodes via `-numa
+    // The cargo narf QEMU config publishes 2 NUMA nodes via `-numa
     // node,...,memdev=memN`, so SRAT must be present and decode
     // CPU+memory affinity. Synthetic-body tests scrub the shared
     // tables, so re-parse from the cached RSDP first.
@@ -1757,7 +1757,7 @@ fn smoke_acpi_madt_topology_present() -> TestResult {
             "needs the default multi-CPU QEMU config; NARF_QEMU_SMP shrinks the vCPU count",
         );
     }
-    // The xtask QEMU config has 2 CPUs; MADT must enumerate both
+    // The cargo narf QEMU config has 2 CPUs; MADT must enumerate both
     // and expose the LAPIC base.
     let rsdp = match crate::cached_rsdp() {
         Some(p) => p,
@@ -1815,7 +1815,7 @@ fn smoke_acpi_hmat_latency_lookup() -> TestResult {
             "needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops hmat=on + -numa",
         );
     }
-    // The xtask QEMU config publishes a 2x2 HMAT lat/bw matrix:
+    // The cargo narf QEMU config publishes a 2x2 HMAT lat/bw matrix:
     // same-node latency 10 ns, cross-node 20 ns. Verify the parser
     // returns sane values for both axes.
     let rsdp = match crate::cached_rsdp() {

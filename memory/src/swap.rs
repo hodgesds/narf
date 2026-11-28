@@ -1856,7 +1856,7 @@ pub fn __reset_for_test() {
 }
 
 // In-kernel smoke tests. Registered unconditionally (matching
-// `memory/src/tests.rs`) so `cargo xtask test` runs them from the boot
+// `memory/src/tests.rs`) so `cargo narf test test` runs them from the boot
 // image; a plain `cargo test` on the host also picks them up.
 mod tests {
     use super::*;

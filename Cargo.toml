@@ -37,7 +37,6 @@ members = [
     "rcu",
     "bus",
     "event_bus",
-    "build/xtask",
     "verification/btrfs-host",
     "verification/ext4-host",
     "build/cargo-narf",
@@ -187,7 +186,7 @@ members = [
     "modules/test-module",
 ]
 # narf-testbin / userspace/init / userspace/shell are built out-of-
-# line by verification's build.rs (and by xtask's iso-boot path)
+# line by verification's build.rs (and by cargo narf's iso-boot path)
 # because they need a bare-metal target (x86_64-unknown-none),
 # distinct linker scripts, and a release profile that doesn't
 # inherit the kernel workspace's fat-LTO settings. They define

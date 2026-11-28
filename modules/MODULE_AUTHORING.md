@@ -10,7 +10,7 @@ architecture-comparison overview, see the workspace-root
 > **Status note.** Build your module with:
 >
 > ```sh
-> cargo xtask build-module --manifest-path /path/to/Cargo.toml \
+> cargo narf build build-module --manifest-path /path/to/Cargo.toml \
 >   --package <your-crate> --arch x86_64
 > ```
 >
@@ -34,7 +34,7 @@ architecture-comparison overview, see the workspace-root
 >
 > ```sh
 > cat /sys/kernel/abi_hash                       # e.g. 0x1f3a90c2
-> cargo xtask build-module --package <your-crate> \
+> cargo narf build build-module --package <your-crate> \
 >       --arch x86_64 --kernel-abi 0x1f3a90c2
 > ```
 >
@@ -48,14 +48,14 @@ architecture-comparison overview, see the workspace-root
 > production module, build the envelope first and attach the signature second:
 >
 > ```sh
-> cargo xtask build-module --package <your-crate> --arch x86_64 \
+> cargo narf build build-module --package <your-crate> --arch x86_64 \
 >   --kernel-abi 0x1f3a90c2 --compress --out module.ko.lz4
 > # Produce module.sig over BLAKE3(module.ko.lz4) with the release signer.
-> cargo xtask attach-module-signature --module module.ko.lz4 \
+> cargo narf build attach-module-signature --module module.ko.lz4 \
 >   --signature module.sig --public-key module.pub
 > ```
 >
-> xtask verifies the detached signature before writing the fixed `NRFM`
+> cargo narf verifies the detached signature before writing the fixed `NRFM`
 > trailer. The signature covers the compressed `NRFCMOD` header and LZ4 bytes,
 > so production kernels authenticate before allocating the bounded (32 MiB
 > maximum) output buffer or running the decompressor. Unsigned modules are
@@ -339,7 +339,7 @@ arguments, and marking only the pointer-taking ones would imply the rest
 had been checked.
 
 Safe wrappers may live in your crate or in a kernel-free dependency
-crate: `cargo xtask build-module` links out-of-line code from the
+crate: `cargo narf build build-module` links out-of-line code from the
 crate's dependencies into the `.ko`, so a wrapper in another crate is
 resolved inside the module and only the `narf_*` export it calls is
 left for KSYMTAB.

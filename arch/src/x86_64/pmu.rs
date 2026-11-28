@@ -1294,7 +1294,7 @@ pub mod tests {
 
     // ── Test 5: detect() returns vendor-correct backend ───────────
     //
-    // On the QEMU x86_64 TCG target used by `cargo xtask test`:
+    // On the QEMU x86_64 TCG target used by `cargo narf test test`:
     // - CPUID.0.EBX = "Genu" (Intel) → detect() must return Intel
     //   IF CPUID leaf 0x0A reports version >= 1, else None.
     // - On real AMD hardware detect() must return Amd.

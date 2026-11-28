@@ -11,7 +11,7 @@
 #   * `builtin` (default): compiles the pure level computation and
 #     the (empty) registration. Nothing is registered.
 #   * `module`: built to a relocatable `.ko` via
-#     `cargo xtask build-module --package narf-drivers-leds-audio-micmute \
+#     `cargo narf build build-module --package narf-drivers-leds-audio-micmute \
 #        --no-default-features --features module`. The only undefined
 #     symbols in the `.ko` are the C-ABI KSYMTAB exports.
 
@@ -28,7 +28,7 @@ repository.workspace   = true
 name = "narf_drivers_leds_audio_micmute"
 path = "src/lib.rs"
 # rlib for the built-in facade dependency and the kernel link. The `.ko` build
-# overrides this to `staticlib` via `cargo xtask build-module`.
+# overrides this to `staticlib` via `cargo narf build build-module`.
 
 [features]
 default = ["builtin"]
@@ -36,7 +36,7 @@ default = ["builtin"]
 # itself is module-only — no kernel crates, no registration.
 builtin = ["dep:narf-kernel-test"]
 # Module: NO kernel crates. The only undefined symbols in the `.ko` are the
-# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
+# C-ABI KSYMTAB exports; `cargo narf build build-module`'s `nm -u` gate enforces that.
 module = []
 # Declared so the `any(test, feature = "kernel-test")` gate on the
 # tests module resolves; the smokes need no extra dependency.

@@ -10,7 +10,7 @@ use clap::Parser;
 pub struct Args {
     #[arg(long, value_parser = ["x86_64", "aarch64", "host"])]
     arch: String,
-    /// JSON array from `xtask affected`'s clippy_crates or host_clippy_crates.
+    /// JSON array from `cargo narf ci affected`'s clippy_crates or host_clippy_crates.
     #[arg(long)]
     packages: String,
     /// Print commands without running Clippy (metadata is still resolved).
@@ -127,7 +127,7 @@ pub fn run(args: &Args, root: &Path) -> Result<()> {
     // Module-config pass: lint the loadable-`.ko` build directly. There is no
     // frame to unify features through here (a module is not linked into the
     // kernel), so bypass the planning loop and pin the exact feature set the
-    // `xtask build-module` path uses.
+    // `cargo narf build build-module` path uses.
     if args.module_config {
         let mut module_args = vec![
             "clippy".to_string(),

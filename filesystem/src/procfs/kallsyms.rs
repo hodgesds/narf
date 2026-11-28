@@ -172,7 +172,7 @@ impl Cursor {
             n = take;
         }
         let Ok(table) = kallsyms::table() else {
-            // No table in this image (linked without `xtask`'s patch step):
+            // No table in this image (linked without `cargo narf`'s patch step):
             // the file exists and is empty.
             self.pos += n as u64;
             return n;

@@ -19,7 +19,7 @@
 # boot-init covers with a memfs mount that would shadow the staged file:
 #
 #   XTASK_STAGE_BIN=$PWD/tmpfs_share_smoke_x86_64:tmpfs_share \
-#     cargo xtask run-interactive --cmd /tmpfs_share \
+#     cargo narf run run-interactive --cmd /tmpfs_share \
 #       --expect tmpfs-share-ok --features boot-init,firmware-allow-unsigned
 #
 # It must also pass on the host's real Linux kernel: every assertion in it

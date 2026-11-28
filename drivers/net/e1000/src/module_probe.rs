@@ -9,7 +9,7 @@
 //! in the operator-selected isolation domain.
 //!
 //! A module build links ONLY these KSYMTAB imports — no kernel crates — so the
-//! `.ko`'s undefined-symbol set stays within the exported ABI (xtask's `nm -u`
+//! `.ko`'s undefined-symbol set stays within the exported ABI (cargo narf's `nm -u`
 //! gate enforces it).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

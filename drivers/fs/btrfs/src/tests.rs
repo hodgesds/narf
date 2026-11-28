@@ -12550,16 +12550,16 @@ fn smoke_btrfs_shared_instance_views() -> TestResult {
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_shared_instance_views);
 
 /// The same sharing on real (QEMU NVMe) hardware through the registry the
-/// `mount -t btrfs` and root factories use. Two subvolume mounts of xtask's
+/// `mount -t btrfs` and root factories use. Two subvolume mounts of cargo narf's
 /// disposable nvme0 image write concurrently with genuinely asynchronous I/O,
-/// then sync; the xtask postflight runs host `btrfs check` on the result.
+/// then sync; the cargo narf postflight runs host `btrfs check` on the result.
 /// Subvolumes are created with NARF's own subvolume-creation path first.
 fn smoke_btrfs_shared_instance_nvme() -> TestResult {
     use crate::volume::Subvol;
     use narf_block::fs_detect::{detect_filesystem, FsType};
     use narf_filesystem::FsInstance;
 
-    // Test-only: mutate only the disk xtask provided for it.
+    // Test-only: mutate only the disk cargo narf provided for it.
     if !narf_boot::args().has_flag("narf.btrfs_smoke") {
         return TestResult::Skip("no disposable btrfs disk (narf.btrfs_smoke)");
     }
@@ -13535,7 +13535,7 @@ fn smoke_btrfs_bgt_many_small_files_rw() -> TestResult {
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_bgt_many_small_files_rw);
 
 /// The many-small-files pattern of `cachyos-root-smoke --rw` against
-/// whatever large btrfs image xtask serves on nvme0
+/// whatever large btrfs image cargo narf serves on nvme0
 /// (`XTASK_BTRFS_NVME_IMAGE`, with `narf.btrfs_bigtree` on the command line):
 /// a fresh directory under `@` receives hundreds of files, directories,
 /// writes, renames and unlinks through the VFS, then everything is read back
@@ -13809,7 +13809,7 @@ async fn racing_writers<B: narf_block::BlockDevice + 'static>(
     Ok(())
 }
 
-/// [`racing_writers`] on xtask's NVMe btrfs disk (real asynchronous I/O).
+/// [`racing_writers`] on cargo narf's NVMe btrfs disk (real asynchronous I/O).
 fn smoke_btrfs_racing_writers_nvme() -> TestResult {
     use core::fmt::Write as _;
     use narf_block::fs_detect::{detect_filesystem, FsType};

@@ -53,9 +53,9 @@ u16. DD bit at `status_error & 1`.
 ## Validation
 
 - `cargo build --workspace --bins` — clean.
-- `cargo xtask run --arch=x86_64 --display none` (30 s) — QEMU
+- `cargo narf run run --arch=x86_64 --display none` (30 s) — QEMU
   82540EM still binds polled-only (no ME, no MSI-X).
-- `cargo xtask test --arch=x86_64` (180 s) — 2388 pass / 2 fail /
+- `cargo narf test test --arch=x86_64` (180 s) — 2388 pass / 2 fail /
   49 skip. Both fails are the pre-existing virtio-blk-pci_irq_async
   baseline; no new regressions. 5 new smokes:
 

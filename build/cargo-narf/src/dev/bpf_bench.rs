@@ -1,9 +1,9 @@
-//! `cargo xtask bpf-bench` — boot the BPF benchmark suite, harvest the raw
+//! `cargo narf bench bpf-bench` — boot the BPF benchmark suite, harvest the raw
 //! samples, and apply `verification/specification/spec.md` §8 to them.
 //!
 //! The kernel side (`bpf/bench`) collects samples and emits them; everything
 //! judgemental happens here. That boundary is deliberate — see
-//! [`crate::bench_stats`] for why — and it makes this subcommand the only place
+//! [`crate::dev::bench_stats`] for why — and it makes this subcommand the only place
 //! that can say the word "regression".
 //!
 //! ## The precondition gate
@@ -32,11 +32,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use wait_timeout::ChildExt;
 
-use crate::bench_stats::{
+use crate::dev::bench_stats::{
     benjamini_hochberg, delta_pct_ci, mann_whitney_u, mean, stddev, summarize, welch_t_test,
     Comparison, Decision, Series, Summary,
 };
-use crate::{cargo_build, ensure_feature, workspace_root, Arch, BuildArgs};
+use crate::dev::{cargo_build, ensure_feature, workspace_root, Arch, BuildArgs};
 
 #[derive(clap::Parser, Clone)]
 pub struct BpfBenchArgs {
@@ -610,7 +610,7 @@ fn resamples_publishable(resamples: usize) -> Result<bool> {
 }
 
 fn verify_protocol_preconditions(args: &BpfBenchArgs, accel: &str) -> Result<(bool, Option<u64>)> {
-    println!("xtask bpf-bench: observing the required 30s pre-run thermal window...");
+    println!("cargo narf bench bpf-bench: observing the required 30s pre-run thermal window...");
     let thermal = monitor_thermal_window();
     let pre = check_preconditions(accel, &thermal);
     println!("── §8.2 noise-control preconditions ─────────────────────");
@@ -667,7 +667,7 @@ pub fn bpf_bench_cmd(args: &BpfBenchArgs) -> Result<()> {
         // publish cases have no aarch64 emitter to measure and would skip,
         // and RDTSC-versus-CNTPCT changes what a "cycle" means. Refuse rather
         // than silently report a different metric under the same name.
-        bail!("xtask bpf-bench: only x86_64 is wired (no aarch64 emitter to measure)");
+        bail!("cargo narf bench bpf-bench: only x86_64 is wired (no aarch64 emitter to measure)");
     }
 
     // Accelerator first: the precondition report needs to know, and the guest
@@ -748,7 +748,10 @@ fn run_and_report(args: &BpfBenchArgs, build: &BuildArgs, accel: &str) -> Result
     )?);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
-    println!("xtask bpf-bench: launching {qemu} {}", kernel.display());
+    println!(
+        "cargo narf bench bpf-bench: launching {qemu} {}",
+        kernel.display()
+    );
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
@@ -788,19 +791,19 @@ fn run_and_report(args: &BpfBenchArgs, build: &BuildArgs, accel: &str) -> Result
     }
     let (harvest, panic_line, clean) = reader
         .join()
-        .map_err(|_| anyhow!("xtask bpf-bench: serial-reader thread panicked"))?;
+        .map_err(|_| anyhow!("cargo narf bench bpf-bench: serial-reader thread panicked"))?;
 
     if let Some(p) = panic_line {
-        bail!("xtask bpf-bench: kernel panic during the run — '{p}'");
+        bail!("cargo narf bench bpf-bench: kernel panic during the run — '{p}'");
     }
     if timed_out {
         bail!(
-            "xtask bpf-bench: no clean exit within {}s",
+            "cargo narf bench bpf-bench: no clean exit within {}s",
             args.timeout_secs
         );
     }
     if !clean {
-        bail!("xtask bpf-bench: QEMU exited without the kernel clean-exit marker");
+        bail!("cargo narf bench bpf-bench: QEMU exited without the kernel clean-exit marker");
     }
     let throttle_after_run = thermal_throttle_count();
     let runtime_thermal_clean = throttle_before_run
@@ -1610,7 +1613,7 @@ fn write_json(
 
     let mut f =
         std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
-    // Hand-formatted because xtask has no serde dependency and one record shape
+    // Hand-formatted because cargo narf has no serde dependency and one record shape
     // is not worth adding one. §8.8's field names are reproduced exactly so an
     // archived record from this harness is comparable with one from any other.
     writeln!(f, "{{")?;
@@ -1772,7 +1775,7 @@ fn write_json(
     writeln!(f, "  ]")?;
     writeln!(f, "}}")?;
     println!();
-    println!("xtask bpf-bench: wrote {}", path.display());
+    println!("cargo narf bench bpf-bench: wrote {}", path.display());
     Ok(())
 }
 

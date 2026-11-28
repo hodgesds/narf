@@ -14,7 +14,7 @@ with the in-tree initramfs and `narf.disks=boot-only`; add hardware firmware
 through explicit `--initramfs-firmware` selections. For a laptop console:
 
 ```sh
-cargo xtask efi-image \
+cargo narf build efi-image \
   --cmdline 'narf.disks=boot-only console=ttyS0 console=tty0'
 python3 packaging/native-efi.py target/narf-x86_64.efi
 sha256sum target/narf-x86_64.efi

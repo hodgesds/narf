@@ -9,7 +9,7 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 
 if [[ ${NARF_UEFI_SKIP_BASE_ISO_BOOT:-0} != 1 ]]; then
-    cargo xtask efi-image --smoke
+    cargo narf build efi-image --smoke
 fi
 
 for command_name in grub-mkimage mformat mcopy qemu-system-x86_64 sfdisk; do

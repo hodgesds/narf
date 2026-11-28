@@ -1,7 +1,7 @@
 //! narf-frame — kernel TCB binary.
 //!
 //! Real builds are kernel-target only and go through
-//! `cargo xtask --arch=x86_64|aarch64`, which builds with
+//! `cargo narf build build --arch=x86_64|aarch64`, which builds with
 //! `target_os = "none"`. The bare-metal entry point + the rest
 //! of the kernel live in `bare_main.rs`, included here as a
 //! module under the `target_os = "none"` cfg.
@@ -23,7 +23,7 @@
 extern crate alloc;
 
 // The composition registrar is generated beneath target/ and supplied through
-// an environment variable by xtask. Keeping this single generic hook in-tree
+// an environment variable by cargo narf. Keeping this single generic hook in-tree
 // lets distributions link built-ins without patching the NARF checkout.
 #[cfg(all(target_os = "none", feature = "external-composition"))]
 mod external_composition {
@@ -44,6 +44,6 @@ pub use bare::x86_64;
 
 #[cfg(not(target_os = "none"))]
 fn main() {
-    eprintln!("narf-frame is a kernel image; build via `cargo xtask --arch=…`.");
+    eprintln!("narf-frame is a kernel image; build via `cargo narf build build --arch=…`.");
     std::process::exit(1);
 }

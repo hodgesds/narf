@@ -701,7 +701,7 @@ Loader verification flow (in order, each step a hard reject):
    in the **revocation set** (kernel-bundled, updated via signed
    revocation manifest).
 
-`xtask sign-module` is the canonical signing tool; it consumes
+`cargo narf sign-module` is the canonical signing tool; it consumes
 a vendor private key and emits the `.narfmod`. CI signs all
 in-tree drivers with a build-time CA whose cert ships in the
 default kernel image.
@@ -717,7 +717,7 @@ build that even compiles the relaxation path.
 
 ### 6.1 External composition manifest
 
-`cargo xtask build|run|test|image --composition <file>` reads a versioned
+`cargo narf build|run|test|image --composition <file>` reads a versioned
 manifest that may live outside the checkout. Each `[[component]]` names a
 Cargo manifest (and optional package), selects `mode = "builtin"` or
 `"module"`, and may select features, default-feature policy, and a domain.

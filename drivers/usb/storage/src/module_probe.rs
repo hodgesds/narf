@@ -1,5 +1,5 @@
 //! `usb-storage.ko`: a Bulk-Only Transport mass-storage driver written only
-//! against KSYMTAB exports (`modules/src/kabi.rs`); xtask's `nm -u` gate
+//! against KSYMTAB exports (`modules/src/kabi.rs`); cargo narf's `nm -u` gate
 //! enforces that the `.ko` links nothing else.
 //!
 //! Bring-up runs from completions, the way a USB module probe must (the

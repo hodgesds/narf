@@ -18,21 +18,21 @@ build orchestration (`build/`), release sign-off (`process/`).
 
 ## 2. Assumptions
 
-- `build/`'s `cargo xtask test` can boot the kernel in QEMU and collect
+- `build/`'s `cargo narf test test` can boot the kernel in QEMU and collect
   structured exit codes + instrumentation output.
-- `cargo xtask test --subsystem NAME` selects that registered subsystem and
+- `cargo narf test test --subsystem NAME` selects that registered subsystem and
   its `/`-delimited children; comma-separated names select their union.
   PR and push CI select all tests owned by changed crates and their reverse
   dependents. Equivalent prefixes compact large inventories without widening
   the selected set. Nightly/manual runs and conservative fallback cases retain
   the unfiltered suite; `ci-full` explicitly requests it for a PR.
-- `cargo xtask test --exclude-subsystem NAME` removes that subtree from
+- `cargo narf test test --exclude-subsystem NAME` removes that subtree from
   whatever the include filter (or the full suite) selects, with the same
   prefix matching; the two filters compose. The primary CI invocation always
   excludes `drivers/gpu`, which runs in a dedicated job gated on the affected
   plan's `run_gpu_tests` output — the union of the two jobs is the full
   suite, and a GPU-fixture hang (issue #879) costs only the GPU job's cap.
-- `cargo xtask test --kernel-tests-only` is restricted to secondary CI
+- `cargo narf test test --kernel-tests-only` is restricted to secondary CI
   configuration shards after that architecture's primary invocation has run
   the production boot and host interoperability postflight. It does not
   replace the complete merge gate.
@@ -485,7 +485,7 @@ For `build_new` vs. `baseline`:
   investigated within one release cycle. Without this check, a 0.5%
   regression every PR drifts into a 20% release-over-release
   regression undetected, because each individual delta is below noise.
-- The xtask benchmark runner accepts the previous green-main record through
+- The cargo narf benchmark runner accepts the previous green-main record through
   `--baseline` and the release record through `--release-baseline`. It refuses
   cross-runner, cross-architecture, accelerator, unit, direction, iteration,
   warmup, or work-declaration mismatches instead of treating unlike sample
@@ -524,7 +524,7 @@ Each perf run emits a machine-readable record (JSON) including:
 
 Records are archived for at least two release cycles.
 
-The current xtask JSON format is schema 3. It retains every raw sample and the
+The current cargo narf JSON format is schema 3. It retains every raw sample and the
 benchmark's declared delta, and records main/release comparisons separately
 with both commit IDs, corrected significance decisions, direction-aware
 improvement/regression labels, and a `publishable` bit. The reader accepts
@@ -582,7 +582,7 @@ benchmarks; cloud instances for functional CI**.
 Two CI tiers:
 
 - **Functional CI** (every PR): GitHub-hosted runners under
-  KVM. Runs `cargo xtask test` on x86_64 + aarch64, all
+  KVM. Runs `cargo narf test test` on x86_64 + aarch64, all
   smokes, basic correctness. Variable hardware OK because
   results are pass/fail.
 - **Perf CI** (nightly + on `perf-test` PR label): rented

@@ -48,7 +48,7 @@ narf-drivers-sound = { path = "../sound" }
 # `--no-default-features --features intel`) to build a kernel
 # without that vendor's drivers: none of its modules compile and
 # none of its PCI drivers register. The named-config registry
-# (build/xtask configs) selects these per build configuration.
+# (build/cargo-narf configs) selects these per build configuration.
 default = ["amdgpu", "intel"]
 amdgpu = []
 intel = []

@@ -75,7 +75,7 @@ Boot integration: `frame/src/bare_main.rs` calls
     `modules_domains=path=domain,...` applies per-image placement;
     `modules_domain=<name>` is the fallback for unmatched images. Signature,
     ABI, capability, and non-`FRAME` checks are the same as for
-    `init_module(2)`; without `modules_load=` this is a no-op. `cargo xtask
+    `init_module(2)`; without `modules_load=` this is a no-op. `cargo narf
     run --composition FILE` generates and stages this list for external module
     crates.
   * `modules-sysfs` at `Stage::Fs` — installs `/proc/modules` and
@@ -121,7 +121,7 @@ Building a module:
 
 ```sh
 cat /sys/kernel/abi_hash                       # e.g. 0x1f3a90c2
-cargo xtask build-module --package <crate> \
+cargo narf build build-module --package <crate> \
       --arch x86_64 --kernel-abi 0x1f3a90c2
 ```
 
@@ -131,7 +131,7 @@ the loader wants — merging the per-static `.modinfo` sections in the
 process, and folding rustc's per-function and per-object sections into one
 `.text` / `.rodata` / `.data` / `.bss` (plus `.rodata.str`, `.rodata.cst`
 and `.data.rel.ro`) so the object carries a handful of section headers
-rather than one per function. `cargo xtask test` stages the reference
+rather than one per function. `cargo narf test test` stages the reference
 object in the initramfs and loads, executes, and unloads it on both
 architecture paths when QEMU is available; the whole-driver fixtures ride
 as `lib/modules/test-fixtures/*.ko.lz4`.
@@ -146,10 +146,10 @@ compressed bytes, sign `BLAKE3(the complete file)`, then attach the detached
 64-byte signature and its 32-byte raw public key:
 
 ```sh
-cargo xtask build-module --package <crate> --arch x86_64 \
+cargo narf build build-module --package <crate> --arch x86_64 \
   --kernel-abi 0x1f3a90c2 --compress --out module.ko.lz4
 # Produce module.sig over BLAKE3(module.ko.lz4) with the release signer.
-cargo xtask attach-module-signature --module module.ko.lz4 \
+cargo narf build attach-module-signature --module module.ko.lz4 \
   --signature module.sig --public-key module.pub
 ```
 

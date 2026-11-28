@@ -12,7 +12,7 @@ target/
 /userspace/init/Cargo.lock
 /userspace/shell/Cargo.lock
 
-# Cargo xtask artefacts
+# Cargo cargo narf artefacts
 /build/out/
 *.img
 *.bin
@@ -36,7 +36,7 @@ qemu.log
 .claude/
 
 # Note: imported firmware blobs land at `target/firmware/` (default
-# `xtask import-firmware --out`), already covered by `target/`
+# `cargo narf firmware import-firmware --out`), already covered by `target/`
 # above. The workspace `firmware/` dir is the narf-firmware crate
 # itself and stays tracked.
 

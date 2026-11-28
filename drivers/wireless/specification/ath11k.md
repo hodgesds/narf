@@ -2725,7 +2725,7 @@ A SYS_ERR during bring-up still fails the bring-up (Linux's `reset_work`
   → `peer_cleanup`, `set_key` → `pn_replay_config`, `ampdu_action`
   RX_START / RX_STOP → `ampdu_start` / `ampdu_stop`) and every service
   pass feeds `DpServiceOutput::reo_status` to `reo_status_handler`.
-- Firmware (decided): `cargo xtask import-firmware --vendor ath11k`
+- Firmware (decided): `cargo narf firmware import-firmware --vendor ath11k`
   decompresses the distro `.zst` blobs at image build time and now
   imports file symlinks under their own name (linux-firmware ships every
   `ath11k/WCN6855/hw2.1/*` as a link to `../hw2.0/*`; the importer used

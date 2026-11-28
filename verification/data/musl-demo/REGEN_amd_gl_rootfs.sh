@@ -10,7 +10,7 @@
 #
 #   sh verification/data/musl-demo/REGEN_mesa_amd.sh        # once
 #   sh verification/data/musl-demo/REGEN_amd_gl_rootfs.sh
-#   NARF_VBLK_IMG=target/narf-amd-gl-vblk.img cargo xtask run-interactive \
+#   NARF_VBLK_IMG=target/narf-amd-gl-vblk.img cargo narf run run-interactive \
 #       --cmd "chroot_run /bin/busybox sh /mesa-amd-smoke.sh" \
 #       --expect "MESA-AMD-OK"
 #

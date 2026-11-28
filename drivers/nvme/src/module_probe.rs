@@ -2,7 +2,7 @@
 //! controller's first namespace as a module-backed disk.
 //!
 //! Everything goes through KSYMTAB exports (`modules/src/kabi.rs`); a module
-//! build links no kernel crate, and xtask's `nm -u` gate enforces it. The
+//! build links no kernel crate, and cargo narf's `nm -u` gate enforces it. The
 //! probe resets the controller, builds one admin and one I/O queue pair in
 //! module-owned DMA buffers, identifies namespace 1, and registers
 //! `nvme<N>n1` with `narf_blk_register`. Each block request then runs to

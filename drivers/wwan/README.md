@@ -58,7 +58,7 @@ binding above). The CDC-MBIM crate also builds as a registration-only
 `narf_register_usb_driver`:
 
 ```
-cargo xtask build-module --package narf-drivers-wwan-cdc-mbim \
+cargo narf build build-module --package narf-drivers-wwan-cdc-mbim \
   --no-default-features --features module
 ```
 

@@ -4,7 +4,7 @@
 //! `mkfs.ext4 -d` from a CachyOS-shaped tree, applies a seeded random
 //! workload mirrored into a model, and judges the result with Linux's
 //! userspace: `e2fsck -fn` must find nothing, `debugfs rdump` must see the
-//! model's tree, and a fresh NARF mount must read it back. `cargo xtask
+//! model's tree, and a fresh NARF mount must read it back. `cargo narf
 //! ext4-host-rw` is the usual entry point; see `--help`.
 
 mod check;

@@ -1,4 +1,4 @@
-//! `cargo xtask btrfs-rootrw-interop`: prove that `narf.disks=root-rw`
+//! `cargo narf smoke btrfs-rootrw-interop`: prove that `narf.disks=root-rw`
 //! writes leave a CachyOS-shaped btrfs root `btrfs check`-clean.
 //!
 //! 1. Build, unprivileged, a GPT disk image (FAT32 ESP + btrfs root) whose
@@ -65,7 +65,7 @@ pub enum BgtExpect {
     Skip,
 }
 
-/// Options for `cargo xtask btrfs-rootrw-interop`.
+/// Options for `cargo narf smoke btrfs-rootrw-interop`.
 #[derive(clap::Args, Clone)]
 pub struct Args {
     #[command(flatten)]

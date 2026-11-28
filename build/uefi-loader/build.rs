@@ -13,7 +13,7 @@ fn main() {
         println!("cargo:rerun-if-env-changed={name}");
     }
     // Test builds hold part of the kernel's link range before placing it
-    // (`cargo xtask efi-image --occupy-link-range`).
+    // (`cargo narf build efi-image --occupy-link-range`).
     println!("cargo:rustc-check-cfg=cfg(narf_occupy_link)");
     if env::var_os("NARF_EFI_OCCUPY_LINK").is_some() {
         println!("cargo:rustc-cfg=narf_occupy_link");
@@ -31,7 +31,7 @@ fn main() {
     ] {
         let path = PathBuf::from(
             env::var_os(name)
-                .unwrap_or_else(|| panic!("{name} is required; build with cargo xtask efi-image")),
+                .unwrap_or_else(|| panic!("{name} is required; build with cargo narf build efi-image")),
         );
         println!("cargo:rerun-if-changed={}", path.display());
         let size = fs::metadata(&path).expect("EFI input metadata").len();

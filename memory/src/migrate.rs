@@ -741,7 +741,7 @@ pub fn __reset_resolver_for_test() {
 }
 
 // ── Tests ────────────────────────────────────────────────────────
-// Always compiled so they register + run under `cargo xtask test`.
+// Always compiled so they register + run under `cargo narf test test`.
 mod tests {
     use super::{
         __reset_resolver_for_test, register_address_space_resolver, resolve_address_space,

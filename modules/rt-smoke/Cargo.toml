@@ -4,8 +4,8 @@
 # at all), this one is the shape of a module written against `alloc` and
 # `async`: it allocates, formats, and runs futures on its own executor. Its
 # object therefore needs out-of-line `core`/`alloc` code and the runtime
-# crate, which `xtask build-module` links in lazily from the staticlib
-# archive. `cargo xtask module-rt-smoke` boots it and checks its console
+# crate, which `cargo narf build build-module` links in lazily from the staticlib
+# archive. `cargo narf module-rt-smoke` boots it and checks its console
 # tokens.
 
 [package]

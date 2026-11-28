@@ -52,7 +52,7 @@ acceptance remain separate.
 
 - The crate builds built-in (the default `builtin` feature, registered from
   the `narf-drivers-wireless` facade) or as the loadable `ath10k.ko`
-  (`cargo xtask build-module --package narf-drivers-wireless-ath10k
+  (`cargo narf build build-module --package narf-drivers-wireless-ath10k
   --no-default-features --features module`). The module runs the same BMI,
   firmware/board download, CE, HTC, WMI, HTT and station source over the
   KABI (`src/ath10k/platform/`) and registers every built-in PCI ID except

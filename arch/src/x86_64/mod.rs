@@ -264,7 +264,7 @@ impl crate::DomainPrimitive for Pcid {
 
 /// Exit QEMU cleanly via the `isa-debug-exit` device (I/O port 0xF4).
 /// QEMU computes its exit status as `(code << 1) | 1`, so `exit_qemu(0)`
-/// gives exit status 1 and `exit_qemu(16)` gives status 33 — xtask /
+/// gives exit status 1 and `exit_qemu(16)` gives status 33 — cargo narf /
 /// verification harnesses interpret the mapping.
 ///
 /// If `isa-debug-exit` isn't wired up (real hardware, non-QEMU VMMs),

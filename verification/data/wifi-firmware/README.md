@@ -20,9 +20,9 @@ EEPROM rather than external executable firmware. Physical Intel MAC/RF/step,
 Qualcomm board-name/QMI identity and Broadcom board selection remain essential.
 
 ```sh
-cargo xtask wifi-firmware --report /tmp/wifi-inventory.json
-cargo xtask wifi-firmware --profile mt7920,rtl8188ee --require-assets
-cargo xtask import-firmware --vendor iwlwifi --out target/wifi-firmware-intel
+cargo narf firmware wifi-firmware --report /tmp/wifi-inventory.json
+cargo narf firmware wifi-firmware --profile mt7920,rtl8188ee --require-assets
+cargo narf firmware import-firmware --vendor iwlwifi --out target/wifi-firmware-intel
 ```
 
 The audit reads local raw or zstd assets, follows only contained file aliases,
@@ -107,7 +107,7 @@ PCI or SDIO host/card identity, chip revisions and exact canonical asset keys,
 lengths and SHA256 digests. NVRAM and CLM must be signed even in an unsigned
 developer build. Executable-image development policy remains separate. Encode
 verified deployment records with
-`cargo xtask wifi-fixtures board-manifest --input records.json --output manifest.bin`,
+`cargo narf firmware wifi-fixtures board-manifest --input records.json --output manifest.bin`,
 then use the existing `pack-firmware` workflow to sign the manifest and selected
 board assets. The Rust encoder takes explicit host, board and file facts; it does not discover
 wiring, select a board by filename or create measured calibration. A trusted

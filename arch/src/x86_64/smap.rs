@@ -23,7 +23,7 @@
 //!     a runtime check.
 //!   * On Renoir + Phoenix the bit is always available; the
 //!     `supported()` check is for QEMU TCG without `-cpu max`
-//!     and for the same reason `cargo xtask test` includes a
+//!     and for the same reason `cargo narf test test` includes a
 //!     `Skip` path.
 //!
 //! References:

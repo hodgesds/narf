@@ -6,11 +6,11 @@
 # lanes is acceptable — these are correctness gates, not perf runs.
 #
 # ── Lane layout ──────────────────────────────────────────────────────────────
-#   serial preamble (main repo): cargo fmt --check → cargo xtask host-test
+#   serial preamble (main repo): cargo fmt --check → cargo narf test host-test
 #     (fast, and everything depends on fmt; in --affected mode the plan is
 #      computed first, exactly like the serial gate)
 #   lane A  x86_64 pipeline : clippy (boot-smoke,cgroup-all) → clippy
-#                             (kernel-test,cgroup-all) → xtask test → boot-smoke
+#                             (kernel-test,cgroup-all) → cargo narf test test → boot-smoke
 #   lane B  aarch64 pipeline: same four jobs for aarch64 (TCG guest is
 #                             CPU-hungry — it is paired with the light lanes)
 #   lane C  smokes          : musl-demo → net-smoke → redis-smoke
@@ -18,11 +18,11 @@
 #   lane D  feature matrix  : the 4 narf-userspace + 5 narf-frame combos
 #
 # ── Per-lane isolation (READ THIS — it is not CARGO_TARGET_DIR) ─────────────
-# xtask HARDCODES <repo>/target for its artifacts: cargo_build() returns
-# root.join("target")/<triple>/release (build/xtask/src/main.rs:2545) and the
+# cargo narf HARDCODES <repo>/target for its artifacts: cargo_build() returns
+# root.join("target")/<triple>/release (build/cargo-narf/src/main.rs:2545) and the
 # QEMU disk images (narf-nvme.img, narf-vblk.img, qemu-virt.dtb, ISO staging,
 # firmware) all live under root/target too. Setting CARGO_TARGET_DIR makes
-# cargo build elsewhere while xtask BOOTS THE STALE KERNEL from target/ —
+# cargo build elsewhere while cargo narf BOOTS THE STALE KERNEL from target/ —
 # silently wrong. So instead each lane gets a PRIVATE REPO COPY under
 # $NARF_CI_LANES_DIR (default /data/narf-ci-lanes/<lane>), synced from the
 # main tree with rsync/cp --reflink=auto (near-free on btrfs), each with its
@@ -40,7 +40,7 @@
 #
 # ── Ports (known gotcha) ────────────────────────────────────────────────────
 # net-smoke binds host 127.0.0.1:17777 and redis-smoke 127.0.0.1:16379 —
-# both HARDCODED in xtask (no env override), so they cannot be remapped per
+# both HARDCODED in cargo narf (no env override), so they cannot be remapped per
 # lane. Both live in lane C and run sequentially, so this script never
 # collides with itself; before each, the lane waits (up to --port-wait-secs,
 # default 900) for the port to be free. A stale QEMU squatting on 16379 is a
@@ -70,7 +70,7 @@
 # reference gate): iso-boot, the aarch64 uefi-loader tests/clippy, the
 # aarch64 virtio-mmio-populated kernel-test pass, and the nightly
 # non-blocking task87-repro / stress-ng-kasan diagnostics.
-# --affected/--base are preserved: the same `cargo xtask affected` plan the
+# --affected/--base are preserved: the same `cargo narf ci affected` plan the
 # serial gate uses gates jobs/lanes here (redis-smoke follows the net-smoke
 # gate). Resource assumptions: ~16 cores / 60 GB RAM / KVM at /dev/kvm.
 #
@@ -123,13 +123,13 @@ SUBS=""
 
 if [ "$AFFECTED" = 1 ]; then
   if [ "$DRY_RUN" = 1 ]; then
-    echo "--dry-run: skipping \`cargo xtask affected\` (it builds/runs xtask);"
+    echo "--dry-run: skipping \`cargo narf affected\` (it builds/runs cargo narf);"
     echo "  at run time the plan would come from:"
-    echo "    cargo xtask affected --format github --event pull_request --base $BASE"
+    echo "    cargo narf ci affected --format github --event pull_request --base $BASE"
     echo "  showing the FULL-run plan below."
   else
     echo "Computing affected jobs vs $BASE ..."
-    PLAN="$(cd "$SRC" && cargo xtask affected --format github --event pull_request --base "$BASE")"
+    PLAN="$(cd "$SRC" && cargo narf ci affected --format github --event pull_request --base "$BASE")"
     echo "$PLAN"
     get() { printf '%s\n' "$PLAN" | grep "^$1=" | cut -d= -f2-; }
     FULL="$(get full)"
@@ -186,7 +186,7 @@ add_job() { # add_job <lane> <name> <cmd...>
   JOB_CMD+=("set -eu; $COMMON_ENV cd '$LANES_DIR/$lane'; set -x; $*")
 }
 
-# lane A — x86_64 pipeline (clippy → xtask test builds+runs → boot-smoke)
+# lane A — x86_64 pipeline (clippy → cargo narf test test builds+runs → boot-smoke)
 if should "$RUN_CLIPPY"; then
   add_job A clippy-x86_64 \
     "cargo clippy -p narf-frame --target x86_64-unknown-none $KFLAGS --features boot-smoke,cgroup-all -- -D warnings"
@@ -195,10 +195,10 @@ if should "$RUN_CLIPPY"; then
 fi
 if should "$RUN_KERNEL_TEST"; then
   add_job A kernel-test-x86_64 \
-    "export XTASK_QEMU_TIMEOUT_SECS=7200 XTASK_BOOT_SMOKE_TIMEOUT_SECS=3600; cargo xtask test --arch=x86_64 --features cgroup-all,container$KT_SUBS"
+    "export XTASK_QEMU_TIMEOUT_SECS=7200 XTASK_BOOT_SMOKE_TIMEOUT_SECS=3600; cargo narf test test --arch=x86_64 --features cgroup-all,container$KT_SUBS"
 fi
 if should "$RUN_BOOT_SMOKE"; then
-  add_job A boot-smoke-x86_64 "cargo xtask boot-smoke --arch=x86_64"
+  add_job A boot-smoke-x86_64 "cargo narf test boot-smoke --arch=x86_64"
 fi
 
 # lane B — aarch64 pipeline (TCG guest; runs beside the lighter lanes)
@@ -211,25 +211,25 @@ if arch_on aarch64; then
   fi
   if should "$RUN_KERNEL_TEST"; then
     add_job B kernel-test-aarch64 \
-      "export XTASK_QEMU_TIMEOUT_SECS=7200 XTASK_BOOT_SMOKE_TIMEOUT_SECS=3600; cargo xtask test --arch=aarch64 --features cgroup-all,container$KT_SUBS"
+      "export XTASK_QEMU_TIMEOUT_SECS=7200 XTASK_BOOT_SMOKE_TIMEOUT_SECS=3600; cargo narf test test --arch=aarch64 --features cgroup-all,container$KT_SUBS"
   fi
   if should "$RUN_BOOT_SMOKE"; then
-    add_job B boot-smoke-aarch64 "cargo xtask boot-smoke --arch=aarch64"
+    add_job B boot-smoke-aarch64 "cargo narf test boot-smoke --arch=aarch64"
   fi
 fi
 
 # lane C — QEMU smokes (sole owner of the hardcoded host ports)
 if should "$RUN_MUSL"; then
   add_job C musl-demo \
-    "export XTASK_RI_PROMPT_TIMEOUT_SECS=2700 XTASK_RI_ECHO_TIMEOUT_SECS=2700; cargo xtask musl-demo --arch=x86_64"
+    "export XTASK_RI_PROMPT_TIMEOUT_SECS=2700 XTASK_RI_ECHO_TIMEOUT_SECS=2700; cargo narf smoke musl-demo --arch=x86_64"
 fi
 if should "$RUN_NET"; then
   add_job C net-smoke \
-    "export XTASK_RI_PROMPT_TIMEOUT_SECS=2700; wait_port_free 17777; cargo xtask net-smoke --arch=x86_64"
+    "export XTASK_RI_PROMPT_TIMEOUT_SECS=2700; wait_port_free 17777; cargo narf smoke net-smoke --arch=x86_64"
   # Not in the serial reference gate (CI: nightly task87 job only); agreed
   # addition here. Gated with net-smoke in --affected mode.
   add_job C redis-smoke \
-    "export XTASK_RI_PROMPT_TIMEOUT_SECS=2700; wait_port_free 16379; cargo xtask redis-smoke --arch=x86_64"
+    "export XTASK_RI_PROMPT_TIMEOUT_SECS=2700; wait_port_free 16379; cargo narf smoke redis-smoke --arch=x86_64"
 fi
 
 # lane D — feature matrix (keep identical to run_ci_locally.sh / ci.yml)
@@ -262,7 +262,7 @@ if [ "$DRY_RUN" = 1 ]; then
   echo
   echo "--- serial preamble (in $SRC) ---"
   echo "  cargo fmt --all -- --check"
-  echo "  cargo xtask host-test"
+  echo "  cargo narf test host-test"
   echo
   for lane in $LANES; do
     echo "--- lane $lane (root: $LANES_DIR/$lane) ---"
@@ -283,7 +283,7 @@ fi
 echo "Running fmt"
 (cd "$SRC" && cargo fmt --all -- --check)
 echo "Running host tests"
-(cd "$SRC" && cargo xtask host-test)
+(cd "$SRC" && cargo narf test host-test)
 
 # ── lane workspace sync ─────────────────────────────────────────────────────
 sync_lane() {

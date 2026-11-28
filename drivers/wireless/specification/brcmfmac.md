@@ -115,13 +115,13 @@ Keys have no empty, dot or parent components; asset keys within one row differ.
 The manifest's SHA256 is independent of the registry's historically named
 `BlobView.sha256` field, which contains BLAKE3.
 
-`cargo xtask wifi-fixtures board-manifest --input input.json --output output.bin`
+`cargo narf firmware wifi-fixtures board-manifest --input input.json --output output.bin`
 encodes explicit
 board facts and hashes actual payload files. Input records supply family, board,
 revision mask, full host identity, SDIO card tuple when applicable and ordered
 asset key/path/signed entries. `wrapped:true` explicitly strips an existing NRFW
 envelope before hashing; paths otherwise denote raw payloads. Sign/package the
-output with `cargo xtask pack-firmware --payload ... --name
+output with `cargo narf firmware pack-firmware --payload ... --name
 brcm/wifi-board-selection-v1.bin --signature ... --public-key ... --out ...` and
 stage that manifest plus exactly named assets through the existing firmware loader.
 The tool supplies no board default or signer authority; `--synthetic-fixture` emits only
@@ -681,7 +681,7 @@ firmware's 212 event codes (`bca/core.c`) need the same 27-byte event mask
 as WCC's 213. Remaining: 4-stream fixture coverage and the CYW-vendor
 54591 (CYW event protocol, below).
 
-Signed-record tooling: `cargo xtask wifi-fixtures board-manifest` encodes
+Signed-record tooling: `cargo narf firmware wifi-fixtures board-manifest` encodes
 family 3 as `"family": "pciefullmac"` with a required non-43602 `chip`, a
 PCI host with vendor 0x14e4, no card, two assets, and an optional
 `antenna_sku` (bytes 96..112; `board` and keys may then contain `,`). The
@@ -700,7 +700,7 @@ Smokes: `drivers/wireless/brcmfmac/chips`
 `drivers/wireless/brcmfmac/provision`
 `smoke_brcm_signed_manifest_fullmac_otp_board_binding`;
 `drivers/wireless/brcmfmac/channel`
-`smoke_fullmac_occupied_vht160_literal_sidebands_and_exact_span`; xtask
+`smoke_fullmac_occupied_vht160_literal_sidebands_and_exact_span`; cargo narf
 unit test `encodes_family_three_records_with_optional_antenna_sku`.
 Also in `drivers/wireless/brcmfmac/chips`:
 `smoke_brcmf_chip_profile_linux_rambase_and_firmware_rows`,

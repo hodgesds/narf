@@ -9,7 +9,7 @@
 #   * `builtin` (default): rlib linked into the kernel; `frame` calls
 #     `register_initcalls`, which installs the hooks and registers the
 #     `usb-btusb` initcalls.
-#   * `module`: `cargo xtask build-module --package
+#   * `module`: `cargo narf build build-module --package
 #     narf-drivers-bluetooth-btusb --no-default-features --features module`.
 #     Registration-only: registers the Bluetooth interface match (0xE0/0x01/
 #     0x01) through `narf_register_usb_driver`; the probe returns -ENOSYS until

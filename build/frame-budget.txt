@@ -1,5 +1,5 @@
 # Kernel functions whose stack frame exceeds the 8 KiB budget
-# (build/xtask/src/frame_budget.rs). <bytes> <function>. This list
+# (build/cargo-narf/src/frame_budget.rs). <bytes> <function>. This list
 # may only shrink: remove an entry when its function fits. Regenerate
 # (or lower entries): NARF_FRAME_BUDGET_WRITE=1.
 29816 narf_drivers_wireless_iwlwifi::iwlwifi::device::dhcp_composition::Guard::build_native_wide

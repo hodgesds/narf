@@ -20,7 +20,7 @@
 # Then run it against NARF (QEMU, 16 vCPUs), staged at /usr/bin/rstress:
 #
 #   XTASK_STAGE_BIN=$PWD/readiness_stress_smoke_x86_64:usr/bin/rstress \
-#     cargo xtask run-interactive --cmd '/usr/bin/rstress 240' \
+#     cargo narf run run-interactive --cmd '/usr/bin/rstress 240' \
 #       --expect readiness-stress-ok --features boot-init
 #
 # Usage: rstress [seconds [seed]]   (default 240 s; the seed defaults to a

@@ -19,7 +19,7 @@ XTASK_QEMU_ACCEL=kvm \
 NARF_QEMU_CPU=host \
 XTASK_RI_PROMPT_TIMEOUT_SECS=180 \
 XTASK_RI_ECHO_TIMEOUT_SECS=300 \
-cargo xtask run-interactive \
+cargo narf run run-interactive \
     --cmd "busybox chroot /mnt sh -c 'perf stat -a -d --per-node -- sleep 1; echo PERF-NUMA-DONE'" \
     --expect PERF-NUMA-DONE >"$LOG" 2>&1
 

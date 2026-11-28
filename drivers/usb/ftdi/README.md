@@ -25,12 +25,12 @@ loadable module, and the reference consumer of the USB transfer datapath
      bulk-OUT on every kick.
 
   It links nothing but KSYMTAB imports: no allocator, no slice copies, no
-  indexing that could panic (xtask's `nm -u` gate).
+  indexing that could panic (cargo narf's `nm -u` gate).
 
 ```
-cargo xtask build-module --package narf-drivers-usb-ftdi \
+cargo narf build build-module --package narf-drivers-usb-ftdi \
   --no-default-features --features module
-cargo xtask ftdi-module-serial-smoke --arch=x86_64   # end-to-end proof
+cargo narf ftdi-module-serial-smoke --arch=x86_64   # end-to-end proof
 ```
 
 Not yet: termios changes on the module node are cached, not programmed

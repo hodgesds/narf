@@ -8,7 +8,7 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 
 if [[ ${NARF_UEFI_SKIP_BASE_ISO_BOOT:-0} != 1 ]]; then
-    cargo xtask iso-boot --arch=x86_64
+    cargo narf build iso-boot --arch=x86_64
 fi
 
 for command_name in openssl sbsign sbverify virt-fw-vars mformat mcopy qemu-system-x86_64 sfdisk; do

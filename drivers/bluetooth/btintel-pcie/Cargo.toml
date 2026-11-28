@@ -7,7 +7,7 @@
 #   * `builtin` (default): rlib linked into the kernel; `frame` registers its
 #     Stage::Subsys PCI match and Stage::Late firmware download (x86_64 only —
 #     the driver needs the PCIe bus).
-#   * `module`: built to a loadable `.ko` via `cargo xtask build-module
+#   * `module`: built to a loadable `.ko` via `cargo narf build build-module
 #     --package narf-drivers-bluetooth-btintel-pcie --no-default-features
 #     --features module`. Registration-only: the probe thunk returns -ENOSYS;
 #     it registers the driver's PCI ids through `narf_register_pci_driver`.

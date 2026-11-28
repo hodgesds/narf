@@ -217,7 +217,7 @@ pub fn check(elf: &Path, list: &Path) -> Result<()> {
         sorted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         let mut text = String::from(
             "# Kernel functions whose stack frame exceeds the 8 KiB budget\n\
-             # (build/xtask/src/frame_budget.rs). <bytes> <function>. This list\n\
+             # (build/cargo-narf/src/frame_budget.rs). <bytes> <function>. This list\n\
              # may only shrink: remove an entry when its function fits. Regenerate\n\
              # (or lower entries): NARF_FRAME_BUDGET_WRITE=1.\n",
         );
@@ -226,7 +226,7 @@ pub fn check(elf: &Path, list: &Path) -> Result<()> {
         }
         std::fs::write(list, text)?;
         println!(
-            "xtask: frame budget: wrote {} entries to {}",
+            "cargo narf: frame budget: wrote {} entries to {}",
             over.len(),
             list.display()
         );
@@ -277,7 +277,7 @@ pub fn check(elf: &Path, list: &Path) -> Result<()> {
         .collect();
     if !big_shims.is_empty() {
         println!(
-            "xtask: frame budget: {} core/alloc generic shim(s) over {BUDGET} bytes \
+            "cargo narf: frame budget: {} core/alloc generic shim(s) over {BUDGET} bytes \
              (their callers' inlined state, not listed):\n{}",
             big_shims.len(),
             big_shims.join("\n")
@@ -285,7 +285,7 @@ pub fn check(elf: &Path, list: &Path) -> Result<()> {
     }
     if !notes.is_empty() {
         println!(
-            "xtask: frame budget: listed entries that shrank or are absent \
+            "cargo narf: frame budget: listed entries that shrank or are absent \
              (NARF_FRAME_BUDGET_WRITE=1 lowers them):\n{}",
             notes.join("\n")
         );
@@ -301,7 +301,7 @@ pub fn check(elf: &Path, list: &Path) -> Result<()> {
         );
     }
     println!(
-        "xtask: frame budget: {} function(s) over {BUDGET} bytes, all listed",
+        "cargo narf: frame budget: {} function(s) over {BUDGET} bytes, all listed",
         over.len()
     );
     Ok(())

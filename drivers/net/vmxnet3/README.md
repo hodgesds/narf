@@ -13,7 +13,7 @@ with the net stack. `vmxnet3/regs.rs` holds register offsets and
 command codes; `vmxnet3/shared.rs` holds the shared structure and
 descriptor types.
 
-QEMU fixture: `XTASK_QEMU_VMXNET3=1 cargo xtask run` swaps the legacy
+QEMU fixture: `XTASK_QEMU_VMXNET3=1 cargo narf run run` swaps the legacy
 NIC model for QEMU's emulated vmxnet3 (0x07B0) on the same `n1`
 backend, so the datapath + publication smoke runs under QEMU; the
 smoke skips when no vmxnet3 device is present.

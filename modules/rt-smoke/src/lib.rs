@@ -11,7 +11,7 @@
 //!
 //! No device is bound, so there is no kernel poller to drive the executor;
 //! init drives it inline until it is idle (bounded by a deadline). Each step
-//! prints a token that `cargo xtask module-rt-smoke` requires.
+//! prints a token that `cargo narf module-rt-smoke` requires.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]

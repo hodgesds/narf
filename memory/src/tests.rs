@@ -2656,7 +2656,7 @@ fn smoke_frame_alloc_per_node_distribution() -> TestResult {
     }
     // The distribution below can only exist when the firmware
     // described a multi-node topology. When the harness runs with
-    // NARF_QEMU_SMP set, xtask drops its -numa machine config, QEMU
+    // NARF_QEMU_SMP set, cargo narf drops its -numa machine config, QEMU
     // presents no SRAT, and bare_main legitimately keeps the
     // single-node fallback — there is nothing to distribute. Probe
     // the firmware topology (not allocator state) so this skip can

@@ -13,7 +13,7 @@ KSYMTAB export and is registration-only until the device datapath ABI covers
 a PCM device.
 
 ```
-cargo xtask build-module --package narf-drivers-audio-hda \
+cargo narf build build-module --package narf-drivers-audio-hda \
   --no-default-features --features module
 ```
 

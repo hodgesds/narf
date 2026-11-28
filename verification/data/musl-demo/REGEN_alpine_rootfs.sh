@@ -11,9 +11,9 @@
 # running the distro_init test:
 #
 #   sh verification/data/musl-demo/REGEN_alpine_rootfs.sh
-#   cargo xtask run-interactive --cmd distro_init --expect alpine-shell-ran
+#   cargo narf run run-interactive --cmd distro_init --expect alpine-shell-ran
 #
-# Output: target/narf-vblk.img (the path xtask's virtio_blk_image_path() uses
+# Output: target/narf-vblk.img (the path cargo narf's virtio_blk_image_path() uses
 # verbatim when it already exists — it only builds the placeholder otherwise).
 #
 # Requires: curl, tar, mke2fs (e2fsprogs >= 1.43 for `-d`), unprivileged.
@@ -57,4 +57,4 @@ mke2fs -q -F -t ext2 -b 1024 \
   -d "$WORK/root" "$OUT" 28672
 
 echo "built $OUT ($(du -h "$OUT" | cut -f1)) — Alpine $ALPINE_REL rootfs"
-echo "boot it: cargo xtask run-interactive --cmd distro_init --expect alpine-shell-ran"
+echo "boot it: cargo narf run run-interactive --cmd distro_init --expect alpine-shell-ran"

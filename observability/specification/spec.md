@@ -145,7 +145,7 @@ parsers must tolerate truncation at any section boundary.
 ### 3.3a Kernel symbol table (`kallsyms`)
 
 The image's own symbol table, written into the linker-reserved `.kallsyms`
-section after the link by `xtask kallsyms` (`build/` §3) in the
+section after the link by `cargo narf build kallsyms` (`build/` §3) in the
 `narf-kallsyms` format (`observability/kallsyms/specification/spec.md`).
 Linux's `kernel/kallsyms.c` decoder:
 

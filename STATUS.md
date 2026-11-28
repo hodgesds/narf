@@ -158,7 +158,7 @@ below. Validation is native Rust: tests exercise production functions, wire
 contracts, boundaries and failure/ownership behavior. Hardware tables and
 fixed source-cited fixtures are reviewed data, and firmware parser cases are
 authored in Rust. Deployment board manifests are encoded with
-`cargo xtask wifi-fixtures board-manifest`. Source hashes recorded in the
+`cargo narf firmware wifi-fixtures board-manifest`. Source hashes recorded in the
 family specs do not assert current Linux equivalence or physical acceptance.
 
 ### Target and ledger
@@ -423,7 +423,7 @@ reset/PM rows are pending validation.
 
 ### Firmware and provisioning
 
-`cargo xtask wifi-firmware` audits the payload catalog
+`cargo narf firmware wifi-firmware` audits the payload catalog
 `verification/data/wifi-firmware/profiles.json` (47 profiles across all
 eleven families) against the local firmware tree and fails when a required
 fixed-name payload is missing; payload presence is not signing or board
@@ -457,7 +457,7 @@ work in the ledger remain open for every family.
 
 ## Loadable e1000 datapath
 
-The copy-mode module ABI now has an exclusive live-wire proof. `cargo xtask
+The copy-mode module ABI now has an exclusive live-wire proof. `cargo narf
 e1000-module-net-smoke --arch=x86_64` builds and ABI-stamps `e1000.ko`, stages
 it in the initramfs, loads it into the operator-selected `driver2` frame before
 PCI probing, and suppresses the built-in e1000 registration for that fixture.
@@ -952,9 +952,9 @@ interfaces and limits.
 
 ## Exercised paths
 
-- **Kernel on QEMU:** `cargo xtask run` and `cargo xtask test` support x86_64
+- **Kernel on QEMU:** `cargo narf run run` and `cargo narf test test` support x86_64
   and aarch64. The suite reports pass, fail, and skip totals at exit.
-- **Interactive userspace on x86_64 QEMU:** `cargo xtask run-interactive`
+- **Interactive userspace on x86_64 QEMU:** `cargo narf run run-interactive`
   exercises the in-tree shell and coreutils. The musl demo harness covers
   Linux syscall and device ABI cases; `oci_smoke` exercises the container
   path. A dynamically linked Alpine BusyBox has also run from an ext2 rootfs
@@ -970,7 +970,7 @@ interfaces and limits.
   libdrm, and a multi-client Wayland path have runnable demonstrations.
   VirtGPU VirGL ioctls and presentation paths are implemented in-tree;
   this does not establish native AMDGPU display on a laptop.
-- **Runtime modules:** xtask builds and stages a real rustc `.ko`; the kernel
+- **Runtime modules:** cargo narf builds and stages a real rustc `.ko`; the kernel
   smoke stamps the live export-table ABI, resolves the compiler's native
   relocation against `narf_printk`, executes init/exit in the declared
   `target_domain`, and unloads it. Production policy verifies a fixed
@@ -978,10 +978,10 @@ interfaces and limits.
   require an explicit developer/CI feature. Versioned LZ4 module envelopes are
   bounded to 32 MiB and authenticated before decompression. The SMP unload
   grace period remains open.
-- **Boot media:** `cargo xtask image` builds boot media and `iso-boot`
+- **Boot media:** `cargo narf build image` builds boot media and `iso-boot`
   checks UEFI boot in QEMU. These are distinct from a successful USB boot
   on the target laptops.
-- **Self-contained x86_64 EFI:** `cargo xtask efi-image` embeds kernel,
+- **Self-contained x86_64 EFI:** `cargo narf build efi-image` embeds kernel,
   CPIO initramfs, and command line in a versioned, SHA-256-checked `.narf`
   section, with `--run` / `--smoke` OVMF modes. It reuses the kernel's
   Multiboot2 entry. Native distribution packages use this image by default;
@@ -3694,7 +3694,7 @@ tiling/DCC, scaling and multiple planes/streams remain SubVP extensions. Hardwar
 Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
 apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up
 failures stop the controller before freeing DMA; AHCI port bring-up is bounded
-per HBA and sets GHC.IE only after the IRQ route; host-install xtask media
+per HBA and sets GHC.IE only after the IRQ route; host-install cargo narf media
 default to `narf.disks=boot-only`; DMUB-routed retrain/unplug tables, a non-IRQ
 DMUB route lock, a TABLE_MS cap, same-EDID HPD long pulses keep the stream.
 
@@ -3828,7 +3828,7 @@ still pass every display-admission and driver gate (`HARDWARE_VALIDATED`
 stays false; the default list is an implicit opt-in). Multi-display stays
 opt-in until secondary CRTCs can present. A failed native modeset leaves the
 screen dark, and there is no automatic hang recovery, so first hardware boots
-should keep the off switches at hand. Firmware: `xtask import-firmware` now
+should keep the off switches at hand. Firmware: `cargo narf firmware import-firmware` now
 follows linux-firmware alias symlinks; re-imported from 20260916, all twelve
 Navi22 payloads match the distribution and the conformance gate passes.
 Memory/filesystem/userspace/GPU/framebuffer suites passed 3333 x86_64 and
@@ -4121,7 +4121,7 @@ shared DP link layer) and 8b/10b DP MST through the shared sideband manager
 `amdgpu.rdna2_multi` (still opt-in); only CRTC 0 presents (the others show
 static scanouts).
 Register models only; never run on hardware.
-For bare-metal runs, `cargo xtask usb-image` builds a UEFI stick whose kernel
+For bare-metal runs, `cargo narf disk usb-image` builds a UEFI stick whose kernel
 appends its log to `/narf-boot-<n>.log` on that stick (`narf.bootlog=`,
 marker-gated, USB-only, bounded) and boots with `narf.disks=boot-only`: every
 other disk is read-only at the block layer (writes refused, logged once) and
@@ -4199,13 +4199,13 @@ power gating (DPG) and any hardware boot remain open. See the
 ## Reproduce the main checks
 
 ```sh
-cargo xtask run --arch=x86_64
-cargo xtask run --arch=aarch64
-cargo xtask test --arch=x86_64
-cargo xtask test --arch=aarch64
-cargo xtask run-interactive --arch=x86_64 --cmd "echo hello world" --expect "hello world"
-cargo xtask musl-demo --arch=x86_64
-cargo xtask iso-boot --arch=x86_64 --release
+cargo narf run run --arch=x86_64
+cargo narf run run --arch=aarch64
+cargo narf test test --arch=x86_64
+cargo narf test test --arch=aarch64
+cargo narf run run-interactive --arch=x86_64 --cmd "echo hello world" --expect "hello world"
+cargo narf smoke musl-demo --arch=x86_64
+cargo narf build iso-boot --arch=x86_64 --release
 ```
 
 The musl demo cases may need generated binaries and rootfs images; see

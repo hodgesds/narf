@@ -947,7 +947,7 @@ pub fn __reset_for_test() {
 
 // ── Tests ────────────────────────────────────────────────────────
 // Always compiled (not `#[cfg(test)]`) so they register into the in-kernel
-// `narf.tests` section and actually run under `cargo xtask test`.
+// `narf.tests` section and actually run under `cargo narf test test`.
 mod tests {
     use super::{
         __reset_for_test, add, add_reserved, for_each_owner, for_each_tracked_frame, move_owner,

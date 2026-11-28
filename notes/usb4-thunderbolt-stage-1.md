@@ -60,8 +60,8 @@ under post-2026-05-20 GPL-2.0-or-later relicense
 
 ## Verification
 
-- `cargo xtask test --arch=x86_64`: 2569 pass / 0 fail / 49 skip
+- `cargo narf test test --arch=x86_64`: 2569 pass / 0 fail / 49 skip
   (baseline 2451; Stage-1 adds 9 smokes).
-- `cargo xtask run --arch=x86_64 --display none`: Stage::Device
+- `cargo narf run run --arch=x86_64 --display none`: Stage::Device
   `intel-thunderbolt` fires + Stage::Late `thunderbolt-topology`
   returns `not-present` on QEMU (no NHI emulation).

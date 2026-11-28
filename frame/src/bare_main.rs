@@ -4111,7 +4111,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // runs (registration order is execution order within a stage).
             narf_drivers_nvidia::register_gsp_firmware_pass();
 
-            // Test vehicle for `cargo xtask btrfs-rootrw-interop`: systemd-
+            // Test vehicle for `cargo narf smoke btrfs-rootrw-interop`: systemd-
             // and pacman-shaped writes on the mounted root, run only when the
             // harness passes `narf.rootrw_interop=<mode>` together with
             // `narf.disks=root-rw` against its own disposable image (the
@@ -4125,7 +4125,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 },
                 300_000,
             );
-            // The same for `cargo xtask ext4-rootrw-interop`: a LUKS + ext4
+            // The same for `cargo narf smoke ext4-rootrw-interop`: a LUKS + ext4
             // root. Inert without `narf.ext4_interop=<mode>`; refuses any
             // root but the harness image.
             narf_init::register_with_budget(
@@ -4330,7 +4330,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if !matches!(detect_filesystem(&dev), Ok(Some(FsType::Btrfs))) {
                         continue;
                     }
-                    // Only xtask's own fixture, and never the cmdline root.
+                    // Only cargo narf's own fixture, and never the cmdline root.
                     if !narf_drivers_fs_btrfs::harness::device_is_disposable(
                         &dev,
                         "btrfs-disk-smoke",
@@ -4402,7 +4402,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // the 500 ms default-probe warning on every successful run.
             let btrfs_write_smoke = || {
                 // Test-only: this grows and rewrites the first btrfs volume it
-                // finds. Run it only against xtask's own disposable image.
+                // finds. Run it only against cargo narf's own disposable image.
                 if !narf_boot::args().has_flag("narf.btrfs_smoke") {
                     return narf_init::InitResult::NotPresent;
                 }
@@ -4413,7 +4413,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if !matches!(detect_filesystem(&dev), Ok(Some(FsType::Btrfs))) {
                         continue;
                     }
-                    // This grows and rewrites the filesystem: only xtask's
+                    // This grows and rewrites the filesystem: only cargo narf's
                     // own fixture (harness fsid), never the cmdline root.
                     if !narf_drivers_fs_btrfs::harness::device_is_disposable(
                         &dev,
@@ -5158,7 +5158,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     {
         // `test_subsystem=a,b,c` selects those subsystems (prefix-matched:
         // `filesystem` selects `filesystem/page_cache` too). This is the
-        // change-based CI path — `cargo xtask affected` computes the
+        // change-based CI path — `cargo narf ci affected` computes the
         // affected set and CI threads it here. Absent/empty ⇒ run all.
         //
         // `test_subsystem_exclude=a,b,c` removes subsystems from whatever
@@ -5190,7 +5190,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // Boot-smoke: real init flow + a real platform power-off.
     // Drains queued async tasks (including measured-boot) for ~2 s so
     // the boot log surfaces, then enters ACPI S5 on x86_64 or invokes
-    // PSCI SYSTEM_OFF on aarch64. The xtask `boot-smoke` subcommand
+    // PSCI SYSTEM_OFF on aarch64. The cargo narf `boot-smoke` subcommand
     // waits for QEMU to power off naturally + checks stdout for panic
     // markers, rather than killing the child after a wall-clock timeout.
     #[cfg(feature = "boot-smoke")]
@@ -5688,7 +5688,7 @@ fn run_async_demo() -> ! {
 /// Called from `run_async_demo` only when the `boot-init` feature
 /// is enabled. `kernel-test` builds route through
 /// `narf_verification::run_all_and_exit()` instead, so this fn
-/// never fires under `cargo xtask test`.
+/// never fires under `cargo narf test test`.
 #[cfg(all(feature = "boot-init", target_arch = "x86_64"))]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn boot_userspace_init() {
@@ -6322,7 +6322,7 @@ fn boot_userspace_init() {
                 ("accept4_smoke", narf_verification::NARF_ACCEPT4_SMOKE_ELF),
                 // The terminal chain end to end. Shipped in the KDE image
                 // since 6-Aug with nothing running it; staged here so
-                // `cargo xtask musl-demo` gates on it every run.
+                // `cargo narf smoke musl-demo` gates on it every run.
                 ("ptyspawn_smoke", narf_verification::NARF_PTYSPAWN_SMOKE_ELF),
                 // Linux-compat round 2: mremap / sendfile / creds / waitid.
                 ("mremap_smoke", narf_verification::NARF_MREMAP_SMOKE_ELF),
@@ -7014,7 +7014,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
     // Off-box network serving smoke (opt-in `qemu-net`): auto-spawn the
     // TCP echo server alongside getty. The kernel statically configured
     // the virtio NIC with the SLIRP lease (cross_crate_init), and QEMU forwards a
-    // host port to guest :7777, so the host-side `cargo xtask net-smoke`
+    // host port to guest :7777, so the host-side `cargo narf smoke net-smoke`
     // harness can connect and round-trip without driving the console.
     #[cfg(feature = "qemu-net")]
     {
@@ -7023,10 +7023,10 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
         }
         // Unmodified redis-server, bound off-box on 0.0.0.0:6379. Args
         // skip IPv6 + RDB/AOF persistence so it serves from RAM only; the
-        // host-side `cargo xtask redis-smoke` harness then does SET/GET
+        // host-side `cargo narf smoke redis-smoke` harness then does SET/GET
         // over the hostfwd port. Suppressed under `mt-echo`, which
         // dedicates the box to the multithreaded benchmark workload — and
-        // under the `no_redis` cmdline flag, which `cargo xtask net-smoke`
+        // under the `no_redis` cmdline flag, which `cargo narf smoke net-smoke`
         // sets so redis's heavy startup can't starve netserve's RX path on
         // a single CI vcpu past the host deadline (the net-smoke flake).
         #[cfg(not(feature = "mt-echo"))]
@@ -7088,7 +7088,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
 /// the aarch64 init/shell ELFs (the loader's PT_LOAD segment-walker is
 /// arch-neutral, but the init/shell crates currently link against the
 /// x86_64 testbin layout). Until that ELF-side work lands the boot-init
-/// path stays a no-op so `cargo xtask run --arch=aarch64
+/// path stays a no-op so `cargo narf run run --arch=aarch64
 /// --features boot-init` still links and boots the kernel proper.
 #[cfg(all(feature = "boot-init", not(target_arch = "x86_64")))]
 #[allow(dead_code)] // TODO(narf): aarch64 boot-init stub; its caller is cfg'd out under kernel-test

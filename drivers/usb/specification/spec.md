@@ -1426,8 +1426,8 @@ For bring-up, import the Qualcomm tree and place both the generic WCN6855
 files and the QCA2066 board-ID fallback in the initramfs:
 
 ```sh
-cargo xtask import-firmware --vendor qca --clean
-cargo xtask image --arch=x86_64 \
+cargo narf firmware import-firmware --vendor qca --clean
+cargo narf build image --arch=x86_64 \
   --initramfs-firmware 'qca/*' \
   --initramfs-firmware 'qca/QCA2066/*'
 ```

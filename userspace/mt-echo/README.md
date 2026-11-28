@@ -108,8 +108,8 @@ of this file for a sample result.
 ## Running under NARF (implemented)
 
 The server is embedded in the kernel image and boot-spawned, and an
-xtask subcommand drives `loadgen` against it. (This mirrors the
-`redis-bench` flow: `build/xtask/src/main.rs`
+cargo narf subcommand drives `loadgen` against it. (This mirrors the
+`redis-bench` flow: `build/cargo-narf/src/main.rs`
 `boot_narf_redis`/`redis_bench_cmd`.)
 
 **How it's wired:**
@@ -121,7 +121,7 @@ xtask subcommand drives `loadgen` against it. (This mirrors the
   **instead of** redis. Worker count comes from the kernel cmdline
   `mt_echo_threads=N` (default = CPU count) — passed via QEMU `-append`
   (`XTASK_QEMU_APPEND`), so a thread sweep needs **no kernel rebuild**.
-- `cargo run -p xtask -- mt-echo-bench --arch=x86_64` builds the host
+- `cargo run -p cargo-narf -- mt-echo-bench --arch=x86_64` builds the host
   `loadgen`, boots NARF per `XTASK_MT_ECHO_THREADS` (CSV sweep), waits
   for the `mt-echo: listening` marker, runs `loadgen`, and prints an
   rps + p50/p99/p99.9 table.
@@ -135,7 +135,7 @@ ip addr add 10.0.2.2/24 dev tap0; ip link set tap0 up
 NARF_QEMU_SMP=8 \
 XTASK_QEMU_ACCEL=kvm XTASK_QEMU_TAP=tap0 XTASK_QEMU_QUEUES=4 \
 XTASK_MT_ECHO_THREADS=4 XTASK_MT_ECHO_CONNS=50 XTASK_MT_ECHO_SECS=5 \
-  cargo run -p xtask -- mt-echo-bench --arch=x86_64
+  cargo run -p cargo-narf -- mt-echo-bench --arch=x86_64
 ```
 Knobs: `XTASK_MT_ECHO_THREADS` (server-worker CSV sweep, default 4),
 `XTASK_MT_ECHO_CONNS` (50), `XTASK_MT_ECHO_SECS` (5),

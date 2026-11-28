@@ -7,7 +7,7 @@
 # threads (each thread = one SO_REUSEPORT listener the kernel steers
 # distinct flows to). This is the host-only proof that the workload
 # parallelizes; the NARF-vs-Linux-over-tap comparison is documented in
-# README.md and wired into xtask separately.
+# README.md and wired into cargo narf separately.
 #
 # IMPORTANT: the server binary is a NARF/musl-static x86_64 ELF. It is
 # ALSO a perfectly valid Linux ELF, so it runs natively here for the

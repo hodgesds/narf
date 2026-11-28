@@ -378,7 +378,7 @@ pub fn run(args: &Args) -> Result<()> {
     })?;
     let server = H3Server::start()?;
     println!(
-        "xtask http3-smoke: fixture on 127.0.0.1:{}; guest uses 10.0.2.2:{}",
+        "cargo narf smoke http3-smoke: fixture on 127.0.0.1:{}; guest uses 10.0.2.2:{}",
         server.port, server.port
     );
     let guest = run_guest(args, &password, server.port);
@@ -396,7 +396,7 @@ pub fn run(args: &Args) -> Result<()> {
         );
     }
     println!(
-        "xtask http3-smoke: OK — {STREAMS} parallel streams on one QUIC connection, \
+        "cargo narf smoke http3-smoke: OK — {STREAMS} parallel streams on one QUIC connection, \
          then {CONNECTIONS} independent connections"
     );
     Ok(())

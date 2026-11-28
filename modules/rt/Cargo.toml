@@ -6,11 +6,11 @@
 # crate rebuilds the pieces a driver of any size needs — a heap, console
 # lines, locks, a monotonic clock, an executor for its own futures and its
 # load parameters — on top of five KABI exports, and nothing else. It
-# depends on no kernel crate, so `xtask build-module` links it into the
+# depends on no kernel crate, so `cargo narf build build-module` links it into the
 # module from the staticlib archive and the `nm -u` gate still sees only
 # `narf_*` exports.
 #
-# Host tests (`cargo xtask host-test`) swap the five exports for in-process
+# Host tests (`cargo narf test host-test`) swap the five exports for in-process
 # stand-ins; see `src/abi.rs`.
 
 [package]

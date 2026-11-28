@@ -30,7 +30,7 @@
  * ----------------
  * Once all N listeners are bound+listening, the main thread prints
  *   "mt-echo: listening port=<P> threads=<N>"
- * on stdout (and flushes). A harness (xtask, mirroring the redis
+ * on stdout (and flushes). A harness (cargo narf, mirroring the redis
  * "Ready to accept connections" probe) waits for this line before it
  * starts the load generator.
  *

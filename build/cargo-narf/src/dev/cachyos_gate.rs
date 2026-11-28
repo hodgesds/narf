@@ -1,7 +1,7 @@
-//! `cargo xtask cachyos-gate`: the pre-hardware validation gate for booting
+//! `cargo narf smoke cachyos-gate`: the pre-hardware validation gate for booting
 //! the host's installed CachyOS on NARF.
 //!
-//! It boots the real `cargo xtask grub-image` bundle under OVMF on a q35
+//! It boots the real `cargo narf build grub-image` bundle under OVMF on a q35
 //! machine whose storage mirrors the host:
 //!
 //! * NVMe controller 1 (`00:04.0`): a decoy GPT disk, vfat p1 + ext4 p2, the

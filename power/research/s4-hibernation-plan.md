@@ -51,7 +51,7 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
    `stop_parked` and `restart_parked`). This is not a hot-unplug: a
    parked CPU keeps its queue, pinned work included, so nothing needs an
    offline callback. It is INIT'd and later restarted with INIT-SIPI-SIPI.
-   `cargo xtask hibernate-e2e --smp 2` covers it.
+   `cargo narf smoke hibernate-e2e --smp 2` covers it.
 5. ~~**Snapshot.**~~ Done (`hibernate::snapshot`, spec §3.6.0c). The
    walk uses the allocator's free-state index, so free blocks and cached
    frames are skipped and everything else in known RAM is saved (NVS
@@ -84,7 +84,7 @@ prepare for it (amdgpu's `prepare_graphics_hibernate`). S3 entry with an
      the image kernel's saved context at its own slide);
    - in the image kernel: device restore, then thaw.
    A refused or failed image boots normally and invalidates the image.
-9. **End-to-end test.** `cargo xtask hibernate-e2e` (x86_64, one CPU)
+9. **End-to-end test.** `cargo narf smoke hibernate-e2e` (x86_64, one CPU)
    boots QEMU twice on one ext4 disk. The first boot fills 16 MiB with a
    token-seeded pattern and hibernates (guest half:
    `power/src/hibernate/e2e.rs`). The second resumes through `narf.resume=`

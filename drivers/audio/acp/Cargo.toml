@@ -7,7 +7,7 @@
 #   * `builtin` (default): rlib dependency of the `narf-audio` facade,
 #     registered from its Stage::Subsys `acp6-pci` / `acp63-sdw-pci`
 #     initcalls.
-#   * `module`: `cargo xtask build-module --package narf-drivers-audio-acp
+#   * `module`: `cargo narf build build-module --package narf-drivers-audio-acp
 #     --no-default-features --features module`. Registration-only: the probe
 #     thunk returns -ENOSYS; it registers the ACP PCI id through
 #     `narf_register_pci_driver`.

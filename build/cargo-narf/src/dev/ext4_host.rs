@@ -1,4 +1,4 @@
-//! `cargo xtask ext4-host-rw`: the host-side (no QEMU) ext4 write harness,
+//! `cargo narf smoke ext4-host-rw`: the host-side (no QEMU) ext4 write harness,
 //! `verification/ext4-host`.
 //!
 //! Builds the `narf-ext4-host` binary for the host (release by default) and

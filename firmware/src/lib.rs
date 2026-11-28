@@ -421,7 +421,7 @@ pub fn register_in_tree_bundle(blobs: &[(&'static str, &'static [u8])]) {
 ///
 /// - `firmware-scan-initramfs`: scans the multiboot2 initramfs for
 ///   `firmware/*` entries (populated only when `--initramfs-firmware`
-///   globs were passed to `xtask image`). With no globs the initramfs
+///   globs were passed to `cargo narf build image`). With no globs the initramfs
 ///   is firmware-free and this slot returns `NotPresent` — that is
 ///   documented as OK.
 ///

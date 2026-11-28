@@ -7,7 +7,7 @@ export XTASK_QEMU_NO_BALLOON=1
 export NARF_QEMU_MEM_MB=2048
 
 # By default this reproduces the FULL CI gate. Pass `--affected` to run only
-# the jobs `cargo xtask affected` says the working-tree diff can touch (the
+# the jobs `cargo narf ci affected` says the working-tree diff can touch (the
 # same computation CI's `changes` job uses), so local pre-push checks match
 # what CI will actually run on the PR. `--base <ref>` overrides the diff base
 # (default origin/main).
@@ -42,7 +42,7 @@ if [ "$AFFECTED" = 1 ]; then
   echo "Computing affected jobs vs $BASE ..."
   # `--event pull_request` so local pruning matches a PR (push/main forces
   # full). `--format github` prints `name=value` lines to stdout.
-  PLAN="$(cargo xtask affected --format github --event pull_request --base "$BASE")"
+  PLAN="$(cargo narf ci affected --format github --event pull_request --base "$BASE")"
   echo "$PLAN"
   get() { printf '%s\n' "$PLAN" | grep "^$1=" | cut -d= -f2-; }
   FULL="$(get full)"
@@ -70,9 +70,9 @@ cargo fmt --all -- --check
 
 echo "Running host tests"
 # Single source of truth for the host-test gate; also what CI's host-tests job
-# runs. Covers narf-lib, narf-hid, the BPF host-testable crates, xtask (which
+# runs. Covers narf-lib, narf-hid, the BPF host-testable crates, cargo narf (which
 # includes the `affected` unit tests), and the isolated login-core workspace.
-cargo xtask host-test
+cargo narf test host-test
 
 if should "$RUN_CLIPPY"; then
   echo "Running clippy (x86_64)"
@@ -101,22 +101,22 @@ fi
 
 if should "$RUN_BOOT_SMOKE"; then
   echo "Running boot-smoke (x86_64)"
-  cargo xtask boot-smoke --arch=x86_64
+  cargo narf test boot-smoke --arch=x86_64
 
   if arch_on aarch64; then
     echo "Running boot-smoke (aarch64)"
-    cargo xtask boot-smoke --arch=aarch64
+    cargo narf test boot-smoke --arch=aarch64
   fi
 fi
 
 if should "$RUN_MUSL"; then
   echo "Running musl-demo (x86_64, all groups)"
-  XTASK_RI_PROMPT_TIMEOUT_SECS=900 XTASK_RI_ECHO_TIMEOUT_SECS=900 cargo xtask musl-demo --arch=x86_64
+  XTASK_RI_PROMPT_TIMEOUT_SECS=900 XTASK_RI_ECHO_TIMEOUT_SECS=900 cargo narf smoke musl-demo --arch=x86_64
 fi
 
 if should "$RUN_NET"; then
   echo "Running net-smoke (x86_64)"
-  XTASK_RI_PROMPT_TIMEOUT_SECS=900 cargo xtask net-smoke --arch=x86_64
+  XTASK_RI_PROMPT_TIMEOUT_SECS=900 cargo narf smoke net-smoke --arch=x86_64
 fi
 
 if should "$RUN_KERNEL_TEST"; then
@@ -127,9 +127,9 @@ if should "$RUN_KERNEL_TEST"; then
   # behaviour is unconditional now, so there is no feature to add for it.
   # In --affected mode a non-empty subsystem filter runs only the relevant tests.
   if [ -n "$SUBS" ] && [ "$FULL" != "true" ]; then
-    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container --subsystem "$SUBS" --exclude-subsystem drivers/gpu
+    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo narf test test --arch=x86_64 --features cgroup-all,container --subsystem "$SUBS" --exclude-subsystem drivers/gpu
   else
-    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container --exclude-subsystem drivers/gpu
+    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo narf test test --arch=x86_64 --features cgroup-all,container --exclude-subsystem drivers/gpu
   fi
 
   # aarch64 too. CI's kernel-test job is a matrix over BOTH arches while this
@@ -145,9 +145,9 @@ if should "$RUN_KERNEL_TEST"; then
   if arch_on aarch64; then
     echo "Running kernel-test (aarch64)"
     if [ -n "$SUBS" ] && [ "$FULL" != "true" ]; then
-      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container --subsystem "$SUBS" --exclude-subsystem drivers/gpu
+      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo narf test test --arch=aarch64 --features cgroup-all,container --subsystem "$SUBS" --exclude-subsystem drivers/gpu
     else
-      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container --exclude-subsystem drivers/gpu
+      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo narf test test --arch=aarch64 --features cgroup-all,container --exclude-subsystem drivers/gpu
     fi
   fi
 
@@ -159,11 +159,11 @@ if should "$RUN_KERNEL_TEST"; then
   # the primary invocation already ran the production boot postflight.
   if should "$RUN_GPU_TESTS"; then
     echo "Running kernel-test GPU shard (x86_64)"
-    XTASK_QEMU_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container --subsystem drivers/gpu --kernel-tests-only
+    XTASK_QEMU_TIMEOUT_SECS=1200 cargo narf test test --arch=x86_64 --features cgroup-all,container --subsystem drivers/gpu --kernel-tests-only
 
     if arch_on aarch64; then
       echo "Running kernel-test GPU shard (aarch64)"
-      XTASK_QEMU_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container --subsystem drivers/gpu --kernel-tests-only
+      XTASK_QEMU_TIMEOUT_SECS=1200 cargo narf test test --arch=aarch64 --features cgroup-all,container --subsystem drivers/gpu --kernel-tests-only
     fi
   fi
 fi

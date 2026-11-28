@@ -12,7 +12,7 @@
 //! ORed with the offset is non-canonical and faults `#GP`.
 //!
 //! So the build forces OUTLINE instrumentation
-//! (`-asan-instrumentation-with-call-threshold=0`, see `build/xtask`): every
+//! (`-asan-instrumentation-with-call-threshold=0`, see `build/cargo-narf`): every
 //! instrumented access calls `__asan_{load,store}N` with the RAW address, and
 //! we resolve the shadow in software here. The addresses that matter are
 //! the ones naming RAM: heap objects are reached through the high-half

@@ -10,7 +10,7 @@
 # tracks the same shape so authors of out-of-tree modules can copy
 # from it.
 #
-# Built with `cargo xtask build-module`, which compiles it for the kernel
+# Built with `cargo narf build build-module`, which compiles it for the kernel
 # target, extracts this crate's own object members from the `staticlib`
 # archive, and `ld -r`s them into the single relocatable object the loader
 # wants — merging the per-static `.modinfo` sections in the process.

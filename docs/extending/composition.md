@@ -5,9 +5,9 @@ adding them to the repository workspace or editing `frame/Cargo.toml`. Pass a
 composition file to any command that accepts the common build options:
 
 ```sh
-cargo xtask build --arch x86_64 --composition /etc/narf/acme.toml
-cargo xtask run  --arch x86_64 --composition ../acme/narf.toml
-cargo xtask image --arch x86_64 --composition ../acme/narf.toml
+cargo narf build build --arch x86_64 --composition /etc/narf/acme.toml
+cargo narf run run  --arch x86_64 --composition ../acme/narf.toml
+cargo narf build image --arch x86_64 --composition ../acme/narf.toml
 ```
 
 Paths in the file are relative to the file, not the NARF checkout. Generated
@@ -66,7 +66,7 @@ changed at runtime; the entry instead receives it explicitly:
 pub fn register(domain: narf_lib::id::DomainId) { /* retain as static policy */ }
 ```
 
-`xtask` generates an initcall at the requested stage. This removes the former
+`cargo narf` generates an initcall at the requested stage. This removes the former
 kernel-side dependency and retention line, but it does not make internal Rust
 APIs stable. The external crate must track the source/API version of NARF it is
 built against. Because built-ins execute privileged Rust in the kernel graph,
@@ -86,7 +86,7 @@ not a sandbox for an untrusted crate.
 ## Module contract
 
 A module remains a separately linked `.ko` and may use only the stable C KABI;
-see [Building and loading runtime modules](modules.md). `xtask` builds it from
+see [Building and loading runtime modules](modules.md). `cargo narf` builds it from
 its own manifest, stamps the selected kernel's ABI hash, optionally compresses
 and signs it, stages it in the initramfs for `run`/x86_64 `image`, and adds the
 boot arguments needed to autoload it. Per-module placement is encoded as:
@@ -102,14 +102,14 @@ loader still rejects `FRAME`.
 
 For every signed component, `public_key` is both the raw 32-byte Ed25519 key
 used to validate the detached signature during the build and a kernel trust
-anchor. `xtask` writes the selected keys to a generated trust-store file and
+anchor. `cargo narf` writes the selected keys to a generated trust-store file and
 builds the kernel with it. If `NARF_MODULE_TRUSTED_KEYS` already names an
 absolute distribution trust-store file, those keys are retained and the
 composition keys are added. The detached signature must cover BLAKE3 of the
 final ABI-stamped bytes (or the compressed envelope when `compress = true`).
 
 The aarch64 direct-QEMU path carries composed modules. The current aarch64
-UEFI image has no initramfs handoff, so `xtask image --arch aarch64` rejects a
+UEFI image has no initramfs handoff, so `cargo narf build image --arch aarch64` rejects a
 composition containing modules instead of silently dropping them; built-ins
 are supported.
 

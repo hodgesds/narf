@@ -47,7 +47,7 @@ infrastructure (Phase B).
 ### Vendor driver feature split
 
 The Intel registration crate builds as a relocatable NARF module with
-`cargo xtask build-module --package narf-drivers-gpu-intel --no-default-features --features module`.
+`cargo narf build build-module --package narf-drivers-gpu-intel --no-default-features --features module`.
 The loader places `intel_gpu` in the graphics domain by default. Its exact
 PCI matches come from the built-in driver's tables, including its gated
 IDs. Its probe currently returns `-ENODEV` and permits the resident
@@ -66,7 +66,7 @@ of its PCI drivers register: the Intel modules,
 module tree, `amdgpu-pci`, `amdgpu-usbc` and `amdgpu-dp-bridge` only under `amdgpu`.
 The `smoke_gpu_vendor_feature_registration_census` kernel-test
 fixture pins the registered initcall names against the compiled
-feature set. The named-config registry in build/xtask
+feature set. The named-config registry in build/cargo-narf
 (`configs.rs`) selects these features per build configuration:
 laptop/desktop-class configs enable `intel`; `minimal` and
 AMD-only configs do not. These features select the native GPU datapaths.
@@ -16073,7 +16073,7 @@ scanout via `Cap<FbContext, Open>` (per `user-runtime/graphics.rs`)
 and submit DrawCmds through a per-process ring; the
 kernel-side drain task converts to FB writes.
 
-This is the testbin demo path (see `cargo xtask demo`) — it
+This is the testbin demo path (see `cargo narf run demo`) — it
 works today, locked at v1.0.
 
 ## 9. ABI versioning

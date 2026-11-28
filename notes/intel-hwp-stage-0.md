@@ -37,7 +37,7 @@ reserved-high-half mask, vendor-gated summary alignment with
 `NotIntel`, silent. Intel models (`SandyBridge`, `Skylake-Server`,
 etc.) advertise `GenuineIntel` but don't populate CPUID 0x06
 EAX[7] → `hwp: not supported`. Both validated via
-`NARF_QEMU_CPU=... cargo xtask run --arch=x86_64 --display none`.
+`NARF_QEMU_CPU=... cargo narf run run --arch=x86_64 --display none`.
 
 ## Out of scope (Stage-1+)
 

@@ -41,7 +41,7 @@
 //!
 //! Zero dependencies and `#![forbid(unsafe_code)]`, so this crate builds and
 //! tests on the host: `cargo test -p narf-bpf-isa`, or through
-//! `cargo xtask host-test`. In-kernel smokes are behind the `kernel-test`
+//! `cargo narf test host-test`. In-kernel smokes are behind the `kernel-test`
 //! feature.
 
 #![cfg_attr(not(test), no_std)]

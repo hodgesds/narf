@@ -1,7 +1,7 @@
 //! The kernel's own symbol table, read from the image.
 //!
-//! `xtask kallsyms` fills the linker-reserved `.kallsyms` section after the
-//! link (`build/xtask/src/kallsyms.rs`); this is the in-kernel side —
+//! `cargo narf build kallsyms` fills the linker-reserved `.kallsyms` section after the
+//! link (`build/cargo-narf/src/kallsyms.rs`); this is the in-kernel side —
 //! Linux's `kernel/kallsyms.c` decoder. The table stores offsets from the
 //! link-time `_text`, and every runtime address is the RUNTIME `_text` plus
 //! that offset, so the KASLR slide is applied by taking `_text`'s address
@@ -32,14 +32,14 @@ fn reservation() -> &'static [u8] {
     let len = end.saturating_sub(start as usize);
     // SAFETY: the linker script reserves `[__kallsyms_start, __kallsyms_end)`
     // as one PROGBITS section in the read-only image segment, mapped for the
-    // kernel's whole lifetime and never written after `xtask` patched it, so
+    // kernel's whole lifetime and never written after `cargo narf` patched it, so
     // the range is valid, initialised and immutable for `'static`.
     unsafe { core::slice::from_raw_parts(start, len) }
 }
 
 /// The image's symbol table, validated on first use.
 ///
-/// `Err(Error::BadMagic)` when the image was linked without the `xtask`
+/// `Err(Error::BadMagic)` when the image was linked without the `cargo narf`
 /// patch step (a bare `cargo build`): the reservation is still zero, and
 /// there is simply no table — not a corrupt one.
 pub fn table() -> Result<Table<'static>, Error> {

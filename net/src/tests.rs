@@ -8511,7 +8511,7 @@ kernel_test_in!("net/dhcp", smoke_resolv_conf_parse_two_ns_and_search);
 /// Provision a loopback interface named "lo" with 127.0.0.1/8, exactly as
 /// `install_net_stack` now does at boot. The kernel-test image does not run
 /// that path — `install_all_hooks` is gated on `boot-init` and, per
-/// bare_main's own note, "never fires under `cargo xtask test`" — so these
+/// bare_main's own note, "never fires under `cargo narf test test`" — so these
 /// cases provision it themselves and pin the MECHANISM the boot wiring
 /// depends on: that giving lo an address yields a working 127.0.0.0/8 route.
 /// The boot call itself is covered by the "net: lo registered" boot line.

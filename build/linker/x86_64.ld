@@ -32,19 +32,19 @@ KERNEL_IMAGE_SIZE = 0x40000000;   /* 1 GiB. LLD takes K/M, not G. */
 
 /* Space reserved for the KASLR relocation table. The full debug kernel
  * needs ~6 MiB (1.56M sites x 4 bytes + header); 8 MiB leaves room to grow
- * before the reservation has to be revisited. `xtask relocs` errors out if a
+ * before the reservation has to be revisited. `cargo narf build relocs` errors out if a
  * table does not fit rather than writing a short one. */
 KASLR_RELOC_RESERVE = 8M;
 
 /* Space reserved for the kernel symbol table (`/proc/kallsyms`). Filled after
- * linking by `xtask kallsyms`, the same reserve-then-patch scheme as the
+ * linking by `cargo narf build kallsyms`, the same reserve-then-patch scheme as the
  * relocation table: the table is computed from the linked image, so its size
  * has to be fixed before the link or every address it records would move —
  * the reason Linux links vmlinux two or three times. Measured tables: the
- * x86_64 `xtask test` image (every kernel test linked in) 4.4 MiB for 384k
+ * x86_64 `cargo narf test test` image (every kernel test linked in) 4.4 MiB for 384k
  * symbols, a native x86_64 release image 2.4 MiB for 195k, aarch64 release
  * 4.0 MiB for 351k, debug builds ~1.8 MiB. 8 MiB leaves ~1.8x over the
- * largest, the same margin `KASLR_RELOC_RESERVE` keeps. `xtask` fails the
+ * largest, the same margin `KASLR_RELOC_RESERVE` keeps. `cargo narf` fails the
  * build rather than truncating if a table outgrows it. */
 KALLSYMS_RESERVE = 8M;
 
@@ -138,7 +138,7 @@ SECTIONS
 
     /* KASLR relocation table.
      *
-     * Reserved here, filled after linking by `xtask relocs --patch`: the
+     * Reserved here, filled after linking by `cargo narf build relocs --patch`: the
      * table's contents are computed FROM the linked image, so its size has to
      * be fixed before the link or every address it records would move. The
      * build fails rather than truncating if the table outgrows the window.
@@ -159,7 +159,7 @@ SECTIONS
 
     /* Kernel symbol table, read by `/proc/kallsyms`.
      *
-     * Reserved here and filled after linking by `xtask kallsyms` (see
+     * Reserved here and filled after linking by `cargo narf build kallsyms` (see
      * `KALLSYMS_RESERVE`). The table holds symbol offsets from `_text`, never
      * absolute addresses, so it carries no relocation records and the KASLR
      * pass leaves it alone; the kernel adds the runtime `_text` when it reads
@@ -201,7 +201,7 @@ SECTIONS
      *
      * It has to be an absolute linker symbol, not `_start_rust - KERNEL_VIRT_BASE`
      * written in the asm: that expression leaves a relocation whose symbol value
-     * IS in the image, so `xtask relocs` would classify it as moving and add the
+     * IS in the image, so `cargo narf build relocs` would classify it as moving and add the
      * slide a second time. This symbol's value is a small offset, so the
      * classifier leaves it alone -- which is the whole point. */
     __start_rust_off = _start_rust - KERNEL_VIRT_BASE;

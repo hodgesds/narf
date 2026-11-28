@@ -140,7 +140,7 @@ pub fn kernel_virt_base() -> u64 {
 /// who can read the log would otherwise have it. A panic or fatal exception
 /// is the exception because its report is useless without it — every raw
 /// address in the backtrace is slid — and the machine is going down.
-/// `xtask kallsyms --print-slide <offset>` turns it back into a symbol table.
+/// `cargo narf build kallsyms --print-slide <offset>` turns it back into a symbol table.
 ///
 /// `phys delta` is NARF's physical relocation (`IMAGE_PHYS_DELTA`), which
 /// Linux x86 does not report; the fatal printers dump physical addresses

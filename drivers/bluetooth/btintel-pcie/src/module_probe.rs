@@ -8,7 +8,7 @@
 //!
 //! A module build links ONLY the `narf_register_pci_driver` KSYMTAB import —
 //! no kernel crates — so the `.ko`'s undefined-symbol set stays within the
-//! exported ABI (xtask's `nm -u` gate enforces it).
+//! exported ABI (cargo narf's `nm -u` gate enforces it).
 
 /// Intel.
 const INTEL_VENDOR: u16 = 0x8086;

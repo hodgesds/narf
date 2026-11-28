@@ -196,7 +196,7 @@ Any actor may file a bug. Bug reports include:
 - **Summary.** One sentence.
 - **Environment.** NARF revision, target arch, bootloader, QEMU /
   hardware.
-- **Reproduction.** Minimal steps, ideally a `cargo xtask test` command.
+- **Reproduction.** Minimal steps, ideally a `cargo narf test test` command.
 - **Expected vs. actual.** Precisely.
 - **Severity guess.** Info / minor / major / critical. Triage may reclassify.
 

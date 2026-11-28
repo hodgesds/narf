@@ -2183,7 +2183,7 @@ kernel_test_in!("filesystem/procfs/pid_ext", smoke_coredump_filter_default);
 
 /// Stub hooks used by the procfs write-validation smokes so the
 /// validation path runs without depending on `install_all_hooks`
-/// from the frame crate (which isn't called in `cargo xtask test`).
+/// from the frame crate (which isn't called in `cargo narf test test`).
 fn _stub_set_comm(_pid: u64, _name: &str) -> Result<(), FsError> {
     Ok(())
 }

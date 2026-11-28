@@ -5,7 +5,7 @@
 #
 #   * `builtin` (default): rlib dependency of the `narf-audio` facade,
 #     registered from its Stage::Subsys `hda-pci` initcall.
-#   * `module`: `cargo xtask build-module --package narf-drivers-audio-hda
+#   * `module`: `cargo narf build build-module --package narf-drivers-audio-hda
 #     --no-default-features --features module`. Registration-only: the probe
 #     thunk returns -ENOSYS; it registers the HDA PCI ids through
 #     `narf_register_pci_driver`.

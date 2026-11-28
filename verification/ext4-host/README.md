@@ -15,8 +15,8 @@ the result:
 - a fresh NARF mount must read the same tree back.
 
 ```sh
-cargo xtask ext4-host-rw                      # every scenario, 2 seeds
-cargo xtask ext4-host-rw --scenario baseline --seeds 20 --ops 5000
+cargo narf smoke ext4-host-rw                      # every scenario, 2 seeds
+cargo narf smoke ext4-host-rw --scenario baseline --seeds 20 --ops 5000
 ```
 
 A failing run keeps its image under `target/ext4-host/<scenario>-<seed>/`

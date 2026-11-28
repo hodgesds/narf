@@ -171,7 +171,7 @@ _start:
      * and alignment below, so it cannot escape the window. */
     ldr  x1, =KASLR_SLIDE_FIXED
     cbnz x1, .Lkaslr_have
-    /* Or one patched into the linked image (`NARF_KASLR_SLIDE`, xtask), so a
+    /* Or one patched into the linked image (`NARF_KASLR_SLIDE`, cargo narf), so a
      * slide-dependent failure reproduces without a rebuild. */
     adrp x1, kaslr_slide_override
     ldr  x1, [x1, #:lo12:kaslr_slide_override]
@@ -613,7 +613,7 @@ _start_rust_entry:
      * Same three-step search the Rust side already does in `scan_for_dtb`:
      * the handoff pointer, then the historical fixed address a loader
      * may still place the blob at, then a bounded scan of low RAM for
-     * the magic. xtask now places the DTB dynamically above the kernel
+     * the magic. cargo narf now places the DTB dynamically above the kernel
      * image, so the scan is usually the operative step.
      */
     movz w1, #0xfeed
@@ -632,9 +632,9 @@ _start_rust_entry:
     cmp  w0, w1
     b.eq .Lfdt_have
 
-    /* 2b. Where xtask's QEMU runner loads it for a raw-ELF boot: the first
+    /* 2b. Where cargo narf's QEMU runner loads it for a raw-ELF boot: the first
      * 1 MiB boundary at or above both the image's physical end and
-     * 0x4800_0000 (`dtb_load_addr` in build/xtask/src/aarch64_initrd.rs).
+     * 0x4800_0000 (`dtb_load_addr` in build/cargo-narf/src/aarch64_initrd.rs).
      * Once the image reaches past 0x5000_0000 the scan below cannot see it,
      * so this is the step that finds it. Probed only below 0x8000_0000, the
      * 1 GiB of RAM the boot map treats as present. */
@@ -1176,7 +1176,7 @@ fdt_initrd_end:    .quad 0
 fdt_span:          .quad 0
 fdt_floor:         .quad 0
 
-/* Debug: a slide to use instead of drawing entropy, 0 = draw. xtask writes it
+/* Debug: a slide to use instead of drawing entropy, 0 = draw. cargo narf writes it
  * into the linked image from `NARF_KASLR_SLIDE` (`kaslr_knob::set_slide`), and
  * the stub masks and aligns it like a drawn value, so it cannot leave the
  * window. Not zeroed at boot: its value comes from the file. */

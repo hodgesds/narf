@@ -290,7 +290,7 @@ tearing it down per module would invalidate other users of the same BAR.
    with the built-in driver, the RX half injects a device-shaped completion
    into the module-owned coherent ring and proves copy-out, gated stack
    ingress, callback scheduling, and descriptor rearm deterministically.
-   `cargo xtask e1000-module-net-smoke --arch=x86_64` supplies the exclusive
+   `cargo narf e1000-module-net-smoke --arch=x86_64` supplies the exclusive
    proof: it suppresses the built-in claimant, ABI-stamps and initramfs-loads
    `e1000.ko` before PCI probing with `modules_domain=driver2`, then carries
    live host-forwarded TCP and UDP exchanges plus a guest DNS query over the
@@ -538,7 +538,7 @@ Modes are the `WirelessModes` bits (STATION=1, AP=2, MONITOR=4, P2P=8);
 ## USB transfer datapath
 
 Status: **implemented; `ftdi.ko` (`drivers/usb/ftdi`) is the reference
-consumer**, proven by `cargo xtask ftdi-module-serial-smoke`.
+consumer**, proven by `cargo narf ftdi-module-serial-smoke`.
 
 A USB module probe runs inside the async attach cascade, and module text
 cannot produce or await a `Future`, so a blocking "do a transfer" export is
@@ -625,7 +625,7 @@ synthesised slot and compares bytes only when a slot really answers.
 ## Block datapath
 
 Status: **implemented; `nvme.ko` (`drivers/nvme`, `module_probe.rs`) is the
-reference consumer**, proven by `cargo xtask nvme-module-block-smoke`.
+reference consumer**, proven by `cargo narf nvme-module-block-smoke`.
 
 Every storage `.ko` (nvme, ahci, sdhci, the RAID HBAs) had only a
 registration path: PCI/MMIO/DMA let a module drive a controller, but there

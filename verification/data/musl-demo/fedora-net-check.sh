@@ -15,7 +15,7 @@
 #           on it) and actually isolates: the host round-trip that just
 #           succeeded must fail from inside a fresh network namespace.
 #
-# Exactly one verdict line lands on the console; `cargo xtask systemd-pid1`
+# Exactly one verdict line lands on the console; `cargo narf run systemd-pid1`
 # keys its success/failure markers to it. Keep the prefix stable.
 
 set -u
@@ -35,7 +35,7 @@ fail() {
 # --- iface: an eth%d device registered and exported via /proc/net/dev -----
 grep -Eq "^ *eth[0-9]+:" /proc/net/dev 2>/dev/null || fail "no eth%d iface in /proc/net/dev"
 
-# --- tcp: round-trip a token from the xtask listener on the host ----------
+# --- tcp: round-trip a token from the cargo narf listener on the host ----------
 # A few retries cover the boot-time window where the first ARP/route use
 # races the gateway's own bring-up; each one is cheap and bounded.
 tcp_ok=0

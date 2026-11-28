@@ -1,4 +1,4 @@
-//! Compact kernel symbol table — the bytes `xtask` writes into the image's
+//! Compact kernel symbol table — the bytes `cargo narf` writes into the image's
 //! `.kallsyms` reservation after linking, and the allocation-free decoder the
 //! kernel reads them back with for `/proc/kallsyms`.
 //!

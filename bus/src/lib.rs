@@ -129,7 +129,7 @@ pub use vmd_irq::{
 /// across the rewire: callers that already treat the return value as
 /// opaque don't need to change.
 pub fn iommu_group_for(_dev: &BusDevice) -> u32 {
-    // Stage-3 invariant: no vIOMMU on the default xtask QEMU line, so
+    // Stage-3 invariant: no vIOMMU on the default cargo narf QEMU line, so
     // every device lives in a single shared group. This mirrors the
     // `acs_clean: bool = false` placeholder documented in `bus/` §5.
     0

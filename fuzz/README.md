@@ -8,7 +8,7 @@ taxonomy: host, nightly).
 
 This package is its own Cargo workspace (note the `[workspace]`
 table in `Cargo.toml`) so the kernel workspace — which builds for
-`*-unknown-none` through `cargo xtask` — never absorbs host
+`*-unknown-none` through `cargo narf` — never absorbs host
 libFuzzer binaries.
 
 ## Targets

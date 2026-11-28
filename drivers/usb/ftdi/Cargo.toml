@@ -4,7 +4,7 @@
 #     binding stays in `narf-drivers-usb`'s serial cascade (shared with
 #     ch341 / pl2303 / cp210x and the /dev/ttyUSB termios layer), which
 #     re-exports this crate's codec so both builds program identical values.
-#   * `module`: `cargo xtask build-module --package narf-drivers-usb-ftdi
+#   * `module`: `cargo narf build build-module --package narf-drivers-usb-ftdi
 #     --no-default-features --features module`. A working loadable driver:
 #     it registers FT232/FT-X/FT232H matches through `narf_register_usb_driver`
 #     and drives the device entirely through the `narf_usb_*` datapath

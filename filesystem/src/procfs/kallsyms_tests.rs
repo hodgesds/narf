@@ -193,7 +193,7 @@ fn for_each_line(
 
 fn table() -> Result<ksyms::Table<'static>, &'static str> {
     ksyms::table().map_err(|_| {
-        "the image carries no kernel symbol table — was it built without xtask's kallsyms patch?"
+        "the image carries no kernel symbol table — was it built without cargo narf's kallsyms patch?"
     })
 }
 

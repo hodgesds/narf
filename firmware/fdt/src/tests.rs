@@ -203,7 +203,7 @@ fn smoke_fdt_chosen_bootargs() -> TestResult {
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_chosen_bootargs);
 
-/// The guest cmdline xtask builds on an affected-filter test run
+/// The guest cmdline cargo narf builds on an affected-filter test run
 /// (#960): a ~430-byte `test_subsystem=` include list followed by the
 /// `test_subsystem_exclude=` token. The exclude token starts past
 /// byte 440, so the old 256-byte `chosen_bootargs` cap silently

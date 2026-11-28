@@ -12,7 +12,7 @@ run_perf() {
     NARF_QEMU_MEM_MB=2048 \
     XTASK_RI_PROMPT_TIMEOUT_SECS=180 \
     XTASK_RI_ECHO_TIMEOUT_SECS=90 \
-    cargo xtask run-interactive --cmd "$1" --expect "$2"
+    cargo narf run run-interactive --cmd "$1" --expect "$2"
 }
 
 run_perf "busybox chroot /mnt perf stat -e '{cpu-clock,task-clock}' -- true" \

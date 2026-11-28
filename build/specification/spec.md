@@ -9,7 +9,7 @@
 ## 1. Purpose & scope
 
 **Owns:** Cargo workspace layout, `build-std` configuration, linker scripts
-per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config,
+per arch, cargo narf commands (`run`, `test`, `qemu`, `image`), Global LTO config,
 and CI compiler-cache integration.
 
 **Does NOT own:** Release management, CI test policy, debian-style packaging.
@@ -22,13 +22,21 @@ and CI compiler-cache integration.
 
 ## 3. Public interface
 
-`cargo xtask build --features native-ring` opts into the native userspace ring
+The developer entry point is `cargo narf` (cargo alias `narf`, binary
+`cargo-narf` in `build/cargo-narf`). Commands nest under groups — `build`,
+`test`, `run`, `smoke`, `bench`, `firmware`, `pkg`, `ci`, `disk` — so the
+build is `cargo narf build build`, the QEMU test suite is
+`cargo narf test test`, and native packaging is `cargo narf pkg package`.
+The old flat `cargo xtask <command>` alias keeps working as a deprecated
+shim: it prints a notice and forwards to the nested form.
+
+`cargo narf build build --features native-ring` opts into the native userspace ring
 ABI. The feature is forwarded from `narf-frame` to userspace, ABI, and scheduler;
 it is absent from defaults and is not enabled implicitly by `kernel-test`.
 The default kernel retains the Linux-compatible syscall surface and generic
 kernel IPC. CI checks both native-ring feature configurations.
 
-- `cargo xtask efi-image [--arch=x86_64] [--run | --smoke]` builds a
+- `cargo narf build efi-image [--arch=x86_64] [--run | --smoke]` builds a
   self-contained PE/COFF application embedding the kernel, CPIO initramfs, and
   command line. Defaults to `boot-init` and `narf.disks=boot-only`; smoke mode
   adds `boot-smoke` and writes a distinct artifact. Building with either
@@ -61,7 +69,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   `.ko` pipeline, are staged for QEMU/x86_64 media, and produce
   `modules_load` plus per-path `modules_domains` boot arguments. Public keys
   selected by signed module entries augment the build-time module trust store.
-- `cargo xtask build-module --manifest-path PATH --package NAME ...` builds an
+- `cargo narf build build-module --manifest-path PATH --package NAME ...` builds an
   out-of-tree module without adding it to the repository workspace.
   The `.ko` is one `ld -r` of the crate's objects plus the archive members
   they reach, section-GC'd and then linked with a script that folds rustc's
@@ -71,7 +79,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   name. `--compress` wraps the ELF in the `NRFCMOD` LZ4 envelope with a
   hash-chain match finder (window 64 KiB); the in-tree Wi-Fi driver modules
   compress 2.1x to 3.9x.
-- `cargo xtask test` (kernel-test features) stages its module fixtures in the
+- `cargo narf test test` (kernel-test features) stages its module fixtures in the
   initramfs: `lib/modules/{narf_test_module,narf_module_rt_smoke,
   narf_drivers_net_e1000}.ko` raw, `narf_test_module.ko.lz4`, and the
   whole-driver fixtures as `lib/modules/test-fixtures/<name>.ko.lz4`
@@ -81,11 +89,11 @@ kernel IPC. CI checks both native-ring feature configurations.
 - `NARF_FIRMWARE_TRUSTED_KEYS=/absolute/path/keys.txt` embeds firmware
   verification public keys (one 64-digit hex Ed25519 key per line).
   Firmware bootstrap installs them before signed-blob discovery.
-- `cargo xtask pack-firmware --name NAME --payload FILE --signature SIG
+- `cargo narf firmware pack-firmware --name NAME --payload FILE --signature SIG
   --public-key KEY` verifies an externally signed BLAKE3 payload digest
   and stages the NRFW blob in `target/firmware/NAME`. `SIG` and `KEY` are
   raw 64- and 32-byte files. Without both options, the blob is unsigned.
-- `cargo xtask wifi-firmware --source /lib/firmware [--profile ID,...]
+- `cargo narf firmware wifi-firmware --source /lib/firmware [--profile ID,...]
   [--report FILE] [--require-assets]` inventories the fixed-name payloads
   in `verification/data/wifi-firmware/profiles.json`. It resolves raw/zstd
   files and contained file aliases, reports decompressed lengths/SHA256 and
@@ -95,7 +103,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   payloads; conditional PNVM and board qualification remain explicit manual
   gates. A JSON report must be a new file outside the source tree. Inventory
   does not verify signatures, parse firmware or establish hardware readiness.
-- `cargo xtask import-firmware --vendor iwlwifi` accepts linux-firmware's
+- `cargo narf firmware import-firmware --vendor iwlwifi` accepts linux-firmware's
   flat `iwlwifi-*.ucode/.pnvm` names and stages `iwlwifi/<name>` registry keys.
   The importer retains board NVRAM `.txt` files, filters documentation after
   stripping `.zst`, bounds decoded payloads and zstd windows, and imports only
@@ -106,24 +114,24 @@ kernel IPC. CI checks both native-ring feature configurations.
   Production blobs still use externally signed `pack-firmware` and trusted
   public keys; neither tool qualifies board-power or regulatory artifacts.
 
-- `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
+- `cargo narf run run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
   builds omit DWARF generation and strip debug-only ELF sections by default
   while retaining ordinary symbols; `--debug` retains full debuginfo for GDB
   and crash diagnosis.
-- `cargo xtask cachyos-root-smoke --prebuilt ELF ...` boots an explicitly
+- `cargo narf smoke cachyos-root-smoke --prebuilt ELF ...` boots an explicitly
   selected regular kernel file without rebuilding the shared target artifact.
   It reports the selected path and SHA-256. Firmware initramfs construction
   still uses the build options; the caller must supply a compatible kernel.
-- `XTASK_STAGE_BIN=/host/path[:guest/path] cargo xtask run-interactive ...`
+- `XTASK_STAGE_BIN=/host/path[:guest/path] cargo narf run run-interactive ...`
   adds one executable host file to the generated initramfs. With no guest path
   it is installed as `/usr/bin/<basename>`, and the boot shell searches
   `/bin` followed by `/usr/bin`. Destinations hidden by boot-init mounts (for
   example `/bin`) are rejected instead of producing a misleading `ENOENT` at
   `execve`; staged entries retain mode `0755`.
-- `cargo xtask run --arch=x86_64 --passthrough-device 03:00.0
+- `cargo narf run run --arch=x86_64 --passthrough-device 03:00.0
   --passthrough-device 03:00.1` — attach host PCI functions to the guest with
-  QEMU `vfio-pci`. The repeatable option is an xtask/QEMU boot option, not a
-  guest kernel command-line parameter. Before launch, xtask requires KVM,
+  QEMU `vfio-pci`. The repeatable option is a cargo narf/QEMU boot option, not a
+  guest kernel command-line parameter. Before launch, cargo narf requires KVM,
   active host IOMMU groups, every requested endpoint bound to `vfio-pci`,
   complete IOMMU-group assignment, and BAR sizes compatible with NARF's mapped
   physical windows. It never unbinds or rebinds host hardware. PCI passthrough
@@ -135,7 +143,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   prevents KVM physical-width passthrough from overriding `phys-bits`.
   An explicit `phys-bits=N` receives `host-phys-bits-limit=N`; explicit
   host limits and other named CPU models retain the caller's policy.
-- `cargo xtask run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
+- `cargo narf run run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
   — opt into QEMU's OpenGL-backed virtio-gpu device. The default remains
   `--gpu-backend=auto`: graphical runs prefer VirGL when QEMU advertises the
   GL device and otherwise fall back to `virtio-2d`; headless runs stay on 2D.
@@ -153,7 +161,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   2D `virtio-only` case it also makes GTK present the virtio-gpu scanout rather
   than the legacy VGA text console. Headless 2D and full-profile 2D fixtures
   retain their legacy display coverage.
-- `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
+- `cargo narf test test --arch=aarch64` — boot + run all kernel tests.
   The host launcher places the module initramfs above the actual kernel ELF
   physical PT_LOAD memory end (including BSS), aligned to 1 MiB and below the
   DTB. A native Rust FDT helper updates both `/chosen/linux,initrd-{start,end}`
@@ -161,24 +169,24 @@ kernel IPC. CI checks both native-ring feature configurations.
   overflow and insufficient space fail before QEMU; the dummy kernel used for
   DTB generation is never used to infer the real image's occupied memory.
 - GPU validation uses native Rust kernel tests through
-  `cargo xtask test --arch=x86_64 --subsystem drivers/gpu` (and aarch64).
+  `cargo narf test test --arch=x86_64 --subsystem drivers/gpu` (and aarch64).
   Driver builds/tests do not extract Linux/Mesa functions, invoke host C shims,
   or compile temporary Rust source slices for reference comparison. Fixed
   hardware data and reviewed Rust vectors retain their provenance; physical
   hardware and external userspace interoperability require separate acceptance.
 - Wi-Fi firmware parser tests construct small, explicit wire inputs in Rust.
   No extracted metadata binaries, regeneration step or local vendor firmware
-  installation is required. `cargo xtask wifi-fixtures board-manifest` encodes
+  installation is required. `cargo narf firmware wifi-fixtures board-manifest` encodes
   explicit deployment facts (families `pcie43602`, `sdio43439` and
   `pciefullmac` with its `chip` and optional `antenna_sku`) as unsigned NBSP
   v1 data for the existing
   `pack-firmware` signing flow. It does not invent board calibration or grant
   device authority. The former metadata `check`, `write` and `extract` commands
   are removed.
-- `cargo xtask test --arch=x86_64 --subsystem userspace` — run that subsystem
+- `cargo narf test test --arch=x86_64 --subsystem userspace` — run that subsystem
   and its `/`-delimited children, then perform the normal whole-kernel boot
   smoke. Comma-separated filters select the union of those subtrees.
-- `cargo xtask test --arch=x86_64 --exclude-subsystem drivers/gpu` — remove
+- `cargo narf test test --arch=x86_64 --exclude-subsystem drivers/gpu` — remove
   that subsystem subtree from whatever the include filter (or the full
   suite) selects; the two filters compose, and both thread onto the kernel
   cmdline (`test_subsystem=` / `test_subsystem_exclude=`). CI's primary
@@ -186,7 +194,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   the dedicated `kernel-test-gpu` job, gated by the affected plan's
   `run_gpu_tests` output, so an intermittent GPU-fixture hang cannot stall
   the primary suite.
-- `cargo xtask test --arch=x86_64 --split` — run the kernel-test phase as
+- `cargo narf test test --arch=x86_64 --split` — run the kernel-test phase as
   one QEMU boot per subsystem group instead of a single boot. The guest
   harness runs tests as direct synchronous calls, so a hung test never
   returns control and no in-guest watchdog can preempt it; in one boot a
@@ -200,16 +208,16 @@ kernel IPC. CI checks both native-ring feature configurations.
   group. A boot killed at the cap, or one that dies without a summary,
   is accounted from the tests that completed plus exactly one failure
   for the in-flight test, whose reason names the timeout — a timeout is
-  a failure, never a skip. xtask aggregates the groups into the same
+  a failure, never a skip. cargo narf aggregates the groups into the same
   `── summary: P pass, F fail, S skip ──` and `── failing tests ──`
   lines the guest prints, and the phase-2 boot-smoke and postflight run
   once, afterwards, as in the single-boot form.
-- `cargo xtask net-smoke --arch=x86_64` runs live host-to-guest TCP and UDP
-  echoes plus a guest-originated DNS query over virtio-net. `cargo xtask
+- `cargo narf smoke net-smoke --arch=x86_64` runs live host-to-guest TCP and UDP
+  echoes plus a guest-originated DNS query over virtio-net. `cargo narf
   e1000-module-net-smoke --arch=x86_64` runs the identical exchanges over an
-  exclusively module-owned QEMU 82540EM: xtask builds and ABI-stamps
+  exclusively module-owned QEMU 82540EM: cargo narf builds and ABI-stamps
   `e1000.ko`, stages it in an initramfs, selects `driver2` at boot load, and
-  suppresses the built-in e1000 registration for that fixture. `cargo xtask
+  suppresses the built-in e1000 registration for that fixture. `cargo narf
   igb-net-smoke --arch=x86_64` runs the same exchanges over the built-in IGB
   driver and QEMU's 82576 `igb` model, with no competing virtio-net device.
 - QEMU network backends are selectable without source changes.
@@ -224,12 +232,12 @@ kernel IPC. CI checks both native-ring feature configurations.
   same-family NICs at once (issue #1632). QEMU auto-assigns the second NIC a
   distinct MAC (52:54:00:12:34:56, then counting the last octet upward).
   Kernel-test config:
-  `XTASK_QEMU_SECOND_NIC=1 cargo xtask test --arch=x86_64 --subsystem drivers/net/e1000`.
+  `XTASK_QEMU_SECOND_NIC=1 cargo narf test test --arch=x86_64 --subsystem drivers/net/e1000`.
   CI runs that invocation as the `run_second_nic` shard of the `kernel-test`
   job (x86_64 only) whenever the e1000 driver, the net hub, or the bus
   changes, a frame/verification change re-links the test harness, or the
   run is full.
-- `cargo xtask affected --base REF --head REF --event EVENT` computes CI jobs,
+- `cargo narf ci affected --base REF --head REF --event EVENT` computes CI jobs,
   directly changed packages, reverse-dependent packages, and kernel subsystem
   filters from Cargo metadata and Rust registration tokens. PRs use their head
   and base SHAs; pushes compare the event's before/after SHAs directly, including force pushes. Nightly, manual,
@@ -250,7 +258,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   jobs retain both architectures. Shared compiler/configuration changes and
   explicit full runs lint all packages; ordinary crate edits lint direct
   owners even when their tests require a full run.
-- `cargo xtask clippy-changed --arch=x86_64 --packages '["narf-audio"]'`
+- `cargo narf ci clippy-changed --arch=x86_64 --packages '["narf-audio"]'`
   lints selected packages with `--no-deps` in Cargo-resolved production,
   container, and user-mode-e2e feature contexts. The pinned nightly's unit
   graph separates target features from host build-script features; metadata
@@ -263,7 +271,7 @@ kernel IPC. CI checks both native-ring feature configurations.
 - QEMU's HDA and VirtIO sound devices use distinct audio backends. A shared
   mixer can stall HDA DMA after a VirtIO test leaves an idle playback voice;
   the combined `audio` subsystem run covers this ordering regression.
-- `cargo xtask test --arch=x86_64 --subsystem userspace --kernel-tests-only`
+- `cargo narf test test --arch=x86_64 --subsystem userspace --kernel-tests-only`
   — run only the selected in-kernel tests. This is for secondary CI
   configuration shards after a primary invocation for that architecture has
   already completed the production-init boot and host-side btrfs
@@ -277,7 +285,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   (including the Unix signal when present), not only the optional numeric exit
   code. Child timeouts use polling rather than process-wide signal handlers,
   so sandboxed runners remain supported.
-- `cargo xtask boot-smoke --arch=<arch>` accepts success only when the guest
+- `cargo narf test boot-smoke --arch=<arch>` accepts success only when the guest
   emits its clean-exit marker and QEMU then exits naturally with status zero
   through ACPI S5 on x86_64 or PSCI `SYSTEM_OFF` on aarch64. The x86
   `isa-debug-exit` test device returns status one and therefore cannot satisfy
@@ -287,11 +295,11 @@ kernel IPC. CI checks both native-ring feature configurations.
   the start of that phase; normal concise summaries and timeout diagnostics
   remain enabled. It may be combined with `XTASK_QEMU_SERIAL_TEE=1`. Neither
   option adds guest-side instrumentation.
-- The second, whole-kernel phase of `cargo xtask test` strips both
+- The second, whole-kernel phase of `cargo narf test test` strips both
   `kernel-test` and features that transitively select that harness
   (`user-mode-e2e`, `user-mode-testbin`, and `narf-libc-validate`) so it
   always exercises the production init path.
-- `cargo xtask systemd-pid1 --arch=x86_64` — boot a systemd rootfs as real
+- `cargo narf run systemd-pid1 --arch=x86_64` — boot a systemd rootfs as real
   PID 1 for a bounded capture. The command enables the `qemu-net` static
   configuration, exposing `vnet0` as `10.0.2.15/24` with QEMU SLIRP gateway
   `10.0.2.2`, so graphical distro boots have an immediately usable network.
@@ -299,7 +307,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   `XTASK_SYSTEMD_PID1_FAILURE_MARKER` optionally make serial substrings into
   fail-fast integration assertions; the run fails if an expected success
   marker is absent at the timeout. `XTASK_SYSTEMD_PID1_NET_CHECK=1` turns the
-  boot into a network acceptance run: xtask serves a token on an ephemeral
+  boot into a network acceptance run: cargo narf serves a token on an ephemeral
   host port, threads `narf_net_check`/`narf_net_check_port=` onto the kernel
   cmdline, and the rootfs's `narf-net-check.service` gate (staged by
   `REGEN_fedora_kde_rootfs.sh`) proves vnet0 is visible, TCP round-trips to
@@ -307,19 +315,19 @@ kernel IPC. CI checks both native-ring feature configurations.
   `unshare(CLONE_NEWNET)` both works and isolates (the same host round-trip
   must fail inside a fresh netns); its single `NARF-NET-CHECK:` verdict line
   becomes the default success/failure marker pair.
-- `cargo xtask iso-boot --arch=x86_64` — build the removable-media
+- `cargo narf build iso-boot --arch=x86_64` — build the removable-media
   image, boot it through a read-only OVMF pflash + Limine's
   `BOOTX64.EFI`, and require
   the real-init clean-exit marker with no kernel panic.
-- `cargo xtask iso-boot --arch=aarch64` — build a FAT ESP containing
+- `cargo narf build iso-boot --arch=aarch64` — build a FAT ESP containing
   `EFI/BOOT/BOOTAA64.EFI`, generate and attach QEMU's `virt` DTB with
   ACPI disabled so AAVMF publishes the EFI DTB table, and require the
   same clean-exit marker. Before the image is published, the exact kernel's
   BLAKE2b-512 digest is bound into the loader; an unbound loader fails closed.
-- `cargo xtask host-test` — run the fast host unit-test allowlist.
+- `cargo narf test host-test` — run the fast host unit-test allowlist.
   Only hardware-independent crates belong here; privileged, linker-script,
-  and device integration coverage remains under `xtask test`.
-- `cargo xtask crate-release list|bump|check` manages crates.io preparation
+  and device integration coverage remains under `cargo narf test test`.
+- `cargo narf ci crate-release list|bump|check` manages crates.io preparation
   without uploading. A publishable package opts in with an explicit
   `[package].version` and `package.metadata.narf.release-managed = true`;
   workspace-inherited versions are never rewritten. `bump --package NAME`
@@ -333,7 +341,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   archive with checkout-local patches for not-yet-published internal crates,
   enforces crates.io's archive-size limit, and never uploads, commits, tags,
   or pushes.
-- `cargo xtask bpf-bench --arch=x86_64 --baseline <record.json>` — collect the
+- `cargo narf bench bpf-bench --arch=x86_64 --baseline <record.json>` — collect the
   BPF suite and compare each compatible metric with a previous green-main
   §8.8 record. `--release-baseline <record.json>` adds the cumulative
   slow-cooking check. Both comparisons require the same runner, accelerator,
@@ -349,8 +357,8 @@ kernel IPC. CI checks both native-ring feature configurations.
   bootstrap resamples. The host observes temperature and hardware throttle
   counters for 30 seconds before launch. An explicitly allowed development run
   may print advisory statistics but emits no JSON performance record.
-- `cargo xtask image --arch=x86_64 --bootloader=limine` — produce bootable ISO.
-- `cargo xtask grub-image --arch=x86_64` — produce
+- `cargo narf build image --arch=x86_64 --bootloader=limine` — produce bootable ISO.
+- `cargo narf build grub-image --arch=x86_64` — produce
   `target/grub-x86_64/boot/narf-frame-grub`, a direct-GRUB Multiboot2
   artifact. The canonical image build first materialises NARF's compact,
   loadable KASLR table; this compatibility artifact then removes only the
@@ -394,7 +402,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   segment, bounded by `__kallsyms_start`/`__kallsyms_end`, and define Linux's
   image markers `_text` = `_stext` (start of `.text`, the lowest kernel-half
   symbol), `_etext`, `_sdata`/`_edata` (around `.data`) and `_end` (end of
-  `.bss`). Every kernel link (`xtask build/run/test/...`) runs
+  `.bss`). Every kernel link (`cargo narf build` / `run` / `test` ...) runs
   `kallsyms::patch` after the KASLR table: it reads the image's `.symtab`,
   keeps kernel-half text and data symbols with their `nm(1)` letters (dropping
   undefined, absolute, debugging, `$x`/`$d` mapping, `.L*` local and LLVM
@@ -405,10 +413,10 @@ kernel IPC. CI checks both native-ring feature configurations.
   rest. Filling a fixed reservation moves no address, so one link reaches what
   Linux's multi-pass `link-vmlinux.sh` does; the table holds no absolute
   address and needs no KASLR relocation. A table larger than the reservation
-  fails the build. Measured: 4.4 MiB for the x86_64 `xtask test` image
+  fails the build. Measured: 4.4 MiB for the x86_64 `cargo narf test test` image
   (384k symbols, 89k distinct names, 39 MB of names), 2.4 MiB for a native
   x86_64 release image (195k symbols), 4.0 MiB for aarch64 release.
-- `cargo xtask kallsyms ELF [--patch] [--print-slide OFFSET]` reports the
+- `cargo narf build kallsyms ELF [--patch] [--print-slide OFFSET]` reports the
   table an image would carry, patches it, or prints the patched table in
   `/proc/kallsyms` format with every address moved by `OFFSET` (the panic
   report's `Kernel Offset:`), for symbolising a capture offline. The boot log
@@ -480,7 +488,7 @@ kernel IPC. CI checks both native-ring feature configurations.
 ## 6. Dependencies
 
 - **Consumes:** nothing inside NARF.
-- **Provides to:** everything; `xtask` is the entry point for every other
+- **Provides to:** everything; `cargo narf` is the entry point for every other
   subsystem's tests.
 
 ## 7. Stage assignment
@@ -535,7 +543,7 @@ Profile-guided optimisation flow:
 4. Optionally apply `bolt` to re-order hot functions for
    I-cache locality.
 
-Each step is invocable from `xtask`. Stage 5 deliverable.
+Each step is invocable from `cargo narf`. Stage 5 deliverable.
 
 For v1.0 we ship without FDO/BOLT — the perf gain is nice
 but not load-bearing. The mechanism is designed so it can
@@ -557,7 +565,7 @@ kernel ELF, finds every `wrmsr` / `mrs` / `invlpg` /
 `compiler_fence` wrapper functions exported from `narf-arch`.
 Any direct emission outside the wrappers fails CI.
 
-The gate is a small Rust binary in `xtask check-fence-discipline`,
+The gate is a small Rust binary in `cargo narf check-fence-discipline`,
 run on every PR. Cost: ~5 seconds on a release-mode kernel.
 
 This pays off every release: it catches the "developer

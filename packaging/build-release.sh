@@ -102,9 +102,9 @@ case "$arch" in
         gentoo_license='GPL-2+ BSD-2'
         if [[ $skip_build -eq 0 ]]; then
             if [[ $loader_kind == native ]]; then
-                SOURCE_DATE_EPOCH=$source_epoch cargo xtask efi-image "${efi_args[@]}"
+                SOURCE_DATE_EPOCH=$source_epoch cargo narf build efi-image "${efi_args[@]}"
             else
-                SOURCE_DATE_EPOCH=$source_epoch cargo xtask build --arch=x86_64
+                SOURCE_DATE_EPOCH=$source_epoch cargo narf build build --arch=x86_64
             fi
         fi
         kernel=$root/target/$target_triple/release/narf-frame
@@ -130,7 +130,7 @@ case "$arch" in
         arch_license="'GPL-2.0-or-later'"
         gentoo_license='GPL-2+'
         if [[ $skip_build -eq 0 ]]; then
-            SOURCE_DATE_EPOCH=$source_epoch cargo xtask image --arch=aarch64
+            SOURCE_DATE_EPOCH=$source_epoch cargo narf build image --arch=aarch64
         fi
         kernel=$root/target/narf-frame-aarch64.efi-elf
         ;;

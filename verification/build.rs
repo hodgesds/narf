@@ -1068,7 +1068,7 @@ fn main() {
     }
 
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
-    // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
+    // /lib/ld-musl-x86_64.so.1 (Arch's path; same default cargo narf
     // image uses). If absent on the host, point at /dev/null so
     // include_bytes!() resolves to an empty slice — the consumer
     // skips the /lib mount when the slice is empty.

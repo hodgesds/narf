@@ -126,7 +126,7 @@ int main(int argc, char **argv)
     //
     // The run-interactive matcher requires its needle to be followed by
     // \r/\n, so a mid-line token silently never matches. And it must only
-    // appear when EVERY step succeeded: gating the xtask smoke on
+    // appear when EVERY step succeeded: gating the cargo narf smoke on
     // "probe done" (printed unconditionally) or on a substring of the
     // master-read line would pass while the child's output never arrived,
     // which is exactly the failure this probe exists to catch.

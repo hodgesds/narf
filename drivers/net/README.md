@@ -22,7 +22,7 @@ Network device drivers. Exports frames via the `HwNic` trait and the
 
 E1000 is the reference dual-build driver. The default facade feature claims
 its PCI ids as a built-in; `e1000-module-only` suppresses that claim so an
-initramfs-loaded `e1000.ko` can own the device exclusively. Run `cargo xtask
+initramfs-loaded `e1000.ko` can own the device exclusively. Run `cargo narf
 e1000-module-net-smoke --arch=x86_64` for the live TCP/UDP/DNS acceptance path.
 
 Operational PCI Ethernet drivers bind per bus address, including identical cards.
@@ -39,8 +39,8 @@ adapters, including USB Wi-Fi, needs a separate audit.
 To exercise two identical virtual NICs without configuring host networking:
 
 ```sh
-XTASK_QEMU_VMXNET3=1 XTASK_QEMU_SECOND_NIC=1 cargo xtask test --arch=x86_64 --subsystem drivers/net/vmxnet3
-XTASK_QEMU_SECOND_NIC=1 cargo xtask test --arch=x86_64 --subsystem modules/e2e
+XTASK_QEMU_VMXNET3=1 XTASK_QEMU_SECOND_NIC=1 cargo narf test test --arch=x86_64 --subsystem drivers/net/vmxnet3
+XTASK_QEMU_SECOND_NIC=1 cargo narf test test --arch=x86_64 --subsystem modules/e2e
 ```
 
 These use QEMU user networking. Physical-device acceptance remains a separate

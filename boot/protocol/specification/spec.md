@@ -61,7 +61,7 @@ the ELF validator in this crate deliberately rejects aarch64 images.
 
 ## 6. Dependencies
 
-Only Rust `core`. Used by `build/xtask` and `build/uefi-loader`. Host tests use
+Only Rust `core`. Used by `build/cargo-narf` and `build/uefi-loader`. Host tests use
 `std` solely for fixture construction.
 
 ## 7. Stage assignment

@@ -11,13 +11,13 @@
 # into it:
 #
 #   sh verification/data/musl-demo/REGEN_gl_rootfs.sh
-#   NARF_VBLK_IMG=target/narf-gl-vblk.img cargo xtask run-interactive \
+#   NARF_VBLK_IMG=target/narf-gl-vblk.img cargo narf run run-interactive \
 #       --gpu-backend virgl --display egl-headless \
 #       --cmd "chroot_run /bin/busybox sh /glcube.sh" --expect "GLCUBE-OK"
 #
 # A protocol-shaped raw throughput run (30 independent processes, one warmup):
 #
-#   NARF_VBLK_IMG=target/narf-gl-vblk.img cargo xtask run-interactive \
+#   NARF_VBLK_IMG=target/narf-gl-vblk.img cargo narf run run-interactive \
 #       --gpu-backend virgl --display egl-headless \
 #       --cmd "chroot_run /bin/busybox sh /glmark2-bench.sh 30 5.0" \
 #       --expect "GLMARK2-DONE"

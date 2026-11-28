@@ -297,7 +297,7 @@ console is the human-readable surface.
 When `bus/` probes a virtio-console device, `console/`
 auto-redirects log output to it (in addition to the UART).
 The redirected output is the same plain-text format. This
-is what makes `cargo xtask run` show a clean kernel log
+is what makes `cargo narf run run` show a clean kernel log
 without serial-port plumbing.
 
 The UART stays the primary; virtio-console is additive. If

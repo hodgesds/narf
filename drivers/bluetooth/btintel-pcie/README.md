@@ -14,7 +14,7 @@ export and is registration-only until the device datapath ABI covers an HCI
 transport.
 
 ```
-cargo xtask build-module --package narf-drivers-bluetooth-btintel-pcie \
+cargo narf build build-module --package narf-drivers-bluetooth-btintel-pcie \
   --no-default-features --features module
 ```
 

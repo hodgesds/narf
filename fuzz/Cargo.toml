@@ -8,7 +8,7 @@
 #
 # This package is deliberately its own workspace (the [workspace]
 # table below): the kernel workspace builds for *-unknown-none via
-# cargo xtask and must not absorb host libFuzzer binaries, and the
+# cargo narf and must not absorb host libFuzzer binaries, and the
 # root workspace's member list stays untouched.
 [package]
 name = "narf-fuzz"

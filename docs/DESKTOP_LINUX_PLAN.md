@@ -18,8 +18,8 @@ never accumulate unverifiable work.
 - **Rung 1 (`/dev/fb0`) — DONE & proven end-to-end.** Device + Linux
   fbdev ioctls; `smoke_fbdev_*` kernel smokes pass; `/bin/fb_smoke`
   (stock musl) opens `/dev/fb0`, `mmap`s it `MAP_SHARED`, draws + reads
-  back → `fb-ok` / `fb-geom 1280x800` via `xtask run-interactive`. Wired
-  into the `xtask musl-demo` CI case list. On `main`.
+  back → `fb-ok` / `fb-geom 1280x800` via `cargo narf run run-interactive`. Wired
+  into the `cargo narf smoke musl-demo` CI case list. On `main`.
 - **Rung 2 (`/dev/input/event*`) — DONE.** Real 24-byte Linux
   `input_event` wire format at the node (16-byte internal `EvdevEvent`
   unchanged) + `EVIOCG*` ioctls (version/id/name/bits/abs/grab);
@@ -32,7 +32,7 @@ never accumulate unverifiable work.
   `SETCRTC` blits the dumb buffer into the active scanout (`fbdev_info`).
   `/bin/drm_smoke` (stock musl) runs the whole open→CREATE_DUMB→mmap→draw
   →ADDFB2→SETCRTC chain → `drm-ok` / `drm-geom 256x256` via
-  `xtask run-interactive`; wired into the `musl-demo` CI list. On `main`.
+  `cargo narf run run-interactive`; wired into the `musl-demo` CI list. On `main`.
   (Three boot-time bugs the agent's `cargo check` missed were fixed:
   initcall stage ordering, missing SMAP brackets in the ioctl copy
   helpers, and discarded GET_CAP/ADDFB2 results.)
@@ -185,7 +185,7 @@ never accumulate unverifiable work.
   `systemd-udevd` with a populated device database, seats, and a
   `systemd --user` manager for the desktop user. `distro_fedora` is the
   launcher; the kernel hands systemd the real cmdline via
-  `SYSTEMD_PROC_CMDLINE`, and an xtask acceptance gate covers systemd-PID1
+  `SYSTEMD_PROC_CMDLINE`, and an cargo narf acceptance gate covers systemd-PID1
   networking (qemu-net + netns). The image is built by
   `REGEN_fedora_kde_rootfs.sh` and is not committed, so this is a local /
   marker-gated gate rather than an automatic CI case.
@@ -372,7 +372,7 @@ asserts a known pixel.
 - Add `-device virtio-mouse-pci`/`virtio-tablet-pci` to the QEMU profile.
 
 Verify: program reads `/dev/input/event0`, prints key/pointer events
-driven by `xtask run-interactive` keystrokes.
+driven by `cargo narf run run-interactive` keystrokes.
 
 ---
 
@@ -423,7 +423,7 @@ is a separate, much larger track (the existing `amdgpu_*` files) and is
 
 ## Verification harness (cross-cutting)
 
-- Extend `xtask` with graphical smokes that boot, drive input via stdin
+- Extend `cargo narf` with graphical smokes that boot, drive input via stdin
   (as `run-interactive` does), then use QEMU monitor `screendump` to
   capture the framebuffer and assert known pixels / regions.
 - Each user-side test program prints serial success markers too, so
@@ -443,7 +443,7 @@ is a separate, much larger track (the existing `amdgpu_*` files) and is
 - Rung 3 DRM dumb-buffer ioctl structs (`drm_mode_create_dumb`,
   `map_dumb`, `destroy_dumb`) — mechanical UAPI mirroring.
 - Userspace test programs (gradient-to-fb0, evdev-dump, modetest-style).
-- `xtask` graphical smoke subcommands + screendump assertion helper.
+- `cargo narf` graphical smoke subcommands + screendump assertion helper.
 
 **Needs care (kernel internals, not pure-mechanical):**
 - Rung 3 virtio-gpu DRM backend + SETCRTC→SET_SCANOUT wiring.

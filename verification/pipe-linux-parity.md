@@ -23,8 +23,8 @@ count as success.
 ```sh
 rustc --edition=2021 userspace/pipe-test/src/main.rs -o /tmp/narf-pipe-linux
 /tmp/narf-pipe-linux
-cargo xtask test --arch=x86_64 --features user-mode-e2e --subsystem verification/pipe-abi
-cargo xtask test --arch=aarch64 --features user-mode-e2e --subsystem verification/pipe-abi
+cargo narf test test --arch=x86_64 --features user-mode-e2e --subsystem verification/pipe-abi
+cargo narf test test --arch=aarch64 --features user-mode-e2e --subsystem verification/pipe-abi
 ```
 
 ## Validation (2026-09-27)

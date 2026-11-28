@@ -116,7 +116,7 @@ Wire the already-defined counters — `rx_drop`, `tx_drop`, `rx_over_errors`,
 `rx_missed_errors` — at every silent drop point (RX ring overrun, ring-full
 `try_send`, refill-allocation failure, TX queue-full) so saturation and loss
 are measurable, and add per-queue pps/bytes. A throughput benchmark
-(`cargo xtask` net-bench over virtio/tap, or a loopback pps harness) measures
+(`cargo narf` net-bench over virtio/tap, or a loopback pps harness) measures
 progress toward line rate.
 
 ## 3. Driver tiers and targets
@@ -179,7 +179,7 @@ progress toward line rate.
   end-to-end (the production-init boot comes up over it). IPv6 TCP egress takes
   the same zero-copy path (`build_frame6_into`). net-bench (`net/bench`) logs
   the per-packet software cost of the checksum / GSO / GRO primitives via
-  `cargo xtask test --kernel-tests-only --subsystem=net/bench`. _Deferred:_
+  `cargo narf test test --kernel-tests-only --subsystem=net/bench`. _Deferred:_
   mlx5 100G bring-up — the mlx5 RX/TX datapath is a from-scratch `Stage 15+`
   stub, and with no ConnectX hardware and no QEMU emulation it could only be
   written blind (KAT + no-regression, never exercised), so it waits for

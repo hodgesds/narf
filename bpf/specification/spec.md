@@ -64,14 +64,14 @@ through a verified BPF subprogram call chain.
 | `narf-bpf-leds` | atomic LED-command kfunc + worker-registration seam | `narf-bpf`, `narf-drivers-leds`, `narf-init` |
 
 The first three are dependency-free of the kernel and host-testable via
-`cargo xtask host-test`. `narf-bpf` must **not** depend on `narf-userspace` —
+`cargo narf test host-test`. `narf-bpf` must **not** depend on `narf-userspace` —
 that would be a cycle. The `bpf(2)` handler lives in `narf-userspace`, which
 depends on `narf-bpf`.
 
 `narf-bpf-bench` serial output uses grammar version 2. Each record publishes
 both its collected `n` and benchmark-declared `target_n`; an operator override
 may raise but never lower that target. Value chunks carry their starting sample
-index and terminate in a record/skip count marker consumed by `cargo xtask
+index and terminate in a record/skip count marker consumed by `cargo narf
 bpf-bench`.
 
 ### 3.2 The kfunc contract
@@ -959,7 +959,7 @@ and the perf event layer, all of which are closed.
    interpreter burns per instruction retired; the JIT will burn per basic
    block, the same bound at coarser granularity.
 
-   The cost of that choice is now **measured**, not asserted. `cargo xtask
+   The cost of that choice is now **measured**, not asserted. `cargo narf
    bpf-bench` runs the interpreter over four instruction mixes under both
    policies as an A/B pair, N = 60 each, samples interleaved round-robin, and
    applies §8's protocol. Median cycles per interpreted instruction, and the
@@ -1029,7 +1029,7 @@ and the perf event layer, all of which are closed.
     validator requires nullable acquisition so cleanup-slot conflict can fail
     closed without manufacturing a dangling non-null guard.
 11. **`bpf(2)` load latency has no yield point, and verification dominates
-    it.** Measured by `cargo xtask bpf-bench` (N = 60, same runner caveat as
+    it.** Measured by `cargo narf bench bpf-bench` (N = 60, same runner caveat as
     item 7), for one `BpfProg::load` of a 64-instruction straight-line
     program:
 

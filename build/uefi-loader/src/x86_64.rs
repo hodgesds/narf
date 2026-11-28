@@ -320,7 +320,7 @@ fn firmware_random() -> Option<u64> {
     Some(u64::from_le_bytes(bytes))
 }
 
-/// Test builds only (`cargo xtask efi-image --occupy-link-range`): hold one
+/// Test builds only (`cargo narf build efi-image --occupy-link-range`): hold one
 /// page in the middle of the kernel's link range as ACPI NVS, as the
 /// ThinkPad P14s Gen 5 AMD firmware holds part of it, so an OVMF boot takes
 /// the placement path in `place_kernel`.

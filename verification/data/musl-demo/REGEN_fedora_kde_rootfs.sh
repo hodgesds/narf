@@ -532,7 +532,7 @@ ln -sfn ../narf-ptrace-check.service \
 
 # Network acceptance gate: prove the distro has a WORKING off-box path
 # (the virtio NIC visible, TCP round-trip to the host across SLIRP, DNS through
-# 10.0.2.3). Opt-in via the narf_net_check kernel cmdline flag — xtask
+# 10.0.2.3). Opt-in via the narf_net_check kernel cmdline flag — cargo narf
 # systemd-pid1 sets it for XTASK_SYSTEMD_PID1_NET_CHECK=1 runs — so
 # ordinary graphical boots never run it.
 printf '%s\n' \
@@ -580,4 +580,4 @@ $UNSHARE_CMD mke2fs -q -F -t ext2 -b 1024 -I 128 \
   -d "$WORK/root" "$OUT" "$((IMG_MB * 1024))"
 
 echo "built $OUT ($(du -h "$OUT" | cut -f1)) — Fedora $FEDORA_VER KDE rootfs"
-echo "boot it with: NARF_VBLK_IMG=$OUT cargo xtask run-interactive ..."
+echo "boot it with: NARF_VBLK_IMG=$OUT cargo narf run run-interactive ..."

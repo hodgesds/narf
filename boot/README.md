@@ -3,7 +3,7 @@
 Accepts control from a bootloader, parses the memory map / ACPI /
 devicetree, hands a `BootInfo` to `frame/`.
 
-x86_64 native packages and `cargo xtask efi-image` embed kernel/initramfs/config
+x86_64 native packages and `cargo narf build efi-image` embed kernel/initramfs/config
 in NARF's own EFI application and emit a Multiboot2 handoff without Limine; see
 [build, run, and install instructions](../docs/NATIVE_UEFI.md).
 aarch64 uses the Linux/U-Boot FDT entry ABI through direct boot or

@@ -114,7 +114,7 @@ pub(crate) fn decompress(image: &[u8]) -> Result<Vec<u8>, CompressionError> {
 /// Construct a v1 envelope from an already-compressed LZ4 block.
 ///
 /// Kept crate-visible so kernel smokes can construct adversarial envelopes
-/// without duplicating the wire format. Production creation lives in xtask.
+/// without duplicating the wire format. Production creation lives in cargo narf.
 #[doc(hidden)]
 pub(crate) fn envelope_lz4(
     plain_len: usize,

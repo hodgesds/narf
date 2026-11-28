@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build a CachyOS-like GPT disk image for `cargo xtask cachyos-root-smoke`.
+# Build a CachyOS-like GPT disk image for `cargo narf smoke cachyos-root-smoke`.
 #
 # The image mirrors the installed CachyOS layout NARF has to boot on bare
 # metal: a GPT disk with a FAT32 ESP and a btrfs root carrying the CachyOS
@@ -49,7 +49,7 @@ STAGE="$WORK/stage"
 R="$STAGE/@"
 
 # Fixed identities, so the smoke's cmdline is static. Keep in sync with
-# build/xtask/src/cachyos_root.rs.
+# build/cargo-narf/src/cachyos_root.rs.
 BTRFS_UUID=c4c405ee-0000-4a11-9e57-00000000c0de
 ESP_VOLID=CA50EF15
 ESP_UUID=CA50-EF15

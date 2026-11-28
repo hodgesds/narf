@@ -3,7 +3,7 @@
 //! `verification/specification/spec.md` §8 splits a performance number into
 //! two jobs: collecting samples under stated conditions, and deciding what the
 //! samples mean. This crate does only the first. It emits every raw sample to
-//! the console; `cargo xtask bpf-bench` computes the median, the 95% bootstrap
+//! the console; `cargo narf bench bpf-bench` computes the median, the 95% bootstrap
 //! CI, Welch's t, Mann-Whitney U, and the Benjamini-Hochberg correction.
 //!
 //! The split is not squeamishness about `f64` in a kernel. It is that §8.5
@@ -47,7 +47,7 @@
 //! One `narf.bench.env:` line, then per benchmark one `narf.bench.rec:` line
 //! followed by `narf.bench.val:` chunks carrying the samples, then one
 //! `narf.bench.end:` line. Line-oriented `key=value` rather than JSON because
-//! the emitter is `core::fmt` and the parser is a `split_whitespace` in xtask;
+//! the emitter is `core::fmt` and the parser is a `split_whitespace` in cargo narf;
 //! the §8.8 JSON record is assembled host-side, where the statistics it
 //! carries are computed.
 

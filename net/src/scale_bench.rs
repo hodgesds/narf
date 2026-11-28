@@ -24,7 +24,7 @@
 //!   card, which is how "no constant tuned for one card" gets checked.
 //! - **Timer sweep** — the per-connection cost of the periodic timer scan.
 //!
-//! Every result is a `NETBENCH` line, which `cargo xtask test` relays after
+//! Every result is a `NETBENCH` line, which `cargo narf test test` relays after
 //! the summary. The numbers come from a QEMU guest on a shared host: they are
 //! **harness numbers, not performance claims** (`verification/` §8 governs
 //! those). Use them to rank bottlenecks and to compare before and after a

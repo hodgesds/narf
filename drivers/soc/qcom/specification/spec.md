@@ -285,7 +285,7 @@ skipped. The ath11k AHB bring-up drives these around `PasRproc`.
 
 ## 7. Stage assignment
 Stage 5 "Silicon" (ath11k IPQ8074/IPQ6018/IPQ5018/WCN6750 enablement).
-Tests: `cargo xtask test --subsystem drivers/soc/qcom --kernel-tests-only`.
+Tests: `cargo narf test test --subsystem drivers/soc/qcom --kernel-tests-only`.
 
 ## 8. Open questions
 - **GLINK**: intentless edges (RPM `qcom,glink-rpm`), the `qcom,intents`

@@ -10,9 +10,9 @@ Everything here is terse by design. Follow links for depth.
 - **Async-first** executor, zero-copy Narf-Ring IPC, capability-typed
   access control, no root user.
 - **Status:** Stages 1–4 closed. Stage 4 exit gate met for the
-  in-tree shell + coreutils (`cargo xtask run-interactive` types
+  in-tree shell + coreutils (`cargo narf run run-interactive` types
   `echo hello world` over serial; full IRQ-4 → byte ring → fd 0 →
-  shell → fd 1 → UART chain). `cargo xtask test` runs 5022+ smokes
+  shell → fd 1 → UART chain). `cargo narf test test` runs 5022+ smokes
   / 0 fail / 73 skip on x86_64 + aarch64. Stage 5 "Silicon" — boot
   on AMD Zen2 Renoir + Phoenix HawkPoint1 laptops — is in progress.
 
@@ -34,7 +34,7 @@ Everything here is terse by design. Follow links for depth.
 | `arch/`             | HAL trait surface + per-arch impls (x86_64, aarch64).    |
 | `abi/`              | Kernel↔user boundary: async submission/completion rings. |
 | `security-model/`   | Threat model, caps × domains composition.                |
-| `build/`            | Cargo workspace, LTO, linker scripts, xtask, QEMU.       |
+| `build/`            | Cargo workspace, LTO, linker scripts, cargo narf, QEMU.  |
 | `verification/`     | Test taxonomy + statistical perf protocol.               |
 | `process/`          | Contribution flow, AI-agent rules, bug/sec handling.     |
 | `frame/`            | TCB: boot CPU, traps, panic path, domain entry hooks.    |
@@ -319,9 +319,9 @@ the *same* test every run; flaky/heisenbug fails *vary* run-to-run.
 ## Quick commands (once `build/` lands)
 
 ```
-cargo xtask run   --arch=x86_64
-cargo xtask test  --arch=aarch64
-cargo xtask image --arch=x86_64 --bootloader=limine
+cargo narf run run   --arch=x86_64
+cargo narf test test  --arch=aarch64
+cargo narf build image --arch=x86_64 --bootloader=limine
 ```
 
 (Not available in design phase; documented here so the first
@@ -341,7 +341,7 @@ numbers without the statistical protocol. Do not merge your own PRs.
 
 Do not commit firmware or other externally published binary data: device
 firmware, microcode, the wireless regulatory database. They are imported
-at build time (`cargo xtask import-firmware`, `pack-firmware`,
+at build time (`cargo narf firmware import-firmware`, `cargo narf firmware pack-firmware`,
 `--initramfs-firmware`) and never live in git.
 
 Trust roots — the public keys and certificates used to verify such data —

@@ -4,7 +4,7 @@
 //! far faster and needs no QEMU. These smokes exist only to prove the crate
 //! behaves identically when built for the kernel target — the `no_std` build,
 //! the kernel's codegen flags, and the target endianness. Keep them cheap;
-//! `cargo xtask test` runs thousands of these.
+//! `cargo narf test test` runs thousands of these.
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 

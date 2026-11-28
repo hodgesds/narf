@@ -4,7 +4,7 @@
 
 Owns the byte format of the kernel symbol table stored in the image's
 `.kallsyms` section, its build-time encoder and its run-time decoder. Does
-not own symbol selection from an ELF (`build/xtask/src/kallsyms.rs`), access
+not own symbol selection from an ELF (`build/cargo-narf/src/kallsyms.rs`), access
 to the image's reservation (`narf_observability::kallsyms`) or the policy on
 who may see addresses (`filesystem/` §3.14, `kallsyms_show_value`).
 
@@ -83,7 +83,7 @@ Architecture-neutral; the same format on x86_64 and aarch64.
 
 ## 6. Dependencies
 
-Only `core` (and `alloc` for the encoder). Used by `build/xtask` (encoder)
+Only `core` (and `alloc` for the encoder). Used by `build/cargo-narf` (encoder)
 and `observability/` (decoder).
 
 ## 7. Stage assignment

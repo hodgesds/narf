@@ -117,7 +117,7 @@ _start:
     /* ── KASLR: apply the relocation table ──
      *
      * The kernel is linked at a fixed address with `relocation-model=static`,
-     * so sliding it means patching every absolute field. `xtask relocs` has
+     * so sliding it means patching every absolute field. `cargo narf build relocs` has
      * already recorded them into `.kaslr_relocs`; this walks that table and
      * adds the slide to each site.
      *

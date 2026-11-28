@@ -65,7 +65,7 @@ narf-frame = { path = "...", features = ["linux-compat"] }
 or on the command line:
 
 ```sh
-cargo xtask build --features linux-compat
+cargo narf build build --features linux-compat
 ```
 
 ---

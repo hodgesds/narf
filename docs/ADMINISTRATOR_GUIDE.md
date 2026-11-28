@@ -12,10 +12,10 @@ Builds are optimized by default; use `--debug` only when its diagnostics are
 needed.
 
 ```sh
-cargo xtask image --arch=x86_64
-cargo xtask image --arch=aarch64
-cargo xtask iso-boot --arch=x86_64
-cargo xtask iso-boot --arch=aarch64
+cargo narf build image --arch=x86_64
+cargo narf build image --arch=aarch64
+cargo narf build iso-boot --arch=x86_64
+cargo narf build iso-boot --arch=aarch64
 ```
 
 `image` creates the bootable image. `iso-boot` builds removable-media output
@@ -23,7 +23,7 @@ and boots it under OVMF/AAVMF for a UEFI check. To write the generated x86_64
 ISO to a USB device, resolve the exact block device first, then run:
 
 ```sh
-cargo xtask disk-write --device /dev/sdX
+cargo narf disk disk-write --device /dev/sdX
 ```
 
 That command wipes the selected device. A successful QEMU ISO boot or USB
@@ -87,8 +87,8 @@ Keep distribution or site-specific crate selection outside the NARF checkout
 and pass it to every build/media command:
 
 ```sh
-cargo xtask build --arch=x86_64 --composition /etc/narf/site.toml
-cargo xtask image --arch=x86_64 --composition /etc/narf/site.toml
+cargo narf build build --arch=x86_64 --composition /etc/narf/site.toml
+cargo narf build image --arch=x86_64 --composition /etc/narf/site.toml
 ```
 
 Built-in entries are fixed into the image, including any declared protection
@@ -111,8 +111,8 @@ VFIO. Repeat it for every function that belongs to the device, such as a GPU
 and its HD-audio function:
 
 ```sh
-cargo xtask passthrough -d 03:00.0 -d 03:00.1
-cargo xtask run --arch=x86_64 \
+cargo narf run passthrough -d 03:00.0 -d 03:00.1
+cargo narf run run --arch=x86_64 \
   --passthrough-device 03:00.0 \
   --passthrough-device 03:00.1
 ```
@@ -120,7 +120,7 @@ cargo xtask run --arch=x86_64 \
 The first command is a read-only readiness check. The second repeats that
 preflight, injects QEMU `vfio-pci` devices, and boots NARF. The Linux host must
 have KVM and an enabled IOMMU, and every assigned endpoint must already be
-bound to `vfio-pci`. xtask checks IOMMU-group completeness and whether the
+bound to `vfio-pci`. cargo narf checks IOMMU-group completeness and whether the
 device BARs fit NARF's mapped physical windows, but never rebinds host
 hardware. Prefer the distribution's early-boot VFIO configuration; detaching
 the GPU driving an active desktop can terminate the session and may leave the
@@ -141,8 +141,8 @@ fleet-management plane.
 For a live network check, use:
 
 ```sh
-cargo xtask net-smoke --arch=x86_64
-cargo xtask e1000-module-net-smoke --arch=x86_64
+cargo narf smoke net-smoke --arch=x86_64
+cargo narf e1000-module-net-smoke --arch=x86_64
 ```
 
 Both network commands verify host-to-guest TCP, host-to-guest UDP, and a guest
@@ -162,7 +162,7 @@ crate is the current dual-build reference:
 
 ```sh
 cat /sys/kernel/abi_hash
-cargo xtask build-module --package narf-drivers-net-e1000 \
+cargo narf build build-module --package narf-drivers-net-e1000 \
   --no-default-features --features module \
   --arch x86_64 --kernel-abi 0x1f3a90c2
 ```
@@ -178,10 +178,10 @@ Ed25519 trust roots from the absolute build-time path in
 bytes)`, then attach the detached signature and public key:
 
 ```sh
-cargo xtask build-module --package <crate> --arch x86_64 \
+cargo narf build build-module --package <crate> --arch x86_64 \
   --kernel-abi 0x1f3a90c2 --compress --out module.ko.lz4
 # Produce module.sig and module.pub with the authorized release signer.
-cargo xtask attach-module-signature --module module.ko.lz4 \
+cargo narf build attach-module-signature --module module.ko.lz4 \
   --signature module.sig --public-key module.pub
 ```
 

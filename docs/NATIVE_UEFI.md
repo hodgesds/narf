@@ -9,7 +9,7 @@ sidecar is needed on the EFI System Partition (ESP).
 Native x86 distribution packages and `cargo narf install` use this path by
 default. `image`, `iso-boot`, `grub-image`, and `usb-image` retain their existing
 media layouts. `--limine-efi` explicitly selects legacy x86 packages. aarch64 continues to use
-`cargo xtask image --arch=aarch64` and its kernel-bound EFI loader.
+`cargo narf build image --arch=aarch64` and its kernel-bound EFI loader.
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ and `llvm-tools` installed. Run Cargo through rustup so the pinned toolchain
 is selected. Initial builds need access to crates.io.
 
 For QEMU, install `qemu-system-x86_64` and OVMF. Set `OVMF_CODE` to the
-firmware CODE image if it is not in one of xtask's standard locations.
+firmware CODE image if it is not in one of cargo narf's standard locations.
 The new run path uses QEMU's read-only virtual FAT backend and needs neither
 Limine, xorriso, nor mtools.
 
@@ -28,17 +28,17 @@ From the repository root:
 
 ```sh
 # Build the self-contained application, init/shell, and coreutils.
-cargo xtask efi-image
+cargo narf build efi-image
 
 # Build and boot it through OVMF; serial input/output uses this terminal.
-cargo xtask efi-image --run
+cargo narf build efi-image --run
 
 # Use the graphical QEMU window for login; retain serial boot diagnostics.
-cargo xtask efi-image --run --display=gtk \
+cargo narf build efi-image --run --display=gtk \
   --cmdline 'narf.disks=boot-only console=ttyS0 console=tty0'
 
 # Build a separate smoke image, require the clean-exit marker and ACPI S5.
-cargo xtask efi-image --smoke
+cargo narf build efi-image --smoke
 ```
 
 The default build enables `boot-init`. It embeds the in-tree init, shell,
@@ -65,7 +65,7 @@ large firmware bundles may require a real FAT image for manual QEMU testing.
 To reuse an exact kernel or supply a complete archive:
 
 ```sh
-cargo xtask efi-image --prebuilt /absolute/path/narf-frame \
+cargo narf build efi-image --prebuilt /absolute/path/narf-frame \
   --initramfs /absolute/path/initramfs.cpio --output target/my-narf.efi
 ```
 
@@ -84,7 +84,7 @@ The default embedded command line is `narf.disks=boot-only`. To select an
 installed root for the existing kernel root-mount path, build a separate image:
 
 ```sh
-cargo xtask efi-image --output target/narf-installed.efi \
+cargo narf build efi-image --output target/narf-installed.efi \
   --cmdline 'root=UUID=YOUR-FILESYSTEM-UUID systemd_pid1 narf.disks=root-ro'
 ```
 
@@ -98,7 +98,7 @@ On a desktop installation, the default runlevel typically includes
 `display-manager`. To try it with a RAM-backed writable view of the root, use
 
 ```sh
-cargo xtask efi-image --output target/narf-openrc.efi \
+cargo narf build efi-image --output target/narf-openrc.efi \
   --cmdline 'root=UUID=YOUR-FILESYSTEM-UUID narf.disks=root-ro openrc_pid1 console=ttyS0 console=tty0'
 ```
 
@@ -148,8 +148,8 @@ from the build host and select them from `target/firmware/` with repeatable
 `--initramfs-firmware` arguments. For example, for Alder Lake-P graphics:
 
 ```sh
-cargo xtask import-firmware --source /lib/firmware --vendor i915
-cargo xtask efi-image --initramfs-firmware 'i915/adlp_dmc.bin' \
+cargo narf firmware import-firmware --source /lib/firmware --vendor i915
+cargo narf build efi-image --initramfs-firmware 'i915/adlp_dmc.bin' \
   --initramfs-firmware 'i915/adlp_guc_70.bin' --initramfs-firmware 'i915/tgl_huc.bin'
 ```
 
@@ -198,7 +198,7 @@ on an already-mounted ESP. These commands are performed by the administrator,
 not by `efi-image`:
 
 ```sh
-cargo xtask efi-image --cmdline 'narf.disks=boot-only console=ttyS0 console=tty0'
+cargo narf build efi-image --cmdline 'narf.disks=boot-only console=ttyS0 console=tty0'
 
 ESP=/boot/efi                 # use your mounted ESP's actual path
 sudo install -D -m 0644 target/narf-x86_64.efi \
@@ -259,7 +259,7 @@ The loader puts the kernel at the ELF's physical load range when that range
 is free. When firmware owns part of it, as on the ThinkPad P14s Gen 5 AMD
 (ACPI NVS and tables at 0x179ec000-0x1f46bfff), the loader puts the kernel a
 multiple of 2 MiB higher in free memory below 4 GiB and prints the address. It
-fails only when no free range fits. `cargo xtask efi-image --smoke
+fails only when no free range fits. `cargo narf build efi-image --smoke
 --occupy-link-range` tests that path under OVMF. The loader keeps the loaded EFI image,
 initramfs, handoff and EFI boot-services pages reserved for the kernel lifetime;
 firmware configuration tables can still refer into the latter. It bounds the
@@ -284,7 +284,7 @@ applying `ro`, `rootflags=`, and the root overlay policy.
 For serial unlock, use the **outer LUKS container UUID** for both selectors:
 
 ```sh
-cargo xtask efi-image --output target/narf-encrypted.efi \
+cargo narf build efi-image --output target/narf-encrypted.efi \
   --cmdline 'narf.disks=root-ro root=UUID=YOUR-LUKS-UUID rd.luks.uuid=YOUR-LUKS-UUID rd.luks.prompt=serial console=ttyS0'
 ```
 
@@ -324,7 +324,7 @@ over serial and executed `echo hello world` from the shell. The diskless QEMU
 fixture exposed an existing NVMe AER-supervisor busy loop when its controller
 registry was empty; the supervisor now parks between discovery attempts.
 Its regression runs with
-`cargo xtask test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme`.
+`cargo narf test test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme`.
 The encrypted btrfs write fixture also exposed a virtio sync adapter which
 rejected multi-sector writes; it now sends every sector and preserves flush
 semantics. This matters for both ordinary btrfs metadata and encrypted views.
@@ -335,7 +335,7 @@ Run the focused acceptance gates with the pinned toolchain on PATH:
 packaging/test-packaging.sh
 packaging/test-secure-boot.sh
 # Build a current production boot-init image first (without --smoke):
-cargo xtask efi-image
+cargo narf build efi-image
 python3 packaging/test-native-luks.py \
   --kernel target/native-uefi-x86_64/kernel.elf \
   --initramfs target/native-uefi-x86_64/initramfs.cpio

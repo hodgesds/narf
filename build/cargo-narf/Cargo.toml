@@ -1,6 +1,6 @@
 [package]
 name = "cargo-narf"
-description = "Cargo frontend for building and installing native NARF kernel packages"
+description = "NARF build/run/test orchestrator and native package frontend. See build/specification/spec.md §3."
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -13,8 +13,40 @@ name = "cargo-narf"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0"
+narf-boot-protocol = { path = "../../boot/protocol" }
+# `/proc/kallsyms` table: the encoder half of the format the kernel decodes.
+narf-kallsyms = { path = "../../observability/kallsyms", features = ["alloc"] }
+# Rust symbol demangling for that table, to the form `nm -C` prints.
+rustc-demangle = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+wait-timeout = "0.2"
+# zstd decompression for /lib/firmware/*.zst blobs (Arch ships them
+# compressed; Linux kernel decompresses at load time, NARF unpacks
+# at build-time and stores the raw payload).
+zstd = "0.13"
+# `cargo narf ci affected` parses `cargo metadata --no-deps` JSON to build
+# the workspace dependency graph for change-based CI job selection.
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+toml_edit = "0.22"
+semver = { version = "1.0", features = ["serde"] }
+# Tokenize registrations without mistaking comments/string examples for tests.
+proc-macro2 = "1"
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+sha2 = { version = "0.10", default-features = false }
+# `smoke ext4-rootrw-interop` encrypts and decrypts its LUKS1 payload
+# (aes-xts-plain64) on the host, with the volume key it gave cryptsetup.
+aes = "0.8"
+xts-mode = { version = "0.5", default-features = false }
+ed25519-dalek = { version = "2", default-features = false }
+# Deterministic host-side HTTP/3 fixture for the live CachyOS smoke.  The
+# guest uses its stock curl through SLIRP; this is not linked into NARF.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

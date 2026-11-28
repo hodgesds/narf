@@ -293,7 +293,7 @@ pub struct Report {
 
 impl Report {
     fn fail(&self, msg: String) {
-        println!("xtask net-smoke: robust host FAIL: {msg}");
+        println!("cargo narf smoke net-smoke: robust host FAIL: {msg}");
         if let Ok(mut v) = self.inner.lock() {
             v.push(msg);
         }
@@ -305,7 +305,7 @@ impl Report {
 }
 
 fn note(msg: &str) {
-    println!("xtask net-smoke: robust host: {msg}");
+    println!("cargo narf smoke net-smoke: robust host: {msg}");
 }
 
 fn bind(port: u16) -> Result<TcpListener> {
@@ -762,7 +762,7 @@ pub fn spawn_ns_peer(sock: &std::path::Path, cfg: RobustConfig) -> Option<NsPeer
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            println!("xtask net-smoke: namespace peer unavailable (unshare: {e})");
+            println!("cargo narf smoke net-smoke: namespace peer unavailable (unshare: {e})");
             return None;
         }
     };
@@ -776,7 +776,7 @@ pub fn spawn_ns_peer(sock: &std::path::Path, cfg: RobustConfig) -> Option<NsPeer
             let mut ready_tx = Some(ready_tx);
             for line in std::io::BufReader::new(out).lines() {
                 let Ok(line) = line else { break };
-                println!("xtask net-smoke: {line}");
+                println!("cargo narf smoke net-smoke: {line}");
                 if line.starts_with("net-peer: ready") {
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(true);
@@ -799,7 +799,7 @@ pub fn spawn_ns_peer(sock: &std::path::Path, cfg: RobustConfig) -> Option<NsPeer
     match ready_rx.recv_timeout(Duration::from_secs(20)) {
         Ok(true) => Some(NsPeer { child, lines }),
         _ => {
-            println!("xtask net-smoke: namespace peer did not come up; namespace phases skipped");
+            println!("cargo narf smoke net-smoke: namespace peer did not come up; namespace phases skipped");
             let _ = child.kill();
             let _ = child.wait();
             None
@@ -919,7 +919,7 @@ fn open_tap(name: &str) -> Result<std::fs::File> {
 /// dropped by the relay, as a real switch port would, and counted.
 const MAX_FRAME: usize = 1514;
 
-/// `xtask net-peer`: runs inside `unshare -rn`. Sets up tap0 (10.0.3.1/24)
+/// `cargo narf run net-peer`: runs inside `unshare -rn`. Sets up tap0 (10.0.3.1/24)
 /// with an ifb mirror of its ingress for netem, relays tap0 to QEMU's
 /// stream socket, and serves the namespace phases in order.
 pub fn net_peer_main(sock: &std::path::Path, mask: u64, long_run: bool) -> Result<()> {
@@ -1048,7 +1048,7 @@ pub fn net_peer_main(sock: &std::path::Path, mask: u64, long_run: bool) -> Resul
         }
     }
     println!("net-peer: done");
-    // Keep relaying until xtask kills us.
+    // Keep relaying until cargo narf kills us.
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }

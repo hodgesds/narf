@@ -6,10 +6,10 @@
 //! firmware pointers, and hand normalized data to `frame/`.
 //!
 //! **Deviation from spec §5 noted:** the spec pins Limine as the sole
-//! Stage-1 bootloader on x86_64, but `cargo xtask run` targets QEMU's
+//! Stage-1 bootloader on x86_64, but `cargo narf run run` targets QEMU's
 //! `-kernel` path which supports multiboot2 natively. Stage 1 uses
 //! multiboot2; Limine's UEFI application converts its firmware handoff to
-//! that same protocol, and the OVMF path is exercised by `xtask iso-boot`.
+//! that same protocol, and the OVMF path is exercised by `cargo narf build iso-boot`.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -79,7 +79,7 @@ pub fn cmdline() -> &'static str {
 /// aarch64 got a real one above: it always parsed `/chosen/bootargs` into a
 /// static buffer for `BootInfo::cmdline`, but this dispatcher had no aarch64 arm
 /// and returned `""`, so every cmdline flag was inert there. `stop_at=` and
-/// `safe_mode` silently did nothing, and `cargo xtask test --subsystem <name>`
+/// `safe_mode` silently did nothing, and `cargo narf test test --subsystem <name>`
 /// appeared to filter nothing — the harness passes the filter through
 /// `-append`, the kernel read an empty string, and `run_all_and_exit()` ran the
 /// whole suite while still reporting success.

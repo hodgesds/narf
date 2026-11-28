@@ -109,7 +109,7 @@ pub fn run(args: &Args) -> Result<()> {
         }
     }
     if args.arch != Arch::X86_64 {
-        bail!("efi-image currently supports x86_64; aarch64 uses cargo xtask image --arch=aarch64");
+        bail!("efi-image currently supports x86_64; aarch64 uses cargo narf build image --arch=aarch64");
     }
     let root = workspace_root()?;
     let build = args.build_args();
@@ -154,12 +154,12 @@ pub fn run(args: &Args) -> Result<()> {
     let bytes = std::fs::read(&staged_kernel)?;
     let elf = ElfImage::parse(&bytes).map_err(|error| anyhow!("EFI kernel rejected: {error:?}"))?;
     println!(
-        "xtask efi-image: kernel {} (SHA256 {})",
+        "cargo narf build efi-image: kernel {} (SHA256 {})",
         kernel.display(),
         sha256_file(&kernel)?
     );
     println!(
-        "xtask efi-image: physical load {:#x}..{:#x}",
+        "cargo narf build efi-image: physical load {:#x}..{:#x}",
         elf.load_start, elf.load_end
     );
 
@@ -224,12 +224,12 @@ pub fn run(args: &Args) -> Result<()> {
     std::fs::create_dir_all(&efi_directory)?;
     std::fs::copy(&output, efi_directory.join("BOOTX64.EFI"))?;
     println!(
-        "xtask efi-image: wrote {} ({} bytes; initramfs {} bytes)",
+        "cargo narf build efi-image: wrote {} ({} bytes; initramfs {} bytes)",
         output.display(),
         std::fs::metadata(&output)?.len(),
         cpio.len()
     );
-    println!("xtask efi-image: embedded cmdline: {cmdline}");
+    println!("cargo narf build efi-image: embedded cmdline: {cmdline}");
     if args.run || args.smoke {
         boot(args, &esp)?;
     }
@@ -344,7 +344,10 @@ fn boot(args: &Args, esp: &Path) -> Result<()> {
                 "virtio-blk-pci,drive=narf-root,disable-legacy=on,disable-modern=off",
             ]);
     }
-    println!("xtask efi-image: booting {} through OVMF", esp.display());
+    println!(
+        "cargo narf build efi-image: booting {} through OVMF",
+        esp.display()
+    );
     if args.smoke {
         let child = command
             .stdout(Stdio::piped())
@@ -374,7 +377,8 @@ mod tests {
             ("narf.disks=boot-only", false),
         ] {
             let cli = Cli::try_parse_from([
-                "xtask",
+                "cargo-narf",
+                "build",
                 "efi-image",
                 "--cmdline",
                 cmdline,
@@ -382,7 +386,7 @@ mod tests {
                 "user-task-smp",
             ])
             .unwrap();
-            let Cmd::EfiImage(args) = cli.cmd else {
+            let TopCommand::Build(BuildCmd::EfiImage(args)) = cli.command else {
                 panic!("wrong command")
             };
             let build = args.build_args();
@@ -398,19 +402,22 @@ mod tests {
     #[test]
     fn efi_cli_is_opt_in_and_has_distinct_run_and_smoke_modes() {
         let cli = Cli::try_parse_from([
-            "xtask",
+            "cargo-narf",
+            "build",
             "efi-image",
             "--cmdline",
             "root=UUID=123 narf.disks=root-ro",
             "--smoke",
         ])
         .unwrap();
-        let Cmd::EfiImage(args) = cli.cmd else {
+        let TopCommand::Build(BuildCmd::EfiImage(args)) = cli.command else {
             panic!("wrong command")
         };
         assert!(args.smoke);
         assert!(!args.run);
         assert_eq!(args.cmdline, "root=UUID=123 narf.disks=root-ro");
-        assert!(Cli::try_parse_from(["xtask", "efi-image", "--run", "--smoke"]).is_err());
+        assert!(
+            Cli::try_parse_from(["cargo-narf", "build", "efi-image", "--run", "--smoke"]).is_err()
+        );
     }
 }

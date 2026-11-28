@@ -1504,7 +1504,7 @@ pub fn init_per_task_state() {
     //
     // Installed here rather than in `frame::cross_crate_init` because that
     // runs only under `boot-init` and, per bare_main's own note, "never fires
-    // under `cargo xtask test`" -- so the files fell back to procfs's private
+    // under `cargo narf test test`" -- so the files fell back to procfs's private
     // statics in every kernel test, which is the split-brain this wiring
     // exists to remove. `init_per_task_state` runs in both, and
     // `narf-userspace` already depends on `narf-filesystem`, so no third

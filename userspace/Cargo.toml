@@ -57,8 +57,8 @@ async-trait       = { version = "0.1", optional = true }
 # Native Bootstrap/RingKick ABI and per-task sessions. Off by default.
 native-ring = ["narf-abi/native-ring", "narf-scheduler/native-ring"]
 
-# Default-on so the workspace's `cargo xtask kernel-test` driver
-# (which doesn't enable any per-crate features explicitly) still
+# Default-on so the workspace's kernel-test driver (`cargo narf test test`,
+# which doesn't enable any per-crate features explicitly) still
 # builds the Linux-shaped surface into the kernel. Strip with
 # --no-default-features at the workspace level if a future
 # non-Linux-shaped consumer wants them off.
@@ -80,7 +80,7 @@ unix-latency-trace = []
 # Syscall-path and procfs-read microbenchmarks (`hotpath_bench.rs`), emitted
 # as raw samples for the host-side verification §8 statistics. Off by default
 # so ordinary kernel-test suites never pay for them; enable with
-# `cargo xtask test --features narf-userspace/hotpath-bench --subsystem
+# `cargo narf test test --features narf-userspace/hotpath-bench --subsystem
 # userspace/hotpath_bench`.
 hotpath-bench = []
 

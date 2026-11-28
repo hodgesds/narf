@@ -123,7 +123,7 @@ and block layers' responsibility; the EFI loader only hands off the archive.
 
 Multi-architecture handoff:
 
-- **Native EFI** (x86_64, `cargo xtask efi-image`): the EFI application
+- **Native EFI** (x86_64, `cargo narf build efi-image`): the EFI application
   embeds the kernel, uncompressed CPIO archive and command line. It copies
   the archive into page-aligned EFI loader pages below 4 GiB, retains them
   as reserved memory, and emits the same Multiboot2 `initramfs` module below.
