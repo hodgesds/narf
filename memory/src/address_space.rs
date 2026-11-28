@@ -7261,13 +7261,35 @@ impl AddressSpace {
             if tracks_resident_leaves {
                 match mode {
                     SharedMremapMode::Duplicate => {
-                        for (index, &phys) in leaf_view.phys.indexed() {
-                            if phys.raw() != 0 {
-                                crate::rmap::add_reserved(
-                                    phys,
-                                    self.root,
-                                    VirtAddr::new(destination_lo + index as u64 * 4096),
-                                );
+                        // Commit the reserved alias owners as one batch —
+                        // one lock hold per touched shard instead of one
+                        // per duplicated leaf. The entries vector is
+                        // best-effort: if it cannot be allocated, fall
+                        // back to the per-leaf commit.
+                        let mut entries = Vec::new();
+                        if entries
+                            .try_reserve_exact(leaf_view.phys.allocated_slots())
+                            .is_ok()
+                        {
+                            for (index, &phys) in leaf_view.phys.indexed() {
+                                if phys.raw() != 0 {
+                                    entries.push((
+                                        phys,
+                                        self.root,
+                                        VirtAddr::new(destination_lo + index as u64 * 4096),
+                                    ));
+                                }
+                            }
+                            crate::rmap::add_reserved_multi(&entries);
+                        } else {
+                            for (index, &phys) in leaf_view.phys.indexed() {
+                                if phys.raw() != 0 {
+                                    crate::rmap::add_reserved(
+                                        phys,
+                                        self.root,
+                                        VirtAddr::new(destination_lo + index as u64 * 4096),
+                                    );
+                                }
                             }
                         }
                     }
@@ -10936,14 +10958,28 @@ impl AddressSpace {
         }
         // Publish phase: the single fault's transaction, reservation,
         // and release idioms, per page. Every failure is final only for
-        // its page.
+        // its page. The rmap preparation for the whole range runs first
+        // as one batch — one lock hold per touched shard instead of one
+        // per page — and leaves no reservation behind if it fails, so
+        // the loop below falls back to the single-page preparation for
+        // every page.
+        let mut filled = Vec::new();
+        let batch_prepared = if filled
+            .try_reserve_exact(frames.iter().filter(|frame| frame.is_some()).count())
+            .is_ok()
+        {
+            filled.extend(frames.iter().flatten().copied());
+            crate::rmap::try_prepare_owner_slots_multi(&filled).is_ok()
+        } else {
+            false
+        };
         let mut installed = 0usize;
         for (claim, frame) in claimed.iter().zip(frames) {
             let Some(phys) = frame else {
                 self.cancel_demand_page(claim.v, claim.ticket);
                 continue;
             };
-            if crate::rmap::try_prepare_owner_slots(phys, 1).is_err() {
+            if !batch_prepared && crate::rmap::try_prepare_owner_slots(phys, 1).is_err() {
                 self.cancel_demand_page(claim.v, claim.ticket);
                 release(claim, phys);
                 continue;
@@ -13820,12 +13856,30 @@ impl AddressSpace {
                 // by phys — a separate lock from the page tables — so the expensive
                 // 4-level walk was already amortised above; this is an O(1) insert
                 // per page. Lazy (phys == 0) slots are not installed, so skip them.
-                for (k, &p) in slice.iter().enumerate() {
-                    if p.raw() == 0 {
-                        continue;
+                // One batch commit per touched shard instead of one lock hold per
+                // leaf; the entries vector is best-effort and falls back to the
+                // per-leaf add if it cannot be allocated.
+                let mut entries = Vec::new();
+                if entries.try_reserve_exact(slice.len()).is_ok() {
+                    for (k, &p) in slice.iter().enumerate() {
+                        if p.raw() == 0 {
+                            continue;
+                        }
+                        entries.push((
+                            p,
+                            self.root,
+                            crate::VirtAddr::new(window_base.as_u64() + ((k as u64) << 12)),
+                        ));
                     }
-                    let v = crate::VirtAddr::new(window_base.as_u64() + ((k as u64) << 12));
-                    crate::rmap::add(p, self.root, v);
+                    crate::rmap::add_multi(&entries);
+                } else {
+                    for (k, &p) in slice.iter().enumerate() {
+                        if p.raw() == 0 {
+                            continue;
+                        }
+                        let v = crate::VirtAddr::new(window_base.as_u64() + ((k as u64) << 12));
+                        crate::rmap::add(p, self.root, v);
+                    }
                 }
             }
         }
@@ -13928,12 +13982,30 @@ impl AddressSpace {
                 }
                 // Reverse-map every installed leaf (rmap shards by phys, a separate
                 // lock from the page tables; the costly walk was amortised above).
-                for (k, &p) in slice.iter().enumerate() {
-                    if p.raw() == 0 {
-                        continue;
+                // One batch commit per touched shard instead of one lock hold per
+                // leaf; the entries vector is best-effort and falls back to the
+                // per-leaf add if it cannot be allocated.
+                let mut entries = Vec::new();
+                if entries.try_reserve_exact(slice.len()).is_ok() {
+                    for (k, &p) in slice.iter().enumerate() {
+                        if p.raw() == 0 {
+                            continue;
+                        }
+                        entries.push((
+                            p,
+                            self.root,
+                            crate::VirtAddr::new(window_base.as_u64() + ((k as u64) << 12)),
+                        ));
                     }
-                    let v = crate::VirtAddr::new(window_base.as_u64() + ((k as u64) << 12));
-                    crate::rmap::add(p, self.root, v);
+                    crate::rmap::add_multi(&entries);
+                } else {
+                    for (k, &p) in slice.iter().enumerate() {
+                        if p.raw() == 0 {
+                            continue;
+                        }
+                        let v = crate::VirtAddr::new(window_base.as_u64() + ((k as u64) << 12));
+                        crate::rmap::add(p, self.root, v);
+                    }
                 }
             }
         }
