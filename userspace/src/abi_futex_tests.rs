@@ -1208,9 +1208,10 @@ fn smoke_abi_futex_pi_ordered_handoff() -> TestResult {
                 return Err("taking a PI futex with two parked waiters must set FUTEX_WAITERS");
             }
             // Unlock transfers ownership DIRECTLY to the head waiter:
-            // the word names it (not FUTEX_WAITERS, not 0), so no other
-            // locker can take the word before it is scheduled.
-            if p_op(FUTEX_UNLOCK_PI) != Some(0) || get() != w1_id as u32 {
+            // the word names it, with FUTEX_WAITERS still set while the
+            // second waiter remains queued, so no other locker can take
+            // the word before it is scheduled.
+            if p_op(FUTEX_UNLOCK_PI) != Some(0) || get() != (w1_id as u32 | PI_WAITERS) {
                 return Err(
                     "unlocking with parked waiters must transfer the word to the head waiter",
                 );
@@ -1221,9 +1222,10 @@ fn smoke_abi_futex_pi_ordered_handoff() -> TestResult {
             }
             // The head waiter re-executes LOCK_PI as itself: the grant
             // turns the owner==me check into an acquire, not EDEADLK,
-            // and the word is untouched by the acquire.
+            // and the word is untouched by the acquire — it still names
+            // the head waiter with FUTEX_WAITERS set (T2 still queued).
             set_task(w1_id);
-            if p_op(FUTEX_LOCK_PI) != Some(0) || get() != w1_id as u32 {
+            if p_op(FUTEX_LOCK_PI) != Some(0) || get() != (w1_id as u32 | PI_WAITERS) {
                 return Err("the designated head waiter must acquire via its handoff grant");
             }
             // The grant is single-use: locking again is a recursive lock.
