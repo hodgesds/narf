@@ -377,3 +377,331 @@ kernel_test_in!(
     "syscall_abi/execve_pagein/truncated_eager_fails_load",
     smoke_execve_pagein_truncated_eager_fails_load
 );
+
+/// FS-backed interpreter: the kernel neither relocates it nor slurps
+/// it. The interpreter comes from a memfs mounted ONLY in a private
+/// namespace (the smoke-5f pattern), the program names it via
+/// PT_INTERP, and the load goes through the production
+/// `load_user_process_with_root_file` path.
+///
+/// Witnesses, after the load:
+///   a. The interpreter's text AND writable-data pages are NOT backed
+///      — both demand-page now. The old code backed the writable
+///      segment eagerly (for the relocation pass) and read the whole
+///      file up front.
+///   b. The RELA target slot still holds the file's marker bytes: the
+///      kernel did not patch it. The old pass would have overwritten
+///      it with ADDEND + bias.
+///   c. Entry is the interpreter's entry at its (pinned) bias.
+///
+/// The byte-count half of (a) — "the file saw headers only" — is not
+/// directly observable here: the interpreter is served by the VFS
+/// (memfs has no read counter), not by the counting `FileOps`. The
+/// read behaviour itself is the same `ExecSource::File` bounded range
+/// reads the program-side counting tests above already prove; what
+/// this test pins is the observable consequence on the FS path: no
+/// eager backing, no patched slot.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+use crate::syscall::{SyscallArgs, SyscallReturn, TrapContext};
+
+/// Pinned interpreter base: `UserAslrGuard::off()` holds the loader
+/// to the canonical `INTERP_NOMINAL_BASE`.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+const INTERP_BASE: u64 = 0x0000_4000_0000_0000;
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+const INTERP_TEXT_VA: u64 = 0x1000;
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+const INTERP_DATA_VA: u64 = 0x11000;
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+const RELA_SLOT_VA: u64 = 0x11100;
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+const INTERP_ENTRY: u64 = 0x1234;
+/// The RELA slot's pre-relocation content in the file. The old kernel
+/// pass would have overwritten it with `RELA_ADDEND + INTERP_BASE`.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+const SLOT_MARKER: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+
+#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "container")]
+const RELA_RELATIVE: u64 = 8; // R_X86_64_RELATIVE
+#[cfg(target_arch = "aarch64")]
+#[cfg(feature = "container")]
+const RELA_RELATIVE: u64 = 1027; // R_AARCH64_RELATIVE
+
+/// Minimal TrapContext for the `unshare(CLONE_NEWNS)` call — the
+/// mount-smoke pattern, local so this file does not depend on
+/// `mount_e2e_tests`'s private helpers.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+struct NsStubCtx {
+    args: SyscallArgs,
+    ret: Option<SyscallReturn>,
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+impl TrapContext for NsStubCtx {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, r: SyscallReturn) {
+        self.ret = Some(r);
+    }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
+    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        false
+    }
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+fn ns_flags_args(flags: u64) -> SyscallArgs {
+    SyscallArgs {
+        arg0: flags,
+        ..Default::default()
+    }
+}
+
+/// Synthetic ET_DYN interpreter: 16-page R-X text, 16-page R-W data
+/// (both at/above the 64 KiB demand floor, so both demand-page), one
+/// PT_DYNAMIC page carrying a single RELATIVE RELA entry against a
+/// slot in the data segment. File size 0x22000.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+fn build_interp_elf() -> alloc::vec::Vec<u8> {
+    const TEXT_OFF: usize = 0x1000;
+    const DATA_OFF: usize = 0x11000;
+    const DYN_OFF: usize = 0x21000;
+    const RELA_OFF: usize = 0x21100;
+    const SLOT_OFF: usize = 0x11100;
+    const ADDEND: u64 = 0x1122_3344_5566_7788;
+
+    let mut b = alloc::vec![0u8; 0x22000];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&INTERP_ENTRY.to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    b[0x38..0x3A].copy_from_slice(&3u16.to_le_bytes()); // e_phnum
+                                                        // Phdr 0: PT_LOAD R+X text, 16 pages.
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&(TEXT_OFF as u64).to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&INTERP_TEXT_VA.to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&INTERP_TEXT_VA.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&(16 * PAGE).to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&(16 * PAGE).to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&PAGE.to_le_bytes());
+    // Phdr 1: PT_LOAD R+W data, 16 pages.
+    let ph = 64 + 56;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes()); // PF_R|PF_W
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&(DATA_OFF as u64).to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&INTERP_DATA_VA.to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&INTERP_DATA_VA.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&(16 * PAGE).to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&(16 * PAGE).to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&PAGE.to_le_bytes());
+    // Phdr 2: PT_DYNAMIC, one page.
+    let ph = 64 + 112;
+    b[ph..ph + 0x04].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&(DYN_OFF as u64).to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&0x21000u64.to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&0x21000u64.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&PAGE.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&PAGE.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
+    // .dynamic entries: DT_RELA, DT_RELASZ, DT_RELAENT, DT_NULL.
+    b[DYN_OFF..DYN_OFF + 8].copy_from_slice(&7i64.to_le_bytes());
+    b[DYN_OFF + 8..DYN_OFF + 16].copy_from_slice(&0x21100u64.to_le_bytes());
+    b[DYN_OFF + 16..DYN_OFF + 24].copy_from_slice(&8i64.to_le_bytes());
+    b[DYN_OFF + 24..DYN_OFF + 32].copy_from_slice(&24u64.to_le_bytes());
+    b[DYN_OFF + 32..DYN_OFF + 40].copy_from_slice(&9i64.to_le_bytes());
+    b[DYN_OFF + 40..DYN_OFF + 48].copy_from_slice(&24u64.to_le_bytes());
+    b[DYN_OFF + 48..DYN_OFF + 56].copy_from_slice(&0i64.to_le_bytes());
+    b[DYN_OFF + 56..DYN_OFF + 64].copy_from_slice(&0u64.to_le_bytes());
+    // The one RELA entry: RELATIVE against the data slot.
+    b[RELA_OFF..RELA_OFF + 8].copy_from_slice(&RELA_SLOT_VA.to_le_bytes());
+    b[RELA_OFF + 8..RELA_OFF + 16].copy_from_slice(&RELA_RELATIVE.to_le_bytes());
+    b[RELA_OFF + 16..RELA_OFF + 24].copy_from_slice(&ADDEND.to_le_bytes());
+    // The slot's pre-relocation content.
+    b[SLOT_OFF..SLOT_OFF + 8].copy_from_slice(&SLOT_MARKER.to_le_bytes());
+    // Text page 0 carries a recognizable byte.
+    b[TEXT_OFF..TEXT_OFF + PAGE as usize].fill(0xCC);
+    b
+}
+
+/// Synthetic ET_EXEC program: one PT_LOAD R+X page at `SEG_VA` plus
+/// PT_INTERP naming the mounted interpreter.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+fn build_interp_program_elf() -> alloc::vec::Vec<u8> {
+    const INTERP_STR_OFF: usize = 0x200;
+    let mut b = alloc::vec![0u8; 0x2000];
+    b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    b[0x12..0x14].copy_from_slice(&EM_NATIVE.to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x100).to_le_bytes()); // e_entry
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+                                                        // Phdr 0: PT_LOAD R+X at SEG_VA.
+    let ph = 64usize;
+    b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&PAGE.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&PAGE.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&PAGE.to_le_bytes());
+    // Phdr 1: PT_INTERP naming the mounted interpreter.
+    let ph = 64 + 56;
+    b[ph..ph + 0x04].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+    b[ph + 0x08..ph + 0x10].copy_from_slice(&(INTERP_STR_OFF as u64).to_le_bytes());
+    b[ph + 0x10..ph + 0x18].copy_from_slice(&(INTERP_STR_OFF as u64).to_le_bytes());
+    b[ph + 0x18..ph + 0x20].copy_from_slice(&(INTERP_STR_OFF as u64).to_le_bytes());
+    b[ph + 0x20..ph + 0x28].copy_from_slice(&16u64.to_le_bytes());
+    b[ph + 0x28..ph + 0x30].copy_from_slice(&16u64.to_le_bytes());
+    b[ph + 0x30..ph + 0x38].copy_from_slice(&1u64.to_le_bytes());
+    b[INTERP_STR_OFF..INTERP_STR_OFF + 16].copy_from_slice(b"/pxinterp/ld.so\0");
+    b[SEG_FOFF as usize..SEG_FOFF as usize + PAGE as usize].fill(0x41);
+    b
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+fn smoke_execve_fs_interp_not_relocated_nor_slurped() -> TestResult {
+    // Harness fresh view (resets namespaces, installs the task-id
+    // lookup); pair with teardown() on every exit path.
+    setup();
+    let _aslr = crate::tests::UserAslrGuard::off();
+    // Every exit runs the namespace cleanup + teardown.
+    let finish = |verdict: TestResult| -> TestResult {
+        crate::handlers::clear_current_mount_namespace_for_test();
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        teardown();
+        verdict
+    };
+    set_task(0x71_e1);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    narf_filesystem::__test_ensure_mount_target("/");
+    let mut uctx = NsStubCtx {
+        args: ns_flags_args(CLONE_NEWNS),
+        ret: None,
+    };
+    crate::handlers::sys_unshare(&mut uctx);
+    if !matches!(uctx.ret, Some(r) if r.value == 0) {
+        return finish(TestResult::Fail("unshare(CLONE_NEWNS) failed"));
+    }
+    // A memfs ld.so mounted ONLY in the private namespace.
+    let interp = build_interp_elf();
+    let fs: Arc<dyn narf_filesystem::FsInstance> = Arc::new(narf_filesystem::MemFs::with_seeds(
+        "pxld",
+        &[("ld.so", interp.as_slice())],
+    ));
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    if crate::handlers::current_mount_arc(&auth, "/pxinterp", fs).is_err() {
+        return finish(TestResult::Fail("private mount of /pxinterp failed"));
+    }
+    let proc = match try_load(build_interp_program_elf()) {
+        Ok(p) => p,
+        Err(_) => return finish(TestResult::Fail("file-sourced load with FS interp failed")),
+    };
+    *PAGEIN_AS.lock() = Some(Arc::clone(&proc.address_space));
+    crate::handlers::install_address_space_lookup(lookup_pagein_as);
+    let verdict = (|| {
+        // (c) Entry is the interpreter's entry at its (pinned) bias.
+        if proc.entry.0.raw() != INTERP_BASE + INTERP_ENTRY {
+            return Err("entry is not the interpreter entry at its bias");
+        }
+        // (a) The interpreter's pages are NOT backed after load: text
+        // and writable data alike demand-page. The old code backed the
+        // writable segment eagerly (for the relocation pass) and read
+        // the whole file up front.
+        assert_unbacked(&proc.address_space, INTERP_BASE + INTERP_TEXT_VA, 0)?;
+        assert_unbacked(&proc.address_space, INTERP_BASE + INTERP_DATA_VA, 0)?;
+        // (b) Fault the page holding the RELA target in and read the
+        // slot: it still holds the file's marker. The old kernel pass
+        // would have overwritten it with ADDEND + bias.
+        if fault_page(&proc.address_space, INTERP_BASE + RELA_SLOT_VA).is_err() {
+            return Err("the RELA slot page did not fault in on first touch");
+        }
+        assert_backed(&proc.address_space, INTERP_BASE + INTERP_DATA_VA, 0)?;
+        if mapped_bytes(&proc.address_space, INTERP_BASE + RELA_SLOT_VA, 8)?
+            != SLOT_MARKER.to_le_bytes()
+        {
+            return Err("the RELA slot was patched — the kernel relocation pass ran");
+        }
+        Ok(())
+    })();
+    crate::handlers::restore_address_space_lookup(None);
+    *PAGEIN_AS.lock() = None;
+    let pid = proc.pid;
+    drop(proc);
+    crate::release_pid(pid);
+    finish(match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    })
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "container"
+))]
+kernel_test_in!(
+    "syscall_abi/execve_pagein/fs_interp_not_relocated_nor_slurped",
+    smoke_execve_fs_interp_not_relocated_nor_slurped
+);

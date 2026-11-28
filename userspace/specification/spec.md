@@ -107,10 +107,10 @@ byte-only wrappers retain their existing return types. Demand-paged PT_LOAD
 mappings fault in on first touch after the new image starts — there is no
 eager page-in inside execve, matching Linux's `binfmt_elf`, which maps with
 `elf_map` and reads zero file bytes before the image runs. The interpreter
-is demand-paged the same way when it comes from the filesystem, except its
-writable segments stay eager so the kernel's `PT_DYNAMIC` relocation pass —
-which writes through page-table translation and cannot fault a page in —
-always finds its targets present.
+is demand-paged the same way when it comes from the filesystem, writable
+segments included: Linux never relocates any interpreter — ld.so relocates
+itself in bootstrap — so no kernel pass writes its pages before first
+touch.
 
 Blocking poll/ppoll and select/pselect distinguish providers with a durable
 readiness arm or broadcast notification from silent legacy providers (such
