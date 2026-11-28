@@ -4,7 +4,7 @@
 
 **A framekernel with first-class Linux compatibility.**
 
-**Not Another Rust Frame Kernel** is a `no_std` Rust operating system
+**Narf** is a `no_std` Rust operating system
 for x86_64 and aarch64. NARF combines a small Ring-0 trusted computing
 base (TCB) with a kernel organized into protection domains, then
 exposes both a native interface and a Linux-compatible userspace
