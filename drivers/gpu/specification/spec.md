@@ -12479,7 +12479,18 @@ CPU-updated tables (`AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED`). Every table of
 a space on such a card is a 64-bit-stored VRAM page plus a system-RAM copy
 the CPU reads (`describe_va`, unmaps) and restores from; a new table is
 committed before its PDE is written, every map/unmap/relocation rewrite
-commits once. `root_pde()` — the base both hubs' ring flushes program — and
+commits once. Before UNMAP, CLEAR or REPLACE changes any mapping or PTE,
+the VA ioctl waits for all previously submitted jobs in that VM to retire,
+following `amdgpu_vm_clear_freed`'s same-VM dependencies and
+`amdgpu_vm_cpu_prepare`'s CPU update wait. Card placement admission covers
+sampling those jobs through the edit, excluding new submission publication.
+Waits have a five-second deadline; cancellation, timeout, device loss or an
+error without hardware retirement leaves the mappings and PTEs intact.
+The synchronous entry returns `Busy` for pending work. The ioctl snapshots
+its request before parking and executes that same snapshot; disjoint MAP
+does not drain older jobs. Holding backing references alone is insufficient:
+running shaders must retain their translations too.
+`root_pde()` — the base both hubs' ring flushes program — and
 every PDE are `amdgpu_gmc_vram_mc2pa(mc) | VALID` with no SYSTEM/SNOOPED bit
 (`amdgpu_gmc_get_pde_for_bo`, `gmc_v10_0_get_vm_pde`); PTEs of GTT pages
 keep SYSTEM/SNOOPED. `register_table_heap` brings every registered space of
