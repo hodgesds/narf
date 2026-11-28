@@ -20,8 +20,8 @@ use alloc::sync::Arc;
 use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
 use crate::{
-    alloc_pid, interp, loader::apply_relocations, loader::load_elf_into_at,
-    loader::load_elf_into_at_file, loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
+    alloc_pid, interp, loader::load_elf_into_at, loader::load_elf_into_at_file,
+    loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
 };
 
 /// Eagerly-committed top-of-stack window: 128 KiB of real frames at the
@@ -341,21 +341,18 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     let mut entry = program_entry;
     let mut interp_loaded = false;
 
-    // Program-side relocations. PT_DYNAMIC may name R_X86_64_RELATIVE
-    // entries that need patching before the interpreter (or the
-    // program itself) starts; the program loads at vaddr 0 by
-    // convention so the bias passed in is 0. Materialize already
-    // happened inside `load_elf_bytes`, so the patch sites are
-    // walkable through `paging::translate`.
-    //
-    // ONLY apply when there's no PT_INTERP. When the binary names a
-    // dynamic linker, ld-musl resolves every program relocation
-    // (including symbol-bound R_X86_64_GLOB_DAT / JUMP_SLOT against
-    // `write`, `__libc_start_main`, `__cxa_finalize`, …) after the
-    // kernel hands control to its entry point. Running the kernel's
-    // own relocation pass first would `UnresolvedSymbol`-fail on
-    // those externals — they're defined inside libc.so, which
-    // ld-musl hasn't mapped yet at this point.
+    // Program-side relocations are never applied by the kernel.
+    // PT_DYNAMIC may name R_X86_64_RELATIVE entries, but the program
+    // loads at vaddr 0 by convention so there is no bias to apply, and
+    // when the binary names a dynamic linker, ld-musl resolves every
+    // program relocation (including symbol-bound R_X86_64_GLOB_DAT /
+    // JUMP_SLOT against `write`, `__libc_start_main`, `__cxa_finalize`,
+    // …) after the kernel hands control to its entry point. A kernel
+    // pass here would `UnresolvedSymbol`-fail on those externals —
+    // they're defined inside libc.so, which ld-musl hasn't mapped yet
+    // at this point. Static-PIE binaries self-relocate the same way
+    // (see below); the kernel trusts self-relocation for the program
+    // exactly as it does for the interpreter.
     // `program_bias` comes back from `load_elf_bytes` above — it is the
     // bias that was actually used to map the segments. This used to be
     // recomputed here from a second copy of PROGRAM_DYN_BASE, kept in
@@ -422,15 +419,18 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // are expanded through the task's mounts: an absolute link restarts at
     // the task root and may land in another mount. bubblewrap's
     // `--symlink /usr/lib /lib64` over a separately bound /usr is exactly
-    // that, and the filesystem-local walk `read_path_and_file_from_vfs`
+    // that, and the filesystem-local walk `resolve_exec_file`
     // does would restart the link at the root of the filesystem holding it.
     // The image itself and `#!` interpreters already resolve this way
     // (`do_execve_resolved`'s `read_exec`).
     let mut interp_noexec = false;
-    let interp_fs_owned: Option<(
-        alloc::vec::Vec<u8>,
-        alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-    )> = image
+    // Filesystem-backed interpreter, resolved but NOT read here: the
+    // file is handed to the loader as `ExecSource::File` and
+    // demand-paged like the program, so execve reads only its headers
+    // — never a whole-file slurp into a kernel `Vec` (the old
+    // `read_path_and_file_from_vfs` path, with its 64 MiB cap and
+    // fallible bulk allocation).
+    let interp_fs_owned: Option<(alloc::sync::Arc<dyn narf_filesystem::FileOps>, u64)> = image
         .interp
         .as_deref()
         .filter(|name| interp::lookup_interpreter(name).is_none())
@@ -452,7 +452,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
                 interp_noexec = true;
                 return None;
             }
-            read_path_and_file_from_vfs(&resolved)
+            resolve_exec_file(&resolved)
         });
     if interp_noexec {
         return Err(ProcessLoadError::InterpNoExec);
@@ -460,11 +460,19 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
 
     if let Some(name) = image.interp.as_deref() {
         let registered: Option<&[u8]> = interp::lookup_interpreter(name).map(|s| s as &[u8]);
-        let interp_bytes_opt: Option<&[u8]> =
-            registered.or_else(|| interp_fs_owned.as_ref().map(|(bytes, _)| bytes.as_slice()));
-        let interp_bytes = match interp_bytes_opt {
-            Some(b) => b,
-            None => {
+        // Parse the interpreter ONCE. Filesystem-backed: from the file
+        // source, with bounded range reads — the file is never slurped
+        // whole. Registered (in-memory): from its bytes, as before.
+        let interp_image = match (&registered, interp_fs_owned.as_ref()) {
+            (Some(bytes), _) => crate::parse_elf(bytes).map_err(LoadBytesError::Elf)?,
+            (None, Some((file, size))) => {
+                let source = crate::handlers::ExecSource::File {
+                    ops: alloc::sync::Arc::clone(file),
+                    size: *size,
+                };
+                crate::elf::parse_from(&source).map_err(LoadBytesError::Elf)?
+            }
+            (None, None) => {
                 // HARD FAILURE — never fall through to the program's own
                 // entry. A PT_INTERP binary started without its interpreter
                 // has an unrelocated GOT: _start's very first indirect call
@@ -479,17 +487,18 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         };
         {
             if compat32 {
-                interp_bias = compat32_interp_bias(interp_bytes, &address_space)?;
+                interp_bias = compat32_interp_bias(&interp_image, &address_space)?;
             }
             // Demand-page the interpreter when it came from the filesystem:
-            // its read-only segments — the bulk of ld.so — fault in on first
-            // touch like the program's, instead of being read page-by-page
-            // into fresh frames inside execve. Writable segments stay eager
-            // (`demand_writable_segments = false`) so the kernel relocation
-            // pass below, which writes its targets through page-table
-            // translation, always finds them present. A registered
-            // interpreter has no file behind it and keeps the eager
-            // in-memory load.
+            // every segment — read-only text and writable data alike —
+            // faults in on first touch like the program's, instead of
+            // being read page-by-page into fresh frames inside execve.
+            // Nothing in the exec path writes interp pages before first
+            // touch any more: Linux never relocates any interpreter
+            // (ld.so relocates itself in bootstrap), so the kernel
+            // relocation pass that used to force writable segments eager
+            // is gone. A registered interpreter has no file behind it
+            // and keeps the eager in-memory load.
             //
             // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
             // interp_bias is a randomised user-range base well-separated from the
@@ -498,20 +507,34 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             // cannot collide with pages already mapped.
             // SAFETY: Valid memory or trusted environment
             let interp_entry = match interp_fs_owned.as_ref() {
-                // SAFETY: Live AS, well-separated `interp_bias` (argument
-                // above): the interp segments cannot collide with pages
-                // already mapped.
-                Some((_, ops)) => unsafe {
-                    load_elf_into_at_file(
-                        interp_bytes,
-                        &address_space,
-                        interp_bias,
-                        Some(ops),
-                        false,
-                    )
-                }?,
-                // SAFETY: As above.
-                None => unsafe { load_elf_into_at(interp_bytes, &address_space, interp_bias) }?,
+                Some((file, size)) => {
+                    let source = crate::handlers::ExecSource::File {
+                        ops: alloc::sync::Arc::clone(file),
+                        size: *size,
+                    };
+                    // SAFETY: Live AS, well-separated `interp_bias`
+                    // (argument above): the interp segments cannot collide
+                    // with pages already mapped; `source` is the resolved
+                    // interpreter file.
+                    unsafe {
+                        load_elf_into_at_file(
+                            &source,
+                            &address_space,
+                            interp_bias,
+                            Some(file),
+                            true,
+                        )
+                    }?
+                }
+                None => {
+                    let interp_bytes =
+                        registered.expect("registered interpreter present when no FS interpreter");
+                    // SAFETY: Live AS, well-separated `interp_bias`
+                    // (argument above): the interp segments cannot collide
+                    // with pages already mapped; `interp_bytes` is the
+                    // registered in-memory interpreter.
+                    unsafe { load_elf_into_at(interp_bytes, &address_space, interp_bias) }?
+                }
             };
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
             // we just appended interp regions and materialize is
@@ -520,14 +543,9 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
             unsafe { address_space.materialize() }
                 .map_err(|e| LoadBytesError::Load(crate::loader::LoadError::AddressSpace(e)))?;
 
-            // Re-parse so we can drive the interpreter's PT_DYNAMIC
-            // through the same relocation pass — the interpreter is
-            // typically an ET_DYN object with its own .rela.dyn that
-            // needs the interp_bias applied as the load offset.
-            let interp_image = crate::parse_elf(interp_bytes).map_err(LoadBytesError::Elf)?;
             let interp_file_identity = interp_fs_owned
                 .as_ref()
-                .map(|(_, file)| (file.inode_attrs().dev, file.ino()));
+                .map(|(file, _)| (file.inode_attrs().dev, file.ino()));
             loaded_mappings.extend(interp_image.segments.iter().map(|seg| {
                 segment_mapping(
                     seg,
@@ -536,30 +554,18 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
                     interp_file_identity,
                 )
             }));
-            // No kernel relocation pass for an IA-32 interpreter: Linux never
-            // relocates any interpreter (`ld.so` relocates itself), and i386
-            // uses `Elf32_Rel` whose addends live in the slots, so a second
-            // pass would add the load bias twice.
-            if !compat32 && !interp_image.dynamic.is_empty() {
-                // SAFETY: the interp's segments were just mapped + materialized
-                // at interp_bias above, so its PT_DYNAMIC relocation sites are
-                // walkable; interp_bias is the matching load offset to apply.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    // apply_relr = false: the interpreter self-relocates its
-                    // own DT_RELR in bootstrap (it has a correct AT_BASE). The
-                    // kernel applying it too would double the bias (RELR is
-                    // read-modify-write) and corrupt ld.so into a non-canonical
-                    // call target. RELATIVE (DT_RELA) is still applied.
-                    apply_relocations(
-                        interp_bytes,
-                        &interp_image,
-                        &address_space,
-                        interp_bias,
-                        false,
-                    )
-                }?;
-            }
+            // No kernel relocation pass for ANY interpreter, IA-32 or
+            // native: Linux never relocates any interpreter — ld.so
+            // relocates itself in bootstrap (musl `_dlstart`, glibc
+            // `_dl_start`) — and i386 uses `Elf32_Rel` whose addends
+            // live in the slots, so a second pass would add the load
+            // bias twice. The interpreter already self-relocates its
+            // own DT_RELR today (it has a correct AT_BASE); the kernel
+            // pass only ever added RELA on top, redundantly for the
+            // idempotent absolute writes and load-bearing only for the
+            // page walks and the eager-writable requirement it imposed.
+            // Entry is the interpreter's own entry at its load bias;
+            // AT_ENTRY still forwards the program's entry via auxv.
 
             entry = EntryPoint(VirtAddr::new(interp_entry));
             interp_loaded = true;
@@ -1377,10 +1383,9 @@ const AT_PLATFORM: u32 = 15;
 /// The interpreter must be an IA-32 image (`elf_check_arch` on
 /// `interp_elf_ex`); a 64-bit one is refused here, before anything maps.
 fn compat32_interp_bias(
-    interp_bytes: &[u8],
+    interp: &crate::ExecImage,
     address_space: &AddressSpace,
 ) -> Result<u64, ProcessLoadError> {
-    let interp = crate::parse_elf(interp_bytes).map_err(LoadBytesError::Elf)?;
     if !interp.is_compat32() {
         return Err(ProcessLoadError::Load(LoadBytesError::Elf(
             crate::ElfError::WrongMachine,

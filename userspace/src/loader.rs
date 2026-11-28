@@ -250,13 +250,14 @@ pub unsafe fn load_elf_into_at(
 ///
 /// `demand_writable_segments` selects whether writable segments may be
 /// demand-paged too. The program image passes `true`: nothing in the exec
-/// path writes its pages before first touch. The interpreter passes `false`:
-/// the kernel applies the interpreter's own `PT_DYNAMIC` relocations after
-/// the load, and that pass writes its targets through page-table translation
-/// (`user_vaddr_to_kernel_ptr`), which cannot fault a demand-paged page in —
-/// an absent writable page would fail the exec with `RelocTargetUnmapped`.
-/// Keeping the interpreter's writable segments eager while its (much larger)
-/// read-only text stays demand-paged preserves the relocation pass exactly.
+/// path writes its pages before first touch. The interpreter passes `true`
+/// as well, for the same reason: Linux never relocates any interpreter
+/// (ld.so relocates itself in bootstrap), so no kernel pass writes its
+/// targets through page-table translation any more. The parameter stays
+/// because a future caller that DOES write an image's pages before first
+/// touch must keep the segments it writes eager — translation cannot
+/// fault a demand-paged page in, and an absent writable page would fail
+/// the exec with `RelocTargetUnmapped`.
 ///
 /// The BSS suffix deliberately stays OUTSIDE the `FILE_DEMAND` region:
 /// `load_file_demand_page` reports no page past EOF, so a BSS page routed to
@@ -395,9 +396,10 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
                 && seg.file_size >= DEMAND_MIN_FILE_BYTES
                 && (seg.vaddr.wrapping_add(vaddr_bias) & 0xFFF) == (seg.file_off & 0xFFF)
                 // A caller that writes an image's pages before first touch
-                // (the interpreter's kernel relocation pass) must keep the
-                // segments it writes eager: translation cannot fault a
-                // demand-paged page in. See `load_elf_into_at_file`.
+                // must keep the segments it writes eager: translation cannot
+                // fault a demand-paged page in. No in-tree caller does
+                // today — the interpreter's kernel relocation pass, the
+                // only such writer, is gone. See `load_elf_into_at_file`.
                 && (demand_writable_segments
                     || !seg.flags.contains(crate::SegmentFlags::WRITE))
         })
