@@ -631,7 +631,9 @@ fn navi22_submit_validates_and_throttles() -> TestResult {
         validate(Ring::Gfx, VmRef { vmid: 0, ..vm() }, &[ib]),
         validate(Ring::Gfx, VmRef { vmid: 16, ..vm() }, &[ib]),
         validate(Ring::Gfx, vm(), &[]),
-        validate(Ring::Gfx, vm(), &[ib; MAX_IBS + 1]),
+        validate(Ring::Gfx, vm(), &alloc::vec![ib; MAX_IBS_GFX + 1]),
+        validate(Ring::Compute, vm(), &alloc::vec![ib; MAX_IBS_COMPUTE + 1]),
+        validate(Ring::Sdma(0), vm(), &alloc::vec![ib; MAX_IBS_SDMA + 1]),
         validate(
             Ring::Gfx,
             vm(),
@@ -660,7 +662,12 @@ fn navi22_submit_validates_and_throttles() -> TestResult {
             }],
         ),
     ];
-    if bad.iter().any(|r| *r != Err(Error::Invalid)) || validate(Ring::Gfx, vm(), &[ib]).is_err() {
+    if bad.iter().any(|r| *r != Err(Error::Invalid))
+        || validate(Ring::Gfx, vm(), &[ib]).is_err()
+        || validate(Ring::Gfx, vm(), &alloc::vec![ib; MAX_IBS_GFX]).is_err()
+        || validate(Ring::Compute, vm(), &alloc::vec![ib; MAX_IBS_COMPUTE]).is_err()
+        || validate(Ring::Sdma(0), vm(), &alloc::vec![ib; MAX_IBS_SDMA]).is_err()
+    {
         return TestResult::Fail("IB/VMID validation");
     }
     // A stalled CP: two submissions may be outstanding, the third is Busy
@@ -705,6 +712,157 @@ fn navi22_submit_validates_and_throttles() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_submit_validates_and_throttles
+);
+
+/// The per-ring IB caps are ring-space bounds, not just counts: a max-size
+/// frame must fit in one half of the 2048-dword ring, because two
+/// submissions may be outstanding per ring and the throttle only waits out
+/// the job two back. Worst case is every optional section on (pipeline
+/// sync, VM flush, PASID map, VM fence, first-IB cache sync), and for
+/// compute every IB flagged `RESET_GDS_MAX_WAVE_ID`. Each frame is encoded
+/// here at its cap and must fit the half, including commit padding to the
+/// ring's align mask — GFX 844, compute 940, SDMA 682 dwords before padding.
+fn navi22_submit_max_ib_frames_fit_one_ring_half() -> TestResult {
+    use crate::amdgpu_cp_navi22::RING_DW;
+    let layout = crate::amdgpu_cp_navi22::tests::layout();
+    let half = RING_DW / 2;
+    // GFX at 192 IBs, every optional section on.
+    let gfx_ib = Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+    };
+    let gfx_ibs = alloc::vec![gfx_ib; MAX_IBS_GFX];
+    let gfx = encode_cp(
+        layout,
+        &Frame {
+            gfx: true,
+            engine: 0,
+            sync: Some((0x1000, 5)),
+            flush: Some(vm()),
+            pasid_map: Some((0x10a0 + u32::from(VMID), PASID)),
+            vm_fence: Some((0x3000, 6)),
+            vmid: VMID,
+            context_switch: true,
+            gds_max_wave_id: None,
+            ibs: &gfx_ibs,
+            fence: 0x2000,
+            seq: 6,
+            wptr: 0,
+        },
+    );
+    // Compute at 125 IBs, every IB flagged for the GDS wave-id reset.
+    let compute_ib = Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC
+            | crate::amdgpu_uapi::AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID,
+    };
+    let compute_ibs = alloc::vec![compute_ib; MAX_IBS_COMPUTE];
+    let compute = encode_cp(
+        layout,
+        &Frame {
+            gfx: false,
+            engine: 4,
+            sync: Some((0x1000, 5)),
+            flush: Some(vm()),
+            pasid_map: Some((0x10a0 + u32::from(VMID), PASID)),
+            vm_fence: Some((0x3000, 6)),
+            vmid: VMID,
+            context_switch: true,
+            gds_max_wave_id: Some(1279),
+            ibs: &compute_ibs,
+            fence: 0x2000,
+            seq: 6,
+            wptr: 0,
+        },
+    );
+    // CP frames commit-pad to the 256-dword align mask; the padded frame is
+    // what the ring holds.
+    if gfx.len() as u64 > half
+        || compute.len() as u64 > half
+        || gfx.len().next_multiple_of(256) as u64 > half
+        || compute.len().next_multiple_of(256) as u64 > half
+    {
+        return TestResult::Fail("max-size CP frame overflows one ring half");
+    }
+    // SDMA at 49 IBs, every optional section on, at every wptr residue: the
+    // per-IB NOP pad depends on the absolute ring position.
+    let sdma_ib = Ib {
+        va: IB_VA,
+        dwords: 8,
+        flags: crate::amdgpu_uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+    };
+    let sdma_ibs = alloc::vec![sdma_ib; MAX_IBS_SDMA];
+    for wptr in 0..8u64 {
+        let sdma = encode_sdma(
+            layout,
+            &Frame {
+                gfx: false,
+                engine: 13,
+                sync: Some((0x1000, 5)),
+                flush: Some(vm()),
+                pasid_map: Some((0x10a0 + u32::from(VMID), PASID)),
+                vm_fence: Some((0x3000, 6)),
+                vmid: VMID,
+                context_switch: false,
+                gds_max_wave_id: None,
+                ibs: &sdma_ibs,
+                fence: 0x2000,
+                seq: 6,
+                wptr,
+            },
+        );
+        // SDMA commit pads to 16 dwords; the padded frame must fit the half.
+        if sdma.len() as u64 > half || sdma.len().next_multiple_of(16) as u64 > half {
+            return TestResult::Fail("max-size SDMA frame overflows one ring half");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_submit_max_ib_frames_fit_one_ring_half
+);
+
+/// A 192-IB GFX submission — twelve times the old 16-IB cap — is accepted
+/// and executes: every IB runs under the flushed VMID and the job fence
+/// signals. All IBs share one installed client IB (one WRITE_DATA), so the
+/// frame proves the submitter/ring path at the cap, not 192 distinct
+/// programs.
+fn navi22_submit_full_gfx_frame_executes() -> TestResult {
+    let (_pool, mut e) = gfx_engine();
+    let ib = install(&mut e.hw.io, false, 0x1234_5678);
+    let mut state = RingState::default();
+    let ibs = alloc::vec![ib; MAX_IBS_GFX];
+    let seq = match submit(
+        &mut e.hw,
+        &mut e.queue,
+        &mut state,
+        Ring::Gfx,
+        vm(),
+        1,
+        &ibs,
+    ) {
+        Ok(seq) => seq,
+        Err(_) => return TestResult::Fail("192-IB gfx submission refused"),
+    };
+    if run(wait_fence(&mut e.hw, &e.queue, seq)).is_err()
+        || e.hw.io.word(DST_MC) != 0x1234_5678
+        || e.hw.io.user_ibs.len() != MAX_IBS_GFX
+        || e.hw
+            .io
+            .user_ibs
+            .iter()
+            .any(|&(engine, vmid)| engine != 0 || vmid != VMID)
+    {
+        return TestResult::Fail("192-IB gfx submission did not execute every IB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_submit_full_gfx_frame_executes
 );
 
 fn navi22_submit_encodes_linux_vm_flush() -> TestResult {

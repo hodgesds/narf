@@ -4783,8 +4783,8 @@ share hardware ring 1) before dependency waits or placement. Media IPs additiona
 when their rings passed, HW_IP_COUNT(VCN_DEC/ENC) is `num_vcn_inst` (every
 discovered instance, harvested ones included) and JPEG 1. VIDEO_CAPS
 returns the Sienna Cichlid codec tables for the published harvest; MAX_IBS
-reports
-`amdgpu_navi22_submit::MAX_IBS` (16) for advertised rings.
+reports `amdgpu_navi22_submit::max_ibs` per ring (192 GFX, 125 compute, 49
+SDMA, 16 media) for advertised rings.
 
 `unsafe amdgpu_gfx10_topology::read(gpu, pci_cap)` requires exclusive GRBM
 selector ownership with RLC booted and GFX powered. It samples the NBIO
@@ -5167,9 +5167,9 @@ allow-list only for `GB_ADDR_CONFIG` (GC segment 0 + 0x13de, from the
 topology sample's `gb_addr_config`), with Linux's SE (< 4) / SH (< 2) /
 count (<= 128) checks and EFAULT for any other offset. `MAX_IBS` on an open
 of a card with a submitter reports `Submitter::max_ibs` for each IP type it
-runs (8 on Navi48, `MAX_JOB_IBS`; 16 on Navi22, `amdgpu_navi22_cs::ring_max_ibs`:
-`amdgpu_navi22_submit::MAX_IBS` for the kernel queues, `MEDIA_MAX_IBS` for
-VCN/JPEG) and 0 for the rest. A card backend must report at least two for a
+runs (8 on Navi48, `MAX_JOB_IBS`; on Navi22, `amdgpu_navi22_cs::ring_max_ibs`:
+per-ring `amdgpu_navi22_submit::max_ibs` — 192 GFX, 125 compute, 49 SDMA —
+for the kernel queues, `MEDIA_MAX_IBS` (16) for VCN/JPEG) and 0 for the rest. A card backend must report at least two for a
 ring it runs: Mesa's RADV spends one IB of each submission on its preamble, and
 with a bound of one it never fits a command buffer and resubmits forever.
 `DEV_INFO.gpu_counter_freq` is `Snapshot::reference_clock_10khz` times

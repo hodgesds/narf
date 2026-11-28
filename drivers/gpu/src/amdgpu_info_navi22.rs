@@ -666,12 +666,21 @@ fn video_caps(snap: &Snapshot, kind: u32) -> Result<Vec<u8>, FsError> {
 }
 
 /// `AMDGPU_INFO_MAX_IBS`: `u32[AMDGPU_HW_IP_NUM]`, the IBs one CS may carry
-/// per ring type; the native queues take `amdgpu_navi22_submit::MAX_IBS`.
+/// per ring type; the native queues take `amdgpu_navi22_submit::max_ibs`
+/// (192 GFX, 125 compute, 49 SDMA, 16 media).
 fn max_ibs(published: &Published, submission: Submission) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 * uapi::AMDGPU_HW_IP_NUM as usize);
     for ip in 0..uapi::AMDGPU_HW_IP_NUM {
         let n = if available_rings(published, submission, ip) != 0 {
-            crate::amdgpu_navi22_submit::MAX_IBS as u32
+            match ip {
+                uapi::AMDGPU_HW_IP_GFX => crate::amdgpu_navi22_submit::MAX_IBS_GFX as u32,
+                uapi::AMDGPU_HW_IP_COMPUTE => crate::amdgpu_navi22_submit::MAX_IBS_COMPUTE as u32,
+                uapi::AMDGPU_HW_IP_DMA => crate::amdgpu_navi22_submit::MAX_IBS_SDMA as u32,
+                uapi::AMDGPU_HW_IP_VCN_DEC
+                | uapi::AMDGPU_HW_IP_VCN_ENC
+                | uapi::AMDGPU_HW_IP_VCN_JPEG => crate::amdgpu_navi22_submit::MEDIA_MAX_IBS as u32,
+                _ => 0,
+            }
         } else {
             0
         };
