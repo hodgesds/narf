@@ -1665,6 +1665,13 @@ Userspace resolves procfs network table opens to the calling thread or named
 outer PID/TID and retains its network namespace for the open file. A named
 task that has exited cannot supply a new table view. The raw socket providers
 snapshot live AF_INET and AF_INET6 raw endpoints through weak references.
+`socket::{tcp4_loopback_snapshot_in,tcp6_loopback_snapshot_in}(net_ns_id)`
+snapshot local ring-backed TCP listeners and connected endpoints through that
+same weak registry, releasing the registry lock before inspecting sockets.
+Rows carry the socket UID, sockfs inode, endpoint names, state and receive
+queue. They exclude merely-bound streams and endpoints already represented
+by the network stack. Queued local children retain their connection's network
+namespace even when the connecting task has since changed namespaces.
 Multicast providers read per-device IPv4 and IPv6 membership counts keyed
 by network namespace and interface index.
 

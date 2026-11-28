@@ -90,6 +90,7 @@ struct Fake {
     sos: u32,
     smu_version: Option<u32>,
     mode1_status: u32,
+    mode1_drops_before_ack: bool,
     tos: u32,
     bootloader_polls: usize,
     memsize: u32,
@@ -113,6 +114,7 @@ impl Fake {
             sos: 0x0004_0021,
             smu_version: Some(0x003a_4f00),
             mode1_status: 1,
+            mode1_drops_before_ack: false,
             tos: READY,
             bootloader_polls: 3,
             memsize: 12 << 10,
@@ -198,6 +200,10 @@ impl Io for Fake {
         self.events.push(Event::Mp1(register, value));
         if register == MESSAGE {
             self.pending = Some(value);
+            if value == MODE1_RESET && self.mode1_drops_before_ack {
+                self.decoding = false;
+                self.reset = true;
+            }
         }
         if register == 0x76 {
             self.decoding = false;
@@ -381,6 +387,37 @@ fn reset_navi22_smu_mode1_follows_linux_order() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     reset_navi22_smu_mode1_follows_linux_order
+);
+
+/// A real mode1 reset can clear PCI decoding before the cooperative mailbox
+/// poll sees its acknowledgement. Restore PCI instead of stranding the card
+/// with unassigned BARs; a failed restore must still fail the recovery.
+fn reset_navi22_smu_restores_pci_when_ack_is_lost() -> TestResult {
+    for restore_error in [false, true] {
+        let mut e = engine(Fake {
+            mode1_drops_before_ack: true,
+            restore_error,
+            ..Fake::posted()
+        });
+        e.mode = Mode::Recovery;
+        let result = run(e.run());
+        if !e.io.events.contains(&Event::Restore) || e.io.stray != 1 {
+            return TestResult::Fail("reset did not restore PCI after the lost acknowledgement");
+        }
+        if restore_error {
+            if result != Err(Error::Pci) || e.state != State::Failed {
+                return TestResult::Fail("failed PCI restore was accepted as a successful reset");
+            }
+        } else if !matches!(result, Ok(Some(report)) if report.method == Method::Smu && report.post.ran)
+        {
+            return TestResult::Fail("lost reset acknowledgement prevented full recovery");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    reset_navi22_smu_restores_pci_when_ack_is_lost
 );
 
 fn reset_navi22_old_or_silent_pmfw_uses_psp_mode1() -> TestResult {

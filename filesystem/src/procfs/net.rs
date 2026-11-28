@@ -620,11 +620,37 @@ pub(crate) fn fmt_ipv6_raw(addr: [u8; 16]) -> String {
     s
 }
 
-/// One-line shared header used by /proc/net/{tcp,udp,raw,tcp6,udp6,raw6}.
+/// IPv4 socket-table header. IPv6 spells out `remote_address`; lsof checks
+/// that label before parsing any rows (Linux dialect, get_tcpudp6/get_raw6).
 /// Trailing newline included so the per-line emitter just writes
 /// the next line directly.
 const SOCK_HDR_LINE: &str =
     "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+const SOCK6_HDR_LINE: &str =
+    "  sl  local_address remote_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+/// Exercise the production table readers with cross-crate adapters before
+/// boot-smoke installs them. Restore the previous hooks for the next test.
+#[cfg(feature = "kernel-test")]
+pub fn __test_with_tcp_hooks<T>(
+    tcp: fn(u64) -> Vec<TcbSnapshot>,
+    tcp6: fn(u64) -> Vec<Tcb6Snapshot>,
+    test: impl FnOnce() -> T,
+) -> T {
+    struct Restore(usize, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TCP_HOOK.store(self.0, Ordering::Release);
+            TCP6_HOOK.store(self.1, Ordering::Release);
+        }
+    }
+    let _restore = Restore(
+        TCP_HOOK.swap(tcp as usize, Ordering::AcqRel),
+        TCP6_HOOK.swap(tcp6 as usize, Ordering::AcqRel),
+    );
+    test()
+}
 
 // ── ProcFile impls ──────────────────────────────────────────────
 
@@ -690,7 +716,7 @@ fn render_raw(namespace: u64) -> Vec<u8> {
 
 fn render_tcp6(namespace: u64) -> Vec<u8> {
     use core::fmt::Write as _;
-    let mut s = String::from(SOCK_HDR_LINE);
+    let mut s = String::from(SOCK6_HDR_LINE);
     for (i, tcb) in tcp6_snapshot(namespace).into_iter().enumerate() {
         let local = fmt_ipv6_port(tcb.local_addr, tcb.local_port);
         let remote = fmt_ipv6_port(tcb.remote_addr, tcb.remote_port);
@@ -715,7 +741,7 @@ fn render_tcp6(namespace: u64) -> Vec<u8> {
 
 fn render_udp6(namespace: u64) -> Vec<u8> {
     use core::fmt::Write as _;
-    let mut s = String::from(SOCK_HDR_LINE);
+    let mut s = String::from(SOCK6_HDR_LINE);
     for (i, u) in udp6_snapshot(namespace).into_iter().enumerate() {
         let local = fmt_ipv6_port(u.local_addr, u.local_port);
         let remote = fmt_ipv6_port(u.remote_addr, u.remote_port);
@@ -730,7 +756,7 @@ fn render_udp6(namespace: u64) -> Vec<u8> {
 
 fn render_raw6(namespace: u64) -> Vec<u8> {
     use core::fmt::Write as _;
-    let mut s = String::from(SOCK_HDR_LINE);
+    let mut s = String::from(SOCK6_HDR_LINE);
     for (i, r) in raw6_snapshot(namespace).into_iter().enumerate() {
         let local = fmt_ipv6_port(r.local_addr, u16::from(r.protocol));
         let remote = fmt_ipv6_port(r.remote_addr, 0);

@@ -1,5 +1,8 @@
 //! Per-crate kernel-test entries for `narf-userspace`.
 
+#[cfg(feature = "kernel-test")]
+pub(crate) mod proc_tcp;
+
 pub(crate) use alloc::sync::Arc;
 
 #[allow(unused_imports)]

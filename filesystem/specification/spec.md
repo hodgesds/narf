@@ -2202,6 +2202,11 @@ with whatever that file's `FileOps::show_fdinfo` writes — Linux's
 `procfs::current_process_id()` and `procfs::process_comm(pid)` expose the
 caller's process id and a process's name to drivers through the same hooks
 procfs reads them with.
+Process directories and their `fd`, `fdinfo`, `task`, `ns`, `attr`, and `net`
+subdirectories report the task's live UID/GID through the same identity hook
+as per-task files. Path metadata and open-directory metadata agree, including
+after a credential change. Static procfs directories retain root ownership.
+This ownership lets process inspectors such as `lsof` identify socket owners.
 For user namespaces, `/proc/<pid>/uid_map` and `gid_map` expose parent-to-child
 id ranges, while `setgroups` reads `allow` or `deny` and accepts the one-way
 `deny` transition before `gid_map` is installed. Their inode owners use the
@@ -2247,6 +2252,13 @@ columns of `/proc/net/{tcp,tcp6,udp,udp6}` are the owning socket's `sk_uid`
 `socket:[ino]`; a TCB that outlives its socket, and kernel-internal endpoints,
 report zero. `/proc/net/udp` lists user AF_INET datagram sockets alongside the
 kernel's own UDP endpoints.
+`tcp` and `tcp6` also include local ring-backed TCP listeners and connected
+endpoints in the selected namespace. Stack-backed listeners appear only once;
+unconnected or merely-bound streams are omitted. Ring receive queues report
+buffered bytes (pending connections for listeners), with no synthetic packet
+retransmission or timer values. Closing the socket removes its inode from the
+table. IPv6 socket table headers use Linux's `remote_address` label, including
+`tcp6`, `udp6`, and `raw6`, so lsof accepts their inode-bearing rows.
 `/proc/net/sockstat` and `sockstat6` expose Linux's line and field names and
 derive protocol in-use, TIME-WAIT, and allocation counts from the same
 namespace-scoped socket snapshots as the protocol tables.
