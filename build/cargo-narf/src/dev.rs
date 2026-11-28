@@ -442,9 +442,10 @@ enum Cmd {
     /// rather than the full boot flow.
     BootSmoke(BuildArgs),
     /// Cross-compile and boot the mounted /mnt rootfs's
-    /// `/lib/systemd/systemd` as REAL PID 1 (sets the `systemd_pid1`
-    /// kernel cmdline flag, which makes boot-init spawn the chroot
-    /// launcher as the first user task instead of NARF init/getty). The NICs
+    /// `/lib/systemd/systemd` as REAL PID 1 (sets
+    /// `init=/usr/lib/systemd/systemd` on the kernel cmdline, which makes
+    /// boot-init spawn the chroot launcher as the first user task instead of
+    /// NARF init/getty). The NICs
     /// come up down and unconfigured, as on Linux, for the distro's network
     /// manager to bring up and DHCP from QEMU's user-mode network.
     /// XTASK_SYSTEMD_PID1_NET_CHECK=1 instead builds with the static
@@ -463,7 +464,7 @@ enum Cmd {
     /// Boot a CachyOS-layout btrfs root (GPT ESP + `@` subvolumes, the
     /// host's fstab shape, real CachyOS systemd userspace) as an NVMe disk
     /// with the bare-metal cmdline (`root=UUID=… rootflags=subvol=/@
-    /// systemd_pid1 narf.disks=root-ro`) and wait for agetty's login prompt.
+    /// init=/usr/lib/systemd/systemd narf.disks=root-ro`) and wait for agetty's login prompt.
     /// Builds `target/narf-cachyos-root.img` unprivileged on first use (see
     /// `verification/data/cachyos-root/REGEN_cachyos_root_image.sh`).
     CachyosRootSmoke(cachyos_root::Args),
@@ -810,7 +811,7 @@ pub(crate) struct GrubImageArgs {
     /// the partition whose filesystem UUID is `--root-uuid` is written;
     /// every other disk and partition, its ESP included, stays read-only).
     /// Emits `narf.disks=<mode> root=UUID=<uuid> rootflags=<flags>
-    /// systemd_pid1`. Without it the default (`boot-only`) is unchanged.
+    /// init=/usr/lib/systemd/systemd`. Without it the default (`boot-only`) is unchanged.
     #[arg(
         long,
         value_enum,
@@ -973,9 +974,13 @@ fn grub_image_policy_cmdline(cmdline: &str, grub: &GrubImageArgs) -> Result<Stri
     let tokens = cmdline
         .split_whitespace()
         .chain(grub.cmdline_extra.iter().flat_map(|e| e.split_whitespace()));
-    if !tokens.clone().any(|arg| arg == "openrc_pid1") {
-        if !tokens.clone().any(|arg| arg == "systemd_pid1") {
-            tail.push_str(" systemd_pid1");
+    // The distro init is selected by init=: an explicit OpenRC init takes
+    // no systemd tokens; anything else (including no init= at all) boots
+    // systemd, and the generated systemd options follow it.
+    let init = tokens.clone().find(|arg| arg.starts_with("init="));
+    if init != Some("init=/sbin/openrc-init") {
+        if init.is_none() {
+            tail.push_str(" init=/usr/lib/systemd/systemd");
         }
         if !tokens.clone().any(|arg| arg.starts_with("systemd.zram=")) {
             tail.push(' ');
@@ -1148,7 +1153,7 @@ mod disk_policy_tests {
         assert_eq!(
             grub_image_cmdline("", &rw).unwrap(),
             format!(
-                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 systemd.zram=0 narf.bootlog={tok} console=ttyS0 console=tty0"
+                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ init=/usr/lib/systemd/systemd systemd.zram=0 narf.bootlog={tok} console=ttyS0 console=tty0"
             )
         );
         let plain = grub(&["--bootlog-token", tok]);
@@ -1177,7 +1182,7 @@ mod disk_policy_tests {
         assert_eq!(
             grub_image_cmdline("", &rw).unwrap(),
             format!(
-                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 systemd.zram=0 \
+                "narf.disks=root-rw root=UUID={UUID} rootflags=subvol=/@ init=/usr/lib/systemd/systemd systemd.zram=0 \
                  console=ttyS0 console=tty0"
             )
         );
@@ -1193,7 +1198,7 @@ mod disk_policy_tests {
             grub_image_cmdline("amdgpu.native_display=1", &ro).unwrap(),
             format!(
                 "amdgpu.native_display=1 narf.disks=root-ro root=UUID={UUID} \
-                 rootflags=subvol=/@,noatime systemd_pid1 systemd.zram=0 console=ttyS0 console=tty0"
+                 rootflags=subvol=/@,noatime init=/usr/lib/systemd/systemd systemd.zram=0 console=ttyS0 console=tty0"
             )
         );
         // No default change: without --root-policy the boot-only line stays.
@@ -1287,7 +1292,7 @@ mod disk_policy_tests {
         assert_eq!(
             grub_image_cmdline("", &ro).unwrap(),
             format!(
-                "narf.disks=root-ro root=UUID={UUID} rootflags=subvol=/@ systemd_pid1 \
+                "narf.disks=root-ro root=UUID={UUID} rootflags=subvol=/@ init=/usr/lib/systemd/systemd \
                  systemd.zram=0 narf.bootlog=0123456789abcdef systemd.unit=multi-user.target fsck.mode=skip \
                  console=ttyS0 console=tty0"
             )
@@ -1311,17 +1316,22 @@ mod disk_policy_tests {
             "systemd.zram=1",
         ]);
         let line = grub_image_cmdline("", &zram).unwrap();
-        assert!(line.contains(" systemd_pid1 systemd.zram=1"), "{line}");
+        assert!(
+            line.contains(" init=/usr/lib/systemd/systemd systemd.zram=1"),
+            "{line}"
+        );
         let openrc = grub(&[
             "--root-policy",
             "root-ro",
             "--root-uuid",
             UUID,
             "--cmdline-extra",
-            "openrc_pid1",
+            "init=/sbin/openrc-init",
         ]);
         let line = grub_image_cmdline("", &openrc).unwrap();
-        assert!(line.split_whitespace().any(|arg| arg == "openrc_pid1"));
+        assert!(line
+            .split_whitespace()
+            .any(|arg| arg == "init=/sbin/openrc-init"));
         assert!(!line.contains("systemd"));
         let plain = grub(&["--cmdline-extra", "quiet"]);
         assert_eq!(
@@ -2018,21 +2028,32 @@ mod systemd_marker_tests {
 
     #[test]
     fn systemd_pid1_cmdline_threads_flags_without_duplicates() {
-        assert_eq!(systemd_pid1_cmdline("", None), "systemd_pid1");
+        assert_eq!(
+            systemd_pid1_cmdline("", None),
+            "init=/usr/lib/systemd/systemd"
+        );
         assert_eq!(
             systemd_pid1_cmdline("console=ttyS0", None),
-            "console=ttyS0 systemd_pid1"
+            "console=ttyS0 init=/usr/lib/systemd/systemd"
         );
         // Caller already asked for PID 1 — don't double the token.
-        assert_eq!(systemd_pid1_cmdline("systemd_pid1", None), "systemd_pid1");
+        assert_eq!(
+            systemd_pid1_cmdline("init=/usr/lib/systemd/systemd", None),
+            "init=/usr/lib/systemd/systemd"
+        );
+        // An explicit OpenRC init is left alone — no systemd init= added.
+        assert_eq!(
+            systemd_pid1_cmdline("init=/sbin/openrc-init", None),
+            "init=/sbin/openrc-init"
+        );
         assert_eq!(
             systemd_pid1_cmdline("", Some(18080)),
-            "systemd_pid1 narf_net_check narf_net_check_port=18080"
+            "init=/usr/lib/systemd/systemd narf_net_check narf_net_check_port=18080"
         );
         // A caller-pinned port wins over the listener's.
         assert_eq!(
             systemd_pid1_cmdline("narf_net_check_port=7 narf_net_check", Some(18080)),
-            "narf_net_check_port=7 narf_net_check systemd_pid1"
+            "narf_net_check_port=7 narf_net_check init=/usr/lib/systemd/systemd"
         );
     }
 
@@ -7640,12 +7661,13 @@ fn wait_for_boot_smoke(
 }
 
 /// Boot the mounted /mnt rootfs's `/lib/systemd/systemd` as REAL PID 1.
-/// Sets the `systemd_pid1` kernel cmdline flag (boot-init then spawns the
-/// chroot launcher as the first user task, so systemd inherits PID 1 down
-/// the execve chain) and captures serial for a bounded window before
-/// killing QEMU — systemd as PID 1 never exits, so unlike `boot-smoke`
-/// there is no clean-shutdown to wait on. Requires a systemd rootfs disk
-/// at `target/narf-vblk.img` (built out-of-band; not committed).
+/// Threads `init=/usr/lib/systemd/systemd` onto the kernel cmdline
+/// (boot-init then spawns the chroot launcher as the first user task, so
+/// systemd inherits PID 1 down the execve chain) and captures serial for a
+/// bounded window before killing QEMU — systemd as PID 1 never exits, so
+/// unlike `boot-smoke` there is no clean-shutdown to wait on. Requires a
+/// systemd rootfs disk at `target/narf-vblk.img` (built out-of-band; not
+/// committed).
 fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
         bail!("cargo narf run systemd-pid1: only x86_64 is wired (aarch64 boot-init is a stub)");
@@ -7680,7 +7702,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         None
     };
 
-    // Thread `systemd_pid1` (and the opt-in net-check tokens) onto the
+    // Thread `init=/usr/lib/systemd/systemd` (and the opt-in net-check tokens) onto the
     // kernel cmdline (multiboot2 -append), preserving any caller-provided
     // XTASK_QEMU_APPEND. Set BEFORE qemu_args() runs — it reads
     // XTASK_QEMU_APPEND.
@@ -7882,16 +7904,17 @@ fn configure_distro_pid1_build(args: &mut BuildArgs, net_check: bool) {
     ensure_feature(&mut args.features, "container");
 }
 
-/// Thread `systemd_pid1` — and, for net-check runs, the `narf_net_check`
+/// Thread `init=/usr/lib/systemd/systemd` — and, for net-check runs, the `narf_net_check`
 /// gate flag plus its listener port — onto the kernel cmdline without
-/// duplicating tokens the caller already provided.
+/// duplicating tokens the caller already provided. A caller that already
+/// selected an init via `init=` (systemd or OpenRC) is left alone.
 fn systemd_pid1_cmdline(existing: &str, net_check_port: Option<u16>) -> String {
     let mut tokens: Vec<String> = existing
         .split_ascii_whitespace()
         .map(str::to_string)
         .collect();
-    if !tokens.iter().any(|t| t == "systemd_pid1") {
-        tokens.push("systemd_pid1".to_string());
+    if !tokens.iter().any(|t| t.starts_with("init=")) {
+        tokens.push("init=/usr/lib/systemd/systemd".to_string());
     }
     if let Some(port) = net_check_port {
         if !tokens.iter().any(|t| t == "narf_net_check") {
@@ -15359,7 +15382,7 @@ fn grub_image_cmd(grub: &GrubImageArgs) -> Result<()> {
 # The app must be trusted by the active Secure Boot policy (or Secure Boot must
 # be disabled); this bundle does not sign it.
 #
-# For a full Linux userspace root, append `root=PARTLABEL=NARF_ROOT systemd_pid1`
+# For a full Linux userspace root, append `root=PARTLABEL=NARF_ROOT init=/usr/lib/systemd/systemd`
 # to the BIOS `multiboot2` line and to esp/boot/limine/limine.conf's kernel_cmdline.
 menuentry "NARF" {
     if [ "${grub_platform}" = "efi" ]; then

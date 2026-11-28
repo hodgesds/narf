@@ -320,18 +320,18 @@ cargo narf build grub-image --arch=x86_64 \
 ```
 
 Each command emits `narf.disks=<mode> root=UUID=<uuid> rootflags=subvol=/@
-systemd_pid1 systemd.zram=0` (`--rootflags` changes the subvolume;
+init=/usr/lib/systemd/systemd systemd.zram=0` (`--rootflags` changes the subvolume;
 `systemd.zram=0` keeps zram-generator from creating swap units for a zram
 device NARF does not have), then
 `narf.bootlog=<token>` and the `--cmdline-extra` arguments. Without
 `--root-policy`, grub-image still writes `boot-only`.
 
 - `--root-policy` builds the systemd PID 1 kernel by itself: it adds the
-  features `boot-init` (honours `systemd_pid1`), `cgroup-all` (a real
+  features `boot-init` (honours `init=`), `cgroup-all` (a real
   cgroup2 `/sys/fs/cgroup`, which systemd requires), `container` (namespaces
   for unit sandboxing) and `firmware-allow-unsigned`, the same set
   `systemd-pid1`, `cachyos-root-smoke` and `cachyos-gate` use. A bundle built
-  without them boots NARF's own userspace and ignores `systemd_pid1`. Passing
+  without them boots NARF's own userspace and ignores `init=`. Passing
   them explicitly with `--features boot-init,cgroup-all,container,firmware-allow-unsigned`
   is equivalent.
 - Add `--initramfs-firmware "<device-firmware-pattern>"` when an installed
@@ -500,10 +500,10 @@ partition by its own identity
 ```sh
 cargo narf build efi-image --output target/narf-root-ro.efi \
   --cmdline "narf.disks=root-ro root=UUID=<LUKS_UUID> rd.luks.uuid=<LUKS_UUID> \
-rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
+rd.luks.prompt=console init=/usr/lib/systemd/systemd systemd.zram=0 systemd.unit=multi-user.target"
 ```
 
-`systemd_pid1` on the command line selects the systemd PID 1 kernel build, as
+`init=/usr/lib/systemd/systemd` on the command line selects the systemd PID 1 kernel build, as
 `--root-policy` does for `grub-image`.
 
 #### An ext4 root, read-write
@@ -514,7 +514,7 @@ LUKS-unlocked root above included:
 ```sh
 cargo narf build efi-image --output target/narf-root-rw.efi \
   --cmdline "narf.disks=root-rw root=UUID=<LUKS_UUID> rd.luks.uuid=<LUKS_UUID> \
-rd.luks.prompt=console systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target"
+rd.luks.prompt=console init=/usr/lib/systemd/systemd systemd.zram=0 systemd.unit=multi-user.target"
 ```
 
 - **Journaled, as Linux.** On a root with a journal (the CachyOS default),
@@ -910,7 +910,7 @@ cargo narf pkg package --version 0.5.0 --skip-build \
   --limine-efi /usr/share/limine/BOOTX64.EFI
 ```
 
-`boot-init` enables `systemd_pid1`; the cgroup and namespace features support
+`boot-init` enables `init=`; the cgroup and namespace features support
 the distro's systemd services. Do not package the canonical artifact left
 by a kernel-test run. The normal package build serves NARF's built-in
 userspace and does not enable these installed-root features automatically.
@@ -996,7 +996,7 @@ The gate passes `--bootlog-token <token>`. The resulting command line is
 printed in the `topology` row, for example:
 
 ```
-narf.disks=root-rw root=UUID=<fsid> rootflags=subvol=/@ systemd_pid1 systemd.zram=0 narf.bootlog=gate...
+narf.disks=root-rw root=UUID=<fsid> rootflags=subvol=/@ init=/usr/lib/systemd/systemd systemd.zram=0 narf.bootlog=gate...
 ```
 
 Each boot logs in on the serial console (`root` / `narf`, the image's test
@@ -1182,13 +1182,13 @@ must match the installed devices.
 First trial, read-only:
 
 ```text
-narf.disks=root-ro root=UUID=<ROOT_UUID> rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
+narf.disks=root-ro root=UUID=<ROOT_UUID> rootflags=subvol=/@ init=/usr/lib/systemd/systemd systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
 Read-write, after the root-ro trial worked:
 
 ```text
-narf.disks=root-rw root=UUID=<ROOT_UUID> rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
+narf.disks=root-rw root=UUID=<ROOT_UUID> rootflags=subvol=/@ init=/usr/lib/systemd/systemd systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
 `cargo narf build grub-image --root-policy root-ro|root-rw --root-uuid <uuid>

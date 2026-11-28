@@ -42,7 +42,7 @@ pub use info::{validate_memory_map, BootError, BootInfo, MemRegion, MemRegionKin
 /// that is the one place the tokenizing and key/value rules live.
 ///
 /// Recognized tokens today (see the module docs on [`args`]): `safe_mode`,
-/// `stop_at=<stage>`, `nosmp`, `root=<spec>`, `systemd_pid1`, `no_redis`,
+/// `stop_at=<stage>`, `nosmp`, `root=<spec>`, `init=<path>`, `no_redis`,
 /// `hugepages_2m=N`, `hugepages_1g=N`, `mt_echo_threads=N`,
 /// `rcu_stall_panic`, plus feature-gated `trace_comm=`, `test_subsystem=`,
 /// `test_subsystem_exclude=`, `bpf_bench[_n]`, `bpf_fuzz_{n,seed,trace}`.
@@ -58,7 +58,7 @@ pub fn cmdline() -> &'static str {
 /// parser. This is the entry point every in-kernel consumer should use:
 ///
 /// ```ignore
-/// if narf_boot::args().has_flag("systemd_pid1") { /* ... */ }
+/// if narf_boot::args().has_flag("nosmp") { /* ... */ }
 /// let comm = narf_boot::args().value("trace_comm");
 /// ```
 ///

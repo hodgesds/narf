@@ -2147,7 +2147,7 @@ kernel_test_in!(
 
 /// The bare-metal CachyOS command line.
 const CACHYOS_CMDLINE: &str = "root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 \
-     rootflags=subvol=/@ systemd_pid1 narf.disks=root-ro";
+     rootflags=subvol=/@ init=/usr/lib/systemd/systemd narf.disks=root-ro";
 
 fn smoke_root_spec_parses_cachyos_cmdline() -> TestResult {
     use crate::root_selector::{BtrfsSubvol, RootAccess, RootSelector, RootSpec};
@@ -2253,7 +2253,7 @@ fn smoke_root_plan_follows_disk_policy() -> TestResult {
     }
     let p = plan_root(DiskPolicy::RootRo, false, &spec);
     if !p.read_only || p.tmpfs_overlay {
-        return TestResult::Fail("root-ro without systemd_pid1: plain read-only root");
+        return TestResult::Fail("root-ro without a distro init: plain read-only root");
     }
     // root-rw: the real root, writable, no overlay ...
     let p = plan_root(DiskPolicy::RootRw, true, &spec);
@@ -2271,7 +2271,7 @@ fn smoke_root_plan_follows_disk_policy() -> TestResult {
     if p.read_only || !p.tmpfs_overlay || p.designate {
         return TestResult::Fail("narf.disks=all keeps the selected-root tmpfs overlay");
     }
-    let none = RootSpec::from_cmdline("systemd_pid1");
+    let none = RootSpec::from_cmdline("init=/usr/lib/systemd/systemd");
     let p = plan_root(DiskPolicy::RootRo, true, &none);
     if p.designate || p.flags.is_some() {
         return TestResult::Fail("no root= means nothing to designate");

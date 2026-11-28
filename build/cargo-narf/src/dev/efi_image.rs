@@ -88,11 +88,12 @@ impl Args {
             build.features = without_kernel_test_features(&build.features);
             ensure_feature(&mut build.features, "boot-smoke");
         }
-        if self
-            .cmdline
-            .split_ascii_whitespace()
-            .any(|arg| matches!(arg, "openrc_pid1" | "systemd_pid1"))
-        {
+        if self.cmdline.split_ascii_whitespace().any(|arg| {
+            matches!(
+                arg,
+                "init=/sbin/openrc-init" | "init=/usr/lib/systemd/systemd"
+            )
+        }) {
             configure_distro_pid1_build(&mut build, false);
         } else {
             ensure_feature(&mut build.features, "boot-init");
@@ -370,9 +371,11 @@ mod tests {
     #[test]
     fn efi_distro_init_selects_native_cgroups_and_namespaces() {
         for (cmdline, distro) in [
-            ("rw openrc_pid1", true),
-            ("systemd_pid1 quiet", true),
+            ("rw init=/sbin/openrc-init", true),
+            ("init=/usr/lib/systemd/systemd quiet", true),
             ("openrc_pid1=0", false),
+            ("systemd_pid1", false),
+            ("openrc_pid1", false),
             ("init=openrc_pid1", false),
             ("narf.disks=boot-only", false),
         ] {

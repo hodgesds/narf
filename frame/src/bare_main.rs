@@ -6993,7 +6993,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
                 if narf_userspace::process::resolve_exec_file(path).is_none() {
                     let _ = writeln!(
                         console::Writer,
-                        "  boot-init: systemd_pid1 requested but {path} is unavailable"
+                        "  boot-init: init=/usr/lib/systemd/systemd requested but {path} is unavailable"
                     );
                 } else {
                     spawn_rooted_pid1("systemd", path, "/mnt", env);
