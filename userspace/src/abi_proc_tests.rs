@@ -264,6 +264,66 @@ fn smoke_abi_proc_pgid_cache_tracks_outer_id() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_pgid_cache_tracks_outer_id);
 
+/// The fused `job_control_fork` inherits all three job-control rows in one
+/// call: process group, session, and controlling terminal. It must copy
+/// exactly what the three separate calls copied — the group's cached outer
+/// id, the session id (the parent's own id when it never setsid'd), and an
+/// explicitly recorded controlling tty.
+fn smoke_abi_proc_job_control_fork_copies_all_three() -> TestResult {
+    with_setup(|| {
+        const LEADER_TASK: u64 = 0x6A10_0011;
+        const LEADER_PID: u64 = 0x6A20_0011;
+        const MEMBER_TASK: u64 = 0x6A10_0012;
+        const MEMBER_PID: u64 = 0x6A20_0012;
+
+        crate::handlers::__test_pgid_reset();
+        crate::handlers::__test_sid_reset();
+        crate::handlers::__test_ctty_reset();
+        crate::task::release_task(LEADER_TASK);
+        crate::task::release_task(MEMBER_TASK);
+        let _ = crate::task::Task::new_registered(LEADER_TASK, LEADER_PID);
+        let _ = crate::task::Task::new_registered(MEMBER_TASK, MEMBER_PID);
+        crate::handlers::register_pid_task_mapping(LEADER_PID, LEADER_TASK);
+        crate::handlers::register_pid_task_mapping(MEMBER_PID, MEMBER_TASK);
+        crate::handlers::register_task_to_pid(LEADER_TASK, LEADER_PID);
+        crate::handlers::register_task_to_pid(MEMBER_TASK, MEMBER_PID);
+
+        crate::handlers::__test_set_pgid(LEADER_TASK, LEADER_TASK);
+        crate::handlers::set_controlling_tty_console(LEADER_TASK);
+        crate::handlers::job_control_fork(LEADER_TASK, MEMBER_TASK);
+
+        let result = (|| {
+            let inherited = crate::task::__test_cached_process_group(MEMBER_TASK);
+            if inherited != Some((LEADER_TASK, LEADER_PID)) {
+                return Err("fused job_control_fork did not cache the inherited pgrp");
+            }
+            // Session: the leader never setsid'd, so its sid is its own id;
+            // the child must read back the leader's visible pid.
+            set_task(MEMBER_TASK);
+            let sid = call(Syscall::Getsid.raw(), a0(0));
+            set_task(FAKE_TASK);
+            match sid {
+                Some(v) if v as u64 == LEADER_PID => {}
+                Some(_) => return Err("fused job_control_fork did not inherit the session"),
+                None => return Err("getsid returned a non-Ok status"),
+            }
+            let parent_ctty = crate::handlers::ctty_for(LEADER_TASK);
+            let child_ctty = crate::handlers::ctty_for(MEMBER_TASK);
+            if parent_ctty.is_none() || child_ctty != parent_ctty {
+                return Err("fused job_control_fork did not inherit the controlling tty");
+            }
+            Ok(())
+        })();
+        crate::task::release_task(LEADER_TASK);
+        crate::task::release_task(MEMBER_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_job_control_fork_copies_all_three
+);
+
 // ── setpgid(2) error ladder — kernel/sys.c::SYSCALL_DEFINE2(setpgid) ──
 //
 // This handler used to validate NOTHING: it translated both arguments and

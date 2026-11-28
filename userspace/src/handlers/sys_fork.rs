@@ -49,6 +49,13 @@ fn parent_rotated_cpu(
 /// while a per-parent cursor prevents helper forks made by one child from
 /// consuming another parent's placement sequence. This is shared by `fork(2)`
 /// and process-creating `clone(2)`/`clone3(2)`; pthread siblings remain local.
+///
+/// The rotation only supplies the *preferred* CPU. Placement itself goes
+/// through `select_fork_cpu_prefer_current`, which keeps the child on the
+/// parent's CPU when nothing but the forking parent is queued there (the
+/// fork+wait shape: the parent is about to park, so the child is not
+/// queueing behind runnable work) and still spreads to an idle CPU when the
+/// parent CPU has other queued work.
 pub(super) fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler::CpuId> {
     let candidates = allowed.intersection(narf_scheduler::online_cpu_set()).bits();
     let current_cpu = narf_lib::percpu::current_cpu() as u32;
@@ -59,7 +66,7 @@ pub(super) fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler
         None => round_robin_cpu(candidates, NEXT_FORK_CPU.fetch_add(1, Ordering::Relaxed)),
     };
     let preferred = rotated.unwrap_or(narf_scheduler::CpuId(current_cpu));
-    narf_scheduler::select_fork_cpu(allowed, preferred).or(rotated)
+    narf_scheduler::select_fork_cpu_prefer_current(allowed, preferred).or(rotated)
 }
 
 /// Boot trace: the first few forks print the child's allowed CPUs and
@@ -391,13 +398,11 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     prctl_fork(parent_pid, child_tid.raw());
     crate::seccomp::fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
-    // `copy_process` duplicates the task mempolicy for every child.
-    crate::handlers::mempolicy_fork(parent_pid, child_tid.raw());
-    // The interleave cursor rides along in the task_struct copy.
-    crate::handlers::interleave_index_fork(parent_pid, child_tid.raw());
-    // Only pacing is seeded: the scan position lives with the address
-    // space, and fork(2)'s new one starts at the floor by construction.
-    crate::handlers::numa_balance_fork(parent_pid, child_tid.raw());
+    // `copy_process` duplicates the task mempolicy for every child, and
+    // carries the interleave cursor and the NUMA-balancing pacing with it.
+    // One fused call: a single mempolicy gate check, then one pass over the
+    // three NUMA tables instead of three separate gate checks + table ops.
+    crate::handlers::numa_fork(parent_pid, child_tid.raw());
     // brk is inherited by `clone_for_fork` (it's address-space state), not copied
     // per-task.
     sigaction_fork(parent_pid, child_tid.raw());
@@ -405,9 +410,10 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     // POSIX: inherit the parent's process group, session, and controlling
     // terminal. pgid inheritance keeps a forked foreground job in the
     // terminal's foreground pgrp (no spurious SIGTTIN on its first read).
-    pgid_fork(parent_pid, child_tid.raw());
-    sid_fork(parent_pid, child_tid.raw());
-    ctty_fork(parent_pid, child_tid.raw());
+    // One fused call: one pass over the three job-control tables, with the
+    // session and ctty rows read and written under a single lock each
+    // instead of two acquisitions apiece.
+    job_control_fork(parent_pid, child_tid.raw());
     // Mount namespaces are implemented by the Linux-compat layer itself, not
     // by the optional container feature. A child always shares its parent's
     // current mount namespace until it explicitly unshares a new one.
