@@ -771,6 +771,35 @@ Remainders: rtl8125/8126/8127 are still unwired (§3.2), and
 path — uncited in-tree, so it stays capped at the 9000 family
 envelope.
 
+### Wired module bring-up (RTL8125B / ConnectX-3)
+
+`narf-drivers-net-realtek` and `narf-drivers-net-mlx4` expose
+`register() -> i32`; module initialization propagates errors. Both compile
+shared hardware engines in `--no-default-features --features module`, using
+`drivers/net/module_platform.rs` for the device KABI. Their module-only
+facade features are `rtl8125-module-only` and `mlx4-module-only`; these
+suppress the respective built-in PCI registrations while retaining shared
+code. Module packet contracts are Ethernet frames with software TX
+checksums, MTU 1500, one polled queue per device, device-context TX callbacks
+and copied RX delivery. Carrier uses `narf_netif_set_link`, independently of
+administrative UP state.
+
+The Realtek module currently accepts RTL8125B XID 0x641 only. Its MAC/EPHY
+sequence follows Linux MAC_VER_63, programs DMA rings before enabling
+TX/RX, and bounds reset/PHY waits. Firmware must successfully load and
+execute before TX or carrier is enabled. Module registry lookup retries
+for at most 60 seconds; reads span 64 KiB chunks without a fixed total-size
+buffer. PHY bytecode parsing uses fallible allocation; execution validates
+jumps and has both a 30-second deadline and a finite instruction budget.
+Firmware failure stops setup and restores the software page selector.
+
+ConnectX-3 uses onboard flash firmware plus paged host context memory,
+not an external firmware file; see [mlx4](mlx4.md) for command and memory
+lifetime limits. These changes establish module packet paths and bounded
+software failures, not silicon qualification. Native module models and
+QEMU image loading are separate checks; cold boot, link negotiation,
+ARP/DHCP and bidirectional TCP/UDP on both physical ports remain required.
+
 ## 4. Invariants & safety properties
 
 - Received frames are placed into buffers the driver domain *owns*; no

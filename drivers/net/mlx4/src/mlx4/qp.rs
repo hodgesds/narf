@@ -27,7 +27,7 @@
 //! | 0x25   | u8      | sched_queue      | 0x83 | ((port-1)<<6)            |
 //! | 0x5c   | BE u32  | cqn_send         | send CQ number                   |
 //! | 0x7c   | BE u32  | cqn_recv         | receive CQ number                |
-//! | 0x80   | BE u64  | db_rec_addr      | DMA addr of doorbell record <<2  |
+//! | 0x80   | BE u64  | db_rec_addr      | DMA addr of receive doorbell  |
 //! | 0xa8   | u8      | log_page_size    | log2 of backing-page size        |
 //! | 0xab   | u8      | mtt_base_addr_h  | bits [39:32] of MTT base         |
 //! | 0xac   | BE u32  | mtt_base_addr_l  | bits [31:0] of MTT base          |
@@ -66,8 +66,7 @@ pub struct QpEthParams {
     pub log_sq_stride: u8,
     /// 1-based port number (1 or 2 on dual-port ConnectX-3).
     pub port: u8,
-    /// DMA address of the QP doorbell record page (shifted left 2 by HW
-    /// convention; `build_qp_context` applies the shift).
+    /// DMA address of the receive producer doorbell record (unshifted).
     pub db_rec_addr: u64,
 }
 
@@ -116,8 +115,11 @@ pub fn build_qp_context(p: &QpEthParams) -> [u8; QP_CONTEXT_LEN] {
     put_be32(&mut b, 0x5c, p.cqn_send);
     put_be32(&mut b, 0x7c, p.cqn_recv);
 
-    // db_rec_addr @0x80: DMA address of the doorbell record, shifted left 2.
-    put_be64(&mut b, 0x80, p.db_rec_addr << 2);
+    // db_rec_addr @0x80: DMA address of the receive doorbell record (Linux en_rx).
+    put_be64(&mut b, 0x80, p.db_rec_addr);
+
+    // Preserve VLAN headers: module RX delivers complete Ethernet frames.
+    put_be32(&mut b, 0xa0, 1 << 30);
 
     // log_page_size @0xa8.
     put_u8(&mut b, 0xa8, p.log_page_size);

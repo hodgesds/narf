@@ -12,21 +12,19 @@
 
 use narf_driver_macros::narf_driver;
 
-#[cfg(feature = "builtin")]
+#[path = "../../module_platform.rs"]
+pub(crate) mod platform;
+
 extern crate alloc;
 
 #[cfg(feature = "builtin")]
 pub use narf_drivers_net_core::*;
 
-#[cfg(feature = "builtin")]
 pub mod features;
-#[cfg(feature = "builtin")]
 pub mod phy_access;
-#[cfg(feature = "builtin")]
 pub mod pm;
 #[cfg(feature = "builtin")]
 pub mod r8169;
-#[cfg(feature = "builtin")]
 pub mod rtl8125;
 #[cfg(feature = "builtin")]
 pub mod rtl8126;
@@ -46,23 +44,26 @@ narf_driver! {
         author: "narf",
         description: "Realtek r8169/RTL8125/RTL8126/RTL8127 NIC family",
         target_domain: "net",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write,Firmware:Read",
     },
-    register: do_register,
+    register: do_register => i32,
 }
 
 /// Register every driver in the family. The facade calls this once from its
 /// `Stage::Subsys` initcall (replacing the four per-driver initcalls).
 #[cfg(feature = "builtin")]
-fn do_register() {
+fn do_register() -> i32 {
     r8169::register_pci_driver();
+    #[cfg(not(feature = "rtl8125-module-only"))]
     rtl8125::register_pci_driver();
     rtl8126::register_pci_driver();
     rtl8127::register_pci_driver();
+    0
 }
 
 #[cfg(feature = "module")]
-fn do_register() {
-    module_probe::register();
+fn do_register() -> i32 {
+    module_probe::register()
 }
 
 /// The RTL8127 late PHY-firmware pass. Kept out of [`register`] because it must
@@ -86,3 +87,11 @@ pub fn configure_rtl8125_phy_late() {
 pub fn configure_rtl8126_phy_late() {
     rtl8126::configure_phy_late();
 }
+
+#[cfg(all(test, feature = "module"))]
+extern crate std;
+#[cfg(all(test, feature = "module"))]
+#[path = "../../module_test_support.rs"]
+mod module_test_support;
+#[cfg(all(test, feature = "module"))]
+mod module_tests;

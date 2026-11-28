@@ -1101,6 +1101,19 @@ kernel_abi! {
         }
     }
 
+    /// Publish physical carrier for this module's own device and ifindex.
+    /// Administrative IFF_UP is unchanged. `carrier` must be 0 or 1.
+    ///
+    /// # Safety
+    /// The caller must use its module execution context. The kernel validates
+    /// device/interface ownership and rejects invalid carrier values.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_netif_set_link(dev: u64, ifindex: u32, carrier: u32) -> i32 {
+        if carrier > 1 { return -22; }
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_netif_set_link(owner, dev, ifindex, carrier != 0)
+    }
+
     /// Deliver one copied Ethernet frame from a module RX ring into the kernel
     /// stack. The stack may rewrite bytes in place for XDP before the call
     /// returns; the module retains ownership of the backing storage.

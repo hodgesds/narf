@@ -14,21 +14,59 @@
 //! validated on ConnectX-3 silicon at boot (QEMU emulates no mlx4
 //! device).
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{fence, Ordering};
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use crate::platform::{map_bar, BusDevice, MmioRegion};
+use core::mem::ManuallyDrop;
+
+// Firmware can retain these addresses after any command, including a timeout.
+// Releasing them requires a device reset/drain proof that this driver does not
+// yet have. Pin both built-in and module DMA; only completed mailboxes free.
+struct DmaBuffer(ManuallyDrop<crate::platform::DmaBuffer>);
+impl core::ops::Deref for DmaBuffer {
+    type Target = crate::platform::DmaBuffer;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+fn alloc_dma(device: &BusDevice, len: usize) -> Result<DmaBuffer, ()> {
+    crate::platform::alloc_dma(device, len).map(|b| DmaBuffer(ManuallyDrop::new(b)))
+}
+impl DmaBuffer {
+    fn free_completed(self) {
+        let buffer = ManuallyDrop::into_inner(self.0);
+        #[cfg(feature = "builtin")]
+        drop(buffer);
+        #[cfg(feature = "module")]
+        buffer.free_completed();
+    }
+}
+#[cfg(feature = "builtin")]
+use narf_bus::BusDeviceCap;
+#[cfg(feature = "builtin")]
 use narf_capabilities::{Cap, Write};
-use narf_io::{alloc_coherent, DmaBuffer};
+#[cfg(feature = "builtin")]
+use narf_io::alloc_coherent;
+#[cfg(feature = "builtin")]
 use narf_ipc::{channel, Consumer, Producer};
+#[cfg(feature = "builtin")]
 use narf_lib::id::DomainId;
+#[cfg(feature = "builtin")]
 use narf_lib::sync::IrqSafeSpinLock;
+#[cfg(feature = "builtin")]
 use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
+#[cfg(feature = "module")]
+use crate::platform::{
+    console as narf_console, scheduler as narf_scheduler, time as narf_time,
+    Lock as IrqSafeSpinLock,
+};
 use cmd::CmdOp;
 
+#[cfg(feature = "builtin")]
 mod tests;
 
 pub mod bit_field;
@@ -43,6 +81,22 @@ pub mod qp;
 pub mod wire;
 pub mod wqe;
 
+// Try-only gates prevent nested pumps and concurrent callers from posting
+// WQEs out of order or consuming the same CQE twice. Never wait on a gate.
+struct Busy<'a>(&'a core::sync::atomic::AtomicBool);
+impl<'a> Busy<'a> {
+    fn enter(flag: &'a core::sync::atomic::AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 // ── PCI device IDs ──────────────────────────────────────────────────
 
 /// Vendor: Mellanox (now NVIDIA Networking).
@@ -52,6 +106,7 @@ pub const MLX4_DEV_CX3: u16 = 0x1003;
 /// ConnectX-3 Pro (MT27520).
 pub const MLX4_DEV_CX3_PRO: u16 = 0x1007;
 
+#[cfg(feature = "builtin")]
 const ALL_DEV_IDS: &[u16] = &[MLX4_DEV_CX3, MLX4_DEV_CX3_PRO];
 
 // ── Tunables ────────────────────────────────────────────────────────
@@ -79,10 +134,13 @@ const LOG_RQ_STRIDE: u8 = 4;
 const RX_SLOT_LEN: usize = 2048;
 const TX_SLOT_LEN: usize = 2048;
 /// RX poll interval when no completions are pending.
+#[cfg(feature = "builtin")]
 const RX_POLL_INTERVAL_NS: u64 = 1_000_000;
 /// CQEs drained per RX pump pass.
+#[cfg(feature = "builtin")]
 const RX_DRAIN_BUDGET: usize = 64;
 /// TX slot-exhaustion retry budget before dropping a frame.
+#[cfg(feature = "builtin")]
 const TX_RETRY_MAX: u32 = 100;
 /// Default Ethernet MTU.
 const DEFAULT_MTU: u32 = 1500;
@@ -207,6 +265,13 @@ impl DatapathState {
 // ── The controller ──────────────────────────────────────────────────
 
 pub struct Mlx4Eth {
+    device: BusDevice,
+    bringup_deadline: Option<narf_time::Deadline>,
+    command_failed: core::sync::atomic::AtomicBool,
+    command_busy: core::sync::atomic::AtomicBool,
+    tx_busy: core::sync::atomic::AtomicBool,
+    drain_busy: core::sync::atomic::AtomicBool,
+    next_link_poll: IrqSafeSpinLock<Option<narf_time::Deadline>>,
     /// BAR0 — init registers, HCR, clear-int.
     mmio: MmioRegion,
     /// BAR2 — UAR doorbell region.
@@ -225,14 +290,19 @@ pub struct Mlx4Eth {
     /// BAR2 UAR page index the driver rings its doorbells through — the
     /// first page past the firmware-reserved UARs (`QUERY_DEV_CAP`).
     uar_index: u32,
+    #[cfg(feature = "builtin")]
     pub addr: narf_bus::BusAddr,
     nic_state: IrqSafeSpinLock<NicCachedState>,
     datapath: IrqSafeSpinLock<Option<DatapathState>>,
 
     // IPC integration (mlx5's shape).
+    #[cfg(feature = "builtin")]
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    #[cfg(feature = "builtin")]
     pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    #[cfg(feature = "builtin")]
     rx_ipc_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
+    #[cfg(feature = "builtin")]
     ifname: crate::publish::IfName,
 }
 
@@ -258,13 +328,14 @@ impl core::fmt::Debug for Mlx4Eth {
                 ),
             )
             .field("num_ports", &self.dev_cap.num_ports)
-            .field("addr", &self.addr)
+            .field("device", &self.device)
             .finish_non_exhaustive()
     }
 }
 
 impl Mlx4Eth {
     /// The published interface name, or `""` before probe published one.
+    #[cfg(feature = "builtin")]
     pub fn ifname(&self) -> &'static str {
         self.ifname.get()
     }
@@ -278,8 +349,7 @@ impl Mlx4Eth {
 
     /// Allocate a zeroed 4-KiB DMA command mailbox.
     fn alloc_mailbox(&self) -> Result<DmaBuffer, Mlx4Error> {
-        let mb = alloc_coherent(cmd::MAILBOX_SIZE, DomainId::DRIVER_0)
-            .map_err(|_| Mlx4Error::NoMemory)?;
+        let mb = alloc_dma(&self.device, cmd::MAILBOX_SIZE).map_err(|_| Mlx4Error::NoMemory)?;
         // SAFETY: freshly-allocated coherent DMA exclusively ours.
         unsafe {
             core::ptr::write_bytes(mb.cpu_mut_ptr_at::<u8>(0), 0, cmd::MAILBOX_SIZE);
@@ -316,12 +386,46 @@ impl Mlx4Eth {
         out_param: u64,
         out_is_imm: bool,
     ) -> Result<u64, Mlx4Error> {
-        // Wait for any prior command's GO bit to clear.
+        use core::fmt::Write as _;
+        if self.command_failed.load(Ordering::Acquire)
+            || self.bringup_deadline.is_some_and(|d| d.expired())
+        {
+            return Err(Mlx4Error::CmdTimeout);
+        }
+        if self
+            .command_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Mlx4Error::Other("command already in progress"));
+        }
+        struct Busy<'a>(&'a core::sync::atomic::AtomicBool);
+        impl Drop for Busy<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = Busy(&self.command_busy);
+        #[cfg(feature = "builtin")]
+        let _nested = narf_scheduler::sleep_pumps::block_nested();
+        let per_command = narf_time::Deadline::after_ms(CMD_DEADLINE_MS);
+        let deadline = self
+            .bringup_deadline
+            .map_or(per_command, |d| per_command.min(d));
+        let previous_toggle = *self.cmd_toggle.lock();
+        // Wait for the previous command's GO and toggle handshake.
         let clear = narf_scheduler::responsive_spin_until(
-            || self.hcr_read_status() & cmd::HCR_GO == 0,
-            narf_time::Deadline::after_ms(CMD_DEADLINE_MS),
+            || !cmd::is_pending(self.hcr_read_status(), previous_toggle),
+            deadline,
         );
         if !clear {
+            self.command_failed.store(true, Ordering::Release);
+            let _ = writeln!(
+                narf_console::Writer,
+                "mlx4: {:?} idle timeout, HCR={:#010x}",
+                op,
+                self.hcr_read_status()
+            );
             return Err(Mlx4Error::CmdTimeout);
         }
         let toggle = {
@@ -335,21 +439,34 @@ impl Mlx4Eth {
         self.hcr_write(cmd::HCR_OUT_PARAM_H, (out_param >> 32) as u32);
         self.hcr_write(cmd::HCR_OUT_PARAM_L, out_param as u32);
         self.hcr_write(cmd::HCR_TOKEN, cmd::token_word(cmd::POLL_TOKEN));
-        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         self.hcr_write(
             cmd::HCR_STATUS,
             cmd::go_word(op, op_modifier, toggle, false),
         );
 
         let done = narf_scheduler::responsive_spin_until(
-            || self.hcr_read_status() & cmd::HCR_GO == 0,
-            narf_time::Deadline::after_ms(CMD_DEADLINE_MS),
+            || !cmd::is_pending(self.hcr_read_status(), toggle),
+            deadline,
         );
         if !done {
+            self.command_failed.store(true, Ordering::Release);
+            let _ = writeln!(
+                narf_console::Writer,
+                "mlx4: {:?} completion timeout, HCR={:#010x}",
+                op,
+                self.hcr_read_status()
+            );
             return Err(Mlx4Error::CmdTimeout);
         }
         let status = cmd::status_of(self.hcr_read_status());
         if status != 0 {
+            let _ = writeln!(
+                narf_console::Writer,
+                "mlx4: {:?} failed: {:?}",
+                op,
+                cmd::CmdStatus::from_raw(status)
+            );
             return Err(Mlx4Error::CmdFailed(status));
         }
         if out_is_imm {
@@ -372,20 +489,30 @@ impl Mlx4Eth {
         in_modifier: u32,
         out_len: usize,
     ) -> Result<Vec<u8>, Mlx4Error> {
+        if out_len > cmd::MAILBOX_SIZE {
+            return Err(Mlx4Error::Other("oversize output mailbox"));
+        }
         let out_mb = self.alloc_mailbox()?;
-        self.cmd(
+        let result = self.cmd(
             0,
             in_modifier,
             op_modifier,
             op,
             out_mb.dma_addr().raw(),
             false,
-        )?;
+        );
+        if let Err(error) = result {
+            if !matches!(error, Mlx4Error::CmdTimeout) {
+                out_mb.free_completed();
+            }
+            return Err(error);
+        }
         let mut buf = alloc::vec![0u8; out_len];
         // SAFETY: `out_mb` is a 4-KiB mailbox; `out_len <= MAILBOX_SIZE`.
         unsafe {
             core::ptr::copy_nonoverlapping(out_mb.cpu_ptr_at::<u8>(0), buf.as_mut_ptr(), out_len);
         }
+        out_mb.free_completed();
         Ok(buf)
     }
 
@@ -398,6 +525,9 @@ impl Mlx4Eth {
         in_modifier: u32,
         in_bytes: &[u8],
     ) -> Result<(), Mlx4Error> {
+        if in_bytes.len() > cmd::MAILBOX_SIZE {
+            return Err(Mlx4Error::Other("oversize input mailbox"));
+        }
         let mb = self.alloc_mailbox()?;
         // SAFETY: `in_bytes.len() <= MAILBOX_SIZE` by contract.
         unsafe {
@@ -407,9 +537,12 @@ impl Mlx4Eth {
                 in_bytes.len(),
             );
         }
-        compiler_fence(Ordering::SeqCst);
-        self.cmd(mb.dma_addr().raw(), in_modifier, op_modifier, op, 0, false)?;
-        Ok(())
+        fence(Ordering::SeqCst);
+        let result = self.cmd(mb.dma_addr().raw(), in_modifier, op_modifier, op, 0, false);
+        if !matches!(result, Err(Mlx4Error::CmdTimeout)) {
+            mb.free_completed();
+        }
+        result.map(|_| ())
     }
 
     // ── MTT allocation + writing ─────────────────────────────────────
@@ -443,19 +576,27 @@ impl Mlx4Eth {
     /// # Safety
     /// Caller owns the device's BARs exclusively for the duration of
     /// init.
-    pub unsafe fn bring_up(
-        device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<Arc<Self>, Mlx4Error> {
+    pub unsafe fn bring_up(device: &BusDevice) -> Result<Arc<Self>, Mlx4Error> {
         // SAFETY: caller-authority over the device.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| Mlx4Error::BarMapFailed)?;
         // SAFETY: caller-authority over the device; BAR2 is the UAR region.
         let uar = unsafe { map_bar(device, 2) }.map_err(|_| Mlx4Error::BarMapFailed)?;
 
+        #[cfg(feature = "builtin")]
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        #[cfg(feature = "builtin")]
         let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
+        #[cfg(feature = "module")]
+        device.enable().map_err(|_| Mlx4Error::BarMapFailed)?;
         let dev = Arc::new(Self {
+            device: *device,
+            bringup_deadline: Some(narf_time::Deadline::after_ms(60_000)),
+            command_failed: core::sync::atomic::AtomicBool::new(false),
+            command_busy: core::sync::atomic::AtomicBool::new(false),
+            tx_busy: core::sync::atomic::AtomicBool::new(false),
+            drain_busy: core::sync::atomic::AtomicBool::new(false),
+            next_link_poll: IrqSafeSpinLock::new(None),
             mmio,
             uar,
             cmd_toggle: IrqSafeSpinLock::new(false),
@@ -466,6 +607,7 @@ impl Mlx4Eth {
             fw_info: fw::FwInfo::default(),
             mtt_entry_sz: 8,
             uar_index: 0,
+            #[cfg(feature = "builtin")]
             addr: device.addr,
             nic_state: IrqSafeSpinLock::new(NicCachedState {
                 mac: [0; 6],
@@ -473,9 +615,13 @@ impl Mlx4Eth {
                 link_up: false,
             }),
             datapath: IrqSafeSpinLock::new(None),
+            #[cfg(feature = "builtin")]
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            #[cfg(feature = "builtin")]
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
+            #[cfg(feature = "builtin")]
             rx_ipc_prod: IrqSafeSpinLock::new(Some(rx_prod)),
+            #[cfg(feature = "builtin")]
             ifname: crate::publish::IfName::new(),
         });
 
@@ -490,6 +636,7 @@ impl Mlx4Eth {
         // the simpler route and keep them `Copy` defaults, refreshing
         // caches post-handshake through dedicated locks.
         let dev = Self::run_bringup(dev)?;
+        #[cfg(feature = "builtin")]
         spawn_pumps(dev.clone(), tx_cons);
         Ok(dev)
     }
@@ -502,6 +649,16 @@ impl Mlx4Eth {
         // 1. QUERY_FW — firmware version + ICM firmware-area size.
         let fw_mb = dev.cmd_out_mailbox(CmdOp::QueryFw, 0, 0, 0x100)?;
         let fw_info = fw::decode_query_fw(&fw_mb);
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "mlx4: firmware {}.{}.{} requests {} pages ({} KiB)",
+            fw_info.major,
+            fw_info.minor,
+            fw_info.subminor,
+            fw_info.fw_pages,
+            u64::from(fw_info.fw_pages) * 4
+        );
 
         // 2. MAP_FA — map the firmware area's ICM pages.
         let fw_pages = fw_info.fw_pages.max(1);
@@ -528,7 +685,9 @@ impl Mlx4Eth {
         };
         let layout = icm::make_layout(&dev_cap, &counts);
         let aux_pages = dev.cmd(layout.total, 0, 0, CmdOp::SetIcmSize, 0, true)?;
-        let aux_pages = (aux_pages as usize).max(1);
+        let aux_pages = u32::try_from(aux_pages)
+            .map_err(|_| Mlx4Error::Other("invalid auxiliary page count"))?
+            .max(1);
         let icm_aux = dev.map_icm_pages(CmdOp::MapIcmAux, aux_pages as u32, &mut 0, false)?;
 
         let mut icm_pages: Vec<DmaBuffer> = Vec::new();
@@ -547,10 +706,7 @@ impl Mlx4Eth {
         dev.cmd_in_mailbox(CmdOp::InitHca, 0, 0, &init_mb)?;
 
         // 7. QUERY_ADAPTER (board id / inta pin — informational).
-        let _ = dev.cmd_out_mailbox(CmdOp::QueryAdapter, 0, 0, 0x100);
-
-        // 8. INIT_PORT (port 1).
-        dev.cmd(0, 1, 0, CmdOp::InitPort, 0, false)?;
+        dev.cmd_out_mailbox(CmdOp::QueryAdapter, 0, 0, 0x100)?;
 
         // Fold the gathered caps in. Interior-mutability-free: rebuild
         // a fresh `Arc` carrying the caps, moving the resident DMA +
@@ -573,6 +729,11 @@ impl Mlx4Eth {
         }
 
         dev.setup_datapath(&layout)?;
+        dev.cmd(0, 1, 0, CmdOp::InitPort, 0, false)?;
+        Arc::get_mut(&mut dev)
+            .ok_or(Mlx4Error::Other("mlx4 Arc aliased during init"))?
+            .bringup_deadline = None;
+        dev.refresh_link()?;
         Ok(dev)
     }
 
@@ -590,9 +751,20 @@ impl Mlx4Eth {
         with_virt: bool,
     ) -> Result<Vec<DmaBuffer>, Mlx4Error> {
         let mut pages: Vec<DmaBuffer> = Vec::new();
+        pages
+            .try_reserve_exact(npages as usize)
+            .map_err(|_| Mlx4Error::NoMemory)?;
         let mut entries: Vec<icm::VpmEntry> = Vec::new();
+        entries
+            .try_reserve_exact(icm::VPM_ENTRIES_PER_MAILBOX)
+            .map_err(|_| Mlx4Error::NoMemory)?;
         for _ in 0..npages {
-            let page = alloc_coherent(icm::ICM_PAGE_SIZE as usize, DomainId::DRIVER_0)
+            if self.command_failed.load(Ordering::Acquire)
+                || self.bringup_deadline.is_some_and(|d| d.expired())
+            {
+                return Err(Mlx4Error::CmdTimeout);
+            }
+            let page = alloc_dma(&self.device, icm::ICM_PAGE_SIZE as usize)
                 .map_err(|_| Mlx4Error::NoMemory)?;
             let phys = page.dma_addr().raw();
             entries.push(icm::VpmEntry {
@@ -623,13 +795,13 @@ impl Mlx4Eth {
     /// receive ring. Runs in `bring_up` before the pumps spawn.
     fn setup_datapath(&self, _layout: &icm::IcmLayout) -> Result<(), Mlx4Error> {
         // One page backs the SQ+RQ, one the CQ, one the doorbell record.
-        let wq = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
-        let cq_buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
-        let db_rec = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
-        let rx_pool = alloc_coherent(RQ_N * RX_SLOT_LEN, DomainId::DRIVER_0)
-            .map_err(|_| Mlx4Error::NoMemory)?;
-        let tx_pool = alloc_coherent(SQ_N * TX_SLOT_LEN, DomainId::DRIVER_0)
-            .map_err(|_| Mlx4Error::NoMemory)?;
+        let wq = alloc_dma(&self.device, 4096).map_err(|_| Mlx4Error::NoMemory)?;
+        let cq_buf = alloc_dma(&self.device, 4096).map_err(|_| Mlx4Error::NoMemory)?;
+        let db_rec = alloc_dma(&self.device, 4096).map_err(|_| Mlx4Error::NoMemory)?;
+        let rx_pool =
+            alloc_dma(&self.device, RQ_N * RX_SLOT_LEN).map_err(|_| Mlx4Error::NoMemory)?;
+        let tx_pool =
+            alloc_dma(&self.device, SQ_N * TX_SLOT_LEN).map_err(|_| Mlx4Error::NoMemory)?;
 
         // Our object numbers sit at the first index past each resource's
         // firmware-reserved range (`QUERY_DEV_CAP`); the ICM tables were
@@ -646,7 +818,21 @@ impl Mlx4Eth {
         let data_lkey = self.create_physical_mr()?;
 
         // EQ: its own single page, one MTT entry.
-        let eq_buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx4Error::NoMemory)?;
+        let eq_buf = alloc_dma(&self.device, 4096).map_err(|_| Mlx4Error::NoMemory)?;
+        // Empty completion/event entries start hardware-owned (phase 1).
+        // SAFETY: fresh DMA pages, initialized before SW2HW commands.
+        unsafe {
+            for i in 0..(1 << LOG_CQ_SIZE) {
+                cq_buf
+                    .cpu_mut_ptr_at::<u8>((i * cq::CQE_SIZE + 31) as u64)
+                    .write(0x80);
+            }
+            for i in 0..(1 << LOG_EQ_SIZE) {
+                eq_buf
+                    .cpu_mut_ptr_at::<u8>((i * eq::EQE_SIZE + 31) as u64)
+                    .write(0x80);
+            }
+        }
         let eq_mtt = self.alloc_mtt(1);
         self.write_mtt(eq_mtt, &[eq_buf.dma_addr().raw()])?;
         let eq_ctx = eq::build_eq_context(&eq::EqParams {
@@ -656,7 +842,7 @@ impl Mlx4Eth {
             log_page_size: 0,
         });
         self.cmd_in_mailbox(CmdOp::Sw2hwEq, 0, eq_number, &eq_ctx)?;
-        self.cmd(eq::ASYNC_EVENT_MASK, eq_number, 0, CmdOp::MapEq, 0, false)?;
+        // Completion polling does not arm EQ interrupts. Link uses QUERY_PORT.
 
         // CQ.
         let cq_mtt = self.alloc_mtt(1);
@@ -674,7 +860,7 @@ impl Mlx4Eth {
         // QP (SQ+RQ in one page).
         let qp_mtt = self.alloc_mtt(1);
         self.write_mtt(qp_mtt, &[wq.dma_addr().raw()])?;
-        let qp_ctx = qp::build_qp_context(&qp::QpEthParams {
+        let mut qp_ctx = qp::build_qp_context(&qp::QpEthParams {
             pd: 0,
             uar_index,
             cqn_send: cq_number,
@@ -688,35 +874,47 @@ impl Mlx4Eth {
             port: 1,
             db_rec_addr: db_rec.dma_addr_at(8).raw(),
         });
+        wire::put_be32(&mut qp_ctx, 0x10, qp_number);
         self.qp_to_ready(qp_number, &qp_ctx)?;
 
         // Program MTU + unicast MAC on the port.
         let gen = port::build_set_port_general(WIRE_MTU);
-        let _ = self.cmd_in_mailbox(
+        self.cmd_in_mailbox(
             CmdOp::SetPort,
             port::SET_PORT_ETH_OPCODE,
             (u32::from(port::SET_PORT_GENERAL) << 8) | 1,
             &gen,
-        );
-        let mac = self.query_port_mac().unwrap_or([0; 6]);
+        )?;
+        let mac = self.query_port()?.mac;
+        if mac == [0; 6] || mac[0] & 1 != 0 {
+            return Err(Mlx4Error::Other("invalid port MAC"));
+        }
         let mac_mb = port::build_mac_table(&[mac], 1);
-        let _ = self.cmd_in_mailbox(
+        self.cmd_in_mailbox(
             CmdOp::SetPort,
             port::SET_PORT_ETH_OPCODE,
             (u32::from(port::SET_PORT_MAC_TABLE) << 8) | 1,
             &mac_mb,
-        );
+        )?;
+        // INIT_HCA selects legacy (A0) steering. One receive QP accepts
+        // our MAC and multicast/broadcast (ARP, DHCP, IPv6 discovery).
+        let steering = port::build_rqp_calc(qp_number);
+        self.cmd_in_mailbox(
+            CmdOp::SetPort,
+            port::SET_PORT_ETH_OPCODE,
+            (u32::from(port::SET_PORT_RQP_CALC) << 8) | 1,
+            &steering,
+        )?;
 
-        let sq_base = wq.dma_addr_at(0).raw();
-        // RQ follows the SQ within the page.
-        let rq_off = (SQ_N * (1 << LOG_SQ_STRIDE)) as u64;
-        let rq_base = wq.dma_addr_at(rq_off).raw();
+        // Larger-stride queue comes first (Linux mlx4_ib set_kernel_sq_size).
+        let sq_base = wq.cpu_ptr_at::<u8>(0) as u64;
+        let rq_base = wq.cpu_ptr_at::<u8>((SQ_N * (1 << LOG_SQ_STRIDE)) as u64) as u64;
 
         {
             let mut nic = self.nic_state.lock();
             nic.mac = mac;
             nic.mtu = DEFAULT_MTU;
-            nic.link_up = true;
+            nic.link_up = false;
         }
 
         *self.datapath.lock() = Some(DatapathState {
@@ -777,9 +975,32 @@ impl Mlx4Eth {
     }
 
     /// Read the port's default MAC via QUERY_PORT.
-    fn query_port_mac(&self) -> Option<[u8; 6]> {
-        let mb = self.cmd_out_mailbox(CmdOp::QueryPort, 0, 1, 0x40).ok()?;
-        Some(port::decode_query_port(&mb).mac)
+    fn query_port(&self) -> Result<port::PortInfo, Mlx4Error> {
+        let mb = self.cmd_out_mailbox(CmdOp::QueryPort, 0, 1, 0x40)?;
+        Ok(port::decode_query_port(&mb))
+    }
+    fn refresh_link(&self) -> Result<(), Mlx4Error> {
+        match self.query_port() {
+            Ok(info) => {
+                self.nic_state.lock().link_up = info.link_up;
+                Ok(())
+            }
+            Err(error) => {
+                self.nic_state.lock().link_up = false;
+                Err(error)
+            }
+        }
+    }
+    /// At most one bounded link query per second; permanently stop after HCR timeout.
+    pub fn poll_link(&self) {
+        {
+            let mut next = self.next_link_poll.lock();
+            if next.is_some_and(|d| !d.expired()) {
+                return;
+            }
+            *next = Some(narf_time::Deadline::after_ms(1000));
+        }
+        let _ = self.refresh_link();
     }
 
     // ── Datapath: TX ─────────────────────────────────────────────────
@@ -787,6 +1008,7 @@ impl Mlx4Eth {
     /// Transmit one frame: copy into a staging slot, post a send WQE,
     /// ring the send doorbell.
     pub fn transmit(&self, frame: &[u8]) -> Result<(), Mlx4Error> {
+        let _busy = Busy::enter(&self.tx_busy).ok_or(Mlx4Error::TxSlotsExhausted)?;
         if frame.len() > TX_SLOT_LEN {
             return Err(Mlx4Error::FrameTooLarge);
         }
@@ -824,14 +1046,19 @@ impl Mlx4Eth {
             let dp = self.datapath.lock();
             dp.as_ref().ok_or(Mlx4Error::NoDatapath)?.data_lkey
         };
-        let wqe = wqe::build_tx_wqe(own, true, slot_va, data_lkey, frame.len() as u32);
+        let wqe = wqe::build_tx_wqe(own, false, slot_va, data_lkey, frame.len() as u32);
         // Write the WQE into the SQ slot.
         // SAFETY: `sq_addr` is the identity-mapped SQ-slot DMA address.
         unsafe {
-            let dst = narf_memory::PhysAddr::new(sq_addr).kernel_ptr::<u8>() as *mut u8;
-            core::ptr::copy_nonoverlapping(wqe.as_ptr(), dst, wqe.len());
+            let dst = sq_addr as *mut u8;
+            core::ptr::copy_nonoverlapping(wqe.as_ptr().add(4), dst.add(4), wqe.len() - 4);
+            core::sync::atomic::fence(Ordering::Release);
+            core::ptr::write_volatile(
+                dst.cast::<u32>(),
+                core::ptr::read_unaligned(wqe.as_ptr().cast::<u32>()),
+            );
         }
-        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         // Ring the send doorbell (BAR2 UAR).
         self.uar_write(
             self.uar_index,
@@ -868,10 +1095,10 @@ impl Mlx4Eth {
         let wqe = wqe::build_rx_wqe(va, lkey, RX_SLOT_LEN as u32);
         // SAFETY: `rq_addr` is the identity-mapped RQ-slot DMA address.
         unsafe {
-            let dst = narf_memory::PhysAddr::new(rq_addr).kernel_ptr::<u8>() as *mut u8;
+            let dst = rq_addr as *mut u8;
             core::ptr::copy_nonoverlapping(wqe.as_ptr(), dst, wqe.len());
         }
-        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         // Bump the RX producer doorbell record (host memory).
         self.write_rx_prod_db(prod);
         Ok(())
@@ -883,7 +1110,7 @@ impl Mlx4Eth {
             let w = wqe::rx_prod_doorbell_word(prod).swap_bytes();
             // SAFETY: the doorbell record is the driver's resident DMA page.
             unsafe {
-                core::ptr::write_volatile(dp.db_rec.cpu_mut_ptr_at::<u32>(0), w);
+                core::ptr::write_volatile(dp.db_rec.cpu_mut_ptr_at::<u32>(8), w);
             }
         }
     }
@@ -891,6 +1118,9 @@ impl Mlx4Eth {
     /// Drain up to `budget` CQEs. TX completions free their staging
     /// slot; RX completions deliver the frame and repost the slot.
     pub fn drain_datapath(&self, budget: usize) -> usize {
+        let Some(_busy) = Busy::enter(&self.drain_busy) else {
+            return 0;
+        };
         let (cq_base_cpu, cq_number) = {
             let dp = self.datapath.lock();
             match dp.as_ref() {
@@ -911,16 +1141,19 @@ impl Mlx4Eth {
             };
             let idx = (cons % cq_cap) as usize;
             let cqe_ptr = (cq_base_cpu + idx * cq::CQE_SIZE) as *const u8;
+            // Read ownership first, then acquire the device-written payload.
+            // SAFETY: ownership byte lies within this CQ entry.
+            let owner = unsafe { core::ptr::read_volatile(cqe_ptr.add(31)) };
+            if !cq::cqe_is_sw_owned(owner, cons, cq_cap) {
+                break;
+            }
+            core::sync::atomic::fence(Ordering::Acquire);
             let mut raw = [0u8; cq::CQE_SIZE];
             // SAFETY: `cqe_ptr` is within the resident CQ buffer.
             unsafe {
                 core::ptr::copy_nonoverlapping(cqe_ptr, raw.as_mut_ptr(), cq::CQE_SIZE);
             }
-            let owner = raw[0x1f];
-            if !cq::cqe_is_sw_owned(owner, cons, cq_cap) {
-                break;
-            }
-            compiler_fence(Ordering::SeqCst);
+
             let cqe = cq::decode_cqe(&raw);
             {
                 let mut dp = self.datapath.lock();
@@ -951,15 +1184,24 @@ impl Mlx4Eth {
                 None => return,
             }
         };
-        // Doorbell record: set_ci slot (host memory) + UAR arm.
-        self.uar_write64(
-            self.uar_index,
-            cq::CQ_DOORBELL_UAR_OFFSET,
-            cq::cq_arm_uar_words(cqn, cons, 0, cq::CQ_DB_REQ_NOT),
-        );
+        let _ = cqn;
+        // Polled CQ: advance the host-memory set_ci record; do not arm an
+        // interrupt vector that the module has not installed.
+        let dp = self.datapath.lock();
+        if let Some(dp) = dp.as_ref() {
+            core::sync::atomic::fence(Ordering::Release);
+            // SAFETY: first dword of the resident CQ doorbell record.
+            unsafe {
+                core::ptr::write_volatile(
+                    dp.db_rec.cpu_mut_ptr_at::<u32>(0),
+                    (cons & 0xffffff).to_be(),
+                );
+            }
+        }
     }
 
     /// Write a 64-bit (two big-endian words) CQ doorbell into a UAR page.
+    #[allow(dead_code)]
     fn uar_write64(&self, uar_index: u32, byte_off: u64, words: [u32; 2]) {
         let abs = u64::from(uar_index) * UAR_PAGE_SIZE + byte_off;
         // SAFETY: identity-mapped MMIO; BE on wire.
@@ -970,7 +1212,7 @@ impl Mlx4Eth {
     }
 
     fn rx_complete(&self, cqe: &cq::CqeView) {
-        if cqe.bad_fcs() {
+        if cqe.bad_fcs() || cqe.is_error() || !(14..=RX_SLOT_LEN as u32).contains(&cqe.byte_cnt) {
             let slot = (cqe.wqe_index as usize) % RQ_N;
             let _ = self.post_recv_slot(slot);
             return;
@@ -988,7 +1230,10 @@ impl Mlx4Eth {
                 None => return,
             }
         };
+        #[cfg(feature = "module")]
+        let _ = (l4_ok, ip_ok);
         if len > 0 {
+            #[cfg(feature = "builtin")]
             if let Ok(buf) = alloc_coherent(len, DomainId::DRIVER_0) {
                 // SAFETY: `slot_ptr` names `RX_SLOT_LEN` resident bytes
                 // the HCA just filled; `len` is clamped to the slot.
@@ -1008,7 +1253,10 @@ impl Mlx4Eth {
             // SAFETY: same resident slot bounds; `deliver_rx` returns
             // before the slot is reposted below.
             let bytes = unsafe { core::slice::from_raw_parts_mut(slot_ptr as *mut u8, len) };
+            #[cfg(feature = "builtin")]
             crate::publish::deliver_rx(self.ifname(), bytes);
+            #[cfg(feature = "module")]
+            crate::module_probe::deliver(self.device.token, bytes);
         }
         let _ = self.post_recv_slot(slot);
     }
@@ -1016,6 +1264,7 @@ impl Mlx4Eth {
 
 // ── narf_net integration ────────────────────────────────────────────
 
+#[cfg(feature = "builtin")]
 impl narf_net::Interface for Mlx4Eth {
     fn name(&self) -> &str {
         self.ifname()
@@ -1042,6 +1291,7 @@ impl narf_net::Interface for Mlx4Eth {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl crate::HwNic for Mlx4Eth {
     fn name(&self) -> &'static str {
         "mlx4"
@@ -1064,7 +1314,7 @@ impl crate::HwNic for Mlx4Eth {
         crate::NicModel::MellanoxMlx4
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::TX_CSUM | crate::NicCaps::RX_CSUM
+        crate::NicCaps::RX_CSUM
     }
     fn ring_capacity(&self) -> usize {
         RQ_N
@@ -1079,23 +1329,28 @@ impl crate::HwNic for Mlx4Eth {
 
 // ── Probe / registration ────────────────────────────────────────────
 
+#[cfg(feature = "builtin")]
 static CONTROLLERS: IrqSafeSpinLock<Vec<Arc<Mlx4Eth>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// The probed controller at `index`.
+#[cfg(feature = "builtin")]
 pub fn controller(index: usize) -> Option<Arc<Mlx4Eth>> {
     CONTROLLERS.lock().get(index).cloned()
 }
 
 /// Number of probed controllers.
+#[cfg(feature = "builtin")]
 pub fn instance_count() -> usize {
     CONTROLLERS.lock().len()
 }
 
 /// `true` once at least one ConnectX-3 has been probed.
+#[cfg(feature = "builtin")]
 pub fn is_probed() -> bool {
     !CONTROLLERS.lock().is_empty()
 }
 
+#[cfg(feature = "builtin")]
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLERS.lock().iter().any(|c| c.addr == device.addr) {
         return Ok(());
@@ -1110,7 +1365,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: probe holds exclusive authority over `device` + its cfg
     // `cap` across `bring_up`.
-    let dev = match unsafe { Mlx4Eth::bring_up(&device, &cap) } {
+    let dev = match unsafe { Mlx4Eth::bring_up(&device) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
@@ -1153,10 +1408,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// Lightweight registry adapter — owns its instance's `Arc` so each
 /// port gets its own rings (the `Rtl8125Nic` / `Mlx5NetIface` pattern).
 #[derive(Debug)]
+#[cfg(feature = "builtin")]
 pub struct Mlx4NetIface {
     nic: Arc<Mlx4Eth>,
 }
 
+#[cfg(feature = "builtin")]
 impl narf_net::Interface for Mlx4NetIface {
     fn name(&self) -> &str {
         self.nic.ifname()
@@ -1183,6 +1440,7 @@ impl narf_net::Interface for Mlx4NetIface {
     }
 }
 
+#[cfg(feature = "builtin")]
 fn spawn_pumps(device: Arc<Mlx4Eth>, tx_cons: Consumer<Frame, TX_RING_N>) {
     let d1 = device.clone();
     narf_scheduler::spawn(async move {
@@ -1193,9 +1451,17 @@ fn spawn_pumps(device: Arc<Mlx4Eth>, tx_cons: Consumer<Frame, TX_RING_N>) {
     });
 }
 
+#[cfg(feature = "builtin")]
 async fn mlx4_rx_pump(device: Arc<Mlx4Eth>) {
     let poll_cycles = narf_time::ns_to_cycles(RX_POLL_INTERVAL_NS);
     loop {
+        device.poll_link();
+        let _ = narf_net::iface::set_link_metadata(
+            device.ifname(),
+            device.nic_state().link_up,
+            None,
+            None,
+        );
         if device.drain_datapath(RX_DRAIN_BUDGET) != 0 {
             continue;
         }
@@ -1203,6 +1469,7 @@ async fn mlx4_rx_pump(device: Arc<Mlx4Eth>) {
     }
 }
 
+#[cfg(feature = "builtin")]
 async fn mlx4_tx_pump(device: Arc<Mlx4Eth>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
         if frame.len() as usize > TX_SLOT_LEN {
@@ -1224,6 +1491,7 @@ async fn mlx4_tx_pump(device: Arc<Mlx4Eth>, mut tx_cons: Consumer<Frame, TX_RING
 
 /// Synchronous CQ drain over every probed controller — for
 /// syscall-context busy-waits (ARP / TCP handshake).
+#[cfg(feature = "builtin")]
 pub fn mlx4_rx_pump_step() -> bool {
     let controllers = CONTROLLERS.lock().clone();
     let mut any = false;
@@ -1234,12 +1502,14 @@ pub fn mlx4_rx_pump_step() -> bool {
 }
 
 /// Stack `SendCtxFn`: transmit through the cookie's controller.
+#[cfg(feature = "builtin")]
 fn mlx4_send_frame(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     let ctrl = controller(usize::try_from(cookie).map_err(|_| ())?).ok_or(())?;
     ctrl.transmit(frame).map_err(|_| ())
 }
 
 /// Register the driver against the ConnectX-3 device ids.
+#[cfg(feature = "builtin")]
 pub fn register_pci_driver() {
     for &did in ALL_DEV_IDS {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -1253,10 +1523,18 @@ pub fn register_pci_driver() {
     }
 }
 
+#[cfg(feature = "builtin")]
 fn name_for(did: u16) -> &'static str {
     match did {
         MLX4_DEV_CX3 => "mlx4-connectx3",
         MLX4_DEV_CX3_PRO => "mlx4-connectx3-pro",
         _ => "mlx4",
+    }
+}
+
+#[cfg(feature = "module")]
+impl Mlx4Eth {
+    pub(crate) fn module_access_failed(&self) -> bool {
+        self.mmio.failed() || self.uar.failed() || self.command_failed.load(Ordering::Acquire)
     }
 }

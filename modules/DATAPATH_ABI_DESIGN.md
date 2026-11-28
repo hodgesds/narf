@@ -156,6 +156,7 @@ narf_spawn_poller(dev, cb: usize, cookie: u64) -> i32
 narf_netif_register(dev, mac: *const u8 /*6*/, tx_cb: extern "C" fn(frame: *const u8, len: usize) -> i32, out_ifindex: *mut u32) -> i32
 narf_netif_register_with_context(dev, mac: *const u8 /*6*/, tx_cb: extern "C" fn(dev: u64, frame: *const u8, len: usize) -> i32, out_ifindex: *mut u32) -> i32
 narf_netif_rx(dev, ifindex: u32, frame: *mut u8, len: usize) -> i32  // synchronous stack delivery; XDP may rewrite
+narf_netif_set_link(dev, ifindex: u32, carrier: u32) -> i32 // physical carrier only; 0 or 1
 ```
 The kernel registers a legacy-stack interface with a permanent in-tree
 `SendCtxFn` trampoline; the unloadable callback address remains only in the

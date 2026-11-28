@@ -626,6 +626,7 @@ fn smoke_rtl8125_model() -> TestResult {
         wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
         link_up: false,
         suspended: AtomicBool::new(false),
+        phy_ready: AtomicBool::new(true),
         irq_vector: None,
         msix: None,
         addr: narf_bus::BusAddr::Mmio(mem.phys_addr()),

@@ -187,3 +187,16 @@ pub fn decode_query_port(mb: &[u8]) -> PortInfo {
         speed_mbps,
     }
 }
+
+/// Legacy A0 single-QP receive steering (Linux mlx4_SET_PORT_qpn_calc).
+/// MAC table slot zero selects base_qpn; n_mac/n_vlan/n_prio are all zero.
+/// Multicast defaults to that QP, including broadcast ARP/DHCP.
+pub fn build_rqp_calc(base_qpn: u32) -> [u8; 28] {
+    let mut context = [0u8; 28];
+    super::wire::put_be32(&mut context, 0, base_qpn);
+    context[13] = 0; // MLX4_NO_VLAN_IDX
+    context[15] = 1; // MLX4_VLAN_MISS_IDX
+    super::wire::put_be32(&mut context, 20, base_qpn);
+    super::wire::put_be32(&mut context, 24, (2 << 30) | base_qpn);
+    context
+}

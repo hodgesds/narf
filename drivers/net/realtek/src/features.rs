@@ -63,8 +63,11 @@
 //! conflict is flagged in the PR body; no such conflict was found
 //! for the registers modelled here.
 
+#[cfg(feature = "module")]
+use crate::platform::net as narf_net;
+
+use crate::platform::MmioRegion;
 use alloc::vec::Vec;
-use narf_driver_runtime::MmioRegion;
 
 // ── Shared register offsets ─────────────────────────────────────────
 
@@ -1545,7 +1548,7 @@ pub fn v1_tso_words(mss: u16, vlan: Option<u16>) -> Option<OffloadWords> {
 
 // ── Fixtures ────────────────────────────────────────────────────────
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "builtin", target_arch = "x86_64"))]
 mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 

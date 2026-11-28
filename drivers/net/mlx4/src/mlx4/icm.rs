@@ -99,7 +99,7 @@ pub fn build_init_hca(p: &InitHcaParams) -> [u8; INIT_HCA_IN_LEN] {
     // Cacheline size: ((log2(line) - 4) << 5) | (1 << 4); 64-byte line.
     wire::put_u8(&mut m, 0x00e, ((6u8 - 4) << 5) | (1 << 4));
     // FLAGS @0x14: host is little-endian, so the BE-host bit stays 0.
-    wire::put_be32(&mut m, 0x014, 0);
+    wire::put_be32(&mut m, 0x014, 1);
 
     // QPC section.
     wire::put_be64(&mut m, QPC_OFFSET + 0x10, p.qpc_base);
@@ -240,11 +240,29 @@ impl IcmLayout {
         }
     }
 
+    fn cmpt_bank(&self, kind: u64, log_num: u8) -> (u64, u64) {
+        let base = self.cmpt.base + ((kind * u64::from(self.cmpt.entry_sz)) << 24);
+        (
+            base,
+            IcmRegion {
+                base,
+                log_num,
+                entry_sz: self.cmpt.entry_sz,
+            }
+            .size(),
+        )
+    }
+
     /// Every region as `(virt_base, byte_size)`, in mapping order, for
     /// the per-table `MAP_ICM` calls.
-    pub fn regions(&self) -> [(u64, u64); 11] {
+    pub fn regions(&self) -> [(u64, u64); 14] {
         [
-            (self.cmpt.base, self.cmpt.size()),
+            // cMPT type is in object-index bits 25:24, not tightly packed.
+            // Reserve all four virtual banks, physically map only used entries.
+            self.cmpt_bank(0, self.qpc.log_num),
+            self.cmpt_bank(1, self.srqc.log_num),
+            self.cmpt_bank(2, self.cqc.log_num),
+            self.cmpt_bank(3, self.eqc.log_num),
             (self.mtt.base, self.mtt.size()),
             (self.dmpt.base, self.dmpt.size()),
             (self.eqc.base, self.eqc.size()),
@@ -267,25 +285,20 @@ impl IcmLayout {
 pub fn make_layout(dev: &DevCap, counts: &IcmCounts) -> IcmLayout {
     let mut cursor: u64 = 0;
     let mut place = |log_num: u8, entry_sz: u16| -> IcmRegion {
-        let base = cursor;
-        let r = IcmRegion {
-            base,
+        let mut r = IcmRegion {
+            base: 0,
             log_num,
             entry_sz,
         };
-        cursor = base + r.size();
+        let alignment = r.size().next_power_of_two();
+        r.base = cursor.div_ceil(alignment) * alignment;
+        cursor = r.base + r.size();
         r
     };
 
-    // cMPT covers all four context-MPT types (QP/SRQ/CQ/EQ), so size it
-    // for the largest object count across them.
-    let cmpt_log = counts
-        .log_num_qps
-        .max(counts.log_num_cqs)
-        .max(counts.log_num_eqs)
-        .max(counts.log_num_srqs)
-        + 2;
-    let cmpt = place(cmpt_log, dev.cmpt_entry_sz);
+    // Linux MLX4_NUM_CMPTS = 4 << 24. This reserves virtual space;
+    // regions() maps sparse banks rather than allocating gigabytes of RAM.
+    let cmpt = place(26, dev.cmpt_entry_sz);
     let mtt = place(counts.log_num_mtts, dev.mtt_entry_sz);
     let dmpt = place(counts.log_num_mpts, dev.dmpt_entry_sz);
     let eqc = place(counts.log_num_eqs, dev.eqc_entry_sz);

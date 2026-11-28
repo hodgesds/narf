@@ -7,11 +7,9 @@
 //! that the sibling [`narf-drivers-net-mlx5`] crate implements. The two share
 //! no wire formats, so ConnectX-3 lives in its own crate.
 //!
-//! See `narf-drivers-net-e1000` for the reference dual-build pattern. The real
-//! driver in [`mlx4`] compiles only for the built-in build; the `module` build
-//! registers through the `narf_register_pci_driver` KSYMTAB export
-//! (registration-only until the device datapath ABI is exported to modules,
-//! mirroring mlx5).
+//! The built-in and module builds share the HCR, ICM, queue and packet
+//! engines. Modules use device-scoped KABI grants and a polled single-port
+//! datapath. See drivers/net/specification/mlx4.md for validation limits.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -19,13 +17,14 @@
 
 use narf_driver_macros::narf_driver;
 
-#[cfg(feature = "builtin")]
+#[path = "../../module_platform.rs"]
+pub(crate) mod platform;
+
 extern crate alloc;
 
 #[cfg(feature = "builtin")]
 pub use narf_drivers_net_core::*;
 
-#[cfg(feature = "builtin")]
 pub mod mlx4;
 
 #[cfg(feature = "module")]
@@ -39,16 +38,26 @@ narf_driver! {
         author: "narf",
         description: "Mellanox ConnectX-3 NIC",
         target_domain: "net",
+        required_caps: "BusDevice:Write,NetIface:Write,DmaBuffer:Write",
     },
-    register: do_register,
+    register: do_register => i32,
 }
 
 #[cfg(feature = "builtin")]
-fn do_register() {
+fn do_register() -> i32 {
     mlx4::register_pci_driver();
+    0
 }
 
 #[cfg(feature = "module")]
-fn do_register() {
-    module_probe::register();
+fn do_register() -> i32 {
+    module_probe::register()
 }
+
+#[cfg(all(test, feature = "module"))]
+extern crate std;
+#[cfg(all(test, feature = "module"))]
+#[path = "../../module_test_support.rs"]
+mod module_test_support;
+#[cfg(all(test, feature = "module"))]
+mod module_tests;
