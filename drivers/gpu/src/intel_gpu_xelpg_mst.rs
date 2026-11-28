@@ -1682,6 +1682,9 @@ pub(super) mod tests {
         smoke_mtl_mst_128b132b_training_fallback_retry
     );
 
+    /// A 128b/132b tunnel MST case: (estimated units, one sink, bpp, TU, M/N words, BW requests, units after stop).
+    type TunnelMstCase<'a> = (u8, bool, u32, u8, [u32; 4], &'a [u8], &'a [u8]);
+
     /// 128b/132b MST through a DP tunnel (Panther Lake TC2 in Thunderbolt
     /// alt mode, `narf.intel.uhbr=1`): the hub reports no 128b/132b rate in
     /// its own DPCD; after the unconditional `DP_128B132B_SUPPORTED_LINK_RATES`
@@ -1703,7 +1706,7 @@ pub(super) mod tests {
     fn smoke_ptl_mst_128b132b_through_dp_tunnel() -> TestResult {
         use crate::intel_gpu_xelpg_external::tests::usb4_adapter;
         let ctl = tunnel::DP_DPTX_BW_ALLOCATION_MODE_CONTROL;
-        let cases: [(u8, bool, u32, u8, [u32; 4], &[u8], &[u8]); 2] = [
+        let cases: [TunnelMstCase<'_>; 2] = [
             (
                 72,
                 false,

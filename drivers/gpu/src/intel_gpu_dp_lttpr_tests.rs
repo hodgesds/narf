@@ -64,7 +64,8 @@ impl Link {
     fn writes_to(&self, base: u32) -> Vec<Vec<u8>> {
         self.writes
             .iter()
-            .filter_map(|(a, d)| (*a == base).then(|| d.clone()))
+            .filter(|&(a, _)| *a == base)
+            .map(|(_, d)| d.clone())
             .collect()
     }
 }
