@@ -438,6 +438,8 @@ pub mod x86_64;
 pub mod aarch64;
 
 mod canary;
+#[cfg(feature = "kernel-test")]
+mod census;
 mod cross_crate_init;
 mod init_depth;
 pub(crate) mod kstack_overflow;
@@ -3349,14 +3351,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(feature = "bpf-leds")]
             narf_bpf_leds::register_initcalls();
             narf_input::register_initcalls();
+            #[cfg(feature = "drivers-nvme")]
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();
+            #[cfg(feature = "drivers-net")]
             narf_drivers_net::register_initcalls();
             narf_drivers_wireless::register_initcalls();
             narf_drivers_i3c::register_initcalls();
             narf_drivers_gpio::register_initcalls();
             narf_drivers_i2c::register_initcalls();
             narf_drivers_usbpd::register_initcalls();
+            #[cfg(feature = "drivers-storage")]
             narf_drivers_storage::register_initcalls();
             narf_drivers_usb::register_initcalls();
             narf_drivers_bluetooth_btusb::register_initcalls();
@@ -4105,6 +4110,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_init::InitResult::Error("no Bluetooth controller completed bring-up")
                 }
             });
+            #[cfg(feature = "drivers-net")]
             narf_drivers_net::register_late_firmware_initcalls();
             // GSP firmware acquisition (Turing+). Registered here, after the
             // firmware scans, so the registry is populated when the Late pass
@@ -5156,6 +5162,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
     {
+        // Snapshot the composed initcall registry before any smoke
+        // can add registrations of its own (configurable-drivers
+        // census fixture, frame/src/census.rs).
+        census::capture();
         // `test_subsystem=a,b,c` selects those subsystems (prefix-matched:
         // `filesystem` selects `filesystem/page_cache` too). This is the
         // change-based CI path — `cargo xtask affected` computes the

@@ -29,16 +29,16 @@ narf-bus           = { path = "../bus" }
 narf-event-bus     = { path = "../event_bus" }
 narf-io            = { path = "../io" }
 narf-block         = { path = "../block" }
-narf-drivers-nvme    = { path = "../drivers/nvme" }
+narf-drivers-nvme    = { path = "../drivers/nvme", optional = true }
 narf-drivers-virtio  = { path = "../drivers/virtio" }
-narf-drivers-net     = { path = "../drivers/net" }
+narf-drivers-net     = { path = "../drivers/net", default-features = false, optional = true }
 narf-net             = { path = "../net" }
 narf-drivers-wireless = { path = "../drivers/wireless" }
 narf-drivers-i3c      = { path = "../drivers/i3c" }
 narf-drivers-i2c      = { path = "../drivers/i2c" }
 narf-drivers-gpio     = { path = "../drivers/gpio" }
 narf-drivers         = { path = "../drivers" }
-narf-drivers-storage = { path = "../drivers/storage" }
+narf-drivers-storage = { path = "../drivers/storage", default-features = false, optional = true }
 narf-drivers-usb     = { path = "../drivers/usb" }
 narf-drivers-video   = { path = "../drivers/video" }
 narf-drivers-media = { path = "../drivers/media" }
@@ -250,7 +250,58 @@ cgroup-all = [
 # user tasks run there (sharing the BSP's TSS/IST corrupts memory — that was
 # a long-lived heisenbug). `--no-default-features` pins user tasks to the
 # BSP; the per-CPU AP setup stays on either way.
-default = ["user-task-smp"]
+default = [
+    "user-task-smp",
+    "drivers-net",
+    "drivers-storage",
+    "drivers-nvme",
+    "narf-drivers-net/aqc1xx",
+    "narf-drivers-net/atheros",
+    "narf-drivers-net/bnxt",
+    "narf-drivers-net/cxgb4",
+    "narf-drivers-net/e1000",
+    "narf-drivers-net/enic",
+    "narf-drivers-net/forcedeth",
+    "narf-drivers-net/i40e",
+    "narf-drivers-net/igb",
+    "narf-drivers-net/igc",
+    "narf-drivers-net/ixgbe",
+    "narf-drivers-net/mlx4",
+    "narf-drivers-net/mlx5",
+    "narf-drivers-net/realtek",
+    "narf-drivers-net/rtl8139",
+    "narf-drivers-net/tg3",
+    "narf-drivers-net/vmxnet3",
+    "narf-drivers-storage/ahci",
+    "narf-drivers-storage/megaraid",
+    "narf-drivers-storage/mpt3sas",
+    "narf-drivers-storage/rtsx",
+    "narf-drivers-storage/sdhci",
+    "narf-drivers-storage/smartpqi",
+    "narf-drivers-storage/vmd",
+]
+
+# Driver-group selection (configurable drivers, design §5). The
+# net/storage facades expose per-driver features whose own `default`
+# is "all"; frame takes both facades with default features OFF.
+# `drivers-net` / `drivers-storage` are the group GATES: each names
+# only its facade dep, and bare_main calls the facade's
+# `register_initcalls()` only under the matching gate — so a group
+# that is not selected is never registered. The per-driver
+# selection lives in `default` (the FULL set, so a plain build
+# composes exactly the driver set it did before this wiring) and
+# in the TOML config files xtask translates (`--config`,
+# build/xtask/src/configs.rs): a config resolves to
+# `--no-default-features` + the gate for every group with at least
+# one `"y"` key + the per-driver facade features for the `"y"`
+# keys. Selection and registration are the same switch (the
+# composition census fixture in frame/src/census.rs pins the
+# equivalence). `drivers-nvme` is the same shape for the
+# standalone NVMe crate: `drivers.storage.nvme = "y"` selects it,
+# `"n"` leaves the dep out (it is not a storage-facade feature).
+drivers-net = ["dep:narf-drivers-net"]
+drivers-storage = ["dep:narf-drivers-storage"]
+drivers-nvme = ["dep:narf-drivers-nvme"]
 
 # User-task SMP: let USER tasks migrate onto application processors.
 # ON by default. Provides the per-AP user-mode machinery (per-CPU

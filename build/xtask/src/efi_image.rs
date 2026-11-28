@@ -73,6 +73,7 @@ impl Args {
             debug: self.debug,
             package: "narf-frame".into(),
             features: self.features.clone(),
+            config: None,
             composition: self.composition.clone(),
             builtin_crates: self.builtin_crates.clone(),
             module_crates: self.module_crates.clone(),

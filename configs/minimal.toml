@@ -1,0 +1,33 @@
+# Boot-to-shell floor: frame core only. Every key the file
+# expresses is "n" — the net and storage driver groups are
+# neither compiled into the kernel nor registered.
+# Lane 1: net + storage tables only (design §5.2).
+
+[drivers.net]
+aqc1xx = "n"
+atheros = "n"
+bnxt = "n"
+cxgb4 = "n"
+e1000 = "n"
+enic = "n"
+forcedeth = "n"
+i40e = "n"
+igb = "n"
+igc = "n"
+ixgbe = "n"
+mlx4 = "n"
+mlx5 = "n"
+realtek = "n"
+rtl8139 = "n"
+tg3 = "n"
+vmxnet3 = "n"
+
+[drivers.storage]
+ahci = "n"
+megaraid = "n"
+mpt3sas = "n"
+rtsx = "n"
+sdhci = "n"
+smartpqi = "n"
+vmd = "n"
+nvme = "n"

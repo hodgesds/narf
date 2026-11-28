@@ -66,10 +66,11 @@ of its PCI drivers register: the Intel modules,
 module tree, `amdgpu-pci`, `amdgpu-usbc` and `amdgpu-dp-bridge` only under `amdgpu`.
 The `smoke_gpu_vendor_feature_registration_census` kernel-test
 fixture pins the registered initcall names against the compiled
-feature set. The named-config registry in build/xtask
-(`configs.rs`) selects these features per build configuration:
-laptop/desktop-class configs enable `intel`; `minimal` and
-AMD-only configs do not. These features select the native GPU datapaths.
+feature set. The TOML driver config (`--config`, build/xtask `configs.rs`)
+selects these features per build configuration, from lane 2
+(design §5.1: the `[drivers.gpu]` keys `amdgpu` / `intel` become
+valid when the frame forwarding feature lands): laptop/desktop-class
+configs enable `intel`; `minimal` and AMD-only configs do not. These features select the native GPU datapaths.
 The Intel registration module uses the PCI module ABI.
 
 The feature split applies to the shared DRM render-node hooks, native AMD

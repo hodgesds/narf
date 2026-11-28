@@ -40,6 +40,7 @@ mod cachyos_gate;
 mod cachyos_root;
 mod ci_clippy;
 mod composition;
+mod configs;
 mod crate_release;
 mod efi_image;
 mod ext4_host;
@@ -1156,6 +1157,19 @@ struct BuildArgs {
     /// Forward-list of cargo features to enable. Comma-separated.
     #[arg(long, default_value = "")]
     features: String,
+
+    /// TOML driver configuration (design §5.2): a preset name or
+    /// a path. A bare word is a preset name resolving to
+    /// `configs/<name>.toml` (`all`: every driver in; `minimal`:
+    /// always-on core only, net + storage out); an argument
+    /// containing `/` or ending in `.toml` is a path, used as-is,
+    /// relative to the cwd. The file lists `[drivers.*]` tables
+    /// with `"y"` / `"n"` / `"m"` per driver (unspecified defaults
+    /// to `"y"`); `"m"` is a hard error in lane 1. `auto` is
+    /// reserved for the lane-5 test-config generator. Unioned with
+    /// `--features`; CI passes names/paths, not feature vectors.
+    #[arg(long, value_name = "NAME-OR-PATH")]
+    config: Option<String>,
 
     /// External kernel composition manifest. The file can live outside this
     /// checkout and select crates as built-ins or loadable modules.
@@ -5181,6 +5195,27 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
             .any(|component| component.signature.is_none())
     {
         ensure_feature(&mut features, "module-allow-unsigned");
+    }
+    // TOML driver configuration (`--config`, design §5.2/§5.3):
+    // a preset name or a path, resolved in `configs.rs`. `all`
+    // re-selects frame's default feature set explicitly, so the
+    // build is bit-for-bit today's; a subset config drops frame's
+    // defaults and selects its core features, the group gates, and
+    // the per-driver facade features for the `"y"` keys, unioned
+    // with the caller's `--features` like everything above.
+    let mut no_default_features = false;
+    if let Some(arg) = &args.config {
+        if args.package != "narf-frame" {
+            bail!("--config selects narf-frame driver features and requires --package narf-frame");
+        }
+        let config = configs::resolve(arg, root)?;
+        no_default_features = config.no_default_features;
+        for feature in &config.features {
+            ensure_feature(&mut features, feature);
+        }
+    }
+    if no_default_features {
+        cmd.arg("--no-default-features");
     }
     if !features.is_empty() {
         cmd.arg("--features").arg(&features);
