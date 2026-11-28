@@ -9384,7 +9384,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     net_smoke_cmd_with_nic(args, NetSmokeNic::Virtio)
 }
 
-/// `cargo narf ftdi-module-serial-smoke` — see [`Cmd::FtdiModuleSerialSmoke`].
+/// `cargo narf smoke ftdi-module-serial-smoke` — see [`Cmd::FtdiModuleSerialSmoke`].
 fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
@@ -9395,7 +9395,7 @@ fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
     const PONG: &[u8] = b"HOST-FTDI-PONG";
     if !matches!(args.arch, Arch::X86_64) {
         bail!(
-            "cargo narf ftdi-module-serial-smoke: only x86_64 is wired (boot-init is x86_64-only)"
+            "cargo narf smoke ftdi-module-serial-smoke: only x86_64 is wired (boot-init is x86_64-only)"
         );
     }
     let root = workspace_root()?;
@@ -9413,7 +9413,9 @@ fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
         .join("target")
         .join("ftdi-module-serial-smoke-initramfs.cpio");
     std::fs::write(&initrd, cpio).with_context(|| format!("writing {}", initrd.display()))?;
-    println!("cargo narf ftdi-module-serial-smoke: staged ABI 0x{abi:08x} ftdi.ko for autoload");
+    println!(
+        "cargo narf smoke ftdi-module-serial-smoke: staged ABI 0x{abi:08x} ftdi.ko for autoload"
+    );
 
     let out_dir = cargo_build(&build, &root)?;
     let kernel = out_dir.join(&build.package);
@@ -9511,14 +9513,14 @@ fn ftdi_module_serial_smoke_cmd(args: &BuildArgs) -> Result<()> {
     ];
     for (needle, why) in required {
         if !transcript.contains(needle) {
-            bail!("cargo narf ftdi-module-serial-smoke: {why} (missing `{needle}`)");
+            bail!("cargo narf smoke ftdi-module-serial-smoke: {why} (missing `{needle}`)");
         }
     }
     if !host_saw_ping {
-        bail!("cargo narf ftdi-module-serial-smoke: the host end never received the guest's bytes");
+        bail!("cargo narf smoke ftdi-module-serial-smoke: the host end never received the guest's bytes");
     }
     println!(
-        "cargo narf ftdi-module-serial-smoke: PASS — guest→host bulk-OUT and host→guest bulk-IN through ftdi.ko"
+        "cargo narf smoke ftdi-module-serial-smoke: PASS — guest→host bulk-OUT and host→guest bulk-IN through ftdi.ko"
     );
     Ok(())
 }
@@ -9541,7 +9543,7 @@ struct ModuleBlockSmoke {
     token: &'static str,
 }
 
-/// `cargo narf nvme-module-block-smoke` — see [`Cmd::NvmeModuleBlockSmoke`].
+/// `cargo narf smoke nvme-module-block-smoke` — see [`Cmd::NvmeModuleBlockSmoke`].
 fn nvme_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
     module_block_smoke(
         args,
@@ -9568,7 +9570,7 @@ fn nvme_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
     )
 }
 
-/// `cargo narf usb-storage-module-block-smoke` — see
+/// `cargo narf smoke usb-storage-module-block-smoke` — see
 /// [`Cmd::UsbStorageModuleBlockSmoke`].
 fn usb_storage_module_block_smoke_cmd(args: &BuildArgs) -> Result<()> {
     module_block_smoke(
@@ -9790,7 +9792,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
             .lock()
             .map_err(|_| anyhow!("e1000 module smoke initramfs state is poisoned"))? = Some(initrd);
         println!(
-            "cargo narf e1000-module-net-smoke: staged ABI 0x{abi:08x} e1000.ko for pre-probe autoload"
+            "cargo narf smoke e1000-module-net-smoke: staged ABI 0x{abi:08x} e1000.ko for pre-probe autoload"
         );
     }
     if nic == NetSmokeNic::Igb {

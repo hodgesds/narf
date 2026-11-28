@@ -30,7 +30,7 @@ loadable module, and the reference consumer of the USB transfer datapath
 ```
 cargo narf build build-module --package narf-drivers-usb-ftdi \
   --no-default-features --features module
-cargo narf ftdi-module-serial-smoke --arch=x86_64   # end-to-end proof
+cargo narf smoke ftdi-module-serial-smoke --arch=x86_64   # end-to-end proof
 ```
 
 Not yet: termios changes on the module node are cached, not programmed

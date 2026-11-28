@@ -412,7 +412,7 @@ through the shell + execve + ELF loader + `syscall` dispatch +
 
 ```sh
 cargo narf smoke net-smoke   --arch=x86_64   # TCP + UDP + guest DNS through SLIRP
-cargo narf e1000-module-net-smoke --arch=x86_64 # same over module-owned e1000
+cargo narf smoke e1000-module-net-smoke --arch=x86_64 # same over module-owned e1000
 cargo narf smoke redis-smoke --arch=x86_64   # unmodified redis-server, host SET/GET
 ```
 

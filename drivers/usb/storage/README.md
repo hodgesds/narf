@@ -19,7 +19,7 @@ The module handles LUN 0 and READ/WRITE(10) only, at most 4 KiB per
 command, with no BOT reset recovery: a stall or phase error takes the
 device offline. Build the kernel with `narf-drivers-usb/msc-module-only`
 so the built-in binder leaves the stick to the module. The proof is
-`cargo narf usb-storage-module-block-smoke`.
+`cargo narf smoke usb-storage-module-block-smoke`.
 
 Design: `modules/DATAPATH_ABI_DESIGN.md` ("USB transfer datapath",
 "Block datapath").

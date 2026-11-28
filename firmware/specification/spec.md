@@ -335,8 +335,8 @@ blob so observability tools can audit deployment.
 ```
 $ cargo narf build image --initramfs-firmware "amd-ucode/*" \
                     --initramfs-firmware "intel-ucode/*"
-cargo narf image: initramfs firmware: 12 entries (4.2 MiB)
-cargo narf image: rootfs firmware:    38214 entries (1696.3 MiB)
+cargo narf build image: initramfs firmware: 12 entries (4.2 MiB)
+cargo narf build image: rootfs firmware:    38214 entries (1696.3 MiB)
 ```
 
 With no `--initramfs-firmware` flags (the default):

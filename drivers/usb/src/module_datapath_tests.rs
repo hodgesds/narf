@@ -4,7 +4,7 @@
 //! `__open_for_test` under owner ids no loaded module can have, and every
 //! request carries no completion callback, so the module call gate is never
 //! entered. The end-to-end proof with real module text driving a real
-//! device is `cargo narf ftdi-module-serial-smoke`.
+//! device is `cargo narf smoke ftdi-module-serial-smoke`.
 
 use alloc::sync::Arc;
 
@@ -214,7 +214,7 @@ kernel_test_in!(
 /// slot does answer a direct GET_DESCRIPTOR, that answer is the oracle and
 /// the datapath must return it byte for byte; otherwise only the lifecycle
 /// is checked. Real transfers against a real device are proven by
-/// `cargo narf ftdi-module-serial-smoke`.
+/// `cargo narf smoke ftdi-module-serial-smoke`.
 fn smoke_module_datapath_control_request_lifecycle() -> TestResult {
     crate::class_registry::install_module_host();
     let devices = crate::device::enumerate();

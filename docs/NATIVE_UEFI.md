@@ -6,7 +6,7 @@ initramfs, and kernel command line. UEFI firmware can execute this file
 directly. No Limine executable, configuration, kernel sidecar, or initramfs
 sidecar is needed on the EFI System Partition (ESP).
 
-Native x86 distribution packages and `cargo narf install` use this path by
+Native x86 distribution packages and `cargo narf pkg install` use this path by
 default. `image`, `iso-boot`, `grub-image`, and `usb-image` retain their existing
 media layouts. `--limine-efi` explicitly selects legacy x86 packages. aarch64 continues to use
 `cargo narf build image --arch=aarch64` and its kernel-bound EFI loader.
@@ -166,8 +166,8 @@ such as `i915/adlp_dmc.bin`. The root search directory is fixed in this build.
 ## Package installation
 
 ```sh
-cargo narf package --version 0.5.0 --formats auto
-cargo narf install --version 0.5.0 --dry-run
+cargo narf pkg package --version 0.5.0 --formats auto
+cargo narf pkg install --version 0.5.0 --dry-run
 # After installing a distribution package, check the mounted ESP:
 sudo narf-uefi status
 ```

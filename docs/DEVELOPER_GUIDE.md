@@ -61,7 +61,7 @@ x86_64-only:
 cargo narf run run-interactive --arch=x86_64 \
   --cmd "echo hello world" --expect "hello world"
 cargo narf smoke net-smoke --arch=x86_64
-cargo narf e1000-module-net-smoke --arch=x86_64
+cargo narf smoke e1000-module-net-smoke --arch=x86_64
 ```
 
 For a faster focused cycle, kernel test names are prefix-filtered:
@@ -185,7 +185,7 @@ ABI-stamped image in the initramfs and boot with, for example,
 placements. Autoload runs after
 KABI/trust initialization and before `Stage::Device`; the e1000 facade's
 `e1000-module-only` profile suppresses its built-in PCI registration for this
-fixture. `cargo narf e1000-module-net-smoke --arch=x86_64` is the executable
+fixture. `cargo narf smoke e1000-module-net-smoke --arch=x86_64` is the executable
 reference for that complete path.
 
 The module manifest declares identity, ABI hash, dependencies, required

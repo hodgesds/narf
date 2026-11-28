@@ -385,9 +385,9 @@ kernel IPC. CI checks both native-ring feature configurations.
   UEFI GRUB chainloads the payload; systemd-boot, rEFInd, and CachyOS Limine
   consume their native discovery/registration paths.
 - `cargo install --path build/cargo-narf` installs the optional source-tree
-  frontend. `cargo narf package` drives reproducible native package generation;
+  frontend. `cargo narf pkg package` drives reproducible native package generation;
   both package/install commands expose the architecture, loader, and optional
-  signing inputs; `cargo narf install` delegates the resulting artifact to
+  signing inputs; `cargo narf pkg install` delegates the resulting artifact to
   apt/dpkg, dnf/rpm, or pacman rather than writing `/boot` or the ESP directly.
 - `narf-uefi install --sign-with-sbctl` explicitly opts an installation into
   the host's existing `sbctl` database key. That preference persists for

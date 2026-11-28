@@ -103,7 +103,7 @@ Before testing networking on hardware, run both end-to-end virtual paths:
 
 ```sh
 cargo narf smoke net-smoke --arch=x86_64
-cargo narf e1000-module-net-smoke --arch=x86_64
+cargo narf smoke e1000-module-net-smoke --arch=x86_64
 ```
 
 Both require successful host-to-guest TCP and UDP exchanges plus a guest DNS
@@ -789,11 +789,11 @@ Developers can build the same package locally:
 
 ```sh
 cargo install --path build/cargo-narf
-cargo narf detect
-cargo narf install --version 0.5.0 \
+cargo narf pkg detect
+cargo narf pkg install --version 0.5.0 \
   --limine-efi /usr/share/limine/BOOTX64.EFI \
   --dry-run
-cargo narf install --version 0.5.0 \
+cargo narf pkg install --version 0.5.0 \
   --limine-efi /usr/share/limine/BOOTX64.EFI
 ```
 
@@ -906,7 +906,7 @@ production systemd kernel, then package that exact artifact with
 ```sh
 cargo narf build build --arch=x86_64 \
   --features boot-init,cgroup-all,container,firmware-allow-unsigned
-cargo narf package --version 0.5.0 --skip-build \
+cargo narf pkg package --version 0.5.0 --skip-build \
   --limine-efi /usr/share/limine/BOOTX64.EFI
 ```
 

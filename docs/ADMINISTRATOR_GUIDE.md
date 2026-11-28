@@ -142,7 +142,7 @@ For a live network check, use:
 
 ```sh
 cargo narf smoke net-smoke --arch=x86_64
-cargo narf e1000-module-net-smoke --arch=x86_64
+cargo narf smoke e1000-module-net-smoke --arch=x86_64
 ```
 
 Both network commands verify host-to-guest TCP, host-to-guest UDP, and a guest

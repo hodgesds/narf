@@ -123,7 +123,7 @@ SUBS=""
 
 if [ "$AFFECTED" = 1 ]; then
   if [ "$DRY_RUN" = 1 ]; then
-    echo "--dry-run: skipping \`cargo narf affected\` (it builds/runs cargo narf);"
+    echo "--dry-run: skipping \`cargo narf ci affected\` (it builds/runs cargo narf);"
     echo "  at run time the plan would come from:"
     echo "    cargo narf ci affected --format github --event pull_request --base $BASE"
     echo "  showing the FULL-run plan below."

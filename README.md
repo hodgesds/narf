@@ -127,12 +127,12 @@ Cargo frontend and let it detect the host package manager:
 
 ```sh
 cargo install --path build/cargo-narf
-cargo narf detect
-cargo narf install --version 0.5.0 --dry-run
-cargo narf install --version 0.5.0
+cargo narf pkg detect
+cargo narf pkg install --version 0.5.0 --dry-run
+cargo narf pkg install --version 0.5.0
 ```
 
-`cargo narf install` builds a native package and delegates installation to
+`cargo narf pkg install` builds a native package and delegates installation to
 `apt`/`dpkg`, `dnf`/`rpm`, or `pacman`; it never copies files directly into
 `/boot`. Gentoo output is generated as an overlay-ready ebuild rather than
 installed automatically because overlay registration is host policy.

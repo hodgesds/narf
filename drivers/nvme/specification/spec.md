@@ -367,7 +367,7 @@ multipath / fabrics (defer).
   the identify VWC bit sets the disk's volatile-cache flag (flush issues NVM
   Flush). Feature `nvme-module-only` keeps the built-in crate but withdraws
   its PCI matches, so a module loaded before PCI probing binds the
-  controller (`cargo narf nvme-module-block-smoke`).
+  controller (`cargo narf smoke nvme-module-block-smoke`).
 
 ## 4. Invariants & safety properties
 
