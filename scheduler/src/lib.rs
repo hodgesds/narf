@@ -3990,6 +3990,35 @@ pub fn __reset_queues_for_test() {
     user_policy::reset_for_test();
 }
 
+/// Test-only hook: build a scheduler waker for a synthetic parked waiter.
+/// The cell is homed on `cpu` with the given direct-eligibility, and its
+/// awake flag starts clear — the sleep state of a real parked waiter (a
+/// fresh cell starts runnable). Lets a non-scheduler crate drive
+/// `wake_preempt_task` through a real `Waker` and observe the routing.
+#[doc(hidden)]
+pub fn __make_waker_for_test(id: TaskId, cpu: u32, direct_eligible: bool) -> Waker {
+    let cell = new_wake_cell(id, cpu, direct_eligible);
+    cell.flag.store(false, Ordering::Release);
+    make_waker(cell)
+}
+
+/// Test-only hook: take the exact synchronous-handoff waker published on
+/// `cpu`, if one was published. The returned waker names the same cell the
+/// publisher held, so `will_wake` against the original proves the exact
+/// handle — not just a scalar next-buddy id — was published.
+#[doc(hidden)]
+pub fn __take_urgent_wake_waker_for_test(cpu: usize) -> Option<Waker> {
+    take_urgent_wake_cell(cpu).map(make_waker)
+}
+
+/// Test-only hook: read the awake flag behind a scheduler waker (`None`
+/// for a foreign waker). Proves a wake was published even when the direct
+/// handoff was correctly declined.
+#[doc(hidden)]
+pub fn __waker_flag_for_test(waker: &Waker) -> Option<bool> {
+    scheduler_wake_cell(waker).map(|cell| cell.flag.load(Ordering::Acquire))
+}
+
 /// Authoritative affinity for every live scheduler task.
 ///
 /// A slot is absent from both runnable and parked ownership while its future is

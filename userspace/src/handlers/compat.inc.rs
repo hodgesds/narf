@@ -11787,17 +11787,29 @@ impl FutexWaiter {
     /// Handler-driven waits observe their own completion record. No remote
     /// task lookup or write to a later syscall's park deadline is needed.
     ///
-    /// Benchmark variant B1 (plain wake): a handler-driven waiter is woken
-    /// with a bare `Waker::wake()` — no `wake_preempt_task` direct handoff
-    /// (`hint_urgent_next_on` / `try_sync_wake_affine` / IPI kick) and no
-    /// preempt note. The waiter was already `mark_woken()`ed by its
-    /// dequeuer, so the plain wake still enqueues and kicks it via the
-    /// raw-waker path; only the urgency machinery is dropped. Compare
-    /// against the baseline (urgent handoff) and variant B2 (spread wake +
-    /// preempt note) with `perf bench futex` on hardware.
+    /// Benchmark variant B4 (direct handoff for handler-driven waiters):
+    /// an urgent wake routes through `wake_preempt_task`, so a local,
+    /// direct-eligible waiter gets the exact-cell handoff
+    /// (`hint_urgent_next_on` + local urgent preempt note) instead of full
+    /// executor placement. The non-urgent arm is unchanged (plain wake +
+    /// generic preempt note), and the legacy park-loop arms still use
+    /// `wake_one_urgent` / `wake_one`. The waiter was already
+    /// `mark_woken()`ed by its dequeuer before this runs. No wake can be
+    /// lost by the routing: `wake_preempt_task` publishes the wake first
+    /// (`publish_owned_wake` — the same flag-set + activation staging the
+    /// raw-waker path performs) and every decline of the direct handoff
+    /// falls back to ordinary placement (`wake_place_and_kick`); foreign
+    /// or mismatched wakers fall back to a plain wake. Compare against
+    /// variant B1 (plain wake) with `perf bench futex` on hardware;
+    /// selection among futex variants is by hardware measurement only.
     fn wake(self, urgent: bool) {
         if self.q.is_some() {
             if urgent {
+                // `wake_preempt_task` is x86_64/aarch64-only, mirroring
+                // `wake_one_inner`; other architectures keep the plain wake.
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                narf_scheduler::wake_preempt_task(self.waker, self.tid);
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 self.waker.wake();
             } else {
                 self.waker.wake();
