@@ -2203,6 +2203,215 @@ kernel_test_in!(
     smoke_scheduler_replace_address_space_from_task_without_as
 );
 
+/// Drive executor rounds until `cond` holds (or `n` rounds elapse),
+/// mirroring the workqueue tests' driver. A round is one
+/// `poll_one_round` on the calling CPU's executor.
+fn rounds_until<F: FnMut() -> bool>(n: usize, mut cond: F) -> bool {
+    for _ in 0..n {
+        if cond() {
+            return true;
+        }
+        crate::poll_one_round();
+    }
+    cond()
+}
+
+/// A displaced address space is torn down by the background reclaimer, not
+/// inline on the execve path (execve E2): `replace_address_space` from
+/// inside a user task queues the old AS's `mmput`, and the `system_wq`
+/// worker runs `exit_mmap` for it while the task parks on a gate holding
+/// the new AS — so the `exit_mmap` count advances by exactly one in that
+/// window (the new AS cannot contribute one while it is still attached),
+/// the count is still at baseline right after `replace` returns (recorded
+/// synchronously inside the task's poll, before any worker can run on
+/// this CPU), and the old AS is gone after the drain.
+fn smoke_scheduler_deferred_as_teardown_runs_exit_mmap() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::task::{Context, Poll};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    static GATE: AtomicBool = AtomicBool::new(false);
+    static RECORDED: AtomicU64 = AtomicU64::new(u64::MAX);
+    GATE.store(false, Ordering::Relaxed);
+    RECORDED.store(u64::MAX, Ordering::Relaxed);
+
+    struct Gate;
+    impl Future for Gate {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if GATE.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    crate::__reset_queues_for_test();
+    // SAFETY: paging is live in the kernel-test environment.
+    let old_mm = Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc old AS"));
+    // One mapped 4 KiB region so `exit_mmap` has a real unmap to run.
+    let frame = narf_memory::alloc_frame().expect("fixture frame");
+    let phys = frame.start_address();
+    unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0x5a, 4096) };
+    old_mm
+        .map_region(Region {
+            base: VirtAddr::new(AddressSpace::USER_FIXED_FLOOR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![phys].into(),
+        })
+        .expect("map fixture region");
+    let old_weak = Arc::downgrade(&old_mm);
+    let replacement =
+        Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc replacement AS"));
+    let replacement_for_poll = Arc::clone(&replacement);
+    let task = crate::alloc_task_id();
+    let before = crate::exit_mmap_stats().0;
+
+    crate::spawn_user(
+        task,
+        async move {
+            let _ = crate::replace_address_space(task, Arc::clone(&replacement_for_poll));
+            let _ = replacement_for_poll.activate();
+            RECORDED.store(crate::exit_mmap_stats().0, Ordering::Release);
+            Gate.await;
+        },
+        crate::TaskSpec::unthrottled(),
+        Arc::clone(&old_mm),
+    );
+
+    if !rounds_until(1000, || crate::exit_mmap_stats().0 == before + 1) {
+        GATE.store(true, Ordering::Release);
+        crate::run_until_empty();
+        return TestResult::Fail("deferred address-space teardown did not run exit_mmap");
+    }
+    if RECORDED.load(Ordering::Acquire) != before {
+        GATE.store(true, Ordering::Release);
+        crate::run_until_empty();
+        return TestResult::Fail("exit_mmap ran inline instead of deferred");
+    }
+    GATE.store(true, Ordering::Release);
+    crate::run_until_empty();
+    drop(old_mm);
+    drop(replacement);
+    if crate::__deferred_as_teardowns_for_test() != 0 {
+        return TestResult::Fail("deferred teardown left a pending reclaimer count");
+    }
+    if old_weak.upgrade().is_some() {
+        return TestResult::Fail("deferred teardown leaked the old address space");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_deferred_as_teardown_runs_exit_mmap
+);
+
+/// At the deferred bound the execve path falls back to inline `mmput`
+/// (execve E2): with the pending count filled to the bound, `replace`
+/// runs `exit_mmap` synchronously — the count has already advanced by
+/// the time the task records it — and queues no reclaimer work, so the
+/// pending count is unchanged.
+fn smoke_scheduler_deferred_as_teardown_falls_back_inline_when_bounded() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::task::{Context, Poll};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    static GATE: AtomicBool = AtomicBool::new(false);
+    static RECORDED: AtomicU64 = AtomicU64::new(u64::MAX);
+    GATE.store(false, Ordering::Relaxed);
+    RECORDED.store(u64::MAX, Ordering::Relaxed);
+
+    struct Gate;
+    impl Future for Gate {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if GATE.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    crate::__reset_queues_for_test();
+    crate::__set_deferred_as_teardowns_for_test(crate::MAX_DEFERRED_AS_TEARDOWNS);
+    // SAFETY: paging is live in the kernel-test environment.
+    let old_mm = Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc old AS"));
+    let frame = narf_memory::alloc_frame().expect("fixture frame");
+    let phys = frame.start_address();
+    unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0x5a, 4096) };
+    old_mm
+        .map_region(Region {
+            base: VirtAddr::new(AddressSpace::USER_FIXED_FLOOR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![phys].into(),
+        })
+        .expect("map fixture region");
+    let old_weak = Arc::downgrade(&old_mm);
+    let replacement =
+        Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc replacement AS"));
+    let replacement_for_poll = Arc::clone(&replacement);
+    let task = crate::alloc_task_id();
+    let before = crate::exit_mmap_stats().0;
+
+    crate::spawn_user(
+        task,
+        async move {
+            let _ = crate::replace_address_space(task, Arc::clone(&replacement_for_poll));
+            let _ = replacement_for_poll.activate();
+            RECORDED.store(crate::exit_mmap_stats().0, Ordering::Release);
+            Gate.await;
+        },
+        crate::TaskSpec::unthrottled(),
+        Arc::clone(&old_mm),
+    );
+
+    // Drive until the task has run its replace (recorded) — no worker
+    // should ever fire on this path.
+    if !rounds_until(1000, || RECORDED.load(Ordering::Acquire) != u64::MAX) {
+        crate::__set_deferred_as_teardowns_for_test(0);
+        GATE.store(true, Ordering::Release);
+        crate::run_until_empty();
+        return TestResult::Fail("bounded test task never ran its replace");
+    }
+    let recorded = RECORDED.load(Ordering::Acquire);
+    let pending = crate::__deferred_as_teardowns_for_test();
+    crate::__set_deferred_as_teardowns_for_test(0);
+    GATE.store(true, Ordering::Release);
+    crate::run_until_empty();
+    drop(old_mm);
+    drop(replacement);
+    if recorded != before + 1 {
+        return TestResult::Fail("bounded teardown did not run exit_mmap inline");
+    }
+    if pending != crate::MAX_DEFERRED_AS_TEARDOWNS {
+        return TestResult::Fail("bounded teardown queued reclaimer work it should not have");
+    }
+    if old_weak.upgrade().is_some() {
+        return TestResult::Fail("bounded teardown leaked the old address space");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_deferred_as_teardown_falls_back_inline_when_bounded
+);
+
 // ── relocated from verification ──
 
 fn smoke_sleep_future_waits() -> TestResult {
