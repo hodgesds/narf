@@ -222,7 +222,10 @@ pub(crate) fn ring_max_ibs(id: usize) -> u32 {
     if (crate::amdgpu_vcn_navi22_cs::FIRST_ID..8).contains(&id) {
         crate::amdgpu_navi22_submit::MEDIA_MAX_IBS as u32
     } else if id < RING_IDS {
-        crate::amdgpu_navi22_submit::MAX_IBS as u32
+        match RINGS[id] {
+            Some(ring) => crate::amdgpu_navi22_submit::max_ibs(ring) as u32,
+            None => 0,
+        }
     } else {
         0
     }
@@ -1006,14 +1009,18 @@ mod tests {
     /// as this card reported, no command buffer ever fits: RADV resubmitted
     /// the preamble alone forever, so vkcube and GTK4's Vulkan renderer
     /// (Steam's setup dialog) hung in their first vkQueueSubmit. Every ring
-    /// reports what its native queue takes: `validate` / `validate_media`.
+    /// reports what its native queue takes: `validate` / `validate_media`,
+    /// per ring (192 GFX, 125 compute, 49 SDMA, 16 media).
     fn navi22_cs_max_ibs_is_what_the_native_queues_take() -> TestResult {
         for id in 0..RING_IDS {
             let media = (crate::amdgpu_vcn_navi22_cs::FIRST_ID..8).contains(&id);
             let native = if media {
                 crate::amdgpu_navi22_submit::MEDIA_MAX_IBS
             } else {
-                crate::amdgpu_navi22_submit::MAX_IBS
+                match RINGS[id] {
+                    Some(ring) => crate::amdgpu_navi22_submit::max_ibs(ring),
+                    None => 0,
+                }
             };
             let reported = ring_max_ibs(id);
             if reported < 2 {

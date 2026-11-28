@@ -80,9 +80,38 @@ pub(crate) const IH_VMID_LUT_LAST: u32 = 0x001f; // linux: mmIH_VMID_0_LUT_MM@os
                                                  // linux-ctx: reset
 /// `amdgpu_sched_hw_submission` default.
 pub const HW_SUBMISSIONS: u32 = 2; // linux: n/a (amdgpu_sched_hw_submission module default)
-/// Largest IB count per submission (`AMDGPU_CS_MAX_IBS_PER_SUBMIT`); 16
-/// frames of at most 13 dwords stay far inside one ring half.
-pub const MAX_IBS: usize = 16; // linux: n/a (NARF bound)
+/// Largest IB count per submission on each kernel ring
+/// (`AMDGPU_CS_MAX_IBS_PER_SUBMIT`), Linux's `amdgpu_ring_max_ibs` as the
+/// parse layer already encodes it (`amdgpu_cs::MAX_IBS_GFX` /
+/// `MAX_IBS_COMPUTE` / `MAX_IBS_OTHER`): 192 GFX, 125 compute, 49 SDMA.
+/// The media rings keep their own `MEDIA_MAX_IBS` (16, Linux's VCN_JPEG
+/// bound), untouched by this change.
+///
+/// The bound is also a ring-space bound: one frame must fit in half of the
+/// 2048-dword ring (`amdgpu_cp_navi22::RING_DW`), because two submissions
+/// may be outstanding per ring (`HW_SUBMISSIONS`) and the throttle only
+/// waits out the job two back. Worst case, every optional section on:
+/// - GFX, 192 IBs: 192 x 4 (INDIRECT_BUFFER) + 76 fixed = 844 dwords;
+/// - compute, 125 IBs, every IB flagged `RESET_GDS_MAX_WAVE_ID`:
+///   125 x (4 + 3) + 65 fixed = 940 dwords;
+/// - SDMA, 49 IBs: 49 x 13 (6-dword INDIRECT + up to 7 NOP pad) + 45
+///   fixed = 682 dwords.
+/// Each pads to at most one 1024-dword ring half, so two max-size frames
+/// never overwrite each other; `Queue::emit` still refuses any frame over
+/// the ring. A single 192 cap for SDMA would not hold: 192 x 13 + 45 =
+/// 2541 dwords overflows the ring, so the cap is per ring, not one number.
+pub const MAX_IBS_GFX: usize = 192; // linux: amdgpu_ring_max_ibs(AMDGPU_RING_TYPE_GFX)
+pub const MAX_IBS_COMPUTE: usize = 125; // linux: amdgpu_ring_max_ibs(AMDGPU_RING_TYPE_COMPUTE)
+pub const MAX_IBS_SDMA: usize = 49; // linux: amdgpu_ring_max_ibs(...) — everything else
+
+/// How many IBs one submission on `ring` may carry (`amdgpu_ring_max_ibs`).
+pub const fn max_ibs(ring: Ring) -> usize {
+    match ring {
+        Ring::Gfx => MAX_IBS_GFX,
+        Ring::Compute => MAX_IBS_COMPUTE,
+        Ring::Sdma(_) => MAX_IBS_SDMA,
+    }
+}
 /// Largest single IB, in dwords (`length_dw` is 20 bits in the packet).
 pub const MAX_IB_DWORDS: u32 = (1 << 20) - 1; // linux: n/a (20-bit IB length_dw)
 
@@ -620,7 +649,7 @@ pub fn validate(ring: Ring, vm: VmRef, ibs: &[Ib]) -> Result<(), Error> {
     if matches!(ring, Ring::Sdma(i) if i >= 4) {
         return Err(Error::Invalid);
     }
-    if !(1..=15).contains(&vm.vmid) || ibs.is_empty() || ibs.len() > MAX_IBS {
+    if !(1..=15).contains(&vm.vmid) || ibs.is_empty() || ibs.len() > max_ibs(ring) {
         return Err(Error::Invalid);
     }
     let align = if matches!(ring, Ring::Sdma(_)) { 32 } else { 4 };
