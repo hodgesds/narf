@@ -2083,7 +2083,15 @@ fn dispatch_trap(frame: &mut TrapFrame) {
     // SIGSEGV, and never a stack-growth candidate.
     let mut file_fault_bus = false;
     if frame.vector == 14 {
-        narf_lib::perf::page_fault();
+        // Count the fault for the faulting task: the per-CPU total moves
+        // here (every #PF, kernel or user — the existing shape), and any
+        // task-bound page-faults event tracking the task is attributed
+        // through the hook. MIN/MAJ are counted at the resolution site,
+        // once the fault is known to have healed.
+        narf_lib::perf::note_sw_event(
+            narf_userspace::handlers::current_task_id(),
+            narf_lib::perf::SW_PAGE_FAULTS,
+        );
         // PF error code (Intel SDM Vol. 3 §4.7):
         //   bit 0 (P): set if fault was a present-page violation
         //   bit 1 (W): set if write
@@ -2185,6 +2193,11 @@ fn dispatch_trap(frame: &mut TrapFrame) {
         let p_clear = (ec & PF_P) == 0;
         if p_clear && (from_user || cr2_in_user_half) {
             if from_user && narf_userspace::handlers::handle_numa_hint_fault(cr2) {
+                // A NUMA hinting fault heals without I/O: a minor fault.
+                narf_lib::perf::note_sw_event(
+                    narf_userspace::handlers::current_task_id(),
+                    narf_lib::perf::SW_PAGE_FAULTS_MIN,
+                );
                 return;
             }
             if let Some(as_arc) = narf_userspace::active_user_as() {
@@ -2270,6 +2283,11 @@ fn dispatch_trap(frame: &mut TrapFrame) {
                     }
                     .is_ok()
                     {
+                        // Stack growth heals without I/O: a minor fault.
+                        narf_lib::perf::note_sw_event(
+                            narf_userspace::handlers::current_task_id(),
+                            narf_lib::perf::SW_PAGE_FAULTS_MIN,
+                        );
                         return;
                     }
                 }
@@ -2302,6 +2320,11 @@ fn dispatch_trap(frame: &mut TrapFrame) {
                     // SAFETY: Valid memory or trusted environment
                     let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
                     if remap_ok {
+                        // A COW split heals without I/O: a minor fault.
+                        narf_lib::perf::note_sw_event(
+                            narf_userspace::handlers::current_task_id(),
+                            narf_lib::perf::SW_PAGE_FAULTS_MIN,
+                        );
                         return;
                     }
                 }
@@ -2324,6 +2347,15 @@ fn dispatch_trap(frame: &mut TrapFrame) {
     // unmappable vector like #DF) means the user genuinely deserves
     // the panic surface below.
     if (frame.cs & 3) == 3 {
+        // An alignment-check fault (#AC, vector 17) is a real fault for the
+        // task whether or not a signal handler is installed: count it here,
+        // before delivery is decided below.
+        if frame.vector == 17 {
+            narf_lib::perf::note_sw_event(
+                narf_userspace::handlers::current_task_id(),
+                narf_lib::perf::SW_ALIGNMENT_FAULTS,
+            );
+        }
         if let Some(hook) = narf_userspace::sync_signal_hook() {
             let vector = frame.vector;
             // Wave-58: forward the faulting address. #PF → CR2;

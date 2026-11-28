@@ -52,7 +52,10 @@ container = []
 # freeze/kill/events. Resource controllers are additive sub-features
 # below, each implying `cgroup`. `cgroup-all` turns on everything.
 # Orthogonal to the container feature.
-cgroup = []
+# Forwards to `narf-scheduler/cgroup`, which is not optional: `place()`
+# attributes a cgroup switch to the moved task through the scheduler's
+# pid→task resolver, and that module is behind scheduler's `cgroup`.
+cgroup = ["narf-scheduler/cgroup"]
 
 # Resource controllers (each implies the base `cgroup`).
 cgroup-pids   = ["cgroup"]

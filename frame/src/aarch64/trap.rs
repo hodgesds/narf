@@ -401,6 +401,15 @@ fn dispatch_sync(frame: &mut TrapFrame) {
     let mut el0_far = 0u64;
     let mut el0_bus = false;
     if el0_abort_is_healable(ec) {
+        // Count the fault for the faulting task: the per-CPU total moves
+        // here (every EL0 data/instruction abort — the aarch64 shape of
+        // x86's #PF-entry bump), and any task-bound page-faults event
+        // tracking the task is attributed through the hook. MIN/MAJ are
+        // counted at the resolution site, once the fault is known healed.
+        narf_lib::perf::note_sw_event(
+            narf_userspace::handlers::current_task_id(),
+            narf_lib::perf::SW_PAGE_FAULTS,
+        );
         // SAFETY: FAR_EL1 read at EL1 is always defined.
         let far = unsafe { sysreg::read_far_el1() };
         // Demand paging / stack grow / COW split for the EL0 fault. On
@@ -436,6 +445,15 @@ fn dispatch_sync(frame: &mut TrapFrame) {
     // terminates (or dumps) just this task.
     if from_el0 {
         if let Some((vector, addr)) = el0_signal_route(ec, esr, el0_far, frame.elr, frame.sp_el0) {
+            // An alignment fault (signal 17: data-abort FSC_ALIGNMENT, PC
+            // or SP misalignment) is a real fault for the task whether or
+            // not a signal handler is installed: count it before delivery.
+            if vector == 17 {
+                narf_lib::perf::note_sw_event(
+                    narf_userspace::handlers::current_task_id(),
+                    narf_lib::perf::SW_ALIGNMENT_FAULTS,
+                );
+            }
             if let Some(hook) = narf_userspace::sync_signal_hook() {
                 let info = narf_userspace::SyncFaultInfo {
                     addr,
@@ -457,6 +475,17 @@ fn dispatch_sync(frame: &mut TrapFrame) {
 
         // SAFETY: FAR_EL1 read at EL1 is always defined.
         let far = unsafe { sysreg::read_far_el1() };
+
+        // A current-EL abort on a user-half address is a user page fault
+        // taken from kernel mode (a guarded user copy touching a
+        // not-yet-backed page): count it like the EL0 case. A kernel-half
+        // abort is a kernel bug, not a task's fault.
+        if in_user_half(far) {
+            narf_lib::perf::note_sw_event(
+                narf_userspace::handlers::current_task_id(),
+                narf_lib::perf::SW_PAGE_FAULTS,
+            );
+        }
 
         // HEAL FIRST. A guarded kernel↔user copy (`uaccess::copy_user_guarded`)
         // runs at EL1, so a fault while it touches a *legitimate but not-yet-
@@ -563,6 +592,11 @@ fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> HealOu
     let mut bus = false;
     if is_translation_fault {
         if narf_userspace::handlers::handle_numa_hint_fault(far) {
+            // A NUMA hinting fault heals without I/O: a minor fault.
+            narf_lib::perf::note_sw_event(
+                narf_userspace::handlers::current_task_id(),
+                narf_lib::perf::SW_PAGE_FAULTS_MIN,
+            );
             return HealOutcome::Healed;
         }
         if let Some(as_arc) = narf_userspace::active_user_as() {
@@ -593,6 +627,11 @@ fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> HealOu
                 }
                 .is_ok()
                 {
+                    // Stack growth heals without I/O: a minor fault.
+                    narf_lib::perf::note_sw_event(
+                        narf_userspace::handlers::current_task_id(),
+                        narf_lib::perf::SW_PAGE_FAULTS_MIN,
+                    );
                     return HealOutcome::Healed;
                 }
             }
@@ -609,6 +648,11 @@ fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> HealOu
                 // touched by the split.
                 let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
                 if remap_ok {
+                    // A COW split heals without I/O: a minor fault.
+                    narf_lib::perf::note_sw_event(
+                        narf_userspace::handlers::current_task_id(),
+                        narf_lib::perf::SW_PAGE_FAULTS_MIN,
+                    );
                     return HealOutcome::Healed;
                 }
             }

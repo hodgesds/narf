@@ -305,3 +305,75 @@ kernel_test_in!(
     "memory/demand_wait",
     smoke_demand_wait_has_no_waiter_capacity
 );
+
+/// A fault-served anonymous demand fill counts one minor fault for the
+/// faulting task and nothing for the page-faults total (the total moves
+/// at trap entry, not at resolution); a non-fault fill through
+/// `demand_alloc_page` counts nothing.
+fn smoke_demand_page_for_fault_counts_minor() -> TestResult {
+    // The fault counters only run while the perf subsystem is enabled;
+    // no event is published here, so enable counting for the test and
+    // restore the flag afterwards.
+    let saved_enabled = narf_lib::perf::enabled();
+    narf_lib::perf::set_enabled(true);
+    let outcome: Result<(), &'static str> = (|| {
+        let anon = Region {
+            base: VirtAddr::new(BASE),
+            len: 8192,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![].into(),
+        };
+        let space = AddressSpace::empty();
+        space
+            .map_region(anon)
+            .map_err(|_| "map anonymous region failed")?;
+        // Sum over every CPU: the fill runs on whichever CPU executes
+        // it, and the test task may have migrated since the last read.
+        let total_min = || -> u64 {
+            (0..narf_lib::percpu::MAX_CPUS)
+                .map(|cpu| {
+                    narf_lib::perf::snapshot_cpu_config(cpu, narf_lib::perf::SW_PAGE_FAULTS_MIN)
+                })
+                .sum()
+        };
+        let total_faults = || -> u64 {
+            (0..narf_lib::percpu::MAX_CPUS)
+                .map(|cpu| narf_lib::perf::snapshot_cpu_config(cpu, narf_lib::perf::SW_PAGE_FAULTS))
+                .sum()
+        };
+        let min_before = total_min();
+        let faults_before = total_faults();
+        const FAULT_TASK: u64 = 0x5EED_F001;
+        // SAFETY: allocator and kernel mapping are live; this unpublished
+        // mm has no running user, like a stopped tracee's remote-page fault.
+        let filled = unsafe { space.demand_alloc_page_for_fault(VirtAddr::new(BASE), FAULT_TASK) };
+        if filled.is_err() {
+            return Err("fault-served anonymous demand fill failed");
+        }
+        if total_min() != min_before + 1 {
+            return Err("fault-served anonymous fill did not count exactly one minor fault");
+        }
+        if total_faults() != faults_before {
+            return Err("demand resolution moved the page-faults total (trap-entry counter)");
+        }
+        // A non-fault fill of the neighbouring page counts nothing.
+        // SAFETY: same unpublished mm as above.
+        let filled = unsafe { space.demand_alloc_page(VirtAddr::new(BASE + 4096)) };
+        if filled.is_err() {
+            return Err("non-fault anonymous demand fill failed");
+        }
+        if total_min() != min_before + 1 {
+            return Err("non-fault fill counted a minor fault");
+        }
+        Ok(())
+    })();
+    narf_lib::perf::set_enabled(saved_enabled);
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+kernel_test_in!(
+    "memory/demand_wait",
+    smoke_demand_page_for_fault_counts_minor
+);

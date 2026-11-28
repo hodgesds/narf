@@ -12,7 +12,7 @@
 //! "marginal-buddy" flake), so profiling state must stay out of it.
 
 use crate::percpu::{current_cpu, MAX_CPUS};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Master gate. When `false` (the default — "not attached"), every
 /// tracepoint short-circuits to a single read-mostly load + a predictable
@@ -58,6 +58,24 @@ struct PerCpu {
     user_ticks: AtomicU64,
     /// Timer ticks that interrupted the kernel (CPL=0).
     kernel_ticks: AtomicU64,
+    /// Scheduler switches out of a task on this CPU
+    /// (`PERF_COUNT_SW_CONTEXT_SWITCHES`).
+    ctx_switches: AtomicU64,
+    /// Tasks whose switch-in landed on this CPU after last running elsewhere
+    /// (`PERF_COUNT_SW_CPU_MIGRATIONS`).
+    migrations: AtomicU64,
+    /// Faults resolved without I/O (`PERF_COUNT_SW_PAGE_FAULTS_MIN`).
+    faults_min: AtomicU64,
+    /// Faults resolved with I/O (`PERF_COUNT_SW_PAGE_FAULTS_MAJ`).
+    faults_maj: AtomicU64,
+    /// Alignment faults (`PERF_COUNT_SW_ALIGNMENT_FAULTS`).
+    align_faults: AtomicU64,
+    /// Emulated instructions (`PERF_COUNT_SW_EMULATION_FAULTS`). No
+    /// instruction-emulation path exists in the tree yet, so this stays zero
+    /// until one lands — it is never estimated.
+    emul_faults: AtomicU64,
+    /// Tasks moved to a different cgroup (`PERF_COUNT_SW_CGROUP_SWITCHES`).
+    cgroup_switches: AtomicU64,
 }
 
 impl PerCpu {
@@ -68,6 +86,13 @@ impl PerCpu {
             page_faults: AtomicU64::new(0),
             user_ticks: AtomicU64::new(0),
             kernel_ticks: AtomicU64::new(0),
+            ctx_switches: AtomicU64::new(0),
+            migrations: AtomicU64::new(0),
+            faults_min: AtomicU64::new(0),
+            faults_maj: AtomicU64::new(0),
+            align_faults: AtomicU64::new(0),
+            emul_faults: AtomicU64::new(0),
+            cgroup_switches: AtomicU64::new(0),
         }
     }
 }
@@ -122,6 +147,71 @@ pub fn tick(kernel: bool) {
     });
 }
 
+/// Linux `PERF_COUNT_SW_*` config values for the software events this module
+/// counts (`compat/linux-perf-uapi/src/lib.rs:40-51`, mirroring
+/// `include/uapi/linux/perf_event.h`). `narf-lib` does not depend on the uapi
+/// crate, so the values are repeated here — keep them in sync with that file.
+pub const SW_PAGE_FAULTS: u64 = 2;
+pub const SW_CONTEXT_SWITCHES: u64 = 3;
+pub const SW_CPU_MIGRATIONS: u64 = 4;
+pub const SW_PAGE_FAULTS_MIN: u64 = 5;
+pub const SW_PAGE_FAULTS_MAJ: u64 = 6;
+pub const SW_ALIGNMENT_FAULTS: u64 = 7;
+pub const SW_EMULATION_FAULTS: u64 = 8;
+pub const SW_CGROUP_SWITCHES: u64 = 11;
+
+/// Task-attribution hook for software events, mirroring the scheduler's
+/// `USER_PERF_SWITCH_HOOK`: the userspace perf registry installs
+/// `perf_event::note_task_sw_event` at `install_user_task_hooks()`, and any
+/// crate that observes a countable phenomenon calls [`note_sw_event`].
+/// A hook that is never installed (unit tests, pre-userspace boot) simply
+/// leaves task-bound attribution off; the per-CPU counters still move.
+static SW_EVENT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the task-attribution hook for [`note_sw_event`]. Only the
+/// userspace perf registry calls this, once, at boot.
+pub fn set_sw_event_hook(hook: fn(u64, usize, u64)) {
+    SW_EVENT_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Count one occurrence of software event `config` for `task` on the current
+/// CPU: the per-CPU counter moves (the CPU-wide read), and the installed hook
+/// attributes it to the task-bound events tracking `task` (the task-bound
+/// read). Free when not attached — the `enabled()` gate is the same one the
+/// `page_fault()`/`ctx_switch()` bumps use, so counters only run while a
+/// perf event is live and reads subtract their enable-time base.
+///
+/// `config` must be one of the `SW_*` constants above; anything else is
+/// ignored (no counter exists for it). `task` is a scheduler TaskId; a
+/// `TaskId::NONE` (0) occurrence still moves the per-CPU counter but
+/// attributes to no task.
+#[inline]
+pub fn note_sw_event(task: u64, config: u64) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let cpu = current_cpu();
+    let p = &COUNTERS[if cpu < MAX_CPUS { cpu } else { 0 }];
+    let counter = match config {
+        SW_PAGE_FAULTS => &p.page_faults,
+        SW_CONTEXT_SWITCHES => &p.ctx_switches,
+        SW_CPU_MIGRATIONS => &p.migrations,
+        SW_PAGE_FAULTS_MIN => &p.faults_min,
+        SW_PAGE_FAULTS_MAJ => &p.faults_maj,
+        SW_ALIGNMENT_FAULTS => &p.align_faults,
+        SW_EMULATION_FAULTS => &p.emul_faults,
+        SW_CGROUP_SWITCHES => &p.cgroup_switches,
+        _ => return,
+    };
+    bump(counter);
+    let hook = SW_EVENT_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_sw_event_hook` writes this slot.
+        let hook: fn(u64, usize, u64) = unsafe { core::mem::transmute(hook) };
+        hook(task, cpu, config);
+    }
+}
+
 /// Counters summed across all CPUs (a `perf_events`-style aggregate read).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Snapshot {
@@ -130,6 +220,13 @@ pub struct Snapshot {
     pub page_faults: u64,
     pub user_ticks: u64,
     pub kernel_ticks: u64,
+    pub ctx_switches: u64,
+    pub migrations: u64,
+    pub faults_min: u64,
+    pub faults_maj: u64,
+    pub align_faults: u64,
+    pub emul_faults: u64,
+    pub cgroup_switches: u64,
 }
 
 /// Sum every CPU's counters into one [`Snapshot`].
@@ -141,6 +238,13 @@ pub fn snapshot() -> Snapshot {
         s.page_faults += p.page_faults.load(Ordering::Relaxed);
         s.user_ticks += p.user_ticks.load(Ordering::Relaxed);
         s.kernel_ticks += p.kernel_ticks.load(Ordering::Relaxed);
+        s.ctx_switches += p.ctx_switches.load(Ordering::Relaxed);
+        s.migrations += p.migrations.load(Ordering::Relaxed);
+        s.faults_min += p.faults_min.load(Ordering::Relaxed);
+        s.faults_maj += p.faults_maj.load(Ordering::Relaxed);
+        s.align_faults += p.align_faults.load(Ordering::Relaxed);
+        s.emul_faults += p.emul_faults.load(Ordering::Relaxed);
+        s.cgroup_switches += p.cgroup_switches.load(Ordering::Relaxed);
     }
     s
 }
@@ -158,6 +262,30 @@ pub fn snapshot_cpu(cpu: usize) -> Snapshot {
         page_faults: p.page_faults.load(Ordering::Relaxed),
         user_ticks: p.user_ticks.load(Ordering::Relaxed),
         kernel_ticks: p.kernel_ticks.load(Ordering::Relaxed),
+        ctx_switches: p.ctx_switches.load(Ordering::Relaxed),
+        migrations: p.migrations.load(Ordering::Relaxed),
+        faults_min: p.faults_min.load(Ordering::Relaxed),
+        faults_maj: p.faults_maj.load(Ordering::Relaxed),
+        align_faults: p.align_faults.load(Ordering::Relaxed),
+        emul_faults: p.emul_faults.load(Ordering::Relaxed),
+        cgroup_switches: p.cgroup_switches.load(Ordering::Relaxed),
+    }
+}
+
+/// One software event's per-CPU value, for a CPU-wide `perf_event` read.
+/// Returns 0 for an unknown config (no counter exists for it).
+pub fn snapshot_cpu_config(cpu: usize, config: u64) -> u64 {
+    let s = snapshot_cpu(cpu);
+    match config {
+        SW_PAGE_FAULTS => s.page_faults,
+        SW_CONTEXT_SWITCHES => s.ctx_switches,
+        SW_CPU_MIGRATIONS => s.migrations,
+        SW_PAGE_FAULTS_MIN => s.faults_min,
+        SW_PAGE_FAULTS_MAJ => s.faults_maj,
+        SW_ALIGNMENT_FAULTS => s.align_faults,
+        SW_EMULATION_FAULTS => s.emul_faults,
+        SW_CGROUP_SWITCHES => s.cgroup_switches,
+        _ => 0,
     }
 }
 

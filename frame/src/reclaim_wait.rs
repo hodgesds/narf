@@ -282,7 +282,11 @@ fn try_demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), Address
     // SAFETY: callers are the architecture page-fault/data-abort paths with
     // the faulting task's address-space root active and the kernel RAM mapping
     // live. This helper changes only retry/parking around the existing call.
-    let result = unsafe { aspace.demand_alloc_page(vaddr) };
+    // The faulting task's id rides along so the resolution counts as a
+    // minor/major fault for that task.
+    let result = unsafe {
+        aspace.demand_alloc_page_for_fault(vaddr, narf_userspace::handlers::current_task_id())
+    };
     narf_userspace::clear_mempolicy_for_fault();
     result
 }

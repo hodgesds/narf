@@ -23,7 +23,10 @@ use narf_linux_perf_uapi::{
     PERF_ATTR_FLAG_SAMPLE_ID_ALL, PERF_ATTR_FLAG_SIGTRAP, PERF_ATTR_FLAG_TASK,
     PERF_ATTR_FLAG_WATERMARK, PERF_ATTR_SIZE_VER0, PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
     PERF_COUNT_HW_BRANCH_MISSES, PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CPU_CYCLES,
-    PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_CPU_CLOCK, PERF_COUNT_SW_DUMMY,
+    PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_SW_ALIGNMENT_FAULTS, PERF_COUNT_SW_BPF_OUTPUT,
+    PERF_COUNT_SW_CGROUP_SWITCHES, PERF_COUNT_SW_CONTEXT_SWITCHES, PERF_COUNT_SW_CPU_CLOCK,
+    PERF_COUNT_SW_CPU_MIGRATIONS, PERF_COUNT_SW_DUMMY, PERF_COUNT_SW_EMULATION_FAULTS,
+    PERF_COUNT_SW_PAGE_FAULTS, PERF_COUNT_SW_PAGE_FAULTS_MAJ, PERF_COUNT_SW_PAGE_FAULTS_MIN,
     PERF_COUNT_SW_TASK_CLOCK, PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST,
     PERF_FORMAT_TOTAL_TIME_ENABLED, PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_RECORD_COMM,
     PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
@@ -137,6 +140,15 @@ fn publish_perf_event(registry: &mut Vec<Weak<PerfEventFile>>, file: &Arc<PerfEv
         // The task enters the filter before the event can be scheduled for it.
         perf_task_filter_add(file.target_task);
         TASK_BOUND_PERF_EVENTS.fetch_add(1, Ordering::Release);
+        if file.attr.type_ == PERF_TYPE_SOFTWARE {
+            if let Some(slot) = sw_event_live_slot(file.attr.config) {
+                slot.fetch_add(1, Ordering::Release);
+            }
+        }
+    } else if file.attr.type_ == PERF_TYPE_SOFTWARE
+        && file.attr.config == PERF_COUNT_SW_CPU_MIGRATIONS
+    {
+        CPU_MIGRATION_EVENTS.fetch_add(1, Ordering::Release);
     }
     if file.reads_cpu_user_time() && CPU_USER_CLOCK_EVENTS.fetch_add(1, Ordering::AcqRel) == 0 {
         // A new accounting epoch: per-CPU depths recorded while the hook was
@@ -163,6 +175,15 @@ fn unpublish_perf_event(file: &PerfEventFile) {
         }
         perf_task_filter_remove(file.target_task);
         TASK_BOUND_PERF_EVENTS.fetch_sub(1, Ordering::AcqRel);
+        if file.attr.type_ == PERF_TYPE_SOFTWARE {
+            if let Some(slot) = sw_event_live_slot(file.attr.config) {
+                slot.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    } else if file.attr.type_ == PERF_TYPE_SOFTWARE
+        && file.attr.config == PERF_COUNT_SW_CPU_MIGRATIONS
+    {
+        CPU_MIGRATION_EVENTS.fetch_sub(1, Ordering::AcqRel);
     }
     drop(inherited);
     if file.reads_cpu_user_time() {
@@ -222,6 +243,128 @@ fn perf_task_filter_remove(task: u64) {
 #[inline]
 fn perf_task_maybe_tracked(task: u64) -> bool {
     PERF_TASK_FILTER[perf_task_filter_slot(task)].load(Ordering::Acquire) != 0
+}
+
+/// Live task-bound events per software-counter config (indexed by the
+/// `PERF_COUNT_SW_*` config value; only the seven real counters use slots).
+/// Lets a phenomenon's hook skip the registry walk entirely when no
+/// task-bound event of its config exists — the same fast-gate shape as
+/// `TASK_BOUND_PERF_EVENTS` / `CPU_USER_CLOCK_EVENTS`.
+static TASK_SW_EVENT_LIVE: [AtomicUsize; 12] = [const { AtomicUsize::new(0) }; 12];
+
+/// The live-count slot for a software-counter config, or `None` when the
+/// config has no task-bound attribution (dummy/clocks, or the two still
+/// unsupported events).
+fn sw_event_live_slot(config: u64) -> Option<&'static AtomicUsize> {
+    match config {
+        PERF_COUNT_SW_PAGE_FAULTS
+        | PERF_COUNT_SW_CONTEXT_SWITCHES
+        | PERF_COUNT_SW_CPU_MIGRATIONS
+        | PERF_COUNT_SW_PAGE_FAULTS_MIN
+        | PERF_COUNT_SW_PAGE_FAULTS_MAJ
+        | PERF_COUNT_SW_ALIGNMENT_FAULTS
+        | PERF_COUNT_SW_CGROUP_SWITCHES => TASK_SW_EVENT_LIVE.get(config as usize),
+        _ => None,
+    }
+}
+
+/// Attribute one occurrence of software event `config` for `task` (which
+/// just produced the phenomenon on `cpu`) to every enabled task-bound event
+/// tracking `task` with that config. Called through the `narf_lib::perf`
+/// hook cell (`note_sw_event`), which already moved the per-CPU counter —
+/// this is the task-bound half. A CPU-pinned task event counts only
+/// occurrences on its CPU; a CPU-wide event never reaches this walk.
+///
+/// Runs at the phenomenon's site (trap handler, switch hook, cgroup move),
+/// so it must stay cheap when nothing is listening: the per-config live
+/// count gates the registry lock. The walk itself is best-effort
+/// (`try_lock`): a trap firing while the registry lock is held on this CPU
+/// (an `open`/`close` in progress) skips the attribution rather than
+/// spinning on a lock its own CPU holds — the per-CPU total already moved,
+/// so only a task-bound attribution can be dropped, never the count.
+pub(crate) fn note_task_sw_event(task: u64, cpu: usize, config: u64) {
+    let Some(slot) = sw_event_live_slot(config) else {
+        return;
+    };
+    if slot.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let Some(registry) = PERF_EVENT_REGISTRY.try_lock() else {
+        return;
+    };
+    for weak in registry.iter() {
+        let Some(event) = weak.upgrade() else {
+            continue;
+        };
+        if event.attr.type_ != PERF_TYPE_SOFTWARE || event.attr.config != config {
+            continue;
+        }
+        if !event.enabled.load(Ordering::Acquire) || !event.tracks_task(task) {
+            continue;
+        }
+        if event.target_cpu >= 0 && event.target_cpu as usize != cpu {
+            continue;
+        }
+        event.count_accumulated.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Last CPU each task switched out on, for `PERF_COUNT_SW_CPU_MIGRATIONS`:
+/// a switch-in on a different CPU than the recorded switch-out is one
+/// migration. Exact-match slots (`task` stored beside `cpu`): a hash
+/// collision loses a migration (the displaced task finds no slot for
+/// itself), it never invents one. Slots are cleared on thread exit, so a
+/// recycled task id cannot inherit a stale CPU.
+const MIGRATION_SLOTS: usize = 256;
+static MIGRATION_LAST_CPU: [(AtomicU64, AtomicU32); MIGRATION_SLOTS] =
+    [const { (AtomicU64::new(u64::MAX), AtomicU32::new(0)) }; MIGRATION_SLOTS];
+
+fn migration_slot(task: u64) -> usize {
+    (task.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MIGRATION_SLOTS.trailing_zeros())) as usize
+}
+
+/// Live CPU-wide `PERF_COUNT_SW_CPU_MIGRATIONS` events. The switch-out
+/// recording must run for CPU-wide events too (their reads come from the
+/// per-CPU counter alone), so the migration gate is the OR of this and the
+/// task-bound live count — never a registry scan per switch.
+static CPU_MIGRATION_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+fn migration_event_live() -> bool {
+    TASK_SW_EVENT_LIVE[PERF_COUNT_SW_CPU_MIGRATIONS as usize].load(Ordering::Acquire) != 0
+        || CPU_MIGRATION_EVENTS.load(Ordering::Acquire) != 0
+}
+
+/// Record a switch-out for migration detection. No-op unless a migration
+/// event is live.
+pub(crate) fn note_migration_switch_out(task: u64, cpu: usize) {
+    if !migration_event_live() {
+        return;
+    }
+    let (slot_task, slot_cpu) = &MIGRATION_LAST_CPU[migration_slot(task)];
+    slot_cpu.store(cpu as u32, Ordering::Relaxed);
+    slot_task.store(task, Ordering::Release);
+}
+
+/// Check a switch-in for a migration: the task's last switch-out was on a
+/// different CPU. No-op unless a migration event is live.
+pub(crate) fn note_migration_switch_in(task: u64, cpu: usize) {
+    if !migration_event_live() {
+        return;
+    }
+    let (slot_task, slot_cpu) = &MIGRATION_LAST_CPU[migration_slot(task)];
+    if slot_task.load(Ordering::Acquire) == task && slot_cpu.load(Ordering::Acquire) as usize != cpu
+    {
+        narf_lib::perf::note_sw_event(task, PERF_COUNT_SW_CPU_MIGRATIONS);
+    }
+}
+
+/// Clear a dead task's migration slot so a recycled task id cannot inherit
+/// its CPU and count a spurious migration on its first switch-in.
+pub(crate) fn clear_migration_slot(task: u64) {
+    let (slot_task, _) = &MIGRATION_LAST_CPU[migration_slot(task)];
+    if slot_task.load(Ordering::Acquire) == task {
+        slot_task.store(u64::MAX, Ordering::Release);
+    }
 }
 
 /// `(task-bound events, user-time cpu-clock events, filter count of task's
@@ -1409,6 +1552,28 @@ impl PerfEventFile {
                     }
                 }
                 PERF_COUNT_SW_TASK_CLOCK => self.task_software_count(),
+                // Real per-CPU counters (`narf_lib::perf`). A CPU-wide event
+                // reads its CPU's counter through the same base/accumulated
+                // machinery as the clocks; a task-bound event reads 0 here
+                // because its occurrences are counted straight into
+                // `count_accumulated` by the phenomenon's hook (see
+                // `note_task_sw_event`).
+                PERF_COUNT_SW_PAGE_FAULTS
+                | PERF_COUNT_SW_CONTEXT_SWITCHES
+                | PERF_COUNT_SW_CPU_MIGRATIONS
+                | PERF_COUNT_SW_PAGE_FAULTS_MIN
+                | PERF_COUNT_SW_PAGE_FAULTS_MAJ
+                | PERF_COUNT_SW_ALIGNMENT_FAULTS
+                | PERF_COUNT_SW_CGROUP_SWITCHES => {
+                    if self.target_task != u64::MAX {
+                        0
+                    } else {
+                        narf_lib::perf::snapshot_cpu_config(
+                            self.target_cpu as usize,
+                            self.attr.config,
+                        )
+                    }
+                }
                 _ => 0,
             };
         }
@@ -1444,9 +1609,10 @@ impl PerfEventFile {
             }
         }
 
-        // PERF_COUNT_SW_DUMMY is the only software event admitted until
-        // scheduler-owned, per-target software accounting exists. Its specified
-        // count is exactly zero.
+        // PERF_COUNT_SW_DUMMY is the only software event whose specified
+        // count is exactly zero. Every other admitted software event is
+        // handled in the match above; anything reaching here was rejected
+        // at the open site.
         0
     }
 
@@ -2781,6 +2947,10 @@ pub(crate) fn on_process_exit(pid: u64, tid: u64) {
 }
 
 pub(crate) fn on_thread_exit(_pid: u64, tid: u64) {
+    // A dead task's migration slot must not survive it: a recycled task id
+    // would otherwise inherit its CPU and count a spurious migration on its
+    // first switch-in. Cleared even with no live events, for the same reason.
+    clear_migration_slot(tid);
     if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -3585,12 +3755,22 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     if CPU_USER_CLOCK_EVENTS.load(Ordering::Relaxed) != 0 {
         account_cpu_user_switch(running);
     }
+    // Software counting events run before the task-bound early return:
+    // CPU-wide events count untracked switches too. A switch-out is one
+    // context switch for the outgoing task / this CPU; a switch-in on a
+    // different CPU than the task's last switch-out is one migration.
+    let cpu = narf_lib::percpu::current_cpu();
+    if !running {
+        narf_lib::perf::note_sw_event(task, PERF_COUNT_SW_CONTEXT_SWITCHES);
+        note_migration_switch_out(task, cpu);
+    } else {
+        note_migration_switch_in(task, cpu);
+    }
     // `perf_sched_events`: per-CPU events (perf top / perf record -a) need no
     // context-switch work at all.
     if TASK_BOUND_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let cpu = narf_lib::percpu::current_cpu();
     // `perf_event_task_sched_in/out` touch only a task with a perf context.
     // The multiplex cursor still needs every selected task (see below).
     if !perf_task_maybe_tracked(task) {
@@ -4949,10 +5129,33 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
         #[cfg(target_arch = "aarch64")]
         PERF_TYPE_HARDWARE | PERF_TYPE_RAW => aarch_pmu_event(attr).is_some(),
         // PERF_TYPE_SOFTWARE
-        PERF_TYPE_SOFTWARE => matches!(
-            attr.config,
-            PERF_COUNT_SW_DUMMY | PERF_COUNT_SW_CPU_CLOCK | PERF_COUNT_SW_TASK_CLOCK
-        ),
+        PERF_TYPE_SOFTWARE => match attr.config {
+            // Implemented: exact scheduler accounting (cpu/task clocks), the
+            // dummy event whose specified count is exactly zero, and the seven
+            // real software counters (`narf_lib::perf` per-CPU counters for
+            // CPU-wide events, direct `count_accumulated` bumps for
+            // task-bound ones — see `note_task_sw_event`).
+            PERF_COUNT_SW_DUMMY
+            | PERF_COUNT_SW_CPU_CLOCK
+            | PERF_COUNT_SW_TASK_CLOCK
+            | PERF_COUNT_SW_PAGE_FAULTS
+            | PERF_COUNT_SW_CONTEXT_SWITCHES
+            | PERF_COUNT_SW_CPU_MIGRATIONS
+            | PERF_COUNT_SW_PAGE_FAULTS_MIN
+            | PERF_COUNT_SW_PAGE_FAULTS_MAJ
+            | PERF_COUNT_SW_ALIGNMENT_FAULTS
+            | PERF_COUNT_SW_CGROUP_SWITCHES => true,
+            // Recognized but uncounted, and never estimated or silently zero:
+            // `EMULATION_FAULTS` has no countable source in the tree (no
+            // instruction-emulation path: no vsyscall emulation on x86, no
+            // undefined-instruction/MRS emulation on aarch64), and
+            // `BPF_OUTPUT` is not a counter at all — it is the sink for
+            // `bpf_perf_event_output()`, which has no helper and no
+            // PERF_EVENT_ARRAY map type in the tree yet. The open site
+            // declines these as EOPNOTSUPP.
+            PERF_COUNT_SW_EMULATION_FAULTS | PERF_COUNT_SW_BPF_OUTPUT => false,
+            _ => false,
+        },
         PERF_TYPE_TRACEPOINT => attr.config != 0,
         // PERF_TYPE_HW_CACHE (3)
         #[cfg(target_arch = "x86_64")]

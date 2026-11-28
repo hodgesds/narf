@@ -2062,7 +2062,10 @@ struct FaultExpansion {
 /// what makes bulk faulting acyclic (see `demand_alloc_range` in
 /// `narf-memory` and [`demand_frames_batch`] below).
 pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
-    let (phys, expansion) = demand_frame_inner(address_space_id, vaddr)?;
+    // The faulting task's id rides along so the fill counts as a minor
+    // (page-cache hit) or major (file read) fault for that task.
+    let (phys, expansion) =
+        demand_frame_inner(address_space_id, vaddr, crate::handlers::current_task_id())?;
     if let Some(expansion) = expansion {
         // A recorded batch (#737 step 2) outranks the fixed window:
         // the caller once named this whole range as its upcoming scan,
@@ -2106,7 +2109,9 @@ pub(crate) fn demand_frames_batch(address_space_id: u64, first_vaddr: u64, out: 
         if let Some(consumed) = fill_cached_run(address_space_id, vaddr, &mut out[index..]) {
             index += consumed;
         } else {
-            if let Ok((phys, _)) = demand_frame_inner(address_space_id, vaddr) {
+            // Batch prefetch, never a fault: fault_task 0, so the fill
+            // counts nothing even when it reads from the file.
+            if let Ok((phys, _)) = demand_frame_inner(address_space_id, vaddr, 0) {
                 out[index] = phys;
             }
             index += 1;
@@ -2333,9 +2338,21 @@ fn register_writeback(
 /// a leaf — it is the whole of what `demand_frame` did before
 /// fault-around existed, shared by the single-page hook and the batch
 /// fill hook.
+/// Count one minor/major file fault for the faulting task, if this fill
+/// serves a fault at all. `fault_task == 0` means batch prefetch (the
+/// `fault_around` window / a recorded batch) or a test — never a fault,
+/// counts nothing. Only the faulting page is counted; prefetch is not.
+#[inline]
+fn note_file_fault(task: u64, config: u64) {
+    if task != 0 {
+        narf_lib::perf::note_sw_event(task, config);
+    }
+}
+
 fn demand_frame_inner(
     address_space_id: u64,
     vaddr: u64,
+    fault_task: u64,
 ) -> Result<(u64, Option<FaultExpansion>), FileFaultError> {
     let page = vaddr & !0xFFFu64;
     let owner_bucket = existing_mapping_owners(address_space_id).ok_or(FileFaultError::NoOwner)?;
@@ -2362,6 +2379,8 @@ fn demand_frame_inner(
     };
     if private_copy {
         let phys = crate::handlers::load_file_demand_page(&ops, offset).map_err(fault_error)?;
+        // A private-copy fill always reads the file: a major fault.
+        note_file_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MAJ);
         // `padzero()`: the bytes from an ELF segment's `p_filesz` to the end of
         // that page are `.bss` and must read as zero, not as whatever the file
         // holds there. Only this private copy is touched.
@@ -2398,7 +2417,11 @@ fn demand_frame_inner(
             .map_err(|_: crate::killable_wait::Killed| FileFaultError::Bus)?
             .ok_or(FileFaultError::Bus)?
             .map_err(fault_error)
-            .map(|phys| (phys, None));
+            .map(|phys| {
+                // An I/O-backed provider fill reads the file: a major fault.
+                note_file_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MAJ);
+                (phys, None)
+            });
     }
 
     // Linux filemap_fault first looks in the inode page cache, then reads a
@@ -2409,10 +2432,16 @@ fn demand_frame_inner(
         return Err(FileFaultError::Bus);
     }
     let mut attempts = 0usize;
+    // Whether the loop below resolved the fault from the page cache
+    // (minor) rather than a file read (major). Set at the cache-hit
+    // break; the count itself lands once, at the success return below,
+    // so a stale fill re-read inside the loop never counts twice.
+    let mut cache_hit = false;
     let (phys, publication, expected_generation) = loop {
         let changes_at_read = writeback::content_changes(ops.mmap_backing_identity());
         let expected_generation = ops.mmap_cache_generation();
         if let Some((phys, publication)) = reserve_cached_shared_file_pages(&ops, offset, 1) {
+            cache_hit = true;
             break (
                 *phys.first().ok_or(FileFaultError::NoMemory)?,
                 publication,
@@ -2492,6 +2521,17 @@ fn demand_frame_inner(
     // for a sequential reader before the fault returns
     // (`do_fault_around`, #734) — the expansion itself lives there,
     // never in this fill core.
+    //
+    // A page-cache hit resolves the fault without I/O (minor); a file
+    // read resolves it with I/O (major). One fault, one count.
+    note_file_fault(
+        fault_task,
+        if cache_hit {
+            narf_lib::perf::SW_PAGE_FAULTS_MIN
+        } else {
+            narf_lib::perf::SW_PAGE_FAULTS_MAJ
+        },
+    );
     Ok((
         phys.raw(),
         Some(FaultExpansion {

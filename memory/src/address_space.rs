@@ -10498,7 +10498,39 @@ impl AddressSpace {
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         // SAFETY: forwarded caller contract.
-        unsafe { self.demand_page_in(vaddr, false) }
+        unsafe { self.demand_page_in(vaddr, false, 0) }
+    }
+
+    /// The fault-serving twin of [`Self::demand_alloc_page`]: identical,
+    /// except the faulting task's id is carried through so the resolution
+    /// can be counted as a minor or major fault for that task (see
+    /// `demand_page_in`'s `fault_task`). Used only by the trap paths, via
+    /// `frame::reclaim_wait::try_demand_page`; every other caller (mlock,
+    /// GUP, tests) is not a fault and keeps the unattributed entry point.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_page`].
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn demand_alloc_page_for_fault(
+        &self,
+        vaddr: VirtAddr,
+        fault_task: u64,
+    ) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.demand_page_in(vaddr, false, fault_task) }
+    }
+
+    /// Count one minor/major fault for the faulting task, if this demand
+    /// fill serves a fault at all. `fault_task == 0` means a non-fault
+    /// caller (mlock, GUP, remote access, tests) — never a fault, counts
+    /// nothing. A real task id attributes the fault to the task-bound event
+    /// tracking it (via the `narf_lib::perf` hook) and moves the per-CPU
+    /// counter.
+    #[inline]
+    fn note_fault(task: u64, config: u64) {
+        if task != 0 {
+            narf_lib::perf::note_sw_event(task, config);
+        }
     }
 
     /// The body of [`Self::demand_alloc_page`]. `force` is Linux's
@@ -10515,6 +10547,7 @@ impl AddressSpace {
         &self,
         vaddr: VirtAddr,
         force: bool,
+        fault_task: u64,
     ) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb_demand, MapError};
         let v = vaddr.as_u64() & !0xFFFu64;
@@ -10616,7 +10649,13 @@ impl AddressSpace {
                 }
             });
             let error = match loaded {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    // A swap-in resolves the fault with I/O: a major fault.
+                    // The batch may have read ahead, but this counts the
+                    // one faulting page only.
+                    Self::note_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MAJ);
+                    return Ok(());
+                }
                 Err(error) => error,
             };
             let mut table = self.regions.lock();
@@ -10712,7 +10751,12 @@ impl AddressSpace {
             }
         })?;
         if let DemandPageClaim::Revoked(phys) = claim {
-            return device_revoke::await_refault(phys);
+            // A device-revoked page refaults without I/O: a minor fault.
+            let result = device_revoke::await_refault(phys);
+            if result.is_ok() {
+                Self::note_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MIN);
+            }
+            return result;
         }
         if let DemandPageClaim::InProgress(ticket) = claim {
             return demand_wait::wait(self, v, ticket);
@@ -10724,6 +10768,9 @@ impl AddressSpace {
             external_refs,
         } = claim
         else {
+            // Already-backed repair: the page was resident, only its leaf
+            // was missing — a minor fault.
+            Self::note_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MIN);
             return Ok(());
         };
 
@@ -10808,6 +10855,13 @@ impl AddressSpace {
             } else if !file_backed || !externally_owned {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
+        }
+        if published && !file_backed {
+            // An anonymous page is a fresh zeroed frame: a minor fault,
+            // counted once the leaf is published (the fault healed).
+            // File-backed fills count at their fill decision inside
+            // `demand_frame_inner` instead.
+            Self::note_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MIN);
         }
         Ok(())
     }
@@ -11015,7 +11069,22 @@ impl AddressSpace {
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         // SAFETY: forwarded caller contract.
-        unsafe { self.demand_page_in(vaddr, false) }
+        unsafe { self.demand_page_in(vaddr, false, 0) }
+    }
+
+    /// aarch64 twin of [`Self::demand_alloc_page_for_fault`]; see its
+    /// documentation.
+    ///
+    /// # Safety
+    /// As [`Self::demand_alloc_page`].
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn demand_alloc_page_for_fault(
+        &self,
+        vaddr: VirtAddr,
+        fault_task: u64,
+    ) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.demand_page_in(vaddr, false, fault_task) }
     }
 
     /// aarch64 twin of the x86_64 `demand_page_in`; see its documentation.
@@ -11027,6 +11096,7 @@ impl AddressSpace {
         &self,
         vaddr: VirtAddr,
         force: bool,
+        fault_task: u64,
     ) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError};
         let v = vaddr.as_u64() & !0xFFFu64;
@@ -11066,7 +11136,12 @@ impl AddressSpace {
             }
         })?;
         if let DemandPageClaim::Revoked(phys) = claim {
-            return device_revoke::await_refault(phys);
+            // A device-revoked page refaults without I/O: a minor fault.
+            let result = device_revoke::await_refault(phys);
+            if result.is_ok() {
+                Self::note_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MIN);
+            }
+            return result;
         }
         if let DemandPageClaim::InProgress(ticket) = claim {
             return demand_wait::wait(self, v, ticket);
@@ -11078,6 +11153,9 @@ impl AddressSpace {
             external_refs,
         } = claim
         else {
+            // Already-backed repair: the page was resident, only its leaf
+            // was missing — a minor fault.
+            Self::note_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MIN);
             return Ok(());
         };
 
@@ -11147,6 +11225,16 @@ impl AddressSpace {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
         }
+        if published && !file_backed {
+            // An anonymous page is a fresh zeroed frame: a minor fault,
+            // counted once the leaf is published (the fault healed).
+            // File-backed fills count at their fill decision inside
+            // `demand_frame_inner` instead.
+            // NOTE: this twin has no swap-in arm (swap-in batching lives
+            // only in the x86_64 twin), so a major fault on a swapped page
+            // has no counting site on aarch64 yet — see the design record.
+            Self::note_fault(fault_task, narf_lib::perf::SW_PAGE_FAULTS_MIN);
+        }
         Ok(())
     }
 
@@ -11192,6 +11280,7 @@ impl AddressSpace {
         &self,
         _vaddr: VirtAddr,
         _force: bool,
+        _fault_task: u64,
     ) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
     }

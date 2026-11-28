@@ -102,6 +102,14 @@ fn process_task(pid: u64) -> Option<TaskId> {
     resolve(pid).map(TaskId)
 }
 
+/// Resolve a process id to the executor task id of its main thread, for
+/// perf attribution: a cgroup move is counted for the task that moved.
+/// `None` when no task is known for the pid — the caller skips the count
+/// rather than attributing the move to a stale or wrong task.
+pub fn task_id_for_process(pid: u64) -> Option<u64> {
+    process_task(pid).map(|task| task.0)
+}
+
 /// Temporarily install a process-to-task resolver while an in-kernel
 /// regression test exercises the cgroup seam, then restore the boot-time
 /// resolver. Kernel tests share one address space, so leaving a synthetic
