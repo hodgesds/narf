@@ -713,6 +713,133 @@ fn mmput(space: &Arc<AddressSpace>) {
     }
 }
 
+/// Bound on address-space teardowns deferred to the background reclaimer
+/// (below). Caps the memory a burst of execs can hold past the execve
+/// syscall: past the bound the exec path tears down inline, exactly as
+/// before. Tunable; 4 is small enough to bound deferred memory and large
+/// enough that an exec storm still defers in the common case.
+const MAX_DEFERRED_AS_TEARDOWNS: usize = 4;
+
+/// Teardowns accepted by `mmput_deferred` and not yet run by the reclaimer.
+static DEFERRED_AS_TEARDOWNS: AtomicUsize = AtomicUsize::new(0);
+
+/// A displaced address space queued for background teardown. `work` is the
+/// first field so the work function recovers the container from the
+/// `WorkRef` by cast, as `DelayedWork` and the `Counted` workqueue-test
+/// work do.
+#[repr(C)]
+struct AsTeardownWork {
+    work: workqueue::WorkStruct,
+    space: Option<Arc<AddressSpace>>,
+}
+
+/// The background reclaimer: run the deferred `mmput` (detach → `exit_mmap`
+/// iff the last user), drop our `Arc`, and free the container. Runs on a
+/// `system_wq` pool worker in task context, where `exit_mmap`'s locks,
+/// shootdowns and allocations are legal — the same context class `exit_mm`
+/// runs it in on process exit.
+fn as_teardown_work_fn(r: workqueue::WorkRef) {
+    // SAFETY: only `mmput_deferred` queues this function, and `work` is the
+    // first field of the repr(C) container, so the cast recovers it.
+    let container = unsafe { &mut *(r.as_ptr() as *mut AsTeardownWork) };
+    if let Some(space) = container.space.take() {
+        mmput(&space);
+    }
+    DEFERRED_AS_TEARDOWNS.fetch_sub(1, Ordering::AcqRel);
+    // SAFETY: the container was heap-allocated by `mmput_deferred` for this
+    // single queueing; the workqueue never touches it after the function
+    // returns, and nothing else holds a pointer to it.
+    let _ = unsafe { Box::from_raw(container as *mut AsTeardownWork) };
+}
+
+/// True when the executing CPU's NUMA node is under its `low` watermark —
+/// the per-node signal its `kswapd<node>` should reclaim — or, when SRAT
+/// topology wasn't published, when free memory is under the global `low`
+/// watermark. `mmput_deferred` keys its inline fallback off this instead of
+/// a global free-frames count: on a multi-node machine one pressured node
+/// must not force every teardown inline, and a low global count with no node
+/// under reclaim pressure is not a reason to stop deferring.
+///
+/// Why the local node, not the displaced space's exact nodes:
+/// `AddressSpace` only exposes per-node residency via
+/// `numa_regions_snapshot()`, which walks all regions and allocates a `Vec`
+/// — too expensive for a fallback predicate on the execve path. The
+/// exec'ing task runs on the current CPU and its pages were allocated
+/// preferentially on that node, so the local node is the faithful cheap
+/// proxy. `low`, not `min`: `low` is the "reclaim should run" signal;
+/// `min` is the emergency reserve.
+fn node_under_reclaim_pressure() -> bool {
+    match local_node() {
+        Some(node) => narf_memory::reclaim::under_low_watermark_node(node as usize),
+        None => narf_memory::reclaim::under_low_watermark(),
+    }
+}
+
+/// Deferred `mmput` for a displaced address space (execve E2).
+///
+/// Instead of running `exit_mmap` inline on the execve path, hand the
+/// displaced `Arc` to a `system_wq` worker, which runs the exact same
+/// `mmput` (detach → `exit_mmap` iff the last user) and then drops it.
+///
+/// Why the deferred `Drop` cannot free a live root: the scheduler's
+/// active-mm handoff strongly owns every installed root — `prepare`
+/// activates the next root before replacing `active`, `restore` restores
+/// the incoming root before dropping it, and `finish_poll` restores on
+/// mismatch — so reaching the last `Arc` drop proves every CPU has
+/// switched away (`Drop for AddressSpace` contract), and the tag
+/// retirement shootdowns stale TLB entries before the tag can be reused.
+/// The worker's clone is additional, never a replacement for the
+/// handoff's `Arc`, and `exit_mmap` still runs only after the detach's
+/// zero transition, which proves no task can execute, fault or map
+/// through the space again. The one new window (swap → worker detach)
+/// leaves the old space fully mapped with count 1; no task can reach it
+/// — every scheduler publication already names the new space — and the
+/// only new attachers, `mmget_not_zero` readers, bump the count and
+/// thereby prevent the zero transition.
+///
+/// Falls back to inline `mmput` when the deferred queue is at its bound,
+/// when the executing CPU's NUMA node is under its `low` watermark (or the
+/// global `low` watermark when topology is unpublished), or when no
+/// workqueue pool exists yet (pre-boot). `exit_mm` (process exit) keeps the
+/// inline path.
+fn mmput_deferred(space: &Arc<AddressSpace>) {
+    let previous = DEFERRED_AS_TEARDOWNS.fetch_add(1, Ordering::AcqRel);
+    if previous >= MAX_DEFERRED_AS_TEARDOWNS || node_under_reclaim_pressure() {
+        DEFERRED_AS_TEARDOWNS.fetch_sub(1, Ordering::AcqRel);
+        mmput(space);
+        return;
+    }
+    let boxed = Box::new(AsTeardownWork {
+        work: workqueue::WorkStruct::new(workqueue::WorkFn::Sync(as_teardown_work_fn)),
+        space: Some(Arc::clone(space)),
+    });
+    let raw = Box::into_raw(boxed);
+    // SAFETY: the box stays at its address until the work function frees
+    // it; queue failure frees it here instead.
+    let queued = unsafe { workqueue::queue_work(workqueue::system_wq(), &(*raw).work) };
+    if !queued {
+        DEFERRED_AS_TEARDOWNS.fetch_sub(1, Ordering::AcqRel);
+        // SAFETY: queueing failed, so the work is neither pending nor
+        // running; reclaim the box.
+        let _ = unsafe { Box::from_raw(raw) };
+        mmput(space);
+    }
+}
+
+/// Tests drive the bound fallback through this setter. The pending count
+/// is reset by `__reset_queues_for_test` alongside the pools.
+#[doc(hidden)]
+pub fn __set_deferred_as_teardowns_for_test(n: usize) {
+    DEFERRED_AS_TEARDOWNS.store(n, Ordering::Release);
+}
+
+/// Tests read the pending count through this getter (deferred-proof: the
+/// count is nonzero while the reclaimer work is queued, zero after it ran).
+#[doc(hidden)]
+pub fn __deferred_as_teardowns_for_test() -> usize {
+    DEFERRED_AS_TEARDOWNS.load(Ordering::Acquire)
+}
+
 static EXIT_MMAP_COUNT: AtomicU64 = AtomicU64::new(0);
 static EXIT_MMAP_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 static EXIT_MMAP_MAX_NS: AtomicU64 = AtomicU64::new(0);
@@ -3933,6 +4060,11 @@ pub fn __reset_queues_for_test() {
     // The worker tasks of every pool go with the queues: the next use of a
     // workqueue creates fresh pools.
     workqueue::__reset_for_test();
+    // Deferred address-space teardowns go with the pools: a test that
+    // triggers one must drain the executor (run_until_empty) before
+    // returning, so no teardown work is pending here. Reset the count
+    // alongside the pools it is accounted against.
+    DEFERRED_AS_TEARDOWNS.store(0, Ordering::Release);
     for (cpu, q) in READY.iter().enumerate() {
         blocking::reset(cpu);
         if let Some(d) = q.lock().as_mut() {
@@ -6185,9 +6317,15 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         // An exec that displaced the last user of the old space is its
         // `mmput` (Linux `exec_mmap`): the caller no longer touches the old
         // image, and the teardown's invalidation covers this CPU, which still
-        // runs on the old root until the new one is activated.
+        // runs on the old root until the new one is activated. The detach
+        // and teardown are deferred to the background reclaimer
+        // (`mmput_deferred`) so the execve path does not pay the
+        // per-region `exit_mmap`; the invalidation argument is unchanged —
+        // `exit_mmap`'s shootdown covers this CPU's lazy root before any
+        // table frame is freed, and the last-`Arc` drop still cannot run
+        // while the active-mm handoff owns the installed root.
         if let Some(previous) = previous_active.as_ref() {
-            mmput(previous);
+            mmput_deferred(previous);
         }
         let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
         let prev = p
@@ -6216,7 +6354,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             // lock is released; the reaper waker may itself touch scheduler
             // state.
             if let Some(previous) = prev.as_ref() {
-                mmput(previous);
+                mmput_deferred(previous);
             }
             return prev;
         }
@@ -6235,7 +6373,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         };
         if let Some(prev) = replaced {
             if let Some(previous) = prev.as_ref() {
-                mmput(previous);
+                mmput_deferred(previous);
             }
             return prev;
         }
