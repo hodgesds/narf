@@ -60,6 +60,7 @@ pub mod handlers;
 pub mod hwcap;
 pub mod init;
 pub mod interp;
+mod io_accounting;
 pub mod io_mux;
 pub mod keyring;
 mod killable_wait;

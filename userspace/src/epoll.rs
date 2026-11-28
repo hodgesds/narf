@@ -132,6 +132,14 @@ impl core::fmt::Debug for EpollSnapshot {
 struct EpollRegistration {
     fd: i32,
     active: AtomicBool,
+    /// MOD publishes this after updating `state`, while holding its lock.
+    /// A collector samples only this identity before polling, then validates
+    /// it under `state` before committing. No pre-poll state lock is needed.
+    sub_id: core::sync::atomic::AtomicU64,
+    /// Callback-side armed check. Writers hold `state`; callbacks never need
+    /// that lock merely to reject a disarmed oneshot. Delivery still validates
+    /// the authoritative event mask under `state`.
+    enabled: AtomicBool,
     ready_state: AtomicU8,
     /// Intrusive ready-list links. The owning instance's `ready` lock is the
     /// sole writer; atomics make the stable `Arc` node `Sync` without a second
@@ -145,10 +153,6 @@ struct EpollRegistration {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct EpollItemState {
-    /// Every provider arm gets a fresh identity. A stale ADD/MOD completion can
-    /// therefore disarm only its own waiter, never a newer re-arm that won the
-    /// race on this registration.
-    sub_id: u64,
     events: u32,
     data: u64,
     last_mask: u32,
@@ -167,13 +171,14 @@ impl EpollRegistration {
         Arc::new(Self {
             fd,
             active: AtomicBool::new(true),
+            sub_id: core::sync::atomic::AtomicU64::new(sub_id),
+            enabled: AtomicBool::new(Self::events_enabled(events)),
             ready_state: AtomicU8::new(READY_IDLE),
             ready_prev: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             ready_next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             file: Arc::downgrade(file),
             offset,
             state: IrqSafeSpinLock::new(EpollItemState {
-                sub_id,
                 events,
                 data,
                 last_mask: 0,
@@ -183,16 +188,27 @@ impl EpollRegistration {
     }
 
     fn snapshot(self: &Arc<Self>) -> EpollSnapshot {
-        let state = *self.state.lock();
+        let state = self.state.lock();
         EpollSnapshot {
             registration: Arc::clone(self),
             file: self.file.clone(),
             offset: self.offset,
-            sub_id: state.sub_id,
+            sub_id: self.sub_id.load(Ordering::Relaxed),
             events: state.events,
             data: state.data,
             last_mask: state.last_mask,
         }
+    }
+
+    fn events_enabled(events: u32) -> bool {
+        (events & EPOLLONESHOT) == 0 || (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) != 0
+    }
+
+    /// Called only while holding this registration's state lock.
+    fn set_events(&self, state: &mut EpollItemState, events: u32) {
+        state.events = events;
+        self.enabled
+            .store(Self::events_enabled(events), Ordering::Release);
     }
 }
 
@@ -347,21 +363,37 @@ impl EpollReady {
     }
 
     fn link_node(&mut self, registration: &Arc<EpollRegistration>) {
+        self.link_node_at(registration, false);
+    }
+
+    fn link_node_at(&mut self, registration: &Arc<EpollRegistration>, front: bool) {
         debug_assert_eq!(registration.ready_state.load(Ordering::Relaxed), READY_IDLE);
         let node = Arc::into_raw(Arc::clone(registration)) as *mut EpollRegistration;
-        let tail = self.tail.load(Ordering::Relaxed);
-        registration.ready_prev.store(tail, Ordering::Relaxed);
-        registration
-            .ready_next
-            .store(core::ptr::null_mut(), Ordering::Relaxed);
-        if tail.is_null() {
+        let neighbor = if front {
+            self.head.load(Ordering::Relaxed)
+        } else {
+            self.tail.load(Ordering::Relaxed)
+        };
+        let (prev, next) = if front {
+            (core::ptr::null_mut(), neighbor)
+        } else {
+            (neighbor, core::ptr::null_mut())
+        };
+        registration.ready_prev.store(prev, Ordering::Relaxed);
+        registration.ready_next.store(next, Ordering::Relaxed);
+        if prev.is_null() {
             self.head.store(node, Ordering::Relaxed);
         } else {
-            // SAFETY: a non-null tail is linked and kept alive by the ready
-            // queue's raw Arc reference. This lock is the only link writer.
-            unsafe { (&*tail).ready_next.store(node, Ordering::Relaxed) };
+            // SAFETY: a non-null neighbor is linked and kept alive by its
+            // queue-owned raw Arc. The ready lock is the only link writer.
+            unsafe { (&*prev).ready_next.store(node, Ordering::Relaxed) };
         }
-        self.tail.store(node, Ordering::Relaxed);
+        if next.is_null() {
+            self.tail.store(node, Ordering::Relaxed);
+        } else {
+            // SAFETY: same queue-owned neighbor and exclusive lock as above.
+            unsafe { (&*next).ready_prev.store(node, Ordering::Relaxed) };
+        }
         self.len += 1;
         // Publish membership only after both neighboring links are complete.
         registration
@@ -447,6 +479,15 @@ impl EpollReady {
     /// appended exactly once for a later collector. This is the compact
     /// per-node equivalent of Linux's scan-list/overflow-list handoff.
     fn finish_poll(&mut self, registration: &Arc<EpollRegistration>, keep_ready: bool) {
+        self.finish_poll_at(registration, keep_ready, false);
+    }
+
+    fn finish_poll_at(
+        &mut self,
+        registration: &Arc<EpollRegistration>,
+        keep_ready: bool,
+        front: bool,
+    ) {
         let state = registration.ready_state.load(Ordering::Relaxed);
         if !registration.active.load(Ordering::Acquire) {
             registration
@@ -462,11 +503,11 @@ impl EpollReady {
                 registration
                     .ready_state
                     .store(READY_IDLE, Ordering::Relaxed);
-                self.link_node(registration);
+                self.link_node_at(registration, front);
             }
             READY_IDLE => {
                 if keep_ready {
-                    self.link_node(registration);
+                    self.link_node_at(registration, front);
                 }
             }
             READY_QUEUED => {
@@ -855,13 +896,8 @@ impl EpollInstance {
         // `ep_poll_callback`: "If the event mask does not contain any poll(2)
         // event, we consider the descriptor to be disabled" — a disarmed
         // EPOLLONESHOT item is neither queued nor allowed to take a wake.
-        {
-            let events = registration.state.lock().events;
-            if (events & EPOLLONESHOT) != 0
-                && (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
-            {
-                return;
-            }
+        if !registration.enabled.load(Ordering::Acquire) {
+            return;
         }
         if !self.list_ready(registration) {
             return;
@@ -995,9 +1031,9 @@ impl EpollInstance {
     /// identity-checked ready/fallback removal prevents a delayed DEL of an old
     /// numeric fd from unlinking its replacement.
     fn retire_registration(&self, registration: &Arc<EpollRegistration>) -> u64 {
-        let state = registration.state.lock();
+        let _state = registration.state.lock();
         registration.active.store(false, Ordering::Release);
-        let sub_id = state.sub_id;
+        let sub_id = registration.sub_id.load(Ordering::Relaxed);
         let mut ready = self.ready.lock();
         ready.unlink(registration);
         ready.remove_always_poll(registration);
@@ -1020,7 +1056,7 @@ impl EpollInstance {
         {
             let state = registration.state.lock();
             if !registration.active.load(Ordering::Acquire)
-                || state.sub_id != sub_id
+                || registration.sub_id.load(Ordering::Relaxed) != sub_id
                 || state.events != events
             {
                 return;
@@ -1043,7 +1079,9 @@ impl EpollInstance {
         let forwards_deadline = as_epoll(file).is_some();
         let (ready_now, seeded) = {
             let mut state = registration.state.lock();
-            if !registration.active.load(Ordering::Acquire) || state.sub_id != sub_id {
+            if !registration.active.load(Ordering::Acquire)
+                || registration.sub_id.load(Ordering::Relaxed) != sub_id
+            {
                 drop(state);
                 file.disarm_readiness(sub_id);
                 return;
@@ -1149,10 +1187,9 @@ impl EpollInstance {
             }
             let registration = Arc::clone(&item.registration);
             let mut state = item.registration.state.lock();
-            let old_sub_id = state.sub_id;
+            let old_sub_id = registration.sub_id.load(Ordering::Relaxed);
             let new_sub_id = next_sub_id();
-            state.sub_id = new_sub_id;
-            state.events = events;
+            registration.set_events(&mut state, events);
             state.data = data;
             // Linux re-evaluates the fd against its new mask on every MOD and
             // re-adds it to the ready list if currently ready — so a MOD acts as
@@ -1160,6 +1197,7 @@ impl EpollInstance {
             // rising-mask edge state, exactly as `ctl_add` initializes it, so the
             // next scan treats current readiness as a rising edge.
             state.last_mask = 0;
+            registration.sub_id.store(new_sub_id, Ordering::Release);
             (registration, old_sub_id, new_sub_id)
         };
         // The fresh id makes disarm/re-arm order safe against another MOD or
@@ -1278,6 +1316,13 @@ impl EpollInstance {
     /// CTL_MOD/DEL or this instance's drop.
     fn disarm_wait_node(&self, node: &Arc<EpollWaitNode>) {
         let owner = self as *const Self as usize;
+        // Only this task can publish its node; callbacks can select an
+        // existing node but cannot attach it. An immediate, never-parked wait
+        // therefore has no cleanup to do. Recheck under the lock for detach
+        // races with instance destruction / forced task cleanup.
+        if node.owner.load(Ordering::Acquire) != owner {
+            return;
+        }
         let removed = {
             let mut waiters = self.waiters.lock();
             if node.owner.load(Ordering::Acquire) != owner {
@@ -1310,7 +1355,7 @@ impl EpollInstance {
         self.disarm_wait_node(unsafe { &(*uctx).epoll_wait_node });
     }
 
-    /// Two-tier delivery: a bounded pass over the ready-list plus one fair
+    /// Two-tier delivery: bounded batches over the ready-list plus one fair
     /// non-cell-backed source, then (only if needed) a scan of the non-cell
     /// fallback set. Durable registrations make the ready-list authoritative
     /// for cell-backed files, so an empty eventfd/socket/pipe wait never scans
@@ -1321,11 +1366,45 @@ impl EpollInstance {
         task_id: u64,
         maxevents: usize,
     ) -> SmallBuf<(u32, u64), COLLECT_STACK_CAP> {
-        let fast = self.collect_ready_pass(task_id, maxevents, false);
-        if !fast.is_empty() {
-            return fast;
+        // ep_send_events counts delivered events, not stale candidates, toward
+        // maxevents. Keep looking after an empty batch so a drained fd cannot
+        // hide a live one behind it or force a needless park/self-wake cycle.
+        // The first ready-lock acquisition samples the scan budget; subsequent
+        // batches only spend it. Repeated callbacks cannot keep this call alive
+        // indefinitely. Stop on the first nonempty batch, before revisiting any
+        // LT entries it requeued.
+        let mut scan_remaining = usize::MAX;
+        // Reserve only the requested count on the common immediately-ready
+        // path. Once stale entries are found, amortize queue locking over a
+        // private window, independent of a caller's maxevents=1. Other waiters
+        // may continue collecting the rest of the shared FIFO.
+        let mut candidate_limit = maxevents.max(1);
+        loop {
+            let (fast, ready_remains) = self.collect_ready_pass(
+                task_id,
+                maxevents,
+                candidate_limit,
+                false,
+                &mut scan_remaining,
+            );
+            if !fast.is_empty() {
+                self.finish_ready_cycle_with(ready_remains);
+                return fast;
+            }
+            if scan_remaining == 0 {
+                break;
+            }
+            candidate_limit = candidate_limit.max(COLLECT_STACK_CAP);
         }
-        self.collect_ready_pass(task_id, maxevents, true)
+        let (fallback, ready_remains) = self.collect_ready_pass(
+            task_id,
+            maxevents,
+            candidate_limit,
+            true,
+            &mut scan_remaining,
+        );
+        self.finish_ready_cycle_with(ready_remains);
+        fallback
     }
 
     fn finish_ready_cycle_with(&self, ready_remains: bool) {
@@ -1350,8 +1429,10 @@ impl EpollInstance {
         &self,
         _task_id: u64,
         maxevents: usize,
+        candidate_limit: usize,
         full: bool,
-    ) -> SmallBuf<(u32, u64), COLLECT_STACK_CAP> {
+        scan_remaining: &mut usize,
+    ) -> (SmallBuf<(u32, u64), COLLECT_STACK_CAP>, bool) {
         // Candidate snapshot, taken without holding the lock across the
         // poll_readiness() calls (which may themselves lock). Fast pass polls
         // the ready-list (fds whose per-fd waker fired or that were seeded at
@@ -1367,38 +1448,26 @@ impl EpollInstance {
         // changes it to PENDING, and write-back republishes that occurrence.
         // This is the role Linux's private txlist+ovflist pair serves, without a
         // global generation counter.
-        let snapshot: SmallBuf<(i32, EpollSnapshot, bool), COLLECT_STACK_CAP> = if full {
-            let (scan_after, fallback): (
-                Option<i32>,
-                SmallBuf<(i32, Arc<EpollRegistration>), COLLECT_STACK_CAP>,
-            ) = {
-                let ready = self.ready.lock();
-                let mut fallback = SmallBuf::new();
-                for (fd, (registration, _)) in ready.always_poll.iter() {
-                    fallback.push((*fd, Arc::clone(registration)));
-                }
-                (ready.scan_after, fallback)
-            };
-            let mut entries: SmallBuf<(i32, EpollSnapshot, bool), COLLECT_STACK_CAP> =
-                SmallBuf::new();
-            for (fd, registration) in fallback.iter() {
-                if registration.active.load(Ordering::Acquire) {
-                    entries.push((*fd, registration.snapshot(), false));
-                }
+        let candidates: SmallBuf<ReadyCandidate, COLLECT_STACK_CAP> = if full {
+            let ready = self.ready.lock();
+            let mut entries: SmallBuf<ReadyCandidate, COLLECT_STACK_CAP> = SmallBuf::new();
+            for (registration, _) in ready.always_poll.values() {
+                entries.push((Arc::clone(registration), false));
             }
-            if let Some(after) = scan_after {
-                if let Some(start) = entries.iter().position(|(fd, _, _)| *fd > after) {
+            if let Some(after) = ready.scan_after {
+                if let Some(start) = entries.iter().position(|(reg, _)| reg.fd > after) {
                     entries.rotate_left(start);
                 }
             }
             entries
         } else {
-            // Detach no more ready candidates than this wait can return.
-            // Different waiters therefore reserve different FIFO nodes in O(1)
-            // instead of searching a shared ordered index.
-            let limit = maxevents.max(1);
-            let candidates: SmallBuf<ReadyCandidate, COLLECT_STACK_CAP> = {
+            // The private window owns detached nodes until one merge. Provider
+            // callbacks only mark them PENDING; no event can be lost while we
+            // skip stale entries without repeatedly locking the shared queue.
+            {
                 let mut ready = self.ready.lock();
+                *scan_remaining = (*scan_remaining).min(ready.len);
+                let limit = candidate_limit.min(*scan_remaining);
                 let always = if ready.always_poll.is_empty() {
                     None
                 } else {
@@ -1435,6 +1504,7 @@ impl EpollInstance {
                     let Some(registration) = ready.pop_front() else {
                         break;
                     };
+                    *scan_remaining -= 1;
                     candidates.push((registration, true));
                 }
                 if !always_first {
@@ -1443,18 +1513,7 @@ impl EpollInstance {
                     }
                 }
                 candidates
-            };
-
-            let mut snapshot: SmallBuf<(i32, EpollSnapshot, bool), COLLECT_STACK_CAP> =
-                SmallBuf::new();
-            for (registration, was_dequeued) in candidates.iter() {
-                if !registration.active.load(Ordering::Acquire) {
-                    continue;
-                }
-                let fd = registration.fd;
-                snapshot.push((fd, registration.snapshot(), *was_dequeued));
             }
-            snapshot
         };
 
         let mut results: SmallBuf<(u32, u64), COLLECT_STACK_CAP> = SmallBuf::new();
@@ -1470,7 +1529,7 @@ impl EpollInstance {
             COLLECT_STACK_CAP,
         > = SmallBuf::new();
         let mut processed = 0usize;
-        for (_fd, item, dequeued) in snapshot.iter() {
+        for (registration, dequeued) in candidates.iter() {
             // `maxevents` limits acceptance, not merely userspace copying.
             // Do not poll, acknowledge, advance edge state, or disarm a one-shot
             // entry that this wait cannot return.
@@ -1481,19 +1540,21 @@ impl EpollInstance {
             processed += 1;
             // Query current readiness — polled outside the fd-table lock so a
             // nested-epoll child can't deadlock on it (see poll_fd_readiness).
-            let file = item.file.upgrade();
+            let sub_id = registration.sub_id.load(Ordering::Acquire);
+            let file = registration.file.upgrade();
             let cur_mask = file
                 .as_ref()
-                .map(|file| file.poll_readiness_at(item.offset))
+                .map(|file| file.poll_readiness_at(registration.offset))
                 .unwrap_or(0);
 
             let mut keep_ready = false;
             let mut disarm_cold_indexes = false;
-            if item.registration.active.load(Ordering::Acquire) {
-                let mut state = item.registration.state.lock();
-                if item.registration.active.load(Ordering::Acquire) && state.sub_id == item.sub_id {
-                    let armed = (state.events & EPOLLONESHOT) == 0
-                        || (state.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) != 0;
+            if registration.active.load(Ordering::Acquire) {
+                let mut state = registration.state.lock();
+                if registration.active.load(Ordering::Acquire)
+                    && registration.sub_id.load(Ordering::Relaxed) == sub_id
+                {
+                    let armed = EpollRegistration::events_enabled(state.events);
                     let want = state.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
                     // Linux always reports ERR/HUP even when omitted from the
                     // requested mask.
@@ -1514,7 +1575,8 @@ impl EpollInstance {
                         keep_ready =
                             state.cell_backed && (state.events & (EPOLLET | EPOLLONESHOT)) == 0;
                         if (state.events & EPOLLONESHOT) != 0 {
-                            state.events &= EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE;
+                            let events = state.events & (EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+                            registration.set_events(&mut state, events);
                             disarm_cold_indexes = true;
                         }
                     } else {
@@ -1535,23 +1597,17 @@ impl EpollInstance {
             }
             // Even a concurrent CTL_DEL/MOD must complete the POLLING state.
             ready_updates.push((
-                Arc::clone(&item.registration),
-                item.sub_id,
+                Arc::clone(registration),
+                sub_id,
                 *dequeued,
                 keep_ready,
                 disarm_cold_indexes,
             ));
         }
-        // If an always-polled candidate filled the userspace batch first, put
-        // any ready nodes detached behind it back at the tail. They were never
-        // polled, so their occurrence is still pending.
-        let mut unprocessed: SmallBuf<Arc<EpollRegistration>, COLLECT_STACK_CAP> = SmallBuf::new();
-        for (_, item, dequeued) in snapshot.iter().skip(processed) {
-            if *dequeued {
-                unprocessed.push(Arc::clone(&item.registration));
-            }
-        }
-        let needs_ready_write = !unprocessed.is_empty()
+        let needs_ready_write = candidates
+            .iter()
+            .skip(processed)
+            .any(|(_, dequeued)| *dequeued)
             || ready_updates
                 .iter()
                 .any(|(_, _, dequeued, _, disarm_cold_indexes)| *dequeued || *disarm_cold_indexes);
@@ -1568,21 +1624,23 @@ impl EpollInstance {
                     ready.finish_poll(registration, *keep_ready);
                 }
             }
-            for registration in unprocessed.iter() {
-                ready.finish_poll(registration, true);
+            // Uninspected entries keep their FIFO turn ahead of delivered LT
+            // entries and later arrivals. Restoring the suffix in reverse at
+            // the front preserves its original order (Linux's leftover txlist).
+            for index in (processed..candidates.len()).rev() {
+                let (registration, dequeued) = candidates.get(index).unwrap();
+                if *dequeued {
+                    ready.finish_poll_at(registration, true, true);
+                }
             }
             !ready.is_empty()
         } else {
             !self.ready.lock().is_empty()
         };
 
-        // Linux ep_done_scan hands a non-empty rdllist to another exclusive
-        // sleeper. This is required for LT readiness: requeueing the node is not
-        // itself a provider callback, so without this handoff another task can
-        // remain asleep while work is already available.
-        self.finish_ready_cycle_with(ready_remains);
-
-        results
+        // The caller performs ep_done_scan's waiter/nested-epoll handoff once
+        // after the whole scan, not once per batch of stale candidates.
+        (results, ready_remains)
     }
 
     /// True when every registration is queued on its provider's wait queue,
@@ -1925,10 +1983,10 @@ impl Drop for EpollInstance {
     fn drop(&mut self) {
         let items = core::mem::take(&mut self.inner.lock().interest);
         for item in items.values() {
-            let state = item.registration.state.lock();
+            let _state = item.registration.state.lock();
             item.registration.active.store(false, Ordering::Release);
             if let Some(file) = item.registration.file.upgrade() {
-                file.disarm_readiness(state.sub_id);
+                file.disarm_readiness(item.registration.sub_id.load(Ordering::Relaxed));
             }
         }
     }
@@ -3013,10 +3071,10 @@ mod tests {
             let registration = self.registration.lock().as_ref().and_then(Weak::upgrade);
             if let Some(registration) = registration {
                 let mut state = registration.state.lock();
-                state.sub_id = next_sub_id();
-                state.events = EPOLLOUT;
+                registration.set_events(&mut state, EPOLLOUT);
                 state.data = 0xBEEF;
                 state.last_mask = 0;
+                registration.sub_id.store(next_sub_id(), Ordering::Release);
             }
         }
     }
@@ -3112,6 +3170,124 @@ mod tests {
         (ep, file)
     }
 
+    /// Linux's ep_send_events skips drained entries without charging them to
+    /// maxevents. A small wait must reach the live event behind a stale prefix
+    /// in this call, instead of returning zero or parking and self-waking.
+    fn smoke_epoll_wait_skips_drained_ready_prefix() -> TestResult {
+        use core::task::{Context, Poll, Waker};
+
+        const STALE: usize = 33;
+        for flags in [0, EPOLLET, EPOLLONESHOT] {
+            for maxevents in [1, 4, 32] {
+                let ep = EpollInstance::new();
+                let ep_file: Arc<dyn FileOps> = ep.clone();
+                let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
+                for i in 0..=STALE {
+                    let file: Arc<dyn FileOps> = crate::io_mux::EventFd::new(1, 0);
+                    if !ep.ctl_add(i as i32, &file, 0, EPOLLIN | flags, i as u64, &ep_file) {
+                        return TestResult::Fail("eventfd registration failed");
+                    }
+                    files.push(file);
+                }
+
+                let drain = |file: &dyn FileOps| {
+                    let mut bytes = [0u8; 8];
+                    let mut read = file.read(0, &mut bytes);
+                    matches!(
+                        read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Ready(Ok(8))
+                    )
+                };
+                for file in &files[..STALE] {
+                    if !drain(&**file) {
+                        return TestResult::Fail("eventfd prefix drain failed");
+                    }
+                }
+
+                let ready = ep.collect_ready(TASK, maxevents);
+                if ready.len() != 1 || ready.get(0) != Some(&(EPOLLIN, STALE as u64)) {
+                    return TestResult::Fail("drained prefix hid a live event in the same wait");
+                }
+                let again = ep.collect_ready(TASK, maxevents);
+                if again.len() != usize::from(flags == 0) {
+                    return TestResult::Fail("stale scan changed LT/ET/ONESHOT delivery");
+                }
+                if !drain(&*files[STALE]) || !ep.collect_ready(TASK, maxevents).is_empty() {
+                    return TestResult::Fail("fully drained set reported an event");
+                }
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/epoll",
+        smoke_epoll_wait_skips_drained_ready_prefix
+    );
+
+    /// Model another consumer draining each notification before our provider
+    /// poll: callbacks keep the node pending, but must not grow this wait's
+    /// scan budget. A later wait must still see that pending occurrence.
+    fn smoke_epoll_stale_scan_bounds_concurrent_notifications() -> TestResult {
+        struct RenotifyFile {
+            readiness: narf_lib::readiness::Readiness,
+            polls: AtomicU32,
+        }
+        impl FileOps for RenotifyFile {
+            fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+                Box::pin(async { Err(FsError::WouldBlock) })
+            }
+            fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+                Box::pin(async { Err(FsError::WouldBlock) })
+            }
+            fn stat(&self) -> Stat {
+                Stat {
+                    size: 0,
+                    blocks: 0,
+                    mode: Mode::FILE_RO,
+                    mtime_cycles: 0,
+                }
+            }
+            fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+                Some(&self.readiness)
+            }
+            fn poll_readiness(&self) -> u32 {
+                // Cap the fixture's re-notifications so a broken unbounded
+                // scan fails the count assertion instead of hanging the suite.
+                if self.polls.fetch_add(1, Ordering::Relaxed) < 8 {
+                    self.readiness.notify(POLL_IN);
+                }
+                0
+            }
+        }
+
+        let ep = EpollInstance::new();
+        let ep_file: Arc<dyn FileOps> = ep.clone();
+        let file = Arc::new(RenotifyFile {
+            readiness: narf_lib::readiness::Readiness::new(POLL_IN),
+            polls: AtomicU32::new(0),
+        });
+        let file_ops: Arc<dyn FileOps> = file.clone();
+        if !ep.ctl_add(FD, &file_ops, 0, EPOLLIN | EPOLLET, 1, &ep_file) {
+            return TestResult::Fail("re-notifying registration failed");
+        }
+        for expected_polls in 1..=2 {
+            if !ep.collect_ready(TASK, 1).is_empty() {
+                return TestResult::Fail("drained notification produced a phantom event");
+            }
+            if file.polls.load(Ordering::Relaxed) != expected_polls {
+                return TestResult::Fail("concurrent notifications extended the scan budget");
+            }
+            if !ep.has_deliverable(TASK) {
+                return TestResult::Fail("scan lost a callback racing the provider poll");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/epoll",
+        smoke_epoll_stale_scan_bounds_concurrent_notifications
+    );
+
     fn smoke_epoll_stale_arm_cannot_overwrite_mod() -> TestResult {
         let ep = EpollInstance::new();
         let ep_ops = ep.clone() as Arc<dyn FileOps>;
@@ -3144,6 +3320,65 @@ mod tests {
     kernel_test_in!(
         "userspace/epoll",
         smoke_epoll_stale_arm_cannot_overwrite_mod
+    );
+
+    /// A stale prefix expands the private scan beyond maxevents. Entries we
+    /// did not inspect must retain both their FIFO turn and their oneshot/edge
+    /// state, including entries beyond the end of that private window.
+    fn smoke_epoll_private_scan_preserves_unconsumed_suffix() -> TestResult {
+        for mode in [0, EPOLLET, EPOLLONESHOT] {
+            let ep = EpollInstance::new();
+            let ep_ops = ep.clone() as Arc<dyn FileOps>;
+            let mut files = Vec::new();
+            let count = COLLECT_STACK_CAP + 5;
+            for index in 0..count {
+                let file = RaceFile::new(POLL_IN, false, false);
+                let ops = file.clone() as Arc<dyn FileOps>;
+                if !ep.ctl_add(
+                    FD + index as i32,
+                    &ops,
+                    0,
+                    EPOLLIN | mode,
+                    index as u64,
+                    &ep_ops,
+                ) {
+                    return TestResult::Fail("private scan setup failed");
+                }
+                if index < 2 {
+                    // Leave the queued occurrence stale, as a concurrent
+                    // eventfd read would do before epoll inspects it.
+                    file.mask.store(0, Ordering::Release);
+                }
+                files.push(file);
+            }
+            for expected in 2..count {
+                let events = ep.collect_ready(TASK, 1);
+                if events.len() != 1 || events.get(0) != Some(&(EPOLLIN, expected as u64)) {
+                    return TestResult::Fail("private scan changed unconsumed FIFO order");
+                }
+                for (index, file) in files.iter().enumerate() {
+                    let accepted = u32::from(index >= 2 && index <= expected);
+                    if file.acknowledgements.load(Ordering::Acquire) != accepted {
+                        return TestResult::Fail("private scan acknowledged an unreturned event");
+                    }
+                }
+            }
+            let next = ep.collect_ready(TASK, 1);
+            if mode == 0 {
+                if next.get(0) != Some(&(EPOLLIN, 2)) {
+                    return TestResult::Fail(
+                        "LT must return to the first live entry after one round",
+                    );
+                }
+            } else if !next.is_empty() {
+                return TestResult::Fail("private scan redelivered ET or disarmed oneshot");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/epoll",
+        smoke_epoll_private_scan_preserves_unconsumed_suffix
     );
 
     fn smoke_epoll_mod_during_poll_cannot_deliver_old_mask() -> TestResult {
@@ -3187,14 +3422,16 @@ mod tests {
             return TestResult::Fail("CTL_ADD failed");
         }
         let registration = Arc::clone(&ep.inner.lock().interest[&FD].registration);
-        let first_id = registration.state.lock().sub_id;
+        let first_id = registration.sub_id.load(Ordering::Acquire);
         if file.readiness.waiter_count() != 1 {
             return TestResult::Fail("CTL_ADD must install one persistent waiter");
         }
         if !ep.ctl_mod(FD, &file_ops, EPOLLOUT, 2, &ep_ops) {
             return TestResult::Fail("CTL_MOD failed");
         }
-        if registration.state.lock().sub_id == first_id || file.readiness.waiter_count() != 1 {
+        if registration.sub_id.load(Ordering::Acquire) == first_id
+            || file.readiness.waiter_count() != 1
+        {
             return TestResult::Fail("CTL_MOD must atomically replace, not duplicate, its waiter");
         }
         if !ep.ctl_del(FD, &file_ops) || file.readiness.waiter_count() != 0 {

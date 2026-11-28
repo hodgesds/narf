@@ -851,7 +851,11 @@ Every ADD/MOD provider arm carries a fresh immutable subscription id. Completion
 may publish cell/fallback metadata only while that exact id remains current;
 stale work disarms only its own id. Delivery similarly validates the sampled id
 under the registration-state lock before acknowledging provider state, advancing
-the edge mask, or disarming a one-shot. Cold fallback and forwarded-deadline
+the edge mask, or disarming a one-shot. The pre-poll identity is an acquire-loaded
+atomic published by MOD under that same state lock; delivery needs no separate
+metadata snapshot lock. Callbacks use an atomic armed flag and the ready-list
+lock, leaving subscription metadata to control operations and delivery.
+Cold fallback and forwarded-deadline
 indexes are keyed by both registration identity and subscription id, so delayed
 cleanup cannot remove a replacement that reused the same numeric fd.
 `poll(2)` and `ppoll(2)` likewise report `POLLERR`, `POLLHUP`, and
@@ -875,8 +879,20 @@ that write-back faults.
 An epoll wait accepts at most `maxevents` entries. Only entries actually
 returned to the caller advance edge-trigger state, acknowledge provider-local
 readiness, or disarm `EPOLLONESHOT`; additional ready entries remain pending
-for a later wait. Successive waits round-robin through ready level-triggered
-entries when the ready set exceeds `maxevents`. `EPOLLEXCLUSIVE` arbitration is
+for a later wait. A batch containing only drained or otherwise stale ready-list
+candidates advances to the remaining candidates before returning zero or
+parking, matching Linux's `ep_send_events` skip of non-deliverable entries.
+The initial ready-list length bounds this retry work: concurrent callbacks
+cannot extend a single scan indefinitely. After an empty first batch, the
+collector reserves a private window of at least 16 candidates even when
+`maxevents` is smaller, polls outside the ready lock, and merges pending
+callbacks once per window. Uninspected entries return to the front in their
+original order; delivered level-triggered entries return to the tail. Other
+collectors can process the remaining shared queue concurrently. A wait whose
+task-owned waiter node was never published needs no waiter-lock cleanup.
+Successive waits round-robin through
+ready level-triggered entries when the ready set exceeds `maxevents`.
+`EPOLLEXCLUSIVE` arbitration is
 attached to the watched provider's readiness queue and keyed by the persistent
 subscription id: one matching exclusive epoll registration is selected and
 rotated per source event, independent of process-local descriptor numbers.
@@ -2715,6 +2731,16 @@ idle are never charged.
 task and provides `procfs::ProcessIo`. Both syscall dispatch paths contribute
 completed read/write-family calls. Block submission retains the issuing thread
 group's storage counters across asynchronous completion and process exit.
+
+Character and syscall counters (`rchar`, `wchar`, `syscr`, `syscw`) live on each
+refcounted `Task`, start at zero for a new task (including a thread clone), and
+follow it across CPU migration. Syscall accounting borrows the current task's
+published owner and updates relaxed atomic counters without a shared lock,
+registry lookup, allocation, or interrupt masking. Remote `/proc` readers pin
+the task and sample each counter atomically; the fields are not one transactional
+snapshot. Counters saturate at `u64::MAX`. Failed and zero-byte calls still count
+as attempts; a parked call reissued by the kernel adds only transferred bytes.
+Exec retains the task's counters, and the last task reference releases them.
 
 ### 3.7 IA-32 compat ABI (x86_64)
 
