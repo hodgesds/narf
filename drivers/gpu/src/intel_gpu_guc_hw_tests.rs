@@ -1785,7 +1785,15 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                                 0x2030
                             ]
                         );
-                        assert!(matches!(data[1027], 0x00090009 | 0x00090008));
+                        // A PXP RCS/CCS queue runs alone: xe_lrc_init ORs
+                        // REG_MASKED_FIELD_ENABLE(CTX_CTRL_RUN_ALONE)
+                        // (0x00800080) into the base value, so the registered
+                        // image carries 0x00890088 (golden base 0x00090008)
+                        // or 0x00890089 (template base 0x00090009).
+                        assert!(matches!(
+                            data[1027],
+                            0x00090009 | 0x00090008 | 0x00890089 | 0x00890088
+                        ));
                         assert_eq!(data[1032], 0x2038);
                         // The non-Gen12 image is cursor-based, so the extra
                         // register shifts the following groups by 2 dwords;
@@ -2576,7 +2584,14 @@ fn execute_compute(w: &Window, base: u32) {
                 engine + 0x30
             ]
         );
-        assert!(matches!(data[1027], 0x00090009 | 0x00090008));
+        // A PXP CCS queue runs alone: xe_lrc_init ORs
+        // REG_MASKED_FIELD_ENABLE(CTX_CTRL_RUN_ALONE) (0x00800080) into the
+        // base value, so the registered image carries 0x00890088 (golden
+        // base 0x00090008) or 0x00890089 (template base 0x00090009).
+        assert!(matches!(
+            data[1027],
+            0x00090009 | 0x00090008 | 0x00890089 | 0x00890088
+        ));
         assert_eq!(
             (data[1032], data[1024 + 0x1c], data[1024 + 0x21]),
             (engine + 0x38, engine + 0x120, 0x11081011)
