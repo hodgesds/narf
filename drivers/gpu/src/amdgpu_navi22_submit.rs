@@ -96,10 +96,10 @@ pub const HW_SUBMISSIONS: u32 = 2; // linux: n/a (amdgpu_sched_hw_submission mod
 ///   125 x (4 + 3) + 65 fixed = 940 dwords;
 /// - SDMA, 49 IBs: 49 x 13 (6-dword INDIRECT + up to 7 NOP pad) + 45
 ///   fixed = 682 dwords.
-/// Each pads to at most one 1024-dword ring half, so two max-size frames
-/// never overwrite each other; `Queue::emit` still refuses any frame over
-/// the ring. A single 192 cap for SDMA would not hold: 192 x 13 + 45 =
-/// 2541 dwords overflows the ring, so the cap is per ring, not one number.
+///   Each pads to at most one 1024-dword ring half, so two max-size frames
+///   never overwrite each other; `Queue::emit` still refuses any frame over
+///   the ring. A single 192 cap for SDMA would not hold: 192 x 13 + 45 =
+///   2541 dwords overflows the ring, so the cap is per ring, not one number.
 pub const MAX_IBS_GFX: usize = 192; // linux: amdgpu_ring_max_ibs(AMDGPU_RING_TYPE_GFX)
 pub const MAX_IBS_COMPUTE: usize = 125; // linux: amdgpu_ring_max_ibs(AMDGPU_RING_TYPE_COMPUTE)
 pub const MAX_IBS_SDMA: usize = 49; // linux: amdgpu_ring_max_ibs(...) — everything else
