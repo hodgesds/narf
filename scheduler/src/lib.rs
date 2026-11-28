@@ -4097,9 +4097,11 @@ pub fn select_fork_cpu(allowed: CpuSet, preferred: CpuId) -> Option<CpuId> {
 }
 
 /// Fork-placement variant for a forking parent: the parent is about to
-/// wait for (or yield to) the child, so the child's placement prefers the
-/// parent's CPU when that CPU has no other queued work — see
-/// [`choose_fork_cpu`]. Generic spawns keep [`select_fork_cpu`].
+/// wait for (or yield to) the child, so the parent's CPU is discounted by
+/// the about-to-park parent itself — but it wins only when strictly
+/// least-loaded after that discount; minimum-load ties spread via the
+/// rotating preference, see [`choose_fork_cpu`]. Generic spawns keep
+/// [`select_fork_cpu`].
 pub fn select_fork_cpu_prefer_current(allowed: CpuSet, preferred: CpuId) -> Option<CpuId> {
     select_fork_cpu_inner(allowed, preferred, true)
 }
@@ -4160,32 +4162,31 @@ fn choose_fork_cpu(
     preferred_load: Option<usize>,
     prefer_current: bool,
 ) -> CpuId {
-    // Fork+wait locality (Linux `wake_up_new_task` / WF_FORK shape): the
-    // forking parent is the task running on `current` right now, so
-    // `current_load` counts it. A parent about to waitpid has nothing else
-    // queued behind it — the child is not queueing behind a runnable
-    // parent, it is queueing behind a parent that is about to park. Do not
-    // count the parent itself as load against its own CPU: when nothing but
-    // the parent is on it, the child stays local instead of paying a
-    // cross-CPU spawn plus an exit-wakeup IPI pair for an idle CPU. A
-    // genuinely busy parent CPU (queued work besides the parent) still
-    // spreads, and the rotation `preferred` still wins its ties below —
-    // only fork callers that opt in via `select_fork_cpu_prefer_current`
+    // Fork load balancing (Linux `wake_up_new_task` / `select_task_rq`
+    // with `SD_BALANCE_FORK`: the idlest CPU in the idlest group wins, via
+    // `find_idlest_cpu`). The forking parent is the task running on
+    // `current` right now, so `current_load` counts it — and the parent is
+    // about to park, so do not count the parent itself as load against its
+    // own CPU. The parent CPU wins only when strictly least-loaded after
+    // that discount; a minimum-load tie spreads via the rotating
+    // `preferred` below, and a genuinely less-loaded CPU wins outright.
+    // Only fork callers that opt in via `select_fork_cpu_prefer_current`
     // take this branch, so generic spawns are unaffected.
     if prefer_current {
         if let Some(current_load) = current_load {
-            if current_load.saturating_sub(1) <= best_load {
+            if current_load.saturating_sub(1) < best_load {
                 return current;
             }
         }
     }
-    // Linux's WF_FORK search starts from the child's inherited CPU and moves it
-    // only when balancing identifies a better destination. Preserve that
-    // cache-local shape when every CPU is occupied and the parent's CPU is
-    // already one of the least-loaded choices: do not rotate a
-    // fork->exit->wait pair merely to break an equal-load tie. When a genuinely
-    // idle CPU exists, continue spreading a burst and use the parent's rotating
-    // preference only when that CPU is itself tied for the minimum load.
+    // When every CPU is occupied and the parent's CPU is already one of
+    // the least-loaded choices, a generic spawn keeps the cache-local
+    // shape and does not rotate merely to break an equal-load tie. (For
+    // fork callers the strictly-least-loaded case already returned above,
+    // so a minimum-load tie falls through to the rotating preference and
+    // a fork burst spreads.) When a genuinely idle CPU exists, continue
+    // spreading a burst and use the parent's rotating preference only
+    // when that CPU is itself tied for the minimum load.
     if best_load != 0 && current_load == Some(best_load) {
         current
     } else if preferred_load == Some(best_load) {
