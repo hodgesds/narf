@@ -90,8 +90,8 @@ mounted distro rootfs's `/lib/systemd/systemd` as real PID 1 with the
 QEMU user-network configuration, optionally asserting the network works
 end-to-end through SLIRP.
 
-**Benchmarks.** `redis-bench`, `stress-bench`, `mt-echo-bench`, and
-`bpf-bench` measure NARF against a Linux baseline under an identical QEMU
+**Benchmarks.** `redis`, `stress`, `mt-echo`, and
+`bpf` measure NARF against a Linux baseline under an identical QEMU
 configuration. These gate nothing and assert nothing; they answer "where
 does NARF stand" and "what does this cost." The benchmark statistics
 (median, bootstrap CIs, Welch's t and Mann-Whitney U, Benjamini-Hochberg

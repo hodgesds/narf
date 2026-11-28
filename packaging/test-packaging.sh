@@ -340,7 +340,7 @@ cmp "$tmp/tree/usr/lib/narf/uefi/narf-frame" "$host_esp/boot/narf-frame"
 # release builder. It must produce the same package layout without installing
 # anything on the host.
 NARF_LIMINE_EFI=/does/not/exist NARF_SKIP_GRUB_CHECK=1 \
-    cargo run -q -p cargo-narf -- narf package --version 0.0.0-test.1 \
+    cargo run -q -p cargo-narf -- narf pkg package --version 0.0.0-test.1 \
     --limine-efi "$tmp/BOOTX64.EFI" \
     --limine-tool "$tmp/limine-tool" \
     --formats tar --skip-build --output "$tmp/cargo-out" \

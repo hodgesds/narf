@@ -7,7 +7,7 @@ samples mean — and this crate does only the first. It declares benchmarks,
 collects raw samples inside the kernel under controlled conditions, and emits
 every raw sample to the console; the statistics (median, bootstrap confidence
 intervals, Welch's t-test, Mann-Whitney U, and multiple-comparison correction)
-are computed host-side by the `cargo narf bench bpf-bench` tooling that consumes the
+are computed host-side by the `cargo narf bench bpf` tooling that consumes the
 emitted lines.
 
 That division is deliberate rather than squeamishness about floating point in

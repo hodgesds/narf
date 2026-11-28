@@ -3,7 +3,7 @@
 //! `verification/specification/spec.md` §8 splits a performance number into
 //! two jobs: collecting samples under stated conditions, and deciding what the
 //! samples mean. This crate does only the first. It emits every raw sample to
-//! the console; `cargo narf bench bpf-bench` computes the median, the 95% bootstrap
+//! the console; `cargo narf bench bpf` computes the median, the 95% bootstrap
 //! CI, Welch's t, Mann-Whitney U, and the Benjamini-Hochberg correction.
 //!
 //! The split is not squeamishness about `f64` in a kernel. It is that §8.5

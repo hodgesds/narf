@@ -29,7 +29,7 @@ mod affected;
 /// they are the only part of cargo narf with unit tests — a wrong t-distribution
 /// tail invalidates every number that passes through it, silently.
 mod bench_stats;
-/// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
+/// The `bpf` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
 mod btrfs_crash;
 mod btrfs_cycles;
@@ -229,16 +229,16 @@ pub(crate) enum SmokeCmd {
 #[derive(Subcommand)]
 pub(crate) enum BenchCmd {
     /// Off-box redis PERFORMANCE benchmark with a Linux baseline.
-    RedisBench(BuildArgs),
+    Redis(BuildArgs),
     /// stress-ng PERFORMANCE sweep with a Linux baseline.
-    StressBench(BuildArgs),
+    Stress(BuildArgs),
     /// `perf bench` PERFORMANCE sweep with a Linux baseline.
-    PerfBench(BuildArgs),
+    Perf(BuildArgs),
     /// Multi-queue / RSS throughput+latency benchmark.
-    MtEchoBench(BuildArgs),
+    MtEcho(BuildArgs),
     /// BPF microbenchmark suite under the `verification/` §8 statistical
     /// protocol.
-    BpfBench(bpf_bench::BpfBenchArgs),
+    Bpf(bpf_bench::BpfBenchArgs),
 }
 
 #[derive(Subcommand)]
@@ -274,7 +274,7 @@ pub(crate) enum DiskCmd {
     DiskWritePartitioned(DiskWritePartitionedArgs),
     /// Build a UEFI USB-stick image file (MBR + FAT32 ESP) with the
     /// persistent boot log enabled.
-    UsbImage(usb_image::UsbImageArgs),
+    UsbImage(Box<usb_image::UsbImageArgs>),
 }
 
 /// Translate the nested `cargo narf` CLI into the flat internal `Cmd`
@@ -328,11 +328,11 @@ fn to_flat(cmd: TopCommand) -> Cmd {
             SmokeCmd::MuslDemo(a) => Cmd::MuslDemo(a),
         },
         TopCommand::Bench(c) => match c {
-            BenchCmd::RedisBench(a) => Cmd::RedisBench(a),
-            BenchCmd::StressBench(a) => Cmd::StressBench(a),
-            BenchCmd::PerfBench(a) => Cmd::PerfBench(a),
-            BenchCmd::MtEchoBench(a) => Cmd::MtEchoBench(a),
-            BenchCmd::BpfBench(a) => Cmd::BpfBench(a),
+            BenchCmd::Redis(a) => Cmd::RedisBench(a),
+            BenchCmd::Stress(a) => Cmd::StressBench(a),
+            BenchCmd::Perf(a) => Cmd::PerfBench(a),
+            BenchCmd::MtEcho(a) => Cmd::MtEchoBench(a),
+            BenchCmd::Bpf(a) => Cmd::BpfBench(a),
         },
         TopCommand::Firmware(c) => match c {
             FirmwareCmd::PackFirmware(a) => Cmd::PackFirmware(a),
@@ -348,7 +348,7 @@ fn to_flat(cmd: TopCommand) -> Cmd {
         TopCommand::Disk(c) => match c {
             DiskCmd::DiskWrite(a) => Cmd::DiskWrite(a),
             DiskCmd::DiskWritePartitioned(a) => Cmd::DiskWritePartitioned(a),
-            DiskCmd::UsbImage(a) => Cmd::UsbImage(a),
+            DiskCmd::UsbImage(a) => Cmd::UsbImage(*a),
         },
         TopCommand::Pkg(_) => unreachable!("pkg is dispatched in main() before to_flat()"),
     }
@@ -8868,7 +8868,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 /// Boot `kernel` under QEMU, log in as root, type `typed_cmd`, and assert
 /// `expect` appears on the serial console. One attempt; the caller retries.
 /// Returns the full captured serial transcript so callers that measure
-/// (stress-bench) can parse guest-printed metrics out of it.
+/// (stress) can parse guest-printed metrics out of it.
 fn run_interactive_boot(
     kernel: &Path,
     cpio_path: Option<&PathBuf>,
@@ -11017,7 +11017,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
-// ── redis-bench shared helpers ──────────────────────────────────────
+// ── redis shared helpers ──────────────────────────────────────
 
 /// RESP-encode a command as an array of bulk strings.
 fn resp_encode(parts: &[&str]) -> Vec<u8> {
@@ -11348,11 +11348,11 @@ fn boot_narf_redis(
 /// loader + an `/init` that brings up virtio-net and execs redis) and
 /// boot a stock Linux kernel under QEMU with the same hostfwd. Returns
 /// the QEMU child and a connected host `TcpStream`. This is the
-/// Resolve the QEMU accelerator for the perf benches (redis-bench, mt-echo).
+/// Resolve the QEMU accelerator for the perf benches (redis, mt-echo).
 /// `XTASK_QEMU_ACCEL` overrides verbatim; otherwise default to `kvm` when
 /// `/dev/kvm` is usable. Bare QEMU does NOT auto-select KVM, and TCG inflates
 /// the guest ~10x AND distorts the profile — running a perf bench under TCG
-/// silently invalidates it (the redis-bench TCG-vs-KVM confound). Returns `None`
+/// silently invalidates it (the redis TCG-vs-KVM confound). Returns `None`
 /// only when no accelerator should be injected (no /dev/kvm, no override), i.e.
 /// QEMU's TCG default. `label()` renders the same choice for the banner.
 fn bench_accel() -> Option<String> {
@@ -11745,7 +11745,7 @@ fn boot_linux_mt_echo(guest_port: u16, server_threads: usize) -> Result<std::pro
 
     let mem = std::env::var("NARF_QEMU_MEM_MB").unwrap_or_else(|_| "2048".into());
     let cpu = std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into());
-    // Match NARF's vCPU count (mt-echo-bench defaults NARF_QEMU_SMP to
+    // Match NARF's vCPU count (mt-echo defaults NARF_QEMU_SMP to
     // server_threads+1 too) so the comparison is on equal cores.
     let smp = std::env::var("NARF_QEMU_SMP").unwrap_or_else(|_| format!("{}", server_threads + 1));
     // ≥2 for a multi_queue tap (else QEMU can't open it single-queue).
@@ -12146,7 +12146,7 @@ fn boot_narf_mt_echo(
 
 fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("cargo narf bench mt-echo-bench: only x86_64 is wired");
+        bail!("cargo narf bench mt-echo: only x86_64 is wired");
     }
     let guest_port = 7000u16;
     let host_port = 17000u16;
@@ -12186,7 +12186,7 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
     };
 
     println!(
-        "cargo narf bench mt-echo-bench: {conns} conns / {client_threads} client thread(s), \
+        "cargo narf bench mt-echo: {conns} conns / {client_threads} client thread(s), \
          {secs}s measured, backend={backend}, queues={queues}, accel={accel}\n\
          server thread sweep: {sweep:?}\n\
          NOTE: real multi-queue/RSS scaling needs tap (XTASK_QEMU_TAP=<if>) + \
@@ -12302,7 +12302,7 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
 
 fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("cargo narf bench redis-bench: only x86_64 is wired");
+        bail!("cargo narf bench redis: only x86_64 is wired");
     }
     let ops: usize = std::env::var("XTASK_REDIS_BENCH_OPS")
         .ok()
@@ -12319,7 +12319,7 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
 
     let accel = bench_accel_label();
     println!(
-        "cargo narf bench redis-bench: workload = {ops} pipelined ops (depth {pipeline}) SET + GET, \
+        "cargo narf bench redis: workload = {ops} pipelined ops (depth {pipeline}) SET + GET, \
          {lat_ops} sequential PINGs for latency\n\
          both guests: 1 vCPU, accel={accel}, -cpu max, same virtio-net + hostfwd\n"
     );
@@ -12792,13 +12792,13 @@ fn parse_perf_metrics(serial: &str) -> Vec<PerfMetric> {
 /// [`stress_bench_cmd`], driving `/perfbench.sh` instead of `/sweep.sh`.
 fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("cargo narf bench perf-bench: only x86_64 is wired");
+        bail!("cargo narf bench perf: only x86_64 is wired");
     }
     let root = workspace_root()?;
     let disk = virtio_blk_image_path();
     if !disk.exists() {
         bail!(
-            "cargo narf bench perf-bench: no rootfs at {} — run \
+            "cargo narf bench perf: no rootfs at {} — run \
              `sh verification/data/musl-demo/REGEN_stress_rootfs.sh` first",
             disk.display()
         );
@@ -12825,7 +12825,7 @@ fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
     }
 
     println!(
-        "cargo narf bench perf-bench: perf-bench sweep, {threads}-thread scale\n\
+        "cargo narf bench perf: perf sweep, {threads}-thread scale\n\
          both guests: same rootfs (snapshot), same -cpu/-smp/RAM/topology, accel={}\n",
         bench_accel_label()
     );
@@ -12837,7 +12837,7 @@ fn perf_bench_cmd(args: &BuildArgs) -> Result<()> {
     let narf = parse_perf_metrics(&narf_serial);
     if narf.is_empty() {
         bail!(
-            "cargo narf bench perf-bench: no `PBMETRIC` rows in the NARF transcript — \
+            "cargo narf bench perf: no `PBMETRIC` rows in the NARF transcript — \
              is /perfbench.sh in the rootfs? (re-run REGEN_stress_rootfs.sh)"
         );
     }
@@ -12993,13 +12993,13 @@ fn boot_narf_guest_script(
 /// See [`Cmd::StressBench`].
 fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("cargo narf bench stress-bench: only x86_64 is wired");
+        bail!("cargo narf bench stress: only x86_64 is wired");
     }
     let root = workspace_root()?;
     let disk = virtio_blk_image_path();
     if !disk.exists() {
         bail!(
-            "cargo narf bench stress-bench: no stress rootfs at {} — run \
+            "cargo narf bench stress: no stress rootfs at {} — run \
              `sh verification/data/musl-demo/REGEN_stress_rootfs.sh` first",
             disk.display()
         );
@@ -13023,7 +13023,7 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     }
 
     println!(
-        "cargo narf bench stress-bench: sequential sweep, {workers} workers/stressor, {dur} each\n\
+        "cargo narf bench stress: sequential sweep, {workers} workers/stressor, {dur} each\n\
          both guests: same rootfs (snapshot), same -cpu/-smp/RAM/topology, accel={}\n",
         bench_accel_label()
     );
@@ -13039,7 +13039,7 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     let narf = parse_stress_metrics(&narf_serial);
     if narf.is_empty() {
         bail!(
-            "cargo narf bench stress-bench: no `stress-ng: metrc:` rows in the NARF transcript — \
+            "cargo narf bench stress: no `stress-ng: metrc:` rows in the NARF transcript — \
              is /sweep.sh in the rootfs? (re-run REGEN_stress_rootfs.sh)"
         );
     }

@@ -341,7 +341,7 @@ kernel IPC. CI checks both native-ring feature configurations.
   archive with checkout-local patches for not-yet-published internal crates,
   enforces crates.io's archive-size limit, and never uploads, commits, tags,
   or pushes.
-- `cargo narf bench bpf-bench --arch=x86_64 --baseline <record.json>` — collect the
+- `cargo narf bench bpf --arch=x86_64 --baseline <record.json>` — collect the
   BPF suite and compare each compatible metric with a previous green-main
   §8.8 record. `--release-baseline <record.json>` adds the cumulative
   slow-cooking check. Both comparisons require the same runner, accelerator,

@@ -1029,7 +1029,7 @@ and the perf event layer, all of which are closed.
     validator requires nullable acquisition so cleanup-slot conflict can fail
     closed without manufacturing a dangling non-null guard.
 11. **`bpf(2)` load latency has no yield point, and verification dominates
-    it.** Measured by `cargo narf bench bpf-bench` (N = 60, same runner caveat as
+    it.** Measured by `cargo narf bench bpf` (N = 60, same runner caveat as
     item 7), for one `BpfProg::load` of a 64-instruction straight-line
     program:
 
