@@ -9947,9 +9947,20 @@ pub fn yield_now() -> YieldNow {
 /// hardware.
 ///
 /// Shape: fixed-size lock-free static array of `usize` (transmuted
-/// `fn()` pointers). Registration is boot-only + idempotent on the
-/// same fn pointer (registering twice fills two slots — callers
-/// register exactly once per subsystem).
+/// `fn()` pointers). Registration is boot-only and NOT idempotent:
+/// registering the same fn pointer twice fills two slots, so callers
+/// register exactly once per subsystem (each site guards with a
+/// static `AtomicBool`).
+///
+/// `MAX_PUMPS` must exceed every pump that can register in one boot.
+/// Kernel-test boots register every fixture pump: the eight NIC
+/// TX-timeout fixtures alone fill eight nested slots, and the NVMe
+/// request-gate test (#2583) is the ninth — with the old bound of 8
+/// it panicked with `sleep_pumps: registry full` on x86_64
+/// (main oracles 46066902784 @ 5658292 and 46087799593 @ 68ed507).
+/// The bound is 32 to leave headroom for future fixture pumps; the
+/// cost is two 32-entry static arrays, and `run_slots` stops at the
+/// first empty slot, so iteration cost is unchanged.
 ///
 /// Used by:
 /// - `userspace::handlers::sys_sleep`'s busy-wait
@@ -9958,7 +9969,7 @@ pub fn yield_now() -> YieldNow {
 pub mod sleep_pumps {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    const MAX_PUMPS: usize = 8;
+    const MAX_PUMPS: usize = 32;
     pub type Pump = fn();
 
     #[allow(clippy::declare_interior_mutable_const)]
