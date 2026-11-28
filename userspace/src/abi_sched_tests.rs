@@ -151,16 +151,16 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setpriority_out_of_range_neg);
 fn smoke_abi_sched_getrlimit_pos() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 16];
-        // RLIMIT_NOFILE (7): default {cur=1024, max=4096}.
+        // RLIMIT_NOFILE (7): default {cur=1024, max=524288}.
         let args = a1(7, buf.as_mut_ptr() as u64);
         match call(Syscall::Getrlimit.raw(), args) {
             Some(0) => {
                 let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
                 let max = u64::from_ne_bytes(buf[8..].try_into().unwrap());
-                if cur == 1024 && max == 4096 {
+                if cur == 1024 && max == 524288 {
                     Ok(())
                 } else {
-                    Err("getrlimit RLIMIT_NOFILE not the default {1024,4096}")
+                    Err("getrlimit RLIMIT_NOFILE not the default {1024,524288}")
                 }
             }
             _ => Err("getrlimit(RLIMIT_NOFILE) should return 0"),
@@ -310,7 +310,7 @@ fn smoke_abi_rlimit_missing_proc_read_does_not_create_owner() -> TestResult {
     with_setup(|| {
         let before = crate::handlers::__test_rlimit_storage_len();
         let limits = crate::handlers::rlimits_of(0xA7_31F);
-        if limits[7] != (1024, 4096) {
+        if limits[7] != (1024, 524288) {
             return Err("missing process did not return the default limits");
         }
         if crate::handlers::__test_rlimit_storage_len() != before {
@@ -436,13 +436,13 @@ fn smoke_abi_sched_prlimit64_pos() -> TestResult {
         let args = a3(0, 7, newbuf.as_ptr() as u64, oldbuf.as_mut_ptr() as u64);
         match call(Syscall::Prlimit64.raw(), args) {
             Some(0) => {
-                // old* must hold the prior default {1024, 4096}.
+                // old* must hold the prior default {1024, 524288}.
                 let ocur = u64::from_ne_bytes(oldbuf[..8].try_into().unwrap());
                 let omax = u64::from_ne_bytes(oldbuf[8..].try_into().unwrap());
-                if ocur == 1024 && omax == 4096 {
+                if ocur == 1024 && omax == 524288 {
                     Ok(())
                 } else {
-                    Err("prlimit64 old value not the prior default {1024,4096}")
+                    Err("prlimit64 old value not the prior default {1024,524288}")
                 }
             }
             _ => Err("prlimit64 set+get should return 0"),
@@ -469,7 +469,7 @@ fn smoke_abi_sched_setrlimit_validates_pair_and_hard_raise() -> TestResult {
         {
             return Err("setrlimit(cur > max) should return -EINVAL");
         }
-        let hard_raise = [1024u64, 4097u64];
+        let hard_raise = [1024u64, 524289u64];
         // Drop caps so this exercises the *unauthorized* path: raising a hard
         // limit without CAP_SYS_RESOURCE must still be -EPERM. (The harness
         // otherwise starts as the boot credential with every capability.)
@@ -483,6 +483,25 @@ fn smoke_abi_sched_setrlimit_validates_pair_and_hard_raise() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_sched_setrlimit_validates_pair_and_hard_raise
+);
+
+fn smoke_abi_sched_setrlimit_soft_raise_to_new_hard_cap() -> TestResult {
+    with_setup(|| {
+        // systemd parity: default hard NOFILE is 524288, so an unprivileged
+        // task may raise its soft limit up to the hard cap without
+        // CAP_SYS_RESOURCE. Under the old 4096 cap the same call failed
+        // with EPERM (hard raise), which is the F1 divergence.
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        let raise_soft = [65536u64, 524288u64];
+        if call(Syscall::Setrlimit.raw(), a1(7, raise_soft.as_ptr() as u64)) != Some(0) {
+            return Err("unprivileged soft raise within the hard cap should return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setrlimit_soft_raise_to_new_hard_cap
 );
 
 fn smoke_abi_sched_setrlimit_cap_sys_resource_raises_hard_limit() -> TestResult {

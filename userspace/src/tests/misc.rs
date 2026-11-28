@@ -1012,7 +1012,7 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
     crate::handlers::__test_rlimit_reset();
     rlimit_init();
 
-    // Default RLIMIT_NOFILE (resource 7) is (1024, 4096).
+    // Default RLIMIT_NOFILE (resource 7) is (1024, 524288).
     let mut out = [0u64; 2];
     let mut ctx = FakeCtx {
         args: SyscallArgs {
@@ -1026,8 +1026,8 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
         return TestResult::Fail("getrlimit(NOFILE) did not return OK");
     }
-    if out != [1024, 4096] {
-        return TestResult::Fail("default RLIMIT_NOFILE not (1024, 4096)");
+    if out != [1024, 524288] {
+        return TestResult::Fail("default RLIMIT_NOFILE not (1024, 524288)");
     }
 
     // Default RLIMIT_STACK (resource 3) is (8 MiB, INFINITY).

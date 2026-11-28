@@ -18872,7 +18872,7 @@ fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, vals: [u3
 //   RLIMIT_DATA    = INFINITY
 //   RLIMIT_STACK   = (8 MiB cur, INFINITY max)
 //   RLIMIT_CORE    = (0 cur, INFINITY max)
-//   RLIMIT_NOFILE  = (1024 cur, 4096 max)
+//   RLIMIT_NOFILE  = (1024 cur, 524288 max)
 //   RLIMIT_AS      = INFINITY
 
 const RLIMIT_COUNT: usize = crate::rlimit::COUNT;
@@ -18919,12 +18919,20 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
         cur: 0,
         max: RLIM_INFINITY,
     };
-    // RLIMIT_NOFILE = 7. Soft 1024 / hard 4096, matching a typical Linux
-    // default; the soft limit is enforced by the open path (EMFILE) and a
-    // process raises it via setrlimit up to the hard cap.
+    // RLIMIT_NOFILE = 7. Soft 1024 / hard 524288, matching systemd's
+    // DefaultLimitNOFILE=1024:524288 (systemd-system.conf(5)): the limit a
+    // process actually starts with on a systemd Linux desktop (CachyOS
+    // included). The kernel's INIT_RLIMITS is 1024/4096
+    // (include/asm-generic/resource.h: INR_OPEN_CUR/INR_OPEN_MAX), but
+    // systemd applies its default to every unit it starts, so 4096 is a
+    // ceiling no desktop program ever sees — and any unprivileged program
+    // that raises its hard NOFILE past 4096 got EPERM on NARF where Linux
+    // succeeds (perf bench with larger -f/-t, nginx worker_rlimit_nofile).
+    // The soft limit is enforced by the open path (EMFILE) and a process
+    // raises it via setrlimit up to the hard cap without privilege.
     t[7] = RLimitPair {
         cur: 1024,
-        max: 4096,
+        max: 524288,
     };
     // Linux INIT_RLIMITS uses MLOCK_LIMIT (8 MiB) for both soft and hard
     // RLIMIT_MEMLOCK. Keeping infinity here made all new admission paths
