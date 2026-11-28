@@ -465,6 +465,13 @@ pub fn add(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     let owner = Owner { root, va };
     let mut g = RMAP[shard(key)].map.lock();
     let map = g.get_or_insert_with(RmapTable::new);
+    add_owner_in_map(map, key, owner);
+}
+
+/// Record one owner in an already-locked shard table. The single-frame and
+/// batched adds share this body so a batch keeps the single frame's exact
+/// semantics, including reuse-shell accounting.
+fn add_owner_in_map(map: &mut RmapTable, key: u64, owner: Owner) {
     if let Some(list) = map.get_mut(key) {
         // Only an unreserved empty row is a counted reuse shell; a prepared
         // empty row belongs to its in-flight publisher instead.
@@ -476,6 +483,36 @@ pub fn add(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
         }
     } else {
         map.insert(key, OwnerList::new(owner));
+    }
+}
+
+/// Batched counterpart to [`add`]: record many `(phys, root, va)` owners
+/// with one shard-lock acquisition per touched shard instead of one per
+/// entry.
+///
+/// Fork materialization (`materialize_window`) installs a whole window of
+/// leaves with one batched page-table walk and then recorded one rmap owner
+/// per leaf. The batch keeps `add`'s exact per-entry semantics — idempotent
+/// per owner, no-op for the null frame — with the lock held once per shard.
+pub fn add_multi(entries: &[(PhysAddr, PhysAddr, VirtAddr)]) {
+    for (shard_index, _shard) in RMAP.iter().enumerate().take(RMAP_SHARDS) {
+        // One scan per shard, no allocation: a shard with no entry in
+        // this batch is skipped without touching its lock.
+        if !entries
+            .iter()
+            .any(|(phys, _, _)| phys.raw() != 0 && shard(phys.raw()) == shard_index)
+        {
+            continue;
+        }
+        let mut g = RMAP[shard_index].map.lock();
+        let map = g.get_or_insert_with(RmapTable::new);
+        for &(phys, root, va) in entries {
+            let key = phys.raw();
+            if key == 0 || shard(key) != shard_index {
+                continue;
+            }
+            add_owner_in_map(map, key, Owner { root, va });
+        }
     }
 }
 
@@ -511,6 +548,13 @@ pub(crate) fn try_prepare_owner_slots(phys: PhysAddr, additional: usize) -> Resu
     }
     let mut g = RMAP[shard(key)].map.lock();
     let map = g.get_or_insert_with(RmapTable::new);
+    prepare_owner_slots_in_map(map, key, additional)
+}
+
+/// Prepare `additional` owner slots for one frame in an already-locked
+/// shard table. The single-frame and batched preparations share this body
+/// so a batch keeps the single frame's exact semantics.
+fn prepare_owner_slots_in_map(map: &mut RmapTable, key: u64, additional: usize) -> Result<(), ()> {
     if let Some(list) = map.get_mut(key) {
         if list.len() != 0 {
             return list.try_reserve(additional);
@@ -569,6 +613,73 @@ pub(crate) fn try_prepare_owner_slots(phys: PhysAddr, additional: usize) -> Resu
     Ok(())
 }
 
+/// Batched counterpart to [`try_prepare_owner_slots`]: prepare one owner
+/// slot for every frame in `phys` with one shard-lock acquisition per
+/// touched shard instead of one per frame.
+///
+/// Bulk demand publication (`demand_alloc_range`) fills a whole range
+/// before publishing it; per-page preparation re-locked a shard (and
+/// re-probed its table) for every page of the range. The batch
+/// keeps the single-frame semantics — a fresh frame stays inline, a retained
+/// empty shell is uncounted once, an existing alias's owner `Vec` grows by
+/// exactly one per entry — and is failure-atomic: if any frame cannot be
+/// prepared, every slot this call reserved is released before `Err`
+/// returns, so the caller never has to track a partial batch. The null
+/// frame is skipped, and a frame listed twice reserves one slot per entry.
+pub(crate) fn try_prepare_owner_slots_multi(phys: &[PhysAddr]) -> Result<(), ()> {
+    for (shard_index, _shard) in RMAP.iter().enumerate().take(RMAP_SHARDS) {
+        // One scan per shard, no allocation: a shard with no entry in
+        // this batch is skipped without touching its lock.
+        if !phys
+            .iter()
+            .any(|p| p.raw() != 0 && shard(p.raw()) == shard_index)
+        {
+            continue;
+        }
+        let failed_at = {
+            let mut g = RMAP[shard_index].map.lock();
+            let map = g.get_or_insert_with(RmapTable::new);
+            let mut failed_at = None;
+            for (index, p) in phys.iter().enumerate() {
+                let key = p.raw();
+                if key == 0 || shard(key) != shard_index {
+                    continue;
+                }
+                if prepare_owner_slots_in_map(map, key, 1).is_err() {
+                    failed_at = Some(index);
+                    break;
+                }
+            }
+            failed_at
+        };
+        if let Some(failed_at) = failed_at {
+            release_prepared_owner_slots(phys, shard_index, failed_at);
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+/// Release the slots [`try_prepare_owner_slots_multi`] reserved before its
+/// failure point: every entry of an earlier shard (all prepared), plus the
+/// entries of the failing shard that precede the failing entry in slice
+/// order. Runs only on the failure path, so one lock hold per released
+/// frame is acceptable. The counts are exact because each successful
+/// preparation added exactly one reservation, and a reservation pins its
+/// row against retirement by a concurrent removal.
+fn release_prepared_owner_slots(phys: &[PhysAddr], failed_shard: usize, failed_at: usize) {
+    for (index, p) in phys.iter().enumerate() {
+        let key = p.raw();
+        if key == 0 {
+            continue;
+        }
+        let entry_shard = shard(key);
+        if entry_shard < failed_shard || (entry_shard == failed_shard && index < failed_at) {
+            release_reserved_owner_slots(*p, 1);
+        }
+    }
+}
+
 /// Allocation-free counterpart to [`try_reserve_owner_slots`] and
 /// [`try_prepare_owner_slots`].
 ///
@@ -586,6 +697,42 @@ pub(crate) fn add_reserved(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
         .and_then(|map| map.get_mut(key))
         .expect("reserved rmap frame disappeared before commit");
     list.add_reserved(owner);
+}
+
+/// Batched counterpart to [`add_reserved`]: commit many previously reserved
+/// owners with one shard-lock acquisition per touched shard instead of one
+/// per entry.
+///
+/// Shared-alias duplication reserves one slot per duplicated leaf and then
+/// committed them one by one; the batch keeps `add_reserved`'s exact
+/// per-entry semantics — the caller must have reserved one slot per entry,
+/// and a duplicate owner in the batch panics exactly as a duplicate single
+/// commit would. The null frame is skipped.
+pub(crate) fn add_reserved_multi(entries: &[(PhysAddr, PhysAddr, VirtAddr)]) {
+    for (shard_index, _shard) in RMAP.iter().enumerate().take(RMAP_SHARDS) {
+        // One scan per shard, no allocation: a shard with no entry in
+        // this batch is skipped without touching its lock.
+        if !entries
+            .iter()
+            .any(|(phys, _, _)| phys.raw() != 0 && shard(phys.raw()) == shard_index)
+        {
+            continue;
+        }
+        let mut g = RMAP[shard_index].map.lock();
+        let map = g
+            .as_mut()
+            .expect("reserved rmap table disappeared before batch commit");
+        for &(phys, root, va) in entries {
+            let key = phys.raw();
+            if key == 0 || shard(key) != shard_index {
+                continue;
+            }
+            let list = map
+                .get_mut(key)
+                .expect("reserved rmap frame disappeared before batch commit");
+            list.add_reserved(Owner { root, va });
+        }
+    }
 }
 
 /// Release owner slots reserved by [`try_reserve_owner_slots`] when the
@@ -950,12 +1097,14 @@ pub fn __reset_for_test() {
 // `narf.tests` section and actually run under `cargo xtask test`.
 mod tests {
     use super::{
-        __reset_for_test, add, add_reserved, for_each_owner, for_each_tracked_frame, move_owner,
-        owner_count, release_reserved_owner_slots, remove, remove_without_shrink, shard,
-        try_prepare_owner_slots, try_reserve_owner_slots, Owner, OwnerList, Owners, RmapTable,
+        __reset_for_test, add, add_multi, add_reserved, add_reserved_multi, for_each_owner,
+        for_each_tracked_frame, move_owner, owner_count, release_reserved_owner_slots, remove,
+        remove_without_shrink, shard, try_prepare_owner_slots, try_prepare_owner_slots_multi,
+        try_reserve_owner_slots, Owner, OwnerList, Owners, RmapTable,
         RETAINED_EMPTY_KEYS_PER_SHARD, RMAP,
     };
     use crate::{PhysAddr, VirtAddr};
+    use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_rmap_add_count_remove() -> TestResult {
@@ -1226,6 +1375,126 @@ mod tests {
         "memory/rmap",
         smoke_rmap_prepare_fresh_and_shell_destinations
     );
+
+    /// A batch preparation touches every shard once, skips the null frame,
+    /// reserves one slot per entry for a duplicated frame, and commits
+    /// through the batch commit with the same per-frame counts as the
+    /// single-frame calls.
+    fn smoke_rmap_prepare_multi_and_reserved_multi() -> TestResult {
+        __reset_for_test();
+        let root = PhysAddr::new(0x1000);
+        let base = 0x40_0000u64;
+        let result = (|| {
+            // 130 consecutive frames touch every one of the 64 shards
+            // twice; the null entry is skipped and the duplicated frame
+            // reserves one slot per entry.
+            let mut frames = Vec::new();
+            for index in 0..130u64 {
+                frames.push(PhysAddr::new(base + (index << 12)));
+            }
+            frames.push(PhysAddr::new(0));
+            let dup = PhysAddr::new(base + (130 << 12));
+            frames.push(dup);
+            frames.push(dup);
+            if try_prepare_owner_slots_multi(&frames).is_err() {
+                return TestResult::Fail("batch rmap preparation failed");
+            }
+            if owner_count(PhysAddr::new(0)) != 0 {
+                return TestResult::Fail("batch preparation tracked the null frame");
+            }
+            // Every shard gained a table from the batch.
+            let all_shards_live = RMAP.iter().all(|shard| shard.map.lock().is_some());
+            if !all_shards_live {
+                return TestResult::Fail("batch preparation did not reach every shard");
+            }
+            // The duplicated frame reserved two slots, one per entry.
+            let dup_reserved = RMAP[shard(dup.raw())]
+                .map
+                .lock()
+                .as_ref()
+                .and_then(|map| map.get(dup.raw()))
+                .is_some_and(|list| list.reserved == 2);
+            if !dup_reserved {
+                return TestResult::Fail("duplicated batch frame did not reserve two slots");
+            }
+            // Commit the whole batch (skipping the null) as one call.
+            let mut entries = Vec::new();
+            for (index, &phys) in frames.iter().enumerate() {
+                if phys.raw() == 0 {
+                    continue;
+                }
+                entries.push((
+                    phys,
+                    root,
+                    VirtAddr::new(0x4000_0000 + ((index as u64) << 12)),
+                ));
+            }
+            add_reserved_multi(&entries);
+            let committed = frames.iter().all(|&phys| {
+                if phys.raw() == 0 {
+                    return true;
+                }
+                let expected = if phys == dup { 2 } else { 1 };
+                owner_count(phys) == expected
+            });
+            if !committed {
+                return TestResult::Fail("batch rmap commit miscounted owners");
+            }
+            let dup_consumed = RMAP[shard(dup.raw())]
+                .map
+                .lock()
+                .as_ref()
+                .and_then(|map| map.get(dup.raw()))
+                .is_some_and(|list| list.reserved == 0);
+            if !dup_consumed {
+                return TestResult::Fail("batch rmap commit left reservations behind");
+            }
+            TestResult::Pass
+        })();
+        __reset_for_test();
+        result
+    }
+    kernel_test_in!("memory/rmap", smoke_rmap_prepare_multi_and_reserved_multi);
+
+    /// A batch add records exactly what the same single adds would: one
+    /// owner per frame, a duplicate owner idempotent, the null frame
+    /// skipped, and a repeated batch adding nothing new.
+    fn smoke_rmap_add_multi_matches_add() -> TestResult {
+        __reset_for_test();
+        let root = PhysAddr::new(0x1000);
+        let base = 0x50_0000u64;
+        let result = (|| {
+            let mut entries = Vec::new();
+            for index in 0..70u64 {
+                entries.push((
+                    PhysAddr::new(base + (index << 12)),
+                    root,
+                    VirtAddr::new(0x6000_0000 + (index << 12)),
+                ));
+            }
+            // Duplicate owner: idempotent, like a repeated single add.
+            entries.push(entries[3]);
+            // Null frame: skipped, like a single add.
+            entries.push((PhysAddr::new(0), root, VirtAddr::new(0x7000_0000)));
+            add_multi(&entries);
+            let counted =
+                (0..70u64).all(|index| owner_count(PhysAddr::new(base + (index << 12))) == 1);
+            if !counted || owner_count(PhysAddr::new(0)) != 0 {
+                return TestResult::Fail("batch rmap add miscounted owners");
+            }
+            // A second identical batch adds nothing new.
+            add_multi(&entries);
+            let still_counted =
+                (0..70u64).all(|index| owner_count(PhysAddr::new(base + (index << 12))) == 1);
+            if !still_counted {
+                return TestResult::Fail("repeated batch rmap add double-counted owners");
+            }
+            TestResult::Pass
+        })();
+        __reset_for_test();
+        result
+    }
+    kernel_test_in!("memory/rmap", smoke_rmap_add_multi_matches_add);
 
     fn smoke_rmap_frames_independent() -> TestResult {
         __reset_for_test();
