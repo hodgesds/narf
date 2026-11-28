@@ -51,11 +51,10 @@ fn parent_rotated_cpu(
 /// and process-creating `clone(2)`/`clone3(2)`; pthread siblings remain local.
 ///
 /// The rotation only supplies the *preferred* CPU. Placement itself goes
-/// through `select_fork_cpu_prefer_current`, which keeps the child on the
-/// parent's CPU when nothing but the forking parent is queued there (the
-/// fork+wait shape: the parent is about to park, so the child is not
-/// queueing behind runnable work) and still spreads to an idle CPU when the
-/// parent CPU has other queued work.
+/// through `select_fork_cpu_prefer_current`, which load-balances: the
+/// parent's CPU wins only when strictly least-loaded after discounting
+/// the about-to-park parent, minimum-load ties spread via the rotating
+/// preference, and a genuinely less-loaded CPU wins outright.
 pub(super) fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler::CpuId> {
     let candidates = allowed.intersection(narf_scheduler::online_cpu_set()).bits();
     let current_cpu = narf_lib::percpu::current_cpu() as u32;

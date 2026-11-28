@@ -827,6 +827,7 @@ fn smoke_scheduler_fork_cpu_tie_policy() -> TestResult {
     let cpu0 = CpuId(0);
     let cpu1 = CpuId(1);
     let cpu2 = CpuId(2);
+    let cpu3 = CpuId(3);
 
     // A saturated tie stays with the forking task for cache locality.
     if choose_fork_cpu(cpu0, 1, cpu1, Some(1), cpu2, Some(1), false) != cpu1 {
@@ -845,12 +846,33 @@ fn smoke_scheduler_fork_cpu_tie_policy() -> TestResult {
     if choose_fork_cpu(cpu0, 1, cpu1, None, cpu2, None, false) != cpu0 {
         return TestResult::Fail("fork placement escaped its sampled candidates");
     }
-    // Fork+wait locality (`prefer_current`): the load on the parent CPU is
+    // Fork load balancing (`prefer_current`): the load on the parent CPU is
     // the forking parent itself, so it does not count against that CPU —
-    // with nothing else queued there, the child stays local instead of
-    // paying a cross-CPU spawn plus an exit-wakeup IPI pair for an idle CPU.
-    if choose_fork_cpu(cpu0, 0, cpu1, Some(1), cpu2, Some(0), true) != cpu1 {
-        return TestResult::Fail("parent-local fork placement left an otherwise idle parent CPU");
+    // but the parent CPU wins only when strictly least-loaded after that
+    // discount. On an idle tie the rotating preference breaks the tie and
+    // the burst spreads instead of collapsing onto the parent.
+    if choose_fork_cpu(cpu0, 0, cpu1, Some(1), cpu2, Some(0), true) != cpu2 {
+        return TestResult::Fail(
+            "idle-tie fork placement did not spread to the rotating preference",
+        );
+    }
+    // A strictly least-loaded parent CPU still keeps its child.
+    if choose_fork_cpu(cpu0, 2, cpu1, Some(1), cpu2, Some(2), true) != cpu1 {
+        return TestResult::Fail("fork placement left a strictly least-loaded parent CPU");
+    }
+    // A fork burst spreads across idle CPUs instead of collapsing onto the
+    // parent: thread the evolving loads through successive placements,
+    // modelling what the placement snapshot sees as children land.
+    let burst = [
+        choose_fork_cpu(cpu0, 0, cpu1, Some(1), cpu2, Some(0), true),
+        choose_fork_cpu(cpu0, 0, cpu1, Some(1), cpu0, Some(0), true),
+        choose_fork_cpu(cpu3, 0, cpu1, Some(1), cpu3, Some(0), true),
+    ];
+    if burst[0] == burst[1] || burst[1] == burst[2] || burst[0] == burst[2] || burst.contains(&cpu1)
+    {
+        return TestResult::Fail(
+            "fork burst collapsed onto the parent CPU instead of spreading across idle CPUs",
+        );
     }
     // ...but a parent CPU with genuinely queued work besides the parent
     // still spreads to the idle CPU.
