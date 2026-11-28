@@ -184,7 +184,7 @@ pub fn register_initcalls() {
         narf_drivers_net_realtek::register();
         InitResult::Ok
     });
-    #[cfg(feature = "mlx4")]
+    #[cfg(all(feature = "mlx4", not(feature = "mlx4-module-only")))]
     narf_init::register(Stage::Subsys, "mlx4", || {
         narf_drivers_net_mlx4::register();
         InitResult::Ok

@@ -65,6 +65,7 @@
 
 #![allow(dead_code)]
 
+#[cfg(feature = "builtin")]
 mod tests;
 
 // ── PCI ids ─────────────────────────────────────────────────────────
@@ -162,7 +163,7 @@ pub(crate) const REG_ISR_8125: u64 = 0x3C;
 pub(crate) const REG_INT_CFG1_8125: u64 = 0x7A;
 
 /// TxPoll_8125 — new TX doorbell. Moves from 0x38 (now IMR_8125)
-/// to 0x90 on the 8125. `TPPOLL_NPQ` bit (1 << 6) is unchanged.
+/// to 0x90 on the 8125. Write a 16-bit BIT(0), not legacy byte NPQ.
 pub(crate) const REG_TPPOLL_8125: u64 = 0x90;
 
 /// RSS_CTRL_8125 — receive-side scaling control. Held at 0 in
@@ -178,7 +179,7 @@ pub(crate) const CR_RE: u8 = 1 << 3;
 pub(crate) const CR_RST: u8 = 1 << 4;
 
 // TPPoll bits (§2.5). Same NPQ bit on both the legacy 0x38 doorbell
-// and the 8125-relocated 0x90 doorbell.
+// doorbell. RTL8125 uses a distinct 16-bit BIT(0) write at 0x90.
 pub(crate) const TPPOLL_NPQ: u8 = 1 << 6;
 
 // 9346CR (config-write lock). Bits 7:6 = EEM. 00=normal, 11=write-en.
@@ -577,18 +578,31 @@ impl TxDesc {
 // ── Live driver state ───────────────────────────────────────────────
 // Stage 2b: descriptor rings, MMIO-backed bring_up, polled TX/RX path.
 
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
+#[cfg(feature = "builtin")]
 use narf_driver_runtime::{
-    alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
-    Lock as IrqSafeSpinLock, MmioRegion, Write,
+    alloc_coherent, BusDeviceCap, Cap, DomainId, Lock as IrqSafeSpinLock, Write,
 };
+#[cfg(feature = "builtin")]
 use narf_ipc::{channel, Consumer, Producer};
+#[cfg(feature = "builtin")]
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
+
+use crate::platform::{alloc_dma, map_bar, BusDevice, DmaBuffer, MmioRegion};
+#[cfg(feature = "module")]
+use crate::platform::{
+    console as narf_console, net as narf_net, scheduler as narf_scheduler, time as narf_time,
+    Lock as IrqSafeSpinLock,
+};
+#[cfg(feature = "module")]
+use narf_net::TxMeta;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NicError {
+    ResetTimeout,
+    Phy(crate::phy_access::PhyError),
     BarMapFailed,
     NoMemory,
     /// Frame outside [1, chip max frame].
@@ -653,22 +667,28 @@ pub struct RtlNic {
     /// Set by `suspend`, cleared by `resume`: the datapath gates
     /// refuse TX and RX while this is set (issue #793).
     suspended: AtomicBool,
+    phy_ready: AtomicBool,
     /// IDT vector wired to MSI-X entry 0, when MSI-X is enabled.
     pub irq_vector: Option<u8>,
     /// Live MSI-X table — kept alive so the device's MSI-X enable
     /// stays sticky.
+    #[cfg(feature = "builtin")]
     msix: Option<narf_bus::MsixTable>,
     /// PCI address of the function this instance drives. Probe
     /// refuses a second bind of the same address (issue #1631): two
     /// `RtlNic`s for one chip would drive one set of rings.
+    #[cfg(feature = "builtin")]
     pub addr: narf_bus::BusAddr,
     /// Interface name `publish_netdev_with_context` assigned this
     /// instance (`eth%d`). Per-instance (i40e/igc pattern): the old
     /// module-level `RTL8125_IFNAME` static could only name one NIC.
+    #[cfg(feature = "builtin")]
     ifname: crate::publish::IfName,
 
     // IPC integration
+    #[cfg(feature = "builtin")]
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    #[cfg(feature = "builtin")]
     pub tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
@@ -701,14 +721,14 @@ impl RtlNic {
     /// # Safety
     /// Caller owns the device's BAR + cfg windows exclusively for
     /// the duration of init.
-    pub unsafe fn bring_up(
-        device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<Arc<Self>, NicError> {
+    pub unsafe fn bring_up(device: &BusDevice) -> Result<Arc<Self>, NicError> {
         // RTL8125 ships its operational registers in BAR2 (MMIO).
         // BAR0/1 are the legacy I/O alias path we don't use.
         // SAFETY: caller-asserted exclusive ownership.
         let mmio = unsafe { map_bar(device, 2) }.map_err(|_| NicError::BarMapFailed)?;
+
+        #[cfg(feature = "module")]
+        device.enable().map_err(|_| NicError::BarMapFailed)?;
 
         // 1. Software reset. CR.RST self-clears once the chip has
         //    finished re-initialising the FIFOs + descriptor pointers
@@ -721,11 +741,13 @@ impl RtlNic {
         // `rtl_loop_wait_low(tp, &rtl_chipcmd_cond, 100, 100)` at
         // r8169_main.c:2675 (100 µs per poll × 100 polls = 10 ms
         // typical; bumped to 100 ms wall-clock for safety here).
-        narf_scheduler::responsive_spin_until(
+        if !narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { mmio.read8(REG_CR) } & CR_RST == 0,
             narf_time::Deadline::after_ms(100),
-        );
+        ) {
+            return Err(NicError::ResetTimeout);
+        }
 
         // 2. Read MAC from IDR0..5 (datasheet §2.1). Byte-readable
         //    despite the 4-byte write constraint.
@@ -750,25 +772,40 @@ impl RtlNic {
         let xid = decode_xid(txcfg);
         let chip_kind = chip_kind_from_xid(xid);
 
+        #[cfg(feature = "module")]
+        if chip_kind != ChipKind::Rtl8125B {
+            return Err(NicError::Other(
+                "module bring-up currently supports RTL8125B XID 641",
+            ));
+        }
+        // The B silicon needs its MAC/EPHY sequence before DMA is enabled.
+        // SAFETY: probe exclusively owns the configuration registers.
+        unsafe {
+            mmio.write8(REG_9346CR, EEM_CONFIG_WRITE);
+        }
+        if chip_kind == ChipKind::Rtl8125B {
+            if let Err(error) = start_mac_8125b(&mmio) {
+                // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+                unsafe {
+                    mmio.write8(REG_9346CR, EEM_NORMAL);
+                }
+                return Err(NicError::Phy(error));
+            }
+        }
+
         // 4. Allocate descriptor rings + per-slot buffers. zeroed
         //    pages give us "host-owned (OWN=0)" descriptors, which
         //    is the correct initial state for TX; RX gets explicitly
         //    rearmed to NIC-owned in step 6.
-        let tx_ring =
-            alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
-        let rx_ring =
-            alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
+        let tx_ring = alloc_dma(device, RING_BYTES).map_err(|_| NicError::NoMemory)?;
+        let rx_ring = alloc_dma(device, RING_BYTES).map_err(|_| NicError::NoMemory)?;
         let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
-            rx_pool.push(
-                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
-            );
+            rx_pool.push(alloc_dma(device, RX_BUF_LEN).map_err(|_| NicError::NoMemory)?);
         }
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
-            tx_pool.push(
-                alloc_coherent(TX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
-            );
+            tx_pool.push(alloc_dma(device, TX_BUF_LEN).map_err(|_| NicError::NoMemory)?);
         }
 
         // 5. C+CR first per the Linux bring-up order. Enable RX
@@ -785,14 +822,6 @@ impl RtlNic {
             let mut regs = crate::features::MmioRegs(&mmio);
             crate::features::apply_cplus(&mut regs, false, true);
             crate::features::apply_eee_txidle(&mut regs, 1500);
-        }
-
-        // 6. CR enables both TE + RE. Datasheet §2.7 + §2.8 require
-        //    TE / RE be set before TCR / RCR are programmed; same
-        //    idiom as r8169.
-        // SAFETY: same.
-        unsafe {
-            mmio.write8(REG_CR, CR_TE | CR_RE);
         }
 
         // 6a. Program TX descriptor ring base + TCR. Splits the
@@ -830,11 +859,7 @@ impl RtlNic {
             };
             // SAFETY: identity-mapped DMA ring page; i < RING_LEN.
             unsafe {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
-                        .kernel_mut_ptr::<TxDesc>(),
-                    d,
-                );
+                core::ptr::write_volatile(rx_ring.cpu_mut_ptr_at::<TxDesc>((i * 16) as u64), d);
             }
         }
         // RMS is the buffer bound (16383), not the MTU bound —
@@ -846,6 +871,14 @@ impl RtlNic {
             mmio.write16(REG_RMS, RX_BUF_LEN as u16);
         }
 
+        // Publish initialized rings before enabling either DMA engine.
+        core::sync::atomic::fence(Ordering::Release);
+        // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+        unsafe {
+            mmio.write8(REG_9346CR, EEM_NORMAL);
+            mmio.write8(REG_CR, CR_TE | CR_RE);
+        }
+
         // 6c. RCR — 8125 variant uses `RX_FETCH_DFLT_8125 = 8 << 27`
         //     for the DMA-prefetch threshold (Linux
         //     `rtl_init_rxcfg(RTL_GIGA_MAC_VER_61)`; the 8169-era
@@ -855,6 +888,9 @@ impl RtlNic {
         //     without throttling on the 2.5 G PHY's burst rate.
         // SAFETY: same.
         unsafe {
+            // All multicast hashes: IPv6 neighbor discovery requires multicast.
+            mmio.write32(REG_MAR0, u32::MAX);
+            mmio.write32(REG_MAR0 + 4, u32::MAX);
             mmio.write32(
                 REG_RCR,
                 RX_FETCH_DFLT_8125 | RCR_APM | RCR_AM | RCR_AB | RCR_MXDMA_UNLIMITED,
@@ -897,7 +933,9 @@ impl RtlNic {
             mmio.write8(REG_9346CR, EEM_NORMAL);
         }
 
+        #[cfg(feature = "builtin")]
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        #[cfg(feature = "builtin")]
         let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
         let rtl = Arc::new(Self {
@@ -915,16 +953,23 @@ impl RtlNic {
             wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
             suspended: AtomicBool::new(false),
+            phy_ready: AtomicBool::new(false),
             irq_vector: None,
+            #[cfg(feature = "builtin")]
             msix: None,
+            #[cfg(feature = "builtin")]
             addr: device.addr,
+            #[cfg(feature = "builtin")]
             ifname: crate::publish::IfName::new(),
+            #[cfg(feature = "builtin")]
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            #[cfg(feature = "builtin")]
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
         // Spawn the device's only pump pair — probe spawns none, so the
         // pair fed here is the pair whose halves occupy the ring slots.
+        #[cfg(feature = "builtin")]
         spawn_pumps(rtl.clone(), rx_prod, tx_cons);
 
         // Return the `Arc` directly: unwrapping it back to `Self`
@@ -943,6 +988,7 @@ impl RtlNic {
     ///
     /// # Safety
     /// Caller owns the device's BAR + cfg windows exclusively.
+    #[cfg(feature = "builtin")]
     pub unsafe fn enable_msix(
         &mut self,
         cap: &Cap<BusDeviceCap, Write>,
@@ -980,7 +1026,7 @@ impl RtlNic {
     /// family jumbo tagged frame (16384 bytes) are accepted; the
     /// chip pads frames < 64 bytes itself.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
-        if self.suspended.load(Ordering::Acquire) {
+        if self.suspended.load(Ordering::Acquire) || !self.phy_ready.load(Ordering::Acquire) {
             return Err(NicError::Suspended);
         }
         if frame.is_empty() || frame.len() > TX_BUF_LEN {
@@ -989,21 +1035,20 @@ impl RtlNic {
         let mut head_g = self.tx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let phys = self.tx_pool[slot].dma_addr().raw();
+        let desc_offset = (slot * 16) as u64;
+
+        // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
+        let cur_flags =
+            unsafe { core::ptr::read_volatile(self.tx_ring.cpu_ptr_at::<u32>(desc_offset)) };
+        if cur_flags & TXD_OWN != 0 {
+            return Err(NicError::TxRingFull);
+        }
+
         // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
-        }
-        let ring_phys = self.tx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (slot * 16) as u64;
-
-        // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
-        let cur_flags = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())
-        };
-        if cur_flags & TXD_OWN != 0 {
-            return Err(NicError::TxRingFull);
         }
 
         // Select descriptor format based on offload request.
@@ -1045,35 +1090,28 @@ impl RtlNic {
         // them first, fence, then publish OWN.
         // SAFETY: identity-mapped DMA ring.
         unsafe {
+            core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<u32>(desc_offset + 4), d.vlan);
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr + 4).kernel_mut_ptr::<u32>(),
-                d.vlan,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
+                self.tx_ring.cpu_mut_ptr_at::<u32>(desc_offset + 8),
                 d.addr_lo,
             );
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr + 12).kernel_mut_ptr::<u32>(),
+                self.tx_ring.cpu_mut_ptr_at::<u32>(desc_offset + 12),
                 d.addr_hi,
             );
         }
-        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<u32>(),
-                d.flags_len,
-            );
+            core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<u32>(desc_offset), d.flags_len);
         }
-        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
 
         // Ring the TX doorbell at TxPoll_8125 (0x90 on 8125, not
-        // 0x38). NPQ bit (1 << 6) is unchanged from the legacy
-        // doorbell.
+        // 0x38). RTL8125 uses a 16-bit BIT(0), unlike legacy byte NPQ.
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            self.mmio.write8(REG_TPPOLL_8125, TPPOLL_NPQ);
+            self.mmio.write16(REG_TPPOLL_8125, 1);
         }
 
         let next_head = (*head_g + 1) % (RING_LEN as u32);
@@ -1085,7 +1123,7 @@ impl RtlNic {
         // so the FB cursor / serial drain stay alive.
         let owned = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA ring.
-            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>()) } & TXD_OWN == 0,
+            || unsafe { core::ptr::read_volatile(self.tx_ring.cpu_ptr_at::<u32>(desc_offset)) } & TXD_OWN == 0,
             narf_time::Deadline::after_ms(250),
         );
         if !owned {
@@ -1104,22 +1142,21 @@ impl RtlNic {
     /// Like [`RtlNic::receive`], plus the chip's RX checksum
     /// verification result decoded from the returned descriptor.
     pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
-        if self.suspended.load(Ordering::Acquire) {
+        if self.suspended.load(Ordering::Acquire) || !self.phy_ready.load(Ordering::Acquire) {
             return None;
         }
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
-        let ring_phys = self.rx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (slot * 16) as u64;
+        let desc_offset = (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring.
-        let flags_len = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())
-        };
+        let flags_len =
+            unsafe { core::ptr::read_volatile(self.rx_ring.cpu_ptr_at::<u32>(desc_offset)) };
         if flags_len & RXD_OWN_LOCAL != 0 {
             return None;
         }
 
+        core::sync::atomic::fence(Ordering::Acquire);
         // Decode the RX checksum result now, before rearming
         // overwrites the descriptor.
         let csum = TxDesc {
@@ -1136,10 +1173,12 @@ impl RtlNic {
         // they care). LS must be set; multi-segment fragments get
         // their non-LS prefixes dropped.
         let len = (flags_len & RXD_LEN_MASK_LOCAL) as usize;
-        let buf_phys = self.rx_pool[slot].dma_addr().raw();
 
         let mut out = alloc::vec::Vec::with_capacity(len.min(RX_BUF_LEN));
-        if flags_len & RXD_LS_LOCAL != 0 {
+        if flags_len & (RXD_LS_LOCAL | (1 << 29)) == (RXD_LS_LOCAL | (1 << 29))
+            && flags_len & (1 << 21) == 0
+            && (18..=RX_BUF_LEN).contains(&len)
+        {
             let copy_len = len.min(RX_BUF_LEN);
             // SAFETY: identity-mapped DMA buffer.
             for i in 0..copy_len {
@@ -1159,20 +1198,17 @@ impl RtlNic {
         if slot == RING_LEN - 1 {
             new_flags |= RXD_EOR_LOCAL;
         }
-        let d = TxDesc {
-            flags_len: new_flags,
-            vlan: 0,
-            addr_lo: buf_phys as u32,
-            addr_hi: (buf_phys >> 32) as u32,
-        };
-        // SAFETY: same.
+        // Buffer address is unchanged. Reset opts2 before handing ownership
+        // back; an aggregate struct store could publish OWN before opts2.
+        // SAFETY: this consumed RX descriptor is CPU-owned and within the ring.
         unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
-                d,
-            );
+            core::ptr::write_volatile(self.rx_ring.cpu_mut_ptr_at::<u32>(desc_offset + 4), 0);
         }
-        compiler_fence(Ordering::SeqCst);
+        fence(Ordering::Release);
+        // SAFETY: publish only the ownership/length word after the DMA barrier.
+        unsafe {
+            core::ptr::write_volatile(self.rx_ring.cpu_mut_ptr_at::<u32>(desc_offset), new_flags);
+        }
 
         *head_g = (*head_g + 1) % (RING_LEN as u32);
         Some((out, csum))
@@ -1317,6 +1353,9 @@ impl RtlNic {
 
     /// Read the PHY-status register. Useful for tests; bit 1 = link.
     pub fn phy_status(&self) -> u8 {
+        if !self.phy_ready.load(Ordering::Acquire) {
+            return 0;
+        }
         // SAFETY: identity-mapped MMIO.
         unsafe { self.mmio.read8(REG_PHYSTAT) }
     }
@@ -1351,6 +1390,7 @@ impl RtlNic {
     /// second suspend is a no-op success. The PHY stays powered
     /// (its autoneg advertisement persists), and the descriptor
     /// rings persist — only the CR EN bits gate DMA.
+    #[cfg(feature = "builtin")]
     pub fn suspend(&self) -> Result<(), NicError> {
         if self.suspended.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -1367,6 +1407,7 @@ impl RtlNic {
     /// device is a no-op success. The PHY re-kick is best-effort:
     /// a failed MDIO read leaves the advertisement as it was, and
     /// the link still comes back on its own.
+    #[cfg(feature = "builtin")]
     pub fn resume(&self) -> Result<(), NicError> {
         if !self.suspended.load(Ordering::Acquire) {
             return Ok(());
@@ -1664,10 +1705,9 @@ pub fn phy_table_for(kind: ChipKind) -> (&'static [PhyConfigEntry], &'static [Ph
 /// Run the PHY bring-up sequence once the firmware registry exists.
 /// Mirrors the 8127 late hook: take an `Arc` clone and drop the
 /// registry lock before touching the PHY (a firmware delay opcode
-/// can spin for up to `MAX_FIRMWARE_DELAY_MS`). A missing blob is
-/// a log line, not an error — the tables still program the
-/// registers they name. A blob that fails mid-stream is logged
-/// and the tables still run (same shape as the 8127 hook).
+/// can spin for up to `MAX_FIRMWARE_DELAY_MS`). Missing or failed firmware leaves networking down; the post-firmware
+/// table is applied only after the patch completes successfully.
+#[cfg(feature = "builtin")]
 pub fn configure_phy_late() {
     // Every probed controller gets its PHY sequence, not just the
     // first: the hook runs once from a `Stage::Late` initcall and
@@ -1676,105 +1716,179 @@ pub fn configure_phy_late() {
     // opcode can spin for up to `MAX_FIRMWARE_DELAY_MS`).
     let controllers = CONTROLLERS.lock().clone();
     for controller in controllers {
-        configure_phy(&controller.mmio, controller.xid, controller.chip_kind);
+        use core::fmt::Write as _;
+        match load_phy_firmware(controller.xid) {
+            Some(code) => match configure_phy(&controller.mmio, controller.chip_kind, &code) {
+                Ok(()) => {
+                    controller.phy_ready.store(true, Ordering::Release);
+                    crate::publish::publish_link(
+                        controller.ifname(),
+                        rtl8125_link_sample_with_phy(&controller, controller.phy_status()),
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "rtl8125: PHY initialization failed: {:?}",
+                        e
+                    );
+                }
+            },
+            None => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "rtl8125: firmware unavailable for XID {:#x}; networking remains down",
+                    controller.xid
+                );
+            }
+        }
     }
 }
 
-fn configure_phy(mmio: &MmioRegion, xid: u32, kind: ChipKind) {
+fn configure_phy(
+    mmio: &MmioRegion,
+    kind: ChipKind,
+    code: &[u32],
+) -> Result<(), crate::phy_access::PhyError> {
     use core::fmt::Write as _;
-
     let (pre, post) = phy_table_for(kind);
     let mut access = crate::phy_access::PhyAccess::new(mmio);
+    // Power up and enable autonegotiation before applying the PHY patch.
+    access.mdio_write(0x1f, 0)?;
+    let bmcr = access.mdio_read(0)?;
+    access.mdio_write(0, (bmcr & !0x0800) | 0x1000)?;
+    access.apply_config_table(pre)?;
+    access.run_firmware(code)?;
+    access.apply_config_table(post)?;
+    // Advertise 10/100 full/half, 1000 full, and 2500 full (rtlgen PHY).
+    access.mdio_write(4, (access.mdio_read(4)? & !0x03e0) | 0x01e1)?;
+    access.mdio_write(9, (access.mdio_read(9)? & !0x0300) | 0x0200)?;
+    access.phy_ocp_modify(0xa5d4, 0, 1 << 7)?;
+    access.advertise_eee(crate::features::eee_lpi_caps(RtlNic::mac_version_for_kind(
+        kind,
+    )))?;
+    access.mdio_write(0, 0x1200)?;
+    let _ = writeln!(
+        narf_console::Writer,
+        "rtl8125: applied PHY firmware ({} opcodes); autonegotiating",
+        code.len()
+    );
+    Ok(())
+}
 
-    if let Err(e) = access.apply_config_table(pre) {
-        let _ = writeln!(
-            narf_console::Writer,
-            "  rtl8125: pre-firmware PHY table aborted: {:?}",
-            e
-        );
-        return;
-    }
-
-    match load_phy_firmware(xid) {
-        Some(code) => match access.run_firmware(&code) {
-            Ok(()) => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  rtl8125: applied firmware ({} opcodes)",
-                    code.len(),
-                );
-            }
-            Err(e) => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  rtl8125: firmware aborted at an opcode: {:?}; PHY may be partly patched",
-                    e,
-                );
-            }
-        },
-        None => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  rtl8125: no firmware blob for XID {:#x}; applying PHY config without it",
-                xid,
-            );
+// RTL8125B MAC_VER_63, adapted from Linux r8169_main.c (GPL-2.0).
+// ASPM/clock-request stays disabled until NARF has platform ASPM management.
+fn start_mac_8125b(mmio: &MmioRegion) -> Result<(), crate::phy_access::PhyError> {
+    use crate::phy_access::{PhyAccess, PhyError};
+    let access = PhyAccess::new(mmio);
+    let modify = |addr: u32, clear: u16, set: u16| -> Result<(), PhyError> {
+        access.mac_ocp_write(addr, (access.mac_ocp_read(addr)? & !clear) | set)
+    };
+    // SAFETY: probe owns the BAR; widths and offsets follow r8169_main.c.
+    unsafe {
+        mmio.write8(REG_INT_CFG0_8125, 0);
+        mmio.write16(REG_INT_CFG1_8125, 0);
+        mmio.write32(REG_IMR_8125, 0);
+        for offset in (0xa00..0xa80).step_by(4) {
+            mmio.write32(offset, 0);
         }
+        mmio.write8(0x53, mmio.read8(0x53) & !0x80); // Config2.ClkReqEn
+        mmio.write8(0x56, mmio.read8(0x56) & !1); // Config5.ASPM_en
+        mmio.write8(0x54, mmio.read8(0x54) & !2); // Config3.Rdy_to_L23
+        mmio.write8(0x52, mmio.read8(0x52) & !0x10);
+        mmio.write16(0x382, 0x221b);
+        mmio.write32(REG_RSS_CTRL_8125, 0);
+        mmio.write16(REG_Q_NUM_CTRL_8125, 0);
     }
-
-    if let Err(e) = access.apply_config_table(post) {
-        let _ = writeln!(
-            narf_console::Writer,
-            "  rtl8125: PHY config table aborted: {:?}",
-            e
-        );
-    }
-
-    // EEE PHY advertisement (#1274): program the emulated AN MMD
-    // advertisement registers for this chip's LPI caps, then
-    // restart auto-negotiation iff the advertisement changed so
-    // the link partner negotiates EEE on the next exchange.
-    // This runs last so the advertisement is the final PHY-page
-    // programming before the link is used. A failure here is
-    // logged, not fatal: the interface still works, just
-    // without EEE advertisement.
-    let caps = crate::features::eee_lpi_caps(RtlNic::mac_version_for_kind(kind));
-    match access.advertise_eee(caps) {
-        Ok(true) => match access.restart_aneg() {
-            Ok(true) => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  rtl8125: EEE advertisement programmed; autonegotiation restarted",
-                );
-            }
-            Ok(false) => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  rtl8125: EEE advertisement programmed; autonegotiation disabled, \
-                     takes effect at the next autonegotiation",
-                );
-            }
-            Err(e) => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  rtl8125: EEE advertisement programmed but autonegotiation restart \
-                     failed: {:?}",
-                    e
-                );
-            }
-        },
-        Ok(false) => {}
-        Err(e) => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "  rtl8125: EEE advertisement failed: {:?}; link partner will not negotiate EEE",
-                e
-            );
+    modify(0xe092, 0x00ff, 0)?;
+    modify(0xea84, 0, 3)?;
+    for (reg, mask, bits) in [
+        (0x0b, 0xffff, 0xa908),
+        (0x1e, 0xffff, 0x20eb),
+        (0x4b, 0xffff, 0xa908),
+        (0x5e, 0xffff, 0x20eb),
+        (0x22, 0x0030, 0x0020),
+        (0x62, 0x0030, 0x0020),
+    ] {
+        let address = (reg & 0x1f) << 16;
+        // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+        unsafe {
+            mmio.write32(0x80, address);
         }
+        if !narf_scheduler::responsive_spin_until(
+            // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+            || unsafe { mmio.read32(0x80) } & 0x80000000 != 0,
+            narf_time::Deadline::after_ms(1),
+        ) {
+            return Err(PhyError::OcpTimeout);
+        }
+        // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+        let value = (unsafe { mmio.read32(0x80) } as u16 & !mask) | bits;
+        // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+        unsafe {
+            mmio.write32(0x80, 0x80000000 | address | u32::from(value));
+        }
+        if !narf_scheduler::responsive_spin_until(
+            // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+            || unsafe { mmio.read32(0x80) } & 0x80000000 == 0,
+            narf_time::Deadline::after_ms(1),
+        ) {
+            return Err(PhyError::OcpTimeout);
+        }
+        let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(10));
     }
+    access.mac_ocp_write(0xc140, 0xffff)?;
+    access.mac_ocp_write(0xc142, 0xffff)?;
+    for (addr, clear, set) in [
+        (0xd40a, 0x0010, 0),
+        (0xd3e2, 0x0fff, 0x03a9),
+        (0xd3e4, 0x00ff, 0),
+        (0xe860, 0, 0x0080),
+        (0xeb58, 1, 0),
+        (0xe614, 0x0700, 0x0200),
+        (0xe63e, 0x0c30, 0),
+        (0xc0b4, 0, 0x000c),
+        (0xeb6a, 0x00ff, 0x0033),
+        (0xeb50, 0x03e0, 0x0040),
+        (0xe056, 0x00f0, 0),
+        (0xe040, 0x1000, 0),
+        (0xea1c, 3, 1),
+        (0xea1c, 4, 0),
+        (0xe0c0, 0x4f0f, 0x4403),
+        (0xe052, 0x0080, 0x0068),
+        (0xd430, 0x0fff, 0x047f),
+        (0xea1c, 4, 0),
+        (0xeb54, 0, 1),
+    ] {
+        modify(addr, clear, set)?;
+    }
+    let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(1));
+    modify(0xeb54, 1, 0)?;
+    // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+    unsafe {
+        mmio.write16(0x1880, mmio.read16(0x1880) & !0x0030);
+    }
+    access.mac_ocp_write(0xe098, 0xc302)?;
+    if !narf_scheduler::responsive_spin_until(
+        || {
+            access
+                .mac_ocp_read(0xe00e)
+                .is_ok_and(|v| v & (1 << 13) == 0)
+        },
+        narf_time::Deadline::after_ms(10),
+    ) {
+        return Err(PhyError::OcpTimeout);
+    }
+    // SAFETY: exclusive probe owns this mapped RTL8125 register window; offset and width follow Linux MAC_VER_63.
+    unsafe {
+        mmio.write32(0xf0, mmio.read32(0xf0) & !(1 << 19));
+    }
+    Ok(())
 }
 
 /// Fetch and parse this chip's firmware blob, if the firmware
 /// registry has it.
+#[cfg(feature = "builtin")]
 fn load_phy_firmware(xid: u32) -> Option<alloc::vec::Vec<u32>> {
     use core::fmt::Write as _;
 
@@ -1812,6 +1926,7 @@ impl RtlNic {
     /// before probe publishes it. Per-instance state (i40e/igc
     /// pattern); the pumps and the registry adapter read the name
     /// off the device they serve, never a module-level static.
+    #[cfg(feature = "builtin")]
     pub fn ifname(&self) -> &'static str {
         self.ifname.get()
     }
@@ -1826,6 +1941,7 @@ impl RtlNic {
 /// traffic instead of being dropped by a singleton slot (issue
 /// #1631). The vec never shrinks, so a live controller's cookie
 /// stays valid for the kernel lifetime.
+#[cfg(feature = "builtin")]
 static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<RtlNic>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
@@ -1835,6 +1951,7 @@ static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<RtlNic>>> =
 /// `CONTROLLERS`. The `Arc` is cloned out rather than holding the
 /// IRQ-masking `CONTROLLERS` lock across `transmit` (same reasoning
 /// as e1000's send path).
+#[cfg(feature = "builtin")]
 fn rtl8125_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let ctrl = controller(cookie as usize).ok_or(())?;
     ctrl.transmit(frame, &meta).map_err(|_| ())
@@ -1845,6 +1962,7 @@ fn rtl8125_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Resu
 /// 2.5 GbE link also raises it, so 1000 is published as the in-band
 /// lower bound; exact negotiated-rate decode is
 /// [`rtl8125_link_sample_with_phy`] (PHY work, #790).
+#[cfg(feature = "builtin")]
 fn rtl8125_link_sample(status: u8) -> crate::publish::LinkSample {
     let s = PhyStatus::parse(status);
     if !s.link_up {
@@ -1891,6 +2009,7 @@ fn rtl8125_link_sample(status: u8) -> crate::publish::LinkSample {
 /// the config-table or firmware paths. Callers gate on the
 /// PHYStatus byte changing (see the RX pump): the PHY read runs
 /// on link transitions only, never on the per-pass hot path.
+#[cfg(feature = "builtin")]
 fn rtl8125_link_sample_with_phy(device: &RtlNic, status: u8) -> crate::publish::LinkSample {
     use crate::phy::Phy;
     let base = rtl8125_link_sample(status);
@@ -1904,6 +2023,7 @@ fn rtl8125_link_sample_with_phy(device: &RtlNic, status: u8) -> crate::publish::
     }
 }
 
+#[cfg(feature = "builtin")]
 impl narf_power::device_pm::DevicePmOps for RtlNic {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
         self.suspend()
@@ -1921,6 +2041,7 @@ impl narf_power::device_pm::DevicePmOps for RtlNic {
 /// `RtlNic` for the same silicon would let two instances drive one
 /// chip's rings. A second FUNCTION binds as a new instance instead
 /// of being dropped (issue #1631).
+#[cfg(feature = "builtin")]
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLERS.lock().iter().any(|c| c.addr == device.addr) {
         return Ok(());
@@ -1941,7 +2062,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: probe holds exclusive authority over `device` and its cfg `cap`
     // for the duration of `bring_up`, satisfying its `# Safety` contract.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let dev = match unsafe { RtlNic::bring_up(&device, &cap) } {
+    let dev = match unsafe { RtlNic::bring_up(&device) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
@@ -2038,6 +2159,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
+#[cfg(feature = "builtin")]
 fn spawn_pumps(
     device: Arc<RtlNic>,
     rx_prod: Producer<Frame, RX_RING_N>,
@@ -2054,6 +2176,7 @@ fn spawn_pumps(
     });
 }
 
+#[cfg(feature = "builtin")]
 async fn rtl8125_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
     // Carrier refresh (issue #791): the production datapath is polled
     // (probe never enables MSI-X, so the LinkChg bit in the ISR has no
@@ -2112,6 +2235,7 @@ async fn rtl8125_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RI
     }
 }
 
+#[cfg(feature = "builtin")]
 async fn rtl8125_tx_pump(device: Arc<RtlNic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
         let _ = device.transmit(frame.payload(), &TxMeta::plain());
@@ -2121,6 +2245,7 @@ async fn rtl8125_tx_pump(device: Arc<RtlNic>, mut tx_cons: Consumer<Frame, TX_RI
 /// Register a PCI match-table entry per supported device id. Realtek
 /// keeps the IDs distinct between RTL8125 and RTL8125B even though
 /// the register layouts are identical; we register both.
+#[cfg(feature = "builtin")]
 pub fn register_pci_driver() {
     for &did in ALL_DEV_IDS {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
@@ -2144,6 +2269,7 @@ pub fn register_pci_driver() {
 /// rings, with the second port's frames landing in the first port's
 /// queue (i40e's `I40eNicIface` pattern).
 #[derive(Debug)]
+#[cfg(feature = "builtin")]
 pub struct Rtl8125Nic {
     /// This port's controller; the rings are borrowed out of it.
     nic: Arc<RtlNic>,
@@ -2156,6 +2282,7 @@ pub struct Rtl8125Nic {
 /// checksum + TSO follow the program; RX checksum and VLAN
 /// insertion are never touched by Linux's `fix_features` rules
 /// and stay advertised.
+#[cfg(feature = "builtin")]
 fn offloads_for_program(program: crate::features::MtuProgram) -> narf_net::OffloadCapabilities {
     narf_net::OffloadCapabilities {
         tx_checksum: program.tx_checksum,
@@ -2192,11 +2319,13 @@ const EINVAL: i32 = 22;
 /// race to a rebind self-heals on the next `try_set_mtu` to
 /// the same value.
 #[derive(Debug)]
+#[cfg(feature = "builtin")]
 pub struct Rtl8125MtuControl {
     controller: Arc<RtlNic>,
     name: &'static str,
 }
 
+#[cfg(feature = "builtin")]
 impl narf_net::iface::DeviceControl for Rtl8125MtuControl {
     fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
         if config.mtu == *self.controller.mtu.lock() {
@@ -2212,6 +2341,7 @@ impl narf_net::iface::DeviceControl for Rtl8125MtuControl {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl narf_net::Interface for Rtl8125Nic {
     fn name(&self) -> &str {
         // The dynamic `eth%d` name once published (issue #784); the
@@ -2230,7 +2360,7 @@ impl narf_net::Interface for Rtl8125Nic {
         *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
-        self.nic.link_up
+        self.nic.phy_status() & PHYSTAT_LINKSTS != 0
     }
     fn offloads(&self) -> narf_net::OffloadCapabilities {
         // The TSO byte cap is the TX slot buffer: a TSO packet is
@@ -2259,6 +2389,7 @@ impl narf_net::Interface for Rtl8125Nic {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl crate::HwNic for Rtl8125Nic {
     fn name(&self) -> &'static str {
         let n = self.nic.ifname();
@@ -2275,7 +2406,7 @@ impl crate::HwNic for Rtl8125Nic {
         *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
-        self.nic.link_up
+        self.nic.phy_status() & PHYSTAT_LINKSTS != 0
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::RealtekRtl8125
@@ -2303,11 +2434,13 @@ impl crate::HwNic for Rtl8125Nic {
 }
 
 /// Number of probed controllers (issue #1631).
+#[cfg(feature = "builtin")]
 pub fn instance_count() -> usize {
     CONTROLLERS.lock().len()
 }
 
 /// `true` once at least one controller has been probed.
+#[cfg(feature = "builtin")]
 pub fn is_probed() -> bool {
     !CONTROLLERS.lock().is_empty()
 }
@@ -2315,21 +2448,39 @@ pub fn is_probed() -> bool {
 /// The probed controller at `index`, if it exists. The index is the
 /// cookie probe assigned (see `CONTROLLERS`); it is stable for the
 /// kernel lifetime because the vec never shrinks.
+#[cfg(feature = "builtin")]
 pub fn controller(index: usize) -> Option<Arc<RtlNic>> {
     CONTROLLERS.lock().get(index).cloned()
 }
 
 /// Test-side accessor: run `f` against the probed controller at
 /// `index` (i40e shape).
+#[cfg(feature = "builtin")]
 pub fn with_controller<R>(index: usize, f: impl FnOnce(&RtlNic) -> R) -> Option<R> {
     CONTROLLERS.lock().get(index).map(|a| f(a))
 }
 
 /// Mutable accessor — used by tests that want to switch on MSI-X
 /// after probe.
+#[cfg(feature = "builtin")]
 pub fn with_controller_mut<R>(index: usize, f: impl FnOnce(&mut RtlNic) -> R) -> Option<R> {
     CONTROLLERS
         .lock()
         .get_mut(index)
         .map(|a| f(Arc::get_mut(a).expect("RtlNic static has multiple owners")))
+}
+
+#[cfg(feature = "module")]
+impl RtlNic {
+    pub(crate) fn configure_module_phy(&self) -> Result<(), i32> {
+        let name = firmware_name_for(self.xid).ok_or(-19)?;
+        let bytes = crate::platform::firmware(name)?;
+        let code = crate::phy_access::parse_firmware(&bytes).map_err(|_| -22)?;
+        configure_phy(&self.mmio, self.chip_kind, &code).map_err(|_| -5)?;
+        self.phy_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub(crate) fn module_access_failed(&self) -> bool {
+        self.mmio.failed()
+    }
 }

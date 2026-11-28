@@ -40,6 +40,13 @@
 
 ## 3. Public interface
 
+`driver_match::module_netif_set_link(owner, token, ifindex, carrier)`
+publishes physical carrier for the interface owned by that module/device
+context, inside its current device-capability invocation. A foreign context
+returns `-ENODEV`, and a foreign ifindex returns `-EINVAL`; administrative
+IFF_UP is unchanged. The `narf_netif_set_link` module export requires
+`NetIface:Write` and accepts only carrier values 0 or 1.
+
 `module_netif_register_with_context(owner, token, mac, ModuleTxCtxFn)`
 registers a device-aware copy-mode Ethernet callback with signature
 `extern "C" fn(token, frame, len) -> i32`. TX resolves the registered

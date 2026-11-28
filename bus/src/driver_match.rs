@@ -2371,7 +2371,6 @@ fn module_netif_register_inner(
     Ok(ifindex)
 }
 
-/// Deliver one copied receive frame from module memory into the kernel stack.
 /// The name of the netdev module `owner` registered on device `token`, if
 /// its ifindex is `ifindex`. Lets a wireless family host bind its wiphy to
 /// exactly that interface.
@@ -2385,6 +2384,36 @@ pub fn module_netif_name(owner: u64, token: u64, ifindex: u32) -> Option<alloc::
         .map(|iface| iface.name.clone())
 }
 
+/// Publish carrier for exactly this module-owned device/interface.
+/// Administrative interface state is unchanged.
+pub fn module_netif_set_link(owner: u64, token: u64, ifindex: u32, carrier: bool) -> i32 {
+    let (cap, name) = {
+        let contexts = DEVICE_CTXS.lock();
+        let Some(ctx) = contexts
+            .iter()
+            .find(|ctx| ctx.owner == owner && ctx.token == token)
+        else {
+            return -19;
+        };
+        let Some(iface) = ctx
+            .net_iface
+            .as_ref()
+            .filter(|iface| iface.ifindex == ifindex)
+        else {
+            return -22;
+        };
+        (ctx.cap, iface.name.clone())
+    };
+    match cap.invoke(DeviceOp(|| {
+        narf_net::iface::set_link_metadata(&name, carrier, None, None)
+    })) {
+        Ok(true) => 0,
+        Ok(false) => -19,
+        Err(_) => -19,
+    }
+}
+
+/// Deliver one copied receive frame from module memory into the kernel stack.
 pub fn module_netif_rx(owner: u64, token: u64, ifindex: u32, frame: &mut [u8]) -> i32 {
     let (cap, name) = {
         let g = DEVICE_CTXS.lock();

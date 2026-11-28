@@ -25,9 +25,10 @@ builtin = [
     "dep:narf-memory", "dep:narf-net", "dep:narf-power", "dep:narf-scheduler",
     "dep:narf-time",
 ]
-module = []
+module = ["dep:narf-module-rt"]
 
 [dependencies]
+narf-module-rt = { path = "../../../modules/rt", optional = true }
 narf-driver-macros = { path = "../../../driver-macros" }
 narf-drivers-net-core = { path = "../core", optional = true }
 narf-arch         = { path = "../../../arch", optional = true }

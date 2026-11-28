@@ -36,7 +36,7 @@
 //! lands as its own item; no PCI power-state transition — the bus
 //! layer owns PCI config.
 
-use narf_bus::MmioRegion;
+use crate::platform::MmioRegion;
 
 /// Command register (CR) offset — shared across the family.
 pub const REG_CR: u64 = 0x37;
@@ -154,7 +154,7 @@ pub fn resume_plan(bank: &impl RegBank, imr: ImrPort, imr_word: u32, irq_bound: 
     cr
 }
 
-#[cfg(any(test, feature = "builtin"))]
+#[cfg(feature = "builtin")]
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};

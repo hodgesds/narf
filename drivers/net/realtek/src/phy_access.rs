@@ -44,10 +44,14 @@
 //! fatal. The blob is a PHY-MCU patch; without it the table still
 //! programs the registers it names.
 
+#[cfg(feature = "module")]
+use crate::platform::{scheduler as narf_scheduler, time as narf_time};
+
 use alloc::vec::Vec;
 
-use narf_bus::MmioRegion;
+use crate::platform::MmioRegion;
 
+#[cfg(feature = "builtin")]
 use crate::phy::{Phy, PhyLink};
 
 // ── PHY paged-register access types ─────────────────────────────────
@@ -148,6 +152,10 @@ pub enum PhyError {
     /// Firmware container was too short, misaligned, or failed its
     /// checksum.
     BadFirmwareFormat,
+    /// Allocation failed without touching device registers.
+    NoMemory,
+    /// The entire firmware program exceeded its time or instruction budget.
+    FirmwareTimeout,
     /// Firmware contained an opcode this interpreter does not know,
     /// or a jump that leaves the program.
     BadFirmwareOpcode(u32),
@@ -516,7 +524,9 @@ pub fn parse_firmware(bytes: &[u8]) -> Result<Vec<u32>, PhyError> {
         (0, bytes.len() / FW_OPCODE_BYTES)
     };
 
-    let mut code = Vec::with_capacity(count);
+    let mut code = Vec::new();
+    code.try_reserve_exact(count)
+        .map_err(|_| PhyError::NoMemory)?;
     for i in 0..count {
         let o = start + i * FW_OPCODE_BYTES;
         code.push(u32::from_le_bytes([
@@ -614,12 +624,30 @@ impl PhyAccess<'_> {
     /// checks, which is what keeps the jump arithmetic from leaving
     /// the slice.
     pub fn run_firmware(&mut self, code: &[u32]) -> Result<(), PhyError> {
+        validate_firmware(code)?;
+        let result = self.run_firmware_until(code, narf_time::Deadline::after_ms(30_000));
+        // Restore the software page even when a timeout/opcode error interrupts
+        // firmware. Subsequent PHY setup must never inherit its page selector.
+        self.ocp_base = OCP_STD_PHY_BASE;
+        result
+    }
+
+    fn run_firmware_until(
+        &mut self,
+        code: &[u32],
+        deadline: narf_time::Deadline,
+    ) -> Result<(), PhyError> {
+        let mut remaining = code.len().saturating_mul(64).max(1_000_000);
         let mut predata: u16 = 0;
         let mut count: u32 = 0;
         let mut target = FwTarget::Phy;
         let mut i: usize = 0;
 
         while i < code.len() {
+            if remaining == 0 || deadline.expired() {
+                return Err(PhyError::FirmwareTimeout);
+            }
+            remaining -= 1;
             let (opcode, regno, data) = decode_action(code[i]);
             // C mutates `index` inside the loop and then runs the
             // `index++` of the `for`. Computing the successor up
@@ -632,7 +660,7 @@ impl PhyAccess<'_> {
                         FwTarget::Phy => self.mdio_read(regno)?,
                         FwTarget::MacMcu => self.mac_mcu_read(regno)?,
                     };
-                    count += 1;
+                    count = count.wrapping_add(1);
                 }
                 PHY_DATA_OR => predata |= data,
                 PHY_DATA_AND => predata &= data,
@@ -673,7 +701,7 @@ impl PhyAccess<'_> {
                     let ms = (data as u64).min(MAX_FIRMWARE_DELAY_MS);
                     let _ = narf_scheduler::responsive_spin_until(
                         || false,
-                        narf_time::Deadline::after_ms(ms),
+                        narf_time::Deadline::after_ms(ms).min(deadline),
                     );
                 }
                 _ => return Err(PhyError::BadFirmwareOpcode(code[i])),
@@ -887,6 +915,7 @@ pub const fn rtlgen_decode_speed(val: u16) -> Option<u32> {
 /// down link stays down whatever the word says: the speed word
 /// is a negotiated-rate register, and a down link has no
 /// negotiated rate to report.
+#[cfg(feature = "builtin")]
 pub fn rtlgen_apply_speed(c22: PhyLink, speed_val: u16) -> PhyLink {
     if !c22.link_up {
         return c22;
@@ -900,6 +929,7 @@ pub fn rtlgen_apply_speed(c22: PhyLink, speed_val: u16) -> PhyLink {
     }
 }
 
+#[cfg(feature = "builtin")]
 impl Phy for PhyAccess<'_> {
     type Error = PhyError;
 
@@ -946,7 +976,7 @@ impl Phy for PhyAccess<'_> {
 
 // ── Fixtures ────────────────────────────────────────────────────────
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "builtin", target_arch = "x86_64"))]
 mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 

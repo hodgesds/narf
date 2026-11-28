@@ -2453,3 +2453,71 @@ kernel_test_in!("modules/e2e/iwlwifi", e2e_iwlwifi_module_registration);
 fn _force_imports() -> String {
     "ok".to_string()
 }
+
+// The physical packet paths are exercised by the driver crates' host KABI
+// models. QEMU does not emulate these NICs: this test instead loads the actual
+// ET_REL artifacts, resolves their imports, invokes probe rejection and unloads.
+fn e2e_wired_module_images() -> TestResult {
+    use narf_bus::driver_match::{__module_thunk_for_test, count};
+    for (name, vendor, ids) in [
+        ("realtek", 0x10ec, [0x8125, 0x3000]),
+        ("mlx4", 0x15b3, [0x1003, 0x1007]),
+    ] {
+        let Some(initramfs) = narf_initramfs::staged() else {
+            return TestResult::Fail("wired module initramfs missing");
+        };
+        let path = format!("lib/modules/test-fixtures/{name}.ko.lz4");
+        let Some((_, staged)) = initramfs.iter_files().find(|(p, _)| *p == path) else {
+            return TestResult::Fail("wired module fixture missing");
+        };
+        fresh_state(0);
+        let abi = crate::symbols::compute_abi_hash();
+        crate::symbols::set_kernel_abi(abi);
+        let Some(image) = stamp_fixture_abi(staged, abi) else {
+            return TestResult::Fail("wired module ABI stamp missing");
+        };
+        let before = count();
+        let Ok(module) = sys_init_module_with_params(&image, "domain=driver2") else {
+            return TestResult::Fail("wired module relocation or init failed");
+        };
+        let live =
+            module.name() == name && *module.state.lock() == crate::lifecycle::ModuleState::Live;
+        let claims = count() == before + 2
+            && ids.iter().all(|&id| {
+                __module_thunk_for_test(vendor, id).is_some_and(|probe| probe(0, 0) == -19)
+            });
+        drop(module);
+        if sys_delete_module(name).is_err() {
+            return TestResult::Fail("wired module unload failed");
+        }
+        if !live || !claims || count() != before {
+            return TestResult::Fail("wired module identity, probes or cleanup failed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e/wired", e2e_wired_module_images);
+
+fn e2e_module_carrier_ownership() -> TestResult {
+    use narf_bus::driver_match::*;
+    const OWNER: u64 = 0xffff_fff0;
+    const TOKEN: u64 = 0xffff_fff1;
+    let Some((name, index)) = __install_module_netif_for_test(OWNER, TOKEN, [2, 4, 6, 8, 10, 12])
+    else {
+        return TestResult::Fail("carrier fixture unavailable");
+    };
+    let results = [
+        module_netif_set_link(OWNER + 1, TOKEN, index, true) == -19,
+        module_netif_set_link(OWNER, TOKEN, index + 1, true) == -22,
+        module_netif_set_link(OWNER, TOKEN, index, true) == 0,
+        module_netif_set_link(OWNER, TOKEN, index, false) == 0,
+    ];
+    let _ = name;
+    __remove_module_device_for_test(TOKEN);
+    if results.iter().all(|&ok| ok) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("carrier update did not enforce device/interface owner")
+    }
+}
+kernel_test_in!("modules/e2e/wired", e2e_module_carrier_ownership);

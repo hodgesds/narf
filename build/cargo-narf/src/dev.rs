@@ -6314,6 +6314,8 @@ fn run_boot(args: &BuildArgs, gate_exit: bool, timeout_secs: u64) -> Result<Boot
         // stamping the ABI hash (`stamp_fixture_abi`).
         for (package, guest, what) in [
             ("narf-drivers-gpu-intel", "intel_gpu", "Intel GPU"),
+            ("narf-drivers-net-realtek", "realtek", "RTL8125 module"),
+            ("narf-drivers-net-mlx4", "mlx4", "ConnectX-3 module"),
             // WCN6855 over the KABI.
             ("narf-drivers-wireless-ath11k", "ath11k", "ath11k"),
             // MT7921/MT7922 over the KABI.
