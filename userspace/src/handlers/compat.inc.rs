@@ -12012,6 +12012,32 @@ pub(crate) fn futex_register_waiter_key_bitset(
     waker: core::task::Waker,
     bitset: u32,
 ) {
+    futex_register_waiter_key_bitset_gen(key, task_id, waker, bitset);
+}
+
+/// [`futex_register_waiter_key_bitset`] that also snapshots the bucket
+/// wake generation under the SAME bucket lock as the registration, and
+/// returns it.
+///
+/// The snapshot is what makes the generation half of the park guard
+/// atomic with visibility to wakers (Refs #2573). Every waker bumps the
+/// generation BEFORE taking the bucket lock for its scan
+/// (`futex_bump_counter_key`), so a bump whose scan could have missed
+/// this waiter — the scan locked before the registration — is observed
+/// here through the lock handoff instead of relying only on the
+/// post-registration load in `futex_park_register_and_check`. The
+/// converse order (registration locked first) lets the scan find the
+/// waiter and fire its waker. Either way the waiter cannot sleep past
+/// the wake. The caller still re-loads after registration, for
+/// promptness on bumps landing between the unlock and the check; the
+/// snapshot costs one atomic load under a lock already held, so the
+/// uncontended paths pay nothing extra.
+pub(crate) fn futex_register_waiter_key_bitset_gen(
+    key: FutexKey,
+    task_id: u64,
+    waker: core::task::Waker,
+    bitset: u32,
+) -> u64 {
     let mut queue = futex_wait_bucket(key).values.lock();
     // The legacy re-execute park identifies its registration by task rather
     // than a saved handle. Refresh it in place, preserving arrival order.
@@ -12027,6 +12053,9 @@ pub(crate) fn futex_register_waiter_key_bitset(
             key, tid: task_id, slot: FUTEX_PARK_SLOT, waker, bitset, q: None,
         });
     }
+    // Still under the bucket lock: the generation as of the moment this
+    // registration became visible to wakers (see the doc above).
+    futex_wake_counter_key(key)
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
@@ -12476,6 +12505,14 @@ pub(crate) enum FutexParkCheck {
 /// the wait resolves as a spurious wake. Keeping this in one function keeps
 /// the ordering invariant (seq before fields; re-check after register) from
 /// drifting between the two call sites.
+///
+/// The stay decision additionally requires BOTH generation reads to be
+/// unmoved: the snapshot taken under the bucket lock during registration
+/// (`futex_register_waiter_key_bitset_gen`) and the post-registration
+/// load. The snapshot is exact by construction — a bump whose scan could
+/// have missed the waiter is observed through the lock handoff — while
+/// the post-registration load catches bumps landing between the unlock
+/// and the check promptly (Refs #2573).
 pub(crate) fn futex_park_register_and_check(
     uc: &crate::user_task::UserTaskCtx,
     task_id: u64,
@@ -12497,7 +12534,7 @@ pub(crate) fn futex_park_register_and_check(
         return FutexParkCheck::Wake;
     }
     let (key, bitset) = futex_park_key_parts(uc, fu);
-    futex_register_waiter_key_bitset(key, task_id, waker.clone(), bitset);
+    let gen_at_reg = futex_register_waiter_key_bitset_gen(key, task_id, waker.clone(), bitset);
     if uc.futex_park_seq.load(Ordering::Acquire) != seq_before {
         // A requeue retargeted us between the field loads and the
         // registration — the entry we just inserted names the stale word.
@@ -12505,12 +12542,20 @@ pub(crate) fn futex_park_register_and_check(
         clear(uc);
         return FutexParkCheck::Wake;
     }
-    let stay = futex_park_should_stay(
-        futex_gen_key(key),
-        uc.futex_park_gen.load(Ordering::Acquire),
-        futex_read_user_word(fu),
-        uc.futex_val.load(Ordering::Acquire),
-    );
+    let park_gen = uc.futex_park_gen.load(Ordering::Acquire);
+    // BOTH generation reads must be unmoved: the under-lock snapshot
+    // (exact by construction — a bump whose scan could have missed the
+    // registration is observed through the lock handoff) and the
+    // post-registration load (promptness for bumps landing between the
+    // registration and this check). Either one moving means a wake
+    // raced the park; the word check below is the second half.
+    let stay = gen_at_reg == park_gen
+        && futex_park_should_stay(
+            futex_gen_key(key),
+            park_gen,
+            futex_read_user_word(fu),
+            uc.futex_val.load(Ordering::Acquire),
+        );
     if stay {
         FutexParkCheck::Stay
     } else {

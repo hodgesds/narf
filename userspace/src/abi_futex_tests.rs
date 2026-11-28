@@ -1305,3 +1305,170 @@ kernel_test_in!(
     "syscall_abi/futex",
     smoke_abi_futex_pi_handoff_deadline_repark
 );
+
+/// PI `FUTEX_WAITERS` registration race (Refs #2573) — HARDENING, not a
+/// bug fix: a locker that set `FUTEX_WAITERS` but has not registered its
+/// waker yet must not sleep past an unlock or wake that raced its
+/// registration.
+///
+/// The plain interleaving is already closed by three interlocking
+/// mechanisms — the cmpxchg atomicity (the loser retries and re-reads a
+/// fresh gen+word), the exhaustive conditional bump in `futex_unlock_pi`
+/// (`uval & FUTEX_WAITERS || designated || waiter_count > 0`, with `uval`
+/// refreshed by the cmpxchg retry loop), and register-before-validate
+/// under the same bucket lock the wake scan takes — so this fixture is
+/// EXPECTED TO PASS ON THE BASE TOO. Its value is pinning the property:
+/// a locker whose `FUTEX_WAITERS` set races an unlock must not sleep
+/// past it (Linux semantics), with the generation half pinned
+/// independently of the word half.
+///
+/// Each leg drives the waiter through a real `FUTEX_LOCK_PI` (the
+/// harness has no yield hook, so it returns EAGAIN *after* setting
+/// `FUTEX_WAITERS`), then publishes the park state exactly as
+/// `futex_lock_pi` does — generation sampled before the word read via
+/// `get_futex_key` + `futex_gen_key`, then the parked-on value, then
+/// `futex_park_publish` — leaving the waiter published-but-unregistered,
+/// and asserts `futex_park_register_and_check` resolves `Wake` (not
+/// `Stay`), with the waker unfired, the queue empty, and the park state
+/// cleared. Leg A drives a real `FUTEX_UNLOCK_PI` in that window; leg B
+/// drives a real `FUTEX_WAKE(1)` instead, with the word unchanged, so
+/// only the generation half can fire.
+///
+/// NOTE: the namespace-0 `__test_futex_bump_counter` hook must NOT be
+/// used here — the PI key's namespace is the address-space pointer, so
+/// it would bump the wrong bucket. Both legs drive the real wake paths,
+/// and the generation is read back through the real key.
+fn smoke_abi_futex_pi_waiters_registration_gen_guard() -> TestResult {
+    with_setup(|| {
+        let me = call(Syscall::Gettid.raw(), a0(0)).ok_or("gettid")? as u32;
+        let word = core::sync::atomic::AtomicU32::new(0);
+        let p = &word as *const _ as u64;
+        let get = || word.load(Ordering::SeqCst);
+        let p_op = |op: u64| futex(p, op | FUTEX_PRIVATE_FLAG, 0, 0);
+        // The waiter: a real registered task, as in the handoff test.
+        let w1_id = narf_scheduler::alloc_task_id().raw();
+        if w1_id as u32 == me {
+            return Err("waiter task id must differ from the owner's TID");
+        }
+        let w1 = crate::task::Task::new_registered(w1_id, w1_id);
+        crate::handlers::register_pid_task_mapping(w1_id, w1_id);
+        crate::handlers::register_task_to_pid(w1_id, w1_id);
+        // Drive the waiter through LOCK_PI and publish the park state
+        // exactly as `futex_lock_pi` does, leaving it
+        // published-but-unregistered. Returns the waiter's key.
+        let publish_waiter = || -> Result<crate::handlers::FutexKey, &'static str> {
+            let key =
+                crate::handlers::get_futex_key(true, p).map_err(|_| "get_futex_key failed")?;
+            // Seqlock order: sample the generation BEFORE the word read
+            // below (and before LOCK_PI's own internal read — nothing
+            // can bump in between in the single-threaded harness, so
+            // this is the generation LOCK_PI sampled).
+            let gen = crate::handlers::futex_gen_key(key);
+            set_task(w1_id);
+            if p_op(FUTEX_LOCK_PI) != Some(EAGAIN) {
+                set_task(FAKE_TASK);
+                return Err("waiter LOCK_PI must return EAGAIN in the harness");
+            }
+            let parked_on = get();
+            if parked_on != me | PI_WAITERS {
+                set_task(FAKE_TASK);
+                return Err("waiter LOCK_PI must set FUTEX_WAITERS");
+            }
+            crate::user_task::with_user_task_ctx(w1_id, |uc| {
+                uc.futex_park_gen.store(gen, Ordering::Release);
+                uc.futex_val.store(parked_on, Ordering::Release);
+                crate::handlers::futex_park_publish(uc, p, key, MATCH_ANY);
+            })
+            .ok_or("waiter task ctx is gone")?;
+            // Published but unregistered: the park target is set and no
+            // queue entry exists yet — the window the guard must cover.
+            let parked = crate::user_task::with_user_task_ctx(w1_id, |uc| {
+                uc.futex_uaddr.load(Ordering::Acquire)
+            })
+            .ok_or("waiter task ctx is gone")?;
+            if parked != p || crate::handlers::futex_waiter_count_key(key) != 0 {
+                set_task(FAKE_TASK);
+                return Err("waiter must be published but unregistered");
+            }
+            set_task(FAKE_TASK);
+            Ok(key)
+        };
+        // Run the park loop's register-and-check as the waiter and assert
+        // it resolves as a wake — never a sleep — with the waker unfired,
+        // the queue empty, and the park state cleared.
+        let check_wake = |key: crate::handlers::FutexKey,
+                          hits: &Arc<AtomicU32>|
+         -> Result<(), &'static str> {
+            let waker = counting_waker(hits.clone());
+            let check = crate::user_task::with_user_task_ctx(w1_id, |uc| {
+                crate::handlers::futex_park_register_and_check(uc, w1_id, &waker)
+            })
+            .ok_or("waiter task ctx is gone")?;
+            if !matches!(check, crate::handlers::FutexParkCheck::Wake) {
+                return Err("register-and-check after the racing wake must resolve Wake, not Stay");
+            }
+            if hits.load(Ordering::Acquire) != 0 {
+                return Err("the racing wake must not have fired the waiter's waker");
+            }
+            if crate::handlers::futex_waiter_count_key(key) != 0 {
+                return Err("the queue must be empty after the Wake resolution");
+            }
+            let parked = crate::user_task::with_user_task_ctx(w1_id, |uc| {
+                uc.futex_uaddr.load(Ordering::Acquire)
+            })
+            .ok_or("waiter task ctx is gone")?;
+            if parked != 0 {
+                return Err("the park state must be cleared after the Wake resolution");
+            }
+            Ok(())
+        };
+        let r = (|| {
+            // Owner takes the lock.
+            if p_op(FUTEX_LOCK_PI) != Some(0) || get() != me {
+                return Err("owner LOCK_PI must take the free word");
+            }
+            // Leg A — a real FUTEX_UNLOCK_PI races the registration.
+            let key = publish_waiter()?;
+            let gen_before = crate::handlers::futex_gen_key(key);
+            if p_op(FUTEX_UNLOCK_PI) != Some(0) || get() != 0 {
+                return Err(
+                    "unlocking with a published-but-unregistered waiter must clear the word",
+                );
+            }
+            if crate::handlers::futex_gen_key(key) == gen_before {
+                return Err("the racing unlock must bump the wake generation");
+            }
+            let hits_a = Arc::new(AtomicU32::new(0));
+            check_wake(key, &hits_a)?;
+            // Leg B — same setup, a real FUTEX_WAKE(1) instead of an
+            // unlock: the word is unchanged, so ONLY the generation
+            // half can fire the Wake resolution.
+            if p_op(FUTEX_LOCK_PI) != Some(0) || get() != me {
+                return Err("owner must re-take the lock for the wake leg");
+            }
+            let key = publish_waiter()?;
+            let gen_before = crate::handlers::futex_gen_key(key);
+            if futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0) != Some(0) {
+                return Err("FUTEX_WAKE(1) with no registered waiter must wake 0");
+            }
+            if get() != me | PI_WAITERS {
+                return Err("FUTEX_WAKE must leave the word unchanged for the generation leg");
+            }
+            if crate::handlers::futex_gen_key(key) == gen_before {
+                return Err("the racing wake must bump the wake generation");
+            }
+            let hits_b = Arc::new(AtomicU32::new(0));
+            check_wake(key, &hits_b)?;
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::handlers::__test_futex_drop_current(true, p, w1_id);
+        crate::task::abort_prepared_registration(&w1);
+        crate::handlers::release_reaped_task(w1_id);
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_pi_waiters_registration_gen_guard
+);
