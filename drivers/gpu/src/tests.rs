@@ -12120,6 +12120,369 @@ kernel_test_in!(
     smoke_amdgpu_vm_gem_va_maps_and_validates
 );
 
+/// GEM_VA input fences park on the user path: `dispatch_async` waits
+/// (yields Pending, never spins) until the fence signals, then the MAP
+/// proceeds. The first poll returning Pending is the park proof — a
+/// spinning wait could never yield it — and the mapping recorded after the
+/// signal is the wake proof. The signal comes from this thread between
+/// polls; the wait re-samples at most 100 µs after it, on `wait_change`'s
+/// deadline, since a `BinaryFence` signal carries no IRQ wake.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_vm_gem_va_input_fence_parks_until_signal() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState};
+    use crate::drm::syncobj::{BinaryFence, DmaFence, SyncObjTable};
+    use crate::drm_uapi::{self, DRM_COMMAND_BASE};
+    use alloc::boxed::Box;
+    use core::future::Future;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_filesystem::FsError;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    // A 16 KiB buffer to map (as smoke_amdgpu_vm_gem_va_maps_and_validates).
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&16384u64.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+
+    // An unsignalled input fence.
+    let mut table = SyncObjTable::new();
+    let sync_handle = match table.create(0) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("setup: syncobj create failed"),
+    };
+    let fence = BinaryFence::new();
+    table
+        .get_mut(sync_handle)
+        .unwrap()
+        .replace_fence(fence.clone());
+    let syncobjs = IrqSafeSpinLock::new(table);
+
+    // A 64-byte MAP with one input fence (the layout `dispatch_inner`
+    // reads only when `ioc_size(cmd) >= 64`).
+    const BASE_VA: u64 = 0x1_0000_0000;
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    let handles = [sync_handle];
+    let mut req = [0u8; 64];
+    req[0..4].copy_from_slice(&handle.to_le_bytes());
+    req[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    req[12..16].copy_from_slice(&RW.to_le_bytes());
+    req[16..24].copy_from_slice(&BASE_VA.to_le_bytes());
+    req[24..32].copy_from_slice(&0u64.to_le_bytes());
+    req[32..40].copy_from_slice(&16384u64.to_le_bytes());
+    req[52..56].copy_from_slice(&1u32.to_le_bytes());
+    req[56..64].copy_from_slice(&(handles.as_ptr() as u64).to_le_bytes());
+    let va_cmd = drm_uapi::iowr(
+        drm_uapi::DRM_IOCTL_BASE,
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        64,
+    );
+
+    // A no-op waker (same shape as drivers/fs/9p/src/tests.rs `poll_once`):
+    // the wait registers it and is never woken through it — it wakes on
+    // its 100 µs re-sample deadline instead.
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|data| RawWaker::new(data, &VTABLE), |_| {}, |_| {}, |_| {});
+    // SAFETY: VTABLE contains valid no-op operations and never dereferences
+    // its data.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(vm::dispatch_async(
+        va_cmd,
+        req.as_mut_ptr() as usize,
+        &state,
+        &gem,
+        Some(&syncobjs),
+    ));
+    let start = narf_time::monotonic_ns();
+    let mut outcome: Option<Option<Result<u64, FsError>>> = None;
+    let mut saw_pending = false;
+    let mut signalled = false;
+    let done = narf_scheduler::responsive_spin_until(
+        || {
+            narf_scheduler::poll_one_round_nested();
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => {
+                    outcome = Some(v);
+                    true
+                }
+                Poll::Pending => {
+                    saw_pending = true;
+                    if !signalled {
+                        fence.signal();
+                        signalled = true;
+                    }
+                    false
+                }
+            }
+        },
+        narf_time::Deadline::after_ns(1_000_000_000),
+    );
+    if !done {
+        return TestResult::Fail("GEM_VA input-fence wait did not wake within 1 s");
+    }
+    if !saw_pending {
+        return TestResult::Fail("GEM_VA input-fence wait never yielded (did not park)");
+    }
+    if narf_time::monotonic_ns().saturating_sub(start) >= 1_000_000_000 {
+        return TestResult::Fail("GEM_VA input-fence wait woke too late");
+    }
+    match outcome {
+        Some(Some(Ok(0))) => {}
+        _ => return TestResult::Fail("GEM_VA MAP after the fence signal failed"),
+    }
+    match state.lookup(BASE_VA + 4096) {
+        Some(m) if m.gem_handle == handle => TestResult::Pass,
+        _ => TestResult::Fail("the mapping was not recorded after the wait"),
+    }
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_gem_va_input_fence_parks_until_signal
+);
+
+/// An already-signalled input fence waits nowhere: `dispatch_async`
+/// completes the MAP at once.
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_vm_gem_va_input_fence_signalled_returns_at_once() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState};
+    use crate::drm::syncobj::{BinaryFence, DmaFence, SyncObjTable};
+    use crate::drm_uapi::{self, DRM_COMMAND_BASE};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&16384u64.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+
+    let mut table = SyncObjTable::new();
+    let sync_handle = match table.create(0) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("setup: syncobj create failed"),
+    };
+    let fence = BinaryFence::new();
+    fence.signal();
+    table
+        .get_mut(sync_handle)
+        .unwrap()
+        .replace_fence(fence.clone());
+    let syncobjs = IrqSafeSpinLock::new(table);
+
+    const BASE_VA: u64 = 0x1_0000_0000;
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    let handles = [sync_handle];
+    let mut req = [0u8; 64];
+    req[0..4].copy_from_slice(&handle.to_le_bytes());
+    req[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    req[12..16].copy_from_slice(&RW.to_le_bytes());
+    req[16..24].copy_from_slice(&BASE_VA.to_le_bytes());
+    req[24..32].copy_from_slice(&0u64.to_le_bytes());
+    req[32..40].copy_from_slice(&16384u64.to_le_bytes());
+    req[52..56].copy_from_slice(&1u32.to_le_bytes());
+    req[56..64].copy_from_slice(&(handles.as_ptr() as u64).to_le_bytes());
+    let va_cmd = drm_uapi::iowr(
+        drm_uapi::DRM_IOCTL_BASE,
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        64,
+    );
+    let start = narf_time::monotonic_ns();
+    match narf_scheduler::block_on_spin(vm::dispatch_async(
+        va_cmd,
+        req.as_mut_ptr() as usize,
+        &state,
+        &gem,
+        Some(&syncobjs),
+    )) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("GEM_VA MAP with a signalled fence failed"),
+    }
+    if narf_time::monotonic_ns().saturating_sub(start) >= 1_000_000_000 {
+        return TestResult::Fail("signalled input fence took over 1 s");
+    }
+    match state.lookup(BASE_VA + 4096) {
+        Some(m) if m.gem_handle == handle => TestResult::Pass,
+        _ => TestResult::Fail("the mapping was not recorded"),
+    }
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_gem_va_input_fence_signalled_returns_at_once
+);
+
+/// An unknown input-fence handle fails the VA op with -ENOENT before any
+/// mapping happens (the snapshot error path shared by both dispatchers).
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_vm_gem_va_input_fence_unknown_handle() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState};
+    use crate::drm::syncobj::SyncObjTable;
+    use crate::drm_uapi::{self, DRM_COMMAND_BASE};
+    use narf_filesystem::FsError;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&16384u64.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+
+    let table = SyncObjTable::new();
+    let syncobjs = IrqSafeSpinLock::new(table);
+
+    const BASE_VA: u64 = 0x1_0000_0000;
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    let handles = [0xdead_u32];
+    let mut req = [0u8; 64];
+    req[0..4].copy_from_slice(&handle.to_le_bytes());
+    req[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    req[12..16].copy_from_slice(&RW.to_le_bytes());
+    req[16..24].copy_from_slice(&BASE_VA.to_le_bytes());
+    req[24..32].copy_from_slice(&0u64.to_le_bytes());
+    req[32..40].copy_from_slice(&16384u64.to_le_bytes());
+    req[52..56].copy_from_slice(&1u32.to_le_bytes());
+    req[56..64].copy_from_slice(&(handles.as_ptr() as u64).to_le_bytes());
+    let va_cmd = drm_uapi::iowr(
+        drm_uapi::DRM_IOCTL_BASE,
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        64,
+    );
+    match narf_scheduler::block_on_spin(vm::dispatch_async(
+        va_cmd,
+        req.as_mut_ptr() as usize,
+        &state,
+        &gem,
+        Some(&syncobjs),
+    )) {
+        Some(Err(FsError::NotFound)) => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("unknown input-fence handle was accepted"),
+        _ => TestResult::Fail("unknown input-fence handle gave the wrong error"),
+    }
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_gem_va_input_fence_unknown_handle
+);
+
+/// The synchronous dispatcher still serves a signalled input fence: the
+/// refactor moved its snapshot into a helper, and this pins the sync path's
+/// behaviour (an *unsignalled* fence through sync dispatch still spins by
+/// design — only the async user path parks — so it is deliberately not
+/// exercised here).
+#[cfg(feature = "amdgpu")]
+fn smoke_amdgpu_vm_gem_va_input_fence_sync_signalled_ok() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState};
+    use crate::drm::syncobj::{BinaryFence, DmaFence, SyncObjTable};
+    use crate::drm_uapi::{self, DRM_COMMAND_BASE};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&16384u64.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+
+    let mut table = SyncObjTable::new();
+    let sync_handle = match table.create(0) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("setup: syncobj create failed"),
+    };
+    let fence = BinaryFence::new();
+    fence.signal();
+    table
+        .get_mut(sync_handle)
+        .unwrap()
+        .replace_fence(fence.clone());
+    let syncobjs = IrqSafeSpinLock::new(table);
+
+    const BASE_VA: u64 = 0x1_0000_0000;
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    let handles = [sync_handle];
+    let mut req = [0u8; 64];
+    req[0..4].copy_from_slice(&handle.to_le_bytes());
+    req[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    req[12..16].copy_from_slice(&RW.to_le_bytes());
+    req[16..24].copy_from_slice(&BASE_VA.to_le_bytes());
+    req[24..32].copy_from_slice(&0u64.to_le_bytes());
+    req[32..40].copy_from_slice(&16384u64.to_le_bytes());
+    req[52..56].copy_from_slice(&1u32.to_le_bytes());
+    req[56..64].copy_from_slice(&(handles.as_ptr() as u64).to_le_bytes());
+    let va_cmd = drm_uapi::iowr(
+        drm_uapi::DRM_IOCTL_BASE,
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        64,
+    );
+    match vm::dispatch(
+        va_cmd,
+        req.as_mut_ptr() as usize,
+        &state,
+        &gem,
+        Some(&syncobjs),
+    ) {
+        Ok(0) => {}
+        _ => return TestResult::Fail("sync GEM_VA MAP with a signalled fence failed"),
+    }
+    match state.lookup(BASE_VA + 4096) {
+        Some(m) if m.gem_handle == handle => TestResult::Pass,
+        _ => TestResult::Fail("the mapping was not recorded"),
+    }
+}
+#[cfg(feature = "amdgpu")]
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_gem_va_input_fence_sync_signalled_ok
+);
+
 /// Page tables are really built: the entries are read back out of the memory
 /// the GPU would walk.
 ///

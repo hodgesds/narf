@@ -1261,11 +1261,15 @@ pub fn dispatch(
             }
         }
     }
-    dispatch_inner(&bytes, vm, gem, syncobjs)
+    let fences = snapshot_input_fences(&bytes, syncobjs)?;
+    dispatch_inner(&bytes, vm, gem, syncobjs, &fences)
 }
 
 /// User ioctl path parks for relocation admission and, for destructive
 /// updates, the VM's outstanding jobs before editing live page tables.
+/// Input-fence syncobjs park here too (see `wait_input_fences`): the
+/// synchronous wait inside `dispatch_inner` cannot park, so the user path
+/// must arrive with its fences already signalled.
 pub async fn dispatch_async(
     cmd: u32,
     arg: usize,
@@ -1308,7 +1312,16 @@ pub async fn dispatch_async(
                     }
                 }
             }
-            dispatch_inner(&bytes, vm, gem, syncobjs)
+            // Park for the input fences before the synchronous VA op: its
+            // own wait can only spin (see `dispatch_inner`), and a VA op
+            // whose dependency is still in flight must not burn a CPU in
+            // this ioctl's poll body. The snapshot comes from `bytes`, the
+            // single user copy `copy_va_request` took — never a second one.
+            // An unknown handle fails here, exactly as it would inside
+            // `dispatch_inner`.
+            let fences = snapshot_input_fences(&bytes, syncobjs)?;
+            wait_input_fences(&fences).await;
+            dispatch_inner(&bytes, vm, gem, syncobjs, &fences)
         }
         .await,
     )
@@ -1362,11 +1375,76 @@ fn copy_va_request(cmd: u32, arg: usize) -> Result<Vec<u8>, FsError> {
     unsafe { copy_in(arg, in_size) }
 }
 
+/// The GEM_VA input-fence syncobjs (`input_fence_syncobj_handles`), if any:
+/// the handles the 64-byte `drm_amdgpu_gem_va` layout in `bytes` names,
+/// resolved to their current fences. No waiting — the caller waits in its
+/// own context. `bytes` is the single snapshot `copy_va_request` took: the
+/// handles are read from it, never from a second user copy. An unknown
+/// handle is -ENOENT, as `drm_syncobj_array_find` reports it; no syncobj
+/// table, a short (40-byte) layout, or no input handles is an empty list
+/// (the op proceeds without waiting, as before).
+fn snapshot_input_fences(
+    bytes: &[u8],
+    syncobjs: Option<&IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
+) -> Result<Vec<Arc<dyn crate::drm::syncobj::DmaFence>>, FsError> {
+    let Some(syncobjs) = syncobjs else {
+        return Ok(Vec::new());
+    };
+    if bytes.len() < 64 {
+        return Ok(Vec::new());
+    }
+    let num = u32::from_le_bytes(bytes[52..56].try_into().unwrap()) as usize;
+    let ptr = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
+    if num == 0 || ptr == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: bounds-checked copy of input syncobj handle array
+    let handle_bytes = unsafe { copy_in(ptr as usize, num * 4)? };
+    let handles: Vec<u32> = handle_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let table = syncobjs.lock();
+    let mut fences = Vec::new();
+    for h in handles {
+        let obj = table.get(h).map_err(|_| FsError::NotFound)?;
+        if let Some(fence) = obj.fence() {
+            fences.push(fence);
+        }
+    }
+    Ok(fences)
+}
+
+/// Parked wait for GEM_VA input fences — the `nap()` discipline from
+/// `amdgpu_cs` (`wait_change` with a 100 µs deadline): sample, then park
+/// until the next fence interrupt or the deadline, whichever is first. The
+/// sequence is taken before sampling and `wait_change` registers before
+/// re-checking, so a completion between the sample and the registration
+/// cannot be lost. Engines without an IRQ wake (GFX11, Navi48) still
+/// re-sample at most 100 µs after they complete, since polling stays the
+/// mandatory completion path. Unbounded, as the synchronous wait it
+/// replaces: a VA op must not proceed before its input fences, however
+/// long they take — it just must not burn a CPU while it waits.
+async fn wait_input_fences(fences: &[Arc<dyn crate::drm::syncobj::DmaFence>]) {
+    loop {
+        let observed = crate::amdgpu_fence_navi22::change_sequence();
+        if fences.iter().all(|f| f.is_signalled()) {
+            return;
+        }
+        crate::amdgpu_fence_navi22::wait_change(
+            observed,
+            narf_time::monotonic_ns().saturating_add(100_000),
+        )
+        .await;
+    }
+}
+
 fn dispatch_inner(
     bytes: &[u8],
     vm: &VmState,
     gem: &crate::amdgpu_gem::GemState,
     syncobjs: Option<&IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>>,
+    input_fences: &[Arc<dyn crate::drm::syncobj::DmaFence>],
 ) -> Result<u64, FsError> {
     let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let operation = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -1377,8 +1455,8 @@ fn dispatch_inner(
     let (
         vm_timeline_point,
         vm_timeline_syncobj_out,
-        num_syncobj_handles,
-        input_fence_syncobj_handles,
+        _num_syncobj_handles,
+        _input_fence_syncobj_handles,
     ) = if bytes.len() >= 64 {
         let point = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
         let syncobj_out = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
@@ -1389,33 +1467,15 @@ fn dispatch_inner(
         (0, 0, 0, 0)
     };
 
-    if num_syncobj_handles > 0 && input_fence_syncobj_handles != 0 {
-        if let Some(syncobjs) = syncobjs {
-            // SAFETY: bounds-checked copy of input syncobj handle array
-            let handle_bytes = unsafe {
-                copy_in(
-                    input_fence_syncobj_handles as usize,
-                    (num_syncobj_handles as usize) * 4,
-                )?
-            };
-            let handles: Vec<u32> = handle_bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            let fences: Vec<Option<Arc<dyn crate::drm::syncobj::DmaFence>>> = {
-                let table = syncobjs.lock();
-                let mut f = Vec::new();
-                for h in handles {
-                    let obj = table.get(h).map_err(|_| FsError::NotFound)?;
-                    f.push(obj.fence());
-                }
-                f
-            };
-            for fence in fences.into_iter().flatten() {
-                while !fence.is_signalled() {
-                    core::hint::spin_loop();
-                }
-            }
+    // Synchronous callers (the `FileOps::ioctl` fallback and the kernel-test
+    // harness) cannot park: `block_on` panics inside an executor poll, and
+    // `block_on_spin` would only trade this loop for the same burn with a
+    // timer tick. The user path never reaches this loop unsignalled —
+    // `dispatch_async` parks first — so it is a fast re-check there. The
+    // fences were snapshotted once by the caller, from the same `bytes`.
+    for fence in input_fences {
+        while !fence.is_signalled() {
+            core::hint::spin_loop();
         }
     }
 
